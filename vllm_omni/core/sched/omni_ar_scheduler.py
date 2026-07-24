@@ -438,8 +438,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
                             self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
-                    request.async_tokens_to_discard = 1
-                    request.num_output_placeholders = 0
+                    outstanding_async_tokens = request.num_output_placeholders
+                    if outstanding_async_tokens > 0:
+                        # Discard only outputs that are already in flight and
+                        # roll back their optimistic computed-token accounting.
+                        request.async_tokens_to_discard = outstanding_async_tokens
+                        request.num_computed_tokens -= outstanding_async_tokens
+                        request.num_output_placeholders = 0
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
@@ -700,9 +705,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
-        if self.chunk_transfer_adapter:
+        stage_id = self.vllm_config.model_config.stage_id
+        if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
-            if self.vllm_config.model_config.stage_id != 0:
+            if stage_id != 0:
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
@@ -720,6 +726,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
+        update_info = getattr(update, "additional_information", None)
+        update_meta = update_info.get("meta") if isinstance(update_info, dict) else None
+        if isinstance(update_meta, dict) and update_meta.get("replace_streaming_prompt") is True:
+            self._replace_streaming_session(session, update)
+            return
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer

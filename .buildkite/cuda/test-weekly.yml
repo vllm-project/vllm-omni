@@ -5,45 +5,14 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
+
   - label: "Reliability Test - qwen3-omni"
     timeout_in_minutes: 180
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
       - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+    mirror_hardwares: h100_2
 
   - label: "Reliability Test - wan22"
     timeout_in_minutes: 180
@@ -51,39 +20,7 @@ steps:
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
       - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+    mirror_hardwares: h100_2
 
   - label: "Reliability Test - hunyuan-image"
     timeout_in_minutes: 180
@@ -91,39 +28,7 @@ steps:
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
       - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 4
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+    mirror_hardwares: h100_4
 
   - label: "Reliability Test - voxcpm2"
     timeout_in_minutes: 180
@@ -131,86 +36,30 @@ steps:
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
       - pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
-    agents:
-      queue: "gpu_1_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+    mirror_hardwares: l4_1
 
-  # Invalid HTTP / WS payloads vs live Omni servers (Issue #3649 tracks known skips).
   - group: "Reliability Test - Invalid parameters Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
+
       - label: "Invalid parameters Test · H100"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2
 
-      # Stable Audio Open, Qwen3-TTS speech/batch/voices paths marked ``L4``.
       - label: "Invalid parameters Test · L4"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+        mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Tests"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
+
       - label: "Omni · L4"
         timeout_in_minutes: 90
         commands:
@@ -222,19 +71,7 @@ steps:
             --ignore=tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py
             -m "slow and L4 and omni"
             --run-level "full_model"
-        agents:
-          queue: "gpu_4_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+        mirror_hardwares: l4_4
 
       - label: "Omni · H100"
         timeout_in_minutes: 90
@@ -243,39 +80,7 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and H100 and omni"
             --run-level "full_model"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2
 
       - label: "TTS · L4"
         timeout_in_minutes: 90
@@ -289,19 +94,7 @@ steps:
               pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
             done
             exit $$failed
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+        mirror_hardwares: l4_1
 
       - label: "TTS · H100"
         timeout_in_minutes: 90
@@ -313,39 +106,7 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and H100 and tts"
             --run-level "full_model"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_1
 
       - label: "Diffusion · L4"
         timeout_in_minutes: 60
@@ -354,19 +115,7 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and L4"
             --run-level "full_model"
-        agents:
-          queue: "gpu_4_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+        mirror_hardwares: l4_4
 
       - label: "Diffusion · H100 · Single-GPU"
         timeout_in_minutes: 120
@@ -375,39 +124,7 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and H100 and not distributed_cuda"
             --run-level "full_model"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_1
 
       - label: "Diffusion · H100 · Multi-GPU"
         timeout_in_minutes: 90
@@ -416,36 +133,4 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2

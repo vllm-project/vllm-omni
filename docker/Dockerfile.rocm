@@ -17,7 +17,7 @@ ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 ARG COMMON_WORKDIR=/app
 WORKDIR ${COMMON_WORKDIR}
 
-# Step 1: Setup - Install system dependencies
+# Step 1: Setup - Install system dependencies.
 # Need to include ffmpeg because vllm rocm upstream docker image
 # does not include it.
 RUN apt-get update && \
@@ -37,6 +37,26 @@ RUN if [ "${USE_NIGHTLY_BUILD}" = "1" ]; then \
         cd ../ && \
         rm -rf vllm/.git; \
     fi
+
+# Build TorchCodec after any optional nightly vLLM reinstall so it targets the
+# final torch/ROCm ABI. Keep this layer before COPY . so source changes do not
+# invalidate the expensive native build. FFmpeg development headers are
+# removed after the wheel is built.
+COPY tools/install_torchcodec_rocm.sh /tmp/install_torchcodec_rocm.sh
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/torchcodec-wheels \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        pkg-config \
+        libavcodec-dev libavformat-dev libavutil-dev \
+        libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev && \
+    bash /tmp/install_torchcodec_rocm.sh && \
+    apt-get purge -y \
+        libavcodec-dev libavformat-dev libavutil-dev \
+        libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev && \
+    rm -f /tmp/install_torchcodec_rocm.sh && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Step 3: Copy vllm-omni code and install without uv
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
@@ -59,7 +79,10 @@ RUN printf '%s\n' \
     '    os._exit(_exit_code)' \
     > ${COMMON_WORKDIR}/vllm-omni/conftest.py
 
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]" --no-build-isolation
+RUN cd ${COMMON_WORKDIR}/vllm-omni && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+        --no-cache-dir ".[dev]" --no-build-isolation && \
+    python3 -c "from torchcodec.decoders import VideoDecoder"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

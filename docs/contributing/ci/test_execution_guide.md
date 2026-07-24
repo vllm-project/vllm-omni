@@ -1,4 +1,4 @@
-# Test Guide
+# Test Execution Guide
 ## Setting Up the Test Environment
 ### Creating a Container
 vLLM-Omni provides an official Docker image for deployment. These images are built upon vLLM Docker images and are available on [Docker Hub](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which vLLM release it is based on.
@@ -191,7 +191,7 @@ Failed jobs: 1/2
 
     The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml).
 
-You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
+You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).
 
 ## Adding New Test Cases
-Please refer to the [L5 Layering Specification document](./CI_5levels.md).
+Please refer to the [Test System Overview](./test_system_overview.md) and [Test Writing Guide](./test_writing_guide.md).

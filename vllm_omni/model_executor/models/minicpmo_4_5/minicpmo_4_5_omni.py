@@ -34,7 +34,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
@@ -58,9 +57,11 @@ logger = init_logger(__name__)
 class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
     """MiniCPM-o 4.5 Omni model for conditional generation.
 
-    This model has two pipeline stages:
-    - llm: multimodal thinker and text generation
-    - tts: talker generation followed by its built-in Token2Wav vocoder
+    Three-stage pipeline:
+    - thinker (model_stage="llm"): image / video / audio encoders + 3D
+      resampler + the omni LLM that emits text + hidden states.
+    - talker  (model_stage="tts"): native continuous MiniCPMTTS AR that emits
+      codec-token deltas for the separate Code2Wav stage.
     """
 
     @classmethod
@@ -106,7 +107,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         elif self.model_stage == "tts":
             self.thinker = None
-            # Initialize talker model (LLM generation)
+            # The Talker is always the runner-owned continuous codec producer.
             self.talker = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "talker"),
@@ -125,12 +126,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.make_empty_intermediate_tensors = (
             (self.thinker.make_empty_intermediate_tensors)
             if self.model_stage == "llm" and self.thinker is not None
+            else self.talker.make_empty_intermediate_tensors
+            if self.talker is not None
             else lambda: None
         )
 
         self._language_model_names = ["model"]
         self.prefer_model_sampler = self.model_stage in {"llm", "tts"}
-        self.has_preprocess = self.model_stage == "llm"
+        # Both AR stages require model-specific embeddings.  The Thinker uses
+        # preprocess for duplex audio, while the Talker converts the
+        # tts_token_ids/tts_hidden_states handoff into its conditioning
+        # embeddings and initializes request-local codec generation state.
+        self.has_preprocess = self.model_stage in {"llm", "tts"}
 
     @cached_property
     def sampler(self):
@@ -299,6 +306,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         and sampler. This hook only turns the current duplex audio append into
         the prompt embeddings consumed by the normal runner forward.
         """
+        if self.model_stage == "tts":
+            return self.talker.preprocess(input_ids=input_ids, input_embeds=input_embeds, **kwargs)
         if self.model_stage != "llm":
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
@@ -474,174 +483,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
 
-    def _run_tts_request(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
-        talker_info: dict[str, Any],
-        device: torch.device,
-    ) -> tuple[dict[str, Any] | None, bool, bool]:
-        meta_info = talker_info.get("meta") if isinstance(talker_info.get("meta"), dict) else {}
-        if talker_info.get("native_duplex") is True:
-            # ids/hidden_states may be accumulated for the talker KV stream,
-            # but displayed transcript belongs to the current thinker segment.
-            tts_text = meta_info.get("native_duplex_segment_text", "")
-        else:
-            tts_text = talker_info.get("llm_output_text", "")
-        if isinstance(tts_text, list):
-            tts_text = (
-                tts_text[-1]
-                if talker_info.get("native_duplex") is True and tts_text
-                else (tts_text[0] if tts_text else "")
-            )
-        if not isinstance(tts_text, str):
-            tts_text = ""
-
-        with torch.inference_mode():
-            talker_result = self.talker(
-                input_ids=input_ids,
-                positions=positions,
-                inputs_embeds=inputs_embeds,
-                additional_information=talker_info,
-            )
-        chunk_flags = getattr(self.talker, "_ar_last_chunk_flags", [True])
-        chunk_is_last = bool(chunk_flags[-1]) if chunk_flags else True
-        turn_end_flags = getattr(self.talker, "_ar_turn_end_flags", [False])
-        turn_ended = bool(turn_end_flags[-1]) if turn_end_flags else False
-        if talker_info.get("native_duplex") is True:
-            emitted_text = getattr(self.talker, "_ar_last_emitted_text", "")
-            tts_text = emitted_text if isinstance(emitted_text, str) else ""
-
-        if not (isinstance(talker_result, tuple) and len(talker_result) == 2):
-            return None, chunk_is_last, turn_ended
-
-        mel_spec, waveform = talker_result
-        mm_out: dict[str, Any] = {}
-        duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
-        if talker_info.get("native_duplex") is True:
-            turn_id = duplex_info.get("turn_id")
-            if isinstance(turn_id, int):
-                mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
-            epoch = duplex_info.get("epoch")
-            if isinstance(epoch, int):
-                mm_out["meta.duplex_epoch"] = torch.tensor([epoch], dtype=torch.int32, device=device)
-        mm_out["meta.tts_is_last_chunk"] = torch.tensor(
-            [int(chunk_is_last)],
-            dtype=torch.int32,
-            device=device,
-        )
-        if talker_info.get("native_duplex") is True:
-            mm_out["meta.turn_end"] = torch.tensor(
-                [int(turn_ended)],
-                dtype=torch.int32,
-                device=device,
-            )
-        if tts_text or talker_info.get("native_duplex") is True:
-            mm_out["meta.llm_output_text_utf8"] = torch.tensor(
-                list(tts_text.encode("utf-8")),
-                dtype=torch.uint8,
-                device=device,
-            )
-            mm_out["meta.audio_text_total_chars"] = torch.tensor(
-                [len(tts_text)],
-                dtype=torch.int32,
-                device=device,
-            )
-        if mel_spec is not None:
-            mm_out["mel_spec"] = [mel_spec]
-        if waveform is not None:
-            mm_out["model_outputs"] = [waveform]
-        elif mel_spec is not None:
-            mm_out["model_outputs"] = [mel_spec]
-        return mm_out, chunk_is_last, turn_ended
-
-    @staticmethod
-    def _slice_tts_request_rows(value: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
-        return value[start:end] if isinstance(value, torch.Tensor) else value
-
-    def _run_batched_tts_requests(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
-        runtime_info: list[object],
-        request_token_spans: object,
-        num_tokens: int,
-        hidden_dim: int,
-        device: torch.device,
-    ) -> OmniOutput:
-        if not isinstance(request_token_spans, list) or len(request_token_spans) != len(runtime_info):
-            raise RuntimeError(
-                "MiniCPM-o 4.5 batched TTS requires one request_token_spans entry "
-                f"per request; got {request_token_spans!r} for {len(runtime_info)} requests"
-            )
-
-        request_ids: list[str] = []
-        request_outputs: list[dict[str, Any]] = []
-        row_chunk_flags = [True] * num_tokens
-        row_turn_end_flags = [False] * num_tokens
-        previous_end = 0
-        for index, raw_info in enumerate(runtime_info):
-            if not isinstance(raw_info, dict):
-                raise RuntimeError(f"MiniCPM-o 4.5 TTS request metadata at index {index} is not a dict")
-            span = request_token_spans[index]
-            if not (
-                isinstance(span, (list, tuple)) and len(span) == 2 and all(isinstance(value, int) for value in span)
-            ):
-                raise RuntimeError(f"Invalid MiniCPM-o 4.5 TTS token span at index {index}: {span!r}")
-            start, end = span
-            if start != previous_end or start < 0 or end < start or end > num_tokens:
-                raise RuntimeError(
-                    f"Invalid MiniCPM-o 4.5 TTS token span at index {index}: "
-                    f"expected start {previous_end} and 0 <= start <= end <= {num_tokens}, got {span!r}"
-                )
-            previous_end = end
-            if start == end:
-                continue
-            mm_out, chunk_is_last, turn_ended = self._run_tts_request(
-                input_ids=self._slice_tts_request_rows(input_ids, start, end),
-                positions=self._slice_tts_request_rows(positions, start, end),
-                inputs_embeds=self._slice_tts_request_rows(inputs_embeds, start, end),
-                talker_info=raw_info,
-                device=device,
-            )
-            row_chunk_flags[start:end] = [chunk_is_last] * (end - start)
-            row_turn_end_flags[start:end] = [turn_ended] * (end - start)
-            if mm_out is not None:
-                request_ids.append(get_stream_request_key(raw_info))
-                request_outputs.append(mm_out)
-        # vLLM pads the flattened token tensor to a CUDA Graph capture size.
-        # The spans describe only scheduled request rows, so an uncovered tail
-        # is graph padding rather than a missing request. Contiguity checks
-        # above still reject gaps between real requests.
-
-        self.talker._ar_last_chunk_flags = row_chunk_flags
-        self.talker._ar_turn_end_flags = row_turn_end_flags
-        dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-        if not request_outputs:
-            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
-
-        sparse_output: dict[str, Any] = {
-            "meta.req_id": request_ids,
-            "meta.sparse_audio": ["1"],
-        }
-        output_keys = set().union(*(output.keys() for output in request_outputs))
-        for key in output_keys:
-            values: list[Any] = []
-            for output in request_outputs:
-                value = output.get(key)
-                if isinstance(value, list) and len(value) == 1:
-                    value = value[0]
-                if value is None:
-                    dtype = torch.uint8 if key == "meta.llm_output_text_utf8" else torch.float32
-                    value = torch.empty(0, dtype=dtype, device=device)
-                values.append(value)
-            sparse_output[key] = values
-        return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=sparse_output)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -658,8 +499,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         Forward pass for MiniCPM-o Omni model.
 
         Workflow:
-        1) LLM: multimodal thinker → hidden states and text tokens
-        2) TTS: talker + Token2Wav → speech waveform
+        1) Thinker (model_stage="llm"): Image / video / audio encoders +
+           3D resampler + omni LLM → text + hidden states.
+        2) Talker (model_stage="tts"): native MiniCPMTTS AR → codec deltas.
         """
         if self.model_stage == "llm":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
@@ -778,56 +620,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 multimodal_outputs=multimodal_outputs,
             )
 
-        # Talker stage: runs TTS generation and its built-in Token2Wav vocoder.
+        # Talker stage: runner-owned native AR only. Waveform generation belongs
+        # to the separate Code2Wav stage.
         if self.model_stage == "tts":
-            if input_ids is not None:
-                num_tokens = input_ids.shape[0]
-                device = input_ids.device
-            elif inputs_embeds is not None:
-                num_tokens = inputs_embeds.shape[0]
-                device = inputs_embeds.device
-            else:
-                num_tokens = 1
-                device = current_omni_platform.get_torch_device()
-            hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
-
-            # Profile/dummy run: both input_ids and inputs_embeds are None.
-            # Note: SupportsMultiModal preprocessing converts input_ids to
-            # inputs_embeds, so input_ids=None alone does NOT indicate a dummy run.
-            if input_ids is None and inputs_embeds is None:
-                dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
-
-            runtime_info = kwargs.get("runtime_additional_information")
-            request_token_spans = kwargs.get("request_token_spans")
-            if isinstance(runtime_info, list) and (len(runtime_info) > 1 or request_token_spans is not None):
-                return self._run_batched_tts_requests(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    runtime_info=runtime_info,
-                    request_token_spans=request_token_spans,
-                    num_tokens=num_tokens,
-                    hidden_dim=hidden_dim,
-                    device=device,
-                )
-            talker_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-            dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-            mm_out, _, _ = self._run_tts_request(
+            return self.talker(
                 input_ids=input_ids,
                 positions=positions,
+                intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
-                talker_info=talker_info,
-                device=device,
+                **kwargs,
             )
-            if mm_out is not None:
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=mm_out)
-
-            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
+
+    def make_omni_output(self, model_outputs, **kwargs):
+        if self.model_stage != "tts":
+            return model_outputs
+        return self.talker.make_omni_output(model_outputs, **kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
@@ -1261,7 +1070,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         # MiniCPM-o checkpoint prefixes → stage mapping:
         #   thinker: vpm, resampler, llm, apm, audio_projection_layer
-        #   talker:  tts (ConditionalChatTTS)
+        #   talker:  tts (native MiniCPMTTS AR codec producer)
         for k, v in weights:
             if k.startswith(("vpm.", "resampler.", "llm.", "apm.", "audio_projection_layer.")):
                 thinker_weights.append((k, v))

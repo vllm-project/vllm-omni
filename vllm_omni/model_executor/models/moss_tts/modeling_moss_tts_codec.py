@@ -307,11 +307,15 @@ class MossTTSCodecDecoder(nn.Module):
                 "MossTTS codec requires seq_token_counts; otherwise concatenated "
                 "codec tokens cannot be split per request."
             )
-        if sum(token_counts) != int(ids_flat.shape[0]):
+        real_token_count = sum(token_counts)
+        input_token_count = int(ids_flat.shape[0])
+        if real_token_count > input_token_count:
             raise RuntimeError(
                 "MossTTS codec seq_token_counts mismatch: "
-                f"counts={token_counts}, sum={sum(token_counts)}, input_tokens={int(ids_flat.shape[0])}."
+                f"counts={token_counts}, sum={real_token_count}, input_tokens={input_token_count}."
             )
+        if real_token_count < input_token_count:
+            ids_flat = ids_flat[:real_token_count]
 
         num_req = len(token_counts)
         if len(info_list) < num_req:
