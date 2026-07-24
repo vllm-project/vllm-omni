@@ -12,7 +12,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
@@ -310,7 +310,7 @@ def resolve_model_config_path(model: str) -> str:
 def load_stage_configs_from_model(
     model: str,
     *,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -344,13 +344,12 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
-    # Opt-in semantics (store_true flag): only a truthy trust_remote_code is
-    # an explicit override; a falsy one is dropped so the deploy yaml's
-    # per-stage value survives the CLI merge.
-    if trust_remote_code:
-        cli_overrides["trust_remote_code"] = True
-    elif not cli_overrides.get("trust_remote_code"):
+    # A False inherited from the engine-args dump is the store_true flag's
+    # default, not an explicit choice — drop it so only the tri-state
+    # parameter below decides (see with_trust_remote_code_override).
+    if not cli_overrides.get("trust_remote_code"):
         cli_overrides.pop("trust_remote_code", None)
+    cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
@@ -560,7 +559,7 @@ def load_and_resolve_stage_configs(
     stage_configs_path: str | None,
     kwargs: dict | None,
     *,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,

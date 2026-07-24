@@ -30,7 +30,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -150,7 +150,7 @@ class AsyncOmniEngine:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
-        trust_remote_code: bool = False,
+        trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -229,15 +229,11 @@ class AsyncOmniEngine:
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
-        # trust_remote_code is opt-in and the serve CLI flag is store_true, so
-        # a False here cannot be distinguished from "not specified". Only a
-        # truthy value becomes a stage override; otherwise the deploy yaml's
-        # per-stage trust_remote_code stays in effect (a coerced False used to
-        # clobber it and broke every remote-code model on the offline path).
-        if trust_remote_code:
-            kwargs["trust_remote_code"] = True
-        else:
-            kwargs.pop("trust_remote_code", None)
+        # Tri-state: None means "not specified" — the deploy yaml's per-stage
+        # trust_remote_code stays in effect. An explicit True/False here is a
+        # global override (precedence: caller > deploy yaml > default False);
+        # the merge rule lives in with_trust_remote_code_override.
+        kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
@@ -1144,7 +1140,7 @@ class AsyncOmniEngine:
         model: str,
         kwargs: dict[str, Any],
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
