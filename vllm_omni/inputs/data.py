@@ -3,21 +3,13 @@ import pprint
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
 
-from vllm.inputs import PromptType
+import torch
+from typing_extensions import NotRequired, TypedDict
+from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
+from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
-
-try:
-    from typing import NotRequired, TypedDict
-except ImportError:
-    # Python < 3.11: use typing_extensions
-    from typing_extensions import NotRequired, TypedDict
-
-
-import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
-from vllm.inputs.engine import TokensInput
 
 
 class OmniTextPrompt(TextPrompt):

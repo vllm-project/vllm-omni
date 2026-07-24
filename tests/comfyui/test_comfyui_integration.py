@@ -10,7 +10,7 @@ import multiprocessing
 import time
 import traceback
 from collections.abc import Iterable, Sequence
-from enum import auto
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -35,7 +35,6 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.enums import StrEnum
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -58,15 +57,15 @@ class SamplingCase(NamedTuple):
     lora: dict | None = None
 
 
-class SamplingKind(StrEnum):
-    IMAGE_NONE = auto()
-    IMAGE_DIFFUSION_SINGLE = auto()
-    UNDERSTANDING_NONE = auto()
-    UNDERSTANDING_AR_LIST = auto()
-    TTS_NONE = auto()
-    TTS_DIFFUSION_SINGLE = auto()
-    VIDEO_NONE = auto()
-    VIDEO_DIFFUSION_SINGLE = auto()
+class SamplingKind(str, Enum):
+    IMAGE_NONE = "image_none"
+    IMAGE_DIFFUSION_SINGLE = "image_diffusion_single"
+    UNDERSTANDING_NONE = "understanding_none"
+    UNDERSTANDING_AR_LIST = "understanding_ar_list"
+    TTS_NONE = "tts_none"
+    TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
+    VIDEO_NONE = "video_none"
+    VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
 
 
 # Pre-defined arguments to be used in function calls during the tests

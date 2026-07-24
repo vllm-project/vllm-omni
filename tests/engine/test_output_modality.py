@@ -15,7 +15,6 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
-_UTILS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "utils"
 
 
 def _load_module(name: str, filepath: Path):
@@ -26,10 +25,6 @@ def _load_module(name: str, filepath: Path):
     return mod
 
 
-_load_module(
-    "vllm_omni.utils.enums",
-    _UTILS_DIR / "enums.py",
-)
 _om_mod = _load_module(
     "vllm_omni.outputs.output_modality",
     _OUTPUTS_DIR / "output_modality.py",
