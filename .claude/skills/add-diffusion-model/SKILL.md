@@ -418,7 +418,8 @@ def enable_cache_for_your_model(pipeline, cache_config):
 
 #### 9d. Register the custom enabler
 
-Add your enabler to `CUSTOM_DIT_ENABLERS` in `vllm_omni/diffusion/cache/cache_dit_backend.py`:
+Add your enabler to `CUSTOM_DIT_ENABLERS` in
+`vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
 CUSTOM_DIT_ENABLERS = {
