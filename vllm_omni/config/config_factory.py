@@ -310,9 +310,14 @@ class StageConfigFactory:
 
         registry_cli_overrides = {
             **cli_overrides,
-            "trust_remote_code": trust_remote_code,
             "model": model,
         }
+        # Opt-in semantics: never let an unset/False trust_remote_code become
+        # an explicit stage override that clobbers the deploy yaml's value.
+        if trust_remote_code:
+            registry_cli_overrides["trust_remote_code"] = True
+        elif not registry_cli_overrides.get("trust_remote_code"):
+            registry_cli_overrides.pop("trust_remote_code", None)
         return VllmOmniConfig.from_pipeline_config(
             pipeline_cfg,
             user_deploy_config=user_deploy_config,
@@ -346,10 +351,13 @@ class StageConfigFactory:
         if pipeline_cfg is None:
             return None, None
 
-        legacy_cli_overrides = {
-            **cli_overrides,
-            "trust_remote_code": trust_remote_code,
-        }
+        legacy_cli_overrides = dict(cli_overrides)
+        # Opt-in semantics: never let an unset/False trust_remote_code become
+        # an explicit stage override that clobbers the deploy yaml's value.
+        if trust_remote_code:
+            legacy_cli_overrides["trust_remote_code"] = True
+        elif not legacy_cli_overrides.get("trust_remote_code"):
+            legacy_cli_overrides.pop("trust_remote_code", None)
         return cls._create_legacy_from_registry(
             pipeline_cfg,
             legacy_cli_overrides,

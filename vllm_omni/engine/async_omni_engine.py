@@ -288,7 +288,15 @@ class AsyncOmniEngine:
             deploy_config_path=deploy_config_path,
         )
 
-        kwargs["trust_remote_code"] = trust_remote_code
+        # trust_remote_code is opt-in and the serve CLI flag is store_true, so
+        # a False here cannot be distinguished from "not specified". Only a
+        # truthy value becomes a stage override; otherwise the deploy yaml's
+        # per-stage trust_remote_code stays in effect (a coerced False used to
+        # clobber it and broke every remote-code model on the offline path).
+        if trust_remote_code:
+            kwargs["trust_remote_code"] = True
+        else:
+            kwargs.pop("trust_remote_code", None)
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
