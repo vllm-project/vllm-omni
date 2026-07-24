@@ -43,7 +43,7 @@ class LTXForwardContext:
     padded_audio_num_frames: int
     timesteps: torch.Tensor
     audio_scheduler: Any
-    video_audio_scheduler: Any
+    video_audio_step_adapter: Any
 
     @property
     def batch_size(self) -> int:
@@ -125,58 +125,52 @@ def calculate_shift(
     return image_seq_len * slope + intercept
 
 
-class VideoAudioScheduler:
-    """Composite scheduler dispatching video and audio updates."""
+class LTXVideoAudioStepAdapter:
+    """Expose the shared LTX Euler update through the distributed scheduler API."""
 
-    def __init__(self, video_scheduler, audio_scheduler):
-        self.video_scheduler = video_scheduler
-        self.audio_scheduler = audio_scheduler
-
-    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self.video_scheduler.step(
-            noise_pred[0],
-            t[0],
-            latents[0],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
-            latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        return ((video_out, audio_out),)
-
-
-class I2VVideoAudioScheduler:
-    """Update the unconditioned video frames and the full audio state."""
-
-    def __init__(self, pipeline, audio_scheduler, latent_num_frames, latent_height, latent_width):
-        self.video_scheduler = pipeline.scheduler
-        self.audio_scheduler = audio_scheduler
+    def __init__(
+        self,
+        pipeline: Any,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+        *,
+        image_conditioned: bool,
+    ) -> None:
         self._pipeline = pipeline
+        self._audio_scheduler = audio_scheduler
         self._latent_num_frames = latent_num_frames
         self._latent_height = latent_height
         self._latent_width = latent_width
+        self._image_conditioned = image_conditioned
+        self._step_index = 0
 
     def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self._pipeline._step_video_latents_i2v(
-            noise_pred[0],
-            latents[0],
-            t[0],
-            self._latent_num_frames,
-            self._latent_height,
-            self._latent_width,
-        )
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
+        del t, return_dict, generator
+        if self._image_conditioned:
+            video_out = self._pipeline._step_video_latents_i2v(
+                noise_pred[0],
+                latents[0],
+                self._step_index,
+                self._latent_num_frames,
+                self._latent_height,
+                self._latent_width,
+            )
+        else:
+            video_out = euler_step_from_velocity(
+                latents[0],
+                noise_pred[0],
+                self._pipeline.scheduler.sigmas,
+                self._step_index,
+            )
+        audio_out = euler_step_from_velocity(
             latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
+            noise_pred[1],
+            self._audio_scheduler.sigmas,
+            self._step_index,
+        )
+        self._step_index += 1
         return ((video_out, audio_out),)
 
 
@@ -234,7 +228,8 @@ def prepare_scheduler_stage(
         raise ValueError("Only one of `sigmas` or `timesteps` may be provided.")
 
     audio_scheduler = copy.deepcopy(pipeline.scheduler)
-    video_audio_scheduler = pipeline._make_video_audio_scheduler(
+    video_audio_step_adapter = LTXVideoAudioStepAdapter(
+        pipeline,
         audio_scheduler,
         latent_num_frames,
         latent_height,
@@ -249,13 +244,13 @@ def prepare_scheduler_stage(
             scheduler_sigmas = torch.cat([scheduler_sigmas, scheduler_sigmas.new_zeros(1)])
         timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
-        return audio_scheduler, video_audio_scheduler, timesteps_tensor
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
     if sigmas is None and timesteps is None and use_official_sigma_schedule:
         scheduler_sigmas = _official_ltx_sigmas(pipeline.scheduler, request_inputs.num_inference_steps, device)
         timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
-        return audio_scheduler, video_audio_scheduler, timesteps_tensor
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
     mu = calculate_shift(
         pipeline.scheduler.config.get("max_image_seq_len", 4096),
@@ -280,7 +275,7 @@ def prepare_scheduler_stage(
         sigmas=sigmas,
         mu=mu,
     )
-    return audio_scheduler, video_audio_scheduler, timesteps_tensor
+    return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
 
 def prepare_rope_coords_stage(
@@ -355,31 +350,14 @@ def step_denoised_latents(
     noise_pred_video: torch.Tensor,
     noise_pred_audio: torch.Tensor,
     timestep: torch.Tensor,
-    index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if denoise_ctx.conditioning_mask is not None or forward_ctx.cfg_parallel_ready:
-        latents = pipeline.scheduler_step_maybe_with_cfg(
-            (noise_pred_video, noise_pred_audio),
-            (timestep, timestep),
-            (denoise_ctx.latents, denoise_ctx.audio_latents),
-            do_true_cfg=pipeline.do_classifier_free_guidance,
-            per_request_scheduler=forward_ctx.video_audio_scheduler,
-        )
-    else:
-        latents = (
-            euler_step_from_velocity(
-                denoise_ctx.latents,
-                noise_pred_video,
-                pipeline.scheduler.sigmas,
-                index,
-            ),
-            euler_step_from_velocity(
-                denoise_ctx.audio_latents,
-                noise_pred_audio,
-                forward_ctx.audio_scheduler.sigmas,
-                index,
-            ),
-        )
+    latents = pipeline.scheduler_step_maybe_with_cfg(
+        (noise_pred_video, noise_pred_audio),
+        (timestep, timestep),
+        (denoise_ctx.latents, denoise_ctx.audio_latents),
+        do_true_cfg=pipeline.do_classifier_free_guidance,
+        per_request_scheduler=forward_ctx.video_audio_step_adapter,
+    )
     return pipeline._synchronize_cfg_parallel_step_output(
         latents,
         do_true_cfg=pipeline.do_classifier_free_guidance,
@@ -434,7 +412,7 @@ class LTXPhaseExecutor:
                 noise_scale=noise_scale,
             )
         )
-        audio_scheduler, video_audio_scheduler, timesteps_tensor = prepare_scheduler_stage(
+        audio_scheduler, video_audio_step_adapter, timesteps_tensor = prepare_scheduler_stage(
             pipeline,
             request_inputs,
             device=device,
@@ -461,7 +439,7 @@ class LTXPhaseExecutor:
             padded_audio_num_frames=padded_audio_num_frames,
             timesteps=timesteps_tensor,
             audio_scheduler=audio_scheduler,
-            video_audio_scheduler=video_audio_scheduler,
+            video_audio_step_adapter=video_audio_step_adapter,
         )
         video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
         denoise_ctx = LTXDenoiseContext(

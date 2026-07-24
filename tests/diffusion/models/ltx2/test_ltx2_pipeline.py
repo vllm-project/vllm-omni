@@ -842,10 +842,7 @@ def test_ltx_custom_sigmas_bypass_scheduler_shifting():
         max_shift=2.05,
         shift_terminal=0.1,
     )
-    pipeline = SimpleNamespace(
-        scheduler=scheduler,
-        _make_video_audio_scheduler=lambda *args, **kwargs: object(),
-    )
+    pipeline = SimpleNamespace(scheduler=scheduler)
     sigmas = [1.0, 0.75, 0.25, 0.0]
 
     audio_scheduler, _, timesteps = prepare_scheduler_stage(

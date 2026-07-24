@@ -18,7 +18,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
 from . import ltx2_latents as latent_ops
-from .ltx2_denoise import I2VVideoAudioScheduler
+from .ltx2_guidance import euler_step_from_velocity
 
 if TYPE_CHECKING:
     from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
@@ -545,7 +545,7 @@ class LTXI2VConditioningMixin:
         self,
         noise_pred_video: torch.Tensor,
         latents: torch.Tensor,
-        timestep: torch.Tensor,
+        step_index: int,
         latent_num_frames: int,
         latent_height: int,
         latent_width: int,
@@ -568,12 +568,14 @@ class LTXI2VConditioningMixin:
         )
         noise_pred_video = noise_pred_video[:, :, 1:]
         noise_latents = latents_unpacked[:, :, 1:]
-        pred_latents = self.scheduler.step(
-            noise_pred_video,
-            timestep,
+        # Official LTX advances the unconditioned frames directly on the
+        # sigma trajectory; the first frame remains fixed conditioning.
+        pred_latents = euler_step_from_velocity(
             noise_latents,
-            return_dict=False,
-        )[0]
+            noise_pred_video,
+            self.scheduler.sigmas,
+            step_index,
+        )
         latents_unpacked = torch.cat([latents_unpacked[:, :, :1], pred_latents], dim=2)
         return latent_ops.pack_latents(
             latents_unpacked,
@@ -640,31 +642,6 @@ class LTXI2VConditioningMixin:
             latents=request_inputs.latents,
         )
 
-    def _make_video_audio_scheduler(
-        self,
-        audio_scheduler: Any,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-        *,
-        image_conditioned: bool = False,
-    ) -> Any:
-        if not image_conditioned and self.unified_text_image_entry:
-            return super()._make_video_audio_scheduler(
-                audio_scheduler,
-                latent_num_frames,
-                latent_height,
-                latent_width,
-                image_conditioned=False,
-            )
-        return I2VVideoAudioScheduler(
-            self,
-            audio_scheduler,
-            latent_num_frames,
-            latent_height,
-            latent_width,
-        )
-
     def _prepare_denoise_context_for_cfg(
         self,
         forward_ctx: LTXForwardContext,
@@ -724,3 +701,16 @@ class LTXI2VConditioningMixin:
             timestep=ts.reshape(-1, 1) * (1 - conditioning_mask),
         )
         return kwargs
+
+    def _video_guidance_model_sigma(
+        self,
+        sigma: torch.Tensor,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> torch.Tensor:
+        if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return super()._video_guidance_model_sigma(sigma, denoise_ctx)
+            raise ValueError("LTX I2V guidance requires a conditioning mask.")
+        # The conditioned tokens are evaluated at timestep zero by the model,
+        # so velocity-to-x0 guidance must use that same per-token sigma.
+        return sigma.reshape(-1, 1, 1) * (1 - denoise_ctx.conditioning_mask).unsqueeze(-1)

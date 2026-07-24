@@ -37,7 +37,6 @@ from .ltx2_denoise import (
     LTXForwardContext,
     LTXPhaseExecutor,
     LTXPhaseResult,
-    VideoAudioScheduler,
     build_transformer_kwargs,
     step_denoised_latents,
 )
@@ -594,18 +593,6 @@ class LTXRuntime(
         padded_length = latent_ops.get_sp_padded_audio_latent_length(requested_length, int(sp_size))
         return requested_length if provided_length in {requested_length, padded_length} else provided_length
 
-    def _make_video_audio_scheduler(
-        self,
-        audio_scheduler: Any,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-        *,
-        image_conditioned: bool = False,
-    ) -> Any:
-        del latent_num_frames, latent_height, latent_width, image_conditioned
-        return VideoAudioScheduler(self.scheduler, audio_scheduler)
-
     def _prepare_denoise_context_for_cfg(
         self,
         forward_ctx: LTXForwardContext,
@@ -628,6 +615,15 @@ class LTXRuntime(
     ) -> dict[str, torch.Tensor]:
         del forward_ctx, denoise_ctx
         return self.guidance_executor.timestep_kwargs(ts, video_token_count, audio_token_count)
+
+    def _video_guidance_model_sigma(
+        self,
+        sigma: torch.Tensor,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> torch.Tensor:
+        """Return the video timestep used to convert velocity predictions to x0."""
+        del denoise_ctx
+        return sigma
 
     def _build_transformer_kwargs(
         self,
@@ -699,7 +695,6 @@ class LTXRuntime(
             noise_pred_video,
             noise_pred_audio,
             timestep,
-            index,
         )
         return latent_ops.LTXAVState(video=video, audio=audio)
 

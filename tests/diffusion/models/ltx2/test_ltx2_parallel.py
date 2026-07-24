@@ -183,7 +183,7 @@ class TestCFGParallelForwardPath:
         ("frame_rate_input", "audio_sampling_rate", "expected_frame_rate"),
         [(1.0, 1, 1.0), (None, 24, 24.0)],
     )
-    def test_forward_cfg_parallel_steps_video_and_audio_scheduler(
+    def test_forward_cfg_parallel_uses_shared_video_audio_euler_step(
         self,
         monkeypatch,
         cfg_rank,
@@ -372,19 +372,15 @@ class TestCFGParallelForwardPath:
             pipe.scheduler.sigmas[0],
             7.0,
         )
-        scheduler_call_names = [call[0] for call in pipe.scheduler.calls]
-        assert scheduler_call_names == ["video", "audio", "video", "audio"]
+        assert pipe.scheduler.calls == []
         assert len(pipe.transformer.calls) == 2
-        torch.testing.assert_close(pipe.scheduler.calls[0][1], expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[1][1], expected_audio_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[2][1], expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[3][1], expected_audio_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[2][3], video_latents - expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[3][3], audio_latents - expected_audio_noise)
 
         video_out, audio_out = output.output
-        torch.testing.assert_close(video_out, (video_latents - 2 * expected_video_noise).reshape(1, 2, 1, 1, 1))
-        torch.testing.assert_close(audio_out, (audio_latents - 2 * expected_audio_noise).reshape(1, 1, 1, 2))
+        sigma_delta = pipe.scheduler.sigmas[-1] - pipe.scheduler.sigmas[0]
+        expected_video = video_latents + expected_video_noise * sigma_delta
+        expected_audio = audio_latents + expected_audio_noise * sigma_delta
+        torch.testing.assert_close(video_out, expected_video.reshape(1, 2, 1, 1, 1))
+        torch.testing.assert_close(audio_out, expected_audio.reshape(1, 1, 1, 2))
 
         # fps regression guard: an omitted request fps (frame_rate_input=None) must resolve
         # to the model's own 24.0 default, not crash on None; a provided rate is passed through.

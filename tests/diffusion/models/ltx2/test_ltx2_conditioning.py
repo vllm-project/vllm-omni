@@ -281,8 +281,7 @@ class TestLTXImageToVideoConditioning:
         pipe.transformer_temporal_patch_size = 1
 
         class FakeScheduler:
-            def step(self, noise_pred, t, latents, return_dict=False):
-                return (latents + noise_pred + t,)
+            sigmas = torch.tensor([1.0, 0.5])
 
         pipe.scheduler = FakeScheduler()
         latents = torch.tensor([[[1.0], [2.0], [3.0]]])
@@ -291,11 +290,103 @@ class TestLTXImageToVideoConditioning:
         out = pipe._step_video_latents_i2v(
             noise_pred,
             latents,
-            torch.tensor(0.5),
+            0,
             latent_num_frames=3,
             latent_height=1,
             latent_width=1,
         )
 
         torch.testing.assert_close(out[:, :1], latents[:, :1])
-        torch.testing.assert_close(out[:, 1:], latents[:, 1:] + noise_pred[:, 1:] + 0.5)
+        torch.testing.assert_close(out[:, 1:], latents[:, 1:] - 0.5 * noise_pred[:, 1:])
+
+    def test_shared_step_adapter_uses_official_euler_for_t2v(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXVideoAudioStepAdapter
+
+        pipeline = SimpleNamespace(scheduler=SimpleNamespace(sigmas=torch.tensor([1.0, 0.5])))
+        adapter = LTXVideoAudioStepAdapter(
+            pipeline,
+            SimpleNamespace(sigmas=torch.tensor([1.0, 0.25])),
+            latent_num_frames=1,
+            latent_height=1,
+            latent_width=1,
+            image_conditioned=False,
+        )
+        video = torch.tensor([[[2.0]]])
+        audio = torch.tensor([[[4.0]]])
+
+        ((video, audio),) = adapter.step(
+            (torch.tensor([[[2.0]]]), torch.tensor([[[4.0]]])),
+            (torch.tensor(1.0), torch.tensor(1.0)),
+            (video, audio),
+        )
+
+        torch.testing.assert_close(video, torch.tensor([[[1.0]]]))
+        torch.testing.assert_close(audio, torch.tensor([[[1.0]]]))
+
+    def test_shared_step_adapter_uses_official_euler_for_i2v_audio(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXVideoAudioStepAdapter
+
+        class FakePipeline:
+            scheduler = object()
+
+            def __init__(self):
+                self.step_indices = []
+
+            def _step_video_latents_i2v(
+                self,
+                noise_pred,
+                latents,
+                step_index,
+                latent_num_frames,
+                latent_height,
+                latent_width,
+            ):
+                del noise_pred, latent_num_frames, latent_height, latent_width
+                self.step_indices.append(step_index)
+                return latents
+
+        pipeline = FakePipeline()
+        adapter = LTXVideoAudioStepAdapter(
+            pipeline,
+            SimpleNamespace(sigmas=torch.tensor([1.0, 0.5, 0.0])),
+            latent_num_frames=1,
+            latent_height=1,
+            latent_width=1,
+            image_conditioned=True,
+        )
+        video = torch.tensor([[[1.0]]])
+        audio = torch.tensor([[[2.0]]])
+        video_velocity = torch.zeros_like(video)
+        audio_velocity = torch.tensor([[[4.0]]])
+
+        ((video, audio),) = adapter.step(
+            (video_velocity, audio_velocity),
+            (torch.tensor(1.0), torch.tensor(1.0)),
+            (video, audio),
+        )
+        torch.testing.assert_close(audio, torch.tensor([[[0.0]]]))
+
+        ((video, audio),) = adapter.step(
+            (video_velocity, audio_velocity),
+            (torch.tensor(0.5), torch.tensor(0.5)),
+            (video, audio),
+        )
+        torch.testing.assert_close(audio, torch.tensor([[[-2.0]]]))
+        assert pipeline.step_indices == [0, 1]
+
+    def test_i2v_guidance_uses_zero_sigma_for_conditioned_tokens(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseContext
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        denoise_ctx = LTXDenoiseContext(
+            latents=torch.empty(1, 3, 1),
+            audio_latents=torch.empty(1, 1, 1),
+            video_coords=torch.empty(1),
+            audio_coords=torch.empty(1),
+            conditioning_mask=torch.tensor([[1.0, 0.0, 0.0]]),
+        )
+
+        actual = pipe._video_guidance_model_sigma(torch.tensor(0.75), denoise_ctx)
+
+        torch.testing.assert_close(actual, torch.tensor([[[0.0], [0.75], [0.75]]]))

@@ -251,11 +251,14 @@ class LTXGuidanceExecutor:
         negative_velocity: torch.Tensor,
         sigma: torch.Tensor,
         guidance_scale: float,
+        *,
+        model_sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         guidance = LTXModalityGuidance(cfg_scale=guidance_scale)
+        model_sigma = sigma if model_sigma is None else model_sigma
         guided_x0 = combine_guided_x0(
-            cond=x0_from_velocity(sample, positive_velocity, sigma),
-            uncond_text=x0_from_velocity(sample, negative_velocity, sigma),
+            cond=x0_from_velocity(sample, positive_velocity, model_sigma),
+            uncond_text=x0_from_velocity(sample, negative_velocity, model_sigma),
             uncond_perturbed=0.0,
             uncond_modality=0.0,
             guidance=guidance,
@@ -304,13 +307,15 @@ class LTXGuidanceExecutor:
         group = get_cfg_group()
         video = group.all_gather(local_video, separate_tensors=True)
         audio = group.all_gather(local_audio, separate_tensors=True)
+        video_sigma = pipeline.scheduler.sigmas[index]
         return (
             self.combine_cfg_velocity(
                 state.video,
                 video[0],
                 video[1],
-                pipeline.scheduler.sigmas[index],
+                video_sigma,
                 plan.spec.video.cfg_scale,
+                model_sigma=pipeline._video_guidance_model_sigma(video_sigma, denoise_ctx),
             ),
             self.combine_cfg_velocity(
                 state.audio,
@@ -382,8 +387,11 @@ class LTXGuidanceExecutor:
             splits: dict[str, torch.Tensor],
             sigma: torch.Tensor,
             guidance: LTXModalityGuidance,
+            *,
+            model_sigma: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            x0 = {name: x0_from_velocity(sample, value, sigma) for name, value in splits.items()}
+            model_sigma = sigma if model_sigma is None else model_sigma
+            x0 = {name: x0_from_velocity(sample, value, model_sigma) for name, value in splits.items()}
             guided = combine_guided_x0(
                 cond=x0["cond"],
                 uncond_text=x0.get("uncond", 0.0),
@@ -394,7 +402,16 @@ class LTXGuidanceExecutor:
             return velocity_from_x0(sample, guided, sigma)
 
         return (
-            guide_modality(state.video, video_splits, pipeline.scheduler.sigmas[index], plan.spec.video),
+            guide_modality(
+                state.video,
+                video_splits,
+                pipeline.scheduler.sigmas[index],
+                plan.spec.video,
+                model_sigma=pipeline._video_guidance_model_sigma(
+                    pipeline.scheduler.sigmas[index],
+                    denoise_ctx,
+                ),
+            ),
             guide_modality(
                 state.audio,
                 audio_splits,
