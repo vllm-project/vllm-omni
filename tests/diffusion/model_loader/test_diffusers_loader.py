@@ -11,13 +11,13 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm.config.load import LoadConfig
-from vllm_omni.transformers_utils.repo_utils import hf_api
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

@@ -14,6 +14,7 @@ else:
     def snapshot_download(*args, **kwargs):
         return hf_api().snapshot_download(*args, **kwargs)
 
+
 logger = init_logger(__name__)
 
 

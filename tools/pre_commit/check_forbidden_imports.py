@@ -31,10 +31,7 @@ CHECK_IMPORTS = {
             r"^\s*(import\s+(pickle|cloudpickle)(\s|$|\sas)"
             r"|from\s+(pickle|cloudpickle)\s+import\b)"
         ),
-        tip=(
-            "Avoid using pickle or cloudpickle or add this file to "
-            "tools/pre_commit/check_forbidden_imports.py."
-        ),
+        tip=("Avoid using pickle or cloudpickle or add this file to tools/pre_commit/check_forbidden_imports.py."),
         allowed_files={
             "tests/helpers/process.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
@@ -118,9 +115,7 @@ def test_regex():
     pickle_pattern = re.compile(CHECK_IMPORTS["pickle/cloudpickle"].pattern)
     for i, (line, should_match) in enumerate(pickle_cases):
         result = bool(pickle_pattern.match(line))
-        assert result == should_match, (
-            f"pickle case {i} failed: '{line}' (expected {should_match}, got {result})"
-        )
+        assert result == should_match, f"pickle case {i} failed: '{line}' (expected {should_match}, got {result})"
 
     hf_cases = [
         # Should match
@@ -146,8 +141,7 @@ def test_regex():
     for i, (line, should_match) in enumerate(hf_cases):
         result = bool(hf_pattern.search(line))
         assert result == should_match, (
-            f"huggingface_hub case {i} failed: '{line}' "
-            f"(expected {should_match}, got {result})"
+            f"huggingface_hub case {i} failed: '{line}' (expected {should_match}, got {result})"
         )
 
     print("All regex tests passed.")
