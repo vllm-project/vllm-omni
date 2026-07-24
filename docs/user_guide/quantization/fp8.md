@@ -84,7 +84,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
 |-------|-----------|:-------:|:------:|----------------|------------------|------------------|
-| Stable Diffusion 3.5 | `stabilityai/stable-diffusion-3.5-medium` | Yes | Not validated | Transformer-focused online FP8; validate image quality against BF16 before expanding to larger checkpoints | None | |
+| Stable Diffusion 3.5 | `stabilityai/stable-diffusion-3.5-medium` | Yes | Not validated | Use tuned online FP8 for `stable-diffusion-3.5-medium`; keep quality-sensitive endpoint and FFN output layers in BF16. Full FP8 still needs additional quality validation. | `proj_out`, `context_embedder`, `transformer_blocks.*.ff.net.2`, `transformer_blocks.*.ff_context.net.2` | |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
@@ -170,4 +170,8 @@ omni = Omni(
 
 Compare generated outputs with a BF16 baseline before adding a new model to the
 supported table. GLM-Image and Helios are not listed as FP8-supported diffusion
-models until they have method-specific validation.
+models until they have method-specific validation. For Stable Diffusion 3.5
+medium, the validated online FP8 setup keeps `proj_out`, `context_embedder`,
+`transformer_blocks.*.ff.net.2`, and
+`transformer_blocks.*.ff_context.net.2` in BF16; full-model FP8 remains a
+separate validation target.

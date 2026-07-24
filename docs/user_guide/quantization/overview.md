@@ -38,7 +38,7 @@ otherwise.
 
 | Method | Guide | Mode | Example models | Status |
 |--------|-------|------|----------------|--------|
-| FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Stable Diffusion 3.5 medium; Wan2.2 is not validated | Validated for Qwen-Image family, Stable Diffusion 3.5 medium, and other DiT models |
+| FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Stable Diffusion 3.5 medium; Wan2.2 is not validated | Validated for Qwen-Image family and Stable Diffusion 3.5 medium with model-specific `ignored_layers`; Wan2.2 still needs model-specific validation |
 | Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
