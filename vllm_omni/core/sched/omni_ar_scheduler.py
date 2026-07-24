@@ -703,10 +703,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         if outstanding_async_tokens > 0:
-            # Async scheduling may already have sampled the previous
-            # segment's next token. Drop that late token instead of
-            # appending it to the new streaming segment.
-            session.async_tokens_to_discard = 1
+            # Async scheduling may already have sampled tokens for the previous
+            # segment. Drop those late tokens instead of appending them to the
+            # new streaming segment.
+            session.async_tokens_to_discard = outstanding_async_tokens
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []

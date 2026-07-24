@@ -187,26 +187,31 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
-def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
+@pytest.mark.parametrize(
+    ("outstanding_async_tokens", "expected_kept_output_tokens"),
+    [(1, [7, 8]), (2, [7])],
+)
+def test_stage0_streaming_update_discards_outstanding_async_placeholder_tokens(
+    outstanding_async_tokens: int, expected_kept_output_tokens: list[int]
+) -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.append_output_token_ids([7, 8, 9])
     session.num_computed_tokens = 6
-    session.num_output_placeholders = 1
-    session.spec_token_ids = [-1]
+    session.num_output_placeholders = outstanding_async_tokens
+    session.spec_token_ids = [-1] * outstanding_async_tokens
 
     sched._update_request_as_session(session, _make_update([10, 20]))
 
-    assert session.async_tokens_to_discard == 1
+    assert session.async_tokens_to_discard == outstanding_async_tokens
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
-    # The async placeholder makes token 9 unconfirmed, so only 7 and 8 are
-    # carried into the next streaming prompt before the new chunk tokens.
-    assert session.prompt_token_ids == [1, 2, 3, 7, 8, 10, 20]
-    assert list(session._all_token_ids) == [1, 2, 3, 7, 8, 10, 20]
+    expected_tokens = [1, 2, 3, *expected_kept_output_tokens, 10, 20]
+    assert session.prompt_token_ids == expected_tokens
+    assert list(session._all_token_ids) == expected_tokens
     assert session._output_token_ids == []
-    assert session.num_prompt_tokens == 7
+    assert session.num_prompt_tokens == len(expected_tokens)
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
