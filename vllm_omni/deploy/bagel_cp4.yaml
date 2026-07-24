@@ -1,0 +1,28 @@
+# BAGEL-7B-MoT single-stage KV-Gather Context Parallel example.
+pipeline: bagel_single_stage
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0,1,2,3"
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 4
+      ulysses_degree: 1
+      ring_degree: 1
+      context_parallel_degree: 4
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    default_sampling_params:
+      seed: 52

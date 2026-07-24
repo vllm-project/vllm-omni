@@ -6,6 +6,7 @@ from __future__ import annotations
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention, ParallelAttentionStrategy
+from vllm_omni.diffusion.attention.parallel.context_parallel import ContextParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
@@ -36,6 +37,7 @@ def build_parallel_attention_strategy(
 
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
+    context_parallel_degree = getattr(p, "context_parallel_degree", 1)
 
     try:
         sp_group = get_sp_group()
@@ -44,12 +46,20 @@ def build_parallel_attention_strategy(
             return NoParallelAttention()
     except Exception as e:
         # Log warning if SP is configured but group is not available
-        if ulysses_degree > 1 or ring_degree > 1:
+        if ulysses_degree > 1 or ring_degree > 1 or context_parallel_degree > 1:
             logger.warning(
-                f"SP configured (ulysses={ulysses_degree}, ring={ring_degree}) but SP group not available: {e}. "
+                f"SP configured (ulysses={ulysses_degree}, ring={ring_degree}, "
+                f"context_parallel={context_parallel_degree}) but SP group not available: {e}. "
                 f"Falling back to NoParallelAttention. This may cause incorrect results."
             )
         return NoParallelAttention()
+
+    if context_parallel_degree > 1:
+        logger.debug(
+            "Using ContextParallelAttention (context_parallel_degree=%d)",
+            context_parallel_degree,
+        )
+        return ContextParallelAttention(sp_group=sp_group)
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:

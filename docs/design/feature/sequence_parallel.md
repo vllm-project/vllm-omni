@@ -45,6 +45,58 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### KV-Gather Context Parallel
+
+KV-Gather CP is a third attention communication strategy under the SP
+umbrella, alongside Ulysses and Ring:
+
+- Ulysses exchanges Q/K/V with All-to-All and reverses the exchange for output.
+- Ring keeps Q local and circulates K/V blocks.
+- KV-Gather CP keeps Q local and All-Gathers K/V once per attention layer.
+
+Ring attention uses online softmax to merge successive K/V blocks while those
+blocks circulate; its running maximum, exponential sum, and output accumulator
+remain on the rank that owns Q. KV-Gather starts from the same local-Q
+decomposition but materializes full K/V with one collective, then invokes a
+regular attention backend. Every local query sees the same global K/V in both
+strategies, although different reduction orders need not be bitwise identical.
+
+For GQA models such as BAGEL (`Hq=28`, `Hkv=4`), CP removes Q and output
+communication from the attention strategy and communicates only the smaller
+K/V tensors. The tradeoff is that every rank stores full-sequence K/V.
+
+Let `P` be the parallel degree and `R = Hq / Hkv`. For equal sequence shards,
+the per-rank communication-volume ratio to Ulysses is:
+
+```text
+V_CP / V_Ulysses = P / (R + 1)
+```
+
+This counts the K/V All-Gather for CP and the Q/K/V forward plus output reverse
+All-to-All for Ulysses, while ignoring collective implementation overhead. For
+BAGEL CP4, `P=4` and `R=7`, so KV-Gather communicates half as many bytes as
+Ulysses. CP communicates less when `P < R+1`.
+
+The BAGEL fast path splits the generation-expert projection and schedules it
+as K projection → asynchronous K All-Gather → V projection → asynchronous V
+All-Gather → Q projection. K communication overlaps V/Q projection and V
+communication overlaps Q projection. Communication leaves the critical path
+only when those compute windows cover the collective latency. Prompt prefill
+continues to use the frozen text expert and is not part of this denoising-only
+overlap.
+
+The initial BAGEL CP path uses SDPA for numerical alignment. Although dense
+FlashAttention accepts asymmetric Q/K lengths, its small reduction-order
+differences compound across the denoise trajectory. A CP-specific stable Flash
+kernel remains follow-up work.
+
+The first implementation uses `context_parallel_degree`, requires equal
+unmasked sequence shards, and is mutually exclusive with Ulysses/Ring. Full K/V
+must fit on every rank, and quantized QKV implementations need independent
+projection slices to use the overlap fast path. Its communication group is the
+existing outer SP `device_group`; it does not create a duplicate CP process
+group.
+
 ---
 
 ## UAA Mode (Experimental)

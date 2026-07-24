@@ -23,6 +23,7 @@ See supported models list in [Diffusion Features - Supported Models](../../diffu
 - **DeepSpeed Ulysses Sequence Parallel (Ulysses-SP)** ([paper](https://arxiv.org/pdf/2309.14509)): Uses all-to-all communication for subset of attention heads per device
 - **Ring-Attention** ([paper](https://arxiv.org/abs/2310.01889)): Uses ring-based P2P communication with sharded sequence dimension throughout
 - **Hybrid Ulysses + Ring**: Combines both for larger scale parallelism (`ulysses_degree × ring_degree`)
+- **KV-Gather Context Parallel (CP)**: Keeps Q sequence-sharded and all-gathers only K/V. This is especially useful for GQA denoisers where K/V have substantially fewer heads than Q.
 
 ---
 
@@ -84,6 +85,28 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)  # 4 GPUs total
 )
 ```
+
+**KV-Gather Context Parallel** (BAGEL first):
+
+```python
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    parallel_config=DiffusionParallelConfig(context_parallel_degree=4),
+)
+```
+
+CP trades replicated full-sequence K/V memory for lower communication volume. In
+the first implementation it is mutually exclusive with Ulysses and Ring. For
+parallel degree `P` and GQA head ratio `R = Hq / Hkv`, its per-rank
+communication volume relative to Ulysses is `P / (R + 1)` (ignoring collective
+implementation overhead). BAGEL has `R=7`, so CP4 communicates half as many
+bytes as Ulysses-SP 4.
+
+The BAGEL fast path launches asynchronous K/V All-Gathers between independent
+K, V, and Q projections. The communication can be fully hidden when the V/Q
+projection window covers the collective latency. Full K/V must fit on each
+rank, sequence shards must be equal and unmasked, and quantized QKV projections
+must expose independent projection slices to use this overlap path.
 
 ---
 
@@ -153,6 +176,15 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 ```
 
+**KV-Gather Context Parallel:**
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --cp 4
+```
+
+`VLLM_OMNI_CP_DEGREE=4` supplies the CP default when neither YAML nor CLI sets
+`context_parallel_degree`.
+
 ---
 
 ## Configuration Parameters
@@ -163,10 +195,12 @@ In `DiffusionParallelConfig`:
 |-----------|------|---------|-------------|
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
+| `context_parallel_degree` | int | 1 | Number of GPUs for KV-Gather CP. Q remains local; K/V are all-gathered. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 
 **Notes:**
-- Total sequence parallel size equals to `ulysses_degree × ring_degree`
+- Total sequence parallel size is `ulysses_degree × ring_degree × context_parallel_degree`
+- CP > 1 currently requires `ulysses_degree=1` and `ring_degree=1`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 
 

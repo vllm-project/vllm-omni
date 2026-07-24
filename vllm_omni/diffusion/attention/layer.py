@@ -272,6 +272,11 @@ class Attention(nn.Module):
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:
             out = self._run_ring_attention(query, key, value, attn_metadata)
+        elif strategy.name == "context_parallel":
+            # BAGEL's denoise trajectory is highly sensitive to the small
+            # reduction-order differences of asymmetric-Q/K FlashAttention.
+            # SDPA preserves alignment with the established UP reference.
+            out = self.sdpa_fallback.forward(query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)
 

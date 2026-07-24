@@ -34,6 +34,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _default_context_parallel_degree() -> int:
+    from vllm_omni.diffusion import envs
+
+    return envs.VLLM_OMNI_CP_DEGREE
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
@@ -156,13 +162,19 @@ class DiffusionParallelConfig:
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
 
     sequence_parallel_size: int | None = None
-    """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
+    """Total SP degree: Ulysses degree × Ring degree × Context Parallel degree."""
 
     ulysses_degree: int = 1
     """Number of GPUs used for ulysses sequence parallelism."""
 
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
+
+    context_parallel_degree: int = field(default_factory=_default_context_parallel_degree)
+    """Number of GPUs used for KV-gather context parallelism.
+
+    The first implementation is mutually exclusive with Ulysses and Ring.
+    """
 
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
@@ -225,6 +237,7 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
+        assert self.context_parallel_degree > 0, "Context parallel degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.cfg_parallel_size in [1, 2, 3], (
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
@@ -234,10 +247,16 @@ class DiffusionParallelConfig:
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
-        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
-            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
-            f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        assert self.sequence_parallel_size == (self.ulysses_degree * self.ring_degree * self.context_parallel_degree), (
+            "Sequence parallel size must equal ulysses_degree * ring_degree * context_parallel_degree, "
+            f"but got {self.sequence_parallel_size} != {self.ulysses_degree} * "
+            f"{self.ring_degree} * {self.context_parallel_degree}"
         )
+        if self.context_parallel_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
+            raise ValueError(
+                "KV-gather context parallelism is mutually exclusive with Ulysses and Ring in the first "
+                "implementation. Set ulysses_degree=1 and ring_degree=1 when context_parallel_degree > 1."
+            )
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
@@ -250,7 +269,7 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.context_parallel_degree
 
         # Calculate world_size from other parallelism dimensions
         other_parallel_world_size = (
@@ -259,6 +278,7 @@ class DiffusionParallelConfig:
             * self.tensor_parallel_size
             * self.ulysses_degree
             * self.ring_degree
+            * self.context_parallel_degree
             * self.cfg_parallel_size
         )
 

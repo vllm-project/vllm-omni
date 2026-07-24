@@ -149,14 +149,19 @@ def _apply_diffusion_parallel_runtime_overrides(
             continue
         if parallel_config_dict is None:
             parallel_config_dict = {}
-        if key in ("ulysses_degree", "ring_degree"):
+        if key in ("ulysses_degree", "ring_degree", "context_parallel_degree"):
             degree_overridden = True
         parallel_config_dict[key] = runtime_overrides.pop(key)
 
     if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+        context_parallel_degree = parallel_config_dict.get("context_parallel_degree")
+        if context_parallel_degree is None:
+            from vllm_omni.diffusion import envs
+
+            context_parallel_degree = envs.VLLM_OMNI_CP_DEGREE
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree * context_parallel_degree
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -366,6 +371,7 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ring_degree: int | None = None
+    context_parallel_degree: int | None = None
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None

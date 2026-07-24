@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -125,6 +126,31 @@ class MoTQKVParallelLinear(QKVParallelLinear):
     # ==================================================================
     #  Forward
     # ==================================================================
+    @property
+    def supports_separate_gen_projection(self) -> bool:
+        weight = self.gen_exp.weight
+        return weight.dtype.is_floating_point and weight.dtype.itemsize >= 2
+
+    def forward_gen_component(self, input_: torch.Tensor, component: str) -> torch.Tensor:
+        """Project one generation-expert Q/K/V component.
+
+        KV-gather context parallelism uses this to overlap K/V collectives with
+        later projections. Quantized packed weights keep using the fused path.
+        """
+        if not self.supports_separate_gen_projection:
+            raise NotImplementedError(
+                "Separate generation Q/K/V projection currently supports BF16/FP16/FP32 weights only."
+            )
+        component_to_index = {"q": 0, "k": 1, "v": 2}
+        if component not in component_to_index:
+            raise ValueError(f"Unknown QKV component {component!r}.")
+        index = component_to_index[component]
+        start = sum(self.output_partition_sizes[:index])
+        end = start + self.output_partition_sizes[index]
+        weight = self.gen_exp.weight[start:end]
+        bias = self.gen_exp.bias[start:end] if self.gen_exp.bias is not None else None
+        return F.linear(input_, weight, bias)
+
     def forward(
         self,
         input_: torch.Tensor,

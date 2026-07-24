@@ -468,17 +468,22 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             sp_config = SequenceParallelConfig(
                 ulysses_degree=od_config.parallel_config.ulysses_degree,
                 ring_degree=od_config.parallel_config.ring_degree,
+                context_parallel_degree=od_config.parallel_config.context_parallel_degree,
             )
 
             # Apply hooks according to the plan
-            mode = (
-                "hybrid"
-                if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-            )
+            if sp_config.context_parallel_degree > 1:
+                mode = "context_parallel"
+            elif sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1:
+                mode = "hybrid"
+            elif sp_config.ulysses_degree > 1:
+                mode = "ulysses"
+            else:
+                mode = "ring"
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, "
+                f"ring={sp_config.ring_degree}, context_parallel={sp_config.context_parallel_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1

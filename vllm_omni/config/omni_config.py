@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -109,6 +110,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     sequence_parallel_size: int
     ulysses_degree: int
     ring_degree: int
+    context_parallel_degree: int
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
@@ -360,6 +362,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
+    context_parallel_degree: int = Field(
+        default_factory=lambda: int(os.environ.get("VLLM_OMNI_CP_DEGREE", "1")),
+        ge=1,
+    )
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
@@ -370,7 +376,9 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
-        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.context_parallel_degree
+        if self.context_parallel_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
+            raise ValueError("context_parallel_degree > 1 is mutually exclusive with Ulysses and Ring")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:

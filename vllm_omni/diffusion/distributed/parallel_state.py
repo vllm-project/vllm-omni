@@ -303,6 +303,14 @@ def get_ring_parallel_rank():
     return get_sp_group().ring_rank
 
 
+def get_context_parallel_world_size():
+    return get_sp_group().context_parallel_world_size
+
+
+def get_context_parallel_rank():
+    return get_sp_group().context_parallel_rank
+
+
 def get_expert_parallel_group_ranks() -> list[list[int]]:
     assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
     assert _EXPERT_PARALLEL_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
@@ -694,6 +702,7 @@ def initialize_model_parallel(
     sequence_parallel_size: int | None = None,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
+    context_parallel_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
@@ -710,7 +719,7 @@ def initialize_model_parallel(
         data_parallel_size: number of data parallelism groups.
         cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
         sequence_parallel_size: number of GPUs used for sequence parallelism.
-            sequence_parallel_size = ulysses_degree * ring_degree
+            sequence_parallel_size = ulysses_degree * ring_degree * context_parallel_degree
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
@@ -749,16 +758,20 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
+    if context_parallel_degree > 1 and (ulysses_degree > 1 or ring_degree > 1):
+        raise ValueError("context_parallel_degree > 1 is mutually exclusive with Ulysses and Ring.")
+
     if sequence_parallel_size is None:
-        sequence_parallel_size = ring_degree * ulysses_degree
+        sequence_parallel_size = ring_degree * ulysses_degree * context_parallel_degree
         logger.info(
-            f"sequence_parallel_size is not provided, using ring_degree * ulysses_degree = {sequence_parallel_size}"
+            "sequence_parallel_size is not provided, using ring_degree * ulysses_degree * "
+            f"context_parallel_degree = {sequence_parallel_size}"
         )
 
-    if sequence_parallel_size != ring_degree * ulysses_degree:
+    if sequence_parallel_size != ring_degree * ulysses_degree * context_parallel_degree:
         raise ValueError(
-            "sequence_parallel_size is not equal to ring_degree * ulysses_degree,"
-            f" but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree}"
+            "sequence_parallel_size is not equal to ring_degree * ulysses_degree * context_parallel_degree, "
+            f"but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree} * {context_parallel_degree}"
         )
 
     dit_parallel_size = (
@@ -835,12 +848,14 @@ def initialize_model_parallel(
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
+    subgroup_ulysses_degree = 1 if context_parallel_degree > 1 else ulysses_degree
+    subgroup_ring_degree = 1 if context_parallel_degree > 1 else ring_degree
     ulysses_pg, ring_pg = set_seq_parallel_pg(
-        sp_ulysses_degree=ulysses_degree,
-        sp_ring_degree=ring_degree,
+        sp_ulysses_degree=subgroup_ulysses_degree,
+        sp_ring_degree=subgroup_ring_degree,
         rank=get_world_group().rank_in_group,
         world_size=dit_parallel_size,
-        sp_group_ranks=sp_group_ranks,
+        sp_group_ranks=None if context_parallel_degree > 1 else sp_group_ranks,
     )
     _SP = init_model_parallel_group(
         group_ranks=sp_group_ranks,
@@ -849,6 +864,7 @@ def initialize_model_parallel(
         parallel_mode="sequence",
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
+        context_parallel_degree=context_parallel_degree,
     )
     if use_moe_parallel_mapping:
         # Diffusion normally uses its own SP group. Map it to vLLM PCP only for

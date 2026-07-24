@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_CP_DEGREE: int = 1
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -25,6 +26,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Default degree for KV-gather context parallelism. Explicit CLI/YAML
+    # configuration is passed to DiffusionParallelConfig and therefore wins.
+    "VLLM_OMNI_CP_DEGREE": lambda: int(os.environ.get("VLLM_OMNI_CP_DEGREE", "1")),
 }
 
 

@@ -119,6 +119,24 @@ class MoTRowParallelLinear(RowParallelLinear):
     # ==================================================================
     #  Forward
     # ==================================================================
+    def forward_gen(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Generation-only projection without token routing."""
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.gen_exp.bias
+        output_parallel = self.quant_method.apply(self.gen_exp, input_parallel, bias)
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+        if not self.return_bias:
+            return output
+        return output, self.gen_exp.bias if self.skip_bias_add else None
+
     def forward(
         self,
         input_: torch.Tensor,

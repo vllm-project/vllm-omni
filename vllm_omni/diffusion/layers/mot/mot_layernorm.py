@@ -85,6 +85,12 @@ class MoTRMSNorm(CustomOp):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def forward_gen(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize generation-only tokens without MoT routing overhead."""
+        if x.is_cuda:
+            return ir.ops.rms_norm(x, self.gen_weight.data, self.variance_epsilon)
+        return self._rms_norm_native(x, self.gen_weight)
+
     def _rms_norm_native(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.float()
