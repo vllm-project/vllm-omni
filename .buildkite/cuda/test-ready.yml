@@ -3,16 +3,12 @@ env:
   VLLM_USE_FLASHINFER_MOE_FP16: 0
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 60
-  # Prefer Buildkite checkout (k8s: /workspace/build/buildkite). Keep /workdir
-  # (docker plugin) and APP_DIR as fallbacks. $$ = expand at job runtime, not upload.
-  PYTHONPATH: "$$BUILDKITE_BUILD_CHECKOUT_PATH:/workdir:/workspace/vllm-omni"
 
 steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      # H100 + k8s (same pool/plugin as failing nightly jobs); compare PYTHONPATH vs
-      # editable-only find_spec off-repo-cwd (#5364).
+      # H100 + k8s: editable APP_DIR is /opt/vllm-omni (outside workspace mount) (#5364).
       - label: "Simple · vllm_omni import diag"
         commands:
           - |
@@ -27,6 +23,8 @@ steps:
             from pathlib import Path
 
             candidates = [
+                "/opt/vllm-omni",
+                "/opt/vllm-omni/vllm_omni",
                 "/workspace/vllm-omni",
                 "/workspace/vllm-omni/vllm_omni",
                 "/workspace/build/buildkite",
@@ -117,12 +115,12 @@ steps:
 
             if spec is None:
                 raise SystemExit("find_spec(vllm_omni) is None in the main process")
-            if rc_with != 0:
+            if rc_without != 0:
                 raise SystemExit(
-                    "find_spec(vllm_omni) failed in non-repo-cwd subprocess with PYTHONPATH"
+                    "find_spec(vllm_omni) failed off-repo-cwd without PYTHONPATH "
+                    "(editable APP_DIR=/opt/vllm-omni should work)"
                 )
-            # Do not fail the step on editable-only failure: keep collecting signal.
-            print("diag ok (PYTHONPATH path verified; see editable_only above)")
+            print("diag ok (editable /opt/vllm-omni verified)")
             PY
         agents:
           queue: "mithril-h100-pool"
