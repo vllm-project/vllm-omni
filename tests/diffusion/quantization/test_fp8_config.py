@@ -73,6 +73,30 @@ def test_build_quant_config_modelopt_fp8_config_json():
     assert config.is_checkpoint_fp8_serialized
 
 
+def test_build_quant_config_modelopt_w4a16_nvfp4_config_json():
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+    )
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config(
+        {
+            "producer": {"name": "modelopt"},
+            "quantization": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16,
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+            },
+        }
+    )
+
+    assert isinstance(config, ModelOptNvFp4Config)
+    assert config.get_name() == "modelopt_fp4"
+    assert config.quant_method == "W4A16_NVFP4"
+
+
 def test_build_quant_config_per_component():
     from vllm_omni.quantization import ComponentQuantizationConfig, build_quant_config
 
