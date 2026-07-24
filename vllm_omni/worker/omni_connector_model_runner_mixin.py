@@ -1766,9 +1766,11 @@ class OmniConnectorModelRunnerMixin:
                 payload_consumable = incoming_payload_consumable
             else:
                 new_ids = self._payload_audio_codes(payload_data) or []
-                if not new_ids and not is_finished:
+                # Text-passing models (e.g. Ming thinker->talker) stream a kv_metadata
+                # text payload that carries no codes but is still consumable
+                if not new_ids and not incoming_payload_consumable and not is_finished:
                     return False
-                payload_consumable = self._payload_is_consumable(payload_data)
+                payload_consumable = incoming_payload_consumable
 
             with self._lock:
                 if is_finished:

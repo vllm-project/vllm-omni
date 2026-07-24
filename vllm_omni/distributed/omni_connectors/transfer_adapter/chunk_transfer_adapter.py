@@ -104,6 +104,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
         return max(0, num_computed - num_placeholders)
 
+    @staticmethod
+    def _payload_has_consumable_text(payload_data: dict[str, object] | None) -> bool:
+        """Whether a non-codec chunk carries schedulable text content.
+
+        Text-passing producers (e.g. Ming thinker->talker) stream the upstream
+        output token ids and request-static voice metadata instead of audio codes.
+        Such a chunk has no `codes.audio` but might still drive a downstream forward,
+        so it is treated as a consumable unit. Mirrors the worker-side
+        `OmniConnectorModelRunnerMixin._payload_is_consumable` gate.
+        """
+        if not isinstance(payload_data, dict):
+            return False
+        ids = payload_data.get("ids")
+        if isinstance(ids, dict) and ids.get("output"):
+            return True
+        kv_metadata = payload_data.get("kv_metadata")
+        return isinstance(kv_metadata, dict) and bool(kv_metadata)
+
     @classmethod
     def create_connector(cls, model_config: Any):
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -243,14 +261,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 new_ids = payload_data.get("codes", {}).get("audio")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
                 use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
+                has_consumable_text = not has_tensor_codes and self._payload_has_consumable_text(payload_data)
                 if use_tensor_codes:
                     request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
                 elif has_tensor_codes:
                     new_ids = new_ids.tolist()
-                elif new_ids is None:
-                    new_ids = []
                     request.prompt_token_ids = new_ids
-                if not use_tensor_codes:
+                elif has_consumable_text:
+                    new_ids = []
+                    request.prompt_token_ids = [0]
+                else:
+                    new_ids = [] if new_ids is None else new_ids
                     request.prompt_token_ids = new_ids
                 prev_info = getattr(request, "additional_information", None)
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
@@ -272,12 +293,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         info[key] = merged_sub
                         continue
                     info[key] = value
+
+                # restore the finished flag for the text path.
+                if has_consumable_text and payload_finished:
+                    meta_info = info.get("meta")
+                    if not isinstance(meta_info, dict):
+                        meta_info = {}
+                        info["meta"] = meta_info
+                    meta_info["finished"] = meta.get("finished")
                 request.additional_information = info
                 request.num_computed_tokens = 0
 
-                # Empty chunk with more data expected: keep polling.
+                # Empty chunk with more data expected: keep polling. A
+                # text-only chunk (has_consumable_text) carries no codec ids but
+                # must still wake the consumer, so it is not treated as empty.
                 has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
-                if not has_new_ids and not payload_finished:
+                if not has_new_ids and not has_consumable_text and not payload_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the

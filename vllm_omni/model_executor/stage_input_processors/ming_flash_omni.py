@@ -7,12 +7,17 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import IdsStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+    from vllm_omni.request import OmniRequest
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +440,42 @@ def thinker2imagegen(
     return [{"prompt": "", "extra": extra}]
 
 
+def _build_talker_info(text: str, additional_info: dict[str, Any]) -> dict[str, Any]:
+    """Build the talker's per-request metadata dict from thinker-side additional_information.
+
+    Single source of truth shared by the sync builder and the async-chunk producer.
+    The async path passes an empty text and the talker fills it by detokenizing the
+    streamed thinker token ids.
+
+    Omni speech path mirrors upstream omni_audio_generation:
+    - `prompt` is hardcoded, `instruction` is forced to None, and
+      cfg/sigma/temperature inherit the `tts_job` defaults (the upstream API
+      does NOT expose these knobs). The talker `forward()` enforces the
+      per-task defaults from `ming_task="omni"` so any stray caller overrides
+      are ignored.
+    - Voice cloning is preset-only via `voice_name` (default 'DB30'); when no
+      preset/spk_emb resolves the talker passes `spk_emb=None` through rather
+      than substituting a zero vector. Presets are resolved by `voice_name` in
+      the talker's `forward()` from its registered_prompts cache.
+    """
+    # spk_emb can arrive serialised as a plain list from JSON requests;
+    # the talker's spk_head wants a torch tensor.
+    spk_emb = additional_info.get("spk_emb", None)
+    if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
+        spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
+
+    return {
+        "ming_task": "omni",
+        "text": text,
+        "spk_emb": spk_emb,
+        "voice_name": additional_info.get("voice_name", "DB30"),
+        "prompt_text": additional_info.get("prompt_text", None),
+        "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
+        "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
+        "max_text_length": additional_info.get("max_text_length", 50),
+    }
+
+
 def _build_talker_inputs(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
@@ -451,41 +492,11 @@ def _build_talker_inputs(
 
         # Extract additional information from the original prompt
         original_prompt = prompt[i] if i < len(prompt) else None
-        additional_info = {}
+        additional_info: dict[str, Any] = {}
         if original_prompt is not None and hasattr(original_prompt, "additional_information"):
             additional_info = original_prompt.additional_information or {}
 
-        # spk_emb can arrive serialised as a plain list from JSON requests;
-        # the talker's spk_head wants a torch tensor.
-        spk_emb = additional_info.get("spk_emb", None)
-        if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
-            spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
-
-        # Omni speech path mirrors upstream `omni_audio_generation`:
-        # - `prompt` is hardcoded, `instruction` is forced to None,
-        #   cfg/sigma/temperature inherit the `tts_job` defaults (the
-        #   upstream API does NOT expose these knobs).
-        # - Voice cloning is preset-only via `voice_name` (default
-        #   'DB30'); `get_prompt_emb` is called with
-        #   `use_spk_emb=True, use_zero_spk_emb=False`, so when no
-        #   preset resolves upstream simply passes `spk_emb=None`
-        #   through to `tts_job` rather than substituting a zero
-        #   vector.
-        # The bridge only plumbs the request-specific fields; the
-        # talker `forward()` enforces the per-task defaults from
-        # `ming_task="omni"` so any stray caller overrides are ignored.
-        # Voice presets are resolved by voice_name in the talker's
-        # forward() from its registered_prompts cache.
-        talker_info = {
-            "ming_task": "omni",
-            "text": generated_text,
-            "spk_emb": spk_emb,
-            "voice_name": additional_info.get("voice_name", "DB30"),
-            "prompt_text": additional_info.get("prompt_text", None),
-            "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
-            "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
-            "max_text_length": additional_info.get("max_text_length", 50),
-        }
+        talker_info = _build_talker_info(generated_text, additional_info)
 
         # Use dummy token IDs (talker builds its own embeddings from text)
         talker_inputs.append(
@@ -512,9 +523,89 @@ def thinker2talker_token_only(
 thinker2talker_token_only._is_sync_input = True
 
 
+def _request_additional_info_dict(request: OmniRequest) -> dict[str, Any]:
+    """Extract request's additional information as a dict."""
+    info = getattr(request, "additional_information", None)
+    if isinstance(info, dict):
+        return info
+    entries = getattr(info, "entries", None)
+    if isinstance(entries, dict):
+        out: dict[str, Any] = {}
+        for key, entry in entries.items():
+            list_data = getattr(entry, "list_data", None)
+            if list_data is not None and len(list_data) == 1:
+                out[key] = list_data[0]
+            else:
+                out[key] = list_data
+        return out
+
+    return {}
+
+
+def _committed_output_ids(transfer_manager: OmniChunkTransferAdapter, request: OmniRequest) -> list[int]:
+    """Return the thinker's *committed* output token ids produced so far."""
+    # TODO: revise
+    all_token_ids = getattr(request, "all_token_ids", None) or getattr(request, "_all_token_ids", None)
+    if not all_token_ids:
+        return []
+
+    num_prompt = int(getattr(request, "num_prompt_tokens", 0) or 0)
+    if not num_prompt:
+        prompt_ids = getattr(request, "prompt_token_ids", None)
+        num_prompt = len(prompt_ids) if prompt_ids else 0
+
+    confirmed_fn = getattr(transfer_manager, "_confirmed_num_computed_tokens", None)
+    committed = (
+        int(confirmed_fn(request)) if callable(confirmed_fn) else int(getattr(request, "num_computed_tokens", 0) or 0)
+    )
+    end = min(committed, len(all_token_ids)) if committed > num_prompt else len(all_token_ids)
+    return list(all_token_ids[num_prompt:end])
+
+
+def thinker2talker_async_chunk(
+    transfer_manager: OmniChunkTransferAdapter,
+    pooling_output: dict | None,
+    request: OmniRequest,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Async-chunk producer: forward the thinker's committed output token ids.
+
+    Stateless by design. Each step ships the *cumulative* committed output
+    token ids (the consumer keeps the latest) plus the request-static voice
+    metadata. All text logic (detokenization, sentence/segment boundaries, normalization)
+    lives in the talker. This keeps the producer in token space,
+    and lets the talker reuse the exact segmenter the sync path uses.
+    """
+    # ming thinker emits no worker tensor payload
+    del pooling_output
+    finished = bool(is_finished or (hasattr(request, "is_finished") and request.is_finished()))
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+
+    output_ids = _committed_output_ids(transfer_manager, request)
+    if not output_ids:
+        # On finish, emit a terminal marker so the consumer closes its stream.
+        if finished:
+            return OmniPayloadStruct(
+                request_id=request_id,
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
+        return None
+
+    # Voice/speaker fields are request-static; the talker fills `text` from the
+    # streamed ids, so the carried text is left empty here.
+    talker_info = _build_talker_info("", _request_additional_info_dict(request))
+    return OmniPayloadStruct(
+        request_id=request_id,
+        ids=IdsStruct(output=output_ids),
+        kv_metadata={"additional_information": talker_info},
+        meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),
+    )
+
+
 __all__ = [
     "CFG_TEXT_SUFFIX",
     "expand_cfg_prompts",
     "thinker2imagegen",
+    "thinker2talker_async_chunk",
     "thinker2talker_token_only",
 ]

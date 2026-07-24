@@ -321,7 +321,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        # For models that have diff behaviors constructing connectors
+        # in different modes.
+        _ASYNC_CHUNK_ONLY_CONNECTOR_ARCHS = {
+            # In sync mode, Ming's thinker->talker hand-off carries only text without a connector
+            # In async_chunk mode, Ming's thinker becomes a streaming producer
+            "MingFlashOmniForConditionalGeneration",
+        }
+        model_arch = getattr(self.model_config, "model_arch", None)
+        if model_arch in _OMNI_CONNECTOR_INIT_ARCHS or (
+            model_arch in _ASYNC_CHUNK_ONLY_CONNECTOR_ARCHS and getattr(self.model_config, "async_chunk", False)
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,

@@ -44,6 +44,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             hf_config_name="llm_config",
             engine_output_type="text",
             sampling_constraints={"detokenize": True},
+            async_chunk_process_next_stage_input_func=f"{_PROC}.thinker2talker_async_chunk",
         ),
         StagePipelineConfig(
             stage_id=1,
