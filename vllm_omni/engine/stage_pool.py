@@ -669,6 +669,8 @@ class StagePool:
             num_tokens_out=num_tokens_out,
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
+            # This event summarizes one completed request. Execution batching
+            # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
             rx_decode_time_ms=0.0,

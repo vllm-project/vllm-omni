@@ -79,7 +79,7 @@ For resilience behavior under injected process signals/OOM pressure (validation 
 
 ### Running Tests Locally
 
-For instructions on running tests locally (including specific test files, functions, and markers), see the [Running Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_guide/#running-tests) section in the Test Guide.
+For instructions on running tests locally (including specific test files, functions, and markers), see the [Running Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_execution_guide/#running-tests) section in the Test Execution guide.
 
 ## Step 4: Raise an Issue or Fix It
 

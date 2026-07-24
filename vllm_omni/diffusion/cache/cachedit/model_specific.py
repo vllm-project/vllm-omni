@@ -1,27 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-cache-dit integration backend for vllm-omni.
 
-This module provides a CacheDiTBackend class to enable cache-dit acceleration on diffusion
-pipelines in vllm-omni, supporting both single and dual-transformer architectures.
-"""
+"""Model-specific Cache-DiT adapters and enablers."""
 
 import functools
-from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
-from typing import Any, Optional, TypeAlias
+from typing import Any
 
 import cache_dit
 import torch
 from cache_dit import (
     BlockAdapter,
-    CalibratorConfig,
     DBCacheConfig,
     ForwardPattern,
     ParamsModifier,
-    TaylorSeerCalibratorConfig,
 )
 from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
@@ -31,177 +23,17 @@ from cache_dit.caching.cache_contexts import BasicCacheConfig
 from cache_dit.caching.cache_contexts.cache_manager import CachedContextManager
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.cache.base import CacheBackend
-from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.cache.cachedit.backend import (
+    CUSTOM_DIT_ENABLERS,
+    RefreshCacheContextFunc,
+    _build_cache_context_refresh,
+    _default_get_pipeline_transformer,
+    _maybe_build_block_adapter,
+    enable_cache_for_dit,
+)
+from vllm_omni.diffusion.cache.cachedit.config import CacheDiTConfig
 
 logger = init_logger(__name__)
-
-RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
-
-
-@dataclass
-class CacheDiTAdapterConfig:
-    """Config for creating a Cache DiT's block adapter; to enable CacheDiT,
-    most models just need to define an instance of this class as a class
-    var in the DiT.
-    """
-
-    block_forward_patterns: dict[str, ForwardPattern]
-    has_separate_cfg: bool = False
-    cached_adapter_cls: type[CachedAdapter] | None = None
-    check_forward_pattern: bool = True
-
-
-# Registry of custom cache-dit enablers for specific models
-# Maps pipeline names to their cache-dit enablement functions
-CUSTOM_DIT_ENABLERS: dict[str, Callable] = {}
-
-
-# Small helper to centralize cache-dit summaries.
-def cache_summary(pipeline: Any, details: bool = True) -> None:
-    if hasattr(pipeline, "transformer"):
-        cache_dit.summary(pipeline.transformer, details=details)
-    if hasattr(pipeline, "transformer_2"):
-        cache_dit.summary(pipeline.transformer_2, details=details)
-    if not hasattr(pipeline, "transformer") and not hasattr(pipeline, "transformer_2"):
-        logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
-
-
-def default_get_pipeline_transformer(pipeline: Any) -> Any:
-    return pipeline.transformer
-
-
-def build_cache_context_refresh(
-    cache_config: DiffusionCacheConfig,
-    get_pipeline_transformer: Callable[[Any], Any] = default_get_pipeline_transformer,
-) -> RefreshCacheContextFunc:
-    """Build the cache context refresh func for a single Transformer."""
-
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context for the transformer with new num_inference_steps.
-
-        Args:
-            pipeline: The pipeline instance.
-            num_inference_steps: New number of inference steps.
-        """
-        transformer = get_pipeline_transformer(pipeline)
-
-        # Bypass SCM for step counts that don't support predefined masks (e.g., vLLM's 1-step dummy run)
-        scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
-
-        if cache_config.scm_steps_mask_policy is None or not scm_supported_steps:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
-        else:
-            cache_dit.refresh_context(
-                transformer,
-                cache_config=DBCacheConfig().reset(
-                    num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
-                ),
-                verbose=verbose,
-            )
-
-    return refresh_cache_context
-
-
-def _resolve_calibrator_config(cache_config: DiffusionCacheConfig) -> CalibratorConfig | None:
-    """Resolves the Calibrator subconfig For DiT cache."""
-    calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-    # In the future, more calibrators will likely be added to DiT Cache,
-    # e.g., focal; handle them generically here.
-    return calibrator
-
-
-def _build_db_cache_config(cache_config: DiffusionCacheConfig) -> DBCacheConfig:
-    """Build DBCacheConfig with optional SCM (Step Computation Masking) support.
-
-    Args:
-        cache_config: DiffusionCacheConfig instance.
-
-    Returns:
-        DBCacheConfig instance with SCM support if configured.
-    """
-    return DBCacheConfig(
-        # we will refresh the context when we get num_inference_steps in the first inference request
-        num_inference_steps=None,
-        Fn_compute_blocks=cache_config.Fn_compute_blocks,
-        Bn_compute_blocks=cache_config.Bn_compute_blocks,
-        max_warmup_steps=cache_config.max_warmup_steps,
-        max_cached_steps=cache_config.max_cached_steps,
-        max_continuous_cached_steps=cache_config.max_continuous_cached_steps,
-        residual_diff_threshold=cache_config.residual_diff_threshold,
-        force_refresh_step_hint=cache_config.force_refresh_step_hint,
-        force_refresh_step_policy=cache_config.force_refresh_step_policy,
-    )
-
-
-def enable_cache_for_dit(
-    pipeline: Any,
-    cache_config: Any,
-    block_adapter: BlockAdapter | None = None,
-    adapter_cls: type[CachedAdapter] | None = None,
-) -> RefreshCacheContextFunc:
-    """Enable cache-dit for regular single-transformer DiT models.
-
-    Args:
-        pipeline: The diffusion pipeline instance.
-        cache_config: DiffusionCacheConfig instance with cache configuration.
-        block_adapter: Custom block adapters for specific model architectures.
-        adapter_cls: Custom cached adapter class for specific model architectures.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
-    """
-    # Build DBCacheConfig with optional SCM support
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = _resolve_calibrator_config(cache_config)
-
-    logger.info(
-        f"Enabling cache-dit on transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-    )
-
-    # Enable cache-dit on the transformer
-    transformer = default_get_pipeline_transformer(pipeline)
-
-    # If we have a custom cached adapter subclass, call apply directly
-    if adapter_cls is not None:
-        adapter_cls.apply(
-            transformer if block_adapter is None else block_adapter,
-            cache_config=db_cache_config,
-            calibrator_config=calibrator_config,
-        )
-    else:
-        # Otherwise, call enable cache, which will call CachedAdapter.apply for us
-        cache_dit.enable_cache(
-            transformer if block_adapter is None else block_adapter,
-            cache_config=db_cache_config,
-            calibrator_config=calibrator_config,
-        )
-
-    return build_cache_context_refresh(cache_config)
-
-
-### Complex / custom enablers for DiT cache
-# NOTE (Alex): This case is rare; you should only really need to do this if you have a dual transformer
-# architecture, since it hasn't been handled generically yet, or if the model class has unique attributes
-# that it sets during Cache DiT enablement.
-#
-# For the vast majority of models, you should only need to add a _cache_dit_adapter_config attribute
-# to the Transformer class, which controls the forward pattern, whether or not we have separate CFG,
-# and so on.
 
 
 # from https://github.com/vipshop/cache-dit/pull/542
@@ -249,9 +81,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     Returns:
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
-    # Build DBCacheConfig with optional SCM support
-    db_cache_config = _build_db_cache_config(cache_config)
-    calibrator_config = _resolve_calibrator_config(cache_config)
+    projected_config = CacheDiTConfig.from_diffusion_config(cache_config)
+    db_cache_config = projected_config.to_db_cache_config()
+    calibrator_config = projected_config.to_calibrator_config()
 
     if getattr(pipeline, "transformer_2", None) is None:
         logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
@@ -273,7 +105,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return build_cache_context_refresh(cache_config)
+        return _build_cache_context_refresh(cache_config)
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -296,8 +128,8 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
                 # high-noise transformer only have 30% steps
                 ParamsModifier(
                     cache_config=DBCacheConfig().reset(
-                        max_warmup_steps=cache_config.max_warmup_steps,
-                        max_cached_steps=cache_config.max_cached_steps,
+                        max_warmup_steps=projected_config.max_warmup_steps,
+                        max_cached_steps=projected_config.max_cached_steps,
                     ),
                     calibrator_config=calibrator_config,
                 ),
@@ -315,8 +147,8 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
         calibrator_config=calibrator_config,
     )
 
-    refresh_trans_one = build_cache_context_refresh(cache_config)
-    refresh_trans_two = build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
+    refresh_trans_one = _build_cache_context_refresh(cache_config)
+    refresh_trans_two = _build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
@@ -347,12 +179,9 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> RefreshCache
     permanently replace it with a no-op on the transformer to prevent double
     injection from the main forward loop.
     """
-    db_cache_config = _build_db_cache_config(cache_config)
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+    projected_config = CacheDiTConfig.from_diffusion_config(cache_config)
+    db_cache_config = projected_config.to_db_cache_config()
+    calibrator_config = projected_config.to_calibrator_config()
 
     # Save the original after_transformer_block before cache-dit wrapping
     transformer = pipeline.transformer
@@ -383,7 +212,7 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> RefreshCache
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for the S2V transformer."""
-        if cache_config.scm_steps_mask_policy is None:
+        if projected_config.scm_steps_mask_policy is None:
             cache_dit.refresh_context(
                 pipeline.transformer,
                 num_inference_steps=num_inference_steps,
@@ -395,10 +224,10 @@ def enable_cache_for_wan22_s2v(pipeline: Any, cache_config: Any) -> RefreshCache
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
+                        mask_policy=projected_config.scm_steps_mask_policy,
                         total_steps=num_inference_steps,
                     ),
-                    steps_computation_policy=cache_config.scm_steps_policy,
+                    steps_computation_policy=projected_config.scm_steps_policy,
                 ),
                 verbose=verbose,
             )
@@ -971,7 +800,7 @@ def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheCo
     # step accounting. Still do both cond/uncond CFG steps when cache-dit is active.
     # CFG is instead neutralized via scale=1.0 outside the interval.
     pipeline._cache_dit_requires_paired_cfg = True
-    block_adapter = CacheDiTBackend.maybe_build_block_adapter(pipeline)
+    block_adapter = _maybe_build_block_adapter(pipeline)
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
@@ -996,7 +825,7 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     Returns:
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
-    transformer = default_get_pipeline_transformer(pipeline)
+    transformer = _default_get_pipeline_transformer(pipeline)
     block_adapter = BlockAdapter(
         transformer=transformer,
         blocks=[transformer.transformer_blocks],
@@ -1007,171 +836,28 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
-# Register custom cache-dit enablers after function definitions
-CUSTOM_DIT_ENABLERS.update(
-    {
-        "Wan22Pipeline": enable_cache_for_wan22,
-        "Wan22I2VPipeline": enable_cache_for_wan22,
-        "Wan22TI2VPipeline": enable_cache_for_wan22,
-        "Wan22VACEPipeline": enable_cache_for_wan22,
-        "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
-        "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
-        "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
-        "Krea2Pipeline": enable_cache_for_krea2,
-    }
-)
+def register_custom_dit_enablers() -> None:
+    """Register model-specific Cache-DiT enablers.
 
-
-class CacheDiTBackend(CacheBackend):
-    """Backend class for cache-dit acceleration on diffusion pipelines.
-
-    This class implements cache-dit acceleration (DBCache, SCM, TaylorSeer) using
-    the cache-dit library. It inherits from CacheBackend and provides a unified
-    interface for managing cache-dit acceleration on diffusion models.
-
-    Attributes:
-        config: Cache configuration (DiffusionCacheConfig instance), inherited from CacheBackend.
-        enabled: Whether cache-dit is enabled on this pipeline, inherited from CacheBackend.
-        _refresh_func: Internal refresh function for updating cache context.
-        _last_num_inference_steps: Last num_inference_steps used for refresh optimization.
+    This is called explicitly by the package initializer so registration does
+    not depend on unrelated model-specific symbols being imported for their
+    side effects.
     """
-
-    def __init__(self, cache_config: Any = None):
-        """Initialize the cache-dit backend.
-
-        Args:
-            cache_config: Cache configuration (DiffusionCacheConfig instance, dict, or None).
-                         If None or empty, uses default DiffusionCacheConfig().
-        """
-        # Use default config if cache_config is not provided or is empty
-        if cache_config is None:
-            config = DiffusionCacheConfig()
-        elif isinstance(cache_config, dict):
-            # Convert dict to DiffusionCacheConfig, using defaults for missing keys
-            config = DiffusionCacheConfig.from_dict(cache_config)
-        else:
-            config = cache_config
-
-        # Initialize base class with normalized config
-        super().__init__(config)
-
-        # Cache-dit specific attributes
-        self._refresh_func: Callable[[Any, int, bool], None] | None = None
-        self._last_num_inference_steps: int | None = None
-
-    @staticmethod
-    def maybe_build_block_adapter(pipeline) -> BlockAdapter | None:
-        """If a module defines `_cache_dit_adapter_config`, build the corresponding
-        block adapter.
-        """
-        transformer = default_get_pipeline_transformer(pipeline)
-
-        adapter_cfg: CacheDiTAdapterConfig | None = getattr(transformer, "_cache_dit_adapter_config", None)
-        if adapter_cfg is None:
-            return None
-
-        block_attrs, forward_pattern = zip(*(adapter_cfg.block_forward_patterns).items())
-        missing_attrs = [block_attr for block_attr in block_attrs if not hasattr(transformer, block_attr)]
-
-        if missing_attrs:
-            logger.warning("Missing Cache DiT block attributes: %s", missing_attrs)
-
-        block_adapter = BlockAdapter(
-            transformer=transformer,
-            blocks=[getattr(transformer, block_attr) for block_attr in block_attrs],
-            forward_pattern=list(forward_pattern),
-            has_separate_cfg=adapter_cfg.has_separate_cfg,
-            check_forward_pattern=adapter_cfg.check_forward_pattern,
-        )
-        return block_adapter
-
-    @staticmethod
-    def maybe_get_cached_adapter_cls(pipeline) -> type[CachedAdapter] | None:
-        """If a module has a custom cached adapter type registered, e.g., SenseNova, retrieve it
-        from the transformer's CacheDiTAdapterConfig."""
-        transformer = default_get_pipeline_transformer(pipeline)
-
-        adapter_cfg: CacheDiTAdapterConfig | None = getattr(transformer, "_cache_dit_adapter_config", None)
-        if adapter_cfg is None:
-            return None
-        return adapter_cfg.cached_adapter_cls
-
-    def enable(self, pipeline: Any) -> None:
-        """Enable cache-dit on the pipeline if configured.
-
-        This method applies cache-dit acceleration to the appropriate transformer(s)
-        in the pipeline. It handles both single-transformer and dual-transformer
-        architectures (e.g., Wan2.2).
-
-        Args:
-            pipeline: The diffusion pipeline instance.
-        """
-
-        # Extract pipeline name from pipeline
-        pipeline_name = pipeline.__class__.__name__
-        # Check if this model has a custom cache-dit enabler
-        if pipeline_name in CUSTOM_DIT_ENABLERS:
-            logger.info(f"Using custom cache-dit enabler for model: {pipeline_name}")
-            self._refresh_func = CUSTOM_DIT_ENABLERS[pipeline_name](pipeline, self.config)
-        else:
-            # Common case; either the model doesn't explicitly support dit cache yet,
-            # Or it defines its _cache_dit_adapter_config, which describes how we should
-            # create its block adapter.
-            block_adapter = self.maybe_build_block_adapter(pipeline)
-            adapter_cls = self.maybe_get_cached_adapter_cls(pipeline)
-            self._refresh_func = enable_cache_for_dit(pipeline, self.config, block_adapter, adapter_cls)
-
-        self.enabled = True
-        logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
-
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        """Refresh cache context with new num_inference_steps.
-
-        This method updates the cache context when num_inference_steps changes
-        during inference. For dual-transformer models (e.g., Wan2.2), it automatically
-        splits the steps based on boundary_ratio.
-
-        Args:
-            pipeline: The diffusion pipeline instance.
-            num_inference_steps: New number of inference steps.
-            verbose: Whether to log refresh operations.
-        """
-        if not self.enabled or self._refresh_func is None:
-            logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
-            return
-
-        # Only refresh if num_inference_steps has changed
-        if self._last_num_inference_steps is None or num_inference_steps != self._last_num_inference_steps:
-            if verbose:
-                logger.info(f"Refreshing cache context for transformer with num_inference_steps: {num_inference_steps}")
-            self._refresh_func(pipeline, num_inference_steps, verbose)
-            self._last_num_inference_steps = num_inference_steps
-
-    def is_enabled(self) -> bool:
-        """Check if cache-dit is enabled on this pipeline.
-
-        Returns:
-            True if cache-dit is enabled, False otherwise.
-        """
-        return self.enabled
+    CUSTOM_DIT_ENABLERS.update(
+        {
+            "Wan22Pipeline": enable_cache_for_wan22,
+            "Wan22I2VPipeline": enable_cache_for_wan22,
+            "Wan22TI2VPipeline": enable_cache_for_wan22,
+            "Wan22VACEPipeline": enable_cache_for_wan22,
+            "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
+            "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
+            "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
+            "Krea2Pipeline": enable_cache_for_krea2,
+        }
+    )
 
 
-def may_enable_cache_dit(pipeline: Any, od_config: OmniDiffusionConfig) -> Optional["CacheDiTBackend"]:
-    """Enable cache-dit on the pipeline if configured (convenience function).
-
-    This is a convenience function that creates and enables a CacheDiTBackend.
-    For new code, consider using CacheDiTBackend directly.
-
-    Args:
-        pipeline: The diffusion pipeline instance.
-        od_config: OmniDiffusionConfig with cache configuration.
-
-    Returns:
-        A CacheDiTBackend instance if cache-dit is enabled, None otherwise.
-    """
-    if od_config.cache_backend != "cache-dit" or not od_config.cache_config:
-        return None
-
-    backend = CacheDiTBackend(od_config.cache_config)
-    backend.enable(pipeline)
-    return backend if backend.is_enabled() else None
+__all__ = [
+    "BagelCachedAdapter",
+    "SensenovaCachedAdapter",
+]

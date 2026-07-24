@@ -3,12 +3,11 @@
 """MiniCPM-o 4.5 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
-Stage 1: Talker  — MiniCPMTTS + Token2Wav, emits the final audio waveform.
+Stage 1: Talker  — MiniCPMTTS, emits codec tokens.
+Stage 2: Code2Wav — codec tokens to the final audio waveform.
 
-The thinker -> talker bridge passes the hidden states + token ids extracted
-from the thinker output through ``minicpmo_4_5_omni.llm2tts``; the talker
-runs MiniCPMTTS and the on-device Token2wav vocoder in the same process and
-returns the waveform directly as the pipeline's final audio output.
+The thinker -> talker bridge uses ``llm2tts``. The talker -> Code2Wav bridge
+streams request-routed codec chunks.
 """
 
 from vllm_omni.config.stage_config import (
@@ -56,28 +55,24 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="tts",
-            # Stage 1 shares the top-level wrapper class
-            # (``MiniCPMO45OmniForConditionalGeneration``) inherited from
-            # ``model_arch`` above. The wrapper dispatches on ``model_stage``
-            # and, for ``"tts"``, instantiates the standalone TTS submodule
-            # (``MiniCPMO45OmniTTSForConditionalGeneration``) internally.
-            # Routing through the wrapper is required so that the runner-side
-            # ``runtime_additional_information`` payload reaches the talker
-            # (the standalone TTS class only reads ``additional_information``,
-            # so wiring stage 1 directly to it would always trigger the dummy
-            # path) and so the resulting waveform is packaged as
-            # ``OmniOutput.multimodal_outputs["model_outputs"]`` instead of
-            # being returned as a bare tuple that the AR runner would mistake
-            # for hidden states. ``hf_config_name="tts_config"`` keeps KV
-            # cache / mrope sizing scoped to the talker sub-config.
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
+            hf_config_name="tts_config",
+            engine_output_type="latent",
+            custom_process_input_func=f"{_PROC}.llm2tts",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            sampling_constraints={"detokenize": False},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(1,),
             final_output=True,
             final_output_type="audio",
-            hf_config_name="tts_config",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.llm2tts",
-            sampling_constraints={"detokenize": False},
+            model_arch="MiniCPMO45Code2Wav",
+            sampling_constraints={"detokenize": True},
         ),
     ),
 )

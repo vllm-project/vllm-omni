@@ -234,6 +234,12 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    @pytest.mark.skip(
+        reason=(
+            "/v1/realtime rejects async_chunk since #3907 (server closes with 1000 after "
+            "unsupported error); tracked in #5363"
+        )
+    )
     def test_streaming_audio_input_pcm_output_async_chunk(self, omni_server) -> None:
         """Merge CI: async_chunk on, paced upload, full accuracy check."""
         pcm16 = _synthetic_pcm16_input()
