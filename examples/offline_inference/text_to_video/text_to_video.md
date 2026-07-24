@@ -9,6 +9,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
+| `rootonchair/LTX-2-19b-distilled` | 1024x1536 | 121 | fixed 8+3 | positive-only | Model-dependent |
 | `diffusers/LTX-2.3-Diffusers` | 512x768 | 121 | 30 | video 3.0 / audio 7.0 | 96GB-class GPU |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
@@ -71,6 +72,15 @@ python text_to_video.py \
 
 Both checkpoints select the unified `LTX2Pipeline` from checkpoint metadata.
 See the [LTX family recipe](../../../recipes/LTX/LTX-2.md) for the full API.
+
+The distilled checkpoint selects its fixed two-stage entry and defaults:
+
+```bash
+python text_to_video.py \
+  --model rootonchair/LTX-2-19b-distilled \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --output ltx2_distilled_output.mp4
+```
 
 ### HunyuanVideo-1.5 (480p)
 

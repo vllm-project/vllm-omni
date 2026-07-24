@@ -10,6 +10,8 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` |
+| LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` |
 | Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 
 ## Wan2.2 T2V
@@ -253,8 +255,7 @@ done
 #### Basic Start
 
 ```bash
-vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --boundary-ratio 1.0
+vllm serve Lightricks/LTX-2 --omni --port 8098 --enforce-eager
 ```
 
 #### Start with Optimization Presets
@@ -321,9 +322,12 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "num_frames=41" \
   -F "fps=24" \
   -F "num_inference_steps=20" \
-  -F "guidance_scale=3.0" \
   -F "seed=42"
 ```
+
+Omitting the common `guidance_scale` preserves LTX's independent video/audio
+CFG defaults (3.0/7.0). See the [LTX recipe](../../../recipes/LTX/LTX-2.md)
+for per-modality overrides and the distilled two-stage entry.
 
 ## Helios
 

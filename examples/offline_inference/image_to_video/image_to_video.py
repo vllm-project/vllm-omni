@@ -24,7 +24,7 @@ Usage:
     # LTX2 image-to-video
     python image_to_video.py --model /path/to/LTX-2 \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video

@@ -73,6 +73,19 @@ python image_to_video.py \
 The checkpoint selects the unified `LTX2Pipeline`; adding `--image` selects
 I2V. See the [LTX family recipe](../../../../recipes/LTX/LTX-2.md).
 
+### LTX-2 distilled
+
+```bash
+python image_to_video.py \
+  --model rootonchair/LTX-2-19b-distilled \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --output ltx2_distilled_i2v_output.mp4
+```
+
+The distilled checkpoint selects `LTX2DistilledPipeline` and uses fixed
+positive-only 8+3-step guidance. Its default final resolution is 1024x1536.
+
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or

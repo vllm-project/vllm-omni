@@ -27,6 +27,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
+| `rootonchair/LTX-2-19b-distilled` | 1024 x 1536 | 121 | fixed 8+3 | positive-only | Memory use depends on frame count and tensor parallelism |
 | `diffusers/LTX-2.3-Diffusers` | 512 x 768 | 121 | 30 | video 3.0 / audio 7.0 | 96GB-class GPU |
 
 !!! info
@@ -207,7 +208,6 @@ python image_to_video.py \
   --width 768 \
   --num-frames 121 \
   --num-inference-steps 40 \
-  --guidance-scale 4.0 \
   --frame-rate 24 \
   --fps 24 \
   --output ltx2_i2v.mp4
@@ -250,8 +250,21 @@ python image_to_video.py \
   --output ltx23_i2v_output.mp4
 ```
 
-Both LTX checkpoints select the unified `LTX2Pipeline`; the supplied image
-selects I2V. See the [LTX family recipe](../../../recipes/LTX/LTX-2.md).
+The one-stage checkpoints select the unified `LTX2Pipeline`; the supplied
+image selects I2V.
+
+### LTX-2 distilled
+
+```bash
+python image_to_video.py \
+  --model rootonchair/LTX-2-19b-distilled \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --output ltx2_distilled_i2v_output.mp4
+```
+
+The distilled checkpoint uses fixed positive-only 8+3-step guidance. See the
+[LTX family recipe](../../../recipes/LTX/LTX-2.md) for its request constraints.
 
 ### Cosmos3
 
