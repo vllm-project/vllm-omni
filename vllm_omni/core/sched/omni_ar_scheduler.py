@@ -355,7 +355,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-            if scheduled_spec_token_ids and generated_token_ids:
+            # Skip a stale frame still pending discard: its speculative
+            # rejection count belongs to the previous streaming segment.
+            if scheduled_spec_token_ids and generated_token_ids and request.async_tokens_to_discard == 0:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted

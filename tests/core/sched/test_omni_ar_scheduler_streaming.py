@@ -187,6 +187,54 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
+def test_stale_speculative_output_does_not_mutate_new_segment_accounting() -> None:
+    num_spec = 5
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_computed_tokens = session.num_tokens
+    session.num_output_placeholders = 1
+    session.async_tokens_to_discard = num_spec
+    computed_before = session.num_computed_tokens
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.make_stats.return_value = None
+
+    def discard_stale_output(request: Request, _token_ids: list[int]) -> tuple[list[int], bool]:
+        request.async_tokens_to_discard -= 1
+        return [], False
+
+    sched._update_request_with_output.side_effect = discard_stale_output
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: num_spec + 1}
+    scheduler_output.scheduled_spec_decode_tokens = {session.request_id: [10] * num_spec}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[999]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert session.num_output_placeholders == 1
+    assert session.num_computed_tokens == computed_before
+    assert session.async_tokens_to_discard == num_spec - 1
+    assert session.status == RequestStatus.RUNNING
+
+
 @pytest.mark.parametrize(
     ("outstanding_async_tokens", "expected_kept_output_tokens"),
     [(1, [7, 8]), (2, [7])],
