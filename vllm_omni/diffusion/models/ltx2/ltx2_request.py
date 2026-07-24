@@ -90,9 +90,7 @@ def validate_pipeline_request(
 
     negative_prompt = request_inputs.negative_prompt
     has_negative_prompt = (
-        any(bool(value) for value in negative_prompt)
-        if isinstance(negative_prompt, list)
-        else bool(negative_prompt)
+        any(bool(value) for value in negative_prompt) if isinstance(negative_prompt, list) else bool(negative_prompt)
     )
     if not pipeline_recipe.allow_negative_prompt and (
         has_negative_prompt or request_inputs.negative_prompt_embeds is not None

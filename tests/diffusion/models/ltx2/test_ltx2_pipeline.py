@@ -115,12 +115,10 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
 def test_ltx_distilled_repository_name_selects_two_stage_entry():
     model_index = {"_class_name": "LTX2Pipeline"}
 
-    assert _resolve_model_index_class_name("rootonchair/LTX-2-19b-distilled", model_index) == (
-        "LTX2DistilledPipeline"
-    )
-    assert _resolve_model_index_class_name("/cache/models--rootonchair--LTX-2-19b-distilled/snapshots/abc", model_index) == (
-        "LTX2DistilledPipeline"
-    )
+    assert _resolve_model_index_class_name("rootonchair/LTX-2-19b-distilled", model_index) == ("LTX2DistilledPipeline")
+    assert _resolve_model_index_class_name(
+        "/cache/models--rootonchair--LTX-2-19b-distilled/snapshots/abc", model_index
+    ) == ("LTX2DistilledPipeline")
     assert _resolve_model_index_class_name("Lightricks/LTX-2", model_index) == "LTX2Pipeline"
 
 
