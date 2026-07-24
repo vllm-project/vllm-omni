@@ -502,6 +502,54 @@ class TestModelSpPlans:
         except ImportError:
             pytest.skip("QwenImageTransformer2DModel not available")
 
+    def test_flux_transformer_sp_plan(self):
+        """Test FluxTransformer2DModel _sp_plan structure.
+
+        The Flux plan specifies:
+        - Root-level hidden_states sharding on seq dimension
+        - rope_prepare: img_cos/img_sin sharded (indices 2, 3)
+          txt_cos/txt_sin replicated (indices 0, 1)
+        - proj_out: Gather output
+
+        """
+        try:
+            from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
+
+            plan = getattr(FluxTransformer2DModel, "_sp_plan", None)
+            assert plan is not None, "FluxTransformer2DModel should define _sp_plan"
+            assert isinstance(plan, dict)
+
+            # Check root-level hidden_states sharding
+            assert "" in plan
+            root_plan = plan[""]
+            assert "hidden_states" in root_plan
+            assert root_plan["hidden_states"].split_dim == 1
+            assert root_plan["hidden_states"].expected_dims == 3
+            assert root_plan["hidden_states"].auto_pad is True
+
+            # Check rope_prepare sharding
+            assert "rope_prepare" in plan
+            rope_plan = plan["rope_prepare"]
+            # img_cos (index 2) and img_sin (index 3) should be sharded
+            assert 2 in rope_plan
+            assert 3 in rope_plan
+            assert rope_plan[2].split_dim == 0
+            assert rope_plan[2].split_output is True
+            assert rope_plan[3].split_dim == 0
+            assert rope_plan[3].split_output is True
+            # txt_cos/txt_sin (indices 0, 1) should NOT be in plan
+            assert 0 not in rope_plan
+            assert 1 not in rope_plan
+
+            # Check output gathering
+            assert "proj_out" in plan
+            assert plan["proj_out"].gather_dim == 1
+            assert plan["proj_out"].expected_dims == 3
+
+            validate_sp_plan(plan)
+        except ImportError:
+            pytest.skip("FluxTransformer2DModel not available")
+
 
 # =============================================================================
 # Tests for tensor sharding simulation (no distributed required)
