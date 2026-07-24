@@ -424,7 +424,6 @@ steps:
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
         timeout_in_minutes: 180
         commands:
-          - python -c "import OpenImageIO, cloudpickle" || uv pip install "openimageio>=3" "cloudpickle>=3.1"
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_one_stage_matches_official[ltx2_3]' -m full_model --run-level full_model
