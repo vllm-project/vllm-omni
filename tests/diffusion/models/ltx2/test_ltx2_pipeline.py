@@ -322,7 +322,7 @@ def test_ltx_guidance_uses_official_close_to_disabled_semantics():
     assert LTXGuidancePlan.build(LTXGuidanceSpec(video=guidance)).names == ("cond",)
 
 
-def test_ltx_guidance_rescales_each_sample_independently():
+def test_ltx_guidance_rescale_is_invariant_to_request_batching():
     cond = torch.tensor(
         [
             [[1.0, 2.0], [3.0, 4.0]],
@@ -339,8 +339,21 @@ def test_ltx_guidance_rescales_each_sample_independently():
         uncond_modality=0.0,
         guidance=guidance,
     )
+    individually = torch.cat(
+        [
+            combine_guided_x0(
+                cond=cond[index : index + 1],
+                uncond_text=uncond[index : index + 1],
+                uncond_perturbed=0.0,
+                uncond_modality=0.0,
+                guidance=guidance,
+            )
+            for index in range(cond.shape[0])
+        ]
+    )
 
-    torch.testing.assert_close(actual, cond)
+    # Fusing independent requests must not change either request's output.
+    torch.testing.assert_close(actual, individually)
 
 
 def test_ltx_guidance_rescale_handles_zero_variance_prediction():

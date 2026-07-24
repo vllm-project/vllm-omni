@@ -156,6 +156,10 @@ def combine_guided_x0(
         pred = pred + guidance.stg_scale * (cond - uncond_perturbed)
     pred = pred + (guidance.modality_scale - 1) * (cond - uncond_modality)
     if guidance.rescale_scale != 0.0:
+        # The pinned official one-stage entry runs one generated sample and
+        # uses its full-tensor standard deviation. In Omni, dimension 0 may
+        # instead contain independently scheduled requests. Reduce each item
+        # separately so its result cannot depend on unrelated co-batched work.
         reduce_dims = tuple(range(1, pred.ndim))
         cond_std = cond.std(dim=reduce_dims, keepdim=True)
         pred_std = pred.std(dim=reduce_dims, keepdim=True)
