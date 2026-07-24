@@ -628,6 +628,47 @@ def test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding(tmp_p
     assert stage.parallel_config.mask_sp_padding is True
 
 
+def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
+    deploy_path = tmp_path / "dreamzero_compile.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_compile_granularity: regional",
+                "    diffusion_compile_dynamic: false",
+            ]
+        )
+    )
+
+    configured_stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    overridden_stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+        cli_overrides={
+            "diffusion_compile_granularity": "full",
+            "diffusion_compile_dynamic": True,
+        },
+    ).stage_by_id(0)
+
+    assert configured_stage.diffusion_config.diffusion_compile_granularity == "regional"
+    assert configured_stage.diffusion_config.diffusion_compile_dynamic is False
+    assert overridden_stage.diffusion_config.diffusion_compile_granularity == "full"
+    assert overridden_stage.diffusion_config.diffusion_compile_dynamic is True
+
+
+def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
+    with pytest.raises(ValidationError, match="diffusion_compile_dynamic"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
+
+
+def test_structured_diffusion_config_rejects_invalid_compile_granularity():
+    with pytest.raises(ValidationError, match="diffusion_compile_granularity"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
+
+
 def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]

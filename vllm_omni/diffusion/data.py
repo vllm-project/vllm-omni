@@ -684,6 +684,10 @@ class OmniDiffusionConfig:
 
     # Compilation
     enforce_eager: bool = False
+    # Controls the generic compilation path used when a pipeline does not
+    # provide its own setup_compile() implementation.
+    diffusion_compile_granularity: str = "regional"
+    diffusion_compile_dynamic: bool = True
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -880,6 +884,13 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.diffusion_compile_granularity not in {"regional", "full"}:
+            raise ValueError(
+                "diffusion_compile_granularity must be 'regional' or 'full', "
+                f"got {self.diffusion_compile_granularity!r}"
+            )
+        if not isinstance(self.diffusion_compile_dynamic, bool):
+            raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if self.request_batch_max_wait_ms < 0:
@@ -914,6 +925,23 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
             )
+
+        if self.diffusion_compile_granularity == "full":
+            incompatible_features = []
+            if self.parallel_config.use_hsdp:
+                incompatible_features.append("HSDP")
+            if self.parallel_config.sequence_parallel_size > 1:
+                incompatible_features.append("sequence parallelism")
+            if self.enable_cpu_offload:
+                incompatible_features.append("CPU offload")
+            if self.enable_layerwise_offload:
+                incompatible_features.append("layerwise offload")
+            if incompatible_features:
+                features = ", ".join(incompatible_features)
+                raise ValueError(
+                    "diffusion_compile_granularity='full' is incompatible with "
+                    f"{features}; use 'regional' compilation instead"
+                )
 
         # Convert string dtype to torch.dtype if needed
         if isinstance(self.dtype, str):

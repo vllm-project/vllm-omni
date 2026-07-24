@@ -14,7 +14,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeAlias, TypedDict, cast
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config.utils import config
@@ -470,6 +470,8 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     pin_cpu_memory: bool = True
+    diffusion_compile_granularity: Literal["regional", "full"] = "regional"
+    diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None
