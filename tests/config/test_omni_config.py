@@ -431,6 +431,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "sequence_parallel_size",
         "ulysses_degree",
         "ring_degree",
+        "allgather_degree",
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
@@ -547,9 +548,38 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_degrees(tmp_pa
     assert stage.parallel_config.world_size == 6
 
 
+def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degree(tmp_path):
+    deploy_path = tmp_path / "dreamzero_allgather_parallel.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    parallel_config:",
+                "      sequence_parallel_size: 99",
+                "      allgather_degree: 2",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.allgather_degree == 2
+    assert stage.parallel_config.sequence_parallel_size == 2
+    assert stage.parallel_config.world_size == 2
+
+
 def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
     with pytest.raises(ValidationError):
         OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+
+
+def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
+    with pytest.raises(ValidationError):
+        OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():
