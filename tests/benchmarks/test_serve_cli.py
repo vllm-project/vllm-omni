@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import subprocess
@@ -6,10 +7,148 @@ from pathlib import Path
 
 import pytest
 
+from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+    add_omni_args,
+    extend_omni_choices,
+    preprocess_serve_args,
+    update_omni_help,
+)
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
-@pytest.mark.core_model
-@pytest.mark.benchmark
-@pytest.mark.cpu
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+
+@pytest.mark.parametrize(
+    "dataset_name",
+    [
+        "daily-omni",
+        "seed-tts",
+        "seed-tts-text",
+        "seed-tts-design",
+        "ttsd",
+        "sound-effect",
+    ],
+)
+def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--dataset-name", choices=["random"])
+    parser.add_argument("--backend", choices=["openai-chat-omni"])
+
+    extend_omni_choices(parser)
+
+    args = parser.parse_args(
+        [
+            "--dataset-name",
+            dataset_name,
+            "--backend",
+            "openai-image-edits-omni",
+        ]
+    )
+
+    assert args.dataset_name == dataset_name
+    assert args.backend == "openai-image-edits-omni"
+    assert args.explicit_keys == {"dataset_name", "backend"}
+
+
+@pytest.mark.parametrize(
+    ("argv", "dest", "expected"),
+    [
+        (["--print-stage"], "print_stage", True),
+        (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
+        (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+    ],
+)
+def test_add_omni_args_registers_arguments_on_tracking_parser(
+    argv: list[str],
+    dest: str,
+    expected: object,
+) -> None:
+    parser = TrackingArgumentParser()
+
+    add_omni_args(parser)
+
+    args = parser.parse_args(argv)
+    assert getattr(args, dest) == expected
+    assert args.explicit_keys == {dest}
+
+
+def test_add_omni_args_preserves_implicit_defaults() -> None:
+    parser = TrackingArgumentParser()
+
+    add_omni_args(parser)
+
+    args = parser.parse_args([])
+    assert args.print_stage is False
+    assert args.daily_omni_input_mode == "all"
+    assert args.seed_tts_locale == "en"
+    assert args.explicit_keys == set()
+
+
+def test_update_omni_help_updates_upstream_actions() -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--percentile-metrics", help="Upstream percentile help.")
+    parser.add_argument("--random-mm-limit-mm-per-prompt", help="Upstream limit help.")
+    parser.add_argument("--random-mm-bucket-config", help="Upstream bucket help.")
+
+    update_omni_help(parser)
+
+    actions = {action.dest: action for action in parser._actions}
+    assert all(metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf"))
+    assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
+    assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
+
+
+@pytest.mark.parametrize(
+    ("extra_body", "bot_task", "expected"),
+    [
+        (None, "think", {"bot_task": "think"}),
+        ({"bot_task": "recaption"}, "think", {"bot_task": "recaption"}),
+        ({"custom": True}, None, {"custom": True}),
+    ],
+)
+def test_preprocess_serve_args_merges_bot_task_without_overriding_extra_body(
+    extra_body: dict | None,
+    bot_task: str | None,
+    expected: dict,
+) -> None:
+    args = argparse.Namespace(extra_body=extra_body, bot_task=bot_task)
+
+    preprocess_serve_args(args)
+
+    assert args.extra_body == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_extra_body", "expected_explicit"),
+    [
+        (
+            ["--print-stage", "--image-edits-bot-task", "recaption"],
+            {"bot_task": "recaption"},
+            {"print_stage", "bot_task"},
+        ),
+        (
+            ["--extra-body", '{"bot_task":"vanilla"}'],
+            {"bot_task": "vanilla"},
+            {"extra_body"},
+        ),
+    ],
+)
+def test_omni_args_parse_and_preprocess(
+    argv: list[str],
+    expected_extra_body: dict,
+    expected_explicit: set[str],
+) -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--extra-body", type=json.loads, default=None)
+    add_omni_args(parser)
+
+    args = parser.parse_args(argv)
+    preprocess_serve_args(args)
+
+    assert args.extra_body == expected_extra_body
+    assert args.explicit_keys == expected_explicit
+
+
 def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     num_prompts = 5
     port = 18000

@@ -771,8 +771,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests = deque(
             request for request in self.waiting_for_chunk_running_requests if request.request_id not in request_ids
         )
+        self._held_non_active = deque(
+            request for request in self._held_non_active if request.request_id not in request_ids
+        )
 
         for req_id in request_ids:
+            self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)

@@ -3,10 +3,22 @@
 # be updated on every rebase to match the new upstream vllm commit/tag.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
 ARG VLLM_BASE_TAG=v0.25.0
-FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
+
+# We use registry-based layer caching for the dependencies,
+# where the tag is determined based on the hash of the contents
+# of files like pyproject.toml, etc. The deps stage should have
+# everything except the actual project dir, since that should not
+# change much across branches.
+FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
-COPY . .
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Placeholder package tree so editable install can register APP_DIR.
+# The final stage COPY --link fills this directory with the real sources;
+# the editable .pth / egg-link keeps resolving imports there — no PYTHONPATH.
+RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 
 # Install system dependencies
 RUN apt-get update && \
@@ -14,9 +26,30 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN uv pip install --system ".[dev]"
+# Copy dependency related things first and install deps/
+# We set the version str to 0.0.0 since it doesn't matter
+# for CI
+COPY pyproject.toml setup.py ./
+COPY requirements/ requirements/
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# Editable install: deps + project metadata are cached in this layer, while
+# the package itself is linked to APP_DIR (populated later by COPY --link).
+# Do NOT use a non-editable install here — that copies an empty stub into
+# site-packages and breaks ``import vllm_omni.entrypoints``.
+RUN uv pip install --system -e ".[dev]"
 
+# The final stage just copies the working dir on top of the
+# dependencies image. This uses --link so that we can skip
+# the image pull in Buildkite when we have a cache hit.
+#
+# IMPORTANT: Do not make any modifications that depend on the
+# file system after the --link copy, otherwise we'd need to pull
+# the heavy base image to build it. Editable install above already
+# registered APP_DIR, so we must not re-pip-install after COPY.
+FROM deps
+ARG APP_DIR=/workspace/vllm-omni
+WORKDIR ${APP_DIR}
 
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+COPY --link . .
 
 ENTRYPOINT []

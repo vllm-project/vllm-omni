@@ -25,10 +25,18 @@ from vllm_omni.engine.stage_client import (
     StagePoolLLMClient,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics import (
+    count_audio_frames,
+    count_image_pixels,
+    count_tokens_from_outputs,
+)
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
-from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.metrics.utils import (
+    coerce_positive_int_scalar,
+    iter_mm_outputs,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -97,6 +105,7 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._unavailable_replicas: set[int] = set()
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -206,27 +215,41 @@ class StagePool:
                 return addr
         return None
 
-    def add_client(self, input_addr: str, client: Any) -> int:
+    def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
         Returns the assigned ``replica_id`` (index into :attr:`clients`).
-        If the address is already known, replaces the existing client and
-        returns its existing id (this should not happen in practice — the
-        master server assigns unique slots — but the contract is idempotent
-        to keep the dispatch layer robust).
+        A coordinator-provided ``replica_id`` restores that exact slot after
+        unregister/re-register. Without one, a known address keeps its slot
+        and a new address takes the first vacant slot.
         """
         if not input_addr:
             raise ValueError("input_addr must be a non-empty string")
+        if replica_id is not None and replica_id < 0:
+            raise ValueError("replica_id must be non-negative")
 
         existing = self._addr_to_replica_id.get(input_addr)
-        if existing is not None:
-            self.clients[existing] = client
-            return existing
+        if replica_id is not None and existing is not None and existing != replica_id:
+            raise ValueError(
+                f"input address {input_addr!r} is already assigned to replica {existing}, not {replica_id}"
+            )
+        if replica_id is None:
+            replica_id = existing
+        if replica_id is None:
+            replica_id = next(
+                (index for index, existing_client in enumerate(self.clients) if existing_client is None),
+                len(self.clients),
+            )
 
-        replica_id = len(self.clients)
-        self.clients.append(client)
+        while len(self.clients) <= replica_id:
+            self.clients.append(None)
+            self._replica_metrics.append(_ReplicaMetrics())
+        for known_addr, known_replica_id in list(self._addr_to_replica_id.items()):
+            if known_replica_id == replica_id and known_addr != input_addr:
+                self._addr_to_replica_id.pop(known_addr, None)
+        self.clients[replica_id] = client
         self._addr_to_replica_id[input_addr] = replica_id
-        self._replica_metrics.append(_ReplicaMetrics())
+        self._unavailable_replicas.discard(replica_id)
         return replica_id
 
     def remove_client(self, input_addr: str) -> Any | None:
@@ -234,7 +257,7 @@ class StagePool:
 
         Slot is marked ``None`` to preserve indices for outstanding bindings.
         """
-        replica_id = self._addr_to_replica_id.pop(input_addr, None)
+        replica_id = self._addr_to_replica_id.get(input_addr)
         if replica_id is None:
             return None
         client = self.clients[replica_id]
@@ -475,6 +498,39 @@ class StagePool:
         for request_id in request_ids:
             self.release_binding(request_id)
 
+    def release_replica_bindings(self, replica_id: int) -> list[str]:
+        """Drop all route/session bindings owned by one physical replica."""
+        released_request_ids = [
+            request_id
+            for request_id, bound_replica_id in list(self._request_bindings.items())
+            if bound_replica_id == replica_id
+        ]
+        released_request_ids.extend(
+            request_id
+            for request_id, input_addr in list(self._affinity.items())
+            if self._addr_to_replica_id.get(input_addr) == replica_id
+        )
+        released_request_ids = list(dict.fromkeys(released_request_ids))
+        for request_id in released_request_ids:
+            self.release_binding(request_id)
+        return released_request_ids
+
+    def mark_replica_unavailable(self, replica_id: int) -> list[str]:
+        """Evict a failed replica from admission and release its bindings."""
+        if 0 <= replica_id < self.num_replicas:
+            self._unavailable_replicas.add(replica_id)
+        return self.release_replica_bindings(replica_id)
+
+    def is_replica_available(self, replica_id: int) -> bool:
+        return (
+            0 <= replica_id < self.num_replicas
+            and self.clients[replica_id] is not None
+            and replica_id not in self._unavailable_replicas
+        )
+
+    def available_replica_ids(self) -> list[int]:
+        return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
+
     def select_replica_id(
         self,
         request_id: str,
@@ -483,23 +539,27 @@ class StagePool:
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
         cached = self.get_bound_replica_id(request_id)
-        if cached is not None and self.clients[cached] is not None:
+        if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
+        if cached is not None:
+            # Cached replica is dead/unavailable: drop the stale binding.
+            self.release_binding(request_id)
 
         chosen: int | None = None
         if affinity_request_id is not None:
             parent = self.get_bound_replica_id(affinity_request_id)
-            if parent is not None and self.clients[parent] is not None:
+            if parent is not None and self.clients[parent] is not None and self.is_replica_available(parent):
                 chosen = parent
 
         if chosen is None:
-            live = self.live_replica_ids()
+            # Prefer replicas that are both live (client up) and available.
+            live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise RuntimeError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
-                # Round-robin over live replicas only.
+                # Round-robin over live, available replicas only.
                 start = self._next_replica_id % len(live)
                 chosen = live[start]
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
@@ -539,18 +599,23 @@ class StagePool:
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
-        num_tokens_out = count_tokens_from_outputs(request_outputs)
+        native_text_metrics = {}
+        if request_id:
+            pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
+            if callable(pop_native_text_metrics):
+                native_text_metrics = pop_native_text_metrics(request_id)
+        native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        num_tokens_out = (
+            max(int(native_generation_tokens), 0)
+            if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
+            else count_tokens_from_outputs(request_outputs)
+        )
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
             request_outputs,
             unit_type=output_unit_type,
             fallback_token_count=num_tokens_out,
         )
-        native_text_metrics = {}
-        if request_id:
-            pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
-            if callable(pop_native_text_metrics):
-                native_text_metrics = pop_native_text_metrics(request_id)
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
@@ -562,7 +627,7 @@ class StagePool:
             else 0.0
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
-        num_inference_steps = self._coerce_int_scalar(getattr(sampling_params, "num_inference_steps", None))
+        num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         denoise_step_latency_ms = (
             defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
             if output_unit_type == "image"
@@ -684,78 +749,40 @@ class StagePool:
 
     def _has_audio_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
-            for mm_output in self._iter_multimodal_outputs(ro):
+            for mm_output in iter_mm_outputs(ro):
                 if isinstance(mm_output, Mapping) and mm_output.get("audio") is not None:
                     return True
         return False
 
-    def _collect_audio_metrics(self, request_outputs: list[Any]) -> tuple[int, int, float]:
+    def _collect_audio_metrics(
+        self,
+        request_outputs: list[Any],
+        *,
+        use_default_sample_rate: bool = False,
+    ) -> tuple[int, int, float]:
         total_frames = 0
         sample_rate = 0
         for ro in request_outputs:
-            for mm_output in self._iter_multimodal_outputs(ro):
-                if not isinstance(mm_output, Mapping):
-                    continue
+            for mm_output in iter_mm_outputs(ro):
                 if sample_rate <= 0:
-                    sample_rate = self._infer_audio_sample_rate(mm_output)
-                audio_output = mm_output.get("audio")
-                if audio_output is None:
-                    continue
-                items = audio_output if isinstance(audio_output, list) else [audio_output]
-                for item in items:
-                    total_frames += self._count_audio_frames(item)
+                    sample_rate = self._infer_audio_sample_rate(mm_output, use_default=use_default_sample_rate)
+                total_frames += count_audio_frames(mm_output)
         duration_s = (float(total_frames) / float(sample_rate)) if total_frames > 0 and sample_rate > 0 else 0.0
         return int(total_frames), int(sample_rate), duration_s
 
-    @staticmethod
-    def _count_audio_frames(audio_output: Any) -> int:
-        shape = getattr(audio_output, "shape", None)
-        if shape is not None and len(shape) > 0:
-            # Audio chunks are concatenated on dim=-1 in the output processor,
-            # so the frame/sample axis is the last dim (e.g. [channels, frames]).
-            # Keep this aligned with serving_chat.py: audio tensors are consumed
-            # as (T,), (C, T), or (B, C, T). Flattening would corrupt
-            # multi-channel audio.
-            return int(shape[-1])
-        try:
-            return len(audio_output)
-        except TypeError:
-            return 1
-
-    def _infer_audio_sample_rate(self, mm_output: dict[str, Any]) -> int:
-        for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
-            rate = self._coerce_int_scalar(mm_output.get(key))
-            if rate > 0:
-                return rate
-        for attr in ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate"):
-            rate = self._coerce_int_scalar(getattr(self.stage_client, attr, None))
-            if rate > 0:
-                return rate
-            rate = self._coerce_int_scalar(getattr(self._stage_vllm_config, attr, None))
-            if rate > 0:
-                return rate
-        return 0
-
-    @classmethod
-    def _coerce_int_scalar(cls, value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                coerced = cls._coerce_int_scalar(item)
-                if coerced > 0:
-                    return coerced
-            return 0
-        item = getattr(value, "item", None)
-        if callable(item):
-            try:
-                return int(item())
-            except Exception:
-                return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+    def _infer_audio_sample_rate(
+        self,
+        mm_output: dict[str, Any] | None = None,
+        *,
+        use_default: bool = True,
+    ) -> int:
+        sources: list[Any] = []
+        if mm_output is not None:
+            sources.append(mm_output)
+        sources.extend([self.stage_client, self._stage_vllm_config])
+        if use_default:
+            return defs.resolve_audio_sample_rate(sources)
+        return defs.resolve_audio_sample_rate_or_none(sources) or 0
 
     def _has_image_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
@@ -777,7 +804,7 @@ class StagePool:
 
     def _count_images(self, request_output: Any) -> int:
         total_images = self._count_value_units(getattr(request_output, "images", None))
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping):
                 total_images += self._count_value_units(mm_output.get("image"))
                 total_images += self._count_value_units(mm_output.get("images"))
@@ -786,43 +813,17 @@ class StagePool:
     def _count_image_pixels(self, request_outputs: list[Any]) -> int:
         total_pixels = 0
         for ro in request_outputs:
-            total_pixels += self._count_image_value_pixels(getattr(ro, "images", None))
-            for mm_output in self._iter_multimodal_outputs(ro):
+            total_pixels += count_image_pixels(getattr(ro, "images", None))
+            for mm_output in iter_mm_outputs(ro):
                 if isinstance(mm_output, Mapping):
-                    total_pixels += self._count_image_value_pixels(mm_output.get("image"))
-                    total_pixels += self._count_image_value_pixels(mm_output.get("images"))
+                    total_pixels += count_image_pixels(mm_output.get("image"))
+                    total_pixels += count_image_pixels(mm_output.get("images"))
         return total_pixels
-
-    @classmethod
-    def _count_image_value_pixels(cls, value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, (list, tuple)):
-            return sum(cls._count_image_value_pixels(item) for item in value)
-
-        size = getattr(value, "size", None)
-        if isinstance(size, tuple) and len(size) >= 2:
-            try:
-                return int(size[0]) * int(size[1])
-            except (TypeError, ValueError):
-                return 0
-
-        shape = getattr(value, "shape", None)
-        if shape is None or len(shape) < 2:
-            return 0
-        dims = [int(dim) for dim in shape]
-        if len(dims) >= 4:
-            return dims[0] * dims[-2] * dims[-1]
-        if len(dims) == 3 and dims[0] in (1, 3, 4):
-            return dims[1] * dims[2]
-        if len(dims) == 3 and dims[-1] in (1, 3, 4):
-            return dims[0] * dims[1]
-        return dims[-2] * dims[-1]
 
     def _count_videos(self, request_output: Any) -> int:
         total_videos = self._count_video_units(getattr(request_output, "video", None))
         total_videos += self._count_video_units(getattr(request_output, "videos", None))
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping):
                 total_videos += self._count_video_units(mm_output.get("video"))
                 total_videos += self._count_video_units(mm_output.get("videos"))
@@ -847,7 +848,7 @@ class StagePool:
         custom_output = getattr(request_output, "_custom_output", None)
         if isinstance(custom_output, dict) and custom_output:
             return True
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
         for output in getattr(request_output, "outputs", None) or []:
@@ -910,22 +911,14 @@ class StagePool:
             self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
             if self._has_non_empty_output(request_output):
                 self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
-            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics([request_output])
+            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics(
+                [request_output],
+                use_default_sample_rate=False,
+            )
             if audio_frames > 0:
                 self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
-
-    def _iter_multimodal_outputs(self, request_output: object) -> list[Mapping[str, Any]]:
-        multimodal_outputs: list[Mapping[str, Any]] = []
-        outer_mm = getattr(request_output, "multimodal_output", None)
-        if isinstance(outer_mm, Mapping) and outer_mm:
-            multimodal_outputs.append(outer_mm)
-        for output in getattr(request_output, "outputs", None) or []:
-            inner_mm = getattr(output, "multimodal_output", None)
-            if isinstance(inner_mm, Mapping) and inner_mm:
-                multimodal_outputs.append(inner_mm)
-        return multimodal_outputs
 
     # ---- Stage-local admission ----
 
@@ -1029,14 +1022,28 @@ class StagePool:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-            await self._llm_client(replica_id).add_request_async(request)
+            try:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=prompt_text,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                await self._llm_client(replica_id).add_request_async(request)
+            except Exception:
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor update for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
+                raise
         return replica_id
 
     async def _pick_or_select(
@@ -1097,6 +1104,8 @@ class StagePool:
         timeout_s: float = 0.001,
     ) -> EngineCoreOutputs | None:
         """Poll raw EngineCore outputs from one LLM replica once."""
+        if not self.is_replica_available(replica_id):
+            return None
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
@@ -1120,6 +1129,8 @@ class StagePool:
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
+        if not self.is_replica_available(replica_id):
+            return None
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None

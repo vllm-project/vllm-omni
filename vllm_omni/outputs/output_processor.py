@@ -19,14 +19,14 @@ from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
-from vllm_omni.outputs.output_modality import (
-    DRAINABLE_MODALITIES,
-    OutputModality,
-    get_accumulation_strategy,
+from vllm_omni.outputs.multimodal_accumulation import (
+    drain_delta_payload,
+    is_non_final_delta_audio_chunk,
+    replace_snapshot_keys,
 )
+from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
 
 logger = init_logger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -53,6 +53,14 @@ def _modality_to_type_string(modality: OutputModality) -> str:
         if "latent" in lowered:
             return "latent"
     return "text"
+
+
+def _mean_time_per_output_token_ms(stats: RequestStateStats) -> float:
+    output_intervals = stats.num_generation_tokens - 1
+    if output_intervals <= 0:
+        return 0.0
+    decode_time_s = max(stats.last_token_ts - stats.first_token_ts, 0.0)
+    return decode_time_s * 1000.0 / float(output_intervals)
 
 
 class OmniRequestState(RequestState):
@@ -85,7 +93,7 @@ class OmniRequestState(RequestState):
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
-        self.native_text_stats.arrival_time = update.arrival_time
+        self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
@@ -104,6 +112,7 @@ class OmniRequestState(RequestState):
 
             incoming = MultimodalPayload.from_raw(payload, modality_key)
             if incoming is not None:
+                replace_snapshot_keys(self.mm_accumulated, incoming)
                 self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
@@ -170,9 +179,13 @@ class OmniRequestState(RequestState):
                 kv_transfer_params,
             )
 
+        is_delta = self.output_kind == RequestOutputKind.DELTA
+        if is_delta and finish_reason is not None and is_non_final_delta_audio_chunk(self.mm_accumulated, self.mm_type):
+            finish_reason = None
+            stop_reason = None
+
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
-        is_delta = self.output_kind == RequestOutputKind.DELTA
 
         if not finished and final_only:
             return None
@@ -280,10 +293,10 @@ class OmniRequestState(RequestState):
                     output.cumulative_text = base_output.cumulative_text
 
                 # DELTA mode: drain modality keys (e.g. audio) so the next
-                # step only sees freshly accumulated data for those keys.
+                # step only sees freshly accumulated data for those keys and
+                # their client-facing per-chunk metadata.
                 if self.output_kind == RequestOutputKind.DELTA:
-                    for modality_key in DRAINABLE_MODALITIES:
-                        self.mm_accumulated.tensors.pop(modality_key, None)
+                    drain_delta_payload(self.mm_accumulated)
 
                 return output
         except (RuntimeError, TypeError, AttributeError):
@@ -391,6 +404,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         return self._native_text_metrics_by_request.setdefault(
             request_id,
             {
+                "num_generation_tokens": 0,
                 "vllm_ttft_ms": 0.0,
                 "vllm_tpot_ms": 0.0,
                 "vllm_itl_ms": 0.0,
@@ -592,6 +606,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state.lora_name,
         )
         record = self._native_text_metric_record(req_state.external_req_id)
+        record["num_generation_tokens"] = int(native_stats.num_generation_tokens)
         if was_prefilling:
             record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
             return
@@ -601,6 +616,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             itls_ms = record.setdefault("vllm_itls_ms", [])
             itls_ms.append(itl_ms)
             record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
+        record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
 
     def _update_stats_from_finished(
         self,

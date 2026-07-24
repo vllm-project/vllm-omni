@@ -4,16 +4,11 @@
 from __future__ import annotations
 
 import enum
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import Any, TypedDict
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -34,7 +29,7 @@ class DiffusionRequestStatus(enum.IntEnum):
 
 
 @dataclass(frozen=True, eq=True)
-class SamplingParamsKey:
+class StepBatchSamplingParamsKey:
     """Denoise step level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only requests with the same key can be batched together.
@@ -81,33 +76,33 @@ class RequestBatchSamplingParamsKey:
     """
 
     # Spatial / temporal shape.
-    height: object = None
-    width: object = None
+    height: int | None = None
+    width: int | None = None
     num_frames: int = 1
-    resolution: object = 640
-    fps: object = None
-    frame_rate: object = None
-    boundary_ratio: object = None
+    resolution: int = 640
+    fps: int | None = None
+    frame_rate: float | None = None
+    boundary_ratio: float | None = None
 
     # CFG / guidance.
     do_classifier_free_guidance: bool = False
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
-    guidance_scale_2: object = None
+    guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
-    true_cfg_scale: object = None
+    true_cfg_scale: float | None = None
     cfg_normalize: bool = False
-    strength: object = None
+    strength: float | None = None
 
     # Scheduling / output shape.
-    num_inference_steps: object = None
-    sigmas: object = None
-    max_sequence_length: object = None
+    num_inference_steps: int | None = None
+    sigmas: list[float] | None = None
+    max_sequence_length: int | None = None
     num_outputs_per_prompt: int = 1
     eta: float = 0.0
-    decode_timestep: object = None
-    decode_noise_scale: object = None
-    output_type: object = None
+    decode_timestep: float | list[float] | None = None
+    decode_noise_scale: float | list[float] | None = None
+    output_type: str | None = None
 
     # Model-specific batch defaults used by request-mode pipelines.
     layers: int = 4
@@ -119,12 +114,12 @@ class RequestBatchSamplingParamsKey:
 
 
 @dataclass
-class DiffusionRequestState:
+class SchedulerRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
 
     request_id: str
     req: OmniDiffusionRequest
-    sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -145,7 +140,7 @@ class NewRequestData:
     req: OmniDiffusionRequest
 
     @classmethod
-    def from_state(cls, state: DiffusionRequestState) -> NewRequestData:
+    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
         return cls(request_id=state.request_id, req=state.req)
 
 
@@ -160,10 +155,20 @@ class CachedRequestData:
         return cls(request_ids=[])
 
 
+class KVPrefetchJob(TypedDict):
+    """Descriptor for prefetching the next request's received KV cache."""
+
+    request_id: str
+    kv_sender_info: dict[str, Any]
+
+
 @dataclass
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
+    # Stable scheduler-cycle diagnostics for engines, injected schedulers, and
+    # instrumentation; they are intentionally retained even without a direct
+    # production consumer for every field.
     step_id: int  # global step index
     scheduled_new_reqs: list[NewRequestData]
     scheduled_cached_reqs: CachedRequestData
@@ -171,7 +176,7 @@ class DiffusionSchedulerOutput:
     num_running_reqs: int
     num_waiting_reqs: int
     # next request to background-prefetch KV
-    kv_prefetch_jobs: dict | None = None
+    kv_prefetch_job: KVPrefetchJob | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:
@@ -190,55 +195,3 @@ class DiffusionSchedulerOutput:
     @property
     def is_empty(self) -> bool:
         return self.num_scheduled_reqs == 0
-
-
-class SchedulerInterface(ABC):
-    """Abstract lifecycle contract for diffusion schedulers."""
-
-    @abstractmethod
-    def initialize(self, od_config: OmniDiffusionConfig) -> None:
-        """Initialize or reset scheduler state."""
-
-    @abstractmethod
-    def add_request(self, request: OmniDiffusionRequest) -> str:
-        """Add a request and return the scheduler-owned request id."""
-
-    @abstractmethod
-    def schedule(self) -> DiffusionSchedulerOutput:
-        """Run one scheduling cycle."""
-
-    @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        """Update scheduler state from executor output."""
-
-    @abstractmethod
-    def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
-        """Return request state if present."""
-
-    @abstractmethod
-    def has_requests(self) -> bool:
-        """Return whether the scheduler still owns runnable requests."""
-
-    @abstractmethod
-    def num_waiting_requests(self) -> int:
-        """Return the number of requests waiting to be scheduled."""
-
-    @abstractmethod
-    def num_running_requests(self) -> int:
-        """Return the number of requests currently running."""
-
-    @abstractmethod
-    def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
-        """Remove and return request state if present."""
-
-    @abstractmethod
-    def preempt_request(self, request_id: str) -> bool:
-        """Preempt a running request back to waiting."""
-
-    @abstractmethod
-    def finish_requests(self, request_ids: str | list[str], status: DiffusionRequestStatus) -> None:
-        """Mark one or more requests finished."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Release scheduler-owned state."""
