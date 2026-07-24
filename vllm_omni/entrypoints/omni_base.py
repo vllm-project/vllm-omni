@@ -530,12 +530,11 @@ class OmniBase(PDDisaggregationMixin):
         _m = result.metrics
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
-        if _m is not None:
-            metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
         if finished and _m is not None:
             msg_id = id(result)
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
 

@@ -644,11 +644,17 @@ class OrchestratorAggregator:
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
         if diffusion_metrics:
+            _MS_TO_S = {
+                "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+                "preprocess_time_ms": "preprocess_time_s",
+                "postprocess_time_ms": "postprocess_time_s",
+                "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
+            }
             for key, value in diffusion_metrics.items():
                 if value is None:
                     continue
-                if key.endswith("_time_s"):
-                    self.diffusion_metrics[req_id][key] += value
+                if key in _MS_TO_S:
+                    self.diffusion_metrics[req_id][_MS_TO_S[key]] = float(value) / 1000.0
                 else:
                     self.diffusion_metrics[req_id][key] = value
 
