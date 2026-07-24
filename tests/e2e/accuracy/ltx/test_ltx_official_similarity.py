@@ -35,6 +35,10 @@ PROMPT = (
     "Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, "
     "slow camera rotation, dreamlike atmosphere, ultra-detailed, surreal fantasy scene"
 )
+I2V_PROMPT = (
+    "A space shuttle launches vertically above a desert launch pad. Bright exhaust flames and a dense white "
+    "plume billow beneath it while the camera remains fixed."
+)
 NEGATIVE_PROMPT = (
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
     "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
@@ -71,6 +75,10 @@ class LTXAccuracyCase:
     checkpoint_revision: str
     checkpoint_env: str
     stg_block: int
+    prompt: str = PROMPT
+    image_repo: str | None = None
+    image_filename: str | None = None
+    image_revision: str | None = None
 
 
 CASES = (
@@ -97,6 +105,23 @@ CASES = (
         checkpoint_revision="4229404625088d21c4f112eb640fb04a0900ee25",
         checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
         stg_block=28,
+    ),
+    # Manual I2V guard; the nightly job intentionally selects only ltx2_3.
+    LTXAccuracyCase(
+        name="ltx2_3_i2v",
+        model_id="diffusers/LTX-2.3-Diffusers",
+        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
+        model_env="VLLM_TEST_LTX23_MODEL",
+        model_class_name="LTX2Pipeline",
+        checkpoint_repo="Lightricks/LTX-2.3",
+        checkpoint_filename="ltx-2.3-22b-dev.safetensors",
+        checkpoint_revision="4229404625088d21c4f112eb640fb04a0900ee25",
+        checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
+        stg_block=28,
+        prompt=I2V_PROMPT,
+        image_repo="huggingface/documentation-images",
+        image_filename="diffusers/svd/rocket.png",
+        image_revision="645d8364f0c7a101180b364811b5a11a362e4010",
     ),
 )
 
@@ -226,9 +251,29 @@ def _resolve_checkpoint(case: LTXAccuracyCase, model: Path) -> Path:
     )
 
 
-def _request(case: LTXAccuracyCase) -> dict[str, object]:
-    return {
-        "prompt": PROMPT,
+def _resolve_image(case: LTXAccuracyCase) -> Path | None:
+    if case.image_filename is None:
+        return None
+    if case.image_repo is None or case.image_revision is None:
+        raise ValueError(f"Incomplete image source for LTX accuracy case {case.name!r}.")
+    configured_image = os.environ.get("VLLM_TEST_LTX_I2V_IMAGE")
+    if configured_image:
+        image = Path(configured_image)
+        assert image.is_file(), f"LTX I2V conditioning image not found: {image}"
+        return image
+    return Path(
+        hf_hub_download(
+            repo_id=case.image_repo,
+            repo_type="dataset",
+            filename=case.image_filename,
+            revision=case.image_revision,
+        )
+    )
+
+
+def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
+    request: dict[str, object] = {
+        "prompt": case.prompt,
         "negative_prompt": NEGATIVE_PROMPT,
         "width": 512,
         "height": 384,
@@ -247,6 +292,9 @@ def _request(case: LTXAccuracyCase) -> dict[str, object]:
         "video_stg_blocks": [case.stg_block],
         "audio_stg_blocks": [case.stg_block],
     }
+    if image is not None:
+        request["image"] = str(image.resolve())
+    return request
 
 
 def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
@@ -303,8 +351,9 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     model = _resolve_model(case)
     gemma_root = _resolve_gemma_root(model)
     checkpoint = _resolve_checkpoint(case, model)
+    image = _resolve_image(case)
     request_path = output_root / "request.json"
-    request_path.write_text(json.dumps(_request(case), indent=2) + "\n")
+    request_path.write_text(json.dumps(_request(case, image), indent=2) + "\n")
 
     runner = Path(__file__).with_name("run_ltx_reference.py")
     base_command = [
@@ -319,6 +368,11 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
         base_command.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
+    repository_root = Path(__file__).resolve().parents[4]
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
+    )
 
     official_output = output_root / "official"
     _run(
@@ -371,6 +425,7 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     )
     result = {
         "case": case.name,
+        "task": "i2v" if image is not None else "t2v",
         "attention_backend": ATTENTION_BACKEND,
         "official_revision": official_revision,
         "model_revision": case.model_revision,

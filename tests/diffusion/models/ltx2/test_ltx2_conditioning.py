@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -21,6 +22,18 @@ def _make_ltx23_request_pipe(cls):
 
 
 class TestLTXImageToVideoForwardStages:
+    def test_i2v_pil_preprocessing_matches_official_center_crop(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import _preprocess_i2v_pil_images
+
+        pixels = torch.zeros(4, 8, 3, dtype=torch.uint8)
+        pixels[:, :, 0] = torch.arange(8, dtype=torch.uint8)
+        image = Image.fromarray(pixels.numpy())
+
+        actual = _preprocess_i2v_pil_images(image, height=4, width=4)
+        expected = pixels[:, 2:6].permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
+
+        torch.testing.assert_close(actual, expected)
+
     def test_forward_resolves_request_image_and_delegates_to_shared_recipe_runtime(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest

@@ -121,6 +121,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
 
     from ltx_core.components.guiders import MultiModalGuiderParams
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
+    from ltx_pipelines.utils.args import ImageConditioningInput
     from ltx_pipelines.utils.types import OffloadMode
 
     pipeline = TI2VidOneStagePipeline(
@@ -131,6 +132,22 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     )
     if args.attention_backend == "sdpa_flash":
         _configure_official_sdpa_flash(pipeline)
+    image_path = request.get("image")
+    images = (
+        []
+        if image_path is None
+        else [
+            ImageConditioningInput(
+                path=str(image_path),
+                frame_idx=0,
+                strength=1.0,
+                # Both runtimes must receive the same source pixels. The
+                # official CLI's optional H.264 preprocessing is not part of
+                # the seeded model trajectory under test.
+                crf=0,
+            )
+        ]
+    )
     video, audio = pipeline(
         prompt=request["prompt"],
         negative_prompt=request["negative_prompt"],
@@ -156,7 +173,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
             skip_step=0,
             stg_blocks=request["audio_stg_blocks"],
         ),
-        images=[],
+        images=images,
         max_batch_size=4,
     )
     video_tensor = torch.cat([chunk.detach().cpu() for chunk in video], dim=0)
@@ -287,10 +304,17 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             key: value for key, value in request.items() if key.startswith("video_") or key.startswith("audio_")
         }
         apply_declared_extra_args(sampling_params, get_extra_body_params(model_class_name), guidance)
-        output = omni.generate(
-            {"prompt": request["prompt"], "negative_prompt": request["negative_prompt"]},
-            sampling_params,
-        )
+        prompt: dict[str, Any] = {
+            "prompt": request["prompt"],
+            "negative_prompt": request["negative_prompt"],
+        }
+        image_path = request.get("image")
+        if image_path is not None:
+            with Image.open(str(image_path)) as source_image:
+                image = source_image.convert("RGB")
+                image.load()
+            prompt["multi_modal_data"] = {"image": image}
+        output = omni.generate(prompt, sampling_params)
         video, audio, audio_sample_rate = _unwrap_omni_output(output)
         audio_tensor = torch.as_tensor(np.asarray(audio) if not isinstance(audio, torch.Tensor) else audio)
         _save_outputs(

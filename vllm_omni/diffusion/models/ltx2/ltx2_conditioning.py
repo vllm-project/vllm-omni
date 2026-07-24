@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import PIL.Image
 import torch
+import torch.nn.functional as F
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -42,6 +45,41 @@ def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_outputs: int) ->
     if num_outputs == 1:
         return tensor
     return tensor.repeat_interleave(num_outputs, dim=0)
+
+
+def _preprocess_i2v_pil_images(
+    images: PIL.Image.Image | list[PIL.Image.Image],
+    *,
+    height: int,
+    width: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Match official LTX aspect-preserving resize and center crop."""
+    image_list = images if isinstance(images, list) else [images]
+    processed = []
+    for image in image_list:
+        pixels = (
+            torch.from_numpy(np.array(image.convert("RGB"), copy=True))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=device, dtype=torch.float32)
+        )
+        source_height, source_width = pixels.shape[-2:]
+        scale = max(height / source_height, width / source_width)
+        resized_height = math.ceil(source_height * scale)
+        resized_width = math.ceil(source_width * scale)
+        pixels = F.interpolate(
+            pixels,
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        crop_top = (resized_height - height) // 2
+        crop_left = (resized_width - width) // 2
+        pixels = pixels[:, :, crop_top : crop_top + height, crop_left : crop_left + width]
+        processed.append((pixels / 127.5 - 1.0).to(dtype=dtype))
+    return torch.cat(processed, dim=0)
 
 
 class LTXTextConditioningMixin:
@@ -567,6 +605,16 @@ class LTXI2VConditioningMixin:
                     image = image.unsqueeze(0)
             elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
                 image = torch.stack(image, dim=0)
+            elif isinstance(image, PIL.Image.Image) or (
+                isinstance(image, list) and image and isinstance(image[0], PIL.Image.Image)
+            ):
+                image = _preprocess_i2v_pil_images(
+                    image,
+                    height=request_inputs.height,
+                    width=request_inputs.width,
+                    device=device,
+                    dtype=prompt_context.positive_connector_prompt_embeds.dtype,
+                )
             else:
                 image = self.video_processor.preprocess(
                     image,
