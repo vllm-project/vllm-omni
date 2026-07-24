@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -27,7 +27,7 @@ model_path = "hf-internal-testing/tiny-helios-modular-pipe"
 @pytest.fixture(scope="module")
 def prefetch_helios_model():
     """Downloads the tiny helios model prior to running a test."""
-    snapshot_download(model_path)
+    hf_api().snapshot_download(model_path)
 
 
 @pytest.fixture(scope="function")

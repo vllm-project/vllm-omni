@@ -120,7 +120,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
         raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
 
     try:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Daily-Omni Hub media download requires huggingface_hub. "
@@ -135,7 +135,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
     tar_path: Path | None = None
     for fname in ("Videos.tar", "videos.tar"):
         try:
-            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
+            tar_path = Path(hf_api().hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
             break
         except Exception:
             continue

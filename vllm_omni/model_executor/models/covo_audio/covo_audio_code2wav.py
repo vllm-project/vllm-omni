@@ -25,9 +25,9 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
         if os.path.isdir(model_name):
             model_path = model_name
         else:
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            model_path = snapshot_download(model_name)
+            model_path = hf_api().snapshot_download(model_name)
         token2wav_path = os.path.join(model_path, "token2wav")
 
         code2wav_config = CovoAudioCode2WavConfig()

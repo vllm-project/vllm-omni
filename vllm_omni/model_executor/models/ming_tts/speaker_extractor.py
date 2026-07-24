@@ -14,9 +14,9 @@ def resolve_model_to_local_path(model):
     if os.path.isdir(model):
         return model
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model)
+    return hf_api().snapshot_download(model)
 
 
 class MingSpeakerEmbeddingExtractor:

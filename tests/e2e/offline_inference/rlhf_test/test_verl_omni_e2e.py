@@ -43,7 +43,6 @@ import pytest
 import ray
 import torch
 import torchvision.transforms as T
-from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from transformers import AutoTokenizer
@@ -57,6 +56,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _resolve_model_path(repo_id: str) -> str:
     # Allow overriding with a pre-existing local path (skips download).
     if os.path.isdir(repo_id):
         return repo_id
-    return snapshot_download(repo_id=repo_id)
+    return hf_api().snapshot_download(repo_id=repo_id)
 
 
 _MIN_PROMPT_TOKENS = 35

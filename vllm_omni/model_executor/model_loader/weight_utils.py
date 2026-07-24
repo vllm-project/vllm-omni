@@ -9,7 +9,10 @@ from vllm.model_executor.model_loader.weight_utils import DisabledTqdm, get_lock
 if envs.VLLM_USE_MODELSCOPE:
     from modelscope.hub.snapshot_download import snapshot_download
 else:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    def snapshot_download(*args, **kwargs):
+        return hf_api().snapshot_download(*args, **kwargs)
 
 logger = init_logger(__name__)
 

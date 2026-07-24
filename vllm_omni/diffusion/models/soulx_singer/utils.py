@@ -5,11 +5,11 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torchaudio
-from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -182,7 +182,7 @@ def resolve_preprocess_weights_root(od_config: OmniDiffusionConfig) -> Path:
         "SoulX preprocess weights not found locally; downloading %s",
         _PREPROCESS_WEIGHTS_REPO,
     )
-    downloaded = snapshot_download(
+    downloaded = hf_api().snapshot_download(
         _PREPROCESS_WEIGHTS_REPO,
         allow_patterns=["*"],
         local_dir=local_dir,

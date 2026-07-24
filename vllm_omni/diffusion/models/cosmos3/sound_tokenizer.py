@@ -338,9 +338,9 @@ class Cosmos3SoundTokenizer:
 
         model_root = str(model_path) if model_path and os.path.isdir(model_path) else None
         if model_root is None and model_path and not explicit_avae_path:
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            model_root = snapshot_download(
+            model_root = hf_api().snapshot_download(
                 repo_id=str(model_path),
                 revision=getattr(od_config, "revision", None),
                 allow_patterns=[

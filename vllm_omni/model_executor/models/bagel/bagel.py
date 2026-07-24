@@ -122,9 +122,9 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
             if p.is_dir():
                 index_path = p / "model.safetensors.index.json"
             else:
-                from huggingface_hub import hf_hub_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                index_path = Path(hf_hub_download(model_name, "model.safetensors.index.json"))
+                index_path = Path(hf_api().hf_hub_download(model_name, "model.safetensors.index.json"))
 
             if not index_path.exists():
                 return

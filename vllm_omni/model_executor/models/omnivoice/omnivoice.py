@@ -487,9 +487,9 @@ class OmniVoiceModel(
         if os.path.isdir(model_dir):
             return model_dir
         # HF hub model ID — resolve to local cache
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return snapshot_download(model_dir)
+        return hf_api().snapshot_download(model_dir)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         try:

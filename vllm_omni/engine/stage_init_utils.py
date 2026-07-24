@@ -69,10 +69,10 @@ def _resolve_model_to_local_path(model: str) -> str:
         return model
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         # Keep init path resolution offline-friendly.
-        return snapshot_download(model, local_files_only=True)
+        return hf_api().snapshot_download(model, local_files_only=True)
     except Exception:
         logger.warning(
             "[stage_init] Could not resolve %s to local snapshot; using as-is",

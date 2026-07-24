@@ -94,9 +94,9 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
         return model_path
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_path)
+    return hf_api().snapshot_download(model_path)
 
 
 def _round_by_factor(number: float, factor: int) -> int:

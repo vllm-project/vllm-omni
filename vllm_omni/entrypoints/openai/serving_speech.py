@@ -2827,9 +2827,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if tokenizer is None:
             model_path = self.engine_client.model_config.model
             if not os.path.isdir(model_path):
-                from huggingface_hub import snapshot_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_path = snapshot_download(model_path)
+                model_path = hf_api().snapshot_download(model_path)
             tokenizer = get_qwen_tokenizer(
                 token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
                 skip_special_tokens=hf_cfg.skip_special_tokens,

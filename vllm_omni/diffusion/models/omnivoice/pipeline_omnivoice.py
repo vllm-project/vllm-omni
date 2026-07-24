@@ -141,9 +141,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
 
         # Resolve model path (HF hub ID → local cache)
         if not os.path.isdir(self.model_path):
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            self.model_path = snapshot_download(self.model_path)
+            self.model_path = hf_api().snapshot_download(self.model_path)
 
         # Load OmniVoice config
         config_path = os.path.join(self.model_path, "config.json")

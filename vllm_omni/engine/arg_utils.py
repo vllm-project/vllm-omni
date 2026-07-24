@@ -305,9 +305,9 @@ class OmniEngineArgs(EngineArgs):
                 if subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
-                        from huggingface_hub import snapshot_download
+                        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                        local_dir = snapshot_download(
+                        local_dir = hf_api().snapshot_download(
                             model_path,
                             allow_patterns=[
                                 f"{subfolder}/tokenizer*",

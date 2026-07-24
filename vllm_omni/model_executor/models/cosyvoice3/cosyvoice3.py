@@ -10,7 +10,6 @@ import numpy as np
 import onnxruntime
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from scipy.signal import resample_poly
 from transformers import Qwen2Config
 from transformers.feature_extraction_utils import BatchFeature
@@ -51,6 +50,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -123,7 +123,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         """Build the per-model runtime components once (cached process-wide)."""
         # If model_dir is an HF repo ID (not a local path), resolve to cache.
         if not os.path.isdir(model_dir):
-            model_dir = snapshot_download(model_dir)
+            model_dir = hf_api().snapshot_download(model_dir)
 
         tokenizer = get_qwen_tokenizer(
             token_path=os.path.join(model_dir, config.qwen_pretrain_path),
@@ -449,7 +449,7 @@ class CosyVoice3Model(
         self.model_stage = vllm_config.model_config.model_stage
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
-            model_dir = snapshot_download(model_dir)
+            model_dir = hf_api().snapshot_download(model_dir)
         self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
@@ -895,7 +895,7 @@ class CosyVoice3Model(
         repo = getattr(self.config, "flow_estimator_onnx_repo", None)
         if repo:
             try:
-                fetched_dir = snapshot_download(repo, allow_patterns=[fp16_name])
+                fetched_dir = hf_api().snapshot_download(repo, allow_patterns=[fp16_name])
                 fetched = os.path.join(fetched_dir, fp16_name)
                 if os.path.exists(fetched):
                     return fetched

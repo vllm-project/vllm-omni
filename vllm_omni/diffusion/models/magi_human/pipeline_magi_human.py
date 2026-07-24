@@ -1649,9 +1649,9 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
         with open(path) as f:
             return json.load(f)
     else:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        cached = hf_hub_download(repo_id=model_path, filename=filename)
+        cached = hf_api().hf_hub_download(repo_id=model_path, filename=filename)
         with open(cached) as f:
             return json.load(f)
 
@@ -1669,12 +1669,12 @@ def _resolve_subdir(
     """
     if local_files_only:
         return os.path.join(model_path, subfolder)
-    from huggingface_hub import hf_hub_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     files = required_files or ["config.json"]
     last_cached: str | None = None
     for fname in files:
-        last_cached = hf_hub_download(repo_id=model_path, filename=f"{subfolder}/{fname}")
+        last_cached = hf_api().hf_hub_download(repo_id=model_path, filename=f"{subfolder}/{fname}")
     return os.path.dirname(last_cached)
 
 

@@ -295,7 +295,7 @@ def prefetch_subfolders(
     logger.info("Prefetching %s subfolders: %s", model, subfolders)
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError:  # pragma: no cover - huggingface_hub is a hard dep
         logger.debug("huggingface_hub unavailable; skipping prefetch of %s", model)
         return
@@ -332,7 +332,7 @@ def prefetch_subfolders(
     for attempt in range(1, _PREFETCH_MAX_ATTEMPTS + 1):
         try:
             with _repo_prefetch_lock(model):
-                snapshot_download(
+                hf_api().snapshot_download(
                     repo_id=model,
                     allow_patterns=allow_patterns,
                 )

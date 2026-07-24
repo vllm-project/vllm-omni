@@ -90,9 +90,10 @@ def load_semantic_codec(model_path: str, config: dict, device: torch.device):
         codec.load_state_dict(state, strict=False)
     else:
         import safetensors.torch
-        from huggingface_hub import hf_hub_download
 
-        ckpt_path = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        ckpt_path = hf_api().hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
         safetensors.torch.load_model(codec, ckpt_path)
     _freeze(codec.to(device=device, dtype=torch.float32))
     _semantic_codec_cache[cache_key] = codec
@@ -108,9 +109,9 @@ def load_campplus(model_path: str, device: torch.device):
     campplus = CAMPPlus(feat_dim=80, embedding_size=192)
     ckpt_path = resolve_model_file(model_path, "campplus.pth")
     if ckpt_path is None:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        ckpt_path = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+        ckpt_path = hf_api().hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
     state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     campplus.load_state_dict(state, strict=False)
     _freeze(campplus.to(device=device, dtype=torch.float32))

@@ -113,9 +113,9 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> str:
                 return candidate
         return model_path
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    local_dir = snapshot_download(
+    local_dir = hf_api().snapshot_download(
         model_path,
         allow_patterns=[
             f"{_GLM_TTS_TOKENIZER_SUBDIR}/tokenizer*",
@@ -169,9 +169,9 @@ def resolve_glm_tts_model_dir(
         except Exception:
             pass
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_name_or_path)
+    return hf_api().snapshot_download(model_name_or_path)
 
 
 def _first_glm_tts_value(value: Any) -> Any:

@@ -20,12 +20,13 @@ def skip_if_gated_repo_inaccessible(repo_id: str) -> None:
     and we skip cleanly.
     """
     try:
-        from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except Exception:
         return
     try:
-        hf_hub_download(repo_id=repo_id, filename="config.json")
+        hf_api().hf_hub_download(repo_id=repo_id, filename="config.json")
     except GatedRepoError as exc:
         pytest.skip(
             f"Skipping: gated HF repo {repo_id!r} inaccessible to the current "

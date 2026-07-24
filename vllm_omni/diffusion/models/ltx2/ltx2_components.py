@@ -16,7 +16,6 @@ from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchE
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
-from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
@@ -24,6 +23,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -87,7 +87,7 @@ def _detect_vocoder_output_sample_rate(model: str) -> int | None:
     vocoder_config_path = os.path.join(model, "vocoder", "config.json")
     if not os.path.exists(vocoder_config_path):
         try:
-            vocoder_config_path = hf_hub_download(model, "vocoder/config.json")
+            vocoder_config_path = hf_api().hf_hub_download(model, "vocoder/config.json")
         except Exception:
             return None
     try:
@@ -267,9 +267,7 @@ def load_transformer_config(
                 return json.load(config_file)
     else:
         try:
-            from huggingface_hub import hf_hub_download
-
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
             )

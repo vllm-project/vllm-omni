@@ -248,9 +248,9 @@ def _load_audio_tokenizer():
 
     audio_tokenizer_dir = _resolve_audio_tokenizer_dir()
     if audio_tokenizer_dir is None:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        repo_path = snapshot_download(
+        repo_path = hf_api().snapshot_download(
             _K2_OMNIVOICE_REPO,
             allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
         )

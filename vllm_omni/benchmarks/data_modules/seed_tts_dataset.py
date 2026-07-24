@@ -111,7 +111,7 @@ def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None
 
     repo_id = dataset_path.strip()
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Install huggingface_hub to download Seed-TTS from the Hub, or clone the dataset "
@@ -120,7 +120,7 @@ def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None
     # Download only the requested locale subtree instead of the whole dataset
     # repo. This avoids large, flaky nightly downloads when we only need e.g.
     # ``en/meta.lst`` + ``en/prompt-wavs/**``.
-    cache = snapshot_download(
+    cache = hf_api().snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
         allow_patterns=[f"{locale}/**"],

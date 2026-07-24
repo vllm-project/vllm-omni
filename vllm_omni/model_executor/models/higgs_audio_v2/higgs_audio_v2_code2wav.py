@@ -231,9 +231,9 @@ class HiggsAudioV2Code2Wav(nn.Module):
                 if os.path.isfile(os.path.join(candidate, "config.json")):
                     return candidate
 
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return snapshot_download(repo_id=repo_id)
+        return hf_api().snapshot_download(repo_id=repo_id)
 
     # ------------------------------------------------------ direct decode API
     @torch.inference_mode()

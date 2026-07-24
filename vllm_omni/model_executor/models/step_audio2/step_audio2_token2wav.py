@@ -391,9 +391,9 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         if model_path is None:
             # Resolve HF repo names to local cache path
             if not os.path.isdir(model_name_or_path):
-                from huggingface_hub import snapshot_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_name_or_path = snapshot_download(model_name_or_path)
+                model_name_or_path = hf_api().snapshot_download(model_name_or_path)
             model_path = f"{model_name_or_path}/token2wav"
 
         float16 = getattr(self.config, "token2wav_float16", False)

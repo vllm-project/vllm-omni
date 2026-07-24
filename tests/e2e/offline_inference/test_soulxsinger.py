@@ -66,9 +66,9 @@ _CASES = (
 
 @functools.lru_cache(maxsize=1)
 def _resolve_weights() -> tuple[Path, Path, Path]:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    base = Path(snapshot_download("Soul-AILab/SoulX-Singer", allow_patterns=["*"]))
+    base = Path(hf_api().snapshot_download("Soul-AILab/SoulX-Singer", allow_patterns=["*"]))
 
     # phone_set.json is not on HF; best-effort stage it from pinned upstream so
     # SVS can load. SVS tests skip (not fail) if both this and a manual copy are absent.
@@ -93,9 +93,9 @@ def _resolve_weights() -> tuple[Path, Path, Path]:
         if (pre / "rmvpe" / "rmvpe.pt").is_file():
             return base, svc_dir, pre
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    pre = Path(snapshot_download("Soul-AILab/SoulX-Singer-Preprocess", allow_patterns=["*"]))
+    pre = Path(hf_api().snapshot_download("Soul-AILab/SoulX-Singer-Preprocess", allow_patterns=["*"]))
     return base, svc_dir, pre
 
 

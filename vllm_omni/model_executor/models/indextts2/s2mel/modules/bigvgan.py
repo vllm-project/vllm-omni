@@ -9,13 +9,14 @@ import os
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
+from huggingface_hub import PyTorchModelHubMixin
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import Snake, SnakeBeta
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.commons import AttrDict
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 # ---------------------------------------------------------------------------
 # Helpers (inlined from env.py / utils.py)
@@ -328,7 +329,7 @@ class BigVGAN(
         def _resolve(filename):
             if os.path.isdir(model_id):
                 return os.path.join(model_id, filename)
-            return hf_hub_download(
+            return hf_api().hf_hub_download(
                 repo_id=model_id,
                 filename=filename,
                 **{
