@@ -12,10 +12,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, _resolve_model_index_class_name
 from vllm_omni.diffusion.models.ltx2 import ltx2_components
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
+    LTX2_DISTILLED_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
     _install_connector_attention,
     detect_ltx_model_version,
@@ -61,6 +62,7 @@ def _make_ltx_request_pipe(cls):
     pipe.device = torch.device("cpu")
     pipe.tokenizer_max_length = 99
     pipe.vae_spatial_compression_ratio = 32
+    pipe.vae_temporal_compression_ratio = 8
     return pipe
 
 
@@ -105,8 +107,21 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     assert issubclass(LTX2DistilledPipeline, LTXRuntime)
     assert LTX2Pipeline.component_profile is LTX2_COMPONENT_PROFILE
     assert LTX2Pipeline.pipeline_recipe is LTX2_ONE_STAGE_RECIPE
+    assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
     assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
     assert LTX23_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
+
+
+def test_ltx_distilled_repository_name_selects_two_stage_entry():
+    model_index = {"_class_name": "LTX2Pipeline"}
+
+    assert _resolve_model_index_class_name("rootonchair/LTX-2-19b-distilled", model_index) == (
+        "LTX2DistilledPipeline"
+    )
+    assert _resolve_model_index_class_name("/cache/models--rootonchair--LTX-2-19b-distilled/snapshots/abc", model_index) == (
+        "LTX2DistilledPipeline"
+    )
+    assert _resolve_model_index_class_name("Lightricks/LTX-2", model_index) == "LTX2Pipeline"
 
 
 def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
@@ -594,12 +609,12 @@ def test_denoise_executor_owns_progress_and_interrupt():
 def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
     request_inputs = LTXRequestInputs(
         prompt="prompt",
-        negative_prompt="negative",
+        negative_prompt="",
         height=64,
         width=64,
         num_frames=1,
         frame_rate=24.0,
-        num_inference_steps=4,
+        num_inference_steps=8,
         guidance=LTXGuidanceSpec.positive_only(),
         num_videos_per_prompt=1,
         generator=None,
@@ -622,6 +637,7 @@ def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
 
     def run_phase(req, inputs, *, prompt_context=None, **kwargs):
         phase_recipe = kwargs["phase_recipe"]
+        assert kwargs["image"] is source_image
         phase_calls.append((phase_recipe, inputs, prompt_context))
         if len(phase_calls) == 1:
             assert prompt_context is None
@@ -663,10 +679,8 @@ def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
     class FakeUpsampler(torch.nn.Module):
         dtype = torch.float32
 
-        def forward(self, *, latents, output_type, return_dict):
-            assert output_type == "latent"
-            assert not return_dict
-            return (latents.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1),)
+        def forward(self, latents):
+            return latents.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
 
     prompt_context_sentinel = prompt_context
     pipeline = object.__new__(LTX2DistilledPipeline)
@@ -674,17 +688,59 @@ def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
     pipeline.device = torch.device("cpu")
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
-    pipeline.upsample_pipe = FakeUpsampler()
+    pipeline.latent_upsampler = FakeUpsampler()
     object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
     object.__setattr__(pipeline, "run_phase", run_phase)
     object.__setattr__(pipeline, "decode_phase", decode_phase)
 
-    output = pipeline.forward(SimpleNamespace(sampling_params_list=[], prompts=[]))
+    source_image = object()
+    output = pipeline.forward(SimpleNamespace(sampling_params_list=[], prompts=[]), image=source_image)
 
     assert len(phase_calls) == 2
     assert phase_calls[1][2] is prompt_context_sentinel
     torch.testing.assert_close(output.output[0], torch.full((1, 128, 1, 2, 2), 3.0))
     torch.testing.assert_close(output.output[1], torch.full((1, 8, 1, 2), 4.0))
+
+
+def test_ltx2_distilled_stage2_reapplies_final_resolution_i2v_conditioning():
+    from vllm_omni.diffusion.models.ltx2 import ltx2_latents
+
+    pipeline = object.__new__(LTX2DistilledPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.vae_spatial_compression_ratio = 32
+    pipeline.vae_temporal_compression_ratio = 8
+    pipeline.transformer_spatial_patch_size = 1
+    pipeline.transformer_temporal_patch_size = 1
+    pipeline.vae = SimpleNamespace(
+        latents_mean=torch.zeros(2),
+        latents_std=torch.ones(2),
+        config=SimpleNamespace(scaling_factor=1.0),
+    )
+    object.__setattr__(
+        pipeline,
+        "_encode_i2v_image_latents",
+        lambda image, **_kwargs: torch.full((image.shape[0], 2, 1, 2, 2), 7.0),
+    )
+
+    packed, conditioning_mask = pipeline.prepare_latents(
+        image=torch.zeros(1, 3, 64, 64),
+        batch_size=1,
+        num_channels_latents=2,
+        height=64,
+        width=64,
+        num_frames=9,
+        noise_scale=0.0,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        latents=torch.ones(1, 2, 2, 2, 2),
+    )
+    unpacked = ltx2_latents.unpack_latents(packed, 2, 2, 2)
+
+    torch.testing.assert_close(unpacked[:, :, :1], torch.full((1, 2, 1, 2, 2), 7.0))
+    torch.testing.assert_close(unpacked[:, :, 1:], torch.ones(1, 2, 1, 2, 2))
+    assert conditioning_mask.shape == (1, 8)
+    assert conditioning_mask[:, :4].all()
+    assert not conditioning_mask[:, 4:].any()
 
 
 def test_ltx2_distilled_two_stage_recipe_is_fixed_positive_only():
@@ -701,14 +757,21 @@ def test_ltx2_distilled_two_stage_recipe_is_fixed_positive_only():
     assert stage2.sigmas == (0.909375, 0.725, 0.421875, 0.0)
     assert not LTX2_DISTILLED_TWO_STAGE_RECIPE.allow_request_sigmas
     assert not LTX2_DISTILLED_TWO_STAGE_RECIPE.allow_request_latents
+    assert not LTX2_DISTILLED_TWO_STAGE_RECIPE.allow_negative_prompt
+    assert LTX2_DISTILLED_TWO_STAGE_RECIPE.fixed_num_inference_steps
+    assert (LTX2_DISTILLED_TWO_STAGE_RECIPE.height, LTX2_DISTILLED_TWO_STAGE_RECIPE.width) == (1024, 1536)
 
 
 @pytest.mark.parametrize(
     ("request_inputs", "error"),
     [
         (lambda request: replace(request, height=32), "divisible by 64"),
+        (lambda request: replace(request, num_frames=8), "8 \\* k \\+ 1"),
+        (lambda request: replace(request, num_inference_steps=7), "uses 8 fixed Stage 1"),
         (lambda request: replace(request, latents=torch.empty(1)), "request-provided"),
         (lambda request: replace(request, audio_latents=torch.empty(1)), "request-provided"),
+        (lambda request: replace(request, negative_prompt="negative"), "negative conditioning"),
+        (lambda request: replace(request, negative_prompt_embeds=torch.empty(1)), "negative conditioning"),
         (lambda request: replace(request, guidance=LTX2_ONE_STAGE_RECIPE.request_guidance), "positive-only"),
     ],
 )
@@ -741,6 +804,7 @@ def test_ltx_two_stage_recipe_rejects_unsupported_request_values(request_inputs,
             request_inputs(request),
             pipeline_recipe=LTX2_DISTILLED_TWO_STAGE_RECIPE,
             vae_spatial_compression_ratio=32,
+            vae_temporal_compression_ratio=8,
             pipeline_name="LTX2DistilledPipeline",
         )
 
@@ -774,6 +838,7 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
             request,
             pipeline_recipe=LTX2_DISTILLED_TWO_STAGE_RECIPE,
             vae_spatial_compression_ratio=32,
+            vae_temporal_compression_ratio=8,
             pipeline_name="LTX2DistilledPipeline",
             request_sigmas=[1.0, 0.0],
         )
@@ -792,6 +857,9 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
             {"extra_args": {"audio_latents": torch.empty(1)}},
             "request-provided video or audio latents",
         ),
+        ({"negative_prompt": "negative"}, {}, "negative conditioning"),
+        ({"negative_prompt_embeds": torch.empty(1)}, {}, "negative conditioning"),
+        ({}, {"num_inference_steps": 7}, "uses 8 fixed Stage 1"),
         ({"guidance_scale": 4.0}, {}, "fixed positive-only guidance"),
         ({}, {"guidance_scale": 4.0}, "fixed positive-only guidance"),
     ],
@@ -802,6 +870,9 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
         "request-video-latents",
         "direct-audio-latents",
         "request-audio-latents",
+        "direct-negative-prompt",
+        "direct-negative-embeds",
+        "request-num-steps",
         "direct-guidance",
         "request-guidance",
     ),
@@ -811,13 +882,14 @@ def test_ltx_distilled_forward_rejects_fixed_recipe_overrides(direct_kwargs, sam
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    sampling = OmniDiffusionSamplingParams(
-        height=64,
-        width=64,
-        num_frames=1,
-        num_inference_steps=8,
+    sampling_values = {
+        "height": 64,
+        "width": 64,
+        "num_frames": 1,
+        "num_inference_steps": 8,
         **sampling_kwargs,
-    )
+    }
+    sampling = OmniDiffusionSamplingParams(**sampling_values)
     req = DiffusionRequestBatch(
         [
             OmniDiffusionRequest(
@@ -831,6 +903,41 @@ def test_ltx_distilled_forward_rejects_fixed_recipe_overrides(direct_kwargs, sam
 
     with pytest.raises(ValueError, match=error):
         pipeline.forward(req, **direct_kwargs)
+
+
+def test_ltx_distilled_dummy_run_uses_fixed_recipe_values():
+    from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    req = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="dummy run",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_frames=LTX2DistilledPipeline.dummy_run_num_frames,
+                    num_inference_steps=1,
+                    guidance_scale=0.0,
+                ),
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
+            )
+        ]
+    )
+    pipeline = _make_ltx_request_pipe(LTX2DistilledPipeline)
+    seen = {}
+
+    def fake_run_recipe(_req, request_inputs, **_kwargs):
+        seen["request_inputs"] = request_inputs
+        return "dummy-output"
+
+    object.__setattr__(pipeline, "_run_recipe", fake_run_recipe)
+
+    assert pipeline.forward(req) == "dummy-output"
+    assert seen["request_inputs"].num_frames == 1
+    assert seen["request_inputs"].num_inference_steps == 8
+    assert seen["request_inputs"].guidance == LTXGuidanceSpec.positive_only()
 
 
 def test_ltx_custom_sigmas_bypass_scheduler_shifting():
@@ -983,6 +1090,40 @@ class TestLTXRequestParsing:
         torch.testing.assert_close(resolved.negative_prompt_embeds, torch.stack([negative_prompt_embeds]))
         torch.testing.assert_close(resolved.prompt_attention_mask, torch.stack([prompt_attention_mask]))
         torch.testing.assert_close(resolved.negative_prompt_attention_mask, torch.stack([negative_attention_mask]))
+
+    def test_nonbatch_distilled_request_uses_precomputed_positive_embeddings(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        prompt_embeds = torch.tensor([[1.0, 2.0]])
+        prompt_attention_mask = torch.tensor([True, False])
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={
+                        "prompt": "must not be forwarded with embeddings",
+                        "additional_information": {
+                            "prompt_embeds": prompt_embeds,
+                            "attention_mask": prompt_attention_mask,
+                        },
+                    },
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=8),
+                    request_id="ltx-distilled-prompt-embeds",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(
+            _make_ltx_request_pipe(LTX2DistilledPipeline),
+            req,
+            guidance_scale=None,
+        )
+
+        assert resolved.prompt is None
+        assert resolved.negative_prompt == [""]
+        torch.testing.assert_close(resolved.prompt_embeds, torch.stack([prompt_embeds]))
+        torch.testing.assert_close(resolved.prompt_attention_mask, torch.stack([prompt_attention_mask]))
 
     def test_request_resolves_per_modality_guidance_and_common_cfg_override(self):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -1300,6 +1441,9 @@ class TestPipelineComponents:
         assert modules.encoder_names == ["text_encoder", "connectors"]
         assert modules.resident_names == ["vocoder"]
         assert len(modules.vaes) == 2
+
+    def test_distilled_profile_keeps_upsampler_in_managed_resident_components(self):
+        assert LTX2_DISTILLED_COMPONENT_PROFILE.resident_modules == ("vocoder", "latent_upsampler")
 
 
 class TestLTX23DecodeConditioning:

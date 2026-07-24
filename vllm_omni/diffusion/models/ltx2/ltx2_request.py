@@ -54,6 +54,7 @@ def validate_pipeline_request(
     *,
     pipeline_recipe: LTXPipelineRecipe,
     vae_spatial_compression_ratio: int,
+    vae_temporal_compression_ratio: int,
     pipeline_name: str,
     request_sigmas: list[float] | None = None,
 ) -> None:
@@ -65,6 +66,12 @@ def validate_pipeline_request(
             f"{request_inputs.width}x{request_inputs.height}."
         )
 
+    if request_inputs.num_frames < 1 or (request_inputs.num_frames - 1) % vae_temporal_compression_ratio != 0:
+        raise ValueError(
+            f"{pipeline_name} `num_frames` must be {vae_temporal_compression_ratio} * k + 1, "
+            f"got {request_inputs.num_frames}."
+        )
+
     if not pipeline_recipe.allow_request_latents and (
         request_inputs.latents is not None or request_inputs.audio_latents is not None
     ):
@@ -72,6 +79,25 @@ def validate_pipeline_request(
 
     if not pipeline_recipe.allow_request_sigmas and request_sigmas is not None:
         raise ValueError(f"{pipeline_name} uses fixed phase sigma schedules.")
+
+    if pipeline_recipe.fixed_num_inference_steps and (
+        request_inputs.num_inference_steps != pipeline_recipe.num_inference_steps
+    ):
+        raise ValueError(
+            f"{pipeline_name} uses {pipeline_recipe.num_inference_steps} fixed Stage 1 denoise steps; "
+            f"got {request_inputs.num_inference_steps}."
+        )
+
+    negative_prompt = request_inputs.negative_prompt
+    has_negative_prompt = (
+        any(bool(value) for value in negative_prompt)
+        if isinstance(negative_prompt, list)
+        else bool(negative_prompt)
+    )
+    if not pipeline_recipe.allow_negative_prompt and (
+        has_negative_prompt or request_inputs.negative_prompt_embeds is not None
+    ):
+        raise ValueError(f"{pipeline_name} uses positive-only guidance and does not accept negative conditioning.")
 
     first_phase = pipeline_recipe.phases[0]
     if not first_phase.allow_guidance_override and request_inputs.guidance != first_phase.guidance:
@@ -369,6 +395,7 @@ class LTXRequestMixin:
                 raise ValueError("LTX does not support `flow_shift`; use `sigmas` for a custom schedule.")
 
         sampling = sampling_params_list[0]
+        is_dummy_run = req.is_dummy_run()
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
             req.prompts,
@@ -382,6 +409,8 @@ class LTXRequestMixin:
         num_inference_steps = (
             sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps
         )
+        if is_dummy_run and self.pipeline_recipe.fixed_num_inference_steps:
+            num_inference_steps = self.pipeline_recipe.num_inference_steps
         num_inference_steps = max(int(num_inference_steps), 2)
 
         num_videos_per_prompt = (
@@ -397,6 +426,8 @@ class LTXRequestMixin:
             for item in sampling_params_list
         ]
         guidance = guidance_specs[0]
+        if is_dummy_run and not self.pipeline_recipe.phases[0].allow_guidance_override:
+            guidance = self.pipeline_recipe.request_guidance
         if any(item != guidance for item in guidance_specs[1:]):
             raise ValueError("Batched LTX requests must use identical video/audio guidance parameters.")
 
@@ -460,6 +491,10 @@ class LTXRequestMixin:
             ]
             if any(value is not None for value in request_negative_masks):
                 negative_prompt_attention_mask = torch.stack(request_negative_masks)  # type: ignore[arg-type]
+            if prompt_embeds is not None:
+                prompt = None
+            if negative_prompt_embeds is not None:
+                negative_prompt = None
 
         if sampling.decode_timestep is not None:
             decode_timestep = sampling.decode_timestep

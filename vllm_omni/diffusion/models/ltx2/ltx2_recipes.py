@@ -65,6 +65,8 @@ class LTXPipelineRecipe:
     audio_output_phase: int = -1
     allow_request_sigmas: bool = True
     allow_request_latents: bool = True
+    allow_negative_prompt: bool = True
+    fixed_num_inference_steps: bool = False
 
     def __post_init__(self) -> None:
         if not self.phases:
@@ -121,7 +123,12 @@ LTX_POSITIVE_ONLY_RECIPE = LTXPipelineRecipe(
     ),
 )
 LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
+    # Official distilled arguments describe the final output. Stage 1 applies
+    # spatial_downscale=2 and therefore runs at 512x768.
+    height=1024,
+    width=1536,
     num_inference_steps=len(LTX_DISTILLED_SIGMAS) - 1,
+    negative_prompt="",
     phases=(
         LTXPhaseRecipe(
             name="generate_lowres",
@@ -146,6 +153,8 @@ LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
     audio_output_phase=1,
     allow_request_sigmas=False,
     allow_request_latents=False,
+    allow_negative_prompt=False,
+    fixed_num_inference_steps=True,
 )
 
 

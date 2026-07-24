@@ -17,7 +17,9 @@ image selects I2V. Both one-stage repositories declare this class, so
 the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 
 `LTX2DistilledPipeline` is the unified distilled entry: omit `image` for T2V
-or provide one initial image for I2V.
+or provide one initial image for I2V. The canonical checkpoint name selects it
+automatically; use an explicit `--model-class-name` if a local copy was renamed
+without `distilled` in its path.
 
 ## API Migration
 
@@ -66,6 +68,21 @@ The model recipe also supplies the default negative prompt. Top-level
 API defaults `num_frames` to `1`, so set it explicitly; the offline LTX scripts
 default to `121`.
 
+## Distilled Two-Stage Defaults
+
+| Parameter | Value |
+|---|---:|
+| Final width × height | 1536 × 1024 |
+| Stage 1 width × height | 768 × 512 |
+| Frames / frame rate | 121 / 24 |
+| Stage 1 / Stage 2 denoise steps | 8 / 3 |
+| Guidance | Fixed positive-only |
+
+The dimensions passed to the API are the final output dimensions and must be
+divisible by 64. Both one- and two-stage requests require `num_frames = 8k+1`.
+The distilled recipe fixes both sigma schedules; `num_inference_steps` must be
+`8` when supplied.
+
 ## Serving
 
 Start either checkpoint:
@@ -76,6 +93,13 @@ vllm serve Lightricks/LTX-2 --omni --stage-init-timeout 600
 
 ```bash
 vllm serve diffusers/LTX-2.3-Diffusers --omni --stage-init-timeout 600
+```
+
+Start the distilled checkpoint with its two-stage entry:
+
+```bash
+vllm serve rootonchair/LTX-2-19b-distilled --omni \
+  --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
 ```
 
 The same server handles T2V and I2V. A T2V request using the selected recipe's
@@ -184,11 +208,11 @@ noted below.
 | `image` | image or batch, `None` | Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
 | `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
 | `negative_prompt` | string or list, `None` | Fallback after request values and before the recipe default; mutually exclusive with negative embeddings. |
-| `height` | `int`, `None` | Request → direct value → recipe default; must be divisible by 32. |
-| `width` | `int`, `None` | Same precedence as `height`; must be divisible by 32. |
-| `num_frames` | `int`, `None` | Request → direct value → recipe default; also determines audio duration with `frame_rate`. |
+| `height` | `int`, `None` | Request → direct value → recipe default; divisible by 32 one-stage or 64 distilled. |
+| `width` | `int`, `None` | Same precedence and alignment as `height`. |
+| `num_frames` | `int`, `None` | Request → direct value → recipe default; must be `8k+1` and also determines audio duration with `frame_rate`. |
 | `frame_rate` | `float`, `None` | Request `frame_rate` → request `fps` → direct value → recipe default. |
-| `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; minimum 2. Custom `sigmas` determine actual steps. |
+| `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; minimum 2 one-stage, fixed at 8 for distilled Stage 1. Custom one-stage `sigmas` determine actual steps. |
 | `sigmas` | list of float, `None` | One-stage only. Request values win; every request in a fused batch must use the same schedule. |
 | `timesteps` | list of int, `None` | Compatibility slot; LTX accepts only `None`. Use `sigmas`. |
 | `guidance_scale` | `float`, `None` | One-stage common video/audio CFG fallback; an explicit request value wins. Distilled two-stage uses fixed positive-only guidance. |
@@ -199,7 +223,7 @@ noted below.
 | `latents` | tensor, `None` | Request tensors win. One-stage accepts packed `[B, S, C]` and validated unpacked video layouts. |
 | `audio_latents` | tensor, `None` | One-stage initial audio latents; request tensors win and are collated. |
 | `prompt_embeds` | tensor, `None` | Precomputed positive conditioning; requires `prompt_attention_mask` and cannot accompany `prompt`. |
-| `negative_prompt_embeds` | tensor, `None` | Precomputed negative conditioning; requires its mask and cannot accompany `negative_prompt`. |
+| `negative_prompt_embeds` | tensor, `None` | One-stage precomputed negative conditioning; requires its mask and cannot accompany `negative_prompt`. |
 | `prompt_attention_mask` | tensor, `None` | Mask for positive embeddings; request `prompt_attention_mask` or `attention_mask` wins. |
 | `negative_prompt_attention_mask` | tensor, `None` | Mask for negative embeddings; request negative mask fields win. |
 | `decode_timestep` | float or list, `0.0` | Video-VAE decode timestep; request value wins. Lists may match 1, prompt batch, or output batch. |
@@ -218,10 +242,12 @@ request prompt payload; LTX guidance fields live in sampling `extra_args`.
 | Override | One-stage | Distilled two-stage |
 |---|---|---|
 | Guidance | Supported | Fixed positive-only |
+| Negative prompt/embeddings | Supported | Rejected |
+| `num_inference_steps` | Supported | Fixed at 8 for Stage 1; Stage 2 uses 3 |
 | Custom `sigmas` | Supported | Rejected; both phases use fixed schedules |
 | Video/audio latents | Supported | Rejected |
 
-These three capability checks apply equally to direct `forward` keywords and
+These capability checks apply equally to direct `forward` keywords and
 values in `OmniDiffusionSamplingParams`; unsupported values fail instead of
 being silently ignored.
 
@@ -256,6 +282,9 @@ bundled offline CLI do not currently expose `sigmas`.
   141GB; remeasure on the deployed commit and hardware.
 - LTX-2.3 includes a 22B transformer, Gemma encoder, two VAEs, and a vocoder.
   Start on a 96GB-class GPU or use CPU/layerwise offload on smaller devices.
+- The distilled upsampler uses the configured pipeline dtype and participates
+  in component discovery/device placement; it remains resident during denoise
+  offload because it is used only at the phase boundary.
 - The output audio sample rate comes from the loaded components and is not a
   request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with

@@ -18,6 +18,7 @@ def _make_ltx23_request_pipe(cls):
     pipe.device = torch.device("cpu")
     pipe.tokenizer_max_length = 99
     pipe.vae_spatial_compression_ratio = 32
+    pipe.vae_temporal_compression_ratio = 8
     return pipe
 
 
@@ -158,6 +159,11 @@ class TestLTXImageToVideoConditioning:
         pipe.vae_temporal_compression_ratio = 1
         pipe.transformer_spatial_patch_size = 1
         pipe.transformer_temporal_patch_size = 1
+        object.__setattr__(
+            pipe,
+            "_encode_i2v_image_latents",
+            lambda *_args, **_kwargs: torch.tensor([[[[[40.0]]], [[[41.0]]]]]),
+        )
 
         def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
             raise AssertionError("packed I2V latents should not be noised")
@@ -181,7 +187,7 @@ class TestLTXImageToVideoConditioning:
         )
 
         torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
-        torch.testing.assert_close(out, latents)
+        torch.testing.assert_close(out, torch.tensor([[[40.0, 41.0], [20.0, 21.0], [30.0, 31.0]]]))
 
     def test_ltx23_i2v_5d_latents_noise_preserves_conditioning_frame(self, monkeypatch):
         import vllm_omni.diffusion.models.ltx2.ltx2_conditioning as ltx2_conditioning
@@ -198,6 +204,11 @@ class TestLTXImageToVideoConditioning:
             latents_mean=torch.zeros(2),
             latents_std=torch.ones(2),
             config=SimpleNamespace(scaling_factor=1.0),
+        )
+        object.__setattr__(
+            pipe,
+            "_encode_i2v_image_latents",
+            lambda *_args, **_kwargs: torch.tensor([[[[[40.0]]], [[[41.0]]]]]),
         )
 
         sampled_shapes = []
@@ -225,7 +236,7 @@ class TestLTXImageToVideoConditioning:
         )
 
         torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
-        torch.testing.assert_close(out, torch.tensor([[[10.0, 11.0], [1.0, 1.0], [1.0, 1.0]]]))
+        torch.testing.assert_close(out, torch.tensor([[[40.0, 41.0], [1.0, 1.0], [1.0, 1.0]]]))
         assert sampled_shapes == [(1, 3, 2)]
 
     def test_ltx23_i2v_image_noise_is_sampled_after_packing(self, monkeypatch):

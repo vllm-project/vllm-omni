@@ -398,6 +398,73 @@ class LTXI2VConditioningMixin:
             raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
         super()._check_forward_inputs(request_inputs, image=image)
 
+    def _encode_i2v_image_latents(
+        self,
+        image: torch.Tensor,
+        *,
+        batch_size: int,
+        generator: torch.Generator | list[torch.Generator] | None,
+        dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        """Encode one conditioning frame per prompt into normalized latents."""
+        image_batch_size = image.shape[0]
+        if image_batch_size == 0:
+            raise ValueError("`image` batch is empty.")
+        if batch_size % image_batch_size != 0:
+            raise ValueError(
+                f"`batch_size` ({batch_size}) must be divisible by image batch size ({image_batch_size}) "
+                "for image-to-video outputs."
+            )
+        num_videos_per_prompt = batch_size // image_batch_size
+
+        if isinstance(generator, list):
+            if len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective"
+                    f" batch size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+            image_generators = [generator[i * num_videos_per_prompt] for i in range(image_batch_size)]
+            init_latents = [
+                retrieve_latents(
+                    self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)),
+                    image_generators[i],
+                    "argmax",
+                )
+                for i in range(image_batch_size)
+            ]
+        else:
+            init_latents = [
+                retrieve_latents(
+                    self.vae.encode(img.unsqueeze(0).unsqueeze(2)),
+                    generator,
+                    "argmax",
+                )
+                for img in image
+            ]
+
+        init_latents = torch.cat(init_latents, dim=0).to(dtype=dtype)
+        if num_videos_per_prompt > 1:
+            init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
+        return latent_ops.normalize_latents(
+            init_latents,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+        )
+
+    @staticmethod
+    def _replace_first_latent_frame(
+        latents: torch.Tensor,
+        image_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_shape = (latents.shape[0], latents.shape[1], 1, latents.shape[3], latents.shape[4])
+        if tuple(image_latents.shape) != expected_shape:
+            raise ValueError(
+                f"Encoded LTX conditioning image has shape {tuple(image_latents.shape)}, expected {expected_shape}."
+            )
+        latents = latents.clone()
+        latents[:, :, :1] = image_latents
+        return latents
+
     def prepare_latents(
         self,
         image: torch.Tensor | None = None,
@@ -438,8 +505,11 @@ class LTXI2VConditioningMixin:
         if latents is not None:
             unpacked_latents = latents.ndim == 5
             if latents.ndim == 5:
-                batch_size, _, num_frames, height, width = latents.shape
-                mask_shape = (batch_size, 1, num_frames, height, width)
+                expected_shape = (batch_size, num_channels_latents, num_frames, height, width)
+                if tuple(latents.shape) != expected_shape:
+                    raise ValueError(
+                        f"Provided unpacked `latents` have shape {tuple(latents.shape)}, expected {expected_shape}."
+                    )
                 conditioning_mask = latents.new_zeros(mask_shape)
                 conditioning_mask[:, :, 0] = 1.0
                 latents = latent_ops.normalize_latents(
@@ -448,6 +518,16 @@ class LTXI2VConditioningMixin:
                     self.vae.latents_std,
                     self.vae.config.scaling_factor,
                 )
+                if image is not None:
+                    image_latents = self._encode_i2v_image_latents(
+                        image,
+                        batch_size=batch_size,
+                        generator=generator,
+                        dtype=dtype,
+                    )
+                    # Official distilled Stage 2 starts from the upsampled Stage 1
+                    # state, then reapplies the source image at final resolution.
+                    latents = self._replace_first_latent_frame(latents, image_latents)
                 latents = latent_ops.pack_latents(
                     latents,
                     self.transformer_spatial_patch_size,
@@ -462,6 +542,11 @@ class LTXI2VConditioningMixin:
                 self.transformer_spatial_patch_size,
                 self.transformer_temporal_patch_size,
             ).squeeze(-1)
+            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
+                raise ValueError(
+                    "Provided `latents` tensor has shape"
+                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
+                )
             if unpacked_latents:
                 # Official LTX patchifies the latent state before drawing noise.
                 # Sampling the packed shape preserves its seed-to-output contract.
@@ -470,58 +555,36 @@ class LTXI2VConditioningMixin:
                     noise_scale * (1 - conditioning_mask).unsqueeze(-1),
                     generator,
                 )
-            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
-                raise ValueError(
-                    "Provided `latents` tensor has shape"
-                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
+            elif image is not None:
+                image_latents = self._encode_i2v_image_latents(
+                    image,
+                    batch_size=batch_size,
+                    generator=generator,
+                    dtype=dtype,
+                )
+                unpacked = latent_ops.unpack_latents(
+                    latents,
+                    num_frames,
+                    height,
+                    width,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+                unpacked = self._replace_first_latent_frame(unpacked, image_latents)
+                latents = latent_ops.pack_latents(
+                    unpacked,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
                 )
             return latents.to(device=device, dtype=dtype), conditioning_mask
 
         if image is None:
             raise ValueError("`image` must be provided when `latents` is None.")
-
-        image_batch_size = image.shape[0]
-        if image_batch_size == 0:
-            raise ValueError("`image` batch is empty.")
-        if batch_size % image_batch_size != 0:
-            raise ValueError(
-                f"`batch_size` ({batch_size}) must be divisible by image batch size ({image_batch_size}) "
-                "for image-to-video outputs."
-            )
-        num_videos_per_prompt = batch_size // image_batch_size
-
-        if isinstance(generator, list):
-            if len(generator) != batch_size:
-                raise ValueError(
-                    f"You have passed a list of generators of length {len(generator)}, but requested an effective"
-                    f" batch size of {batch_size}. Make sure the batch size matches the length of the generators."
-                )
-            image_generators = [generator[i * num_videos_per_prompt] for i in range(image_batch_size)]
-            init_latents = [
-                retrieve_latents(
-                    self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)),
-                    image_generators[i],
-                    "argmax",
-                )
-                for i in range(image_batch_size)
-            ]
-        else:
-            init_latents = [
-                retrieve_latents(
-                    self.vae.encode(img.unsqueeze(0).unsqueeze(2)),
-                    generator,
-                    "argmax",
-                )
-                for img in image
-            ]
-
-        init_latents = torch.cat(init_latents, dim=0).to(dtype)
-        if num_videos_per_prompt > 1:
-            init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
-        init_latents = latent_ops.normalize_latents(
-            init_latents,
-            self.vae.latents_mean,
-            self.vae.latents_std,
+        init_latents = self._encode_i2v_image_latents(
+            image,
+            batch_size=batch_size,
+            generator=generator,
+            dtype=dtype,
         )
         init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
 
@@ -601,7 +664,7 @@ class LTXI2VConditioningMixin:
                 image=None,
             )
 
-        if request_inputs.latents is None:
+        if image is not None:
             if isinstance(image, torch.Tensor):
                 if image.ndim == 3:
                     image = image.unsqueeze(0)

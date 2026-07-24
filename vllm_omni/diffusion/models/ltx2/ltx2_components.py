@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
+from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
@@ -52,6 +53,7 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "audio_vae",
     "vocoder",
     "scheduler",
+    "latent_upsampler",
 )
 logger = logging.getLogger(__name__)
 
@@ -90,11 +92,20 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     vocoder_fallback_cls=LTX2Vocoder,
 )
 
+LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
+    name="ltx2_distilled",
+    dit_modules=("transformer",),
+    encoder_modules=("text_encoder", "connectors"),
+    vae_modules=("vae", "audio_vae"),
+    resident_modules=("vocoder", "latent_upsampler"),
+    video_vae_cls=DistributedAutoencoderKLLTX2Video,
+)
+
 
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
-    ("distilled_two_stage", "2"): LTX2_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2"): LTX2_DISTILLED_COMPONENT_PROFILE,
     ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
     ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
 }
@@ -379,6 +390,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             local_files_only=local_files_only,
             dtype=dtype,
         )
+
+    if "latent_upsampler" in profile.resident_modules:
+        # BlurDownsample constructs an integer kernel that must be initialized
+        # on CPU; component placement is handled uniformly after construction.
+        with torch.device("cpu"):
+            pipeline.latent_upsampler = _load_component(
+                LTX2LatentUpsamplerModel,
+                model,
+                "latent_upsampler",
+                local_files_only=local_files_only,
+                dtype=dtype,
+            )
 
     transformer_config = load_transformer_config(model, "transformer", local_files_only)
     quant_config = getattr(od_config, "quantization_config", None)

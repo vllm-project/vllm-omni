@@ -330,8 +330,9 @@ def main():
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
     model_class_name_lower = (model_class_name or "").lower()
+    is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
     is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
-    is_ltx2 = is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
+    is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
@@ -355,6 +356,16 @@ def main():
             10.0,
             1280 * 720,
             16,
+        )
+    elif is_ltx2_distilled:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            None,
+            121,
+            8,
+            None,
+            1024 * 1536,
+            64,
         )
     elif is_ltx2:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (

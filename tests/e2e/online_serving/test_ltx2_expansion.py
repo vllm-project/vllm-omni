@@ -67,18 +67,16 @@ def test_ltx2_two_stage_hsdp(
     is_i2v: bool,
     openai_client: OpenAIClientHandler,
 ):
-    # The two-stage pipeline generates at the requested resolution then 2x
-    # upsamples via LTX2LatentUpsamplerModel, so output dimensions differ
-    # from the request.  Omit height/width from form_data so the assertion
-    # helper skips the dimension check (it only asserts when the key is
-    # present).  The pipeline falls back to its own defaults.
+    # Keep CI small while exercising the fixed 8+3-step distilled recipe.
+    # Height and width describe the final output; Stage 1 runs at half size.
     form_data = {
         "prompt": PROMPT,
         "model": omni_server.model,
+        "height": 128,
+        "width": 128,
         "num_frames": 9,
         "fps": 8,
-        "num_inference_steps": 2,
-        "guidance_scale": 1.0,
+        "num_inference_steps": 8,
         "seed": 42,
     }
 

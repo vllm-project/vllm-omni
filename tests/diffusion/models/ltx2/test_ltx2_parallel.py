@@ -95,6 +95,7 @@ class TestCFGParallelForwardPath:
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4
         pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 8
         monkeypatch.setattr(ltx2_runtime, "get_classifier_free_guidance_world_size", lambda: 1)
 
         class StopAtEncodePromptError(Exception):

@@ -73,6 +73,14 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "ltx2_output.mp4",
     },
+    "ltx2_distilled": {
+        "height": 1024,
+        "width": 1536,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "fps": 24,
+        "output": "ltx2_distilled_output.mp4",
+    },
     "ltx23": {
         "height": 512,
         "width": 768,
@@ -87,6 +95,8 @@ _MODEL_PRESETS = {
 def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
     class_lower = (model_class_name or "").lower()
+    if "distilled" in class_lower or "distilled" in model_lower:
+        return _MODEL_PRESETS["ltx2_distilled"]
     if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
         return _MODEL_PRESETS["ltx23"]
     if "ltx2" in class_lower or "ltx-2" in model_lower or "ltx_2" in model_lower:

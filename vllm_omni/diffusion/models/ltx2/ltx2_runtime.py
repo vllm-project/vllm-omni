@@ -131,7 +131,7 @@ class LTXRuntime(
     connector_batches_cfg = False
     distributed_video_decode = True
     support_image_input = False
-    dummy_run_num_frames = 2
+    dummy_run_num_frames = 1
     preserve_sp_padded_audio_duration = False
     reports_stage_durations = False
 
@@ -210,6 +210,7 @@ class LTXRuntime(
             request_inputs,
             pipeline_recipe=self.pipeline_recipe,
             vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
@@ -824,20 +825,12 @@ class LTXRuntime(
         )
 
     def _spatial_upsample_phase(self, latents: torch.Tensor) -> torch.Tensor:
-        """Apply the currently loaded spatial upsampler to unpacked latents."""
+        """Apply the recipe-managed spatial upsampler to unpacked latents."""
         latent_upsampler = getattr(self, "latent_upsampler", None)
-        if latent_upsampler is not None:
-            dtype = getattr(latent_upsampler, "dtype", latents.dtype)
-            return latent_upsampler(latents.to(device=self.device, dtype=dtype))
-
-        upsample_pipe = getattr(self, "upsample_pipe", None)
-        if upsample_pipe is None:
+        if latent_upsampler is None:
             raise RuntimeError("This LTX pipeline recipe requires a spatial latent upsampler.")
-        return upsample_pipe(
-            latents=latents,
-            output_type="latent",
-            return_dict=False,
-        )[0]
+        dtype = getattr(latent_upsampler, "dtype", latents.dtype)
+        return latent_upsampler(latents.to(device=self.device, dtype=dtype))
 
     def decode_phase(self, phase: LTXPhaseResult) -> DiffusionOutput | list[DiffusionOutput]:
         """Decode one completed phase and restore per-request outputs."""
