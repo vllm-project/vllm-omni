@@ -96,7 +96,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
@@ -104,11 +104,64 @@ from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_image_to_image_prompt,
+    get_ar_input_builder,
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
 )
 from vllm_omni.platforms import current_omni_platform
+
+
+def _apply_ar_stage_inputs(
+    ar_input_builder: Any,
+    *,
+    model: str,
+    prompt_text: str,
+    extra_body: dict[str, Any],
+    num_images: int,
+    height: int | None,
+    width: int | None,
+    prompt_dict: dict[str, Any],
+    sampling_params_list: list[Any],
+    text_output: bool = False,
+) -> None:
+    """Apply a model's declared AR-stage inputs to the request in place.
+
+    Mirrors the helper in ``text_to_image.py``: loads the tokenizer for
+    byte-for-byte HF-parity AR tokenization (string-prompt fallback otherwise),
+    asks the model's ``ar_input_builder`` for the AR prefill + stop tokens, and
+    writes them onto ``prompt_dict`` and the non-diffusion (AR) stage params.
+    Model-agnostic -- only the declared-hook contract is assumed.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    except Exception as exc:  # noqa: BLE001 - tokenizer is optional; fall back to string prompt
+        logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
+        ar_tokenizer = None
+
+    ar_inputs = ar_input_builder(
+        prompt=prompt_text,
+        tokenizer=ar_tokenizer,
+        extra_body=extra_body,
+        num_images=num_images,
+        height=height,
+        width=width,
+        text_output=text_output,
+    )
+
+    if ar_inputs.prompt_token_ids is not None:
+        prompt_dict["prompt_token_ids"] = ar_inputs.prompt_token_ids
+    elif ar_inputs.prompt is not None:
+        prompt_dict["prompt"] = ar_inputs.prompt
+    if ar_inputs.use_system_prompt:
+        prompt_dict["use_system_prompt"] = ar_inputs.use_system_prompt
+    prompt_dict["modalities"] = ar_inputs.modalities
+
+    for params in sampling_params_list:
+        if not isinstance(params, OmniDiffusionSamplingParams) and hasattr(params, "stop_token_ids"):
+            params.stop_token_ids = ar_inputs.stop_token_ids
 
 
 def parse_profiler_config(value: str) -> dict[str, Any]:
@@ -420,6 +473,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
+    )
     return parser.parse_args()
 
 
@@ -497,6 +555,8 @@ def main():
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.trust_remote_code:
+        omni_kwargs["trust_remote_code"] = True
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
     omni = Omni(**omni_kwargs)
@@ -588,6 +648,23 @@ def main():
 
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
+
+    # Models with an AR text stage (e.g. HunyuanImage3 image-editing) declare an
+    # ar_input_builder; build the AR prefill + stop tokens declaratively from the
+    # plain prompt + reference image count + extra_args. Others are untouched.
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    if ar_input_builder is not None:
+        _apply_ar_stage_inputs(
+            ar_input_builder,
+            model=args.model,
+            prompt_text=args.prompt,
+            extra_body=extra_args_from_cli,
+            num_images=len(input_images),
+            height=args.height,
+            width=args.width,
+            prompt_dict=prompt_dict,
+            sampling_params_list=sampling_params_list,
+        )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
     generation_end = time.perf_counter()

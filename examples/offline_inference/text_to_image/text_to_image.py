@@ -24,6 +24,7 @@ from vllm_omni.model_extras import (
     build_text_to_image_prompt as build_model_text_to_image_prompt,
 )
 from vllm_omni.model_extras import (
+    get_ar_input_builder,
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
@@ -377,8 +378,65 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
+    )
     current_omni_platform.pre_register_and_update(parser)
     return parser.parse_args()
+
+
+def _apply_ar_stage_inputs(
+    ar_input_builder: Any,
+    *,
+    model: str,
+    prompt_text: str,
+    extra_body: dict[str, Any],
+    num_images: int,
+    height: int | None,
+    width: int | None,
+    prompt_dict: dict[str, Any],
+    sampling_params_list: list[Any],
+    text_output: bool = False,
+) -> None:
+    """Apply a model's declared AR-stage inputs to the request in place.
+
+    Loads the model tokenizer (for byte-for-byte HF-parity segment tokenization;
+    falls back to the string prompt form if unavailable), asks the model's
+    ``ar_input_builder`` for the AR prefill + stop tokens, then writes them onto
+    ``prompt_dict`` and the non-diffusion (AR) stage sampling params. Kept
+    model-agnostic: the example only knows the declared-hook contract.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    except Exception as exc:  # noqa: BLE001 - tokenizer is optional; fall back to string prompt
+        logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
+        ar_tokenizer = None
+
+    ar_inputs = ar_input_builder(
+        prompt=prompt_text,
+        tokenizer=ar_tokenizer,
+        extra_body=extra_body,
+        num_images=num_images,
+        height=height,
+        width=width,
+        text_output=text_output,
+    )
+
+    if ar_inputs.prompt_token_ids is not None:
+        prompt_dict["prompt_token_ids"] = ar_inputs.prompt_token_ids
+    elif ar_inputs.prompt is not None:
+        prompt_dict["prompt"] = ar_inputs.prompt
+    if ar_inputs.use_system_prompt:
+        prompt_dict["use_system_prompt"] = ar_inputs.use_system_prompt
+    prompt_dict["modalities"] = ar_inputs.modalities
+
+    for params in sampling_params_list:
+        if not isinstance(params, OmniDiffusionSamplingParams) and hasattr(params, "stop_token_ids"):
+            params.stop_token_ids = ar_inputs.stop_token_ids
 
 
 def main():
@@ -469,6 +527,8 @@ def main():
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.trust_remote_code:
+        omni_kwargs["trust_remote_code"] = True
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
@@ -612,6 +672,24 @@ def main():
 
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
+
+    # Models with an AR text stage (e.g. HunyuanImage3) declare an
+    # ar_input_builder. When present, build the AR prefill token-ids and AR
+    # stop-token-ids declaratively from the plain prompt + extra_body, so this
+    # example stays model-agnostic. Models without one are untouched.
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    if ar_input_builder is not None:
+        _apply_ar_stage_inputs(
+            ar_input_builder,
+            model=args.model,
+            prompt_text=args.prompt,
+            extra_body=user_extra,
+            num_images=0,
+            height=args.height,
+            width=args.width,
+            prompt_dict=prompt_dict,
+            sampling_params_list=sampling_params_list,
+        )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
 

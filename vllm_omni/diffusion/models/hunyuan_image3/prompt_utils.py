@@ -317,12 +317,93 @@ def build_prompt_tokens(
     )
 
 
+@dataclass
+class ARPromptInputs:
+    """Fully-resolved AR-stage inputs for one HunyuanImage3 request.
+
+    Consolidates the three things every caller (offline example, OpenAI
+    server) must compute before submitting an AR request: the AR prefill
+    (as segment-tokenized ``prompt_token_ids`` when a tokenizer is
+    available, else a formatted ``prompt`` string), the resolved DiT
+    system-prompt type, and the AR ``stop_token_ids``.
+    """
+
+    prompt: str | None
+    prompt_token_ids: list[int] | None
+    system_prompt_type: str
+    stop_token_ids: list[int]
+
+
+def build_ar_prompt_inputs(
+    user_prompt: str,
+    task: str = "t2i",
+    bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
+    sys_type: str | None = None,
+    custom_system_prompt: str | None = None,
+    num_images: int = 1,
+    tokenizer: Any | None = None,
+    image_size: str | None = None,
+) -> ARPromptInputs:
+    """Build the complete AR-stage inputs for a HunyuanImage3 request.
+
+    This is the single seam shared by the offline task examples and the
+    OpenAI server: it wraps :func:`build_prompt_tokens` (byte-for-byte HF
+    parity when ``tokenizer`` is given), the :func:`build_prompt` string
+    fallback (when no tokenizer is available), and
+    :func:`resolve_stop_token_ids`, so no caller re-derives the AR
+    prefill/stop-token logic. ``image_size`` follows the same convention as
+    :func:`resolve_stop_token_ids` (``None``/``"auto"`` lets the AR predict
+    the aspect ratio; an explicit ``"{w}x{h}"`` makes it stop at the
+    terminator).
+    """
+    if tokenizer is not None:
+        result = build_prompt_tokens(
+            user_prompt,
+            tokenizer,
+            task=task,
+            bot_task=bot_task,
+            sys_type=sys_type,
+            custom_system_prompt=custom_system_prompt,
+            num_images=num_images,
+        )
+        prompt_str: str | None = None
+        prompt_token_ids: list[int] | None = result.token_ids
+        system_prompt_type = result.system_prompt_type
+    else:
+        prompt_str = build_prompt(
+            user_prompt,
+            task=task,
+            bot_task=bot_task,
+            sys_type=sys_type,
+            custom_system_prompt=custom_system_prompt,
+            num_images=num_images,
+        )
+        prompt_token_ids = None
+        _, resolved_bot_task = _normalize_task_and_bot_task(task, bot_task)
+        system_prompt_type = sys_type or resolve_sys_type(resolved_bot_task)
+
+    stop_token_ids = resolve_stop_token_ids(
+        task=task,
+        bot_task=bot_task,
+        tokenizer=tokenizer,
+        image_size=image_size,
+    )
+    return ARPromptInputs(
+        prompt=prompt_str,
+        prompt_token_ids=prompt_token_ids,
+        system_prompt_type=system_prompt_type,
+        stop_token_ids=stop_token_ids,
+    )
+
+
 __all__ = [
     "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
     "MAX_IMAGES_PER_REQUEST",
     "_TASK_PRESETS",
+    "ARPromptInputs",
     "available_bot_tasks",
     "available_tasks",
+    "build_ar_prompt_inputs",
     "build_prompt",
     "build_prompt_tokens",
     "resolve_stop_token_ids",

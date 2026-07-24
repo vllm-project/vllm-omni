@@ -690,3 +690,172 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "visual_token_end_id": [168456],
         },
     }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("HunyuanImage3Pipeline") == frozenset(
+        {
+            "bot_task",
+            "use_system_prompt",
+            "system_prompt",
+            "negative_prompt",
+        }
+    )
+    assert get_extra_output_params("HunyuanImage3Pipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("HunyuanImage3Pipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_text_to_image_prompt_builder() -> None:
+    # Lightweight payload only: AR token-ids / stop-tokens are sourced in the AR
+    # input path, so the builder just selects the image modality and forwards the
+    # negative prompt. height/width travel via OmniDiffusionSamplingParams.
+    assert build_text_to_image_prompt(
+        "HunyuanImage3Pipeline",
+        prompt="a red panda",
+        negative_prompt="blurry",
+        height=1024,
+        width=1024,
+    ) == {
+        "prompt": "a red panda",
+        "modalities": ["image"],
+        "negative_prompt": "blurry",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_text_to_image_prompt_builder_omits_negative_when_none() -> None:
+    out = build_text_to_image_prompt(
+        "HunyuanImage3Pipeline",
+        prompt="a red panda",
+        negative_prompt=None,
+    )
+    assert out == {"prompt": "a red panda", "modalities": ["image"]}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_image_to_image_prompt_builder() -> None:
+    img = Image.new("RGB", (64, 64))
+    out = build_image_to_image_prompt(
+        "HunyuanImage3Pipeline",
+        prompt="make it snow",
+        negative_prompt=None,
+        input_image=img,
+    )
+    assert out == {
+        "prompt": "make it snow",
+        "modalities": ["image"],
+        "multi_modal_data": {"image": img},
+    }
+
+
+class _FakeHunyuanTokenizer:
+    """Minimal tokenizer with distinct ids so AR token assertions are unambiguous."""
+
+    SPECIAL = {
+        "<|startoftext|>": 1,
+        "<img>": 2,
+        "<think>": 3,
+        "<recaption>": 4,
+    }
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        return self.SPECIAL.get(tok, 0)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        # Offset well above the special-id range to avoid collisions.
+        return [500 + len(text)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_ar_input_builder_registered() -> None:
+    from vllm_omni.model_extras import get_ar_input_builder
+
+    builder = get_ar_input_builder("HunyuanImage3Pipeline")
+    assert builder is not None
+    # Models without the hook return None.
+    assert get_ar_input_builder("MammothModa2DiTPipeline") is None
+    assert get_ar_input_builder(None) is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_t2i_string_fallback() -> None:
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=None,
+        extra_body={"bot_task": "recaption"},
+        num_images=0,
+        height=1024,
+        width=1024,
+    )
+    # No tokenizer -> string prompt form; image modality; recaption + explicit
+    # size stops at </recaption> only.
+    assert ar.prompt_token_ids is None
+    assert ar.prompt and "a red panda" in ar.prompt
+    assert ar.modalities == ["image"]
+    assert ar.use_system_prompt
+    assert len(ar.stop_token_ids) == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_t2i_tokenizer_parity() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=_FakeHunyuanTokenizer(),
+        extra_body={"bot_task": "think"},
+        num_images=0,
+    )
+    expected = build_prompt_tokens("a red panda", _FakeHunyuanTokenizer(), task="t2i", bot_task="think")
+    assert ar.prompt is None
+    assert ar.prompt_token_ids == expected.token_ids
+    assert ar.modalities == ["image"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_it2i_inserts_image_placeholders() -> None:
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="edit it",
+        tokenizer=_FakeHunyuanTokenizer(),
+        extra_body={},
+        num_images=2,
+    )
+    # Two reference images -> two <img> placeholder ids (2) in the AR prefill.
+    assert ar.prompt_token_ids is not None
+    assert ar.prompt_token_ids.count(_FakeHunyuanTokenizer.SPECIAL["<img>"]) == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_comprehension_text_output() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    # t2t (no image, text output) -> text modality, stop on <answer>.
+    ar_t2t = build_ar_stage_inputs("hi", tokenizer=None, extra_body={}, num_images=0, text_output=True)
+    assert ar_t2t.modalities == ["text"]
+    assert ar_t2t.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+    # i2t (image, text output) -> single <img> placeholder in the prefill.
+    ar_i2t = build_ar_stage_inputs(
+        "describe", tokenizer=_FakeHunyuanTokenizer(), extra_body={}, num_images=1, text_output=True
+    )
+    assert ar_i2t.modalities == ["text"]
+    assert ar_i2t.prompt_token_ids.count(_FakeHunyuanTokenizer.SPECIAL["<img>"]) == 1

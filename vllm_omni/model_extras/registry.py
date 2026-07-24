@@ -32,6 +32,20 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.hunyuan_image3 import (
+    HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+    HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+    HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_ar_stage_inputs as build_hunyuan_image3_ar_stage_inputs,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_image_to_image_prompt as build_hunyuan_image3_image_to_image_prompt,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_text_to_image_prompt as build_hunyuan_image3_text_to_image_prompt,
+)
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
@@ -235,6 +249,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledTwoStagePipeline",
         )
     },
+    "HunyuanImage3Pipeline": {
+        "extra_body_params": HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+        "extra_output_params": HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_hunyuan_image3_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_hunyuan_image3_image_to_image_prompt,
+        "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
@@ -340,6 +362,18 @@ def should_preserve_reference_image_size(
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
     spec = _get_spec(model_class_name)
     return bool(spec and spec.get("init_extra_args_for_non_diffusion_stages", False))
+
+
+def get_ar_input_builder(model_class_name: str | None) -> Callable[..., Any] | None:
+    """Return a model's AR-stage input builder, or ``None`` if undeclared.
+
+    Models with a text/AR stage that needs template-formatted prompt tokens
+    and AR stop tokens (e.g. HunyuanImage3) declare an ``ar_input_builder``.
+    The shared task examples call it generically when present, so the example
+    scripts stay model-agnostic; models without one are unaffected.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_input_builder") if spec is not None else None
 
 
 def build_text_to_image_prompt(

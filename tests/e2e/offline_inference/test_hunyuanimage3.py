@@ -16,7 +16,7 @@ from vllm_omni.platforms import current_omni_platform
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 

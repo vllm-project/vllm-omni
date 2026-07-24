@@ -3,7 +3,10 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/hunyuan_image3>.
 
 
-This example demonstrates how to run HunyuanImage-3.0 Image-to-Text with the vLLM-Omni.
+This example demonstrates how to run HunyuanImage-3.0 comprehension
+(image-to-text / text-to-text) with vLLM-Omni. The image-generating modalities
+(text-to-image, image-editing) run through the shared task examples — see the
+example directory's README for `--extra-body` recipes.
 
 ## Local CLI Usage
 
@@ -13,23 +16,25 @@ Download the example image:
 wget https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg
 ```
 
-Run example:
+Run example (image-to-text):
 
 ```bash
-python image_to_text.py \
+python run_hunyuan_image3_understanding.py \
+  --modality image2text \
   --image cherry_blossom.jpg \
-  --prompt "<|startoftext|>You are an assistant that understands images and outputs text.<img>Describe the content of the picture."
+  --prompt "Describe the content of the picture."
 ```
 
 Key arguments:
 
 - `--model`: Model used. Default is: tencent/HunyuanImage-3.0-Instruct (Optional).
-- `--image`: Path to input image (required).
-- `--prompt`: Text description used to guide image understanding (required).
+- `--modality`: `image2text` or `text2text` (Optional, default `image2text`).
+- `--image`: Path to input image (required for `image2text`).
+- `--prompt`: Text prompt / question (required).
 
 ## Example materials
 
-??? abstract "image_to_text.py"
+??? abstract "run_hunyuan_image3_understanding.py"
     ``````py
-    --8<-- "examples/offline_inference/hunyuan_image3/image_to_text.py"
+    --8<-- "examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py"
     ``````

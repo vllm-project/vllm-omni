@@ -13,6 +13,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     available_bot_tasks,
     available_tasks,
+    build_ar_prompt_inputs,
     build_prompt,
     build_prompt_tokens,
     resolve_stop_token_ids,
@@ -296,19 +297,39 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[4]
 
 
-def test_end2end_routes_through_shared_prompt_utils():
-    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
-    tree = ast.parse(end2end_path.read_text(encoding="utf-8"))
+def test_example_routes_through_shared_seam():
+    """The comprehension example must not duplicate AR prompt tokenization; it
+    routes through the shared ``model_extras -> prompt_utils`` seam.
 
-    local_func_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    assert not (local_func_names & {"build_prompt", "build_prompt_tokens"})
+    After the model_extras migration the bespoke ``end2end.py`` is gone: t2i /
+    image-editing run through the shared task examples, and the AR-only
+    comprehension flow uses ``run_hunyuan_image3_understanding.py``. This test
+    pins that the example imports the declarative ``build_ar_stage_inputs``
+    helper (rather than re-implementing tokenization) and that the helper in
+    turn routes down to ``prompt_utils.build_ar_prompt_inputs``.
+    """
+    example_path = (
+        _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "run_hunyuan_image3_understanding.py"
+    )
+    example_tree = ast.parse(example_path.read_text(encoding="utf-8"))
 
-    imported_from_prompt_utils: set[str] = set()
-    for node in ast.walk(tree):
+    local_func_names = {n.name for n in ast.walk(example_tree) if isinstance(n, ast.FunctionDef)}
+    assert not (local_func_names & {"build_prompt", "build_prompt_tokens", "resolve_stop_token_ids"})
+
+    imported_from_model_extras: set[str] = set()
+    for node in ast.walk(example_tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("model_extras.hunyuan_image3"):
+            imported_from_model_extras.update(alias.name for alias in node.names)
+    assert "build_ar_stage_inputs" in imported_from_model_extras
+
+    # The model_extras seam itself must delegate to the shared prompt_utils.
+    seam_path = _repo_root() / "vllm_omni" / "model_extras" / "hunyuan_image3.py"
+    seam_tree = ast.parse(seam_path.read_text(encoding="utf-8"))
+    routed_from_prompt_utils: set[str] = set()
+    for node in ast.walk(seam_tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
-            imported_from_prompt_utils.update(alias.name for alias in node.names)
-    expected_imports = {"build_prompt_tokens", "resolve_stop_token_ids", "resolve_sys_type"}
-    assert expected_imports <= imported_from_prompt_utils
+            routed_from_prompt_utils.update(alias.name for alias in node.names)
+    assert "build_ar_prompt_inputs" in routed_from_prompt_utils
 
 
 _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"
@@ -331,3 +352,38 @@ def test_segment_tokenize_diverges_from_full_string_encode():
     full_ids = tok.encode(build_prompt(user_prompt, task="i2t", bot_task=None), add_special_tokens=False)
     assert seg_ids != full_ids
     assert len(seg_ids) >= len(full_ids)
+
+
+def test_build_ar_prompt_inputs_tokenizer_path_matches_build_prompt_tokens():
+    """With a tokenizer, the helper delegates to build_prompt_tokens (parity)."""
+    tok = FakeTokenizer()
+    ar = build_ar_prompt_inputs("a red panda", task="t2i", bot_task="think", tokenizer=tok)
+    expected = build_prompt_tokens("a red panda", FakeTokenizer(), task="t2i", bot_task="think")
+    assert ar.prompt is None
+    assert ar.prompt_token_ids == expected.token_ids
+    assert ar.system_prompt_type == expected.system_prompt_type
+    # think + no explicit size -> AR predicts ratio, so stop range is non-trivial.
+    assert len(ar.stop_token_ids) > 1
+
+
+def test_build_ar_prompt_inputs_string_fallback_without_tokenizer():
+    """Without a tokenizer, the helper returns the build_prompt string form."""
+    ar = build_ar_prompt_inputs("a red panda", task="t2i", bot_task="recaption")
+    assert ar.prompt_token_ids is None
+    assert ar.prompt == build_prompt("a red panda", task="t2i", bot_task="recaption")
+    assert ar.system_prompt_type
+    assert ar.stop_token_ids
+
+
+def test_build_ar_prompt_inputs_explicit_size_stops_at_terminator():
+    """Explicit image_size makes 'recaption' stop at </recaption> only."""
+    ar = build_ar_prompt_inputs(
+        "x", task="t2i", bot_task="recaption", image_size="1024x1024"
+    )
+    assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
+
+
+def test_build_ar_prompt_inputs_comprehension_stops_on_answer():
+    """Text-output tasks (t2t / i2t) stop on <answer>."""
+    ar = build_ar_prompt_inputs("hi", task="t2t")
+    assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]

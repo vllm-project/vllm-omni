@@ -1,140 +1,116 @@
 # HunyuanImage-3.0-Instruct
 
-This example runs HunyuanImage-3.0-Instruct offline with the unified deploy
-YAMLs under `vllm_omni/deploy/`.
+HunyuanImage-3.0-Instruct now runs through the **shared task examples** for its
+two image-generating modalities, with all model-specific knobs declared
+centrally in `vllm_omni/model_extras/hunyuan_image3.py` and routed via
+`--extra-body` / `--extra-args`. Only the AR-only comprehension modalities keep
+a small dedicated script in this directory.
+
+| Modality | How to run |
+| :--- | :--- |
+| Text to image (`t2i`) | shared `examples/offline_inference/text_to_image/text_to_image.py` |
+| Image editing (`it2i`) | shared `examples/offline_inference/image_to_image/image_edit.py` |
+| Image to text (`i2t`) | `run_hunyuan_image3_understanding.py --modality image2text` |
+| Text to text (`t2t`) | `run_hunyuan_image3_understanding.py --modality text2text` |
+
+All four paths build the AR prefill + stop tokens through one declarative seam,
+`vllm_omni.model_extras.hunyuan_image3.build_ar_stage_inputs`, which wraps
+`prompt_utils.build_ar_prompt_inputs` — the same logic the OpenAI server uses —
+so prompt formatting is identical across offline and online flows.
 
 ## Deploy Configs
 
 | File | Topology | Default use |
 | :--- | :--- | :--- |
-| `vllm_omni/deploy/hunyuan_image3.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
-| `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Default for `img2text` and `text2text`. |
-| `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. Pass it explicitly with `--deploy-config`. |
+| `vllm_omni/deploy/hunyuan_image_3_moe.yaml` | AR + DiT | Text-to-image and image-editing. |
+| `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Image-to-text and text-to-text. |
+| `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. |
 
-The example chooses a deploy config automatically when `--deploy-config` and
-`--stage-configs-path` are both omitted:
+HunyuanImage3 selects its AR + DiT / AR-only / DiT-only topology by deploy file,
+so pass the matching `--deploy-config` for the scenario.
 
-| `--modality` | `mode` passed to Omni | Default deploy |
-| :--- | :--- | :--- |
-| `text2img` | `text-to-image` | `hunyuan_image3.yaml` |
-| `img2img` | `image-editing` | `hunyuan_image3.yaml` |
-| `img2text` | `image-to-text` | `hunyuan_image3_ar.yaml` |
-| `text2text` | `text-to-text` | `hunyuan_image3_ar.yaml` |
+## Declared `extra_body` parameters
 
-`--modality` is an offline example convenience flag. It maps to the internal
-`mode` argument passed to `Omni(...)` by this script. HunyuanImage3 uses
-separate deploy YAMLs for AR + DiT, AR-only, and DiT-only topologies, so the
-stage topology is selected by the deploy file rather than by YAML mode
-overrides.
+Declared in `vllm_omni/model_extras/hunyuan_image3.py`
+(`HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS`) and filtered automatically for this model:
 
-Online serving does not expose a `--modality` flag or accept `mode` as an API
-request field. Choose the deploy topology when starting the server with
-`--deploy-config`, then use the OpenAI-compatible endpoint and request shape for
-the scenario. The `modalities` request field is used by the chat completions
-path; the image endpoints infer the image task from the endpoint and payload.
+| Key | Description |
+| :--- | :--- |
+| `bot_task` | Prompt mode / trigger tag: `think`, `recaption`, `think_recaption`, `vanilla`, or `null` for plain mode. Omitted → each task's default. |
+| `use_system_prompt` | System-prompt preset, e.g. `en_unified`, `en_recaption`, `en_vanilla`. |
+| `system_prompt` | Custom system prompt (used with `use_system_prompt=custom`). |
+| `negative_prompt` | Negative prompt for classifier-free guidance. |
 
-| Online scenario | Server deploy | Request |
-| :--- | :--- | :--- |
-| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
-| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/edits`. |
-| Image/text to text | `--deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml` | `POST /v1/chat/completions` for text output, for example with `"modalities": ["text"]`. |
-| DiT-only image generation | `--deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml` | `POST /v1/images/generations`. |
+Standard sampling knobs (`--guidance-scale`, `--num-inference-steps`, `--seed`,
+`--height`, `--width`) are handled generically by the shared scripts and do not
+go through `extra_body`.
 
-## Run Examples
+## Run examples
 
-Text to image, using the default AR + DiT deploy:
+### Text to image (shared script)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
+python examples/offline_inference/text_to_image/text_to_image.py \
   --model tencent/HunyuanImage-3.0-Instruct \
-  --modality text2img \
-  --prompts "A cute cat sitting on a windowsill watching the sunset"
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
+  --trust-remote-code \
+  --prompt "A cute cat sitting on a windowsill watching the sunset" \
+  --height 1024 --width 1024 \
+  --guidance-scale 5.0 --num-inference-steps 50 --seed 42 \
+  --extra-body '{"bot_task": "think", "use_system_prompt": "en_recaption"}' \
+  --output hunyuan_t2i.png
 ```
 
-Image editing, using the default AR + DiT deploy:
+### Image editing (shared script)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
+python examples/offline_inference/image_to_image/image_edit.py \
   --model tencent/HunyuanImage-3.0-Instruct \
-  --modality img2img \
-  --image-path /path/to/image.png \
-  --prompts "Make the petals neon pink"
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
+  --trust-remote-code \
+  --image /path/to/image.png \
+  --prompt "Make the petals neon pink" \
+  --guidance-scale 5.0 --num-inference-steps 50 --seed 42 \
+  --extra-args '{"bot_task": "think"}' \
+  --output hunyuan_edit.png
 ```
 
-Image to text, using the AR-only deploy:
+`image_edit.py` accepts up to 3 reference images (repeat `--image`) for
+HunyuanImage-3.0 multi-image fusion.
+
+### Image to text (this directory)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
+python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
   --model tencent/HunyuanImage-3.0-Instruct \
-  --modality img2text \
-  --image-path /path/to/image.jpg \
-  --prompts "Describe the content of the picture."
+  --modality image2text \
+  --image /path/to/image.jpg \
+  --prompt "Describe the content of the picture."
 ```
 
-Text to text, using the AR-only deploy:
+### Text to text (this directory)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
+python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
   --model tencent/HunyuanImage-3.0-Instruct \
   --modality text2text \
-  --prompts "What is the capital of France?"
+  --prompt "What is the capital of France?"
 ```
 
-Standalone DiT, using the DiT-only deploy explicitly:
+## Online serving
 
-```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
-  --model tencent/HunyuanImage-3.0-Instruct \
-  --modality text2img \
-  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
-  --prompts "A cinematic portrait of an astronaut in a greenhouse"
-```
+Online serving selects the topology with `--deploy-config` at startup, then uses
+the OpenAI-compatible endpoints (`bot_task` / `use_system_prompt` are accepted as
+request / `extra_body` fields):
 
-Override the default full AR + DiT deploy explicitly:
+| Scenario | Server deploy | Request |
+| :--- | :--- | :--- |
+| Text to image | `hunyuan_image_3_moe.yaml` | `POST /v1/images/generations`, or `/v1/chat/completions` with `"modalities": ["image"]`. |
+| Image editing | `hunyuan_image_3_moe.yaml` | `POST /v1/images/edits`. |
+| Image/text to text | `hunyuan_image3_ar.yaml` | `POST /v1/chat/completions` with `"modalities": ["text"]`. |
+| DiT-only generation | `hunyuan_image3_dit.yaml` | `POST /v1/images/generations`. |
 
-```bash
-python examples/offline_inference/hunyuan_image3/end2end.py \
-  --model tencent/HunyuanImage-3.0-Instruct \
-  --modality text2img \
-  --deploy-config vllm_omni/deploy/hunyuan_image3.yaml \
-  --prompts "A cute cat"
-```
-
-## Additional Config
-
-You can pass diffusion worker `additional_config` from the offline example as a JSON object.
-This maps to the upstream vLLM `VllmConfig.additional_config` platform extension field:
-https://docs.vllm.ai/en/stable/api/vllm/config/#vllm.config.VllmConfig.additional_config
-
-```bash
-python end2end.py --modality text2img \
-                  --prompts "A cute cat" \
-                  --additional-config '{"torchair_graph_config":{"enabled":true}}'
-```
-
-
-## Key Arguments
-
-| Argument | Description |
-| :--- | :--- |
-| `--deploy-config` | Preferred config path for unified deploy YAMLs. |
-| `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
-| `--additional-config` | JSON object forwarded to diffusion worker `additional_config`. |
-| `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
-| `--steps` | Number of diffusion inference steps for image generation. |
-| `--guidance-scale` | Classifier-free guidance scale for image generation. |
-| `--height`, `--width` | Output image size for `text2img`. |
-| `--bot-task` | Override prompt mode. `none`, `think`, `recaption`, `think_recaption`, or `vanilla`. |
-| `--sys-type` | Override the system prompt type, for example `en_unified` or `en_vanilla`. |
-| `--vae-use-tiling` | Enable VAE tiling for memory reduction. |
-
-## Notes
-
-- `hunyuan_image3_ar.yaml` is a 4-card AR-only text/comprehension deploy.
-- `hunyuan_image3_dit.yaml` is a single-stage DiT deploy with `stage_id: 0`.
-- The old HunyuanImage3 YAMLs under `model_executor/stage_configs/` and `platforms/*/stage_configs/` have been folded into the deploy YAMLs.
-
-## Prompt Format
+## Prompt format
 
 HunyuanImage-3.0-Instruct uses an instruct chat template:
 
@@ -146,10 +122,11 @@ User: {<img>?}{user_prompt}
 Assistant: {trigger_tag?}
 ```
 
-- `<img>`: Placeholder for each input image (single token; expanded by the multimodal pipeline).
-- Trigger tags: `<think>` for CoT and `<recaption>` for recaptioning, placed after `Assistant: `.
-- System prompt: Auto-selected from `task` and `bot_task`.
+- `<img>`: placeholder per input image (single token; expanded by the multimodal pipeline).
+- Trigger tags: `<think>` (CoT) / `<recaption>` (recaptioning) after `Assistant: `.
+- System prompt: auto-selected from `task` and `bot_task`.
 - `bot_task='vanilla'` with `task='t2i'` uses the bare pretrain template.
 
-The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
-helper handles segment-by-segment tokenization and matches HF `apply_chat_template`.
+`vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
+does segment-by-segment tokenization matching HF `apply_chat_template`, and
+`build_ar_prompt_inputs()` wraps it together with the AR stop-token resolution.
