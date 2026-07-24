@@ -30,6 +30,7 @@ from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _build_terminal_empty_output,
+    _diffusion_transfer_size_bytes,
     _infer_stage_audio_sample_rate,
 )
 from vllm_omni.engine.stage_pool import StagePool
@@ -93,6 +94,34 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
     assert fatal.fatal is True
     assert fatal.error == "stage engine died"
     assert fatal.stage_id == 2
+
+
+def test_diffusion_orchestrator_enables_stage_replica_metrics_without_vllm_config() -> None:
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+        model_name="diffusion-model",
+        log_stats=True,
+    )
+
+    assert orchestrator._stage_replica_metrics is not None
+
+
+def test_diffusion_transfer_size_counts_compatibility_alias_once() -> None:
+    handle = {
+        "key": "req:stage_payload",
+        "from_stage": "0",
+        "to_stage": "1",
+        "size_bytes": 8192,
+    }
+    prompt = {
+        "_stage_payload_transfer": handle,
+        "_encode_embed_transfer": handle,
+    }
+
+    assert _diffusion_transfer_size_bytes(prompt) == 8192
 
 
 @dataclass

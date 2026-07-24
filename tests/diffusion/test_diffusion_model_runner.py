@@ -269,6 +269,7 @@ def test_middle_diffusion_stage_receives_then_sends_payload():
     torch.testing.assert_close(connector.put_calls[0][3]["latents"], latents)
     assert output.custom_output["_stage_payload_transfer"]["from_stage"] == "1"
     assert output.custom_output["_stage_payload_transfer"]["to_stage"] == "2"
+    assert output.custom_output["_stage_payload_transfer"]["size_bytes"] == latents.nbytes
 
 
 @pytest.mark.core_model

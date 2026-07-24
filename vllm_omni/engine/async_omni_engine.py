@@ -408,6 +408,7 @@ class AsyncOmniEngine:
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
+                model_name=self.model,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 duplex_runtime_extension=duplex_runtime_extension,

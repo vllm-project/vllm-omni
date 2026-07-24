@@ -109,6 +109,8 @@ AUDIO_SAMPLE_RATE = "audio_sample_rate"
 NUM_REQUESTS_RUNNING = METRIC_PREFIX + "num_requests_running"
 NUM_REQUESTS_WAITING = METRIC_PREFIX + "num_requests_waiting"
 E2E_REQUEST_LATENCY_S = METRIC_PREFIX + "e2e_request_latency_s"
+STAGE_OUTPUTS_QUEUE_SIZE = METRIC_PREFIX + "stage_outputs_queue_size"
+STAGE_INFLIGHT_REQUESTS = METRIC_PREFIX + "stage_inflight_requests"
 
 # Per-finished_reason Counter; finished_reason ∈ {stop, length, abort, ...}.
 # Aborts include client disconnect / cancellation paths. Counter auto-suffixes

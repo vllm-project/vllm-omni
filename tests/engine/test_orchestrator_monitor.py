@@ -27,6 +27,29 @@ def test_create_orch_monitor_disabled_returns_null_singleton():
     monitor.flush()
 
 
+def test_metrics_only_monitor_observes_samples_without_writing_json(tmp_path, monkeypatch):
+    out_path = tmp_path / "orch_monitor.json"
+    monkeypatch.setenv("VLLM_OMNI_ORCH_MONITOR_PATH", str(out_path))
+
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    observed = []
+    samples = {replica_key(1, 2): (3, 4)}
+
+    monitor = create_orch_monitor(
+        enabled=False,
+        replica_sampler=lambda: samples,
+        sample_observer=observed.append,
+    )
+    monitor.register_replica(1, 2)
+    now[0] = 1.5
+    monitor.note_loop(idle=False)
+    monitor.flush()
+
+    assert observed == [samples]
+    assert not out_path.exists()
+
+
 def test_note_loop_and_flush_json(tmp_path, monkeypatch):
     out_path = tmp_path / "orch_monitor.json"
     monkeypatch.setenv("VLLM_OMNI_ORCH_MONITOR_PATH", str(out_path))

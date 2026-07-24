@@ -32,6 +32,7 @@ _WINDOW_S = 1.0
 
 ReplicaSample = tuple[int, int]
 ReplicaSampler = Callable[[], dict[str, ReplicaSample]]
+ReplicaSampleObserver = Callable[[dict[str, ReplicaSample]], None]
 
 
 class _ReplicaSeries(TypedDict):
@@ -77,17 +78,30 @@ def create_orch_monitor(
     *,
     enabled: bool,
     replica_sampler: ReplicaSampler,
+    sample_observer: ReplicaSampleObserver | None = None,
 ) -> OrchestratorMonitorBase:
-    if not enabled:
+    if not enabled and sample_observer is None:
         return _NULL_ORCH_MONITOR
-    return OrchestratorMonitor(replica_sampler=replica_sampler)
+    return OrchestratorMonitor(
+        replica_sampler=replica_sampler,
+        sample_observer=sample_observer,
+        persist_output=enabled,
+    )
 
 
 class OrchestratorMonitor:
-    def __init__(self, *, replica_sampler: ReplicaSampler) -> None:
+    def __init__(
+        self,
+        *,
+        replica_sampler: ReplicaSampler,
+        sample_observer: ReplicaSampleObserver | None = None,
+        persist_output: bool = True,
+    ) -> None:
         self._output_path = _resolve_output_path()
         self._flushed = False
         self._replica_sampler = replica_sampler
+        self._sample_observer = sample_observer
+        self._persist_output = persist_output
         self._window_start_mono = time.monotonic()
         self._loop_idle = 0
         self._loop_active = 0
@@ -110,8 +124,10 @@ class OrchestratorMonitor:
     def flush(self) -> None:
         if self._flushed:
             return
-        self._roll_window(time.monotonic())
         self._flushed = True
+        if not self._persist_output:
+            return
+        self._roll_window(time.monotonic())
         payload = {
             "configured_window_s": _WINDOW_S,
             "windows": {
@@ -151,6 +167,11 @@ class OrchestratorMonitor:
         except Exception:
             logger.exception("[OrchestratorMonitor] replica sampling failed")
             sampled = {}
+        if self._sample_observer is not None:
+            try:
+                self._sample_observer(sampled)
+            except Exception:
+                logger.exception("[OrchestratorMonitor] sample observer failed")
         self._duration_s.append(max(now_mono - self._window_start_mono, 1e-9))
         self._loop_idle_buf.append(self._loop_idle)
         self._loop_active_buf.append(self._loop_active)

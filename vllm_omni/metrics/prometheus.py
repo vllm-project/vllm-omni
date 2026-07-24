@@ -37,6 +37,16 @@ _generation_tokens_family = Counter(
     "Total generation (output) tokens produced across all pipeline stages.",
     labelnames=_labelnames,
 )
+_stage_outputs_queue_family = Gauge(
+    defs.STAGE_OUTPUTS_QUEUE_SIZE,
+    "Number of completed stage outputs waiting in a replica client queue.",
+    labelnames=list(defs.STAGE_LABELS),
+)
+_stage_inflight_family = Gauge(
+    defs.STAGE_INFLIGHT_REQUESTS,
+    "Number of requests currently routed to a stage replica.",
+    labelnames=list(defs.STAGE_LABELS),
+)
 
 
 class OmniPrometheusMetrics:
@@ -108,3 +118,23 @@ class OmniRequestCounter:
 
     def decrement(self) -> None:
         self.value = max(0, self.value - 1)
+
+
+class OmniStageReplicaMetrics:
+    """Publish the orchestrator's periodic per-replica load samples."""
+
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+
+    def observe(self, samples: dict[str, tuple[int, int]]) -> None:
+        for key, (outputs_queue_size, inflight) in samples.items():
+            labels = dict(part.split("=", 1) for part in key.split(","))
+            stage = labels["stage"]
+            replica = labels["replica"]
+            metric_labels = {
+                "model_name": self._model_name,
+                "stage": stage,
+                "replica": replica,
+            }
+            _stage_outputs_queue_family.labels(**metric_labels).set(outputs_queue_size)
+            _stage_inflight_family.labels(**metric_labels).set(inflight)

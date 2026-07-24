@@ -5,7 +5,7 @@ import re
 import pytest
 from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
 
-from vllm_omni.metrics import OmniPrometheusMetrics
+from vllm_omni.metrics import OmniPrometheusMetrics, OmniStageReplicaMetrics
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -96,6 +96,15 @@ class TestMetricObservation:
             f'vllm_omni:e2e_request_latency_s_count{{model_name="{_MODEL}"}}',
         )
         assert e2e_count == 3.0
+
+    def test_stage_replica_load_gauges(self, registry: CollectorRegistry) -> None:
+        metrics = OmniStageReplicaMetrics(model_name=_MODEL)
+        metrics.observe({"stage=1,replica=2": (3, 4)})
+
+        output = generate_latest(registry).decode()
+        labels = f'model_name="{_MODEL}",replica="2",stage="1"'
+        assert _sample_value(output, f"vllm_omni:stage_outputs_queue_size{{{labels}}}") == 3.0
+        assert _sample_value(output, f"vllm_omni:stage_inflight_requests{{{labels}}}") == 4.0
 
 
 class TestLabelCorrectness:

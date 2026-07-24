@@ -407,6 +407,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     "key": key,
                     "from_stage": from_stage,
                     "to_stage": to_stage,
+                    "size_bytes": int(size),
                     "metadata": metadata,
                     "payload_keys": list(payload.keys()),
                 }

@@ -49,11 +49,38 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.prometheus import OmniRequestCounter, OmniStageReplicaMetrics
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _diffusion_transfer_size_bytes(prompt: Any) -> int:
+    """Return connector payload bytes from diffusion transfer handles."""
+    prompts = prompt if isinstance(prompt, list) else [prompt]
+    seen: set[tuple[str, str, str, int]] = set()
+    total = 0
+    for item in prompts:
+        if not isinstance(item, dict):
+            continue
+        for key, handle in item.items():
+            if not (key.startswith("_") and key.endswith("_transfer") and isinstance(handle, dict)):
+                continue
+            try:
+                size_bytes = max(int(handle.get("size_bytes", 0)), 0)
+            except (TypeError, ValueError):
+                continue
+            fingerprint = (
+                str(handle.get("key", "")),
+                str(handle.get("from_stage", "")),
+                str(handle.get("to_stage", "")),
+                size_bytes,
+            )
+            if size_bytes > 0 and fingerprint not in seen:
+                seen.add(fingerprint)
+                total += size_bytes
+    return total
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -365,6 +392,7 @@ class Orchestrator:
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
+        model_name: str | None = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
@@ -378,9 +406,18 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._init_metrics_state(
+            stage_pools,
+            running_counter,
+            transfer_emitter,
+            model_name=model_name,
+            log_stats=log_stats,
+        )
+        sample_observer = self._stage_replica_metrics.observe if self._stage_replica_metrics is not None else None
         self._orch_monitor = create_orch_monitor(
             enabled=enable_orch_monitor,
             replica_sampler=self._sample_replica_metrics,
+            sample_observer=sample_observer,
         )
         for stage_id, pool in enumerate(self.stage_pools):
             for replica_id in pool.available_replica_ids():
@@ -396,8 +433,6 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
-
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
 
@@ -441,6 +476,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        model_name: str | None = None,
         log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
@@ -464,6 +500,7 @@ class Orchestrator:
         """
         self._running_counter = running_counter
         self._transfer_emitter = transfer_emitter
+        self._stage_replica_metrics: OmniStageReplicaMetrics | None = None
 
         # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
         # consulted at record() time to translate the orchestrator's
@@ -481,6 +518,9 @@ class Orchestrator:
         if not log_stats:
             self._stat_logger = None
             return
+
+        if model_name is not None:
+            self._stage_replica_metrics = OmniStageReplicaMetrics(model_name=model_name)
 
         vllm_config_for_stats = next(
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
@@ -1634,14 +1674,14 @@ class Orchestrator:
         to_pool: StagePool,
         request_id: str,
         tx_ms: float,
+        size_bytes: int = 0,
     ) -> None:
         """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
 
         ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
         submit_*`` (serialize + queue submit to the receiving worker). Best-
-        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
-        on the serialized payload size; a follow-up can plumb that from the
-        connector adapter.
+        effort payload size comes from the connector transfer handle attached
+        by the producing diffusion worker, avoiding duplicate serialization.
         """
         if self._transfer_emitter is None:
             return
@@ -1649,7 +1689,13 @@ class Orchestrator:
         if to_replica is None:
             return
         try:
-            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
+            self._transfer_emitter.observe_size(
+                from_stage,
+                from_replica,
+                to_stage,
+                to_replica,
+                size_bytes,
+            )
             self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
         except Exception:
             logger.debug(
@@ -1777,6 +1823,8 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
+            transfer_size_bytes = _diffusion_transfer_size_bytes(diffusion_prompt)
+
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
@@ -1806,6 +1854,7 @@ class Orchestrator:
                 to_stage=next_logical,
                 to_pool=next_pool,
                 request_id=req_id,
+                size_bytes=transfer_size_bytes,
                 tx_ms=_tx_ms,
             )
             return
