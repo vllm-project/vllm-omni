@@ -1,7 +1,7 @@
-# MiniCPM-o 4.5 three-stage deploy with one GPU per stage.
+# MiniCPM-o 4.5 two-GPU continuous-batching layout.
 #
-# This replaces the former fused two-stage layout: Thinker, Talker, and
-# Code2Wav run independently on GPUs 0, 1, and 2.
+# Thinker owns GPU 0. Talker and Code2Wav share GPU 1, keeping text decoding
+# isolated from codec/vocoder contention while preserving stage-2 batching.
 pipeline: minicpmo_4_5
 async_chunk: true
 
@@ -39,14 +39,15 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.55
     enforce_eager: false
     max_num_batched_tokens: 8192
     devices: "1"
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # vLLM samples the binary continue/stop row; codec sampling comes from
-    # the checkpoint's tts_config and currently uses a deterministic seed.
+    # Codec sampling is model-owned by the checkpoint's tts_config (defaults:
+    # T=0.8, top-k=25, top-p=0.85, repetition penalty=1.05, seed=42).
+    # These parameters only govern vLLM's binary continue/stop token.
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -59,12 +60,12 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 4
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.35
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "2"
+    devices: "1"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -74,4 +75,14 @@ stages:
       max_tokens: 65536
       detokenize: true
 
-platforms: {}
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE

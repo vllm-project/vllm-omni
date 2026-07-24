@@ -6,6 +6,7 @@ from __future__ import annotations
 import queue
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import janus
 import pytest
@@ -91,6 +92,25 @@ class FakeInputProcessor:
         )
 
 
+class FakePrewarmPool:
+    stage_type = "llm"
+
+    def __init__(self, role: str) -> None:
+        self.stage_vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=64,
+                stage_connector_config={"extra": {"role": role}},
+            )
+        )
+        self.submitted: list[Any] = []
+
+    async def submit_initial(self, _request_id, _req_state, request, prompt_text=None):
+        self.submitted.append(request)
+
+    def get_bound_replica_id(self, _request_id):
+        return 0
+
+
 def _request_output(request_id: str) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
@@ -168,3 +188,56 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     submitted_request = stage1.add_request_calls[0][0]
     assert submitted_request.prompt_token_ids == [101, 102]
     assert submitted_request.external_req_id == "req-text"
+
+
+@pytest.mark.asyncio
+async def test_async_prewarm_skips_outgoing_only_stage() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("sender")
+    stage2 = FakePrewarmPool("receiver")
+    orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    req_state = OrchestratorRequestState(
+        request_id="req-prewarm",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        "req-prewarm",
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
+
+    assert stage1.submitted == []
+    assert len(stage2.submitted) == 1
+    assert 1 not in req_state.stage_submit_ts
+    assert 2 in req_state.stage_submit_ts
+
+
+@pytest.mark.asyncio
+async def test_async_route_forwards_to_outgoing_only_stage() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+    )
+    stage0 = SimpleNamespace(final_output=False)
+    stage1 = FakePrewarmPool("sender")
+    orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._forward_to_next_stage = AsyncMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-route",
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
+        final_stage_id=1,
+    )
+    req_state.stage_submit_ts[0] = 1.0
+    output = SimpleNamespace(request_id="req-route", finished=True)
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    orchestrator._forward_to_next_stage.assert_awaited_once()

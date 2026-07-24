@@ -26,6 +26,7 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
+    sched.skipped_waiting = set()
     return sched
 
 
@@ -90,3 +91,24 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=False,
+        segment_finished_requests=set(),
+    )
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    update = _make_update([10, 20])
+    update.additional_information = {
+        "tts_token_ids": [10, 20],
+        "meta": {"replace_streaming_prompt": True},
+    }
+
+    sched._update_request_as_session(session, update)
+
+    assert session.prompt_token_ids == [10, 20]
+    assert session.additional_information == update.additional_information
+    assert session.status == RequestStatus.WAITING

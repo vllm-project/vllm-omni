@@ -440,6 +440,33 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_additional_information_deserializes_new_request_payload():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    conditioning = {
+        "tts_token_ids": torch.tensor([1, 2]),
+        "tts_hidden_states": torch.ones(2, 4),
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="r1",
+                additional_information=serialize_additional_information(conditioning),
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(),
+    )
+
+    OmniGPUModelRunner._update_additional_information(runner, scheduler_output)
+
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["tts_token_ids"], conditioning["tts_token_ids"])
+    assert torch.equal(
+        runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
+        conditioning["tts_hidden_states"],
+    )
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
