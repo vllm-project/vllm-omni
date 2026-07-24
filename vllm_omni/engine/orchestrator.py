@@ -29,6 +29,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
@@ -102,37 +103,6 @@ def _build_terminal_empty_output(
         outputs=[completion],
         finished=True,
     )
-
-
-def _coerce_int_scalar(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            coerced = _coerce_int_scalar(item)
-            if coerced > 0:
-                return coerced
-        return 0
-    if hasattr(value, "item"):
-        value = value.item()
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return coerced if coerced > 0 else 0
-
-
-def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) -> int:
-    """Infer the final audio stage sample rate from stage metadata when possible."""
-    sample_rate_attrs = ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate", "sr")
-    stage_client = getattr(stage_pool, "stage_client", None)
-    stage_config = getattr(stage_pool, "_stage_vllm_config", None)
-    for source in (stage_client, stage_config):
-        for attr in sample_rate_attrs:
-            sample_rate = _coerce_int_scalar(getattr(source, attr, None))
-            if sample_rate > 0:
-                return sample_rate
-    return default
 
 
 def build_engine_core_request_from_tokens(
@@ -1274,7 +1244,7 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
+            and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -1321,6 +1291,12 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs."""
+        pool = self.stage_pools[stage_id]
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return stage_receives_chunks(model_config)
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1909,7 +1885,7 @@ class Orchestrator:
             terminal_output = _build_terminal_empty_output(
                 req_id,
                 final_output_type=final_output_type,
-                audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+                audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
             submit_ts = _time.time()
             req_state.stage_submit_ts[final_stage_id] = submit_ts
@@ -1994,6 +1970,11 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            if not self._stage_receives_async_chunks(next_stage_id):
+                # Outgoing-only stages receive their first real input from the
+                # orchestrator. Pre-submitting a placeholder lets it race and
+                # execute before that conditioning payload arrives.
+                continue
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()

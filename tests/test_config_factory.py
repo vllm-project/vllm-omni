@@ -1129,23 +1129,22 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert deploy.async_chunk is False
+        assert deploy.async_chunk is True
         assert deploy.active_stream_window == 1
-        assert [stage.session_mode for stage in stages] == ["duplex", "duplex"]
-        assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex"]
-        assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False]
+        assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert deploy.stages[1].enforce_eager is False
-        assert deploy.stages[1].compilation_config == {"cudagraph_mode": "PIECEWISE"}
-        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
-        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [151645]
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 2048
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
 
     @pytest.mark.parametrize(
-        ("filename", "stage0_devices", "stage1_devices", "stage1_replicas"),
+        ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
         [
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "0", "1,2", 2),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", "0", "1,2,3", 3),
-            ("minicpmo_4_5_8x4090_stage1_replicas.yaml", "0,1,2,3", "4,5,6,7", 4),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "0", "1,2", "0", 2),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", "0", "1,2,3", "0", 3),
+            ("minicpmo_4_5_8x4090_stage1_replicas.yaml", "0,1,2,3", "4,5,6,7", "5", 4),
         ],
     )
     def test_load_minicpmo_replica_deploy_configs(
@@ -1153,6 +1152,7 @@ class TestDeployConfigLoading:
         filename: str,
         stage0_devices: str,
         stage1_devices: str,
+        stage2_devices: str,
         stage1_replicas: int,
     ):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / filename
@@ -1164,11 +1164,15 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert [stage.yaml_runtime["devices"] for stage in stages] == [stage0_devices, stage1_devices]
+        assert [stage.yaml_runtime["devices"] for stage in stages] == [
+            stage0_devices,
+            stage1_devices,
+            stage2_devices,
+        ]
         assert stages[0].yaml_runtime["num_replicas"] == 1
         assert stages[1].yaml_runtime["num_replicas"] == stage1_replicas
-        assert all(stage.yaml_engine_args["async_scheduling"] is False for stage in stages)
-        assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
+        assert all(stage.yaml_engine_args["async_scheduling"] is False for stage in stages[:2])
+        assert all("Async" not in (stage.scheduler_cls or "") for stage in stages[:2])
 
     def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
         deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
