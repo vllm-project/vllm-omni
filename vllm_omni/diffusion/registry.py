@@ -71,15 +71,10 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
-    "LTX2TwoStagesPipeline": (
+    "LTX2DistilledPipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
-        "LTX2TwoStagesPipeline",
-    ),
-    "LTX2ImageToVideoTwoStagesPipeline": (
-        "ltx2",
-        "pipeline_ltx2_two_stage",
-        "LTX2ImageToVideoTwoStagesPipeline",
+        "LTX2DistilledPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
         "ltx2",
@@ -434,7 +429,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # Some pipelines have recursive
                 # modules that have the transformer
                 module = find_module_with_attr(model, attr)
                 if module is None:
@@ -504,8 +499,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
-    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",

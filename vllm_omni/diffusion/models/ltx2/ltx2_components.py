@@ -91,6 +91,23 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
 )
 
 
+_COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
+    ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
+    ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2"): LTX2_COMPONENT_PROFILE,
+    ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
+    ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
+}
+
+
+def resolve_ltx_component_profile(pipeline_kind: str, model_version: str) -> LTXComponentProfile:
+    """Resolve component construction independently from execution recipes."""
+    try:
+        return _COMPONENT_PROFILES[(pipeline_kind, model_version)]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported LTX component kind/version: {pipeline_kind!r}/{model_version!r}.") from exc
+
+
 def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
     """Load small checkpoint metadata without relying on repository names."""
     if os.path.isdir(model):

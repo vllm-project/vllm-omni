@@ -17,10 +17,11 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retri
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_guidance import euler_step_from_velocity
-from .ltx2_latents import LTXAVState
+from .ltx2_latents import LTXAVState, unpack_audio_latents, unpad_audio_latents
 
 if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
+    from .ltx2_recipes import LTXPhaseRecipe
     from .ltx2_request import LTXRequestInputs
 
 
@@ -72,6 +73,7 @@ class LTXPhaseResult:
     forward_context: LTXForwardContext
     video: torch.Tensor
     audio: torch.Tensor
+    audio_for_next_phase: torch.Tensor | None = None
 
 
 class LTXDenoisePipeline(Protocol):
@@ -225,6 +227,7 @@ def prepare_scheduler_stage(
     latent_num_frames: int,
     latent_height: int,
     latent_width: int,
+    use_official_sigma_schedule: bool,
     image_conditioned: bool = False,
 ) -> tuple[Any, Any, torch.Tensor]:
     if sigmas is not None and timesteps is not None:
@@ -248,7 +251,7 @@ def prepare_scheduler_stage(
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
         return audio_scheduler, video_audio_scheduler, timesteps_tensor
 
-    if sigmas is None and timesteps is None and getattr(pipeline.one_stage_recipe, "use_official_sigma_schedule", True):
+    if sigmas is None and timesteps is None and use_official_sigma_schedule:
         scheduler_sigmas = _official_ltx_sigmas(pipeline.scheduler, request_inputs.num_inference_steps, device)
         timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
@@ -396,6 +399,7 @@ class LTXPhaseExecutor:
         sigmas: list[float] | None,
         timesteps: list[int] | None,
         attention_kwargs: dict[str, Any] | None,
+        phase_recipe: LTXPhaseRecipe,
         image: Any | None = None,
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
@@ -439,6 +443,7 @@ class LTXPhaseExecutor:
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
             latent_width=latent_width,
+            use_official_sigma_schedule=phase_recipe.use_official_sigma_schedule,
             image_conditioned=conditioning_mask is not None,
         )
         forward_ctx = LTXForwardContext(
@@ -486,4 +491,13 @@ class LTXPhaseExecutor:
             state.video,
             state.audio,
         )
-        return LTXPhaseResult(forward_context=forward_ctx, video=latents, audio=audio_latents)
+        normalized_audio = unpack_audio_latents(
+            unpad_audio_latents(state.audio, forward_ctx.original_audio_num_frames),
+            num_mel_bins=forward_ctx.latent_mel_bins,
+        )
+        return LTXPhaseResult(
+            forward_context=forward_ctx,
+            video=latents,
+            audio=audio_latents,
+            audio_for_next_phase=normalized_audio,
+        )

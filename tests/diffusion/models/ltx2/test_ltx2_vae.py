@@ -22,7 +22,8 @@ class TestLTXOutputRank:
         distributed_vae_state,
         expected_decode_calls,
     ):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         class FakeVae:
             dtype = torch.float32
@@ -40,9 +41,9 @@ class TestLTXOutputRank:
                 self.decode_calls += 1
                 return (torch.ones(1, 1),)
 
-        monkeypatch.setattr(ltx.torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(ltx.torch.distributed, "get_rank", lambda: 1)
-        pipe = object.__new__(ltx.LTX2Pipeline)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.vae = FakeVae()
 

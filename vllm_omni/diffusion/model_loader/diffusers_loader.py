@@ -634,7 +634,7 @@ class DiffusersPipelineLoader:
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
         # when available and falls back to well-known attribute names.
-        # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
+        # This supports nested pipelines (e.g. LTX2DistilledPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
 

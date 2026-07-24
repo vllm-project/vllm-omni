@@ -207,6 +207,8 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
 
     assert get_extra_body_params("LTX2Pipeline") == expected
     assert get_extra_output_params("LTX2Pipeline") == frozenset()
+    assert get_extra_body_params("LTX2DistilledPipeline") == expected
+    assert get_extra_output_params("LTX2DistilledPipeline") == frozenset()
 
 
 @pytest.mark.core_model

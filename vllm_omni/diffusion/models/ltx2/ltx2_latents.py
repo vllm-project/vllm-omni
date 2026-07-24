@@ -219,6 +219,7 @@ def prepare_audio_latents(
     device: torch.device | None = None,
     generator: torch.Generator | list[torch.Generator] | None = None,
     latents: torch.Tensor | None = None,
+    latents_normalized: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     original_latent_length = audio_latent_length
     latent_mel_bins = num_mel_bins // pipeline.audio_vae_mel_compression_ratio
@@ -230,11 +231,12 @@ def prepare_audio_latents(
             latents = pack_audio_latents(latents)
         if latents.ndim != 3:
             raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
-        latents = normalize_audio_latents(
-            latents,
-            pipeline.audio_vae.latents_mean,
-            pipeline.audio_vae.latents_std,
-        )
+        if not latents_normalized:
+            latents = normalize_audio_latents(
+                latents,
+                pipeline.audio_vae.latents_mean,
+                pipeline.audio_vae.latents_std,
+            )
         latents = create_noised_state(latents, noise_scale, generator)
 
         if latents.shape[1] not in {original_latent_length, padded_latent_length}:

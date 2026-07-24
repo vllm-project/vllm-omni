@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Shared runtime surface for LTX pipeline variants."""
+"""Shared recipe-driven runtime for LTX pipeline variants."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, ClassVar
 
 import torch
@@ -24,7 +25,12 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 from vllm_omni.platforms import current_omni_platform
 
 from . import ltx2_latents as latent_ops
-from .ltx2_components import LTXComponentProfile, initialize_pipeline_components
+from .ltx2_components import (
+    LTXComponentProfile,
+    detect_ltx_model_version,
+    initialize_pipeline_components,
+    resolve_ltx_component_profile,
+)
 from .ltx2_conditioning import LTXPromptContext, LTXTextConditioningMixin
 from .ltx2_denoise import (
     LTXDenoiseContext,
@@ -42,8 +48,16 @@ from .ltx2_guidance import (
     LTXGuidanceSpec,
     LTXModalityGuidance,
 )
-from .ltx2_recipes import LTXOneStageRecipe
-from .ltx2_request import LTXRequestInputs, LTXRequestMixin
+from .ltx2_recipes import (
+    LTXPhaseRecipe,
+    LTXPipelineRecipe,
+    resolve_ltx_pipeline_recipe,
+)
+from .ltx2_request import (
+    LTXRequestInputs,
+    LTXRequestMixin,
+    validate_pipeline_request,
+)
 
 
 def _expand_per_prompt_decode_value(
@@ -108,10 +122,11 @@ class LTXRuntime(
     SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
 ):
-    """Shared Omni runtime for explicitly composed LTX denoise phases."""
+    """Shared Omni runtime for recipe-driven LTX denoise phases."""
 
+    pipeline_kind: ClassVar[str] = "one_stage"
     component_profile: ClassVar[LTXComponentProfile]
-    one_stage_recipe: ClassVar[LTXOneStageRecipe]
+    pipeline_recipe: ClassVar[LTXPipelineRecipe]
     guidance_executor: ClassVar[LTXGuidanceExecutor] = LTX_GUIDANCE_EXECUTOR
     supports_request_batch = False
     connector_batches_cfg = False
@@ -123,12 +138,128 @@ class LTXRuntime(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
+        self.model_version = detect_ltx_model_version(od_config.model)
+        self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
+        self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        self._dit_modules = list(self.component_profile.dit_modules)
+        self._encoder_modules = list(self.component_profile.encoder_modules)
+        self._vae_modules = list(self.component_profile.vae_modules)
+        self._resident_modules = list(self.component_profile.resident_modules)
+        if self.model_version == "2.3":
+            self.preserve_sp_padded_audio_duration = True
+            self.reports_stage_durations = True
         super().__init__()
-        self._guidance_plan = LTXGuidancePlan.build(self.one_stage_recipe.guidance)
+        self._guidance_plan = LTXGuidancePlan.build(self.pipeline_recipe.request_guidance)
         initialize_pipeline_components(self, od_config)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def _forward_request(
+        self,
+        req: DiffusionRequestBatch,
+        *,
+        image: Any | None = None,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
+        guidance_scale: float | None = None,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        max_sequence_length: int | None = None,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        request_inputs = self._resolve_request_inputs(
+            req,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
+        )
+        image = self._resolve_request_image(req, image, request_inputs)
+        request_sigmas = self._resolve_request_sigmas(req, sigmas)
+        validate_pipeline_request(
+            request_inputs,
+            pipeline_recipe=self.pipeline_recipe,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            pipeline_name=self.__class__.__name__,
+            request_sigmas=request_sigmas,
+        )
+        return self._run_recipe(req, request_inputs, request_sigmas=request_sigmas, image=image)
+
+    def _run_recipe(
+        self,
+        req: DiffusionRequestBatch,
+        request_inputs: LTXRequestInputs,
+        *,
+        request_sigmas: list[float] | None,
+        image: Any | None = None,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """Execute one- and multi-phase recipes through the same control flow."""
+        phase_results: list[LTXPhaseResult] = []
+        prompt_context = None
+
+        for phase_recipe in self.pipeline_recipe.phases:
+            self._enter_phase(phase_recipe)
+            phase_inputs = self._build_phase_inputs(
+                request_inputs,
+                phase_recipe,
+                phase_results[-1] if phase_results else None,
+            )
+            phase_result = self.run_phase(
+                req,
+                phase_inputs,
+                noise_scale=phase_recipe.noise_scale,
+                sigmas=list(phase_recipe.sigmas) if phase_recipe.sigmas is not None else request_sigmas,
+                timesteps=None,
+                attention_kwargs=None,
+                phase_recipe=phase_recipe,
+                image=image,
+                prompt_context=prompt_context,
+            )
+            phase_results.append(phase_result)
+            prompt_context = phase_result.forward_context.prompt_context
+
+        final_context = phase_results[-1].forward_context
+        output_phase = LTXPhaseResult(
+            forward_context=final_context,
+            video=phase_results[self.pipeline_recipe.video_output_phase].video,
+            audio=phase_results[self.pipeline_recipe.audio_output_phase].audio,
+        )
+        return self.decode_phase(output_phase)
+
+    def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
+        """Hook for a future phase-weight strategy."""
+        del phase
 
     def prepare_latents(
         self,
@@ -168,6 +299,7 @@ class LTXRuntime(
         device: torch.device | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
+        latents_normalized: bool = False,
     ) -> tuple[torch.Tensor, int, int]:
         return latent_ops.prepare_audio_latents(
             self,
@@ -180,6 +312,7 @@ class LTXRuntime(
             device,
             generator,
             latents,
+            latents_normalized,
         )
 
     @property
@@ -441,6 +574,7 @@ class LTXRuntime(
             device=device,
             generator=request_inputs.generator,
             latents=request_inputs.audio_latents,
+            latents_normalized=request_inputs.audio_latents_normalized,
         )
         return audio_latents, original_num_frames, padded_num_frames, latent_mel_bins
 
@@ -611,6 +745,7 @@ class LTXRuntime(
         sigmas: list[float] | None,
         timesteps: list[int] | None,
         attention_kwargs: dict[str, Any] | None,
+        phase_recipe: LTXPhaseRecipe,
         image: Any | None = None,
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
@@ -623,9 +758,91 @@ class LTXRuntime(
             sigmas=sigmas,
             timesteps=timesteps,
             attention_kwargs=attention_kwargs,
+            phase_recipe=phase_recipe,
             image=image,
             prompt_context=prompt_context,
         )
+
+    def _build_phase_inputs(
+        self,
+        request_inputs: LTXRequestInputs,
+        phase: LTXPhaseRecipe,
+        previous_phase: LTXPhaseResult | None,
+    ) -> LTXRequestInputs:
+        """Resolve one phase from immutable request inputs and prior AV state."""
+        divisor = phase.spatial_downscale
+        if request_inputs.height % divisor != 0 or request_inputs.width % divisor != 0:
+            raise ValueError(
+                f"LTX phase {phase.name!r} cannot scale resolution "
+                f"{request_inputs.width}x{request_inputs.height} by {divisor}."
+            )
+        height = request_inputs.height // divisor
+        width = request_inputs.width // divisor
+        latents = request_inputs.latents
+        audio_latents = request_inputs.audio_latents
+        audio_latents_normalized = request_inputs.audio_latents_normalized
+        decode_timestep = request_inputs.decode_timestep
+        decode_noise_scale = request_inputs.decode_noise_scale
+
+        if phase.input_transform == "spatial_upsample":
+            if previous_phase is None:
+                raise ValueError(f"LTX phase {phase.name!r} requires a previous phase to upsample.")
+            if previous_phase.video.ndim != 5:
+                raise ValueError(f"LTX spatial upsampling expects a 5D video latent, got {previous_phase.video.shape}.")
+            latents = self._spatial_upsample_phase(previous_phase.video)
+            if previous_phase.audio_for_next_phase is not None:
+                audio_latents = previous_phase.audio_for_next_phase
+                audio_latents_normalized = True
+            else:
+                audio_latents = previous_phase.audio
+                audio_latents_normalized = False
+            decode_timestep = 0.0
+            decode_noise_scale = None
+
+            expected_shape = latent_ops.resolve_video_latent_shape(
+                height,
+                width,
+                request_inputs.num_frames,
+                vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+                vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+            )
+            if latents.shape[2:] != expected_shape:
+                raise ValueError(
+                    f"LTX phase {phase.name!r} upsampler produced {tuple(latents.shape[2:])}, expected "
+                    f"{expected_shape} for {width}x{height}."
+                )
+        elif phase.input_transform != "initial":
+            raise ValueError(f"Unsupported LTX phase input transform: {phase.input_transform!r}.")
+
+        guidance = request_inputs.guidance if phase.allow_guidance_override else phase.guidance
+        return replace(
+            request_inputs,
+            height=height,
+            width=width,
+            num_inference_steps=phase.num_inference_steps or request_inputs.num_inference_steps,
+            guidance=guidance,
+            latents=latents,
+            audio_latents=audio_latents,
+            audio_latents_normalized=audio_latents_normalized,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+        )
+
+    def _spatial_upsample_phase(self, latents: torch.Tensor) -> torch.Tensor:
+        """Apply the currently loaded spatial upsampler to unpacked latents."""
+        latent_upsampler = getattr(self, "latent_upsampler", None)
+        if latent_upsampler is not None:
+            dtype = getattr(latent_upsampler, "dtype", latents.dtype)
+            return latent_upsampler(latents.to(device=self.device, dtype=dtype))
+
+        upsample_pipe = getattr(self, "upsample_pipe", None)
+        if upsample_pipe is None:
+            raise RuntimeError("This LTX pipeline recipe requires a spatial latent upsampler.")
+        return upsample_pipe(
+            latents=latents,
+            output_type="latent",
+            return_dict=False,
+        )[0]
 
     def decode_phase(self, phase: LTXPhaseResult) -> DiffusionOutput | list[DiffusionOutput]:
         """Decode one completed phase and restore per-request outputs."""

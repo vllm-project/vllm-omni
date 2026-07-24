@@ -5,152 +5,43 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
-import torch
-
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .ltx2_components import (
-    LTX2_COMPONENT_PROFILE,
-    LTX23_COMPONENT_PROFILE,
-    detect_ltx_model_version,
-)
+from .ltx2_components import LTX2_COMPONENT_PROFILE
 from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_pipeline_runtime import LTXRuntime
 from .ltx2_recipes import (
     LTX2_ONE_STAGE_RECIPE,
-    LTX23_ONE_STAGE_RECIPE,
     LTX_POSITIVE_ONLY_RECIPE,
 )
-from .ltx2_request import LTXRequestInputs
+from .ltx2_runtime import LTXRuntime
 
 
 class LTX2Pipeline(LTXI2VConditioningMixin, LTXRuntime):
     """LTX-2 family one-stage entry, configured from checkpoint metadata."""
 
+    pipeline_kind = "one_stage"
     unified_text_image_entry = True
     component_profile = LTX2_COMPONENT_PROFILE
-    one_stage_recipe = LTX2_ONE_STAGE_RECIPE
+    pipeline_recipe = LTX2_ONE_STAGE_RECIPE
     _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
     _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
     _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
     _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
     supports_request_batch = True
 
-    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
-        self.model_version = detect_ltx_model_version(od_config.model)
-        if self.model_version == "2.3":
-            self.component_profile = LTX23_COMPONENT_PROFILE
-            if self.one_stage_recipe is LTX2_ONE_STAGE_RECIPE:
-                self.one_stage_recipe = LTX23_ONE_STAGE_RECIPE
-            self.preserve_sp_padded_audio_duration = True
-            self.reports_stage_durations = True
-        self._dit_modules = list(self.component_profile.dit_modules)
-        self._encoder_modules = list(self.component_profile.encoder_modules)
-        self._vae_modules = list(self.component_profile.vae_modules)
-        self._resident_modules = list(self.component_profile.resident_modules)
-        super().__init__(od_config=od_config, prefix=prefix)
-
-    def _forward_impl(
-        self,
-        req: DiffusionRequestBatch,
-        request_inputs: LTXRequestInputs,
-        *,
-        noise_scale: float,
-        sigmas: list[float] | None,
-        timesteps: list[int] | None,
-        attention_kwargs: dict[str, Any] | None,
-        image: Any | None = None,
-    ) -> DiffusionOutput | list[DiffusionOutput]:
-        phase = self.run_phase(
-            req,
-            request_inputs,
-            noise_scale=noise_scale,
-            sigmas=sigmas,
-            timesteps=timesteps,
-            attention_kwargs=attention_kwargs,
-            image=image,
-        )
-        return self.decode_phase(phase)
-
-    def _forward_request(
-        self,
-        req: DiffusionRequestBatch,
-        *,
-        image: Any | None = None,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_frames: int | None = None,
-        frame_rate: float | None = None,
-        num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
-        guidance_scale: float | None = None,
-        num_videos_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        audio_latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        prompt_attention_mask: torch.Tensor | None = None,
-        negative_prompt_attention_mask: torch.Tensor | None = None,
-        decode_timestep: float | list[float] = 0.0,
-        decode_noise_scale: float | list[float] | None = None,
-        output_type: str = "np",
-        max_sequence_length: int | None = None,
-    ) -> DiffusionOutput | list[DiffusionOutput]:
-        request_inputs = self._resolve_request_inputs(
-            req,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            num_videos_per_prompt=num_videos_per_prompt,
-            generator=generator,
-            latents=latents,
-            audio_latents=audio_latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            decode_timestep=decode_timestep,
-            decode_noise_scale=decode_noise_scale,
-            output_type=output_type,
-            max_sequence_length=max_sequence_length,
-        )
-        image = self._resolve_request_image(req, image, request_inputs)
-        sigmas = self._resolve_request_sigmas(req, sigmas)
-        forward_kwargs = {
-            "noise_scale": 0.0,
-            "sigmas": sigmas,
-            "timesteps": None,
-            "attention_kwargs": None,
-        }
-        if self.support_image_input:
-            forward_kwargs["image"] = image
-        return self._forward_impl(
-            req,
-            request_inputs,
-            **forward_kwargs,
-        )
-
 
 class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
     """LTX2 T2V entry for FastGen DMD2-distilled models."""
 
+    pipeline_kind = "dmd2"
     support_image_input = False
-    one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
+    pipeline_recipe = LTX_POSITIVE_ONLY_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -160,8 +51,9 @@ class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
 class LTX2I2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
     """LTX2 I2V entry for FastGen DMD2-distilled models."""
 
+    pipeline_kind = "dmd2"
     unified_text_image_entry = False
-    one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
+    pipeline_recipe = LTX_POSITIVE_ONLY_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)

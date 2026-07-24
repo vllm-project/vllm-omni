@@ -395,10 +395,10 @@ class LTXI2VConditioningMixin:
             vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
             vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
         )
-        shape = (batch_size, num_channels_latents, num_frames, height, width)
         mask_shape = (batch_size, 1, num_frames, height, width)
 
         if latents is not None:
+            unpacked_latents = latents.ndim == 5
             if latents.ndim == 5:
                 batch_size, _, num_frames, height, width = latents.shape
                 mask_shape = (batch_size, 1, num_frames, height, width)
@@ -409,11 +409,6 @@ class LTXI2VConditioningMixin:
                     self.vae.latents_mean,
                     self.vae.latents_std,
                     self.vae.config.scaling_factor,
-                )
-                latents = latent_ops.create_noised_state(
-                    latents,
-                    noise_scale * (1 - conditioning_mask),
-                    generator,
                 )
                 latents = latent_ops.pack_latents(
                     latents,
@@ -429,6 +424,14 @@ class LTXI2VConditioningMixin:
                 self.transformer_spatial_patch_size,
                 self.transformer_temporal_patch_size,
             ).squeeze(-1)
+            if unpacked_latents:
+                # Official LTX patchifies the latent state before drawing noise.
+                # Sampling the packed shape preserves its seed-to-output contract.
+                latents = latent_ops.create_noised_state(
+                    latents,
+                    noise_scale * (1 - conditioning_mask).unsqueeze(-1),
+                    generator,
+                )
             if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
                 raise ValueError(
                     "Provided `latents` tensor has shape"
@@ -486,19 +489,18 @@ class LTXI2VConditioningMixin:
 
         conditioning_mask = torch.zeros(mask_shape, device=device, dtype=dtype)
         conditioning_mask[:, :, 0] = 1.0
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
-
+        init_latents = latent_ops.pack_latents(
+            init_latents,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
         conditioning_mask = latent_ops.pack_latents(
             conditioning_mask,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         ).squeeze(-1)
-        latents = latent_ops.pack_latents(
-            latents,
-            self.transformer_spatial_patch_size,
-            self.transformer_temporal_patch_size,
-        )
+        noise = randn_tensor(init_latents.shape, generator=generator, device=device, dtype=dtype)
+        latents = init_latents * conditioning_mask.unsqueeze(-1) + noise * (1 - conditioning_mask).unsqueeze(-1)
         return latents, conditioning_mask
 
     def _step_video_latents_i2v(

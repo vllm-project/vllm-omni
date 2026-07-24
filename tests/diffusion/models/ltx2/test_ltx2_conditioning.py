@@ -16,11 +16,12 @@ def _make_ltx23_request_pipe(cls):
     torch.nn.Module.__init__(pipe)
     pipe.device = torch.device("cpu")
     pipe.tokenizer_max_length = 99
+    pipe.vae_spatial_compression_ratio = 32
     return pipe
 
 
 class TestLTXImageToVideoForwardStages:
-    def test_forward_resolves_request_image_and_delegates_to_shared_forward_impl(self):
+    def test_forward_resolves_request_image_and_delegates_to_shared_recipe_runtime(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -48,13 +49,13 @@ class TestLTXImageToVideoForwardStages:
         )
         seen = {}
 
-        def fake_forward_impl(req_arg, request_inputs, **kwargs):
+        def fake_run_recipe(req_arg, request_inputs, **kwargs):
             seen["req"] = req_arg
             seen["request_inputs"] = request_inputs
             seen["kwargs"] = kwargs
             return ["i2v-delegated"]
 
-        object.__setattr__(pipe, "_forward_impl", fake_forward_impl)
+        object.__setattr__(pipe, "_run_recipe", fake_run_recipe)
 
         output = pipe.forward(req)
 
@@ -63,7 +64,7 @@ class TestLTXImageToVideoForwardStages:
         assert seen["request_inputs"].prompt == ["make the image move"]
         assert seen["request_inputs"].negative_prompt == ["jitter"]
         assert seen["kwargs"]["image"] is image
-        assert seen["kwargs"]["noise_scale"] == 0.0
+        assert seen["kwargs"]["request_sigmas"] is None
 
     def test_unified_entry_selects_t2v_without_images_and_rejects_mixed_batches(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -186,7 +187,10 @@ class TestLTXImageToVideoConditioning:
             config=SimpleNamespace(scaling_factor=1.0),
         )
 
+        sampled_shapes = []
+
         def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
+            sampled_shapes.append(tuple(shape))
             return torch.ones(shape, device=device, dtype=dtype)
 
         monkeypatch.setattr(ltx2_conditioning, "randn_tensor", fake_randn_tensor)
@@ -207,6 +211,51 @@ class TestLTXImageToVideoConditioning:
             latents=latents,
         )
 
+        torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
+        torch.testing.assert_close(out, torch.tensor([[[10.0, 11.0], [1.0, 1.0], [1.0, 1.0]]]))
+        assert sampled_shapes == [(1, 3, 2)]
+
+    def test_ltx23_i2v_image_noise_is_sampled_after_packing(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_conditioning as ltx2_conditioning
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 1
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+        pipe.vae = SimpleNamespace(
+            encode=lambda image: image,
+            latents_mean=torch.zeros(2),
+            latents_std=torch.ones(2),
+        )
+        monkeypatch.setattr(
+            ltx2_conditioning,
+            "retrieve_latents",
+            lambda *_args, **_kwargs: torch.tensor([[[[[10.0]]], [[[11.0]]]]]),
+        )
+        sampled_shapes = []
+
+        def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
+            sampled_shapes.append(tuple(shape))
+            return torch.ones(shape, device=device, dtype=dtype)
+
+        monkeypatch.setattr(ltx2_conditioning, "randn_tensor", fake_randn_tensor)
+
+        out, conditioning_mask = pipe.prepare_latents(
+            image=torch.zeros(1, 3, 1, 1),
+            batch_size=1,
+            num_channels_latents=2,
+            height=1,
+            width=1,
+            num_frames=3,
+            noise_scale=1.0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert sampled_shapes == [(1, 3, 2)]
         torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
         torch.testing.assert_close(out, torch.tensor([[[10.0, 11.0], [1.0, 1.0], [1.0, 1.0]]]))
 

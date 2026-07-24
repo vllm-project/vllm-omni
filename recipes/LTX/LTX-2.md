@@ -7,8 +7,7 @@
 | Model | Checkpoint | Task | `--model-class-name` | Batching |
 |---|---|---|---|---|
 | LTX-2 | `Lightricks/LTX-2` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
-| LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V | `LTX2TwoStagesPipeline` | No |
-| LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage I2V | `LTX2ImageToVideoTwoStagesPipeline` | No |
+| LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
@@ -16,6 +15,9 @@ LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
 image selects I2V. Both one-stage repositories declare this class, so
 `--model-class-name` is optional. LTX-2.3 requires the Diffusers checkpoint;
 the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
+
+`LTX2DistilledPipeline` is the unified distilled entry: omit `image` for T2V
+or provide one initial image for I2V.
 
 ## API Migration
 
@@ -39,6 +41,8 @@ The consolidation also removes these registry names without aliases:
 | `LTX23Pipeline` | `LTX2Pipeline`; checkpoint metadata selects LTX-2.3 |
 | `LTX2ImageToVideoPipeline` | `LTX2Pipeline` with `image=` |
 | `LTX23ImageToVideoPipeline` | `LTX2Pipeline` with `image=`; checkpoint metadata selects LTX-2.3 |
+| `LTX2TwoStagesPipeline` | `LTX2DistilledPipeline` |
+| `LTX2ImageToVideoTwoStagesPipeline` | `LTX2DistilledPipeline` with `image=` |
 
 Passing any second positional argument now raises `TypeError`. These changes
 affect direct Python callers and explicit `--model-class-name` overrides;
@@ -185,15 +189,15 @@ noted below.
 | `num_frames` | `int`, `None` | Request → direct value → recipe default; also determines audio duration with `frame_rate`. |
 | `frame_rate` | `float`, `None` | Request `frame_rate` → request `fps` → direct value → recipe default. |
 | `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; minimum 2. Custom `sigmas` determine actual steps. |
-| `sigmas` | list of float, `None` | Request values win; every request in a fused batch must use the same schedule. |
+| `sigmas` | list of float, `None` | One-stage only. Request values win; every request in a fused batch must use the same schedule. |
 | `timesteps` | list of int, `None` | Compatibility slot; LTX accepts only `None`. Use `sigmas`. |
-| `guidance_scale` | `float`, `None` | Common video/audio CFG fallback; an explicit request value wins. |
+| `guidance_scale` | `float`, `None` | One-stage common video/audio CFG fallback; an explicit request value wins. Distilled two-stage uses fixed positive-only guidance. |
 | `guidance_rescale` | `float`, `None` | Accepts only `None` or `0.0`; use the modality rescale fields. |
 | `noise_scale` | `float`, `0.0` | Compatibility slot; LTX accepts only `0.0`. |
 | `num_videos_per_prompt` | `int`, `1` | Output-count fallback; positive request `num_outputs_per_prompt` wins. |
 | `generator` | generator or list, `None` | Explicit RNG; otherwise request generators/seeds are collated. Lists must match the effective output batch. |
 | `latents` | tensor, `None` | Request tensors win. One-stage accepts packed `[B, S, C]` and validated unpacked video layouts. |
-| `audio_latents` | tensor, `None` | Initial audio latents; request tensors win and are collated. |
+| `audio_latents` | tensor, `None` | One-stage initial audio latents; request tensors win and are collated. |
 | `prompt_embeds` | tensor, `None` | Precomputed positive conditioning; requires `prompt_attention_mask` and cannot accompany `prompt`. |
 | `negative_prompt_embeds` | tensor, `None` | Precomputed negative conditioning; requires its mask and cannot accompany `negative_prompt`. |
 | `prompt_attention_mask` | tensor, `None` | Mask for positive embeddings; request `prompt_attention_mask` or `attention_mask` wins. |
@@ -208,6 +212,18 @@ noted below.
 Request-object naming differs only in a few places: `num_videos_per_prompt`
 maps to `num_outputs_per_prompt`; images and prompt text/embeddings live in the
 request prompt payload; LTX guidance fields live in sampling `extra_args`.
+
+### Recipe-Specific Request Capabilities
+
+| Override | One-stage | Distilled two-stage |
+|---|---|---|
+| Guidance | Supported | Fixed positive-only |
+| Custom `sigmas` | Supported | Rejected; both phases use fixed schedules |
+| Video/audio latents | Supported | Rejected |
+
+These three capability checks apply equally to direct `forward` keywords and
+values in `OmniDiffusionSamplingParams`; unsupported values fail instead of
+being silently ignored.
 
 ### Custom Sigma Schedules
 
@@ -233,8 +249,6 @@ bundled offline CLI do not currently expose `sigmas`.
   `--max-num-seqs 1`.
 - `--cfg-parallel-size 2` supports only the CFG-only plan: disable STG and
   modality guidance and set both rescale fields to `0.0`.
-- Distilled pipelines require fixed positive-only guidance. All two-stage
-  pipelines currently reject request-provided video and audio latents.
 
 ## Operational Notes
 

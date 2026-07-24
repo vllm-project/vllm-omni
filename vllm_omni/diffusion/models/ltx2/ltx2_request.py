@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Request normalization shared by LTX pipeline variants."""
+"""Request normalization and validation shared by LTX pipeline variants."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
+from .ltx2_recipes import LTXPipelineRecipe
 
 
 @dataclass
@@ -40,11 +41,41 @@ class LTXRequestInputs:
     decode_noise_scale: float | list[float] | None
     output_type: str
     max_sequence_length: int
+    audio_latents_normalized: bool = False
 
     @property
     def guidance_scale(self) -> float:
         """Compatibility view for callers that only understand video CFG."""
         return self.guidance.video.cfg_scale
+
+
+def validate_pipeline_request(
+    request_inputs: LTXRequestInputs,
+    *,
+    pipeline_recipe: LTXPipelineRecipe,
+    vae_spatial_compression_ratio: int,
+    pipeline_name: str,
+    request_sigmas: list[float] | None = None,
+) -> None:
+    """Validate the request capabilities declared by an execution recipe."""
+    alignment = vae_spatial_compression_ratio * pipeline_recipe.max_spatial_downscale
+    if request_inputs.height % alignment != 0 or request_inputs.width % alignment != 0:
+        raise ValueError(
+            f"{pipeline_name} resolution must be divisible by {alignment}, got "
+            f"{request_inputs.width}x{request_inputs.height}."
+        )
+
+    if not pipeline_recipe.allow_request_latents and (
+        request_inputs.latents is not None or request_inputs.audio_latents is not None
+    ):
+        raise ValueError(f"{pipeline_name} does not accept request-provided video or audio latents.")
+
+    if not pipeline_recipe.allow_request_sigmas and request_sigmas is not None:
+        raise ValueError(f"{pipeline_name} uses fixed phase sigma schedules.")
+
+    first_phase = pipeline_recipe.phases[0]
+    if not first_phase.allow_guidance_override and request_inputs.guidance != first_phase.guidance:
+        raise ValueError(f"{pipeline_name} uses fixed positive-only guidance and cannot override it.")
 
 
 def _unwrap_request_tensor(value: Any) -> Any:
@@ -341,15 +372,15 @@ class LTXRequestMixin:
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
             req.prompts,
-            negative_prompt if negative_prompt is not None else self.one_stage_recipe.negative_prompt,
+            negative_prompt if negative_prompt is not None else self.pipeline_recipe.negative_prompt,
         )
 
-        height = sampling.height or height or self.one_stage_recipe.height
-        width = sampling.width or width or self.one_stage_recipe.width
-        num_frames = sampling.num_frames or num_frames or self.one_stage_recipe.num_frames
-        frame_rate = sampling.resolved_frame_rate or frame_rate or self.one_stage_recipe.frame_rate
+        height = sampling.height or height or self.pipeline_recipe.height
+        width = sampling.width or width or self.pipeline_recipe.width
+        num_frames = sampling.num_frames or num_frames or self.pipeline_recipe.num_frames
+        frame_rate = sampling.resolved_frame_rate or frame_rate or self.pipeline_recipe.frame_rate
         num_inference_steps = (
-            sampling.num_inference_steps or num_inference_steps or self.one_stage_recipe.num_inference_steps
+            sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps
         )
         num_inference_steps = max(int(num_inference_steps), 2)
 
@@ -360,7 +391,7 @@ class LTXRequestMixin:
         guidance_specs = [
             _resolve_guidance_spec(
                 item,
-                self.one_stage_recipe.guidance,
+                self.pipeline_recipe.request_guidance,
                 guidance_scale=guidance_scale,
             )
             for item in sampling_params_list
