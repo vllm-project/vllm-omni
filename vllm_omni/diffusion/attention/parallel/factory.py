@@ -5,10 +5,19 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention, ParallelAttentionStrategy
+from vllm_omni.diffusion.attention.parallel.allgather_kv import (
+    AllGatherKVParallelAttention,
+)
+from vllm_omni.diffusion.attention.parallel.base import (
+    NoParallelAttention,
+    ParallelAttentionStrategy,
+)
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
-from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -19,6 +28,7 @@ def build_parallel_attention_strategy(
     scatter_idx: int,
     gather_idx: int,
     use_sync: bool,
+    causal: bool = False,
 ) -> ParallelAttentionStrategy:
     """Select a parallel attention strategy based on current diffusion config.
 
@@ -36,6 +46,7 @@ def build_parallel_attention_strategy(
 
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
+    allgather_degree = getattr(p, "allgather_degree", 1)
 
     try:
         sp_group = get_sp_group()
@@ -44,12 +55,25 @@ def build_parallel_attention_strategy(
             return NoParallelAttention()
     except Exception as e:
         # Log warning if SP is configured but group is not available
-        if ulysses_degree > 1 or ring_degree > 1:
+        if ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1:
             logger.warning(
-                f"SP configured (ulysses={ulysses_degree}, ring={ring_degree}) but SP group not available: {e}. "
+                f"SP configured (ulysses={ulysses_degree}, ring={ring_degree}, "
+                f"allgather={allgather_degree}) but SP group not available: {e}. "
                 f"Falling back to NoParallelAttention. This may cause incorrect results."
             )
         return NoParallelAttention()
+
+    if allgather_degree > 1:
+        if causal:
+            raise ValueError("AllGather-KV SP only supports non-causal attention.")
+        if ulysses_degree > 1 or ring_degree > 1:
+            raise ValueError(
+                f"AllGather-KV SP is mutually exclusive with Ulysses/Ring in v1 "
+                f"(got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+                f"allgather_degree={allgather_degree})."
+            )
+        logger.debug(f"Using AllGatherKVParallelAttention (allgather_degree={allgather_degree})")
+        return AllGatherKVParallelAttention(sp_group=sp_group)
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:

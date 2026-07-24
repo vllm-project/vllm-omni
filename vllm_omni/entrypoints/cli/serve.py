@@ -474,6 +474,14 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
+            "--allgather-degree",
+            dest="allgather_degree",
+            type=int,
+            default=None,
+            help="AllGather-KV Sequence Parallelism degree for non-causal diffusion attention. "
+            "Equivalent to setting DiffusionParallelConfig.allgather_degree.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,

@@ -99,19 +99,21 @@ def test_update_omni_help_updates_upstream_actions() -> None:
 
 
 @pytest.mark.parametrize(
-    ("extra_body", "bot_task", "expected"),
+    ("backend", "extra_body", "bot_task", "expected"),
     [
-        (None, "think", {"bot_task": "think"}),
-        ({"bot_task": "recaption"}, "think", {"bot_task": "recaption"}),
-        ({"custom": True}, None, {"custom": True}),
+        ("openai-chat-omni", None, "think", {}),
+        ("openai-image-edits-omni", None, "think", {"bot_task": "think"}),
+        ("openai-image-edits-omni", {"bot_task": "recaption"}, "think", {"bot_task": "recaption"}),
+        ("openai-image-edits-omni", {"custom": True}, None, {"custom": True}),
     ],
 )
 def test_preprocess_serve_args_merges_bot_task_without_overriding_extra_body(
+    backend: str,
     extra_body: dict | None,
     bot_task: str | None,
     expected: dict,
 ) -> None:
-    args = argparse.Namespace(extra_body=extra_body, bot_task=bot_task)
+    args = argparse.Namespace(backend=backend, extra_body=extra_body, bot_task=bot_task)
 
     preprocess_serve_args(args)
 
@@ -122,9 +124,15 @@ def test_preprocess_serve_args_merges_bot_task_without_overriding_extra_body(
     ("argv", "expected_extra_body", "expected_explicit"),
     [
         (
-            ["--print-stage", "--image-edits-bot-task", "recaption"],
+            [
+                "--backend",
+                "openai-image-edits-omni",
+                "--print-stage",
+                "--image-edits-bot-task",
+                "recaption",
+            ],
             {"bot_task": "recaption"},
-            {"print_stage", "bot_task"},
+            {"backend", "print_stage", "bot_task"},
         ),
         (
             ["--extra-body", '{"bot_task":"vanilla"}'],
@@ -140,6 +148,7 @@ def test_omni_args_parse_and_preprocess(
 ) -> None:
     parser = TrackingArgumentParser()
     parser.add_argument("--extra-body", type=json.loads, default=None)
+    parser.add_argument("--backend", default="openai-chat-omni")
     add_omni_args(parser)
 
     args = parser.parse_args(argv)

@@ -14,6 +14,7 @@ class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
+    supports_piecewise_spans: bool = False
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -51,6 +52,13 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
 
+@dataclass(frozen=True, slots=True)
+class QueryRange:
+    local_start: int
+    local_end: int
+    global_start: int
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -75,6 +83,7 @@ class AttentionMetadata:
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
+    query_ranges: tuple[QueryRange, ...] | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

@@ -65,7 +65,7 @@ def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: i
 
 
 def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
-    """Store the generic AR-stage token/hidden-state handoff consumed by TTS."""
+    """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids
     if hidden_states is not None:
@@ -73,16 +73,15 @@ def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_
 
 
 def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
-    """Read the generic AR-stage to TTS handoff, including legacy flat keys."""
+    """Read the canonical handoff, including the legacy flat aliases."""
     ids_info = info.get("ids")
     hidden_info = info.get("hidden_states")
-    tts_token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
-    tts_hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
-    if tts_token_ids is None:
-        tts_token_ids = info.get("tts_token_ids")
-    if tts_hidden_states is None:
-        tts_hidden_states = info.get("tts_hidden_states")
-    return tts_token_ids, tts_hidden_states
+    token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
+    hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    return (
+        info.get("tts_token_ids") if token_ids is None else token_ids,
+        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+    )
 
 
 def get_stream_request_key(info: dict[str, object]) -> str:

@@ -51,6 +51,13 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
+        """Preserve omni payloads when vLLM builds its scheduler request."""
+        scheduler_request, current_wave = super().preprocess_add_request(request)
+        scheduler_request.additional_information = request.additional_information
+        scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
+        return scheduler_request, current_wave
+
     @staticmethod
     def run_stage_core(
         *args: Any,

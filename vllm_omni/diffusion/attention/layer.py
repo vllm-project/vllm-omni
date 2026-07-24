@@ -140,6 +140,7 @@ class Attention(nn.Module):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            causal=causal,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
@@ -282,6 +283,8 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
+        self._assert_piecewise_compatible(attn_metadata)
+
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
@@ -291,6 +294,20 @@ class Attention(nn.Module):
 
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
+
+    def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
+        if attn_metadata is None or attn_metadata.full_attn_spans is None:
+            return
+        if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
+            return
+        backend_name = self.attn_backend.get_name()
+        if not self.attn_backend.supports_piecewise_spans:
+            raise ValueError(
+                f"Attention backend '{backend_name}' does not support "
+                f"piecewise attention (full_attn_spans without a 4D attn_mask). "
+                f"Use a Flash backend (FLASH_ATTN / FLASH_ATTN_HUB / FLASH_ATTN_3_HUB), "
+                f"or provide a 4D attn_mask that encodes the mixed causal/full pattern."
+            )
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
         # Delegate to RingParallelAttention strategy if available
