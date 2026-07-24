@@ -81,9 +81,8 @@ def test_from_config_loads_local_diffusers_component(tmp_path, monkeypatch: pyte
 
 
 def test_from_config_downloads_component_from_hf_repo(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import huggingface_hub
-
     from vllm_omni.diffusion.models.cosmos3 import sound_tokenizer
+    from vllm_omni.transformers_utils import repo_utils
 
     cache_dir = tmp_path / "hf"
     _write_component(cache_dir, checkpoint_name=DIFFUSERS_SOUND_TOKENIZER_CHECKPOINT_NAME)
@@ -95,7 +94,7 @@ def test_from_config_downloads_component_from_hf_repo(tmp_path, monkeypatch: pyt
         calls.append((repo_id, revision, allow_patterns))
         return str(cache_dir)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", fake_snapshot_download)
 
     sound_tokenizer.Cosmos3SoundTokenizer.from_config(
         SimpleNamespace(
