@@ -10,7 +10,10 @@ ARG VLLM_BASE_TAG=v0.25.0
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
-ARG APP_DIR=/workspace/vllm-omni
+# Keep APP_DIR outside /workspace so k8s Buildkite workspace mounts cannot
+# shadow the editable install target (#5364). Docker WORKDIR creates /opt if
+# needed.
+ARG APP_DIR=/opt/vllm-omni
 WORKDIR ${APP_DIR}
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
@@ -47,7 +50,7 @@ RUN uv pip install --system -e ".[dev]"
 # the heavy base image to build it. Editable install above already
 # registered APP_DIR, so we must not re-pip-install after COPY.
 FROM deps
-ARG APP_DIR=/workspace/vllm-omni
+ARG APP_DIR=/opt/vllm-omni
 WORKDIR ${APP_DIR}
 
 COPY --link . .
