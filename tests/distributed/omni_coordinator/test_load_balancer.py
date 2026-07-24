@@ -178,7 +178,7 @@ def test_least_queue_length_balancer_empty_replicas_raises():
         LeastQueueLengthBalancer().select({}, [])
 
 
-def test_least_queue_length_balancer_equal_queues_uses_choice(mocker):
+def test_least_queue_length_balancer_equal_queues_cycles_candidates():
     now = time()
     replicas = [
         ReplicaInfo(
@@ -210,11 +210,7 @@ def test_least_queue_length_balancer_equal_queues_uses_choice(mocker):
         ),
     ]
     balancer = LeastQueueLengthBalancer()
-    mocker.patch(
-        "vllm_omni.distributed.omni_coordinator.load_balancer.random.choice",
-        return_value=2,
-    )
-    assert balancer.select({}, replicas) == 2
+    assert [balancer.select({}, replicas) for _ in range(4)] == [0, 1, 2, 0]
 
 
 def test_least_queue_length_balancer_negative_queue_raises():

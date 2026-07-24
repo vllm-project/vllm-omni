@@ -102,12 +102,17 @@ class RoundRobinBalancer(LoadBalancer):
 class LeastQueueLengthBalancer(LoadBalancer):
     """Select the replica with the smallest ``queue_length``.
 
-    If multiple replicas share the same minimum queue length, one of them is
-    chosen uniformly at random.
+    If multiple replicas share the same minimum queue length, they are chosen
+    in round-robin order. This prevents bursty submissions from concentrating
+    on one replica while coordinator queue snapshots are still equal.
 
     Raises:
         ValueError: If any replica has a negative ``queue_length``.
     """
+
+    def __init__(self) -> None:
+        self._next_tie_index = 0
+        self._lock = threading.Lock()
 
     def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:  # noqa: ARG002
         if not replicas:
@@ -118,7 +123,12 @@ class LeastQueueLengthBalancer(LoadBalancer):
             raise ValueError("queue_length must be non-negative for all replicas")
         min_q = min(queue_lengths)
         candidates = [i for i, q in enumerate(queue_lengths) if q == min_q]
-        return random.choice(candidates)
+        if len(candidates) == 1:
+            return candidates[0]
+        with self._lock:
+            candidate_index = self._next_tie_index % len(candidates)
+            self._next_tie_index = (self._next_tie_index + 1) % len(candidates)
+        return candidates[candidate_index]
 
 
 __all__ = [
