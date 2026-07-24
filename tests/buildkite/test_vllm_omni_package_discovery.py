@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import textwrap
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -37,20 +36,19 @@ def _assert_subprocess_ok(proc: subprocess.CompletedProcess[str], *, detail: str
 
 def _write_import_probe_script(path: Path, modules: tuple[str, ...] = _EXAMPLE_IMPORT_PROBES) -> None:
     """Write a tiny script that imports the same modules example entrypoints need."""
-    import_lines = "\n".join(f"import {name}" for name in modules)
+    # Build at column 0 — do not mix indented triple-quotes with unindented
+    # ``import_lines`` under textwrap.dedent (common indent becomes 0 and the
+    # surrounding lines keep leading spaces → IndentationError).
+    lines = [
+        "from importlib.util import find_spec",
+        "import sys",
+        'assert find_spec("vllm_omni") is not None, (sys.path[0], sys.path[:5])',
+        *(f"import {name}" for name in modules),
+        'print("ok", sys.path[0])',
+        "",
+    ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        textwrap.dedent(
-            f"""\
-            from importlib.util import find_spec
-            import sys
-            assert find_spec("vllm_omni") is not None, (sys.path[0], sys.path[:5])
-            {import_lines}
-            print("ok", sys.path[0])
-            """
-        ),
-        encoding="utf-8",
-    )
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def test_find_spec_vllm_omni() -> None:
