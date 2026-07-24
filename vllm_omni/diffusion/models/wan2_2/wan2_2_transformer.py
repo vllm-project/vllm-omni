@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -786,6 +787,17 @@ class WanTransformer3DModel(nn.Module):
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
+    # Quantization metadata is expressed with Diffusers layer paths while the
+    # optimized Wan implementation renames FFN/output projections. vLLM applies
+    # this mapper to quantization targets and ignore lists before constructing
+    # the layers; Q/K/V fusion is handled by packed_modules_mapping above.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".ffn.net.0.": ".ffn.net_0.",
+            ".ffn.net.2": ".ffn.net_2",
+            ".to_out.0": ".to_out",
+        }
+    )
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -1114,7 +1126,8 @@ class WanTransformer3DModel(nn.Module):
             original_name = name
             lookup_name = name
 
-            # Handle QKV fusion for weight tensors (separate to_q/k/v → fused to_qkv).
+            # Handle QKV fusion for all layer tensors (separate to_q/k/v →
+            # fused to_qkv), including packed MXFP4 weights and group scales.
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
