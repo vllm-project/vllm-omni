@@ -28,7 +28,37 @@ steps:
                 "/workspace/vllm-omni/vllm_omni",
                 "/workspace/build/buildkite",
                 "/workspace/build/buildkite/vllm_omni",
+                "/workdir",
+                "/workdir/vllm_omni",
             ]
+
+            def run_child(*, cwd: str, env: dict[str, str], label: str) -> int:
+                code = (
+                    "from importlib.util import find_spec; "
+                    "import os, sys; "
+                    "print('child_cwd', os.getcwd()); "
+                    "print('child_sys_path0', repr(sys.path[0])); "
+                    "print('child_PYTHONPATH', os.environ.get('PYTHONPATH')); "
+                    "print('child_sys_path[:8]', sys.path[:8]); "
+                    "s = find_spec('vllm_omni'); "
+                    "print('child_find_spec', s); "
+                    "print('child_loader', None if s is None else type(s.loader).__name__); "
+                    "print('child_origin', None if s is None else s.origin); "
+                    "raise SystemExit(0 if s is not None else 1)"
+                )
+                proc = subprocess.run(
+                    [sys.executable, "-c", code],
+                    cwd=cwd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                print(f"--- subprocess ({label}) ---")
+                print(proc.stdout, end="")
+                print(proc.stderr, end="")
+                print("child_exit:", proc.returncode)
+                return proc.returncode
 
             print("=== vllm_omni package discovery diag (#5364) ===")
             print("cwd:", os.getcwd())
@@ -45,40 +75,51 @@ steps:
                 print(f"exists {path!r}: {p.exists()} is_dir={p.is_dir() if p.exists() else None}")
 
             spec = find_spec("vllm_omni")
-            print("find_spec(vllm_omni):", spec)
+            print("find_spec(vllm_omni) [main, env as-is]:", spec)
             if spec is not None:
+                print("  loader:", type(spec.loader).__name__)
                 print("  origin:", spec.origin)
                 print("  submodule_search_locations:", list(spec.submodule_search_locations or []))
 
-            # Mimic example / vllm CLI: no repo root on sys.path[0].
+            base_env = os.environ.copy()
+            no_pp_env = {k: v for k, v in base_env.items() if k != "PYTHONPATH"}
+
             with tempfile.TemporaryDirectory(prefix="omni_import_diag_") as tmp:
-                code = (
-                    "from importlib.util import find_spec; "
-                    "import sys; "
-                    "print('child_cwd', __import__('os').getcwd()); "
-                    "print('child_sys_path0', sys.path[0]); "
-                    "print('child_PYTHONPATH', __import__('os').environ.get('PYTHONPATH')); "
-                    "s = find_spec('vllm_omni'); "
-                    "print('child_find_spec', s); "
-                    "raise SystemExit(0 if s is not None else 1)"
-                )
-                proc = subprocess.run(
-                    [sys.executable, "-c", code],
+                # 1) With PYTHONPATH (current image default): must work off-repo-cwd.
+                rc_with = run_child(
                     cwd=tmp,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                    env=base_env,
+                    label="cwd=tmpdir, PYTHONPATH kept",
                 )
-                print("--- subprocess (cwd=tmpdir) ---")
-                print(proc.stdout, end="")
-                print(proc.stderr, end="")
-                print("child_exit:", proc.returncode)
-                if proc.returncode != 0:
-                    raise SystemExit("find_spec(vllm_omni) failed in non-repo-cwd subprocess")
+                # 2) Without PYTHONPATH: tests editable finder alone (what #5341 relied on).
+                rc_without = run_child(
+                    cwd=tmp,
+                    env=no_pp_env,
+                    label="cwd=tmpdir, PYTHONPATH unset",
+                )
+
+            print("=== summary ===")
+            print("with_PYTHONPATH_child_ok:", rc_with == 0)
+            print("without_PYTHONPATH_child_ok:", rc_without == 0)
+            if rc_without == 0:
+                print(
+                    "editable_only: PASS "
+                    "(find_spec works off-repo-cwd without PYTHONPATH)"
+                )
+            else:
+                print(
+                    "editable_only: FAIL "
+                    "(off-repo-cwd needs PYTHONPATH; editable finder insufficient here)"
+                )
 
             if spec is None:
                 raise SystemExit("find_spec(vllm_omni) is None in the main process")
-            print("diag ok")
+            if rc_with != 0:
+                raise SystemExit(
+                    "find_spec(vllm_omni) failed in non-repo-cwd subprocess with PYTHONPATH"
+                )
+            # Do not fail the step on editable-only failure: keep collecting signal.
+            print("diag ok (PYTHONPATH path verified; see editable_only above)")
             PY
         agents:
           queue: "gpu_1_queue"
