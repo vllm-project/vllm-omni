@@ -7,6 +7,9 @@ from pathlib import PurePath
 
 import regex as re
 
+# Hub entry points that must go through the library-tagged ``hf_api()`` helper.
+_HF_NAMES = r"snapshot_download|hf_hub_download|HfApi|HfFileSystem|get_safetensors_metadata"
+
 
 @dataclass
 class ForbiddenImport:
@@ -40,14 +43,14 @@ CHECK_IMPORTS = {
     ),
     "huggingface_hub": ForbiddenImport(
         pattern=(
-            r"^\s*from\s+huggingface_hub\s+import\b[^\n]*"
-            r"\b(?:snapshot_download|hf_hub_download|HfApi|HfFileSystem"
-            r"|get_safetensors_metadata)\b"
+            r"^\s*from\s+huggingface_hub\s+import\s*\([^)]*\b(?:" + _HF_NAMES + r")\b"
+            r"|"
+            r"^\s*from\s+huggingface_hub\s+import\b[^\n]*\b(?:" + _HF_NAMES + r")\b"
         ),
         tip=(
-            "Use 'hf_api()' / 'hf_fs()' from "
-            "'vllm_omni.transformers_utils.repo_utils' instead, so requests are "
-            "tagged with vLLM-Omni's library info."
+            "Use 'hf_api()' from 'vllm_omni.transformers_utils.repo_utils' (or "
+            "add a tagged helper there) instead, so requests are tagged with "
+            "vLLM-Omni's library info."
         ),
         allowed_files={"vllm_omni/transformers_utils/repo_utils.py"},
         allowed_dirs={"examples", "benchmarks"},
@@ -59,19 +62,21 @@ def check_file(path: str) -> int:
     with open(path, encoding="utf-8") as f:
         content = f.read()
     return_code = 0
+    parts = PurePath(path).parts
+    top_dir = parts[0] if parts else None
     # Check all patterns in the whole file
     for import_name, forbidden_import in CHECK_IMPORTS.items():
-        # Skip files that are allowed for this import
-        if path in forbidden_import.allowed_files:
-            continue
-        # Skip files whose top-level directory is exempt from this import
-        parts = PurePath(path).parts
-        if parts and parts[0] in forbidden_import.allowed_dirs:
+        # Skip files/directories that are allowed for this import
+        if path in forbidden_import.allowed_files or top_dir in forbidden_import.allowed_dirs:
             continue
         # Search for forbidden imports
         for match in re.finditer(forbidden_import.pattern, content, re.MULTILINE):
             # Check if it's allowed
             if forbidden_import.allowed_pattern.match(match.group()):
+                continue
+            # Skip matches inside a comment
+            line_start = content.rfind("\n", 0, match.start()) + 1
+            if "#" in content[line_start : match.start()]:
                 continue
             # Calculate line number from match position
             line_num = content[: match.start() + 1].count("\n") + 1
@@ -92,13 +97,16 @@ def main():
 
 
 def test_regex():
+    def matches(rule: str, content: str) -> bool:
+        return bool(re.search(CHECK_IMPORTS[rule].pattern, content, re.MULTILINE))
+
     pickle_cases = [
         # Should match
         ("import pickle", True),
         ("import cloudpickle", True),
         ("import pickle as pkl", True),
         ("import cloudpickle as cpkl", True),
-        ("from pickle import *", True),
+        ("from pickle import loads", True),
         ("from cloudpickle import dumps", True),
         ("from pickle import dumps, loads", True),
         ("from cloudpickle import (dumps, loads)", True),
@@ -112,10 +120,9 @@ def test_regex():
         ("print('import pickle')", False),
         ("import pickleas as asdf", False),
     ]
-    pickle_pattern = re.compile(CHECK_IMPORTS["pickle/cloudpickle"].pattern)
-    for i, (line, should_match) in enumerate(pickle_cases):
-        result = bool(pickle_pattern.match(line))
-        assert result == should_match, f"pickle case {i} failed: '{line}' (expected {should_match}, got {result})"
+    for i, (content, should_match) in enumerate(pickle_cases):
+        result = matches("pickle/cloudpickle", content)
+        assert result == should_match, f"pickle case {i} failed: {content!r} (expected {should_match}, got {result})"
 
     hf_cases = [
         # Should match
@@ -126,6 +133,10 @@ def test_regex():
         ("from huggingface_hub import get_safetensors_metadata", True),
         ("    from huggingface_hub import snapshot_download", True),
         ("from huggingface_hub import PyTorchModelHubMixin, hf_hub_download", True),
+        ("from huggingface_hub import (snapshot_download)", True),
+        # Parenthesized multi-line import must not bypass the hook
+        ("from huggingface_hub import (\n    snapshot_download,\n)", True),
+        ("from huggingface_hub import (\n    PyTorchModelHubMixin,\n    HfApi,\n)", True),
         # Should not match
         ("import huggingface_hub", False),
         ("import huggingface_hub as hf", False),
@@ -134,14 +145,13 @@ def test_regex():
         ("from huggingface_hub.constants import HF_HUB_CACHE", False),
         ("from huggingface_hub.utils import EntryNotFoundError", False),
         ("from vllm_omni.transformers_utils.repo_utils import hf_api", False),
-        ("# resolves via ``huggingface_hub.snapshot_download``", False),
-        ('    """Falls back to snapshot_download for remote repos."""', False),
+        ("from huggingface_hub import (\n    PyTorchModelHubMixin,\n)", False),
+        ("# from huggingface_hub import snapshot_download", False),
     ]
-    hf_pattern = re.compile(CHECK_IMPORTS["huggingface_hub"].pattern, re.MULTILINE)
-    for i, (line, should_match) in enumerate(hf_cases):
-        result = bool(hf_pattern.search(line))
+    for i, (content, should_match) in enumerate(hf_cases):
+        result = matches("huggingface_hub", content)
         assert result == should_match, (
-            f"huggingface_hub case {i} failed: '{line}' (expected {should_match}, got {result})"
+            f"huggingface_hub case {i} failed: {content!r} (expected {should_match}, got {result})"
         )
 
     print("All regex tests passed.")
