@@ -17,7 +17,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # Placeholder package tree so editable install can register APP_DIR.
 # The final stage COPY --link fills this directory with the real sources;
-# the editable .pth / egg-link keeps resolving imports there — no PYTHONPATH.
+# the editable .pth / egg-link plus PYTHONPATH (set below) both resolve imports.
 RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 
 # Install system dependencies
@@ -46,8 +46,14 @@ RUN uv pip install --system -e ".[dev]"
 # file system after the --link copy, otherwise we'd need to pull
 # the heavy base image to build it. Editable install above already
 # registered APP_DIR, so we must not re-pip-install after COPY.
+# Keep PYTHONPATH as belt-and-suspenders for console scripts such as
+# ``vllm ... --omni`` (find_spec), which do not rely on repo-root cwd
+# the way ``python -m vllm_omni...`` test helpers do (see #5364).
 FROM deps
 ARG APP_DIR=/workspace/vllm-omni
+# NOTE: this will probably warn about undefined vars, but is expected.
+# See: https://github.com/docker/buildx/issues/2751
+ENV PYTHONPATH=${APP_DIR}${PYTHONPATH:+:${PYTHONPATH}}
 WORKDIR ${APP_DIR}
 
 COPY --link . .
