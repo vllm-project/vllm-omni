@@ -59,7 +59,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     omni_connector_output: OmniConnectorOutput | None = None
 
     @classmethod
-    def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
+    def empty(cls) -> "OmniModelRunnerOutput":
+        """Return a structurally valid empty output."""
         return cls(
             req_ids=[],
             req_id_to_index={},
@@ -67,8 +68,13 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
-            kv_connector_output=kv_connector_output,
         )
+
+    @classmethod
+    def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
+        output = cls.empty()
+        output.kv_connector_output = kv_connector_output
+        return output
 
 
 @dataclass

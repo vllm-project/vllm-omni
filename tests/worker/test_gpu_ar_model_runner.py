@@ -10,7 +10,6 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
-    _snapshot_tensor_payload_to_cpu_async,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
@@ -542,20 +541,35 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
     assert payload["multimodal_outputs"]["codes"]["audio"].tolist() == [[1]]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
-def test_async_snapshot_no_cuda_payload_records_sentinel_event():
-    copy_stream = torch.cuda.Stream()
+def test_should_start_early_sampled_token_copy_for_non_async_hidden_opt_out():
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.model.omni_pooler_payload_include_hidden = False
 
-    snapshot = _snapshot_tensor_payload_to_cpu_async(
-        {"multimodal_outputs": None},
-        copy_stream=copy_stream,
-        pin_memory=False,
-    )
+    # GLM-like path: async scheduling, no Omni async-chunk output, hidden opt-out.
+    assert runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
+    # Omni async-chunk output already starts its own async copy/event.
+    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=True)
 
-    assert snapshot.payload == {"multimodal_outputs": None}
-    assert snapshot._ready_event is not None
-    snapshot.wait()
-    assert snapshot._waited
+    # Without async scheduling, return OmniModelRunnerOutput synchronously.
+    runner.use_async_scheduling = False
+    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
+
+    # Hidden payload kept: keep the existing late AsyncGPUModelRunnerOutput path.
+    runner.use_async_scheduling = True
+    runner.model.omni_pooler_payload_include_hidden = True
+    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
+
+
+def test_omni_model_runner_output_empty_has_required_base_fields():
+    output = OmniModelRunnerOutput.empty()
+
+    assert output.req_ids == []
+    assert output.req_id_to_index == {}
+    assert output.sampled_token_ids == []
+    assert output.logprobs is None
+    assert output.prompt_logprobs_dict == {}
+    assert output.pooler_output == []
 
 
 def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
