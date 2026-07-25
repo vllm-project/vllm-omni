@@ -3587,6 +3587,49 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    @pytest.fixture
+    def higgs_v3_server(self, mocker: MockerFixture):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(
+            model="bosonai/higgs-audio-v3-tts-4b",
+            hf_config=mocker.MagicMock(),
+        )
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048, seed=None, extra_args=None)]
+        mock_engine_client.tts_batch_max_items = 64
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="higgs_audio_v3"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        class FakeHiggsV3Adapter:
+            def validate(self, request):
+                return None
+
+            async def build(self, request, sampling_params_list, has_inline_ref_audio):
+                return PreparedRequest(
+                    prompt={"prompt_token_ids": [1, 2, 3]},
+                    tts_params={},
+                    model_type="higgs_audio_v3",
+                )
+
+        mocker.patch.object(server, "_get_tts_adapter", return_value=FakeHiggsV3Adapter())
+        yield server
+        server.shutdown()
+
     def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server, mocker: MockerFixture):
         """Voxtral path in _prepare_speech_generation should call the async wrapper."""
         voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
@@ -3631,6 +3674,41 @@ class TestTTSAsyncOffloading:
         assert stage0_params.seed == 42
         assert stage0_params.extra_args["tts_local_seed"] == 42
         assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+
+    def test_prepare_higgs_v3_unseeded_request_resolves_effective_seed_once(
+        self,
+        higgs_v3_server,
+        mocker: MockerFixture,
+    ):
+        randint = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.random.randint",
+            return_value=123456789,
+        )
+
+        asyncio.run(higgs_v3_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+
+        stage0_params = higgs_v3_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 123456789
+        assert stage0_params.extra_args["tts_effective_seed"] == 123456789
+        assert higgs_v3_server.engine_client.default_sampling_params_list[0].seed is None
+        assert higgs_v3_server.engine_client.default_sampling_params_list[0].extra_args is None
+        randint.assert_called_once()
+
+    def test_prepare_higgs_v3_explicit_seed_is_the_effective_seed(
+        self,
+        higgs_v3_server,
+        mocker: MockerFixture,
+    ):
+        randint = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.random.randint")
+
+        asyncio.run(
+            higgs_v3_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello", seed=987654321))
+        )
+
+        stage0_params = higgs_v3_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 987654321
+        assert stage0_params.extra_args["tts_effective_seed"] == 987654321
+        randint.assert_not_called()
 
     def test_prepare_speech_generation_uses_adapter_model_type_label(
         self,

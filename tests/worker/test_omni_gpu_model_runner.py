@@ -3,11 +3,63 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _make_decode_metadata_runner(model):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = SimpleNamespace(req_ids=["req-a", "req-b"], num_reqs=2)
+    runner._build_model_kwargs_extra = lambda: {}
+    return runner
+
+
+def test_model_forward_omits_request_ids_without_explicit_capability(monkeypatch):
+    calls = []
+
+    class Model:
+        supports_omni_decode_step_metadata = True
+
+        def update_decode_step_metadata(
+            self,
+            *,
+            input_ids,
+            positions,
+            inputs_embeds,
+            omni_query_start_loc,
+        ):
+            calls.append((input_ids, positions, inputs_embeds, omni_query_start_loc))
+
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda self, **kwargs: object())
+    runner = _make_decode_metadata_runner(Model())
+    input_ids = torch.tensor([1, 2])
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=input_ids)
+
+    assert calls == [(input_ids, None, None, None)]
+
+
+def test_model_forward_passes_request_id_snapshot_when_model_requires_it(monkeypatch):
+    calls = []
+
+    class Model:
+        supports_omni_decode_step_metadata = True
+        requires_request_ids_for_decode_state = True
+
+        def update_decode_step_metadata(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda self, **kwargs: object())
+    runner = _make_decode_metadata_runner(Model())
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.tensor([1, 2]))
+
+    assert calls[0]["req_ids"] == ("req-a", "req-b")
 
 
 class DummyBuffer:

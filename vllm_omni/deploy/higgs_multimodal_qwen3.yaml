@@ -1,10 +1,10 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
 # Auto-discovered default for model_type=higgs_multimodal_qwen3. This file is
-# the high-throughput profile and intentionally keeps Stage 0 enforce_eager=true
-# so the Higgs-specific local MLP CUDA graph path remains active. For low
-# concurrency latency-sensitive serving, use
-# higgs_multimodal_qwen3_low_latency.yaml explicitly.
+# a conservative c16 profile and intentionally keeps Stage 0 enforce_eager=true
+# so the Higgs-specific local MLP CUDA graph path remains active. For c64 peak
+# throughput or low-concurrency latency-sensitive serving, use the explicit
+# high-throughput or low-latency profile, respectively.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
@@ -39,13 +39,13 @@ stages:
     enforce_eager: true
     attention_backend: FLASHINFER
     trust_remote_code: true
-    # Stage-0 prefix caching is on by default. The talker's HS opt-out and
-    # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
-    # keep per-step bookkeeping negligible; any shared text prefix across
-    # concurrent requests is a net throughput win. Stage 1 (codec decoder)
-    # has no KV cache and stays disabled.
-    enable_prefix_caching: true
-    async_scheduling: false
+    # Request-aware pending postprocess overlap currently requires prefix
+    # caching to stay disabled. Stage 1 has no KV cache and also stays off.
+    enable_prefix_caching: false
+    async_scheduling: true
+    hf_overrides:
+      audio_state_step_mode: compile
+      audio_sampler_mode: torch
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
@@ -56,7 +56,6 @@ stages:
       top_p: 0.95
       top_k: 50
       max_tokens: 2048
-      seed: 42
       repetition_penalty: 1.0
 
   - stage_id: 1

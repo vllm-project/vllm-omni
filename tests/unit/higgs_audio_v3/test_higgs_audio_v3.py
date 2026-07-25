@@ -7,6 +7,8 @@ without requiring the actual checkpoint or GPU.
 """
 
 import asyncio
+import hashlib
+import inspect
 import json
 import time
 from collections import OrderedDict, defaultdict
@@ -85,6 +87,72 @@ class TestHiggsAudioV3Config:
         config = HiggsAudioV3Config(text_config={"model_type": "qwen3", "hidden_size": 2560})
         assert config.hidden_size == 2560
         assert config.audio_hidden_size == 2560
+
+    def test_audio_runtime_optimization_config_defaults(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config()
+        assert config.audio_state_step_mode == "legacy"
+        assert config.audio_sampler_mode == "torch"
+
+    def test_audio_runtime_optimization_config_overrides(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(
+            audio_state_step_mode="compile",
+            audio_sampler_mode="flashinfer",
+        )
+        assert config.audio_state_step_mode == "compile"
+        assert config.audio_sampler_mode == "flashinfer"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"audio_state_step_mode": "invalid"}, "audio_state_step_mode"),
+            ({"audio_sampler_mode": "invalid"}, "audio_sampler_mode"),
+        ],
+    )
+    def test_audio_runtime_optimization_config_rejects_invalid_modes(self, kwargs, message):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            HiggsAudioV3Config(**kwargs)
+
+    def test_audio_runtime_mode_uses_config_when_environment_is_unset(self, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            _resolve_audio_runtime_mode,
+        )
+
+        monkeypatch.delenv("HIGGS_AUDIO_V3_AUDIO_STATE_STEP", raising=False)
+        assert (
+            _resolve_audio_runtime_mode(
+                "HIGGS_AUDIO_V3_AUDIO_STATE_STEP",
+                "compile",
+                {"legacy", "eager", "compile"},
+            )
+            == "compile"
+        )
+
+    def test_audio_runtime_mode_prefers_environment_override(self, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            _resolve_audio_runtime_mode,
+        )
+
+        monkeypatch.setenv("HIGGS_AUDIO_V3_AUDIO_SAMPLER", "torch")
+        assert (
+            _resolve_audio_runtime_mode(
+                "HIGGS_AUDIO_V3_AUDIO_SAMPLER",
+                "flashinfer",
+                {"torch", "flashinfer"},
+            )
+            == "torch"
+        )
 
 
 # ---- AC-4: Fused Multi-Codebook Modules ----
@@ -276,13 +344,33 @@ class TestSamplerMethods:
         t._last_audio_host_staging = None
         t._last_audio_gpu_staging = None
         t._last_audio_staging_event = None
-        t._audio_staging_events = []
-        t._audio_staging_event_cursor = 0
         t._last_audio_codes = None
         t._last_audio_code_valid = []
         t._postprocess_cursor = 0
-        t._postprocess_audio_rows = 0
-        t._postprocess_audio_active_rows = 0
+
+        # Stable request-state pool used by async scheduling.  The pool is
+        # distinct from the contiguous active-row buffers above so tests can
+        # exercise reorder/shrink without constructing the full model.
+        t._request_state_row_by_id = {}
+        t._request_state_free_rows = []
+        t._request_state_next_row = 0
+        t._request_decode_last_codes = torch.zeros_like(t._decode_last_codes)
+        t._request_decode_has_codes = torch.zeros_like(t._decode_has_codes)
+        t._request_decode_delay_count = torch.zeros_like(t._decode_delay_count)
+        t._request_decode_eoc_countdown = torch.full_like(t._decode_eoc_countdown, -1)
+        t._request_decode_generation_done = torch.zeros_like(t._decode_generation_done)
+        t._request_decode_seed = torch.full((num_rows,), -1, dtype=torch.long)
+        t._request_decode_step_count = torch.zeros(num_rows, dtype=torch.long)
+        t._decode_seed = torch.full((num_rows,), -1, dtype=torch.long)
+        t._decode_step_count = torch.zeros(num_rows, dtype=torch.long)
+        t._audio_state_update_mask = torch.zeros(num_rows, dtype=torch.bool)
+        t._active_request_pool_rows = torch.empty(0, dtype=torch.long)
+        t._active_request_ids = ()
+        t._request_sampling_seed_by_id = {}
+        t._fast_audio_direct_request_ids = set()
+        t._trajectory_recorder = None
+        t._audio_state_step_mode = "legacy"
+        t._compiled_audio_state_step = None
 
         cls = mod.HiggsAudioV3TalkerForConditionalGeneration
         for name in (
@@ -298,10 +386,525 @@ class TestSamplerMethods:
             "_update_delay_state_batched",
             "_prefill_row_mask",
             "_audio_seed_mask_from_step_input",
+            "_refresh_request_sampling_seeds",
+            "_prepare_request_state",
+            "_commit_request_state",
+            "_ensure_request_state_capacity",
+            "_reset_request_state_pool_rows",
+            "on_requests_finished",
+            "_mark_audio_direct_requests",
+            "_can_use_logits_free_audio_sampler",
         ):
             setattr(t, name, getattr(cls, name).__get__(t))
+        t._sampling_metadata_requires_text_logits = cls._sampling_metadata_requires_text_logits
         t._device_cache_key = cls._device_cache_key
         return t
+
+    def test_request_state_survives_batch_reorder_and_shrink(self):
+        """Active row numbers may change while request-owned state must not."""
+        t = self._make_batched_sampler_talker(num_rows=4)
+
+        t._prepare_request_state(["req-a", "req-b"], torch.device("cpu"))
+        t._decode_last_codes[0].fill_(11)
+        t._decode_last_codes[1].fill_(22)
+        t._decode_delay_count[:2] = torch.tensor([3, 7])
+        t._decode_has_codes[:2] = True
+        t._commit_request_state(2)
+
+        # req-b moves from active row 1 to active row 0 after req-a leaves.
+        t._prepare_request_state(["req-b"], torch.device("cpu"))
+
+        assert t._decode_last_codes[0].eq(22).all()
+        assert t._decode_delay_count[0].item() == 7
+        assert t._decode_has_codes[0].item() is True
+
+    def test_registered_request_seeds_initialize_pool_and_survive_reorder(self):
+        """Effective seeds are request-owned before active rows are materialized."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=4)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+
+        t.register_request_sampling_seeds({"req-a": 111, "req-b": 222})
+        t._prepare_request_state(["req-a", "req-b"], torch.device("cpu"))
+
+        assert t._decode_seed[:2].tolist() == [111, 222]
+
+        t._decode_step_count[:2] = torch.tensor([7, 9])
+        t._commit_request_state(2)
+        t._prepare_request_state(["req-b"], torch.device("cpu"))
+
+        assert t._decode_seed[0].item() == 222
+        assert t._decode_step_count[0].item() == 9
+
+    def test_register_request_sampling_seed_rejects_live_conflict(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+
+        t.register_request_sampling_seeds({"req-a": 111})
+
+        with pytest.raises(ValueError, match="req-a"):
+            t.register_request_sampling_seeds({"req-a": 222})
+
+    def test_finished_request_seed_is_cleared_before_pool_row_reuse(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+        t.register_request_sampling_seeds({"req-a": 111})
+        first_rows = t._prepare_request_state(["req-a"], torch.device("cpu"))
+        first_pool_row = int(first_rows[0])
+
+        t.on_requests_finished({"req-a"})
+        t.register_request_sampling_seeds({"req-b": 222})
+        second_rows = t._prepare_request_state(["req-b"], torch.device("cpu"))
+
+        assert int(second_rows[0]) == first_pool_row
+        assert t._decode_seed[0].item() == 222
+        assert "req-a" not in t._request_sampling_seed_by_id
+
+    def test_finished_request_state_row_is_reset_before_reuse(self):
+        """Finish/cancel cleanup must not leak codec state into the next owner."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+
+        first_rows = t._prepare_request_state(["req-a"], torch.device("cpu"))
+        first_pool_row = int(first_rows[0])
+        t._decode_last_codes[0].fill_(77)
+        t._decode_has_codes[0] = True
+        t._decode_delay_count[0] = 6
+        t._decode_seed[0] = 1234
+        t._decode_step_count[0] = 9
+        t._commit_request_state(1)
+
+        t.on_requests_finished({"req-a"})
+        second_rows = t._prepare_request_state(["req-c"], torch.device("cpu"))
+
+        assert int(second_rows[0]) == first_pool_row
+        assert t._decode_last_codes[0].eq(0).all()
+        assert t._decode_has_codes[0].item() is False
+        assert t._decode_delay_count[0].item() == 0
+        assert t._decode_seed[0].item() == -1
+        assert t._decode_step_count[0].item() == 0
+
+    def test_finished_request_loses_logits_free_audio_certification(self):
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._fast_audio_direct_request_ids.update(("req-a", "req-b"))
+
+        t.on_requests_finished({"req-a"})
+
+        assert t._fast_audio_direct_request_ids == {"req-b"}
+
+    def test_stale_pending_step_cannot_recertify_finished_request(self):
+        """A lagged async resolve must not resurrect cancelled request state."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+        )
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._prepare_request_state(["req-a"], torch.device("cpu"))
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=["req-a"],
+            host_staging=torch.tensor(
+                [[11, 12, 13, 14, 15, 16, 17, 18, 1, 0]],
+                dtype=torch.int32,
+            ),
+            event=None,
+            num_codebooks=8,
+            release=lambda: None,
+            on_resolve=t._mark_audio_direct_requests,
+        )
+
+        t.on_requests_finished({"req-a"})
+        pending.resolve()
+
+        assert "req-a" not in t._fast_audio_direct_request_ids
+
+    def test_logits_free_audio_certification_is_request_aware_after_reorder(self):
+        """A new request must not inherit an old row's direct-audio fast path."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._fast_audio_direct_request_ids.update(("req-a", "req-b"))
+        t._active_request_ids = ("req-b", "req-a")
+
+        assert t._can_use_logits_free_audio_sampler(2, decode_only=True)
+
+        t._active_request_ids = ("req-b", "req-new")
+        assert not t._can_use_logits_free_audio_sampler(2, decode_only=True)
+
+    def test_compute_logits_skips_text_head_only_for_certified_audio_requests(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t.compute_logits = mod.HiggsAudioV3TalkerForConditionalGeneration.compute_logits.__get__(t)
+        t._last_step_input_ids = torch.tensor([10, 10], dtype=torch.long)
+        t._active_request_ids = ("req-a", "req-b")
+        t._fast_audio_direct_request_ids.update(t._active_request_ids)
+        t._backbone_config = SimpleNamespace(vocab_size=151936)
+        calls = []
+        t.logits_processor = lambda head, hidden: calls.append((head, hidden)) or torch.ones(2, 3)
+        t.lm_head = object()
+        metadata = SimpleNamespace(
+            max_num_logprobs=None,
+            logprob_token_ids=None,
+            allowed_token_ids_mask=None,
+            bad_words_token_ids=None,
+            no_penalties=True,
+            logitsprocs=SimpleNamespace(
+                all=(
+                    SimpleNamespace(min_toks={}),
+                    SimpleNamespace(biases={}),
+                    SimpleNamespace(min_p_count=0),
+                )
+            ),
+            thinking_budget_state_holder=None,
+        )
+        hidden = torch.randn(2, 16)
+
+        assert t.compute_logits(hidden, sampling_metadata=metadata) is None
+        assert t._last_logits_hidden is hidden
+        assert calls == []
+
+        t._active_request_ids = ("req-a", "req-new")
+        logits = t.compute_logits(hidden, sampling_metadata=metadata)
+        assert logits.shape == (2, 3)
+        assert len(calls) == 1
+
+    def test_compute_logits_keeps_text_head_when_runner_requires_it(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        cls = mod.HiggsAudioV3TalkerForConditionalGeneration
+        assert "force_text_logits" in inspect.signature(cls.compute_logits).parameters
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t.compute_logits = cls.compute_logits.__get__(t)
+        t._last_step_input_ids = torch.tensor([10], dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t.logits_processor = lambda head, hidden: torch.ones(1, 3)
+        t.lm_head = object()
+
+        logits = t.compute_logits(
+            torch.randn(1, 16),
+            sampling_metadata=None,
+            force_text_logits=True,
+        )
+
+        assert logits.shape == (1, 3)
+
+    def test_logits_processor_checks_all_known_state_containers(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        processor = SimpleNamespace(
+            min_toks={},
+            biases={0: {7: 1.0}},
+        )
+
+        assert mod.HiggsAudioV3TalkerForConditionalGeneration._logits_processor_requires_text_logits(processor)
+
+    @pytest.mark.parametrize(
+        "metadata_overrides",
+        [
+            {"logprob_token_ids": {0: [7]}},
+            {"no_penalties": False},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(min_toks={0: (2, [], {1})}),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(biases={0: {7: 1.0}}),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(min_p_count=1),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(req_info={0: object()}),))},
+            {"logitsprocs": SimpleNamespace(all=(object(),))},
+            {"thinking_budget_state_holder": SimpleNamespace(has_tracked_requests=lambda: True)},
+        ],
+        ids=(
+            "specific-token-logprobs",
+            "penalties",
+            "min-tokens",
+            "logit-bias",
+            "min-p",
+            "adapter-processor",
+            "unknown-custom-processor",
+            "thinking-budget",
+        ),
+    )
+    def test_compute_logits_keeps_text_head_for_active_sampling_dependencies(
+        self,
+        metadata_overrides,
+    ):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t.compute_logits = mod.HiggsAudioV3TalkerForConditionalGeneration.compute_logits.__get__(t)
+        t._last_step_input_ids = torch.tensor([10], dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t.logits_processor = lambda head, hidden: torch.ones(1, 3)
+        t.lm_head = object()
+        metadata_fields = {
+            "max_num_logprobs": None,
+            "logprob_token_ids": None,
+            "allowed_token_ids_mask": None,
+            "bad_words_token_ids": None,
+            "no_penalties": True,
+            "logitsprocs": SimpleNamespace(all=()),
+            "thinking_budget_state_holder": None,
+        }
+        metadata_fields.update(metadata_overrides)
+
+        logits = t.compute_logits(
+            torch.randn(1, 16),
+            sampling_metadata=SimpleNamespace(**metadata_fields),
+        )
+
+        assert logits.shape == (1, 3)
+
+    def test_seeded_audio_sampling_is_request_independent_under_reorder(self):
+        """A request seed must produce the same code row after batch reorder."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+        torch.manual_seed(123)
+        row_logits = torch.randn(8, 1026)
+        logits = torch.stack((row_logits, row_logits), dim=0).reshape(-1, 1026)
+
+        first = t._sample_audio_codes(
+            logits,
+            row_seeds=torch.tensor([111, 222], dtype=torch.long),
+            row_steps=torch.tensor([5, 5], dtype=torch.long),
+        ).view(2, 8)
+        reordered = t._sample_audio_codes(
+            logits,
+            row_seeds=torch.tensor([222, 111], dtype=torch.long),
+            row_steps=torch.tensor([5, 5], dtype=torch.long),
+        ).view(2, 8)
+
+        assert torch.equal(first[0], reordered[1])
+        assert torch.equal(first[1], reordered[0])
+        assert not torch.equal(first[0], first[1])
+
+    def test_fully_seeded_audio_sampling_does_not_run_a_second_rng(self, monkeypatch):
+        """Stateless request sampling must not also launch multinomial."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+        logits = torch.randn(2 * t.num_codebooks, t.codebook_size)
+
+        def unexpected_multinomial(*args, **kwargs):
+            raise AssertionError("fully seeded sampling launched torch.multinomial")
+
+        monkeypatch.setattr(torch, "multinomial", unexpected_multinomial)
+        sampled = t._sample_audio_codes(
+            logits,
+            row_seeds=torch.tensor([111, 222], dtype=torch.long),
+            row_steps=torch.tensor([5, 5], dtype=torch.long),
+        )
+
+        assert sampled.shape == (2 * t.num_codebooks,)
+
+    def test_flashinfer_renorm_sampler_keeps_request_seed_reorder_invariance(self, monkeypatch):
+        """Fused renorm may replace sort/masking without losing request ownership."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        calls = []
+
+        def top_k_renorm(probs, top_k):
+            calls.append(("top_k", top_k))
+            threshold = probs.topk(top_k, dim=-1).values[..., -1:]
+            kept = torch.where(probs >= threshold, probs, torch.zeros_like(probs))
+            return kept / kept.sum(dim=-1, keepdim=True)
+
+        def top_p_renorm(probs, top_p, is_deterministic=False):
+            calls.append(("top_p", top_p, is_deterministic))
+            sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
+            remove = sorted_probs.cumsum(dim=-1) > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            mask = torch.zeros_like(remove)
+            mask.scatter_(-1, sorted_indices, remove)
+            kept = probs.masked_fill(mask, 0)
+            return kept / kept.sum(dim=-1, keepdim=True)
+
+        monkeypatch.setattr(mod, "_flashinfer_top_k_renorm_probs", top_k_renorm, raising=False)
+        monkeypatch.setattr(mod, "_flashinfer_top_p_renorm_probs", top_p_renorm, raising=False)
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._audio_sampler_mode = "flashinfer"
+        row_logits = torch.randn(t.num_codebooks, t.codebook_size)
+        logits = torch.stack((row_logits, row_logits), dim=0).reshape(-1, t.codebook_size)
+        first = t._sample_audio_codes(
+            logits,
+            row_seeds=torch.tensor([111, 222], dtype=torch.long),
+            row_steps=torch.tensor([5, 5], dtype=torch.long),
+        ).view(2, t.num_codebooks)
+        reordered = t._sample_audio_codes(
+            logits,
+            row_seeds=torch.tensor([222, 111], dtype=torch.long),
+            row_steps=torch.tensor([5, 5], dtype=torch.long),
+        ).view(2, t.num_codebooks)
+
+        assert torch.equal(first[0], reordered[1])
+        assert torch.equal(first[1], reordered[0])
+        assert [call[0] for call in calls] == ["top_k", "top_p", "top_k", "top_p"]
+
+    def test_flashinfer_renorm_uses_preallocated_compile_safe_ops(self, monkeypatch):
+        """Static workspaces select opaque ops instead of Python JIT wrappers."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        calls = []
+
+        def top_k_op(probs, row_states):
+            calls.append(("top_k", row_states))
+            return probs
+
+        def top_p_op(probs, workspace):
+            calls.append(("top_p", workspace))
+            return probs
+
+        monkeypatch.setattr(mod, "_higgs_flashinfer_top_k_renorm_op", top_k_op, raising=False)
+        monkeypatch.setattr(mod, "_higgs_flashinfer_top_p_renorm_op", top_p_op, raising=False)
+        row_states = torch.empty(16, dtype=torch.uint8)
+        workspace = torch.empty(32, dtype=torch.uint8)
+        sampled = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes_tensor(
+            torch.randn(8, 1026),
+            row_seeds=torch.tensor([111], dtype=torch.long),
+            row_steps=torch.tensor([5], dtype=torch.long),
+            num_codebooks=8,
+            use_flashinfer=True,
+            flashinfer_top_k_row_states=row_states,
+            flashinfer_top_p_workspace=workspace,
+        )
+
+        assert sampled.shape == (8,)
+        assert calls == [("top_k", row_states), ("top_p", workspace)]
+
+    def test_tensor_state_step_matches_existing_mask_sample_update_path(self):
+        """The fused region must preserve every quality-sensitive transition."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        reference = self._make_batched_sampler_talker(num_rows=4)
+        fused = self._make_batched_sampler_talker(num_rows=4)
+        logits = torch.randn(4, 8, 1026)
+        rows = torch.arange(4, dtype=torch.long)
+        update_mask = torch.tensor([True, False, True, True])
+        seeds = torch.tensor([11, 22, 33, 44], dtype=torch.long)
+        steps = torch.tensor([0, 2, 7, 4], dtype=torch.long)
+        reference._decode_step_count.copy_(steps)
+        fused._decode_step_count.copy_(steps)
+
+        reference_logits = logits.clone()
+        reference._apply_delay_pattern_masking_batched(reference_logits, rows, all_rows=True)
+        reference_codes = reference._sample_audio_codes(
+            reference_logits.reshape(-1, 1026), row_seeds=seeds, row_steps=steps
+        ).view(4, 8)
+        reference._update_delay_state_batched(
+            reference_codes,
+            rows,
+            4,
+            torch.device("cpu"),
+            code_row_mask=update_mask,
+            all_rows=True,
+        )
+
+        result = mod.HiggsAudioV3TalkerForConditionalGeneration._audio_state_step_tensor(
+            logits.clone(),
+            fused._decode_delay_count,
+            fused._decode_eoc_countdown,
+            fused._decode_generation_done,
+            fused._decode_has_codes,
+            fused._decode_last_codes,
+            steps,
+            seeds,
+            update_mask,
+        )
+        (
+            output_codes,
+            delay_count,
+            eoc_countdown,
+            generation_done,
+            has_codes,
+            last_codes,
+            step_count,
+            valid,
+            done,
+        ) = result
+
+        assert torch.equal(output_codes, reference._last_audio_host_staging[:, :8])
+        assert torch.equal(delay_count, reference._decode_delay_count)
+        assert torch.equal(eoc_countdown, reference._decode_eoc_countdown)
+        assert torch.equal(generation_done, reference._decode_generation_done)
+        assert torch.equal(has_codes, reference._decode_has_codes)
+        assert torch.equal(last_codes, reference._decode_last_codes)
+        assert torch.equal(step_count, reference._decode_step_count)
+        assert torch.equal(valid.to(torch.int32), reference._last_audio_host_staging[:, 8])
+        assert torch.equal(done.to(torch.int32), reference._last_audio_host_staging[:, 9])
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA torch.compile")
+    def test_compiled_tensor_state_step_matches_eager_cuda(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+            HiggsFusedMultiTextHead,
+        )
+
+        device = torch.device("cuda")
+        torch.manual_seed(20260718)
+        model = HiggsAudioV3TalkerForConditionalGeneration.__new__(HiggsAudioV3TalkerForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.num_codebooks = 8
+        model.modality_head = HiggsFusedMultiTextHead(8, 1026, 64).to(device)
+        torch.nn.init.normal_(model.modality_head.weight, mean=0.0, std=0.02)
+        model._audio_state_step_mode = "compile"
+        model._compiled_audio_state_step = None
+        args = (
+            torch.randn(4, 64, device=device),
+            torch.tensor([0, 7, 3, 1], dtype=torch.long, device=device),
+            torch.tensor([-1, 2, 0, -1], dtype=torch.long, device=device),
+            torch.tensor([False, False, True, False], device=device),
+            torch.tensor([True, True, False, True], device=device),
+            torch.randint(0, 1024, (4, 8), dtype=torch.long, device=device),
+            torch.tensor([0, 2, 7, 4], dtype=torch.long, device=device),
+            torch.tensor([11, 22, 33, 44], dtype=torch.long, device=device),
+            torch.tensor([True, False, True, True], device=device),
+        )
+        eager = model._audio_state_step_from_hidden(*args)
+        compiled_fn = model._get_audio_state_step_callable()
+        compiled = compiled_fn(*args)
+        torch.accelerator.synchronize()
+
+        assert len(compiled) == len(eager)
+        for actual, expected in zip(compiled, eager, strict=True):
+            assert torch.equal(actual, expected)
+
+    def test_compiled_audio_state_step_disables_nested_cudagraphs(self, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        model = HiggsAudioV3TalkerForConditionalGeneration.__new__(HiggsAudioV3TalkerForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model._audio_state_step_mode = "compile"
+        model._compiled_audio_state_step = None
+        compile_kwargs = {}
+
+        def fake_compile(fn, **kwargs):
+            compile_kwargs.update(kwargs)
+            return fn
+
+        monkeypatch.setattr(torch, "compile", fake_compile)
+        model._get_audio_state_step_callable()
+
+        assert compile_kwargs["options"] == {"triton.cudagraphs": False}
+        assert "mode" not in compile_kwargs
+
+    @pytest.mark.parametrize(
+        ("num_rows", "expected"),
+        ((0, 1), (1, 1), (2, 2), (3, 4), (8, 8), (9, 16), (15, 16), (16, 16), (17, 32)),
+    )
+    def test_audio_state_step_uses_power_of_two_buckets(self, num_rows, expected):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        assert HiggsAudioV3TalkerForConditionalGeneration._audio_state_step_bucket_size(num_rows) == expected
 
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
@@ -463,16 +1066,17 @@ class TestSamplerMethods:
         t._decode_generation_done = torch.tensor([False, True])
         t._decode_delay_count = torch.zeros(2, dtype=torch.long)
         t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
-        t._fast_audio_direct_rows = 2
+        t._active_request_ids = ("req-a", "req-b")
+        t._fast_audio_direct_request_ids.update(t._active_request_ids)
         t._last_audio_done_flags = None
         t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
         t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
         t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
-        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._sample_audio_codes = lambda logits_2d, **kwargs: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 
-        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+        sampler_output = t.sample(None, sampling_metadata=object())
 
         assert not getattr(
             mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
@@ -494,16 +1098,98 @@ class TestSamplerMethods:
         t._decode_generation_done = torch.tensor([False, False])
         t._decode_delay_count = torch.zeros(2, dtype=torch.long)
         t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
-        t._fast_audio_direct_rows = 2
+        t._active_request_ids = ("req-a", "req-b")
+        t._fast_audio_direct_request_ids.update(t._active_request_ids)
         t._last_audio_done_flags = [0, 0]
         t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
         t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
         t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
-        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._sample_audio_codes = lambda logits_2d, **kwargs: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 
-        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+        sampler_output = t.sample(None, sampling_metadata=object())
+
+        assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
+
+    def test_nonempty_logits_preserve_stock_sampler_step_decision(self):
+        """A logits-producing step must not be reclassified as direct audio."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(1, 16)
+        t._last_step_input_ids = torch.tensor([99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True])
+        t._decode_generation_done = torch.tensor([False])
+        t._decode_delay_count = torch.zeros(1, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((1,), -1, dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._apply_audio_mode_bias_batched = lambda *args, **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d, **kwargs: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        expected_logprobs = object()
+        expected_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[99999]]),
+            logprobs_tensors=expected_logprobs,
+        )
+        stock_sampler_calls = []
+
+        def stock_sampler(*, logits, sampling_metadata):
+            stock_sampler_calls.append((logits, sampling_metadata))
+            return expected_output
+
+        t._stock_sampler = stock_sampler
+        logits = torch.zeros(1, 200000)
+        sampling_metadata = SimpleNamespace(logprob_token_ids={0: [7]})
+
+        sampler_output = t.sample(logits, sampling_metadata=sampling_metadata)
+
+        assert sampler_output is expected_output
+        assert stock_sampler_calls == [(logits, sampling_metadata)]
+        assert sampler_output.logprobs_tensors is expected_logprobs
+
+    def test_logits_free_sample_keeps_compute_step_decision_after_certification_changes(self):
+        """Async resolve may update certification after compute_logits returns None."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_step_input_ids = torch.tensor([99999, 99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True, True])
+        t._decode_generation_done = torch.tensor([False, False])
+        t._decode_delay_count = torch.zeros(2, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
+        t._active_request_ids = ("req-a", "req-b")
+        t._fast_audio_direct_request_ids.update(t._active_request_ids)
+        t._last_audio_done_flags = [0, 0]
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d, **kwargs: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.compute_logits = mod.HiggsAudioV3TalkerForConditionalGeneration.compute_logits.__get__(t)
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        logits = t.compute_logits(torch.zeros(2, 16), sampling_metadata=object())
+        assert logits is None
+
+        # Resolving a different pending output can mutate request certification
+        # before sample_tokens() consumes this step's immutable logits result.
+        t._fast_audio_direct_request_ids.clear()
+        sampler_output = t.sample(logits, sampling_metadata=object())
 
         assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
 
@@ -592,6 +1278,178 @@ class TestSamplerMethods:
 
 
 class TestFeedbackMethods:
+    def test_audio_host_staging_pool_ping_pongs_without_aliasing_live_step(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            _HiggsAudioHostStagingPool,
+        )
+
+        pool = _HiggsAudioHostStagingPool(width=10, pin_memory=False)
+        first = pool.acquire(2)
+        second = pool.acquire(2)
+
+        assert first.tensor.data_ptr() != second.tensor.data_ptr()
+        first_ptr = first.tensor.data_ptr()
+        first.release()
+        third = pool.acquire(2)
+        assert third.tensor.data_ptr() == first_ptr
+
+        second.release()
+        third.release()
+
+    def test_pending_audio_step_keeps_immutable_request_row_snapshot(self):
+        """A lagged resolve must use the launch-time request order."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+        )
+
+        synchronized = []
+        released = []
+        event = SimpleNamespace(synchronize=lambda: synchronized.append(True))
+        host = torch.tensor(
+            [
+                [11, 12, 13, 14, 15, 16, 17, 18, 1, 0],
+                [21, 22, 23, 24, 25, 26, 27, 28, 1, 1],
+            ],
+            dtype=torch.int32,
+        )
+        request_ids = ["req-a", "req-b"]
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=request_ids,
+            host_staging=host,
+            event=event,
+            num_codebooks=8,
+            release=lambda: released.append(True),
+        )
+
+        # Mutating the scheduler-owned list after launch must not change the
+        # pending step's request_id -> row ownership.
+        request_ids[:] = ["req-b", "req-a"]
+        resolved = pending.resolve()
+        host.fill_(99)
+
+        assert synchronized == [True]
+        assert released == [True]
+        assert pending.request_ids == ("req-a", "req-b")
+        assert dict(pending.request_id_to_row) == {"req-a": 0, "req-b": 1}
+        with pytest.raises(TypeError):
+            pending.request_id_to_row["req-c"] = 2
+        assert torch.equal(
+            resolved["req-a"]["codes"]["audio"],
+            torch.tensor([[11, 12, 13, 14, 15, 16, 17, 18]], dtype=torch.int32),
+        )
+        assert torch.equal(
+            resolved["req-b"]["codes"]["audio"],
+            torch.tensor([[21, 22, 23, 24, 25, 26, 27, 28]], dtype=torch.int32),
+        )
+
+    def test_pending_audio_step_writes_request_trajectory_fingerprint(self, tmp_path):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+            _HiggsAudioTrajectoryRecorder,
+        )
+
+        path = tmp_path / "trajectory.jsonl"
+        recorder = _HiggsAudioTrajectoryRecorder(path)
+        host = torch.tensor(
+            [
+                [11, 12, 13, 14, 15, 16, 17, 18, 1, 0],
+                [21, 22, 23, 24, 25, 26, 27, 28, 0, 1],
+            ],
+            dtype=torch.int32,
+        )
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=["req-a", "req-b"],
+            request_seeds=[111, 222],
+            sampling_seeds=[111, 333],
+            sampling_post_steps=[1, 7],
+            hidden_snapshot=torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16),
+            host_staging=host,
+            event=None,
+            num_codebooks=8,
+            release=lambda: None,
+            trajectory_recorder=recorder,
+        )
+
+        pending.resolve()
+
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [(record["request_id"], record["effective_seed"]) for record in records] == [
+            ("req-a", 111),
+            ("req-b", 222),
+        ]
+        assert [record["sampling_seed"] for record in records] == [111, 333]
+        assert [record["decode_step"] for record in records] == [0, 0]
+        assert [record["sampling_decode_step"] for record in records] == [0, 7]
+        assert [record["sampling_post_step"] for record in records] == [1, 7]
+        expected_hidden_hashes = [
+            hashlib.sha256(row.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+            for row in torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+        ]
+        assert [record["hidden_hash"] for record in records] == expected_hidden_hashes
+        assert [record["valid"] for record in records] == [True, False]
+        assert [record["done"] for record in records] == [False, True]
+        assert records[0]["sampled_codes_hash"] == hashlib.sha256(host[0, :8].numpy().tobytes()).hexdigest()
+        assert records[1]["sampled_codes_hash"] is None
+
+    def test_trajectory_recorder_is_absent_without_opt_in(self, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            _create_higgs_audio_trajectory_recorder,
+        )
+
+        monkeypatch.delenv("HIGGS_AUDIO_V3_TRAJECTORY_PATH", raising=False)
+
+        assert _create_higgs_audio_trajectory_recorder() is None
+
+    def test_pending_audio_step_keeps_invalid_rows_as_empty_payloads(self):
+        """An authoritative async snapshot must clear stale audio rows."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+        )
+
+        host = torch.tensor(
+            [[11, 12, 13, 14, 15, 16, 17, 18, 0, 0]],
+            dtype=torch.int32,
+        )
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=["req-a"],
+            host_staging=host,
+            event=None,
+            num_codebooks=8,
+            release=lambda: None,
+        )
+
+        resolved = pending.resolve()
+
+        assert "req-a" in resolved
+        assert resolved["req-a"]["codes"]["audio"].numel() == 0
+
+    def test_pending_audio_step_certifies_request_ids_after_snapshot_resolves(self):
+        """Async resolve must restore the direct-audio state lost by cursor bypass."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+        )
+
+        ready = []
+        host = torch.tensor(
+            [
+                [11, 12, 13, 14, 15, 16, 17, 18, 1, 0],
+                [21, 22, 23, 24, 25, 26, 27, 28, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=["req-a", "req-new"],
+            host_staging=host,
+            event=None,
+            num_codebooks=8,
+            release=lambda: None,
+            on_resolve=lambda request_ids, valid, done: ready.append((request_ids, tuple(valid), tuple(done))),
+        )
+
+        pending.resolve()
+
+        assert ready == [(("req-a", "req-new"), (1, 0), (0, 0))]
+
     def test_postprocess_emits_audio_codes(self):
         """postprocess() should return codes from _last_audio_codes."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
@@ -651,6 +1509,47 @@ class TestFeedbackMethods:
 
 
 # ---- AC-6: Audio Feedback Method Tests ----
+
+
+class TestBackboneCompileBoundary:
+    def test_external_decode_graph_reenters_compiled_qwen3_model(self):
+        """FULL_DECODE must call Qwen3Model so its compile decorator can run."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        expected = torch.randn(2, 4)
+
+        class RecordingModel:
+            def __init__(self):
+                self.calls = []
+                self.layers = []
+                self.norm = lambda hidden, residual: (hidden, residual)
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                return expected
+
+        class FakeTalker:
+            _use_external_decode_cudagraph = True
+            model = RecordingModel()
+
+        talker = FakeTalker()
+        positions = torch.arange(2)
+        hidden_states = torch.randn(2, 4)
+
+        actual = mod.HiggsAudioV3TalkerForConditionalGeneration._run_qwen3_layers_eager(
+            talker,
+            positions,
+            hidden_states,
+        )
+
+        assert actual is expected
+        assert talker.model.calls == [
+            {
+                "input_ids": None,
+                "positions": positions,
+                "inputs_embeds": hidden_states,
+            }
+        ]
 
 
 class TestAudioFeedback:
@@ -764,6 +1663,27 @@ class TestAudioFeedback:
         t._decode_has_codes[2] = True
         hidden = torch.zeros(4, 16)
 
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[2].abs().sum() > 0
+        assert result[0].abs().sum() == 0
+        assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
+
+    def test_external_decode_graph_dense_qsl_bypasses_dynamic_position_filter(self):
+        """Dense FULL_DECODE capture must not create dynamic boolean-index outputs."""
+        t = self._make_feedback_talker()
+        t._use_external_decode_cudagraph = True
+        t._last_step_input_ids = torch.tensor([10, 11, 12, 13])
+        t._last_step_query_start_loc = torch.tensor([0, 1, 2, 3, 4])
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[2] = True
+        hidden = torch.zeros(4, 16)
+
+        def fail_dynamic_filter(*args, **kwargs):
+            raise AssertionError("dense decode must bypass dynamic boolean indexing")
+
+        t._decode_request_token_positions = fail_dynamic_filter
         result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
 
         assert result[2].abs().sum() > 0
@@ -1188,6 +2108,122 @@ class TestStageInputProcessor:
 
 
 class TestRegistry:
+    def test_talker_declares_async_no_hidden_output_capabilities(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        assert HiggsAudioV3TalkerForConditionalGeneration.use_async_omni_output is True
+        assert HiggsAudioV3TalkerForConditionalGeneration.eager_omni_postprocess_before_async_output is False
+        assert HiggsAudioV3TalkerForConditionalGeneration.supports_async_omni_postprocess is True
+        assert HiggsAudioV3TalkerForConditionalGeneration.omni_pooler_payload_include_hidden is False
+
+    def test_higgs_deploys_enable_request_aware_stage0_async_only(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        for name in (
+            "higgs_multimodal_qwen3.yaml",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ):
+            with open(os.path.join(deploy_dir, name), encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            assert config["stages"][0]["async_scheduling"] is True
+            assert config["stages"][0]["enable_prefix_caching"] is False
+            assert config["stages"][1]["async_scheduling"] is False
+
+    def test_default_deploy_selects_validated_audio_runtime(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        with open(os.path.join(deploy_dir, "higgs_multimodal_qwen3.yaml"), encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        overrides = config["stages"][0]["hf_overrides"]
+        assert overrides["audio_state_step_mode"] == "compile"
+        assert overrides["audio_sampler_mode"] == "torch"
+
+    def test_higgs_stage0_deploys_do_not_pin_sampling_seed(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        for name in (
+            "higgs_multimodal_qwen3.yaml",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ):
+            with open(os.path.join(deploy_dir, name), encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            assert "seed" not in config["stages"][0]["default_sampling_params"]
+
+    def test_high_throughput_deploy_selects_c64_full_decode_runtime(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(
+            repo_root,
+            "vllm_omni",
+            "deploy",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+        )
+        with open(yaml_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        stage0 = config["stages"][0]
+        overrides = stage0["hf_overrides"]
+        assert overrides["audio_state_step_mode"] == "compile"
+        assert overrides["audio_sampler_mode"] == "torch"
+        assert stage0["enforce_eager"] is False
+        compilation = stage0["compilation_config"]
+        assert compilation["custom_ops"] == ["none"]
+        assert compilation["cudagraph_mode"] == "FULL_DECODE_ONLY"
+        assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 8, 16, 32, 64]
+
+    def test_high_throughput_deploy_matches_stage_concurrency(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(
+            repo_root,
+            "vllm_omni",
+            "deploy",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+        )
+        with open(yaml_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        assert config["stages"][0]["max_num_seqs"] == 64
+        assert config["stages"][1]["max_num_seqs"] == 64
+
+    def test_high_throughput_deploy_uses_large_steady_state_codec_chunks(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(
+            repo_root,
+            "vllm_omni",
+            "deploy",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+        )
+        with open(yaml_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        connector = config["connectors"]["connector_of_shared_memory"]["extra"]
+        assert connector["codec_chunk_frames"] == 75
+        assert connector["initial_codec_chunk_frames"] == 1
+
     def test_talker_registered(self):
         from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 

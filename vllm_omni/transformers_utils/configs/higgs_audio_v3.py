@@ -95,6 +95,8 @@ class HiggsAudioV3Config(PretrainedConfig):
         audio_continuation_id: int | None = None,
         enable_flashinfer_api_unwrap: bool = True,
         enable_mlp_cudagraph: bool = True,
+        audio_state_step_mode: str = "legacy",
+        audio_sampler_mode: str = "torch",
         **kwargs: Any,
     ) -> None:
         # Legacy perf knob removed: Higgs v3 scheduler tokens now come from
@@ -131,6 +133,14 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.audio_continuation_id = audio_continuation_id
         self.enable_flashinfer_api_unwrap = bool(enable_flashinfer_api_unwrap)
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
+        self.audio_state_step_mode = str(audio_state_step_mode).strip().lower()
+        if self.audio_state_step_mode not in {"legacy", "eager", "compile"}:
+            raise ValueError(
+                f"audio_state_step_mode must be one of legacy/eager/compile, got {self.audio_state_step_mode!r}"
+            )
+        self.audio_sampler_mode = str(audio_sampler_mode).strip().lower()
+        if self.audio_sampler_mode not in {"torch", "flashinfer"}:
+            raise ValueError(f"audio_sampler_mode must be one of torch/flashinfer, got {self.audio_sampler_mode!r}")
 
         super().__init__(**kwargs)
 

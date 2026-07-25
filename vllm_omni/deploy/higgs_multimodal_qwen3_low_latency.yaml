@@ -44,8 +44,10 @@ stages:
     enforce_eager: false
     attention_backend: FLASHINFER
     trust_remote_code: true
-    enable_prefix_caching: true
-    async_scheduling: false
+    # Keep request-aware async postprocess enabled without adding the compiled
+    # audio-state warm-up cost to this low-concurrency profile.
+    enable_prefix_caching: false
+    async_scheduling: true
     compilation_config:
       cudagraph_capture_sizes: [1, 2, 4, 8, 16]
       cudagraph_mode: FULL_DECODE_ONLY
@@ -60,7 +62,6 @@ stages:
       top_p: 0.95
       top_k: 50
       max_tokens: 2048
-      seed: 42
       repetition_penalty: 1.0
 
   - stage_id: 1

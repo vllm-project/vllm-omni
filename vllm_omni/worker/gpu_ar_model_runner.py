@@ -40,7 +40,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.data_entry_keys import flatten_payload, unflatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
@@ -638,6 +638,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _register_model_request_sampling_seeds(self, scheduler_output: SchedulerOutput) -> None:
+        """Pass serving-owned request seeds to opt-in models at admission."""
+        register = getattr(self.model, "register_request_sampling_seeds", None)
+        if not callable(register):
+            return
+
+        seeds: dict[str, int] = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling_params = getattr(new_req, "sampling_params", None)
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if not isinstance(extra_args, dict):
+                continue
+            effective_seed = extra_args.get("tts_effective_seed")
+            if effective_seed is not None:
+                seeds[str(new_req.req_id)] = int(effective_seed)
+        if seeds:
+            register(seeds)
+
     def _get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -1077,6 +1095,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
+            self._register_model_request_sampling_seeds(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -1382,13 +1401,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
 
                 sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
-                # Try with sampling_metadata first; fall back to without for models that don't support it
-                try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
-                except TypeError:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_model_logits(sample_hidden_states, scheduler_output)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1405,13 +1418,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     logits = None
                 else:
-                    # Try with sampling_metadata first; fall back to without for models that don't support it
-                    try:
-                        logits = self.model.compute_logits(
-                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                        )
-                    except TypeError:
-                        logits = self.model.compute_logits(sample_hidden_states)
+                    logits = self._compute_model_logits(sample_hidden_states, scheduler_output)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -1447,6 +1454,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         return None
 
+    def _compute_model_logits(
+        self,
+        sample_hidden_states: torch.Tensor,
+        scheduler_output: SchedulerOutput,
+    ) -> torch.Tensor | None:
+        sampling_metadata = self.input_batch.sampling_metadata
+        if getattr(self.model, "supports_force_text_logits", False):
+            return self.model.compute_logits(
+                sample_hidden_states,
+                sampling_metadata=sampling_metadata,
+                force_text_logits=bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+            )
+
+        # Preserve compatibility with models whose compute_logits predates
+        # sampling_metadata support.
+        try:
+            return self.model.compute_logits(
+                sample_hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+        except TypeError:
+            return self.model.compute_logits(sample_hidden_states)
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -1456,11 +1486,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
-            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+            supports_logits_free = bool(
+                logits is None and getattr(self.model, "supports_logits_free_model_sampler", False)
+            )
+            if (
+                (logits is not None or supports_logits_free)
+                and callable(model_sample)
+                and getattr(self.model, "prefer_model_sampler", False)
+            ):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
                 # this internally, but prefer_model_sampler bypasses it.
-                if hasattr(self.sampler, "logit_bias_state"):
+                if logits is not None and hasattr(self.sampler, "logit_bias_state"):
                     self.sampler.logit_bias_state.apply_logit_bias(
                         logits,
                         self.input_batch.expanded_idx_mapping,
@@ -1602,12 +1639,69 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         if not self._model_omni_flag(model, "use_async_omni_output"):
             return False
-        if self._model_omni_flag(model, "has_postprocess") and not self._model_omni_flag(
-            model, "eager_omni_postprocess_before_async_output"
-        ):
-            return False
+        if self._model_omni_flag(model, "has_postprocess"):
+            eager_postprocess = self._model_omni_flag(model, "eager_omni_postprocess_before_async_output")
+            pending_postprocess = self._model_omni_flag(model, "supports_async_omni_postprocess")
+            if not eager_postprocess and not pending_postprocess:
+                return False
 
         return True
+
+    def _take_pending_omni_postprocess(
+        self,
+        req_ids_snapshot: Sequence[str],
+    ) -> tuple[bool, Any]:
+        model = getattr(self, "model", None)
+        if not self._model_omni_flag(model, "supports_async_omni_postprocess"):
+            return False, None
+        take_pending = getattr(model, "take_pending_omni_postprocess", None)
+        if not callable(take_pending):
+            raise RuntimeError(
+                "Model declares supports_async_omni_postprocess but does not implement take_pending_omni_postprocess()"
+            )
+        return True, take_pending(tuple(req_ids_snapshot))
+
+    def _resolve_pending_omni_postprocess(
+        self,
+        pending: Any,
+        *,
+        req_ids_snapshot: Sequence[str],
+        multimodal_outputs: Any,
+    ) -> tuple[bool, Any]:
+        """Resolve one immutable step directly into that step's wire payload.
+
+        The async scheduler may mutate ``self.requests`` and
+        ``model_intermediate_buffer`` while the background output builder is
+        running.  Pending postprocess therefore must not publish through those
+        runner-owned live dictionaries.  Build a dense, request-ordered payload
+        from the launch-time snapshot instead.
+        """
+        if pending is None:
+            # Async-capable models use an empty pending step for prefill/no-op
+            # iterations; do not fall back to their mutable shared postprocess.
+            return True, multimodal_outputs
+        updates_by_req_id = pending.resolve()
+        flat_by_req_id = {
+            req_id: flatten_payload(update) for req_id, update in updates_by_req_id.items() if isinstance(update, dict)
+        }
+        pending_keys = {key for flat in flat_by_req_id.values() for key in flat}
+        if not pending_keys:
+            return True, multimodal_outputs
+
+        merged_flat = dict(flatten_payload(multimodal_outputs)) if isinstance(multimodal_outputs, dict) else {}
+        for key in pending_keys:
+            exemplar = next(flat[key] for flat in flat_by_req_id.values() if key in flat)
+            values = []
+            for req_id in req_ids_snapshot:
+                value = flat_by_req_id.get(req_id, {}).get(key)
+                if value is None:
+                    if isinstance(exemplar, torch.Tensor):
+                        value = exemplar.new_empty(0)
+                    else:
+                        value = None
+                values.append(value)
+            merged_flat[key] = values
+        return True, unflatten_payload(merged_flat)
 
     def _build_omni_async_snapshot_payload(
         self,
@@ -2067,6 +2161,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         use_async_omni_output = self._should_use_async_omni_output()
         omni_postprocess_already_applied = False
+        pending_omni_postprocess_supported = False
+        pending_omni_postprocess = None
         if use_async_omni_output:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
                 hidden_states=hidden_states,
@@ -2076,6 +2172,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 req_ids_output_copy=req_ids_output_copy,
                 query_start_loc_cpu=query_start_loc_cpu,
             )
+            (
+                pending_omni_postprocess_supported,
+                pending_omni_postprocess,
+            ) = self._take_pending_omni_postprocess(req_ids_output_snapshot)
         output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
             use_async_omni_output=use_async_omni_output,
             hidden_states=hidden_states,
@@ -2087,12 +2187,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
+            postprocess_already_applied = omni_postprocess_already_applied
+            resolved_multimodal_outputs = output_tensor_snapshot.multimodal_outputs
+            if pending_omni_postprocess_supported:
+                with record_function_or_nullcontext("omni_async_output:resolve_pending_postprocess"):
+                    (
+                        postprocess_already_applied,
+                        resolved_multimodal_outputs,
+                    ) = self._resolve_pending_omni_postprocess(
+                        pending_omni_postprocess,
+                        req_ids_snapshot=req_ids_output_snapshot,
+                        multimodal_outputs=resolved_multimodal_outputs,
+                    )
             with record_function_or_nullcontext("omni_output_builder:total"):
                 return self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
-                    multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
+                    multimodal_outputs=resolved_multimodal_outputs,
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
                     valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
@@ -2105,7 +2217,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     kv_extracted_req_ids=kv_extracted_req_ids,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
-                    postprocess_already_applied=omni_postprocess_already_applied,
+                    postprocess_already_applied=postprocess_already_applied,
                 )
 
         if not use_async_omni_output:

@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import struct
 import time
@@ -3224,7 +3225,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Stage-0 needs one extra token beyond ming_max_decode_steps.
                 sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
 
-        if request.seed is not None and sampling_params_list:
+        if self._tts_model_type == "higgs_audio_v3" and sampling_params_list:
+            import copy
+
+            effective_seed = int(request.seed) if request.seed is not None else random.randint(0, 2**32 - 1)
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            stage0_params = sampling_params_list[0]
+            stage0_params.seed = effective_seed
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args["tts_effective_seed"] = effective_seed
+        elif request.seed is not None and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
