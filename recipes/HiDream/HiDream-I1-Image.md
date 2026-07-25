@@ -26,7 +26,7 @@ Use this recipe when you want a known-good starting point for serving
 
 ## Hardware Support
 
-This recipe currently documents one CUDA GPU serving configuration.
+This recipe currently documents single-GPU and two-GPU CFG-Parallel serving configurations.
 
 ## GPU
 
@@ -104,3 +104,42 @@ curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: applicatio
 #### Notes
 
 - Key flags: `--auxiliary-text-encoder` designates the path for the auxiliary text model meta-llama/Llama-3.1-8B-Instruct. For HiDream-I1-Full, unspecified use defaults meta-llama/Llama-3.1-8B-Instruct (downloaded from official Hugging Face), and custom paths are supported.
+
+### 2x A800 80GB (CFG-Parallel)
+
+Use CFG-Parallel to run the positive and negative guidance branches on separate GPUs. Requires a negative prompt and `guidance_scale > 1`.
+
+#### Command
+
+Start the server with CFG-Parallel enabled:
+
+```bash
+export MODEL_NAME_OR_PATH=HiDream-ai/HiDream-I1-Full
+vllm serve ${MODEL_NAME_OR_PATH} \
+   --omni \
+   --port 8092 \
+   --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
+   --tensor-parallel-size 1 \
+   --cfg-parallel-size 2 \
+   --vae_use_slicing \
+   --vae_use_tiling
+```
+
+Offline inference with CFG-Parallel:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model HiDream-ai/HiDream-I1-Full \
+  --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
+  --negative-prompt "low quality, blurry" \
+  --seed 42 \
+  --guidance-scale 5.0 \
+  --tensor-parallel-size 1 \
+  --cfg-parallel-size 2 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 50 \
+  --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
+  --output /tmp/hidream_i1_cfg_parallel.png
+```
+
+See also: [`docs/user_guide/diffusion/parallelism/cfg_parallel.md`](../../docs/user_guide/diffusion/parallelism/cfg_parallel.md)

@@ -21,6 +21,7 @@ PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-deta
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_hidream_i1_image_feature_cases(model: str):
@@ -37,6 +38,19 @@ def _get_hidream_i1_image_feature_cases(model: str):
             ),
             id="default",
             marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--auxiliary-text-encoder",
+                    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                    "--cfg-parallel-size",
+                    "2",
+                ],
+            ),
+            id="cfg_parallel_2",
+            marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
 
@@ -63,6 +77,7 @@ def test_hidream_i1_image(
             "width": 512,
             "num_inference_steps": 2,
             "negative_prompt": NEGATIVE_PROMPT,
+            "guidance_scale": 5.0,
             "seed": 42,
         },
     }

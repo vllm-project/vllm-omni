@@ -803,41 +803,55 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             return False
         return True
 
+    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
+        return -self.transformer(**kwargs, return_dict=False)[0]
+
     def diffuse(
         self,
         prompt_embeds_t5: torch.Tensor,
         prompt_embeds_llama3: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_t5: torch.Tensor | None,
+        negative_prompt_embeds_llama3: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
         latents: torch.Tensor,
         timesteps: torch.Tensor,
         do_true_cfg: bool,
+        true_cfg_scale: float,
     ) -> torch.Tensor:
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0])
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timesteps=timestep,
-                    encoder_hidden_states_t5=prompt_embeds_t5,
-                    encoder_hidden_states_llama3=prompt_embeds_llama3,
-                    pooled_embeds=pooled_prompt_embeds,
-                    return_dict=False,
-                )[0]
-                noise_pred = -noise_pred
+                timestep = t.expand(latents.shape[0])
+                positive_kwargs = {
+                    "hidden_states": latents,
+                    "timesteps": timestep,
+                    "encoder_hidden_states_t5": prompt_embeds_t5,
+                    "encoder_hidden_states_llama3": prompt_embeds_llama3,
+                    "pooled_embeds": pooled_prompt_embeds,
+                    "return_dict": False,
+                }
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latents,
+                        "timesteps": timestep,
+                        "encoder_hidden_states_t5": negative_prompt_embeds_t5,
+                        "encoder_hidden_states_llama3": negative_prompt_embeds_llama3,
+                        "pooled_embeds": negative_pooled_prompt_embeds,
+                        "return_dict": False,
+                    }
+                else:
+                    negative_kwargs = None
 
-                # TODO: Modify CFG guidance
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg,
+                    true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                )
 
-                # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
@@ -1011,11 +1025,6 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             lora_scale=lora_scale,
         )
 
-        if self.do_classifier_free_guidance:
-            prompt_embeds_t5 = torch.cat([negative_prompt_embeds_t5, prompt_embeds_t5], dim=0)
-            prompt_embeds_llama3 = torch.cat([negative_prompt_embeds_llama3, prompt_embeds_llama3], dim=1)
-            pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
         latents = self.prepare_latents(
@@ -1037,9 +1046,13 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             prompt_embeds_t5,
             prompt_embeds_llama3,
             pooled_prompt_embeds,
+            negative_prompt_embeds_t5 if do_true_cfg else None,
+            negative_prompt_embeds_llama3 if do_true_cfg else None,
+            negative_pooled_prompt_embeds if do_true_cfg else None,
             latents,
             timesteps,
             do_true_cfg,
+            true_cfg_scale,
         )
 
         if output_type == "latent":
