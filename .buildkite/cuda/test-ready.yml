@@ -8,7 +8,6 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-
       - label: "Simple · Diffusion & Model Executor Test"
         commands:
           - "timeout 20m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
