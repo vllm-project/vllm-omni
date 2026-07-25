@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -25,6 +25,9 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Confi
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.cache.base import CacheBackend
 
 logger = init_logger(__name__)
 
@@ -151,9 +154,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         )
 
         self._llm_hidden_size = llm_hidden_size
-        self.cache_backend = None
+        self.cache_backend: CacheBackend | None = None
 
-    def set_cache_backend(self, cache_backend: Any) -> None:
+    def set_cache_backend(self, cache_backend: CacheBackend) -> None:
         self.cache_backend = cache_backend
 
     def _refresh_cache(self, num_inference_steps: int) -> None:

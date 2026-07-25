@@ -530,11 +530,13 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
 
 
 def test_global_cache_config_injected_into_diffusion_stage_only():
-    stages = [
-        SimpleNamespace(stage_type="llm", engine_args=SimpleNamespace()),
-        SimpleNamespace(stage_type="diffusion", model_stage="diffusion", engine_args=SimpleNamespace()),
-        SimpleNamespace(stage_type="llm", model_stage="dit", engine_args=SimpleNamespace()),
-    ]
+    stages = OmegaConf.create(
+        [
+            {"stage_type": "llm", "engine_args": {}},
+            {"stage_type": "diffusion", "model_stage": "diffusion", "engine_args": {}},
+            {"stage_type": "llm", "model_stage": "dit", "engine_args": {}},
+        ]
+    )
 
     AsyncOmniEngine._inject_diffusion_cache_config(
         stages,
@@ -552,15 +554,17 @@ def test_global_cache_config_injected_into_diffusion_stage_only():
 
 
 def test_global_cache_config_does_not_override_stage_cache_config():
-    stages = [
-        SimpleNamespace(
-            stage_type="diffusion",
-            engine_args=SimpleNamespace(
-                cache_backend="cache_dit",
-                cache_config={"Fn_compute_blocks": 2},
-            ),
-        ),
-    ]
+    stages = OmegaConf.create(
+        [
+            {
+                "stage_type": "diffusion",
+                "engine_args": {
+                    "cache_backend": "cache_dit",
+                    "cache_config": {"Fn_compute_blocks": 2},
+                },
+            },
+        ]
+    )
 
     AsyncOmniEngine._inject_diffusion_cache_config(
         stages,

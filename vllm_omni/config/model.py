@@ -156,7 +156,7 @@ class OmniModelConfig(ModelConfig):
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
     cache_backend: str | None = "none"
-    cache_config: Any = None
+    cache_config: dict[str, Any] | str | None = None
 
     @property
     def registry(self):
