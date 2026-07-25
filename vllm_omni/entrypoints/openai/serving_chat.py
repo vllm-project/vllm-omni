@@ -10,7 +10,6 @@ from io import BytesIO
 from typing import Any, Final, cast
 
 import jinja2
-import requests
 import torch
 from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
@@ -3021,21 +3020,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 {k: v for k, v in extra_body.items() if v is not None},
             )
 
+            model_config = getattr(self.engine_client, "model_config", None)
+            if model_config is not None:
+                connector = MediaConnector(
+                    allowed_local_media_path=getattr(model_config, "allowed_local_media_path", "") or "",
+                    allowed_media_domains=getattr(model_config, "allowed_media_domains", None),
+                )
+            else:
+                connector = MediaConnector(
+                    allowed_local_media_path="",
+                    allowed_media_domains=None,
+                )
+            
             # Decode reference images if provided
             pil_images: list[Image.Image] = []
             for img_str in reference_images:
                 try:
                     if img_str.startswith(("http://", "https://")):
-                        logger.info(f"img_str is {img_str}")
-                        resp = requests.get(img_str, timeout=10)
-                        resp.raise_for_status()
-                        img_bytes = resp.content
-                        pil_images.append(Image.open(BytesIO(img_bytes)))
+                        result = await connector.fetch_image_async(img_str)
+                        pil_images.append(result.media)
                     else:
                         img_bytes = base64.b64decode(img_str)
                         pil_images.append(Image.open(BytesIO(img_bytes)))
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
+
 
             # Build generation kwargs
             gen_prompt: OmniTextPrompt = {
