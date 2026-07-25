@@ -128,9 +128,7 @@ class TeaCacheHook(ModelHook):
 
         if branch_hint is not None:
             if branch_hint not in ("positive", "negative"):
-                raise ValueError(
-                    f"Invalid teacache_branch={branch_hint!r}; expected 'positive' or 'negative'."
-                )
+                raise ValueError(f"Invalid teacache_branch={branch_hint!r}; expected 'positive' or 'negative'.")
             cache_branch = branch_hint
         elif getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
