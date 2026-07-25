@@ -134,6 +134,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.config = config
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
+        self._stop_logit_rows: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
@@ -354,6 +355,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
 
+    def _get_stop_logit_rows(self, hidden: torch.Tensor) -> torch.Tensor:
+        rows = getattr(self, "_stop_logit_rows", None)
+        if rows is None or rows.device != hidden.device or rows.dtype != hidden.dtype:
+            rows = hidden.new_tensor(
+                [
+                    [0.0, float("-inf")],
+                    [float("-inf"), 0.0],
+                ]
+            )
+            self._stop_logit_rows = rows
+        return rows
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -374,20 +387,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"MiniCPM-o continuous Talker received {len(sample_eligible)} sampling flags for {len(infos)} requests"
             )
 
+        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        continue_row, finished_row = self._get_stop_logit_rows(hidden).unbind(0)
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
-        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
         for index, info in enumerate(infos):
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -401,7 +415,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
+                stop_rows.append(finished_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -409,7 +423,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -423,7 +437,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             step = int(state.get("step", 0))
             sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
             is_eos = int(sampled.item()) == self._num_audio_tokens - 1
-            state["step"] = int(state.get("step", 0)) + 1
+            state["step"] = step + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
             finished = is_eos or reached_limit
             state["finished"] = finished
@@ -440,7 +454,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            stop_rows.append(finished_row if finished else continue_row)
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,

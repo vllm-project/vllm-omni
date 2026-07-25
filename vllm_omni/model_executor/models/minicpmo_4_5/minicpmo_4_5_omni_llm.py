@@ -80,6 +80,10 @@ from transformers.utils import (
     replace_return_docstrings,
     requires_backends,
 )
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.config import VllmConfig
 from vllm.config.multimodal import (
     AudioDummyOptions,
@@ -400,6 +404,18 @@ class MiniCPMOConfig(Qwen2Config):
         self.patch_size = self.vision_config.patch_size
 
         super().__init__(**kwargs)
+
+
+def _resolve_vision_attention_implementation(vision_config, model_config) -> str:
+    vision_implementation = getattr(vision_config, "_attn_implementation", None)
+    if vision_implementation not in (None, "eager"):
+        return vision_implementation
+
+    model_implementation = getattr(model_config, "_attn_implementation", None)
+    if model_implementation is not None:
+        return model_implementation
+
+    return vision_implementation or "eager"
 
 
 # ============== Image Processing Classes ==============
@@ -1107,6 +1123,41 @@ class SiglipAttention(nn.Module):
         return attn_output, attn_weights
 
 
+class SiglipSdpaAttention(SiglipAttention):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        output_attentions: bool | None = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if output_attentions:
+            return super().forward(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+            )
+
+        batch_size, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states).view(batch_size, q_len, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(batch_size, q_len, self.num_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(batch_size, q_len, self.num_heads, self.head_dim)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        attn_output = nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale=self.scale,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, q_len, self.embed_dim)
+        return self.out_proj(attn_output), None
+
+
 class SiglipFlashAttention2(SiglipAttention):
     """
     Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
@@ -1311,12 +1362,22 @@ class SiglipMLP(nn.Module):
 
 
 # Copied from transformers.models.clip.modeling_clip.CLIPEncoderLayer with CLIP->Siglip
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1]},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class SiglipEncoderLayer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.self_attn = SiglipAttention(config) if not self._use_flash_attention_2 else SiglipFlashAttention2(config)
+        if self._use_flash_attention_2:
+            self.self_attn = SiglipFlashAttention2(config)
+        elif config._attn_implementation == "sdpa":
+            self.self_attn = SiglipSdpaAttention(config)
+        else:
+            self.self_attn = SiglipAttention(config)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -1519,7 +1580,9 @@ class SiglipEncoder(nn.Module):
 class SiglipVisionTransformer(SiglipPreTrainedModel):
     config_class = SiglipVisionConfig
     main_input_name = "pixel_values"
+    _supports_flash_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     _no_split_modules = []
 
     def __init__(self, config: SiglipVisionConfig):
@@ -3833,11 +3896,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
-            # Set attention implementation
-            if hasattr(vllm_config, "model_config") and hasattr(vllm_config.model_config, "_attn_implementation"):
-                config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
-            else:
-                config.vision_config._attn_implementation = "eager"
+            config.vision_config._attn_implementation = _resolve_vision_attention_implementation(
+                config.vision_config,
+                vllm_config.model_config,
+            )
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
             # Drop last layer if configured

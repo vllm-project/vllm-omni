@@ -73,6 +73,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
             sampling_constraints={"detokenize": True},
+            scheduler_cls=("vllm_omni.model_executor.models.minicpmo_4_5.scheduler.MiniCPMO45Code2WavScheduler"),
         ),
     ),
 )

@@ -81,13 +81,42 @@ def test_audio_token_limit_scales_with_condition_length(
     assert _max_audio_tokens(condition_tokens) == expected
 
 
+def test_talker_reuses_device_stop_logit_rows() -> None:
+    talker = _make_talker()
+    hidden = torch.ones(2, 2)
+    infos = [None, {"audio_state": {"finished": True}}]
+
+    first = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=infos,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    cached_rows = talker._stop_logit_rows
+    first_logits = talker.compute_logits(first.text_hidden_states)
+    second = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=infos,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    assert talker._stop_logit_rows is cached_rows
+    torch.testing.assert_close(
+        cached_rows,
+        torch.tensor([[0.0, float("-inf")], [float("-inf"), 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+    assert first_logits.argmax(dim=-1).tolist() == [0, 1]
+    assert talker.compute_logits(second.text_hidden_states).argmax(dim=-1).tolist() == [0, 1]
+
+
 def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> None:
     talker = _make_talker()
-    seen: list[tuple[str, list[float], list[int]]] = []
+    seen: list[tuple[str, list[float], list[int], int]] = []
 
     def sample(hidden, history, request_id, step):
         assert step == 0
-        seen.append((request_id, hidden.reshape(-1).tolist(), history.tolist()))
+        seen.append((request_id, hidden.reshape(-1).tolist(), history.tolist(), step))
         return torch.tensor(2 if request_id == "req-a" else 3)
 
     mocker.patch.object(talker, "_sample_audio_code", side_effect=sample)
@@ -103,8 +132,8 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     )
 
     assert seen == [
-        ("req-a", [2.0, 0.0], [1]),
-        ("req-b", [3.0, 0.0], []),
+        ("req-a", [2.0, 0.0], [1], 0),
+        ("req-b", [3.0, 0.0], [], 0),
     ]
     assert infos[0]["audio_codes"]["accumulated"].tolist() == [1, 2]
     assert infos[1]["audio_codes"]["accumulated"].tolist() == [3]
@@ -142,6 +171,7 @@ def test_incomplete_prefill_emits_no_code_and_does_not_advance_state(mocker) -> 
 
     sample.assert_called_once()
     assert sample.call_args.args[2] == "req-decode"
+    assert sample.call_args.args[3] == 4
     assert infos[0]["audio_state"]["step"] == 0
     assert infos[0]["audio_codes"]["accumulated"].numel() == 0
     assert infos[1]["audio_state"]["step"] == 5

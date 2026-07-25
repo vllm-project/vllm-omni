@@ -463,11 +463,12 @@ def test_fifo_promotion(build_adapter):
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-1", "req-2"]
-    assert waiting_queue == reqs[2:]
+    assert waiting_queue == []
     assert reqs[0].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[2].status == RequestStatus.WAITING
 
+    adapter.restore_queues(waiting_queue, running_queue)
     adapter.finished_requests.add("req-1")
     # Eviction is deferred to postprocess_scheduler_output in the runtime path
     # (commit c4d95fd9 — otherwise the terminal chunk deadlocks at c=8 K=2).
@@ -479,6 +480,36 @@ def test_fifo_promotion(build_adapter):
     # Promotion + chunk processing happen in the same call, so req-3 is
     # already WAITING_FOR_CHUNK by the time we check.
     assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
+
+
+def test_non_active_waiting_request_is_hidden_from_scheduler(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, max_num_seqs=1, active_stream_window=1)
+    active = _req("active", RequestStatus.WAITING)
+    non_active = _req("non-active", RequestStatus.WAITING)
+    non_active.prompt_token_ids = [0] * 2556
+    waiting_queue = DummyWaitingQueue([active, non_active])
+    running_queue = []
+    scheduler_requests = {
+        active.request_id: active,
+        non_active.request_id: non_active,
+    }
+
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests=scheduler_requests,
+    )
+
+    assert waiting_queue == []
+    assert non_active.status == RequestStatus.WAITING
+
+    adapter.restore_queues(
+        waiting_queue,
+        running_queue,
+        scheduler_requests=scheduler_requests,
+    )
+
+    assert waiting_queue == [active, non_active]
 
 
 def test_legacy_k0(build_adapter):
@@ -509,8 +540,9 @@ def test_finished_releases_slot(build_adapter):
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1"]
-    assert waiting_queue == [req_2]
+    assert waiting_queue == []
 
+    adapter.restore_queues(waiting_queue, running_queue)
     adapter.finished_requests.add("req-1")
     # Eviction is deferred to postprocess_scheduler_output in the runtime path
     # (commit c4d95fd9). Simulate it so promotion can pick up the freed slot.

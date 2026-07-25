@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,6 +70,20 @@ class _FakeEstimator(nn.Module):
         cnn_out.copy_(marker.reshape(1, -1, 1, 1).expand_as(cnn_out))
         att_out.copy_(marker.reshape(1, -1, 1, 1, 1).expand_as(att_out))
         return inputs[:, 1:2]
+
+
+class _FakeTimestepEmbedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.frequency_embedding_size = 8
+        self.scale = 1000
+        self.mlp = nn.Identity()
+
+    def forward(self, time):
+        half = self.frequency_embedding_size // 2
+        frequencies = torch.exp(-math.log(10000) * torch.arange(0, half) / half).to(time.device)
+        args = (time * self.scale)[:, None] * frequencies[None]
+        return torch.cat((torch.cos(args), torch.sin(args)), dim=-1)
 
 
 class _FakeDecoder(nn.Module):
@@ -210,6 +225,65 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_initial_state_template_is_cached_per_prompt_and_batch_without_aliasing():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, enable_initial_state_cache=True)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    first = adapter.setup_batch_cached("shared", "/fake/prompt.wav", prompt, 2)
+    second = adapter.setup_batch_cached("shared", "/fake/prompt.wav", prompt, 2)
+    singleton = adapter.setup_batch_cached("shared", "/fake/prompt.wav", prompt, 1)
+
+    # The expensive prompt-conditioned Flow initialization runs once per exact
+    # batch shape, while every request receives private cache storage.
+    assert token2wav.flow.encoder.calls == [2, 1]
+    assert torch.equal(
+        first[0].flow_cache["estimator_att_cache"],
+        second[0].flow_cache["estimator_att_cache"],
+    )
+    assert (
+        first[0].flow_cache["estimator_att_cache"].data_ptr() != second[0].flow_cache["estimator_att_cache"].data_ptr()
+    )
+    assert (
+        first[0].flow_cache["estimator_att_cache"].data_ptr() != first[1].flow_cache["estimator_att_cache"].data_ptr()
+    )
+    assert len(singleton) == 1
+
+
+def test_graph_safe_timestep_embedding_matches_original() -> None:
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.decoder.estimator.t_embedder = _FakeTimestepEmbedder()
+    adapter = BatchedToken2Wav(token2wav)
+    time = torch.tensor([0.0, 0.25, 0.75], dtype=torch.float32)
+
+    expected = token2wav.flow.decoder.estimator.t_embedder(time)
+    actual = adapter._embed_time(token2wav.flow.decoder.estimator, time)
+
+    assert torch.equal(actual, expected)
+
+
+def test_cfm_cuda_graph_option_falls_back_to_eager_on_cpu() -> None:
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        enable_cfm_cuda_graph=True,
+        cfm_cuda_graph_max_batch_size=2,
+    )
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert len(audios) == 1
+    assert adapter._cfm_graph_max_batch_size == 2
+    assert adapter._cfm_graph_entry is None
 
 
 def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():

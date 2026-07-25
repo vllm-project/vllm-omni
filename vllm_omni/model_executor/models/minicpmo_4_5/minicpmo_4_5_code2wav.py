@@ -111,6 +111,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                 Path(self.model_path) / "assets" / "HT_ref_audio.wav",
             )
         )
+        self._enable_cfm_cuda_graph = bool(extra.get("token2wav_cfm_cuda_graph", False))
+        self._cfm_cuda_graph_capture_after = int(extra.get("token2wav_cfm_cuda_graph_capture_after", 2))
+        self._cfm_cuda_graph_max_batch_size = int(extra.get("token2wav_cfm_cuda_graph_max_batch_size", 2))
+        self._enable_initial_state_cache = bool(extra.get("token2wav_initial_state_cache", False))
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -425,7 +429,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_wav,
                 )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    states = self.backend.setup_batch_cached(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                        features,
+                        batch_size,
+                    )
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
@@ -539,7 +548,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            enable_cfm_cuda_graph=self._enable_cfm_cuda_graph,
+            cfm_cuda_graph_capture_after=self._cfm_cuda_graph_capture_after,
+            cfm_cuda_graph_max_batch_size=self._cfm_cuda_graph_max_batch_size,
+            enable_initial_state_cache=self._enable_initial_state_cache,
+        )
         # Token2wav loads flow.pt and hift.pt inside its constructor instead of
         # from the parent MiniCPM checkpoint iterator. Report those registered
         # parameters as initialized so vLLM's strict loader audit does not

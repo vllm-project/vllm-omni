@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import logging
+import math
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _SILENCE_TOKEN = 4218
+logger = logging.getLogger(__name__)
 
 
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
@@ -38,6 +42,15 @@ class BatchedToken2WavState:
     hift_cache: dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class _CfmGraphEntry:
+    key: tuple[Any, ...]
+    graph: Any
+    stream: Any
+    static_inputs: tuple[torch.Tensor, ...]
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -46,7 +59,15 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        enable_cfm_cuda_graph: bool = False,
+        cfm_cuda_graph_capture_after: int = 2,
+        cfm_cuda_graph_max_batch_size: int = 2,
+        enable_initial_state_cache: bool = False,
+    ):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -60,7 +81,30 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        timestep_embedder = getattr(self.flow.decoder.estimator, "t_embedder", None)
+        frequency_embedding_size = getattr(timestep_embedder, "frequency_embedding_size", None)
+        if frequency_embedding_size is None:
+            timestep_frequencies = None
+        else:
+            half = int(frequency_embedding_size) // 2
+            timestep_frequencies = torch.exp(-math.log(10000) * torch.arange(0, half) / half).to(
+                device=self.flow.decoder.rand_noise.device
+            )
+        self.register_buffer(
+            "_timestep_frequencies",
+            timestep_frequencies,
+            persistent=False,
+        )
+        self._cfm_cuda_graph_enabled = bool(enable_cfm_cuda_graph)
+        self._cfm_graph_capture_after = max(2, int(cfm_cuda_graph_capture_after))
+        self._cfm_graph_max_batch_size = max(1, int(cfm_cuda_graph_max_batch_size))
+        self._cfm_graph_seen: dict[tuple[Any, ...], int] = {}
+        self._cfm_graph_entry: _CfmGraphEntry | None = None
+        self._initial_state_cache_enabled = bool(enable_initial_state_cache)
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._initial_state_templates: OrderedDict[tuple[str, str, int], tuple[BatchedToken2WavState, ...]] = (
+            OrderedDict()
+        )
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -155,7 +199,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        time_embedding = self._embed_time(estimator, time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
@@ -172,6 +216,17 @@ class BatchedToken2Wav(nn.Module):
             att_out,
         )
         return result, cnn_out, att_out
+
+    def _embed_time(self, estimator: nn.Module, time: torch.Tensor) -> torch.Tensor:
+        frequencies = self._timestep_frequencies
+        embedder = estimator.t_embedder
+        if frequencies is None:
+            return embedder(time)
+        args = (time * embedder.scale)[:, None] * frequencies[None]
+        embedding = torch.cat((torch.cos(args), torch.sin(args)), dim=-1)
+        if int(embedder.frequency_embedding_size) % 2:
+            embedding = torch.cat((embedding, torch.zeros_like(embedding[:, :1])), dim=-1)
+        return embedder.mlp(embedding)
 
     def _decode_cfm(
         self,
@@ -231,6 +286,121 @@ class BatchedToken2Wav(nn.Module):
             next_cnn.append(step_cnn)
             next_att.append(step_att)
         return x, torch.stack(next_cnn), torch.stack(next_att)
+
+    @staticmethod
+    def _cfm_graph_key(values: tuple[torch.Tensor, ...]) -> tuple[Any, ...]:
+        return tuple(
+            (
+                tuple(value.shape),
+                tuple(value.stride()),
+                str(value.dtype),
+                value.device.type,
+                value.device.index,
+            )
+            for value in values
+        )
+
+    def _capture_cfm_graph(
+        self,
+        key: tuple[Any, ...],
+        inputs: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        static_inputs = tuple(value.clone() for value in inputs)
+        static_mu, static_speakers, static_cond, static_cnn, static_att = static_inputs
+
+        caller_stream = torch.cuda.current_stream()
+        graph_stream = torch.cuda.Stream()
+        graph_stream.wait_stream(caller_stream)
+        with torch.cuda.stream(graph_stream):
+            for _ in range(3):
+                self._decode_cfm(
+                    static_mu,
+                    static_speakers,
+                    static_cond,
+                    cnn_cache=static_cnn,
+                    att_cache=static_att,
+                )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=graph_stream):
+            outputs = self._decode_cfm(
+                static_mu,
+                static_speakers,
+                static_cond,
+                cnn_cache=static_cnn,
+                att_cache=static_att,
+            )
+        caller_stream.wait_stream(graph_stream)
+        self._cfm_graph_entry = _CfmGraphEntry(
+            key=key,
+            graph=graph,
+            stream=graph_stream,
+            static_inputs=static_inputs,
+            outputs=outputs,
+        )
+        logger.info(
+            "Captured MiniCPM-o exact-shape CFM CUDA Graph: batch=%d key=%s",
+            int(static_mu.shape[0]),
+            key,
+        )
+        return outputs
+
+    def _decode_cfm_maybe_graphed(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            not self._cfm_cuda_graph_enabled
+            or mu.device.type != "cuda"
+            or int(mu.shape[0]) > self._cfm_graph_max_batch_size
+        ):
+            return self._decode_cfm(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+
+        inputs = (mu, speakers, cond, cnn_cache, att_cache)
+        key = self._cfm_graph_key(inputs)
+        entry = self._cfm_graph_entry
+        if entry is not None and entry.key == key:
+            for static_input, value in zip(entry.static_inputs, inputs, strict=True):
+                static_input.copy_(value)
+            caller_stream = torch.cuda.current_stream()
+            entry.stream.wait_stream(caller_stream)
+            with torch.cuda.stream(entry.stream):
+                entry.graph.replay()
+            caller_stream.wait_stream(entry.stream)
+            return entry.outputs
+        if entry is not None:
+            return self._decode_cfm(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+
+        seen = self._cfm_graph_seen.get(key, 0) + 1
+        if len(self._cfm_graph_seen) >= 8 and key not in self._cfm_graph_seen:
+            self._cfm_graph_seen.clear()
+        self._cfm_graph_seen[key] = seen
+        if seen < self._cfm_graph_capture_after:
+            return self._decode_cfm(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+        return self._capture_cfm_graph(key, inputs)
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
@@ -315,6 +485,33 @@ class BatchedToken2Wav(nn.Module):
         ]
 
     @staticmethod
+    def _clone_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
+        return BatchedToken2WavState(
+            flow_cache={name: value.clone() for name, value in state.flow_cache.items()},
+            hift_cache={name: value.clone() for name, value in state.hift_cache.items()},
+        )
+
+    def setup_batch_cached(
+        self,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        features: PromptFeatures,
+        batch_size: int,
+    ) -> list[BatchedToken2WavState]:
+        if not self._initial_state_cache_enabled:
+            return self.setup_batch(features, batch_size)
+        cache_key = (prompt_cache_id, prompt_wav, batch_size)
+        templates = self._initial_state_templates.get(cache_key)
+        if templates is None:
+            templates = tuple(self.setup_batch(features, batch_size))
+            self._initial_state_templates[cache_key] = templates
+            if len(self._initial_state_templates) > 4:
+                self._initial_state_templates.popitem(last=False)
+        else:
+            self._initial_state_templates.move_to_end(cache_key)
+        return [self._clone_state(state) for state in templates]
+
+    @staticmethod
     def _fade_in_out(
         speech: torch.Tensor,
         previous: torch.Tensor,
@@ -347,7 +544,7 @@ class BatchedToken2Wav(nn.Module):
             )
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
-            chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
+            chunk_mel, estimator_cnn, estimator_att = self._decode_cfm_maybe_graphed(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
                 cond,

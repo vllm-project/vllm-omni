@@ -87,6 +87,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # ("Cannot register new removed request after self.removed has
         #   been read").
         self._held_non_active: deque[Any] = deque()
+        # Keep non-active waiting requests out of the scheduler for this tick.
+        # Generation stages prewarm with non-empty placeholder prompts, which
+        # are invalid until the first upstream chunk supplies metadata.
+        self._held_non_active_waiting: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
 
@@ -478,6 +482,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if scheduler_requests is not None:
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self._held_non_active_waiting, scheduler_requests)
 
         if self._active_window <= 0:
             self._process_chunk_queue_legacy(
@@ -637,6 +642,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if scheduler_requests is not None:
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self._held_non_active_waiting, scheduler_requests)
         # Add request waiting for chunk to the waiting and running queue
         for request in self.waiting_for_chunk_waiting_requests:
             if scheduler_requests is None or request.request_id in scheduler_requests:
@@ -655,6 +661,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self._held_non_active:
             running_queue.extend(self._held_non_active)
             self._held_non_active = deque()
+
+        for request in self._held_non_active_waiting:
+            if scheduler_requests is None or request.request_id in scheduler_requests:
+                waiting_queue.add_request(request)
+        self._held_non_active_waiting = deque()
 
     def postprocess_scheduler_output(
         self,
@@ -718,6 +729,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         queue_snapshot = list(queue)
         for request in queue_snapshot:
             if not self._ensure_active_stream(request):
+                if target_status == RequestStatus.WAITING:
+                    queue.remove(request)
+                    self._held_non_active_waiting.append(request)
                 continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
@@ -781,6 +795,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._held_non_active = deque(
             request for request in self._held_non_active if request.request_id not in request_ids
+        )
+        self._held_non_active_waiting = deque(
+            request for request in self._held_non_active_waiting if request.request_id not in request_ids
         )
 
         for req_id in request_ids:
