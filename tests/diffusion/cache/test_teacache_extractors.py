@@ -15,6 +15,7 @@ Currently implemented:
 - TestFlux2KleinExtractor: Flux2Klein model extractor
 - TestFlux2Extractor: Flux2 model extractor
 - TestFluxExtractor: Flux model extractor
+- TestHiDreamExtractor: HiDream-I1-Full model extractor
 """
 
 from abc import ABC, abstractmethod
@@ -24,10 +25,12 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_hidream_image_context,
 )
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -423,3 +426,165 @@ class TestFluxExtractor(BaseExtractorTest):
                 img_ids=torch.randint(0, 64, (1, 16, 3)),
                 txt_ids=torch.randint(0, 64, (1, 8, 3)),
             )
+
+
+@pytest.mark.cpu
+@pytest.mark.cache
+class TestHiDreamExtractor:
+    """Test extract_hidream_image_context function."""
+
+    TRANSFORMER_TYPE = "HiDreamImageTransformer2DModel"
+    BATCH_SIZE = 1
+    HIDDEN_SIZE = 8
+    PATCH_TOKENS = 4
+    PATCH_DIM = 16
+    TEXT_LEN = 3
+
+    def test_bootstrap_coefficients_exist(self):
+        assert self.TRANSFORMER_TYPE in _MODEL_COEFFICIENTS
+        config = TeaCacheConfig(transformer_type=self.TRANSFORMER_TYPE)
+        assert len(config.coefficients) == 5
+
+    @pytest.fixture
+    def hidream_module(self):
+        batch_size = self.BATCH_SIZE
+        hidden_size = self.HIDDEN_SIZE
+        patch_tokens = self.PATCH_TOKENS
+        patch_dim = self.PATCH_DIM
+        text_len = self.TEXT_LEN
+
+        module = Mock()
+        module.training = False
+        module.llama_layers = [0, 1]
+        module.caption_projection = [
+            Mock(side_effect=lambda x: x),
+            Mock(side_effect=lambda x: x),
+            Mock(side_effect=lambda x: x),
+        ]
+        module.patchify = Mock(
+            return_value=(
+                torch.randn(batch_size, patch_tokens, patch_dim),
+                torch.ones(batch_size, patch_tokens),
+                torch.tensor([[2, 2]], dtype=torch.int64),
+                torch.zeros(batch_size, patch_tokens, 3),
+            )
+        )
+        module.x_embedder = Mock(side_effect=lambda x: torch.randn(batch_size, patch_tokens, hidden_size))
+        module.t_embedder = Mock(return_value=torch.randn(batch_size, hidden_size))
+        module.p_embedder = Mock(return_value=torch.randn(batch_size, hidden_size))
+        module.pe_embedder = Mock(
+            return_value=torch.randn(batch_size, patch_tokens, 1, 1, hidden_size),
+        )
+
+        inner_block = Mock()
+        inner_block.adaLN_modulation = Mock(
+            return_value=torch.randn(batch_size, hidden_size * 12),
+        )
+        inner_block.norm1_i = Mock(return_value=torch.randn(batch_size, patch_tokens, hidden_size))
+
+        double_block = Mock(
+            side_effect=lambda hidden_states, hidden_states_masks, encoder_hidden_states, temb, image_rotary_emb: (
+                hidden_states + 0.1,
+                encoder_hidden_states[:, : text_len * 2, :],
+            )
+        )
+        double_block.block = inner_block
+        module.double_stream_blocks = [double_block]
+        module.single_stream_blocks = [Mock(side_effect=lambda **kwargs: kwargs["hidden_states"] + 0.2)]
+        module.final_layer = Mock(side_effect=lambda h, temb: h)
+        module.unpatchify = Mock(return_value=torch.randn(batch_size, 4, 8, 8))
+        return module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        batch_size = self.BATCH_SIZE
+        hidden_size = self.HIDDEN_SIZE
+        text_len = self.TEXT_LEN
+        return {
+            "hidden_states": torch.randn(batch_size, 4, 8, 8),
+            "timesteps": torch.tensor([10]),
+            "encoder_hidden_states_t5": torch.randn(batch_size, text_len, hidden_size),
+            "encoder_hidden_states_llama3": [
+                torch.randn(batch_size, text_len, hidden_size),
+                torch.randn(batch_size, text_len, hidden_size),
+            ],
+            "pooled_embeds": torch.randn(batch_size, hidden_size),
+            "return_dict": False,
+        }
+
+    def test_modulated_input_shape(self, hidream_module, sample_inputs):
+        """Test that modulated_input matches embedded patch token shape."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        context.validate()
+
+        assert context.modulated_input.shape == (
+            self.BATCH_SIZE,
+            self.PATCH_TOKENS,
+            self.HIDDEN_SIZE,
+        )
+
+    def test_run_transformer_blocks_callable(self, hidream_module, sample_inputs):
+        """Test that run_transformer_blocks is callable."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        assert callable(context.run_transformer_blocks)
+
+    def test_postprocess_callable(self, hidream_module, sample_inputs):
+        """Test that postprocess is callable."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        assert callable(context.postprocess)
+
+    def test_postprocess_output_shape(self, hidream_module, sample_inputs):
+        """Test that postprocess returns unpatchified latents."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        output = context.postprocess(context.run_transformer_blocks()[0])
+
+        assert isinstance(output, tuple)
+        assert output[0].shape == (self.BATCH_SIZE, 4, 8, 8)
+
+    def test_postprocess_return_tuple_when_return_dict_false(self, hidream_module, sample_inputs):
+        """Test that postprocess honors return_dict=False."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        output = context.postprocess(context.hidden_states)
+
+        assert isinstance(output, tuple)
+        assert len(output) == 1
+        assert isinstance(output[0], torch.Tensor)
+
+    def test_postprocess_return_dict_when_return_dict_true(self, hidream_module, sample_inputs):
+        """Test that postprocess returns Transformer2DModelOutput when return_dict=True."""
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+        inputs = sample_inputs.copy()
+        inputs["return_dict"] = True
+        context = extract_hidream_image_context(hidream_module, **inputs)
+        output = context.postprocess(context.hidden_states)
+
+        assert isinstance(output, Transformer2DModelOutput)
+        assert isinstance(output.sample, torch.Tensor)
+
+    def test_deprecated_encoder_hidden_states_kwarg(self, hidream_module, sample_inputs):
+        """Test deprecated bundled encoder_hidden_states kwarg is unpacked."""
+        inputs = sample_inputs.copy()
+        inputs.pop("encoder_hidden_states_t5")
+        inputs.pop("encoder_hidden_states_llama3")
+        inputs["encoder_hidden_states"] = [
+            sample_inputs["encoder_hidden_states_t5"],
+            sample_inputs["encoder_hidden_states_llama3"],
+        ]
+
+        context = extract_hidream_image_context(hidream_module, **inputs)
+        context.validate()
+
+    def test_pre_patchified_inputs_require_img_ids(self, hidream_module, sample_inputs):
+        """Test pre-patchified inputs require img_ids and img_sizes."""
+        inputs = sample_inputs.copy()
+        inputs["hidden_states"] = torch.randn(self.BATCH_SIZE, self.PATCH_TOKENS, self.PATCH_DIM)
+        inputs["hidden_states_masks"] = torch.ones(self.BATCH_SIZE, self.PATCH_TOKENS)
+
+        with pytest.raises(ValueError, match="img_ids.*img_sizes"):
+            extract_hidream_image_context(hidream_module, **inputs)
+
+    def test_encoder_hidden_states_is_none(self, hidream_module, sample_inputs):
+        """HiDream keeps text conditioning inside block closures, not CacheContext."""
+        context = extract_hidream_image_context(hidream_module, **sample_inputs)
+        assert context.encoder_hidden_states is None

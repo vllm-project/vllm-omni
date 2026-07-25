@@ -1187,6 +1187,202 @@ def extract_flux_context(
     )
 
 
+def _prepare_hidream_teacache_state(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timesteps: torch.Tensor,
+    encoder_hidden_states_t5: torch.Tensor,
+    encoder_hidden_states_llama3: torch.Tensor,
+    pooled_embeds: torch.Tensor,
+    img_ids: torch.Tensor | None,
+    img_sizes: list[tuple[int, int]] | None,
+    hidden_states_masks: torch.Tensor | None,
+) -> dict[str, Any]:
+    """Mirror HiDreamImageTransformer2DModel preprocessing for TeaCache."""
+    batch_size = hidden_states.shape[0]
+    hidden_states_type = hidden_states.dtype
+
+    if hidden_states_masks is None:
+        hidden_states, hidden_states_masks, img_sizes, img_ids = module.patchify(hidden_states)
+
+    hidden_states = module.x_embedder(hidden_states)
+
+    timesteps = module.t_embedder(timesteps, hidden_states_type)
+    p_embedder = module.p_embedder(pooled_embeds)
+    temb = timesteps + p_embedder
+
+    encoder_hidden_states = [encoder_hidden_states_llama3[k] for k in module.llama_layers]
+    if module.caption_projection is not None:
+        new_encoder_hidden_states = []
+        for i, enc_hidden_state in enumerate(encoder_hidden_states):
+            enc_hidden_state = module.caption_projection[i](enc_hidden_state)
+            enc_hidden_state = enc_hidden_state.view(batch_size, -1, hidden_states.shape[-1])
+            new_encoder_hidden_states.append(enc_hidden_state)
+        encoder_hidden_states = new_encoder_hidden_states
+        encoder_hidden_states_t5 = module.caption_projection[-1](encoder_hidden_states_t5)
+        encoder_hidden_states_t5 = encoder_hidden_states_t5.view(batch_size, -1, hidden_states.shape[-1])
+        encoder_hidden_states.append(encoder_hidden_states_t5)
+
+    txt_ids = torch.zeros(
+        batch_size,
+        encoder_hidden_states[-1].shape[1] + encoder_hidden_states[-2].shape[1] + encoder_hidden_states[0].shape[1],
+        3,
+        device=img_ids.device,
+        dtype=img_ids.dtype,
+    )
+    image_rotary_emb = module.pe_embedder(img_ids)
+    text_rotary_emb = module.pe_embedder(txt_ids)
+    concat_rotary_emb = (
+        torch.cat([image_rotary_emb[..., 0, 0], text_rotary_emb[..., 0, 0]], dim=1),
+        torch.cat([image_rotary_emb[..., 1, 0], text_rotary_emb[..., 1, 0]], dim=1),
+    )
+
+    block0 = module.double_stream_blocks[0].block
+    wtype = hidden_states.dtype
+    shift_msa_i, scale_msa_i, *_ = block0.adaLN_modulation(temb)[:, None].chunk(12, dim=-1)
+    modulated_input = block0.norm1_i(hidden_states).to(dtype=wtype)
+    modulated_input = modulated_input * (1 + scale_msa_i) + shift_msa_i
+
+    return {
+        "hidden_states": hidden_states,
+        "hidden_states_masks": hidden_states_masks,
+        "img_sizes": img_sizes,
+        "encoder_hidden_states": encoder_hidden_states,
+        "temb": temb,
+        "concat_rotary_emb": concat_rotary_emb,
+        "modulated_input": modulated_input,
+    }
+
+
+def _run_hidream_transformer_blocks(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hidden_states_masks: torch.Tensor | None,
+    encoder_hidden_states: list[torch.Tensor],
+    temb: torch.Tensor,
+    concat_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Execute HiDream double-stream and single-stream blocks."""
+    block_id = 0
+    initial_encoder_hidden_states = torch.cat([encoder_hidden_states[-1], encoder_hidden_states[-2]], dim=1)
+    initial_encoder_hidden_states_seq_len = initial_encoder_hidden_states.shape[1]
+    batch_size = hidden_states.shape[0]
+
+    for block in module.double_stream_blocks:
+        cur_llama31_encoder_hidden_states = encoder_hidden_states[block_id]
+        cur_encoder_hidden_states = torch.cat(
+            [initial_encoder_hidden_states, cur_llama31_encoder_hidden_states],
+            dim=1,
+        )
+        hidden_states, initial_encoder_hidden_states = block(
+            hidden_states=hidden_states,
+            hidden_states_masks=hidden_states_masks,
+            encoder_hidden_states=cur_encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=concat_rotary_emb,
+        )
+        initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
+        block_id += 1
+
+    image_tokens_seq_len = hidden_states.shape[1]
+    hidden_states = torch.cat([hidden_states, initial_encoder_hidden_states], dim=1)
+    hidden_states_seq_len = hidden_states.shape[1]
+    if hidden_states_masks is not None:
+        encoder_attention_mask_ones = torch.ones(
+            (batch_size, initial_encoder_hidden_states.shape[1] + cur_llama31_encoder_hidden_states.shape[1]),
+            device=hidden_states_masks.device,
+            dtype=hidden_states_masks.dtype,
+        )
+        hidden_states_masks = torch.cat([hidden_states_masks, encoder_attention_mask_ones], dim=1)
+
+    for block in module.single_stream_blocks:
+        cur_llama31_encoder_hidden_states = encoder_hidden_states[block_id]
+        hidden_states = torch.cat([hidden_states, cur_llama31_encoder_hidden_states], dim=1)
+        hidden_states = block(
+            hidden_states=hidden_states,
+            hidden_states_masks=hidden_states_masks,
+            encoder_hidden_states=None,
+            temb=temb,
+            image_rotary_emb=concat_rotary_emb,
+        )
+        hidden_states = hidden_states[:, :hidden_states_seq_len]
+        block_id += 1
+
+    return hidden_states[:, :image_tokens_seq_len, ...]
+
+
+def extract_hidream_image_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timesteps: torch.Tensor | None = None,
+    encoder_hidden_states_t5: torch.Tensor | None = None,
+    encoder_hidden_states_llama3: torch.Tensor | None = None,
+    pooled_embeds: torch.Tensor | None = None,
+    img_ids: torch.Tensor | None = None,
+    img_sizes: list[tuple[int, int]] | None = None,
+    hidden_states_masks: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """Extract cache context for HiDreamImageTransformer2DModel."""
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    encoder_hidden_states = kwargs.get("encoder_hidden_states", None)
+    if encoder_hidden_states is not None:
+        encoder_hidden_states_t5 = encoder_hidden_states[0]
+        encoder_hidden_states_llama3 = encoder_hidden_states[1]
+
+    if hidden_states_masks is not None and (img_ids is None or img_sizes is None):
+        raise ValueError("if `hidden_states_masks` is passed, `img_ids` and `img_sizes` must also be passed.")
+
+    state = _prepare_hidream_teacache_state(
+        module,
+        hidden_states,
+        timesteps,
+        encoder_hidden_states_t5,
+        encoder_hidden_states_llama3,
+        pooled_embeds,
+        img_ids,
+        img_sizes,
+        hidden_states_masks,
+    )
+    hidden_states = state["hidden_states"]
+    hidden_states_masks = state["hidden_states_masks"]
+    img_sizes = state["img_sizes"]
+    encoder_hidden_states = state["encoder_hidden_states"]
+    temb = state["temb"]
+    concat_rotary_emb = state["concat_rotary_emb"]
+    modulated_input = state["modulated_input"]
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        output = _run_hidream_transformer_blocks(
+            module,
+            hidden_states,
+            hidden_states_masks,
+            encoder_hidden_states,
+            temb,
+            concat_rotary_emb,
+        )
+        return (output,)
+
+    return_dict = kwargs.get("return_dict", True)
+
+    def postprocess(h: torch.Tensor) -> Any:
+        output = module.final_layer(h, temb)
+        output = module.unpatchify(output, img_sizes, module.training)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_sensenova_u1_context(
     module: nn.Module,
     input_ids: torch.Tensor | None = None,
@@ -1264,6 +1460,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
+    "HiDreamImageTransformer2DModel": extract_hidream_image_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
