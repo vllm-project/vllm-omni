@@ -25,6 +25,7 @@ test_params = [
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
             server_args=[
                 "--trust-remote-code",
                 "--no-async-chunk",

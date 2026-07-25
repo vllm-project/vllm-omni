@@ -21,6 +21,7 @@ _MINICPMO_SERVER = [
         OmniServerParams(
             model="openbmb/MiniCPM-o-4_5",
             stage_config_path=_MINICPMO_DEPLOY,
+            use_stage_cli=True,
             server_args=[
                 "--trust-remote-code",
                 "--no-async-chunk",

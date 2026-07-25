@@ -393,27 +393,3 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
-
-    def _gather_runtime_additional_information(self):
-        """NPU: guarantee ``request_id`` reaches Code2Wav's runtime info.
-
-        On GPU the per-step ``_preprocess`` gate calls
-        ``_update_additional_information`` which merges the upstream stage's
-        ``additional_information`` (carrying ``request_id``) into
-        ``model_intermediate_buffer``. The NPU runner does not call omni's
-        ``_preprocess``, so for a downstream stage without ``has_preprocess``
-        (e.g. Code2Wav) the buffer entry can be populated with codec/meta data
-        yet lack ``request_id`` -> ``missing_request_id``. Inject the engine's
-        authoritative ``req_id`` as ``request_id`` so Code2Wav can key its
-        per-request state machine. No-op on GPU where the field is already set.
-        """
-        infos = super()._gather_runtime_additional_information()
-        for req_id, info in zip(self.input_batch.req_ids, infos):
-            if isinstance(info, dict) and not info.get("request_id"):
-                meta = info.get("meta")
-                if not isinstance(meta, dict):
-                    meta = {}
-                    info["meta"] = meta
-                meta["request_id"] = req_id
-                info["request_id"] = req_id
-        return infos
