@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
@@ -241,3 +242,38 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
     await orchestrator._route_output(0, 0, output, req_state, None)
 
     orchestrator._forward_to_next_stage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+    )
+    orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cleanup_request_ids = AsyncMock()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-segment-final-output",
+        sampling_params_list=[SamplingParams(max_tokens=1)],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    output = SimpleNamespace(
+        request_id=req_state.request_id,
+        finished=True,
+    )
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    assert req_state.finished_final_output_stage_ids == set()
+    orchestrator._cleanup_request_ids.assert_not_awaited()
+    routed = orchestrator.output_async_queue.get_nowait()
+    assert routed.finished is False
