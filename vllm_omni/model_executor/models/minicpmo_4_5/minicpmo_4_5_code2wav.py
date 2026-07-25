@@ -17,6 +17,7 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -25,6 +26,8 @@ from .batched_token2wav import (
     BatchedToken2WavState,
     state_shape_signature,
 )
+
+logger = init_logger(__name__)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -358,7 +361,18 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_infos=len(runtime_additional_information),
             )
         if self.backend is None:
-            raise _batch_error("backend_not_loaded")
+            # load_format=dummy (CI core_model runs) skips model.load_weights()
+            # entirely, but Token2wav's assets live beside the checkpoint rather
+            # than in its weight iterator, so they still have to be loaded for
+            # this stage to produce anything. Build them on first use, outside
+            # inference mode so the parameters are ordinary tensors.
+            logger.warning_once(
+                "MiniCPM-o Code2Wav backend was not built during weight loading "
+                "(load_format=%s); loading Token2wav assets now.",
+                getattr(getattr(self.vllm_config, "load_config", None), "load_format", "unknown"),
+            )
+            with torch.inference_mode(False), torch.no_grad():
+                self._build_backend()
 
         state_ids = kwargs.get("request_ids")
         if state_ids is None:
@@ -514,8 +528,17 @@ class MiniCPMO45Code2Wav(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         for _ in weights:
             pass
+        self._build_backend()
+        # Token2wav loads flow.pt and hift.pt inside its constructor instead of
+        # from the parent MiniCPM checkpoint iterator. Report those registered
+        # parameters as initialized so vLLM's strict loader audit does not
+        # misclassify the independently loaded Stage-2 weights as missing.
+        return {name for name, _ in self.named_parameters()}
+
+    def _build_backend(self) -> None:
+        """Load the Token2wav assets that back this stage."""
         if self.backend is not None:
-            return {name for name, _ in self.named_parameters()}
+            return
 
         from vllm_omni.platforms import current_omni_platform
 
@@ -552,8 +575,3 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
-        # Token2wav loads flow.pt and hift.pt inside its constructor instead of
-        # from the parent MiniCPM checkpoint iterator. Report those registered
-        # parameters as initialized so vLLM's strict loader audit does not
-        # misclassify the independently loaded Stage-2 weights as missing.
-        return {name for name, _ in self.named_parameters()}
