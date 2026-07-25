@@ -10,42 +10,8 @@ steps:
     steps:
       - label: "Simple · Dependency versions probe"
         commands:
-          - |
-            set -euo pipefail
-            echo "=== python ==="
-            python -V
-            which python
-            echo "=== key packages ==="
-            python - <<'PY'
-            from importlib import metadata
-            import shutil
-
-            keys = [
-                "vllm",
-                "vllm-omni",
-                "torch",
-                "torchvision",
-                "torchaudio",
-                "transformers",
-                "mooncake-transfer-engine-cuda13",
-                "mooncake-transfer-engine",
-                "numpy",
-                "pillow",
-                "diffusers",
-            ]
-            for name in keys:
-                try:
-                    print(f"{name}=={metadata.version(name)}")
-                except metadata.PackageNotFoundError:
-                    print(f"{name}: <not installed>")
-            print("mooncake_master:", shutil.which("mooncake_master"))
-            PY
-            echo "=== pip freeze (all) ==="
-            if command -v uv >/dev/null 2>&1; then
-              uv pip freeze --system
-            else
-              python -m pip freeze
-            fi
+          - uv pip list --system
+          - uv pip list
         mirror_hardwares: l4_1
 
   #     - label: "Simple · Diffusion & Model Executor Test"
