@@ -11,14 +11,12 @@ Tests cover:
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
@@ -53,39 +51,6 @@ class TestAttentionSpec:
     def test_skip_softmax_rejected_on_non_trtllm(self):
         with pytest.raises(ValueError, match="only supported by the TRTLLM_ATTN"):
             AttentionSpec(backend="TORCH_SDPA", skip_softmax={"target_sparsity": 0.5})
-
-
-def test_sdpa_backend_can_pin_torch_dispatch(monkeypatch: pytest.MonkeyPatch):
-    entered_backends = []
-
-    class FakeSDPAKernel:
-        def __init__(self, backends, *, set_priority):
-            entered_backends.extend(backends)
-            assert set_priority
-
-        def __enter__(self):
-            return None
-
-        def __exit__(self, *args):
-            return False
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.attention.backends.sdpa.sdpa_kernel",
-        FakeSDPAKernel,
-    )
-    implementation = SDPAImpl(
-        num_heads=2,
-        num_kv_heads=2,
-        head_size=4,
-        softmax_scale=0.5,
-        backend_kwargs={"backends": ["FLASH_ATTENTION"]},
-    )
-    query = torch.randn(1, 3, 2, 4)
-    with patch("torch.nn.functional.scaled_dot_product_attention", side_effect=lambda query, *_args, **_kwargs: query):
-        output = implementation.forward_cuda(query, query, query)
-
-    assert entered_backends == [torch.nn.attention.SDPBackend.FLASH_ATTENTION]
-    assert output.shape == query.shape
 
 
 class TestAttentionConfig:

@@ -4,7 +4,6 @@
 from typing import Literal
 
 import torch
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -18,32 +17,6 @@ logger = init_logger(__name__)
 
 
 SDPAMaskMode = Literal["broadcast_k", "full_qk"]
-
-
-def _resolve_sdpa_backends(backend_kwargs: dict | None) -> list[SDPBackend] | None:
-    if not backend_kwargs:
-        return None
-
-    backend_kwargs = dict(backend_kwargs)
-    backend_names = backend_kwargs.pop("backends", None)
-    if backend_kwargs:
-        logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs))
-    if backend_names is None:
-        return None
-    if not isinstance(backend_names, list) or not backend_names:
-        raise ValueError("SDPA backend_kwargs.backends must be a non-empty list")
-
-    backends = []
-    for name in backend_names:
-        if not isinstance(name, str):
-            raise TypeError("SDPA backend names must be strings")
-        normalized_name = name.upper()
-        try:
-            backends.append(SDPBackend.__members__[normalized_name])
-        except KeyError:
-            valid = ", ".join(member for member in SDPBackend.__members__ if member != "ERROR")
-            raise ValueError(f"Unknown SDPA backend {name!r}; expected one of: {valid}") from None
-    return backends
 
 
 def _maybe_reshape_attn_mask(
@@ -113,7 +86,8 @@ class SDPAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.sdpa_backends = _resolve_sdpa_backends(backend_kwargs)
+        if backend_kwargs:
+            logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
     def _forward_impl(
         self,
@@ -147,29 +121,16 @@ class SDPAImpl(AttentionImpl):
             logger.debug(
                 "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
             )
-        if self.sdpa_backends is None:
-            output = torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=self.causal,
-                scale=self.softmax_scale,
-                enable_gqa=enable_gqa,
-            )
-        else:
-            with sdpa_kernel(self.sdpa_backends, set_priority=True):
-                output = torch.nn.functional.scaled_dot_product_attention(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attention_mask,
-                    dropout_p=0.0,
-                    is_causal=self.causal,
-                    scale=self.softmax_scale,
-                    enable_gqa=enable_gqa,
-                )
+        output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=self.causal,
+            scale=self.softmax_scale,
+            enable_gqa=enable_gqa,
+        )
         out = output.permute(0, 2, 1, 3)
         return out
 

@@ -3,8 +3,8 @@
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
-The comparison pins both runtimes to PyTorch SDPA FlashAttention and runs the
-official reference with ``max_batch_size=4`` to match Omni's fused guidance
+The comparison runs both runtimes through PyTorch SDPA and uses
+``max_batch_size=4`` in the official reference to match Omni's fused guidance
 batch. Video and audio guidance use the official non-HQ one-stage defaults;
 only the generation shape and step count are reduced for CI runtime.
 """
@@ -49,9 +49,8 @@ NEGATIVE_PROMPT = (
     "stylized filters, or AI artifacts."
 )
 
-# Both runtimes use PyTorch SDPA pinned to its FlashAttention backend so
-# backend drift does not dominate this pipeline-level accuracy guard.
-ATTENTION_BACKEND = "sdpa_flash"
+# Both runtimes use PyTorch SDPA with the current Torch dispatch defaults.
+ATTENTION_BACKEND = "torch_sdpa"
 VIDEO_SSIM_MEAN_THRESHOLD = 0.95
 VIDEO_SSIM_MIN_THRESHOLD = 0.90
 VIDEO_PSNR_MEAN_THRESHOLD = 30.0
@@ -355,8 +354,6 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
         str(runner),
         "--request",
         str(request_path),
-        "--attention-backend",
-        ATTENTION_BACKEND,
     ]
     if os.environ.get("VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", "").lower() in {"1", "true", "yes", "on"}:
         base_command.append("--enable-layerwise-offload")

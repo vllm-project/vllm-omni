@@ -27,11 +27,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--official-root", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--gemma-root", type=Path)
-    parser.add_argument(
-        "--attention-backend",
-        choices=("default", "sdpa_flash"),
-        default="default",
-    )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
     return parser.parse_args()
 
@@ -73,16 +68,12 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
-def _configure_official_sdpa_flash(pipeline: Any) -> None:
-    """Pin official connector and denoiser attention to PyTorch SDPA Flash."""
+def _configure_official_sdpa(pipeline: Any) -> None:
+    """Use PyTorch SDPA for official connector and denoiser attention."""
     from ltx_core.loader.attention_ops import set_attention_module_op
     from ltx_core.model.transformer.attention import PytorchAttention
-    from torch.nn.attention import SDPBackend
 
-    class AllValidSDPAFlash(PytorchAttention):
-        def __init__(self) -> None:
-            super().__init__(priority=[SDPBackend.FLASH_ATTENTION])
-
+    class AllValidSDPA(PytorchAttention):
         def __call__(
             self,
             query: torch.Tensor,
@@ -95,7 +86,7 @@ def _configure_official_sdpa_flash(pipeline: Any) -> None:
                 raise ValueError("The LTX accuracy guard cannot discard a non-empty attention mask")
             return super().__call__(query, key, value, heads, mask=None)
 
-    attention = AllValidSDPAFlash()
+    attention = AllValidSDPA()
     module_op = set_attention_module_op(
         attention=attention,
         masked_attention=attention,
@@ -130,8 +121,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         loras=(),
         offload_mode=OffloadMode.CPU if args.enable_layerwise_offload else OffloadMode.NONE,
     )
-    if args.attention_backend == "sdpa_flash":
-        _configure_official_sdpa_flash(pipeline)
+    _configure_official_sdpa(pipeline)
     image_path = request.get("image")
     images = (
         []
@@ -184,7 +174,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         audio_sample_rate=audio.sampling_rate,
         metadata={
             "backend": "official",
-            "attention_backend": args.attention_backend,
+            "attention_backend": "torch_sdpa",
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "checkpoint": str(args.checkpoint),
         },
@@ -262,14 +252,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.model is None or args.model_class_name is None:
         raise ValueError("Omni backend requires --model and --model-class-name")
 
-    attention_config = None
-    if args.attention_backend == "sdpa_flash":
-        attention_config = {
-            "default": {
-                "backend": "TORCH_SDPA",
-                "extra": {"backends": ["FLASH_ATTENTION"]},
-            }
-        }
+    attention_config = {"default": {"backend": "TORCH_SDPA"}}
 
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
@@ -324,7 +307,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             audio_sample_rate=audio_sample_rate,
             metadata={
                 "backend": "omni",
-                "attention_backend": args.attention_backend,
+                "attention_backend": "torch_sdpa",
                 "model": args.model,
                 "model_class_name": model_class_name,
             },
