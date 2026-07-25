@@ -27,22 +27,6 @@ except Exception as e:
         e,
     )
 
-try:
-    from flashinfer.prefill import (
-        trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
-    )
-    from flashinfer.prefill import (
-        trtllm_sage_attention_quantize as _trtllm_sage_attention_quantize,
-    )
-
-    trtllm_ragged_attention_deepseek = torch.compiler.disable(_trtllm_ragged_attention_deepseek)
-    trtllm_sage_attention_quantize = torch.compiler.disable(_trtllm_sage_attention_quantize)
-    HAS_FLASHINFER_FUTURE = True
-    FLASHINFER_FUTURE_IMPORT_ERROR: Exception | None = None
-except Exception as e:
-    HAS_FLASHINFER_FUTURE = False
-    FLASHINFER_FUTURE_IMPORT_ERROR = e
-
 
 class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -50,7 +34,7 @@ class FlashInferAttentionBackend(AttentionBackend):
     @classmethod
     def supports_attention_mask(cls) -> bool:
         # Non-CuTe batch-prefill backends accept boolean custom masks. CuTe-DSL
-        # and SageAttention fall back to SDPA for nontrivial masks.
+        # falls back to SDPA for nontrivial masks.
         return True
 
     @staticmethod
@@ -70,7 +54,7 @@ class FlashInferAttentionBackend(AttentionBackend):
 
 
 class FlashInferAttentionImpl(AttentionImpl):
-    _QK_DTYPES = {torch.float16, torch.bfloat16, torch.int8}
+    _QK_DTYPES = {torch.float16, torch.bfloat16}
     _VO_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
     @dataclass(frozen=True)
@@ -108,62 +92,28 @@ class FlashInferAttentionImpl(AttentionImpl):
         backend_kwargs = backend_kwargs or {}
         self.dtype_qk = self._check_dtype(backend_kwargs.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
         self.dtype_vo = self._check_dtype(backend_kwargs.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
-        self.sage_q_block_size = backend_kwargs.get("sage_q_block_size")
-        self.sage_k_block_size = backend_kwargs.get("sage_k_block_size")
         requested_backend = backend_kwargs.get("flashinfer_backend", "auto")
-
-        # SageAttention config for non-causal layers
-        if bool(self.sage_q_block_size or self.sage_k_block_size):
-            self.is_sage = not causal
-            if causal:
-                self.dtype_qk = None
-                self.dtype_vo = None
-        else:
-            self.is_sage = False
 
         if not HAS_FLASHINFER:
             raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
-        if self.is_sage and not HAS_FLASHINFER_FUTURE:
-            raise ImportError(
-                "SageAttention requires a newer version of FlashInfer"
-            ) from FLASHINFER_FUTURE_IMPORT_ERROR
 
         self._check_future_flashinfer_version()
 
-        sm_major, _ = torch.cuda.get_device_capability(self.device)
-        self._wrapper: BatchPrefillWithRaggedKVCacheWrapper | None = None
+        self.flashinfer_backend = self._select_backend(requested_backend, self.device)
+        workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
+        self._workspace = torch.empty(
+            workspace_size,
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        self._wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self._workspace,
+            kv_layout="NHD",
+            backend=self.flashinfer_backend,
+        )
         self._qo_indptr: torch.Tensor | None = None
         self._kv_indptr: torch.Tensor | None = None
         self._plan_key: FlashInferAttentionImpl._WrapperPlanKey | None = None
-
-        if self.is_sage:
-            if sm_major != 10 or head_size != 128:
-                raise ValueError(
-                    f"SageAttention requires head_size=128 on SM10x; got head_size={head_size}, cc={sm_major}."
-                )
-            if self.dtype_vo != torch.float8_e4m3fn:
-                raise ValueError("SageAttention requires QK in {FP8, INT8}, V in {FP8}.")
-            self.flashinfer_backend = "trtllm-gen" if requested_backend == "auto" else requested_backend
-            if self.flashinfer_backend != "trtllm-gen":
-                raise ValueError("SageAttention requires flashinfer_backend='trtllm-gen'.")
-            self._workspace = torch.empty(
-                256 * 1024 * 1024,
-                device=self.device,
-                dtype=torch.uint8,
-            )
-        else:
-            self.flashinfer_backend = self._select_backend(requested_backend, self.device)
-            workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
-            self._workspace = torch.empty(
-                workspace_size,
-                device=self.device,
-                dtype=torch.uint8,
-            )
-            self._wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                self._workspace,
-                kv_layout="NHD",
-                backend=self.flashinfer_backend,
-            )
 
         if self.dtype_qk is not None or self.dtype_vo is not None:
             logger.info_once(
@@ -186,13 +136,15 @@ class FlashInferAttentionImpl(AttentionImpl):
         except (AttributeError, InvalidVersion):
             return
         if flashinfer_version <= Version("0.6.15"):
-            logger.warning_once(
-                "FlashInfer %s is too old for reliable mixed QK/V dtype "
-                "attention (Q/K=%s, V=%s); use a version newer than 0.6.15.",
-                flashinfer_version,
-                self.dtype_qk,
-                self.dtype_vo,
+            error_msg = (
+                f"FlashInfer {flashinfer_version} may be too old for reliable mixed "
+                f"QK/V dtype attention (Q/K={self.dtype_qk}, V={self.dtype_vo}); "
+                "install flashinfer > 0.6.15 or build from later than 41155ec2."
             )
+            if flashinfer_version == Version("0.6.15"):
+                logger.warning_once(error_msg)
+            else:
+                raise RuntimeError(error_msg)
 
     @staticmethod
     def _select_backend(requested_backend: str, device: torch.device) -> str:
@@ -290,7 +242,6 @@ class FlashInferAttentionImpl(AttentionImpl):
         key: _WrapperPlanKey,
         flat_mask: torch.Tensor | None,
     ) -> None:
-        assert self._wrapper is not None
         self._wrapper.plan(
             self._qo_indptr,
             self._kv_indptr,
@@ -403,77 +354,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        assert self._wrapper is not None
         return self._wrapper.run(query, key, value)
-
-    def _run_trtllm_sage_attn(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, qo_len, num_q_heads, head_dim = query.shape
-        kv_len = key.shape[1]
-        num_kv_heads = key.shape[2]
-        q = query.reshape(batch_size * qo_len, num_q_heads, head_dim)
-        k = key.reshape(batch_size * kv_len, num_kv_heads, key.shape[3])
-        v = value.reshape(batch_size * kv_len, num_kv_heads, value.shape[3])
-
-        q, k, v, q_sf, k_sf, v_sf = trtllm_sage_attention_quantize(
-            q,
-            k,
-            v,
-            q_block_size=self.sage_q_block_size,
-            k_block_size=self.sage_k_block_size,
-            qk_quant_dtype=self.dtype_qk,
-        )
-        sage_attn_sfs = (q_sf, k_sf, None, v_sf)
-        sage_block_sizes = (
-            self.sage_q_block_size,
-            self.sage_k_block_size,
-            0,
-            1,
-        )
-
-        qo_indptr = torch.arange(
-            0,
-            (batch_size + 1) * qo_len,
-            qo_len,
-            device=query.device,
-            dtype=torch.int32,
-        )
-        kv_indptr = torch.arange(
-            0,
-            (batch_size + 1) * kv_len,
-            kv_len,
-            device=query.device,
-            dtype=torch.int32,
-        )
-        seq_lens = torch.full((batch_size,), kv_len, device=query.device, dtype=torch.int32)
-        out = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=self._workspace,
-            seq_lens=seq_lens,
-            max_q_len=qo_len,
-            max_kv_len=kv_len,
-            bmm1_scale=self.softmax_scale,
-            bmm2_scale=1.0,
-            o_sf_scale=-1.0,
-            batch_size=batch_size,
-            window_left=-1,
-            cum_seq_lens_q=qo_indptr,
-            cum_seq_lens_kv=kv_indptr,
-            enable_pdl=False,
-            is_causal=self.causal,
-            return_lse=False,
-            sage_attn_sfs=sage_attn_sfs,
-            num_elts_per_sage_attn_blk=sage_block_sizes,
-            backend=self.flashinfer_backend,
-        )
-        out = out.reshape(batch_size, qo_len, num_q_heads, value.shape[3])
-        return out.to(query.dtype) if out.dtype != query.dtype else out
 
     def forward_cuda(
         self,
@@ -497,12 +378,6 @@ class FlashInferAttentionImpl(AttentionImpl):
                 return self._sdpa_fallback(query, key, value, attn_metadata)
             if custom_mask is not None and self.causal:
                 return self._sdpa_fallback(query, key, value, attn_metadata)
-
-        if self.is_sage:
-            if custom_mask is not None:
-                logger.debug("SageAttention has no custom-mask input; deferring to SDPA")
-                return self._sdpa_fallback(query, key, value, attn_metadata)
-            return self._run_trtllm_sage_attn(query, key, value)
 
         if custom_mask is not None and self.flashinfer_backend == "cute-dsl":
             logger.debug("CuTe DSL does not support custom masks; deferring to SDPA")
