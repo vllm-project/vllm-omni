@@ -19,12 +19,30 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 from .batched_token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     state_shape_signature,
 )
+
+
+def _resolve_token2wav_cls() -> type:
+    """Select the vocoder asset loader for the current platform.
+
+    ``stepaudio2`` hard-codes CUDA device placement, so Ascend loads the
+    in-tree adapter over ``StepAudio2Token2WavCore``, which carries the
+    vendored NPU vocoder fixes.
+    """
+    if current_omni_platform.is_npu():
+        from .minicpmo_4_5_token2wav import MiniCPMO45Token2wav
+
+        return MiniCPMO45Token2wav
+
+    from stepaudio2.token2wav import Token2wav
+
+    return Token2wav
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -516,7 +534,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             pass
         if self.backend is not None:
             return {name for name, _ in self.named_parameters()}
-        from stepaudio2.token2wav import Token2wav
+        token2wav_cls = _resolve_token2wav_cls()
 
         extra = self._extra_config()
         prompt_path = Path(self._default_prompt_wav)
@@ -532,7 +550,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             # Token2wav contains fp32-only S3Tokenizer/HiFT modules, so build
             # its independent assets in their native precision.
             torch.set_default_dtype(torch.float32)
-            token2wav = Token2wav(
+            token2wav = token2wav_cls(
                 str(token2wav_path),
                 float16=use_float16,
                 n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),

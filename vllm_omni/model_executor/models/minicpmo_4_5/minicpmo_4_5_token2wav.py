@@ -13,6 +13,10 @@ This module exposes the same call surface MiniCPM expects
 (``__call__`` / ``set_stream_cache`` / ``stream``) while delegating the
 actual vocoder work to
 ``vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav.StepAudio2Token2WavCore``.
+
+It also exposes the asset surface (``flow`` / ``hift`` / cache lengths /
+``speech_window`` / ``_prepare_prompt``) that the Stage-2 ``BatchedToken2Wav``
+driver reads instead of calling ``stream``.
 """
 
 from __future__ import annotations
@@ -81,6 +85,41 @@ class MiniCPMO45Token2wav:
         # Mutable streaming fields expected by MiniCPM's long-form path.
         self.stream_cache: Any | None = None
         self.hift_cache_dict: dict[str, torch.Tensor] = {}
+
+    @property
+    def flow(self):
+        return self._core.flow
+
+    @property
+    def hift(self):
+        return self._core.hift
+
+    @property
+    def mel_cache_len(self) -> int:
+        return self._core.mel_cache_len
+
+    @property
+    def source_cache_len(self) -> int:
+        return self._core.source_cache_len
+
+    @property
+    def speech_window(self) -> torch.Tensor:
+        """Overlap-add window, materialized on first access.
+
+        The core builds this inside its own streaming setup, but Stage-2 reads
+        it while constructing its batched driver, before any stream starts.
+        """
+        window = self._core.speech_window
+        if window is None or window.device != self._core.device:
+            window = torch.from_numpy(np.hamming(2 * self._core.source_cache_len)).to(
+                device=self._core.device, dtype=torch.float32
+            )
+            self._core.speech_window = window
+        return window
+
+    def _prepare_prompt(self, prompt_wav: str):
+        """Extract prompt speech tokens, speaker embedding, and mels."""
+        return self._core._prepare_prompt(prompt_wav)
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""
