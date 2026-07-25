@@ -151,15 +151,33 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if model is None:
             return
 
+        compile_granularity = self.od_config.diffusion_compile_granularity
+        compile_dynamic = self.od_config.diffusion_compile_dynamic
         try:
-            setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
-            logger.info("Model runner: %s compiled with torch.compile.", attr_name)
+            if compile_granularity == "full":
+                model.compile(dynamic=compile_dynamic)
+                compiled_model = model
+            else:
+                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+            setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
-                "Model runner: torch.compile for %s failed: %s. Using eager mode.",
+                "Model runner: %s torch.compile setup for %s failed before activation: %s. "
+                "Continuing with the uncompiled model; lazy compilation errors can still "
+                "surface on the first request.",
+                compile_granularity,
                 attr_name,
                 e,
             )
+            return
+
+        logger.info(
+            "Model runner: %s configured for lazy %s torch.compile with dynamic=%s; "
+            "compilation errors may surface on the first request.",
+            attr_name,
+            compile_granularity,
+            compile_dynamic,
+        )
 
     def load_model(
         self,

@@ -999,6 +999,14 @@ class AsyncOmniEngine:
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
+            "diffusion_compile_granularity": (
+                "regional"
+                if kwargs.get("diffusion_compile_granularity") is None
+                else kwargs["diffusion_compile_granularity"]
+            ),
+            "diffusion_compile_dynamic": (
+                True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
+            ),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),

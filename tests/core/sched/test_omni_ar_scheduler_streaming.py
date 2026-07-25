@@ -57,13 +57,22 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
-def _run_resumable_segment_stop(session: Request) -> None:
+def _run_resumable_segment_stop(
+    session: Request,
+    *,
+    session_finished: bool = False,
+):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.should_advance.return_value = False
-    sched._update_request_with_output.return_value = ([42], True)
-    sched._handle_stopped_request.return_value = False
+
+    def stop_request(request: Request, _token_ids: list[int]):
+        request.status = RequestStatus.FINISHED_STOPPED
+        return [42], True
+
+    sched._update_request_with_output.side_effect = stop_request
+    sched._handle_stopped_request.return_value = session_finished
     sched.chunk_transfer_adapter = None
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
@@ -91,7 +100,7 @@ def _run_resumable_segment_stop(session: Request) -> None:
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
 
-    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+    return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
 
 @pytest.mark.parametrize("outstanding_async_tokens", [0, 1, 2])
@@ -114,6 +123,18 @@ def test_resumable_segment_stop_reconciles_async_placeholders(
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
     assert session._output_token_ids == []
+
+
+def test_resumable_session_terminal_is_not_marked_as_segment_boundary() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+
+    outputs = _run_resumable_segment_stop(session, session_finished=True)
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason is not None
+    assert output.is_segment_finished is False
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
