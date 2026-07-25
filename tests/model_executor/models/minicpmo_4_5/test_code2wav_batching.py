@@ -315,6 +315,65 @@ def test_empty_final_ignores_generation_scheduler_placeholder_token():
     assert model._states == {}
 
 
+@pytest.mark.parametrize(
+    "info",
+    [
+        # The runner injects the engine request id on every step (GPU
+        # _preprocess, NPU _gather_runtime_additional_information)...
+        {"request_id": "a", "meta": {"request_id": "a"}},
+        # ...but a pre-warm step can also reach the model with nothing at all.
+        {},
+    ],
+)
+def test_prewarm_placeholder_step_emits_silence_without_touching_state(info):
+    # async-chunk pre-warm submits Stage 2 with a reserved placeholder prompt.
+    # If it gets scheduled before the first codec window lands, those reserved
+    # tokens must neither be vocoded nor held to the codec payload contract.
+    model, token2wav = _model()
+
+    output = _forward(model, [info], request_ids=["a"])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert model._states == {}
+    assert token2wav.hift.calls == []
+
+
+def test_metadata_only_payload_still_decodes_codec_from_prompt_tokens():
+    # The connector strips 1-D codec tensors out of additional_information and
+    # leaves them in the prompt tokens, so a real chunk reaches the model as
+    # producer metadata plus input ids. It must still be vocoded.
+    model, _ = _model()
+    info = {
+        "request_id": "a",
+        "meta": {
+            "request_id": "a",
+            "chunk_seq": 0,
+            "code_flat_numel": 2,
+            "prompt_cache_id": "shared",
+        },
+    }
+
+    output = _forward(model, [info], placeholder_counts=[2])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert set(model._states) == {"a"}
+
+
+def test_non_final_chunk_shorter_than_lookahead_window_is_rejected():
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    with pytest.raises(RuntimeError, match="chunk_below_lookahead_window"):
+        adapter.decode_batch(torch.tensor([[10]]), prompt, states, last_chunk=False)
+
+    # The final chunk is zero-padded by the encoder, so it stays decodable.
+    audios, _ = adapter.decode_batch(torch.tensor([[10]]), prompt, states, last_chunk=True)
+    assert len(audios) == 1
+
+
 def test_forward_builds_backend_when_weight_loading_was_skipped(monkeypatch):
     # load_format=dummy never calls load_weights(), so Stage 2 would otherwise
     # reach its first request with no Token2wav assets at all.
