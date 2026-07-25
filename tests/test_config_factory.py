@@ -336,6 +336,31 @@ class TestStageConfig:
         assert "ring_degree" not in omega_config.engine_args
         assert "sequence_parallel_size" not in omega_config.engine_args
 
+    def test_to_omegaconf_diffusion_parallel_allgather_override_recomputes_sequence_parallel_size(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                    "allgather_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "allgather_degree": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.allgather_degree == 2
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 2
+        assert "allgather_degree" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+
     def test_to_omegaconf_diffusion_parallel_explicit_sequence_parallel_size_is_preserved(self):
         config = StageConfig(
             stage_id=1,
