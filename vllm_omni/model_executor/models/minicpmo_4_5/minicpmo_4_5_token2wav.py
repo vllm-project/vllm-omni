@@ -87,9 +87,9 @@ class MiniCPMO45Token2wav:
         # lazily inside ``setup_stream_for``, so materialize it here: the
         # 3-stage ``BatchedToken2Wav`` wrapper clones it at construction time.
         if self._core.speech_window is None:
-            self._core.speech_window = torch.from_numpy(
-                np.hamming(2 * self._core.source_cache_len)
-            ).to(device=self.device, dtype=torch.float32)
+            self._core.speech_window = torch.from_numpy(np.hamming(2 * self._core.source_cache_len)).to(
+                device=self.device, dtype=torch.float32
+            )
 
     # --- Surface expected by ``BatchedToken2Wav`` (3-stage Code2Wav) ---------
     # ``BatchedToken2Wav`` wraps this object as a one-time asset loader and
@@ -114,13 +114,7 @@ class MiniCPMO45Token2wav:
 
     @property
     def speech_window(self) -> torch.Tensor:
-        sw = self._core.speech_window
-        if sw is None:
-            sw = torch.from_numpy(np.hamming(2 * self._core.source_cache_len)).to(
-                device=self.device, dtype=torch.float32
-            )
-            self._core.speech_window = sw
-        return sw
+        return self._core.speech_window
 
     def _prepare_prompt(self, prompt_wav: str):
         """Delegate prompt feature extraction to the wrapped core."""
