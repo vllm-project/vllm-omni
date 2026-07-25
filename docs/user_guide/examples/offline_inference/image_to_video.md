@@ -4,7 +4,7 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 
 This example demonstrates how to generate videos from images using Wan2.2,
-LTX-2/LTX-2.3, and HunyuanVideo-1.5 Image-to-Video models with vLLM-Omni's
+LTX-2, and HunyuanVideo-1.5 Image-to-Video models with vLLM-Omni's
 offline inference API.
 
 ## Local CLI Usage
@@ -53,43 +53,22 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
-### LTX-2.3
+### LTX-2
 
 ```bash
 python image_to_video.py \
-  --model diffusers/LTX-2.3-Diffusers \
+  --model Lightricks/LTX-2 \
   --image cherry_blossom.jpg \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 30 \
-  --frame-rate 24 \
-  --fps 24 \
-  --output ltx23_i2v_output.mp4
+  --output ltx2_i2v_output.mp4
 ```
 
-The checkpoint selects the unified `LTX2Pipeline`; adding `--image` selects
-I2V. See the [LTX family recipe](../../../../recipes/LTX/LTX-2.md).
-
-### LTX-2 distilled
-
-```bash
-python image_to_video.py \
-  --model rootonchair/LTX-2-19b-distilled \
-  --image cherry_blossom.jpg \
-  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --output ltx2_distilled_i2v_output.mp4
-```
-
-The distilled checkpoint selects `LTX2DistilledPipeline` and uses fixed
-positive-only 8+3-step guidance. Its default final resolution is 1024x1536.
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, T2V, defaults, and advanced options.
 
 Key arguments:
 
-- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or
-  LTX-2/LTX-2.3).
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or LTX-2).
 - `--image`: Path to input image (required).
 - `--prompt`: Text description of desired motion/animation.
 - `--height/--width`: Output resolution (auto-calculated from image if not set).

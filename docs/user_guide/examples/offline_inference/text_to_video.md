@@ -13,8 +13,6 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
-| `rootonchair/LTX-2-19b-distilled` | 1024x1536 | 121 | fixed 8+3 | positive-only | Model-dependent |
-| `diffusers/LTX-2.3-Diffusers` | 512x768 | 121 | 30 | video 3.0 / audio 7.0 | 96GB-class GPU |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 
@@ -37,30 +35,17 @@ python text_to_video.py \
   --output t2v_out.mp4
 ```
 
-### LTX-2 / LTX-2.3
+### LTX-2
 
 ```bash
-MODEL=Lightricks/LTX-2
-# For LTX-2.3, use: MODEL=diffusers/LTX-2.3-Diffusers
-
 python text_to_video.py \
-  --model "$MODEL" \
+  --model Lightricks/LTX-2 \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
   --output ltx2_output.mp4
 ```
 
-Both checkpoints select the unified `LTX2Pipeline` from checkpoint metadata.
-See the [LTX family recipe](../../../../recipes/LTX/LTX-2.md) for the full API.
-
-The distilled checkpoint selects its fixed two-stage entry and defaults:
-
-```bash
-python text_to_video.py \
-  --model rootonchair/LTX-2-19b-distilled \
-  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --output ltx2_distilled_output.mp4
-```
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, I2V, defaults, and advanced options.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -137,8 +122,7 @@ python text_to_video.py \
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the
-  pipeline returns audio; LTX-2.3 outputs 48kHz audio).
+- `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
 

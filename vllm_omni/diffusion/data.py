@@ -524,18 +524,6 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
-def _resolve_model_index_class_name(model: str | None, model_index: dict[str, Any]) -> str | None:
-    """Resolve repository-specific public entries missing from Diffusers metadata."""
-    class_name = model_index.get("_class_name")
-    # The published full distilled checkpoint retains Diffusers' generic
-    # LTX2Pipeline metadata even though it requires the fixed two-stage recipe.
-    # Preserve the metadata default for ordinary LTX-2, while recognizing the
-    # checkpoint's canonical repository name and equivalent local/cache paths.
-    if class_name == "LTX2Pipeline" and model is not None and "distilled" in str(model).lower():
-        return "LTX2DistilledPipeline"
-    return class_name
-
-
 def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
     """Resolve the diffusion pipeline class name from the model config.
 
@@ -555,7 +543,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     except Exception:
         model_index = None
     if model_index is not None:
-        return _resolve_model_index_class_name(model, model_index)
+        return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
         return "DiffusersAdapterPipeline"
 
@@ -1136,7 +1124,7 @@ class OmniDiffusionConfig:
             config_dict = get_hf_file_to_dict("model_index.json", self.model)
             if config_dict is not None:
                 if self.model_class_name is None:
-                    self.model_class_name = _resolve_model_index_class_name(self.model, config_dict)
+                    self.model_class_name = config_dict.get("_class_name", None)
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter

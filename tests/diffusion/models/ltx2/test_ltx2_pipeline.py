@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.data import DiffusionOutput, _resolve_model_index_class_name
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2 import ltx2_components
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
@@ -110,16 +110,6 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
     assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
     assert LTX23_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
-
-
-def test_ltx_distilled_repository_name_selects_two_stage_entry():
-    model_index = {"_class_name": "LTX2Pipeline"}
-
-    assert _resolve_model_index_class_name("rootonchair/LTX-2-19b-distilled", model_index) == ("LTX2DistilledPipeline")
-    assert _resolve_model_index_class_name(
-        "/cache/models--rootonchair--LTX-2-19b-distilled/snapshots/abc", model_index
-    ) == ("LTX2DistilledPipeline")
-    assert _resolve_model_index_class_name("Lightricks/LTX-2", model_index) == "LTX2Pipeline"
 
 
 def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):

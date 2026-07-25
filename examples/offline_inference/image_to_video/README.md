@@ -1,7 +1,7 @@
 # Image-To-Video
 
-This shared example generates videos from images with VACE, Wan2.2,
-LTX-2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, and other compatible pipelines.
+This shared example generates videos from images with VACE, Wan2.2, LTX-2,
+HunyuanVideo-1.5, Cosmos3, and other compatible pipelines.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -27,8 +27,6 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
-| `rootonchair/LTX-2-19b-distilled` | 1024 x 1536 | 121 | fixed 8+3 | positive-only | Memory use depends on frame count and tensor parallelism |
-| `diffusers/LTX-2.3-Diffusers` | 512 x 768 | 121 | 30 | video 3.0 / audio 7.0 | 96GB-class GPU |
 
 !!! info
     Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
@@ -107,7 +105,7 @@ python image_to_video.py \
 | Argument | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
 | `--model` | str | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Diffusers I2V model ID or local path |
-| `--model-class-name` | str | `None` | Optional pipeline override; LTX checkpoints default to `LTX2Pipeline` |
+| `--model-class-name` | str | `None` | Optional pipeline override |
 | `--image` | str | (required) | Path to input image |
 | `--prompt` | str | `""` | Text description of desired motion/animation |
 | `--negative-prompt` | str | `""` | Optional list of artifacts to suppress |
@@ -197,21 +195,18 @@ python image_to_video.py \
   --output hunyuan_i2v.mp4
 ```
 
-### LTX2 Image-to-Video
+### LTX-2
 
 ```bash
 python image_to_video.py \
-  --model /path/to/LTX-2 \
+  --model Lightricks/LTX-2 \
   --image cherry_blossom.jpg \
   --prompt "A cinematic dolly shot of cherry blossoms" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --frame-rate 24 \
-  --fps 24 \
   --output ltx2_i2v.mp4
 ```
+
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, T2V, defaults, and advanced options.
 
 ## Advanced Features
 
@@ -233,39 +228,6 @@ python image_to_video.py \
   --output i2v_cached.mp4
 ```
 
-### LTX-2.3
-
-```bash
-python image_to_video.py \
-  --model diffusers/LTX-2.3-Diffusers \
-  --image cherry_blossom.jpg \
-  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 30 \
-  --frame-rate 24 \
-  --fps 24 \
-  --output ltx23_i2v_output.mp4
-```
-
-The one-stage checkpoints select the unified `LTX2Pipeline`; the supplied
-image selects I2V.
-
-### LTX-2 distilled
-
-```bash
-python image_to_video.py \
-  --model rootonchair/LTX-2-19b-distilled \
-  --image cherry_blossom.jpg \
-  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --output ltx2_distilled_i2v_output.mp4
-```
-
-The distilled checkpoint uses fixed positive-only 8+3-step guidance. See the
-[LTX family recipe](../../../recipes/LTX/LTX-2.md) for its request constraints.
-
 ### Cosmos3
 
 ```bash
@@ -283,8 +245,8 @@ python image_to_video.py \
 
 Key arguments:
 
-- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V,
-  LTX-2/LTX-2.3, Cosmos3, or VACE).
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, LTX-2,
+  Cosmos3, or VACE).
 - `--image`: Path to the first-frame or source image.
 - `--last-image`: Optional last-frame condition for models such as VACE.
 - `--mask-image`: Optional inpainting mask. White pixels are regenerated and black pixels are preserved.

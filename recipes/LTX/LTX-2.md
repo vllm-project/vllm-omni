@@ -17,9 +17,9 @@ image selects I2V. Both one-stage repositories declare this class, so
 the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 
 `LTX2DistilledPipeline` is the unified distilled entry: omit `image` for T2V
-or provide one initial image for I2V. The canonical checkpoint name selects it
-automatically; use an explicit `--model-class-name` if a local copy was renamed
-without `distilled` in its path.
+or provide one initial image for I2V. As in the official LTX pipelines,
+distilled mode is selected explicitly rather than inferred from the checkpoint
+name or metadata; always pass `--model-class-name LTX2DistilledPipeline`.
 
 ## API Migration
 
