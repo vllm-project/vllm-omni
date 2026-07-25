@@ -18,7 +18,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
 
 test_params = [
     pytest.param(
