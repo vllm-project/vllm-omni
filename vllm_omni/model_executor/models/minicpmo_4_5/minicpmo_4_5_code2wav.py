@@ -516,7 +516,19 @@ class MiniCPMO45Code2Wav(nn.Module):
             pass
         if self.backend is not None:
             return {name for name, _ in self.named_parameters()}
-        from stepaudio2.token2wav import Token2wav
+
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
+            # so use the in-tree NPU-aware adapter instead. It delegates to
+            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
+            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
+            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+                MiniCPMO45Token2wav as Token2wav,
+            )
+        else:
+            from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
         prompt_path = Path(self._default_prompt_wav)
