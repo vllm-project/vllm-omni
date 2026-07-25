@@ -15,6 +15,20 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 
 
+def _autocast_disabled(device: torch.device):
+    """Disable any enclosing autocast region on ``device``.
+
+    ``torch.amp.autocast`` resolves the autocast dtype for ``device_type``
+    while constructing the context, which raises on accelerators (e.g. Ascend
+    NPU) that never registered autocast support. Degrade to a no-op there: an
+    enclosing region can only exist on a device type torch already knows.
+    """
+    try:
+        return torch.amp.autocast(device.type, enabled=False)
+    except (RuntimeError, TypeError, ValueError):
+        return nullcontext()
+
+
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
 
@@ -72,7 +86,7 @@ class BatchedToken2Wav(nn.Module):
             previous_dtype = torch.get_default_dtype()
             try:
                 torch.set_default_dtype(torch.float32)
-                with torch.amp.autocast("cuda", enabled=False):
+                with _autocast_disabled(self.speech_window.device):
                     values = self._token2wav._prepare_prompt(prompt_wav)
             finally:
                 torch.set_default_dtype(previous_dtype)
