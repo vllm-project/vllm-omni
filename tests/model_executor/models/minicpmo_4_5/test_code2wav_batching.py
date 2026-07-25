@@ -315,6 +315,27 @@ def test_empty_final_ignores_generation_scheduler_placeholder_token():
     assert model._states == {}
 
 
+def test_forward_builds_backend_when_weight_loading_was_skipped(monkeypatch):
+    # load_format=dummy never calls load_weights(), so Stage 2 would otherwise
+    # reach its first request with no Token2wav assets at all.
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    token2wav = _FakeToken2Wav()
+    builds = 0
+
+    def build_backend():
+        nonlocal builds
+        builds += 1
+        model.backend = BatchedToken2Wav(token2wav)
+
+    monkeypatch.setattr(model, "_build_backend", build_backend)
+
+    output = _forward(model, [_info("a", 0, [10, 11])])
+    _forward(model, [_info("a", 1, [12, 13])])
+
+    assert builds == 1
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+
+
 @pytest.mark.parametrize(
     ("info", "reason"),
     [

@@ -77,6 +77,7 @@ class _WorkItem:
     duplex_epoch: int | None
     segment_end: bool
     turn_end: bool
+    has_payload: bool = True
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -225,8 +226,33 @@ class MiniCPMO45Code2Wav(nn.Module):
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         reference = codes.get("ref") if isinstance(codes, Mapping) else None
+        declared_numel = _scalar(meta.get("code_flat_numel"))
+        if audio is None and declared_numel is None:
+            # Neither codec tensor nor producer length: no payload is attached
+            # to this step. The stage was scheduled on the placeholder prompt
+            # that async-chunk pre-warm submits before the first codec window
+            # arrives. Those tokens are reserved slots, not codec data, and one
+            # bogus frame is shorter than the vocoder's lookahead window.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                chunk_seq=chunk_seq,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+                last_chunk=False,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=None,
+                segment_text="",
+                duplex_turn_id=None,
+                duplex_epoch=None,
+                segment_end=False,
+                turn_end=False,
+                has_payload=False,
+            )
         tokens = _codec_tensor(audio, segment)
-        if last_chunk and int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
+        if declared_numel is not None and int(declared_numel) == 0:
             # The generation scheduler reserves one placeholder token for an
             # empty terminal chunk. The producer's explicit length is the
             # authority, so do not decode that placeholder as codec data.
@@ -407,7 +433,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         compute_items = [item for item in items if item.tokens.numel() > 0]
-        invalid_empty = [item.request_id for item in items if not item.last_chunk and item.tokens.numel() == 0]
+        invalid_empty = [
+            item.request_id for item in items if item.has_payload and not item.last_chunk and item.tokens.numel() == 0
+        ]
         if invalid_empty:
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
