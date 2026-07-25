@@ -393,24 +393,3 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
-
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        *args: Any,
-        **kwargs: Any,
-    ):
-        # Omni-specific: keep per-request additional_information (including
-        # ``request_id``) refreshed for stages without a preprocess hook
-        # (e.g. code2wav). The GPU omni runner performs this refresh inside
-        # ``_preprocess`` (gated by ``has_preprocess`` /
-        # ``enable_update_additional_information``), but the vllm-ascend
-        # ``execute_model`` path does not invoke that ``_preprocess`` override,
-        # so ``model_intermediate_buffer`` would never receive ``request_id`` and
-        # the vocoder stage would raise ``missing_request_id``. Mirror the GPU
-        # gate here so the buffer is populated before the model forward.
-        if hasattr(self.model, "has_preprocess") or hasattr(
-            self.model, "enable_update_additional_information"
-        ):
-            self._update_additional_information(scheduler_output)
-        return super().execute_model(scheduler_output, *args, **kwargs)
