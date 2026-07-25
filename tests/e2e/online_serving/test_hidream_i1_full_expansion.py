@@ -14,13 +14,24 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "HiDream-ai/HiDream-I1-Full"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+HSDP_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+HSDP_ARGS = [
+    "--auxiliary-text-encoder",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "--use-hsdp",
+    "--hsdp-shard-size",
+    "2",
+    "--tensor-parallel-size",
+    "1",
+]
 
 
 def _get_hidream_i1_image_feature_cases(model: str):
@@ -61,6 +72,41 @@ def test_hidream_i1_image(
         "extra_body": {
             "height": 512,
             "width": 512,
+            "num_inference_steps": 2,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "seed": 42,
+        },
+    }
+
+    openai_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=HSDP_ARGS,
+            ),
+            id="parallel_hsdp_2",
+            marks=HSDP_2_FEATURE_MARKS,
+        ),
+    ],
+    indirect=True,
+)
+def test_hidream_i1_image_hsdp(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    """Validate HiDream-I1-Full online serving with HSDP across 2 GPUs."""
+
+    messages = dummy_messages_from_mix_data(content_text=PROMPT)
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "extra_body": {
             "num_inference_steps": 2,
             "negative_prompt": NEGATIVE_PROMPT,
             "seed": 42,

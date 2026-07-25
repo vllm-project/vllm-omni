@@ -672,6 +672,14 @@ class HiDreamBlock(nn.Module):
 
 
 class HiDreamImageTransformer2DModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["double_stream_blocks", "single_stream_blocks"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return ("double_stream_blocks" in name or "single_stream_blocks" in name) and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig = None,
