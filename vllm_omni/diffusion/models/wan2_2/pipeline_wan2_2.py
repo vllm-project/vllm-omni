@@ -14,7 +14,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -325,7 +326,15 @@ class Wan22Pipeline(
         )
 
         # Set up weights sources for transformer(s)
-        self.weights_sources = []
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            )
+        ]
         if load_transformer:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
@@ -366,14 +375,16 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
         )
-        self.text_encoder = from_pretrained_with_prefetch(
-            UMT5EncoderModel.from_pretrained,
+        text_encoder_config = from_pretrained_with_prefetch(
+            AutoConfig.from_pretrained,
             model,
             subfolder="text_encoder",
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+        )
+        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+            device=self.device, dtype=dtype
+        )
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
             model,
@@ -886,7 +897,7 @@ class Wan22Pipeline(
         ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device))[0]
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
@@ -912,7 +923,7 @@ class Wan22Pipeline(
             )
             ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
             seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
-            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
+            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device))[0]
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
             negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
             negative_prompt_embeds = torch.stack(

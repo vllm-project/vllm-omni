@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
-from transformers import T5Config
+from transformers import T5Config, UMT5Config
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
 from vllm_omni.diffusion.models.t5_encoder.t5_encoder import (
@@ -33,6 +33,11 @@ SMALL_T5_CONFIG = dict(
 @pytest.fixture(scope="module")
 def t5_config() -> T5Config:
     return T5Config(**SMALL_T5_CONFIG)
+
+
+@pytest.fixture(scope="module")
+def umt5_config() -> UMT5Config:
+    return UMT5Config(**SMALL_T5_CONFIG)
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -93,6 +98,67 @@ class TestRelativePositionBiasTPSlicing:
 
         full_bias = torch.cat(biases, dim=1)
         assert full_bias.shape == (1, t5_config.num_heads, seq_len, seq_len)
+
+
+class TestRelativePositionBiasReuse:
+    def test_t5_reuses_first_layer_position_bias(self, t5_config):
+        model = T5EncoderModel(t5_config)
+
+        attentions = [block.layer[0].SelfAttention for block in model.encoder.block]
+        assert attentions[0].has_relative_attention_bias
+        assert attentions[0].reuse_position_bias
+        assert not attentions[1].has_relative_attention_bias
+        assert attentions[1].reuse_position_bias
+
+    def test_umt5_computes_position_bias_per_layer(self, umt5_config):
+        model = T5EncoderModel(umt5_config)
+
+        attentions = [block.layer[0].SelfAttention for block in model.encoder.block]
+        assert all(attention.has_relative_attention_bias for attention in attentions)
+        assert all(not attention.reuse_position_bias for attention in attentions)
+
+    @pytest.mark.parametrize(
+        ("config_cls", "expected_compute_calls"),
+        [(T5Config, 0), (UMT5Config, 1)],
+    )
+    def test_forward_respects_position_bias_reuse(
+        self,
+        config_cls,
+        expected_compute_calls,
+        mocker,
+    ):
+        config = config_cls(**{**SMALL_T5_CONFIG, "num_layers": 1})
+        attention = T5SelfAttention(config, has_relative_attention_bias=True)
+        seq_len = 4
+        local_heads = config.num_heads // 2
+        hidden_states = torch.randn(1, seq_len, config.d_model)
+        supplied_bias = torch.randn(1, local_heads, seq_len, seq_len)
+        computed_bias = torch.randn_like(supplied_bias)
+
+        mocker.patch.object(
+            attention.qkv_proj,
+            "forward",
+            return_value=(
+                torch.randn(1, seq_len, 3 * local_heads * config.d_kv),
+                None,
+            ),
+        )
+        mocker.patch.object(
+            attention.o,
+            "forward",
+            side_effect=lambda value: value,
+        )
+        compute_bias = mocker.patch.object(
+            attention,
+            "compute_bias",
+            return_value=computed_bias,
+        )
+
+        _, returned_bias = attention(hidden_states, position_bias=supplied_bias)
+
+        assert compute_bias.call_count == expected_compute_calls
+        expected_bias = computed_bias if expected_compute_calls else supplied_bias
+        assert returned_bias is expected_bias
 
 
 class TestT5EncoderModelWeightLoading:
