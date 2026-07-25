@@ -157,7 +157,7 @@ class MembershipController:
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
             raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
-        pool.add_client(input_addr, client)
+        pool.add_client(input_addr, client, replica_id=replica_id)
         logger.info(
             "[MembershipController] attached remote replica stage=%d replica=%d addr=%s",
             stage_id,

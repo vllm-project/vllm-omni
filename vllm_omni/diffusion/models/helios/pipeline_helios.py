@@ -1561,11 +1561,12 @@ class HeliosPipeline(
 
         device = generator.device if generator is not None else self.device
 
-        cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
-        cov += torch.eye(block_size) * 1e-8
-        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
-
-        L = torch.linalg.cholesky(cov).to(device)
+        # Allocate directly on the execution device in float32 to use the device solver
+        # and avoid fp16/bf16 Cholesky on the covariance matrix.
+        eye = torch.eye(block_size, device=device, dtype=torch.float32)
+        cov = eye * (1 + gamma) - torch.ones(block_size, block_size, device=device, dtype=torch.float32) * gamma
+        cov += eye * 1e-8
+        L = torch.linalg.cholesky(cov)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator, device=device)
         noise = z @ L.T

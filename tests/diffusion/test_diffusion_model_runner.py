@@ -98,6 +98,38 @@ class _ChunkStepPipeline:
         return output
 
 
+class _FinalOnlyStepPipeline:
+    device = torch.device("cpu")
+    supports_step_execution = True
+
+    def prepare_encode(self, state):
+        state.prompt_embeds = torch.zeros(1, 1, 1)
+        state.latents = torch.zeros(1, 1)
+        state.timesteps = torch.tensor([1.0])
+        state.step_index = 0
+        return state
+
+    def denoise_step(self, input_batch, states):
+        del states
+        return torch.ones_like(input_batch.latents)
+
+    def step_scheduler(self, state, noise_pred):
+        state.latents = noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state):
+        return DiffusionOutput(output=state.latents.clone())
+
+
+class _CompileTrackingModel:
+    def __init__(self):
+        self.compile_calls = []
+
+    def compile(self, *args, **kwargs):
+        self.compile_calls.append((args, kwargs))
+        return self
+
+
 def _make_request():
     sampling_params = SimpleNamespace(
         generator=None,
@@ -154,10 +186,20 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     return runner
 
 
-def _make_compile_runner(*, use_hsdp: bool):
+def _make_compile_runner(
+    model=None,
+    *,
+    compile_granularity: str = "regional",
+    compile_dynamic: bool = True,
+    use_hsdp: bool = False,
+):
     runner = object.__new__(DiffusionModelRunner)
-    runner.pipeline = SimpleNamespace(transformer=SimpleNamespace())
-    runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
+    runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
+    runner.od_config = SimpleNamespace(
+        diffusion_compile_granularity=compile_granularity,
+        diffusion_compile_dynamic=compile_dynamic,
+        parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+    )
     return runner
 
 
@@ -183,6 +225,65 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
             {"dynamic": True},
         )
     ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_dynamic=False)
+    compiled_model = object()
+    regional_calls = []
+
+    def _regionally_compile(target, **kwargs):
+        regional_calls.append((target, kwargs))
+        return compiled_model
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [(model, {"dynamic": False})]
+    assert model.compile_calls == []
+    assert runner.pipeline.transformer is compiled_model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_full_granularity(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False)
+    regional_calls = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "regionally_compile",
+        lambda *args, **kwargs: regional_calls.append((args, kwargs)),
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False})]
+    assert regional_calls == []
+    assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model)
+
+    def _regionally_compile(*args, **kwargs):
+        raise RuntimeError("compile setup failed")
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert runner.pipeline.transformer is model
+    assert "failed before activation" in caplog.text
+    assert "lazy compilation errors" in caplog.text
 
 
 @pytest.mark.core_model
@@ -226,6 +327,35 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     fourth = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert fourth.get_request_output("req").result == chunks[1]
     assert fourth.get_request_output("req").finished is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
+    """Step streaming still returns a final output when no chunk boundaries exist."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.streaming_output = True
+    runner.od_config.step_execution = True
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 1
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
+
+    assert output.finished is True
+    assert output.result is not None
+    assert torch.equal(output.result.output, torch.ones(1, 1))
 
 
 @pytest.mark.core_model

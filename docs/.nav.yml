@@ -56,6 +56,7 @@ nav:
     - Diffusion Features:
       - Overview: user_guide/diffusion_features.md
       - Feature Compatibility: user_guide/feature_compatibility.md
+      - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md

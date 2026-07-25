@@ -48,6 +48,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.utils import coerce_positive_int_scalar
 
 logger = init_logger(__name__)
 
@@ -524,16 +525,8 @@ def _add_image_edit_extra_body_to_form(form: aiohttp.FormData, extra_body: dict[
             form.add_field(key, str(value))
 
 
-def _coerce_positive_int(value: Any) -> int | None:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None
-    return coerced if coerced > 0 else None
-
-
 def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
-    top_level_tokens = _coerce_positive_int(metrics.get(defs.NUM_TOKENS_OUT))
+    top_level_tokens = coerce_positive_int_scalar(metrics.get(defs.NUM_TOKENS_OUT))
     if top_level_tokens is not None:
         return top_level_tokens
 
@@ -545,7 +538,7 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     for info in stage_snapshot.values():
         if not isinstance(info, dict):
             continue
-        num_tokens_out = _coerce_positive_int(info.get(defs.NUM_TOKENS_OUT))
+        num_tokens_out = coerce_positive_int_scalar(info.get(defs.NUM_TOKENS_OUT))
         if num_tokens_out is None:
             continue
         if info.get("final_output_type") == "text" or info.get("output_unit_type") == "token":
@@ -556,9 +549,9 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
 
 def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
     """Apply OpenAI ``usage`` fields to the benchmark output."""
-    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+    if (pt := coerce_positive_int_scalar(usage.get("prompt_tokens"))) is not None:
         output.prompt_len = pt
-    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    completion_tokens = coerce_positive_int_scalar(usage.get("completion_tokens"))
     if completion_tokens is not None:
         output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
     return completion_tokens
@@ -901,12 +894,22 @@ async def async_request_openai_chat_omni_completions(
                     audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        frame_width = sample_width * channels
-                        if frame_width > 0:
-                            audio_frames = len(wav_pcm_buffer) // frame_width
-                            audio_duration_sec = audio_frames / frame_rate
+                        audio_frames = defs.compute_audio_frames(
+                            len(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            channels=channels,
+                        )
+                        if audio_frames > 0 and frame_rate > 0:
+                            audio_duration_sec = audio_frames / float(frame_rate)
                         else:
-                            logger.warning("Audio frame width is zero")
+                            logger.warning(
+                                "Unable to derive audio frames/duration from wav pcm "
+                                "(pcm_nbytes=%d, sample_width=%d, channels=%d, sample_rate=%d)",
+                                len(wav_pcm_buffer),
+                                sample_width,
+                                channels,
+                                frame_rate,
+                            )
                     elif audio_bytes_buffer:
                         try:
                             from vllm.multimodal.audio import get_audio_duration
@@ -925,10 +928,8 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        if audio_duration > 0:
-                            output.audio_rtf = audio_generate_time / output.audio_duration
-                        else:
-                            output.audio_rtf = 0
+                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
@@ -1161,7 +1162,7 @@ async def async_request_openai_audio_speech(
 
     # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
     sample_rate, channels = defs.stream_pcm_format_from_env()
-    sample_width = 2  # 16-bit = 2 bytes
+    sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
     st = time.perf_counter()
     output.start_time = st
@@ -1190,13 +1191,17 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
 
-                total_samples = total_pcm_bytes // (sample_width * channels)
-                output.audio_duration = total_samples / sample_rate
+                total_samples = defs.compute_audio_frames(
+                    total_pcm_bytes,
+                    sample_width=sample_width,
+                    channels=channels,
+                )
                 output.audio_frames = total_samples
-                if output.audio_duration > 0:
-                    output.audio_rtf = output.latency / output.audio_duration
-                else:
-                    output.audio_rtf = 0
+                output.audio_duration = (
+                    float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
+                )
+                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
                 continuity = compute_continuity_stats(
