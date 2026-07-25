@@ -46,6 +46,11 @@ _DIFFUSION_MODELS = {
         "pipeline_glm_image",
         "GlmImagePipeline",
     ),
+    "InternVLUPipeline": (
+        "internvlu",
+        "pipeline_internvlu",
+        "InternVLUPipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
@@ -513,6 +518,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
+    "InternVLUPipeline": "get_internvlu_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",

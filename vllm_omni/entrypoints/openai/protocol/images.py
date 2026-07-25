@@ -183,12 +183,12 @@ class ImageGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
-    output_format: str = Field(None, description="The output format of the image generation")
-    size: str = Field(None, description="The size of the image generated")
+    output_format: str | None = Field(None, description="The output format of the image generation")
+    size: str | None = Field(None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "
-        "Only present for image editing (IT2I) with CoT-enabled models.",
+        "Only present for CoT-enabled models (text-then-image generation or IT2I editing).",
     )
 
     def stream_response(self) -> StreamingResponse:

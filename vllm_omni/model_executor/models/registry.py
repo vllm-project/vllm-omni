@@ -204,6 +204,11 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    "InternVLUChatModel": (
+        "internvlu",
+        "internvlu",
+        "InternVLUChatModel",
+    ),
     ## glm_tts
     "GLMTTSForConditionalGeneration": (
         "glm_tts",

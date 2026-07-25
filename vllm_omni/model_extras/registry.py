@@ -34,6 +34,16 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.internvlu import (
+    INTERNVLU_EXTRA_BODY_PARAMS,
+    INTERNVLU_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.internvlu import (
+    build_image_to_image_prompt as build_internvlu_image_to_image_prompt,
+)
+from vllm_omni.model_extras.internvlu import (
+    build_text_to_image_prompt as build_internvlu_text_to_image_prompt,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
@@ -173,6 +183,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "LingBotVideoPipeline": {
         "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "InternVLUPipeline": {
+        "extra_body_params": INTERNVLU_EXTRA_BODY_PARAMS,
+        "extra_output_params": INTERNVLU_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_internvlu_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_internvlu_image_to_image_prompt,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

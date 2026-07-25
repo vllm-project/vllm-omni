@@ -1,0 +1,30 @@
+# InternVL-U think-mode (text-then-image) deploy.
+#
+# Inherits internvlu_chat.yaml.  In this deployment Stage 0 first decodes a
+# chain-of-thought description of the target image and then enters image
+# generation through an actual <img> token, matching the reference
+# implementation's CoT generation mode (Stage 1 also switches to the weaker
+# 3.5/1.5 guidance defaults automatically).
+#
+# ``think`` enables text-then-image generation for image requests. The
+# processor defers the trailing <img>, while CFG companions keep their
+# explicit direct-image prompts. For rows continuing to Stage 1, the sampler
+# replaces an early EOS with <img>, or forces <img> at the 200-token CoT
+# limit, then forces EOS after the next forward step.
+#
+# max_tokens: 202 reserves 200 CoT tokens plus <img> and EOS. If a smaller
+# budget ends generation before <img> -> EOS completes, the Stage 1 bridge
+# reports an error. Requests explicitly routed as text-only finalize at Stage
+# 0 and are not subject to the CoT limit.
+# Select this topology via:
+#   vllm serve InternVL-U/InternVL-U --omni \
+#       --deploy-config vllm_omni/deploy/internvlu_chat_think.yaml
+
+base_config: internvlu_chat.yaml
+
+stages:
+  - stage_id: 0
+    mm_processor_kwargs:
+      think: true
+    default_sampling_params:
+      max_tokens: 202

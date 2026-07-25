@@ -2138,3 +2138,48 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
         assert captured_prompt["prompt"].count("<img>") == 2, (
             f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
         )
+
+
+@pytest.fixture
+def multistage_cot_generations_client():
+    """Multi-stage /v1/images/generations client whose chat handler bridges CoT text."""
+
+    class _StubChatHandler:
+        async def generate_diffusion_images(self, **kwargs):
+            del kwargs
+            return (
+                [Image.new("RGB", (8, 8), color="blue")],
+                None,
+                None,
+                "a bridged chain-of-thought description",
+            )
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.engine_client = SimpleNamespace()
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
+    app.state.openai_serving_chat = _StubChatHandler()
+    app.state.args = Namespace(max_generated_image_size=1048576)
+    return TestClient(app)
+
+
+def test_multistage_generations_returns_cot_output(multistage_cot_generations_client):
+    """CoT text bridged by the AR stage must surface as top-level cot_output.
+
+    Regression: the multi-stage /v1/images/generations branch used to discard
+    the fourth element of generate_diffusion_images() while /v1/images/edits
+    preserved it (think-mode e2e failed with cot_output=None).
+    """
+    response = multistage_cot_generations_client.post(
+        "/v1/images/generations",
+        json={"prompt": "A cute cat", "response_format": "b64_json"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cot_output"] == "a bridged chain-of-thought description"
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["b64_json"]

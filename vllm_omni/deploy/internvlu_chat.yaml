@@ -1,0 +1,29 @@
+# InternVL-U deploy: native VLM (stage 0) + diffusion decoder (stage 1).
+#
+# A generation request expands into three Stage-0 branches (conditional,
+# partial, and unconditional).  Both stages share GPU 0 by default, so cap the
+# VLM's vLLM reservation at the same conservative value used by BAGEL's
+# verified same-GPU AR-to-DiT deployment.  This leaves memory for the diffusion
+# weights and denoising activations instead of letting Stage 0 reserve nearly
+# the entire device.
+pipeline: internvlu_chat
+async_chunk: false
+
+trust_remote_code: false
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 3
+    gpu_memory_utilization: 0.45
+    # The model-local forced-EOS sampler tracks per-step token metadata; the
+    # verified same-GPU deployment keeps Stage 0 eager.  Text-then-image
+    # (think mode) is off here; internvlu_chat_think.yaml layers the static
+    # think configuration on top.
+    enforce_eager: true
+
+  - stage_id: 1
+    devices: "0"
+    enforce_eager: true
+    diffusion_attention_backend: TORCH_SDPA

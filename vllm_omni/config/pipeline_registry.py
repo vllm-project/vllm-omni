@@ -56,6 +56,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
 )
 from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_PIPELINE
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
+from vllm_omni.model_executor.models.internvlu.pipeline import INTERNVLU_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
@@ -150,6 +151,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
     "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
+    "internvlu_chat": INTERNVLU_PIPELINE,
 }
 
 

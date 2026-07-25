@@ -48,6 +48,7 @@ EXCLUDED_MODELS = [
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",
+    "InternVLUPipeline",
     "LongCatImageEditPipeline",
     "StableDiffusion3Pipeline",
     "FluxKontextPipeline",

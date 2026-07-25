@@ -29,6 +29,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "InternVisionConfig": "vllm_omni.transformers_utils.configs.internvlu",
+    "InternVLUChatConfig": "vllm_omni.transformers_utils.configs.internvlu",
 }
 
 __all__ = [
@@ -51,6 +53,8 @@ __all__ = [
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
+    "InternVisionConfig",
+    "InternVLUChatConfig",
 ]
 
 
@@ -73,6 +77,7 @@ from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # no
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import internvlu as _internvlu  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
