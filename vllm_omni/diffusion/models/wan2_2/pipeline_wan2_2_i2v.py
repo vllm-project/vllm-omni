@@ -15,7 +15,7 @@ import torch
 import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer, CLIPImageProcessor, CLIPVisionModel
+from transformers import AutoConfig, AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -30,7 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel, text_encoder_tp_context
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
@@ -182,14 +182,17 @@ class Wan22I2VPipeline(
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="text_encoder",
-                revision=None,
-                prefix="text_encoder.",
-                fall_back_to_pt=True,
-            ),
         ]
+        if od_config.text_encoder_tensor_parallel_size != 1:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="text_encoder",
+                    revision=None,
+                    prefix="text_encoder.",
+                    fall_back_to_pt=True,
+                )
+            )
 
         # Load model_index.json to detect available components
         try:
@@ -239,9 +242,21 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
-        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
-            device=self.device, dtype=dtype
-        )
+        if od_config.text_encoder_tensor_parallel_size == 1:
+            self.text_encoder = from_pretrained_with_prefetch(
+                UMT5EncoderModel.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            ).to(self.device)
+        else:
+            with text_encoder_tp_context(od_config.text_encoder_tensor_parallel_size):
+                self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+                    device=self.device, dtype=dtype
+                )
+            self.text_encoder.tensor_parallel_size = od_config.text_encoder_tensor_parallel_size
 
         if self.has_image_encoder:
             self.image_processor = from_pretrained_with_prefetch(

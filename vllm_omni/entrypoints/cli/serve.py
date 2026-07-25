@@ -742,6 +742,14 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
         )
+        omni_config_group.add_argument(
+            "--text-encoder-tensor-parallel-size",
+            type=int,
+            default=None,
+            help="Tensor-parallel degree for supported diffusion text encoders. "
+            "Defaults to --tensor-parallel-size. Set to 1 to replicate the text encoder "
+            "while keeping the diffusion transformer tensor-parallel.",
+        )
 
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.

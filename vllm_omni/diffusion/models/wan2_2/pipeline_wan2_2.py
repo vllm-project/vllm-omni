@@ -14,7 +14,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
@@ -31,7 +31,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel, text_encoder_tp_context
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -326,15 +326,17 @@ class Wan22Pipeline(
         )
 
         # Set up weights sources for transformer(s)
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="text_encoder",
-                revision=None,
-                prefix="text_encoder.",
-                fall_back_to_pt=True,
+        self.weights_sources = []
+        if od_config.text_encoder_tensor_parallel_size != 1:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="text_encoder",
+                    revision=None,
+                    prefix="text_encoder.",
+                    fall_back_to_pt=True,
+                )
             )
-        ]
         if load_transformer:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
@@ -382,9 +384,21 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
         )
-        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
-            device=self.device, dtype=dtype
-        )
+        if od_config.text_encoder_tensor_parallel_size == 1:
+            self.text_encoder = from_pretrained_with_prefetch(
+                UMT5EncoderModel.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=component_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            ).to(self.device)
+        else:
+            with text_encoder_tp_context(od_config.text_encoder_tensor_parallel_size):
+                self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+                    device=self.device, dtype=dtype
+                )
+            self.text_encoder.tensor_parallel_size = od_config.text_encoder_tensor_parallel_size
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
             model,

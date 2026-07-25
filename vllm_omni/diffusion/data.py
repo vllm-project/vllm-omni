@@ -595,6 +595,9 @@ class OmniDiffusionConfig:
     # Cache strategy (legacy)
     cache_strategy: str = "none"
     parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
+    # Component-local TP for supported text encoders. ``None`` inherits the
+    # diffusion stage TP. A value greater than 1 uses a compatible initialized parallel group.
+    text_encoder_tensor_parallel_size: int | None = None
 
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
@@ -888,6 +891,12 @@ class OmniDiffusionConfig:
             self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
             self.parallel_config = DiffusionParallelConfig()
+
+        stage_tp = self.parallel_config.tensor_parallel_size
+        if self.text_encoder_tensor_parallel_size is None:
+            self.text_encoder_tensor_parallel_size = stage_tp
+        if self.text_encoder_tensor_parallel_size < 1:
+            raise ValueError("text_encoder_tensor_parallel_size must be positive")
 
         if self.num_gpus is None:
             if self.parallel_config is not None:
