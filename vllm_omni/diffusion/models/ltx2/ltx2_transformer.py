@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available

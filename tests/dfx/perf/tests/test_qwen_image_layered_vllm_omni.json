@@ -1,49 +1,61 @@
 [
-    {
-        "test_name": "test_qwen_image_layered_single_device",
-        "description": "Single-device baseline",
-        "server_type": "vllm-omni",
-        "server_params": {
-            "model": "Qwen/Qwen-Image-Layered",
-            "serve_args": {
-                "enable-diffusion-pipeline-profiler": true
-            }
-        },
-        "benchmark_params": [
-            {
-                "name": "640x640_steps20_i2i",
-                "dataset": "random",
-                "task": "i2i",
-                "width": 640,
-                "height": 640,
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "baseline": {
-                    "throughput_qps": 0.0703,
-                    "latency_mean": 14.208,
-                    "peak_memory_mb_max": 60543.5,
-                    "peak_memory_mb_mean": 60543.5
-                }
-            },
-            {
-                "name": "1024x1024_steps35_i2i",
-                "dataset": "random",
-                "task": "i2i",
-                "width": 1024,
-                "height": 1024,
-                "num-inference-steps": 35,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "baseline": {
-                    "throughput_qps": 0.0417,
-                    "latency_mean": 23.914,
-                    "peak_memory_mb_max": 60543.5,
-                    "peak_memory_mb_mean": 60543.5
-                }
-            }
-        ]
-    }
+  {
+    "test_name": "test_qwen_image_layered_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device baseline",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-Layered",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "640x640_steps20_i2i",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 640,
+        "height": 640,
+        "num-inference-steps": 20,
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true,
+        "baseline": {
+          "throughput_qps": 0.0703,
+          "latency_mean": 14.208,
+          "peak_memory_mb_max": 63225.1429,
+          "peak_memory_mb_mean": 63225.1429
+        }
+      },
+      {
+        "name": "1024x1024_steps35_i2i",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 35,
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true,
+        "baseline": {
+          "throughput_qps": 0.0417,
+          "latency_mean": 23.914,
+          "peak_memory_mb_max": 63225.1429,
+          "peak_memory_mb_mean": 63225.1429
+        }
+      }
+    ]
+  }
 ]

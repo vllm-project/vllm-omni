@@ -1,0 +1,13 @@
+steps:
+  - group: ":card_index_dividers: TTS Model Test"
+    key: ready-tts-group
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
+        mirror_hardwares: a2b3_npu_1
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'

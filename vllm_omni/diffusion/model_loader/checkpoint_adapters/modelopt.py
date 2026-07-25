@@ -11,7 +11,12 @@ from vllm.model_executor.utils import get_packed_modules_mapping
 
 logger = init_logger(__name__)
 
-MODEL_OPT_SCALE_SUFFIXES = (".input_scale", ".weight_scale", ".weight_scale_2", ".weight_scale_inv")
+MODEL_OPT_SCALE_SUFFIXES = (
+    ".input_scale",
+    ".weight_scale",
+    ".weight_scale_2",
+    ".weight_scale_inv",
+)
 DEFAULT_PACKED_MODULES_MAPPING = {
     "to_qkv": ("to_q", "to_k", "to_v"),
     "add_kv_proj": ("add_q_proj", "add_k_proj", "add_v_proj"),
@@ -122,6 +127,7 @@ class ModelOptFp8CheckpointAdapter:
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
+                # Preserve shard names so downstream packed-weight loaders can route them.
                 return candidate, name
         return None, name
 
@@ -178,6 +184,7 @@ class ModelOptFp8CheckpointAdapter:
     def _handle_scale_tensor(
         self,
         name: str,
+        output_name: str,
         tensor: torch.Tensor,
         target_name: str | None,
         state: _AdaptState,
@@ -186,7 +193,7 @@ class ModelOptFp8CheckpointAdapter:
         if target_name is None:
             state.skipped_scales += 1
         else:
-            yield name, tensor
+            yield output_name, tensor
         yield from self._flush_pending_weights(name, state)
 
     def _target_dtype_for_dequantization(
@@ -249,7 +256,7 @@ class ModelOptFp8CheckpointAdapter:
         for name, tensor in weights:
             target_name, output_name = self._resolve_target_and_output_names(name)
             if self._is_scale(name):
-                yield from self._handle_scale_tensor(name, tensor, target_name, state)
+                yield from self._handle_scale_tensor(name, output_name, tensor, target_name, state)
                 continue
 
             target_dtype = self._target_dtype_for_dequantization(tensor, target_name)
@@ -264,6 +271,8 @@ class ModelOptFp8CheckpointAdapter:
 
 
 class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
+    _PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
+
     @staticmethod
     def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
         return (
@@ -272,6 +281,22 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
             and quant_config.get_name() == "modelopt_fp4"
             and bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
         )
+
+    def adapt(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        def validated_weights() -> Generator[tuple[str, torch.Tensor], None, None]:
+            for name, tensor in weights:
+                if name.endswith(self._PRE_QUANT_SCALE_SUFFIX):
+                    raise ValueError(
+                        f"ModelOpt NVFP4 checkpoint tensor {name!r} is unsupported: "
+                        "vLLM 0.25.0 does not consume pre_quant_scale. Export the checkpoint "
+                        "with pre-quant scales folded into the weights."
+                    )
+                yield name, tensor
+
+        yield from super().adapt(validated_weights())
 
 
 class ModelOptMixedPrecisionCheckpointAdapter(ModelOptFp8CheckpointAdapter):

@@ -21,7 +21,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig

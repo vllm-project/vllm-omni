@@ -122,7 +122,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/rocm/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

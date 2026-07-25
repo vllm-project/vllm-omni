@@ -158,6 +158,7 @@ async def test_async_omni_generate():
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
+            max_num_seqs=1,
         )
         after.callback(engine.shutdown)
 
@@ -183,6 +184,7 @@ async def test_async_omni_generate_with_logprobs():
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
+            max_num_seqs=1,
         )
         after.callback(engine.shutdown)
 
@@ -220,6 +222,7 @@ async def test_async_omni_generate_concurrent():
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
+            max_num_seqs=1,
         )
         after.callback(engine.shutdown)
 
