@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -2237,6 +2237,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
         )
 
+        # Harvest thinker text for audio.transcript even when "text" is filtered
+        # out of the response (e.g. modalities=["audio"]). Use reasoning-stripped
+        # content so thinking tokens are not exposed on the audio object.
+        audio_transcripts: dict[int, str] = {}
+        for omni_outputs in final_outputs:
+            if omni_outputs.final_output_type != "text":
+                continue
+            if omni_outputs.request_output is None:
+                text_body = self._get_diffusion_text_output(omni_outputs)
+                if text_body:
+                    audio_transcripts[0] = text_body
+                continue
+            for output in omni_outputs.request_output.outputs:
+                text = self._visible_content_for_transcript(
+                    output.text or "",
+                    request,
+                    reasoning_parser,
+                )
+                if text:
+                    audio_transcripts[output.index] = text
+
         for omni_outputs in final_outputs:
             choices_data = []
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
@@ -2280,7 +2301,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                choices_data = self._create_audio_choice(
+                    omni_outputs,
+                    role,
+                    request,
+                    stream=False,
+                    transcripts=audio_transcripts,
+                )
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2606,8 +2633,57 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
+    @staticmethod
+    def _visible_content_for_transcript(
+        raw_text: str,
+        request: ChatCompletionRequest,
+        reasoning_parser: ReasoningParser | None,
+    ) -> str:
+        """Return user-visible content suitable for audio.transcript.
+
+        When a reasoning parser is enabled, strip hidden thinking so transcript
+        never leaks reasoning tokens that chat content already filters out.
+        """
+        if not raw_text:
+            return ""
+        if reasoning_parser is None:
+            return raw_text
+        _, content = reasoning_parser.extract_reasoning(raw_text, request=request)
+        return content or ""
+
+    @staticmethod
+    def _resolve_audio_transcript(
+        transcripts: dict[int, str] | None,
+        index: int,
+        mm_output: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Best-effort spoken transcript for OpenAI ChatCompletionAudio.transcript.
+
+        Prefer thinker text accumulated for this choice index. Fall back to any
+        transcript-like field the stage attached on multimodal_output.
+        """
+        if transcripts:
+            text = transcripts.get(index)
+            if isinstance(text, str) and text:
+                return text
+        if isinstance(mm_output, Mapping):
+            for key in ("transcript", "text", "spoken_text"):
+                value = mm_output.get(key)
+                if isinstance(value, str) and value:
+                    return value
+                if isinstance(value, (list, tuple)):
+                    joined = "".join(str(item) for item in value if item is not None)
+                    if joined:
+                        return joined
+        return ""
+
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        stream: bool = False,
+        transcripts: dict[int, str] | None = None,
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
@@ -2669,15 +2745,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Set expiration time (e.g., 24 hours from now) as Unix timestamp
         expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
 
-        # Create OpenAIChatCompletionAudio object with all required fields
-        audio_obj = OpenAIChatCompletionAudio(
-            id=audio_id,
-            data=audio_base64,
-            expires_at=expires_at,
-            transcript="",  # Empty transcript if not available
-        )
-
         for output in final_res.outputs:
+            # Non-stream only: fill reasoning-stripped transcript (or mm fallback).
+            # Streaming keeps legacy delta.content=base64; OpenAI-style delta.audio
+            # is intentionally not added here (needs a separate streaming design).
+            transcript = "" if stream else self._resolve_audio_transcript(transcripts, output.index, mm_output)
+            completion_audio = OpenAIChatCompletionAudio(
+                id=audio_id,
+                data=audio_base64,
+                expires_at=expires_at,
+                transcript=transcript,
+            )
+
             if stream:
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=output.index,
@@ -2690,7 +2769,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 choice_data = ChatCompletionResponseChoice(
                     index=output.index,
-                    message=ChatMessage(role=role, audio=audio_obj),
+                    message=ChatMessage(role=role, audio=completion_audio),
                     logprobs=None,
                     finish_reason="stop",
                     stop_reason=output.stop_reason,
@@ -3621,13 +3700,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 audio_base64 = audio_response.audio_data
                 audio_id = f"audio-{uuid.uuid4().hex[:16]}"
                 expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+                # Prefer model-emitted transcript fields. Do not fall back to the
+                # user prompt: for diffusion TTA (AudioX / Stable Audio) the prompt
+                # is a sound description, not a speech transcript.
+                transcript = self._resolve_audio_transcript(
+                    None,
+                    0,
+                    multimodal_output if isinstance(multimodal_output, Mapping) else None,
+                )
                 message = ChatMessage(
                     role="assistant",
                     audio=OpenAIChatCompletionAudio(
                         id=audio_id,
                         data=audio_base64,
                         expires_at=expires_at,
-                        transcript="",
+                        transcript=transcript,
                     ),
                 )
             else:
