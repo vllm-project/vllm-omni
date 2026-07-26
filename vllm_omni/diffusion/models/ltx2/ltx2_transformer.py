@@ -1521,8 +1521,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 # Shard prompt embeds across sequence
                 "encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
                 "audio_encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Shard video timestep when provided as (B, seq_len)
+                # Keep per-token video/audio timestep embeddings aligned with
+                # their corresponding latent sequence shards. Official LTX
+                # multi-guidance supplies both tensors as (B, seq_len).
                 "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
+                "audio_timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
             },
             "rope": {
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),

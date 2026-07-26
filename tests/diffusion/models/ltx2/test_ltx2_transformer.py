@@ -51,3 +51,16 @@ def test_ltx_transformer_exposes_hsdp_shard_conditions_for_blocks():
             matched.append(name)
 
     assert matched == ["transformer_blocks.0", "transformer_blocks.1"]
+
+
+@pytest.mark.parametrize("rope_type", ["interleaved", "split"])
+def test_ltx_sp_plan_shards_video_and_audio_timesteps_together(rope_type):
+    root_plan = LTX2VideoTransformer3DModel._build_sp_plan(rope_type)[""]
+
+    video_timestep = root_plan["timestep"]
+    audio_timestep = root_plan["audio_timestep"]
+
+    assert video_timestep.split_dim == audio_timestep.split_dim == 1
+    assert video_timestep.expected_dims == audio_timestep.expected_dims == 2
+    assert not video_timestep.split_output
+    assert not audio_timestep.split_output
