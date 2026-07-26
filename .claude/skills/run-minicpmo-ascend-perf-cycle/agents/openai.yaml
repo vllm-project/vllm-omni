@@ -1,0 +1,4 @@
+interface:
+  display_name: "MiniCPM-o Ascend Performance Cycle"
+  short_description: "Run reproducible daily Ascend performance experiments."
+  default_prompt: "Use $run-minicpmo-ascend-perf-cycle to take one MiniCPM-o Ascend optimization hypothesis from baseline through validation, experiment recording, and an atomic commit."
