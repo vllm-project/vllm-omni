@@ -804,7 +804,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         return True
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
-        return -self.transformer(**kwargs, return_dict=False)[0]
+        return -self.transformer(**kwargs)[0]
 
     def diffuse(
         self,

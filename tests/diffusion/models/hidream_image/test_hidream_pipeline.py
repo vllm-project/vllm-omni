@@ -143,6 +143,31 @@ def test_forward_passes_separate_embeds_to_diffuse():
     assert diffuse_call["true_cfg_scale"] == 5.0
 
 
+def test_predict_noise_forwards_return_dict_once():
+    pipeline = _make_hidream_pipeline()
+    captured: dict[str, object] = {}
+
+    def _fake_transformer(**kwargs):
+        captured["kwargs"] = kwargs
+        return (torch.zeros(kwargs["hidden_states"].shape),)
+
+    pipeline.transformer = _fake_transformer  # type: ignore[assignment]
+
+    positive_kwargs = {
+        "hidden_states": torch.zeros((1, 4, 2, 2), dtype=torch.float32),
+        "timesteps": torch.tensor([1], dtype=torch.int64),
+        "encoder_hidden_states_t5": torch.zeros(1, 4, 8),
+        "encoder_hidden_states_llama3": torch.zeros(2, 1, 4, 8),
+        "pooled_embeds": torch.zeros(1, 16),
+        "return_dict": False,
+    }
+
+    noise_pred = pipeline.predict_noise(**positive_kwargs)
+
+    assert captured["kwargs"]["return_dict"] is False
+    assert noise_pred.shape == positive_kwargs["hidden_states"].shape
+
+
 def test_diffuse_calls_predict_noise_maybe_with_cfg_per_timestep():
     pipeline = _make_hidream_pipeline()
     pipeline.progress_bar = _noop_progress_bar
