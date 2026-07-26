@@ -13,10 +13,7 @@ capability boundary, and validation scope, see
 Install vLLM-Omni with the MiniCPM-o talker dependencies:
 
 ```bash
-pip install 'vllm-omni[minicpmo]'
-
-# From a source checkout:
-pip install -e '.[minicpmo]'
+pip install stepaudio2-minicpmo
 ```
 
 The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
