@@ -47,6 +47,10 @@ def _resource_peaks(path: Path) -> dict[str, int | None]:
     peak_aicore = None
     peak_hbm = None
     peak_host = None
+    first_hbm = None
+    last_hbm = None
+    first_host = None
+    last_host = None
     for sample in resources.get("samples", []):
         memory = sample.get("host_memory_bytes", {})
         total = memory.get("MemTotal")
@@ -54,6 +58,8 @@ def _resource_peaks(path: Path) -> dict[str, int | None]:
         if total is not None and available is not None:
             used = total - available
             peak_host = used if peak_host is None else max(peak_host, used)
+            first_host = used if first_host is None else first_host
+            last_host = used
 
         output = sample.get("npu_smi", {}).get("stdout", "")
         sample_hbm = 0
@@ -70,18 +76,23 @@ def _resource_peaks(path: Path) -> dict[str, int | None]:
             sample_hbm += values[-2]
         if saw_chip:
             peak_hbm = sample_hbm if peak_hbm is None else max(peak_hbm, sample_hbm)
+            first_hbm = sample_hbm if first_hbm is None else first_hbm
+            last_hbm = sample_hbm
     return {
         "aicore_percent": peak_aicore,
         "aggregate_hbm_mib": peak_hbm,
         "host_memory_bytes": peak_host,
+        "aggregate_hbm_delta_mib": last_hbm - first_hbm if first_hbm is not None else None,
+        "host_memory_delta_bytes": last_host - first_host if first_host is not None else None,
     }
 
 
 def _benchmark_table(result: dict[str, Any], root: Path) -> list[str]:
     rows = [
         "| Mode | C | OK/Fail | First text p50/p95 (s) | First audio p50/p95 (s) | "
-        "E2E p50/p95 (s) | Req/s | Audio s/s | Peak AI Core | Peak HBM MiB | Peak host GiB |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "E2E p50/p95 (s) | Req/s | Audio s/s | Wall (s) | Peak AI Core | Peak HBM MiB | "
+        "HBM delta MiB | Peak/delta host GiB |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for config in result.get("configurations", []):
         summary = config.get("summary", {})
@@ -91,6 +102,8 @@ def _benchmark_table(result: dict[str, Any], root: Path) -> list[str]:
         peaks = _resource_peaks(resource_path)
         host = peaks["host_memory_bytes"]
         host_gib = host / (1024**3) if host is not None else None
+        host_delta = peaks["host_memory_delta_bytes"]
+        host_delta_gib = host_delta / (1024**3) if host_delta is not None else None
         rows.append(
             "| "
             + " | ".join(
@@ -103,9 +116,11 @@ def _benchmark_table(result: dict[str, Any], root: Path) -> list[str]:
                     _percentile_pair(summary, "e2e_s"),
                     _format(summary.get("request_throughput_per_s")),
                     _format(summary.get("audio_seconds_throughput")),
+                    _format(summary.get("wall_time_s")),
                     _format(peaks["aicore_percent"], 0),
                     _format(peaks["aggregate_hbm_mib"], 0),
-                    _format(host_gib),
+                    _format(peaks["aggregate_hbm_delta_mib"], 0),
+                    f"{_format(host_gib)}/{_format(host_delta_gib)}",
                 ]
             )
             + " |"

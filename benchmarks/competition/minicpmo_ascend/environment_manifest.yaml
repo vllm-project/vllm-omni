@@ -59,6 +59,6 @@ local_proxy:
   benchmark_requests_per_configuration: 20
   stability_mode: text_audio
   stability_concurrency: 4
-  stability_requests: 20
+  stability_requests: 100
   percentile_statistics: [p50, p95, p99]
   note: Local proxy values are not official scoring definitions.

@@ -131,6 +131,8 @@ def test_resource_peaks_aggregate_single_card_chips(tmp_path: Path) -> None:
         "aicore_percent": 81,
         "aggregate_hbm_mib": 25000,
         "host_memory_bytes": 600,
+        "aggregate_hbm_delta_mib": 0,
+        "host_memory_delta_bytes": 0,
     }
 
 
