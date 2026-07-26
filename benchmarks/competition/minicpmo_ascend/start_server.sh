@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MODEL="${MODEL:-openbmb/MiniCPM-o-4_5}"
-DEPLOY_CONFIG="${DEPLOY_CONFIG:-${ROOT_DIR}/vllm_omni/deploy/minicpmo_4_5_ascend_2npu.yaml}"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-${ROOT_DIR}/vllm_omni/deploy/minicpmo_4_5_ascend_910c_1card.yaml}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8099}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/artifacts/minicpmo_ascend/server}"

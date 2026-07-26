@@ -252,6 +252,7 @@ outputs/
 results/
 generated/
 output_*/
+/artifacts/minicpmo_ascend/
 
 # Configuration overrides
 configs/local.yaml

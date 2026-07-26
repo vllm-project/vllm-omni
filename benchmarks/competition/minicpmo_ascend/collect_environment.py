@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,57 @@ def _git_snapshot() -> dict[str, Any]:
     }
 
 
+def _npu_inventory() -> dict[str, Any]:
+    npu_smi = shutil.which("npu-smi")
+    if npu_smi is None:
+        return {"npu_smi_path": None, "error": "npu-smi not found"}
+
+    commands = {
+        "info": [npu_smi, "info"],
+        "list": [npu_smi, "info", "-l"],
+        "mapping": [npu_smi, "info", "-m"],
+    }
+    raw = {name: _run(command) for name, command in commands.items()}
+    list_output = raw["list"].get("stdout", "")
+    mapping_output = raw["mapping"].get("stdout", "")
+    total_match = re.search(r"Total Count\s*:\s*(\d+)", list_output)
+    cards = []
+    current: dict[str, int] | None = None
+    for line in list_output.splitlines():
+        npu_match = re.search(r"NPU ID\s*:\s*(\d+)", line)
+        if npu_match:
+            current = {"npu_id": int(npu_match.group(1))}
+            cards.append(current)
+            continue
+        chip_match = re.search(r"Chip Count\s*:\s*(\d+)", line)
+        if chip_match and current is not None:
+            current["chip_count"] = int(chip_match.group(1))
+
+    chips = []
+    for line in mapping_output.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        if not fields[2].isdigit():
+            continue
+        chips.append(
+            {
+                "npu_id": int(fields[0]),
+                "chip_id": int(fields[1]),
+                "logical_id": int(fields[2]),
+                "physical_id": int(fields[3]) if fields[3].isdigit() else None,
+                "name": fields[4],
+            }
+        )
+    return {
+        "npu_smi_path": npu_smi,
+        "physical_card_count": int(total_match.group(1)) if total_match else None,
+        "cards": cards,
+        "logical_chips": chips,
+        "raw": raw,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -126,10 +178,7 @@ def main() -> None:
         },
         "packages": _package_versions(),
         "git": _git_snapshot(),
-        "npu": {
-            "npu_smi_path": shutil.which("npu-smi"),
-            "info": _run(["npu-smi", "info"]) if shutil.which("npu-smi") else {"error": "npu-smi not found"},
-        },
+        "npu": _npu_inventory(),
         "cann": {
             "ASCEND_HOME_PATH": os.environ.get("ASCEND_HOME_PATH"),
             "ASCEND_TOOLKIT_HOME": os.environ.get("ASCEND_TOOLKIT_HOME"),

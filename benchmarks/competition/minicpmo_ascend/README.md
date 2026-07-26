@@ -20,8 +20,16 @@ actual machine separately:
 ```
 
 The collector records the Git SHA and dirty diff, package versions, CANN
-version files, `npu-smi info`, and checksums of supplied manifests/artifacts.
-It deliberately does not hash a multi-gigabyte model tree implicitly.
+version files, physical-card and logical-chip inventory from `npu-smi`, and
+checksums of supplied manifests/artifacts. It deliberately does not hash a
+multi-gigabyte model tree implicitly. When the model directory has no revision
+metadata, create a relative-path manifest explicitly:
+
+```bash
+cd /path/to/MiniCPM-o-4_5
+find . -type f -print0 | sort -z | xargs -0 sha256sum \
+  > /path/to/model-sha256.txt
+```
 
 ## 2. Start the server
 
@@ -31,8 +39,11 @@ MODEL_REVISION=<fixed-revision> \
 bash benchmarks/competition/minicpmo_ascend/start_server.sh
 ```
 
-The default deployment is `vllm_omni/deploy/minicpmo_4_5_ascend_2npu.yaml`.
-Override `DEPLOY_CONFIG` only with a checked-in candidate configuration.
+The default deployment is
+`vllm_omni/deploy/minicpmo_4_5_ascend_910c_1card.yaml`. It uses both logical
+chips exposed by one physical Ascend 910C card; device IDs `0` and `1` do not
+mean two cards. Override `DEPLOY_CONFIG` only with a checked-in candidate
+configuration.
 
 ## 3. Run the gated proxy suite
 
@@ -42,14 +53,18 @@ offline by the suite.
 ```bash
 VIDEO_INPUT=/path/to/official-or-local-fixture.mp4 \
 MODEL=/path/to/MiniCPM-o-4_5 \
+MODEL_PATH=/path/to/MiniCPM-o-4_5 \
+MODEL_MANIFEST=/path/to/model-sha256.txt \
 bash benchmarks/competition/minicpmo_ascend/run_suite.sh \
-  --concurrency 1 2 4 --num-requests 20
+  --concurrency 1 2 4 --num-requests 20 --warmups 2
 ```
 
 The command runs multimodal smoke validation first, then separate text-only
-and text-plus-audio benchmarks, raw NPU/host resource collection, and the
-machine-readable correctness gate. A failed, timed-out, truncated, empty, or
-invalid-audio request is excluded from metrics and makes the command fail.
+and text-plus-audio benchmarks, a text-plus-audio stability run, raw NPU/host
+resource collection, the machine-readable correctness gate, and a baseline
+report with an artifact checksum manifest. A failed, timed-out, truncated,
+empty, or invalid-audio request is excluded from metrics and makes the command
+fail.
 
 Raw per-request output includes first SSE event, first text, first audio,
 audio chunk arrival/inter-chunk times, E2E, finish reasons, error details, WAV

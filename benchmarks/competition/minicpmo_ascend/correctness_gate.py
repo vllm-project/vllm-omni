@@ -17,10 +17,28 @@ def _load(path: Path, label: str, failures: list[str]) -> dict[str, Any] | None:
         return None
 
 
+def _check_benchmark(path: Path, label: str, failures: list[str]) -> None:
+    benchmark = _load(path, label, failures) or {}
+    configurations = benchmark.get("configurations", [])
+    if not configurations:
+        failures.append(f"{label}: contains no configurations")
+    for config in configurations:
+        config_label = f"{label} {config.get('mode')} c={config.get('concurrency')}"
+        if config.get("aborted"):
+            failures.append(f"{config_label}: aborted during warmup")
+            continue
+        summary = config.get("summary", {})
+        if summary.get("failed_requests", 1) != 0:
+            failures.append(f"{config_label}: contains failed requests")
+        if summary.get("successful_requests", 0) <= 0:
+            failures.append(f"{config_label}: contains no successful samples")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-results", type=Path, required=True)
     parser.add_argument("--benchmark-results", type=Path)
+    parser.add_argument("--stability-results", type=Path)
     parser.add_argument("--require-input-modalities", nargs="+", default=["text", "image", "audio", "video"])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -47,17 +65,9 @@ def main() -> None:
                 failures.append(f"{name}: adjacent duplicate audio chunks")
 
     if args.benchmark_results:
-        benchmark = _load(args.benchmark_results, "benchmark", failures) or {}
-        for config in benchmark.get("configurations", []):
-            label = f"{config.get('mode')} c={config.get('concurrency')}"
-            if config.get("aborted"):
-                failures.append(f"{label}: benchmark aborted during warmup")
-                continue
-            summary = config.get("summary", {})
-            if summary.get("failed_requests", 1) != 0:
-                failures.append(f"{label}: benchmark contains failed requests")
-            if summary.get("successful_requests", 0) <= 0:
-                failures.append(f"{label}: benchmark contains no successful samples")
+        _check_benchmark(args.benchmark_results, "benchmark", failures)
+    if args.stability_results:
+        _check_benchmark(args.stability_results, "stability", failures)
 
     result = {
         "schema_version": 1,

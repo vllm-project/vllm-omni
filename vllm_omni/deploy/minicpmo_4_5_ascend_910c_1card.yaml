@@ -1,4 +1,5 @@
-# MiniCPM-o 4.5 deployment for two 64 GiB Ascend NPUs.
+# MiniCPM-o 4.5 deployment for one Ascend 910C card with two 64 GiB chips.
+# Device IDs 0 and 1 are logical chips on the same physical card (NPU ID 0).
 pipeline: minicpmo_4_5
 async_chunk: true
 

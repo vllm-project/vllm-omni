@@ -41,11 +41,24 @@ model:
   packaging_rules: UNRESOLVED
 
 local_proxy:
-  deploy_config: vllm_omni/deploy/minicpmo_4_5_ascend_2npu.yaml
+  hardware:
+    model: Ascend 910C
+    physical_card_count: 1
+    chips_per_card: 2
+    logical_device_ids: [0, 1]
+    hbm_per_chip_gib: 64
+    aggregate_hbm_gib: 128
+    evidence_command: npu-smi info -l
+  deploy_config: vllm_omni/deploy/minicpmo_4_5_ascend_910c_1card.yaml
   output_sample_rate_hz: 24000
   seed: 42
   thinker_max_tokens: 256
   talker_max_tokens: 256
   warmup_requests: 2
+  benchmark_concurrency: [1, 2, 4]
+  benchmark_requests_per_configuration: 20
+  stability_mode: text_audio
+  stability_concurrency: 4
+  stability_requests: 20
   percentile_statistics: [p50, p95, p99]
   note: Local proxy values are not official scoring definitions.
