@@ -27,10 +27,10 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
     PerLayerAttnMetadata,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices

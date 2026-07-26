@@ -484,3 +484,84 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# =============================================================================
+# Patch moe_sum to work around stale _moe_C compiled extension (2-arg only)
+# =============================================================================
+# WHY: The vllm Python source at ffd46bfab212 passes 4 args to
+# torch.ops._moe_C.moe_sum(), but the precompiled shared library
+# _moe_C_stable_libtorch.abi3.so may only register the old 2-argument
+# signature.  When loading a model with MoE layers (e.g. Qwen3-Omni),
+# the Torch dispatcher rejects the call:
+#
+#   RuntimeError: _moe_C::moe_sum() expected at most 2 argument(s)
+#   but received 4 argument(s).
+#
+# This patch detects the stale extension at import time and transparently
+# drops the optional None-valued arguments (topk_ids, expert_map) on the
+# affected build.
+#
+# SELF-EXTINGUISH: when the precompiled .so is rebuilt to match the 4-arg
+# C++ source (torch_bindings.cpp), the probe call succeeds and this patch
+# becomes a no-op.  It can be removed once the vllm-omni pin moves to a
+# vllm build whose compiled extensions are in sync with the C++ source.
+def _patch_moe_sum_stale_extension() -> None:
+    try:
+        import vllm._custom_ops as _custom_ops
+    except ImportError:
+        return
+
+    # Probe the C++ extension with CPU tensors to check argument count.
+    # The Torch dispatcher validates argument count against the registered
+    # schema *before* invoking the kernel, so device type is irrelevant.
+    _needs_patch = False
+    try:
+        dummy = torch.zeros(1)
+        torch.ops._moe_C.moe_sum(dummy, dummy, None, None)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "expected at most 2 argument" in msg:
+            _needs_patch = True
+        else:
+            _PATCH_LOGGER.warning(
+                "[moe-sum] Probe failed with unexpected error: %s. "
+                "The _moe_C extension may need rebuilding.",
+                msg,
+            )
+    except Exception:
+        # Op not loaded or other transient issue -- assume no patch needed.
+        return
+
+    if not _needs_patch:
+        return
+
+    _original_moe_sum = _custom_ops.moe_sum
+
+    def _patched_moe_sum(
+        input: torch.Tensor,
+        output: torch.Tensor,
+        topk_ids: torch.Tensor | None = None,
+        expert_map: torch.Tensor | None = None,
+    ) -> None:
+        # Thin wrapper that drops the optional None args for the stale
+        # .so.  When topk_ids and expert_map are actually provided
+        # (non-None), we must NOT drop them -- in that case we let the
+        # call through and fail explicitly so the caller knows expert
+        # parallelism aware reduce is unavailable.
+        if topk_ids is None and expert_map is None:
+            torch.ops._moe_C.moe_sum(input, output)
+        else:
+            # Caller genuinely needs the 4-arg overload.
+            torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
+
+    _custom_ops.moe_sum = _patched_moe_sum
+    _PATCH_LOGGER.warning(
+        "[moe-sum] Detected stale _moe_C extension (2-arg only). "
+        "Applied transparent fallback (topk_ids/expert_map are unused "
+        "when None). Rebuild vllm extensions with "
+        "VLLM_USE_PRECOMPILED=0 to remove this fallback."
+    )
+
+
+_patch_moe_sum_stale_extension()

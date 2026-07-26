@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from time import time
 from typing import Any
 
@@ -642,7 +643,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return engine_core_outputs
 
-    def finish_requests(self, request_ids: Any, finished_status: RequestStatus) -> list[tuple[str, int]]:
+    def finish_requests(self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus) -> list[Request]:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
@@ -688,8 +689,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
-            for request_id, _ in finished:
-                self._free_input_coordinator_request(request_id)
+            for request in finished:
+                self._free_input_coordinator_request(request.request_id)
         return finished
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -348,7 +349,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
-    def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
+    def finish_requests(self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus) -> list[Request]:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
@@ -382,8 +383,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._purge_finished_from_running()
 
         if self.input_coordinator is not None:
-            for request_id, _ in finished:
-                self._free_input_coordinator_request(request_id)
+            for request in finished:
+                self._free_input_coordinator_request(request.request_id)
         return finished
 
     def _free_request(
