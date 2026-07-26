@@ -46,6 +46,41 @@ def _resolve_device(device: str | torch.device | None) -> str:
     return "cpu"
 
 
+def _resolve_autocast_dtype(
+    dtype: str | torch.dtype | None,
+    *,
+    float16: bool,
+) -> torch.dtype | None:
+    if dtype is None:
+        return torch.float16 if float16 else None
+    if isinstance(dtype, torch.dtype):
+        resolved = dtype
+    else:
+        aliases = {
+            "float32": None,
+            "fp32": None,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        key = str(dtype).lower()
+        if key not in aliases:
+            raise ValueError(
+                "MiniCPM-o Token2Wav dtype must be one of "
+                f"fp32, fp16, or bf16, got {dtype!r}"
+            )
+        resolved = aliases[key]
+    if resolved not in (None, torch.float16, torch.bfloat16):
+        raise ValueError(
+            "MiniCPM-o Token2Wav dtype must resolve to float32, "
+            f"float16, or bfloat16, got {resolved}"
+        )
+    if float16 and resolved is not torch.float16:
+        raise ValueError("float16=True conflicts with a non-fp16 Token2Wav dtype")
+    return resolved
+
+
 class MiniCPMO45Token2wav:
     """Token2wav-compatible facade around ``StepAudio2Token2WavCore``.
 
@@ -64,8 +99,10 @@ class MiniCPMO45Token2wav:
         float16: bool = False,
         n_timesteps: int = 10,
         device: str | torch.device | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
-        self.float16 = float16
+        self.autocast_dtype = _resolve_autocast_dtype(dtype, float16=float16)
+        self.float16 = self.autocast_dtype is torch.float16
         self.n_timesteps = n_timesteps
         self.device = _resolve_device(device)
         self._core = StepAudio2Token2WavCore(

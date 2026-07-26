@@ -122,11 +122,12 @@ def npu_token2wav_sdpa_context() -> Iterator[None]:
         )
 
         apply_cosyvoice2_dit_attn_npu_patch()
-        with npu_math_sdpa_context():
-            yield
     except Exception:
-        with nullcontext():
-            yield
+        context = nullcontext()
+    else:
+        context = npu_math_sdpa_context()
+    with context:
+        yield
 
 
 def _patched_ensure_models_loaded(self) -> None:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,3 +195,28 @@ def test_hift_patch_reports_incompatible_layout(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(TypeError, match=r"m_source\.l_sin_gen\._f02sine"):
         module.patch_step_audio2_hift_for_npu(SimpleNamespace())
+
+
+def test_sdpa_context_does_not_catch_inference_body_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    events = []
+    fake_module = types.ModuleType("vllm_omni.platforms.npu.models.cosyvoice2_dit_attn")
+
+    @contextmanager
+    def fake_math_context():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    fake_module.apply_cosyvoice2_dit_attn_npu_patch = lambda: events.append("patch")
+    fake_module.npu_math_sdpa_context = fake_math_context
+    monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        with module.npu_token2wav_sdpa_context():
+            events.append("body")
+            raise RuntimeError("inference failed")
+
+    assert events == ["patch", "enter", "body", "exit"]

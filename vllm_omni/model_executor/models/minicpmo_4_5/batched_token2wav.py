@@ -66,6 +66,16 @@ class BatchedToken2Wav(nn.Module):
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         self.float16 = bool(token2wav.float16)
+        self.autocast_dtype = getattr(
+            token2wav,
+            "autocast_dtype",
+            torch.float16 if self.float16 else None,
+        )
+        if self.autocast_dtype not in (None, torch.float16, torch.bfloat16):
+            raise ValueError(
+                "MiniCPM-o Token2Wav autocast_dtype must be float16, "
+                f"bfloat16, or None, got {self.autocast_dtype}"
+            )
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
@@ -111,14 +121,25 @@ class BatchedToken2Wav(nn.Module):
         )
 
     def _autocast(self, device: torch.device):
-        if device.type != "cuda":
+        if self.autocast_dtype is None:
+            return _autocast_disabled(device)
+        try:
+            return torch.autocast(
+                device_type=device.type,
+                dtype=self.autocast_dtype,
+            )
+        except (RuntimeError, TypeError, ValueError):
             return nullcontext()
-        if not self.float16:
-            return torch.amp.autocast("cuda", enabled=False)
-        return torch.amp.autocast(
-            "cuda",
-            dtype=torch.float16,
+
+    @staticmethod
+    def _execution_context(device: torch.device):
+        if device.type != "npu":
+            return nullcontext()
+        from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+            npu_token2wav_sdpa_context,
         )
+
+        return npu_token2wav_sdpa_context()
 
     def _pre_lookahead_len(self) -> int | None:
         """Right-context width of the encoder's pre-lookahead convolution.
@@ -307,7 +328,7 @@ class BatchedToken2Wav(nn.Module):
             (batch_size, 3 if lookahead_width is None else lookahead_width),
             _SILENCE_TOKEN,
         )
-        with self._autocast(prompt_tokens.device):
+        with self._execution_context(prompt_tokens.device), self._autocast(prompt_tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 torch.cat((prompt_tokens, lookahead), dim=1),
                 last_chunk=False,
@@ -387,7 +408,7 @@ class BatchedToken2Wav(nn.Module):
                 )
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
-        with self._autocast(tokens.device):
+        with self._execution_context(tokens.device), self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
                 last_chunk=last_chunk or flush_encoder,

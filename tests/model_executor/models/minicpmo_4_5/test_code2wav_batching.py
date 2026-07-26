@@ -1,3 +1,5 @@
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_code2wav
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
 )
@@ -682,6 +685,79 @@ def test_cleanup_uses_generation_runner_internal_request_ids():
     model.on_requests_finished(["internal-a"])
 
     assert set(model._states) == {"internal-b"}
+
+
+def test_npu_load_weights_uses_in_tree_token2wav(monkeypatch, tmp_path):
+    model_path = tmp_path / "model"
+    token2wav_path = model_path / "assets" / "token2wav"
+    token2wav_path.mkdir(parents=True)
+    prompt_wav = model_path / "assets" / "HT_ref_audio.wav"
+    prompt_wav.touch()
+    constructed = {}
+
+    class _FakeNPUToken2Wav(_FakeToken2Wav):
+        def __init__(self, path, *, float16, n_timesteps, device, dtype):
+            super().__init__()
+            constructed.update(
+                path=path,
+                float16=float16,
+                n_timesteps=n_timesteps,
+                device=device,
+                dtype=dtype,
+            )
+
+    config = _config()
+    config.model_config.model = str(model_path)
+    config.model_config.stage_connector_config["extra"]["prompt_wav"] = str(prompt_wav)
+    monkeypatch.setattr(minicpmo_4_5_code2wav.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(minicpmo_4_5_code2wav.current_omni_platform, "get_torch_device", lambda: "npu:0")
+    module_name = "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav"
+    fake_module = types.ModuleType(module_name)
+    fake_module.MiniCPMO45Token2wav = _FakeNPUToken2Wav
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    model.load_weights(iter(()))
+
+    assert constructed == {
+        "path": str(token2wav_path),
+        "float16": False,
+        "n_timesteps": 10,
+        "device": "npu:0",
+        "dtype": "float32",
+    }
+    assert isinstance(model.backend, BatchedToken2Wav)
+
+
+def test_npu_load_weights_accepts_bf16_autocast(monkeypatch, tmp_path):
+    model_path = tmp_path / "model"
+    (model_path / "assets" / "token2wav").mkdir(parents=True)
+    prompt_wav = model_path / "assets" / "HT_ref_audio.wav"
+    prompt_wav.touch()
+    constructed = {}
+
+    class _FakeNPUToken2Wav(_FakeToken2Wav):
+        def __init__(self, path, *, float16, n_timesteps, device, dtype):
+            super().__init__()
+            self.autocast_dtype = torch.bfloat16
+            constructed.update(float16=float16, dtype=dtype)
+
+    config = _config()
+    config.model_config.model = str(model_path)
+    extra = config.model_config.stage_connector_config["extra"]
+    extra.update(prompt_wav=str(prompt_wav), token2wav_dtype="bf16")
+    monkeypatch.setattr(minicpmo_4_5_code2wav.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(minicpmo_4_5_code2wav.current_omni_platform, "get_torch_device", lambda: "npu:0")
+    module_name = "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav"
+    fake_module = types.ModuleType(module_name)
+    fake_module.MiniCPMO45Token2wav = _FakeNPUToken2Wav
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    model.load_weights(iter(()))
+
+    assert constructed == {"float16": False, "dtype": "bfloat16"}
+    assert model.backend.autocast_dtype is torch.bfloat16
 
 
 def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
