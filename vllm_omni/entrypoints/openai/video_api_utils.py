@@ -308,9 +308,6 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
     video_tensor = video_tensor.detach().cpu()
     if video_tensor.dim() == 5:
         raise ValueError("Batched video tensors are not supported for single-video encoding.")
-    elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
-        # [C, F, H, W] -> [F, H, W, C]
-        video_tensor = video_tensor.permute(1, 2, 3, 0)
 
     if video_tensor.is_floating_point():
         # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no

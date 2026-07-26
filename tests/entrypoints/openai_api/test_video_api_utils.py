@@ -48,6 +48,47 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["audio"] is None
 
 
+@pytest.mark.parametrize("num_frames", [3, 4])
+def test_coerce_channel_last_tensor_with_ambiguous_frame_count(num_frames):
+    # Regression test for #5417: [F, H, W, C] tensors with F in (3, 4) must
+    # not be mistaken for channel-first [C, F, H, W] layouts.
+    video = torch.zeros((num_frames, 2, 5, 3), dtype=torch.uint8)
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    assert frames.shape == (num_frames, 2, 5, 3)
+
+
+def test_coerce_channel_first_tensor_still_transposed():
+    video = torch.zeros((3, 5, 6, 7), dtype=torch.uint8)
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    assert frames.shape == (5, 6, 7, 3)
+
+
+def test_coerce_frame_channel_first_tensor_still_transposed():
+    video = torch.zeros((6, 3, 8, 9), dtype=torch.uint8)
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    assert frames.shape == (6, 8, 9, 3)
+
+
+def test_coerce_unambiguous_channel_last_tensor_unchanged():
+    video = torch.zeros((6, 8, 9, 3), dtype=torch.uint8)
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    assert frames.shape == (6, 8, 9, 3)
+
+
+def test_coerce_rgba_channel_last_tensor_drops_alpha_keeps_frames():
+    video = torch.zeros((4, 2, 5, 4), dtype=torch.uint8)
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    assert frames.shape == (4, 2, 5, 3)
+
+
+def test_coerce_channel_first_float_tensor_matches_numpy_path():
+    video = torch.linspace(-1.0, 1.0, 3 * 5 * 6 * 7, dtype=torch.float32).reshape(3, 5, 6, 7)
+    torch_frames = video_api_utils._coerce_video_to_uint8_frames(video)
+    numpy_frames = video_api_utils._coerce_video_to_uint8_frames(video.numpy())
+    assert torch_frames.shape == (5, 6, 7, 3)
+    np.testing.assert_array_equal(torch_frames, numpy_frames)
+
+
 def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
     muxers = []
 
