@@ -1237,11 +1237,8 @@ def _prepare_hidream_teacache_state(
         torch.cat([image_rotary_emb[..., 1, 0], text_rotary_emb[..., 1, 0]], dim=1),
     )
 
-    block0 = module.double_stream_blocks[0].block
-    wtype = hidden_states.dtype
-    shift_msa_i, scale_msa_i, *_ = block0.adaLN_modulation(temb)[:, None].chunk(12, dim=-1)
-    modulated_input = block0.norm1_i(hidden_states).to(dtype=wtype)
-    modulated_input = modulated_input * (1 + scale_msa_i) + shift_msa_i
+    # Match TeaCache4HiDream-I1: use t_embedder output as the cache similarity signal.
+    modulated_input = timesteps
 
     return {
         "hidden_states": hidden_states,

@@ -519,15 +519,11 @@ class TestHiDreamExtractor:
         }
 
     def test_modulated_input_shape(self, hidream_module, sample_inputs):
-        """Test that modulated_input matches embedded patch token shape."""
+        """Test that modulated_input matches HiDream t_embedder output shape."""
         context = extract_hidream_image_context(hidream_module, **sample_inputs)
         context.validate()
 
-        assert context.modulated_input.shape == (
-            self.BATCH_SIZE,
-            self.PATCH_TOKENS,
-            self.HIDDEN_SIZE,
-        )
+        assert context.modulated_input.shape == (self.BATCH_SIZE, self.HIDDEN_SIZE)
 
     def test_run_transformer_blocks_callable(self, hidream_module, sample_inputs):
         """Test that run_transformer_blocks is callable."""
