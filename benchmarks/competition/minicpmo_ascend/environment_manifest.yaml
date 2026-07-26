@@ -1,0 +1,51 @@
+schema_version: 1
+snapshot_date: "2026-07-26"
+competition:
+  name: MiniCPM & Ascend Inference Optimization and Application Innovation Challenge
+  track: high-performance-inference
+  rules_url: https://ascend.openbmb.cn/competition
+  rules_retrieved_at: "2026-07-26T00:00:00Z"
+  starter_kit:
+    url: UNRESOLVED
+    version: UNRESOLVED
+    sha256: UNRESOLVED
+  scoring_formula: UNRESOLVED
+  request_schema: UNRESOLVED
+  effect_thresholds: UNRESOLVED
+  concurrency_levels: UNRESOLVED
+  timeouts: UNRESOLVED
+  package_limits: UNRESOLVED
+
+official_environment:
+  npu_model: UNRESOLVED
+  npu_count: UNRESOLVED
+  topology: UNRESOLVED
+  cpu_limit: UNRESOLVED
+  ram_limit: UNRESOLVED
+  network_policy: UNRESOLVED
+  image: UNRESOLVED
+  driver: UNRESOLVED
+  firmware: UNRESOLVED
+  cann: UNRESOLVED
+  python: UNRESOLVED
+  pytorch: UNRESOLVED
+  torch_npu: UNRESOLVED
+  vllm: UNRESOLVED
+  vllm_ascend: UNRESOLVED
+  vllm_omni: UNRESOLVED
+
+model:
+  source: openbmb/MiniCPM-o-4_5
+  revision: UNRESOLVED
+  sha256_manifest: UNRESOLVED
+  packaging_rules: UNRESOLVED
+
+local_proxy:
+  deploy_config: vllm_omni/deploy/minicpmo_4_5_ascend_2npu.yaml
+  output_sample_rate_hz: 24000
+  seed: 42
+  thinker_max_tokens: 256
+  talker_max_tokens: 256
+  warmup_requests: 2
+  percentile_statistics: [p50, p95, p99]
+  note: Local proxy values are not official scoring definitions.
