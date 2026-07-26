@@ -21,6 +21,12 @@ include:
 - `diffusion-perf-opt`: guides diffusion model performance optimization,
   including profiling traces, parallel strategies, stage timing analysis, and
   benchmark-driven tuning
+- `optimize-minicpmo-ascend`: defines the optimization objectives, correctness
+  gates, measurement rules, and submission requirements for the MiniCPM-o 4.5
+  Ascend competition
+- `run-minicpmo-ascend-perf-cycle`: takes one daily MiniCPM-o Ascend performance
+  hypothesis through baseline measurement, implementation, validation,
+  experiment recording, an atomic commit, and an authorized safe push
 - `quantization`: guides quantization method selection, model integration,
   checkpoint loading, and quality/performance validation for vLLM-Omni
 - `add-omni-model`: covers addition of new omni-modality model support
