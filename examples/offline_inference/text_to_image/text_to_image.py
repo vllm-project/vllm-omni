@@ -421,6 +421,9 @@ def main():
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "use_hsdp": args.use_hsdp,
+        "hsdp_shard_size": args.hsdp_shard_size,
+        "hsdp_replicate_size": args.hsdp_replicate_size,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
@@ -469,7 +472,9 @@ def main():
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
-        f"enable_expert_parallel={args.enable_expert_parallel}."
+        f"enable_expert_parallel={args.enable_expert_parallel}, "
+        f"use_hsdp={args.use_hsdp}, hsdp_shard_size={args.hsdp_shard_size}, "
+        f"hsdp_replicate_size={args.hsdp_replicate_size}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
