@@ -24,7 +24,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
-from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.core.sched.utils import omni_routed_experts_for_request, split_free_request_result
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -383,14 +383,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_encoder_inputs(request)
 
             stopped = False
-            is_segment_finished = False
             finished = False
+            is_segment_finished = False
             new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
+            ec_transfer_params = None
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
@@ -451,7 +452,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
-                    kv_transfer_params = self._free_request(request)
+                    kv_transfer_params, ec_transfer_params = split_free_request_result(self._free_request(request))
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -486,6 +487,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
+                        ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,

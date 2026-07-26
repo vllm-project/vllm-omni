@@ -61,6 +61,8 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    stop_segment: bool = True,
+    chunk_transfer_adapter=None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -68,18 +70,20 @@ def _run_resumable_segment_stop(
     sched.structured_output_manager.should_advance.return_value = False
 
     def stop_request(request: Request, _token_ids: list[int]):
-        request.status = RequestStatus.FINISHED_STOPPED
-        return [42], True
+        if stop_segment:
+            request.status = RequestStatus.FINISHED_STOPPED
+        return [42], stop_segment
 
     sched._update_request_with_output.side_effect = stop_request
     sched._handle_stopped_request.return_value = session_finished
-    sched.chunk_transfer_adapter = None
+    sched.chunk_transfer_adapter = chunk_transfer_adapter
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
     sched.active_kv_transfers = set()
     sched.pending_stop_after_extraction = set()
     sched.connector = None
+    sched._free_request.return_value = None
     sched.kv_cache_manager.take_events.return_value = None
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
