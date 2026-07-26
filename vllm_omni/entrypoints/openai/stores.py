@@ -65,6 +65,10 @@ class AsyncDictStore(Generic[T]):
         async with self._lock:
             return self._items.pop(key, None)
 
+    async def pop_many(self, keys: list[str]) -> list[T]:
+        async with self._lock:
+            return [item for key in keys if (item := self._items.pop(key, None)) is not None]
+
     async def list_values(self) -> list[T]:
         async with self._lock:
             return list(self._items.values())

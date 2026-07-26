@@ -518,7 +518,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             logger.warning("engine client has no endpoint restrictions attribute")
 
         # Start background processes
-        await STORAGE_MANAGER.start()
+        await STORAGE_MANAGER.start(expiration_callback=_remove_expired_video_metadata)
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -586,11 +586,14 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         try:
             await shutdown_task
         finally:
-            state = getattr(app, "state", None)
-            serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
-            if serving_speech is not None:
-                serving_speech.shutdown()
-            sock.close()
+            try:
+                state = getattr(app, "state", None)
+                serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+                if serving_speech is not None:
+                    serving_speech.shutdown()
+                await STORAGE_MANAGER.stop()
+            finally:
+                sock.close()
 
 
 @asynccontextmanager
@@ -2830,6 +2833,10 @@ async def _cleanup_video(video_id: str):
         await STORAGE_MANAGER.delete(video_id)
     except Exception:
         logger.warning("Failed to cleanup partial video file '%s'", video_id)
+
+
+async def _remove_expired_video_metadata(storage_keys: list[str]) -> None:
+    await VIDEO_STORE.pop_many(storage_keys)
 
 
 async def _run_video_generation_job(

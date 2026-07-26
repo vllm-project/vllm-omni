@@ -4,6 +4,7 @@ import os
 import stat
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from tempfile import NamedTemporaryFile
 from typing import Generic, Literal, TypeVar
@@ -34,6 +35,7 @@ class FileStorageHandle(BaseStorageHandle):
 
 
 K = TypeVar("K", bound=BaseStorageHandle, covariant=True)
+ExpirationCallback = Callable[[list[str]], Awaitable[None]]
 
 
 class StorageBaseManager(Generic[K], ABC):
@@ -118,7 +120,14 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
 
 
 class LocalStorageTTLManager(LocalStorageManager):
-    def __init__(self, ttl_seconds: int, sweep_interval_seconds: int, *args, **kwargs):
+    def __init__(
+        self,
+        ttl_seconds: int,
+        sweep_interval_seconds: int,
+        *args,
+        expiration_callback: ExpirationCallback | None = None,
+        **kwargs,
+    ):
         if ttl_seconds <= 0:
             raise ValueError("`ttl_seconds` must be greater than or equal to 1.")
         if sweep_interval_seconds <= 0:
@@ -127,6 +136,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._ttl_seconds = ttl_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._expiration_callback = expiration_callback
 
         super().__init__(*args, **kwargs)
 
@@ -136,20 +146,21 @@ class LocalStorageTTLManager(LocalStorageManager):
         return result
 
     async def _sweep_once(self, cutoff: float) -> int:
-        expired: list[str] = []
+        expired: list[tuple[str, str]] = []
         for entry in os.scandir(self.storage_path):
             try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
                 if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                    expired.append(entry.path)
+                    expired.append((entry.path, entry.name))
             except FileNotFoundError:
                 logger.debug("TTL sweep skipped %s; file removed during scan", entry.path)
             except OSError:
                 logger.warning("TTL sweep failed to inspect %s", entry.path, exc_info=True)
 
         deleted = 0
-        for path in expired:
+        deleted_keys: list[str] = []
+        for path, storage_key in expired:
             try:
                 async with self._io_semaphore:
                     st = await asyncio.to_thread(os.stat, path, follow_symlinks=False)
@@ -159,10 +170,17 @@ class LocalStorageTTLManager(LocalStorageManager):
                         continue
                     await asyncio.to_thread(os.remove, path)
                     deleted += 1
+                    deleted_keys.append(storage_key)
             except FileNotFoundError:
                 logger.debug("TTL sweep skipped %s; file already removed", path)
             except OSError:
                 logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
+
+        if deleted_keys and self._expiration_callback is not None:
+            try:
+                await self._expiration_callback(deleted_keys)
+            except Exception:
+                logger.exception("TTL expiration callback failed for storage keys %s", deleted_keys)
 
         return deleted
 
@@ -175,7 +193,9 @@ class LocalStorageTTLManager(LocalStorageManager):
                 logger.exception("TTL sweep failed for storage path %s", self.storage_path)
             await asyncio.sleep(self._sweep_interval_seconds)
 
-    async def start(self) -> None:
+    async def start(self, expiration_callback: ExpirationCallback | None = None) -> None:
+        if expiration_callback is not None:
+            self._expiration_callback = expiration_callback
         if self._sweeper_task is None or self._sweeper_task.done():
             self._sweeper_task = asyncio.create_task(self._sweep_loop())
 
@@ -186,6 +206,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         with contextlib.suppress(asyncio.CancelledError):
             await self._sweeper_task
         self._sweeper_task = None
+        self._expiration_callback = None
 
 
 def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:

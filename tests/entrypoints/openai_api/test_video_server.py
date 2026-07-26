@@ -150,8 +150,12 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
         return asyncio.create_task(wait_for_shutdown())
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, expiration_callback=None):
         events.append("storage_start")
+        assert expiration_callback is api_server._remove_expired_video_metadata
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
@@ -165,6 +169,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
@@ -198,6 +203,22 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     assert sock.closed
     assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("storage_stop")
+
+
+@pytest.mark.asyncio
+async def test_expired_video_files_remove_matching_metadata(monkeypatch):
+    store: AsyncDictStore[VideoResponse] = AsyncDictStore()
+    expired = VideoResponse(model="test-model", prompt="expired")
+    retained = VideoResponse(model="test-model", prompt="retained")
+    await store.upsert(expired.id, expired)
+    await store.upsert(retained.id, retained)
+    monkeypatch.setattr(api_server, "VIDEO_STORE", store)
+
+    await api_server._remove_expired_video_metadata([expired.id, "unknown-storage-key"])
+
+    assert await store.get(expired.id) is None
+    assert await store.get(retained.id) is retained
 
 
 @pytest.fixture
