@@ -1353,6 +1353,66 @@ def test_image_file_response_format_single(test_client):
     assert img.format == "PNG"
 
 
+@pytest.mark.parametrize(
+    "output_format,expected_media_type,expected_ext",
+    [
+        ("png", "image/png", ".png"),
+        ("jpeg", "image/jpeg", ".jpeg"),
+        ("jpg", "image/jpeg", ".jpg"),
+        ("webp", "image/webp", ".webp"),
+        ("JPEG", "image/jpeg", ".jpeg"),
+        (None, "image/png", ".png"),
+        ("bogus", "image/png", ".png"),
+    ],
+)
+def test_stream_response_single_honors_output_format(output_format, expected_media_type, expected_ext):
+    """Regression test for #5421: file responses must reflect output_format."""
+    from vllm_omni.entrypoints.openai.protocol.images import ImageData, ImageGenerationResponse
+
+    b64 = base64.b64encode(b"fake-image-bytes").decode()
+    response = ImageGenerationResponse(
+        created=0,
+        data=[ImageData(b64_json=b64)],
+        output_format=output_format,
+    ).stream_response()
+
+    assert response.media_type == expected_media_type
+    disposition = response.headers["content-disposition"]
+    assert disposition.endswith(f'{expected_ext}"')
+
+
+@pytest.mark.parametrize(
+    "output_format,expected_ext",
+    [("jpeg", ".jpeg"), ("webp", ".webp"), (None, ".png")],
+)
+def test_stream_response_zip_entries_honor_output_format(output_format, expected_ext):
+    from vllm_omni.entrypoints.openai.protocol.images import ImageData, ImageGenerationResponse
+
+    b64 = base64.b64encode(b"fake-image-bytes").decode()
+    response = ImageGenerationResponse(
+        created=0,
+        data=[ImageData(b64_json=b64), ImageData(b64_json=b64)],
+        output_format=output_format,
+    ).stream_response()
+
+    assert response.media_type == "application/zip"
+
+    import asyncio
+    import zipfile
+
+    async def _drain():
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+        return b"".join(chunks)
+
+    payload = asyncio.run(_drain())
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as zf:
+        names = zf.namelist()
+        assert len(names) == 2
+        assert all(name.endswith(expected_ext) for name in names)
+
+
 def make_test_image_bytes(size=(64, 64)) -> bytes:
     img = Image.new(
         "RGB",
