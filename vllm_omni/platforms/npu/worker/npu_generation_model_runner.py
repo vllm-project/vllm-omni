@@ -33,6 +33,7 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.worker.compat import async_exponential_enabled, profiling_chunk_enabled
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import partition_payload_list
@@ -98,7 +99,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
-        if self.ascend_config.profiling_chunk_config.enabled:
+        if profiling_chunk_enabled(self.ascend_config):
             self._sync_device()
             self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
@@ -355,7 +356,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 self.debugger.start(model=self.model)
             else:
                 self.debugger.start()
-        if self.ascend_config.enable_async_exponential:
+        if async_exponential_enabled(self.ascend_config):
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
                 head_dim=self.model_config.get_vocab_size(),
@@ -552,7 +553,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
+        if profiling_chunk_enabled(self.ascend_config) and hasattr(self, "_execution_start_time"):
             self._sync_device()
             output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
