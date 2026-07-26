@@ -473,7 +473,13 @@ class TestHiDreamExtractor:
         module.t_embedder = Mock(return_value=torch.randn(batch_size, hidden_size))
         module.p_embedder = Mock(return_value=torch.randn(batch_size, hidden_size))
         module.pe_embedder = Mock(
-            return_value=torch.randn(batch_size, patch_tokens, 1, 1, hidden_size),
+            side_effect=lambda ids: torch.randn(
+                ids.shape[0],
+                ids.shape[1],
+                2,
+                2,
+                hidden_size,
+            ),
         )
 
         inner_block = Mock()
