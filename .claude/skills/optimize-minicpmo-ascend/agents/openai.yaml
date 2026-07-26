@@ -1,0 +1,4 @@
+interface:
+  display_name: "MiniCPM-o Ascend Competition Optimization"
+  short_description: "Optimize MiniCPM-o 4.5 for the Ascend competition."
+  default_prompt: "Use $optimize-minicpmo-ascend to optimize MiniCPM-o 4.5 on Ascend NPU against the current competition metrics and correctness gates."

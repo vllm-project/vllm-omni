@@ -103,6 +103,7 @@ nav:
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
+    - design/minicpmo_4_5_ascend_competition_todo.md
     - Feature Design:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
