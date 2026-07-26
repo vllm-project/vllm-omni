@@ -17,6 +17,7 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -25,6 +26,8 @@ from .batched_token2wav import (
     BatchedToken2WavState,
     state_shape_signature,
 )
+
+logger = init_logger(__name__)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -46,6 +49,23 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
     return fallback.reshape(-1).to(dtype=torch.long)
+
+
+# Keys the runner stamps on every step regardless of stage input (see
+# OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
+# override). A step carrying only these has no producer payload at all.
+_RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+
+
+def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
+    """Whether this step carries anything the Talker stage actually sent.
+
+    Any real async-chunk payload brings producer metadata along, whether the
+    transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
+    """
+    if any(key not in _RUNNER_STAMPED_KEYS for key in info):
+        return True
+    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
 
 
 @dataclass(frozen=True)
@@ -74,6 +94,7 @@ class _WorkItem:
     duplex_epoch: int | None
     segment_end: bool
     turn_end: bool
+    has_payload: bool = True
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -207,6 +228,32 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not isinstance(meta, Mapping):
             meta = info
         request_id = str(_scalar(meta.get("request_id"), _scalar(info.get("request_id"), "")))
+        if not _carries_stage_payload(info, meta):
+            # The producer attached nothing to this step, only the bookkeeping
+            # the runner stamps on every request. The stage was scheduled on
+            # the placeholder prompt that async-chunk pre-warm submits before
+            # the first codec window arrives: those tokens are reserved slots,
+            # not codec data, and one bogus frame is shorter than the vocoder's
+            # lookahead window. Such a step carries no producer metadata at
+            # all, so it cannot be held to the payload contract below either.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id or state_id,
+                cache_epoch=0,
+                chunk_seq=0,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+                last_chunk=False,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=None,
+                segment_text="",
+                duplex_turn_id=None,
+                duplex_epoch=None,
+                segment_end=False,
+                turn_end=False,
+                has_payload=False,
+            )
         if not request_id:
             raise _batch_error("missing_request_id", output_index=index)
         cache_epoch = int(_scalar(meta.get("cache_epoch"), 0))
@@ -358,7 +405,18 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_infos=len(runtime_additional_information),
             )
         if self.backend is None:
-            raise _batch_error("backend_not_loaded")
+            # load_format=dummy (CI core_model runs) skips model.load_weights()
+            # entirely, but Token2wav's assets live beside the checkpoint rather
+            # than in its weight iterator, so they still have to be loaded for
+            # this stage to produce anything. Build them on first use, outside
+            # inference mode so the parameters are ordinary tensors.
+            logger.warning_once(
+                "MiniCPM-o Code2Wav backend was not built during weight loading "
+                "(load_format=%s); loading Token2wav assets now.",
+                getattr(getattr(self.vllm_config, "load_config", None), "load_format", "unknown"),
+            )
+            with torch.inference_mode(False), torch.no_grad():
+                self._build_backend()
 
         state_ids = kwargs.get("request_ids")
         if state_ids is None:
@@ -393,7 +451,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         compute_items = [item for item in items if item.tokens.numel() > 0]
-        invalid_empty = [item.request_id for item in items if not item.last_chunk and item.tokens.numel() == 0]
+        invalid_empty = [
+            item.request_id for item in items if item.has_payload and not item.last_chunk and item.tokens.numel() == 0
+        ]
         if invalid_empty:
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
@@ -514,9 +574,30 @@ class MiniCPMO45Code2Wav(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         for _ in weights:
             pass
+        self._build_backend()
+        # Token2wav loads flow.pt and hift.pt inside its constructor instead of
+        # from the parent MiniCPM checkpoint iterator. Report those registered
+        # parameters as initialized so vLLM's strict loader audit does not
+        # misclassify the independently loaded Stage-2 weights as missing.
+        return {name for name, _ in self.named_parameters()}
+
+    def _build_backend(self) -> None:
+        """Load the Token2wav assets that back this stage."""
         if self.backend is not None:
-            return {name for name, _ in self.named_parameters()}
-        from stepaudio2.token2wav import Token2wav
+            return
+
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
+            # so use the in-tree NPU-aware adapter instead. It delegates to
+            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
+            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
+            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+                MiniCPMO45Token2wav as Token2wav,
+            )
+        else:
+            from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
         prompt_path = Path(self._default_prompt_wav)
@@ -540,8 +621,3 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
-        # Token2wav loads flow.pt and hift.pt inside its constructor instead of
-        # from the parent MiniCPM checkpoint iterator. Report those registered
-        # parameters as initialized so vLLM's strict loader audit does not
-        # misclassify the independently loaded Stage-2 weights as missing.
-        return {name for name, _ in self.named_parameters()}

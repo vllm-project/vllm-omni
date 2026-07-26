@@ -2009,6 +2009,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    if isinstance(choices_data, ErrorResponse):
+                        logger.error(
+                            "Skipping audio chunk for request %s: %s",
+                            request_id,
+                            choices_data.error.message,
+                        )
+                        continue
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2281,6 +2288,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ]
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                if isinstance(choices_data, ErrorResponse):
+                    return choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2608,7 +2617,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ):
+    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
@@ -2628,7 +2637,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             audio_tensor = audio_data
         if audio_tensor is None:
-            return self._create_error_response("Audio generation completed but no audio was produced.")
+            if not stream:
+                return self._create_error_response("Audio generation completed but no audio was produced.")
+            # A streamed message can legitimately carry no waveform: the talker
+            # may emit an empty speech segment, and Stage 2 then reports the
+            # chunk with metadata only. Emit an empty audio delta so the
+            # caller's finish_reason bookkeeping still runs and the stream
+            # terminates normally instead of raising mid-generation.
+            return [
+                ChatCompletionResponseStreamChoice(
+                    index=output.index,
+                    delta=DeltaMessage(role=role, content=""),
+                    logprobs=None,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                )
+                for output in final_res.outputs
+            ]
         audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)
