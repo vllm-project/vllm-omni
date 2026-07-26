@@ -226,15 +226,10 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def _resolve_construction_device(od_config: OmniDiffusionConfig, execution_device: torch.device) -> torch.device:
-    """Device on which pipeline components are materialized during ``__init__``.
+    """Build on host when offload is enabled so the backend manages residency.
 
-    When CPU or layerwise offload is requested, components are built on the host
-    so the offload backend (``LayerWiseOffloadBackend``) can keep the text
-    encoder and VAE resident while streaming DiT blocks, instead of first
-    materializing the full checkpoint on the accelerator. This mirrors the
-    load-device selection in ``DiffusionModelRunner.load_model`` and is a no-op
-    otherwise: ``execution_device`` is returned unchanged, preserving the
-    validated single-device placement path for accelerators that fit the model.
+    Mirrors the load-device selection in ``DiffusionModelRunner.load_model``;
+    otherwise returns ``execution_device`` unchanged.
     """
     if getattr(od_config, "enable_layerwise_offload", False) or getattr(od_config, "enable_cpu_offload", False):
         return torch.device("cpu")
@@ -260,10 +255,6 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         del prefix
         self.od_config = od_config
         self.device = get_local_device()
-        # Materialize components on the construction device so that, when CPU or
-        # layerwise offload is enabled, the offload backend can manage
-        # accelerator residency instead of placing the full checkpoint on-device
-        # up front (which OOMs when the checkpoint exceeds accelerator capacity).
         load_device = _resolve_construction_device(od_config, self.device)
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
