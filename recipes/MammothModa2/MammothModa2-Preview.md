@@ -1,6 +1,6 @@
 # MammothModa2-Preview
 
-> MammothModa2-Preview text-to-image generation through the shared offline image example
+> MammothModa2-Preview generation and understanding through shared offline examples
 
 ## Summary
 
@@ -13,8 +13,8 @@
 
 ## When to use this recipe
 
-Use this recipe to run MammothModa2-Preview text-to-image through the shared
-offline image example (`text_to_image.py`) instead of a model-specific script.
+Use this recipe to run MammothModa2-Preview through shared task-oriented
+offline examples. Text-to-image uses the shared image example (`text_to_image.py`) instead of a model-specific script.
 The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
@@ -29,8 +29,10 @@ flags. Image size uses the standard `--height` / `--width` flags.
 
 - Upstream model:
   [`bytedance-research/MammothModa2-Preview`](https://huggingface.co/bytedance-research/MammothModa2-Preview)
-- Related offline example:
+- Related text-to-image example:
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- Related T2T/I2T example:
+  [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Declared parameters:
   [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)
 - Deploy config:
@@ -99,6 +101,25 @@ so unknown keys for MammothModa2 are silently dropped:
 - `num_inference_steps` — number of DiT denoising steps (default `50`).
 
 `--height` and `--width` must be multiples of 16.
+
+Run text-to-text through the shared understanding example. It recognizes the
+MammothModa2 checkpoint and automatically selects `mammoth_moda2_ar.yaml`:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Preview \
+  --prompt "Explain multimodal generation in three sentences."
+```
+
+Add an image for image-to-text or image summarization. The shared example
+uses MammothModa2's chat and vision-token template:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Preview \
+  --image /path/to/input.jpg \
+  --prompt "Please summarize the content of this image."
+```
 
 #### Verification
 
