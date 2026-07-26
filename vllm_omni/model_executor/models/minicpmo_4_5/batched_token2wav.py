@@ -15,6 +15,20 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 
 
+def _autocast_disabled(device: torch.device):
+    """Disable any enclosing autocast region on ``device``.
+
+    ``torch.amp.autocast`` resolves the autocast dtype for ``device_type``
+    while constructing the context, which raises on accelerators (e.g. Ascend
+    NPU) that never registered autocast support. Degrade to a no-op there: an
+    enclosing region can only exist on a device type torch already knows.
+    """
+    try:
+        return torch.amp.autocast(device.type, enabled=False)
+    except (RuntimeError, TypeError, ValueError):
+        return nullcontext()
+
+
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
 
@@ -72,7 +86,7 @@ class BatchedToken2Wav(nn.Module):
             previous_dtype = torch.get_default_dtype()
             try:
                 torch.set_default_dtype(torch.float32)
-                with torch.amp.autocast("cuda", enabled=False):
+                with _autocast_disabled(self.speech_window.device):
                     values = self._token2wav._prepare_prompt(prompt_wav)
             finally:
                 torch.set_default_dtype(previous_dtype)
@@ -105,6 +119,16 @@ class BatchedToken2Wav(nn.Module):
             "cuda",
             dtype=torch.float16,
         )
+
+    def _pre_lookahead_len(self) -> int | None:
+        """Right-context width of the encoder's pre-lookahead convolution.
+
+        ``None`` when the encoder does not expose one, so callers keep working
+        against encoder implementations without that layer.
+        """
+        layer = getattr(self.flow.encoder, "pre_lookahead_layer", None)
+        width = getattr(layer, "pre_lookahead_len", None)
+        return int(width) if width is not None else None
 
     def _encode_chunk(
         self,
@@ -278,7 +302,11 @@ class BatchedToken2Wav(nn.Module):
         batch_size: int,
     ) -> list[BatchedToken2WavState]:
         prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
-        lookahead = prompt_tokens.new_full((batch_size, 3), _SILENCE_TOKEN)
+        lookahead_width = self._pre_lookahead_len()
+        lookahead = prompt_tokens.new_full(
+            (batch_size, 3 if lookahead_width is None else lookahead_width),
+            _SILENCE_TOKEN,
+        )
         with self._autocast(prompt_tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 torch.cat((prompt_tokens, lookahead), dim=1),
@@ -336,6 +364,19 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(tokens.shape[0])
         if batch_size != len(states):
             raise ValueError(f"tokens batch {batch_size} != state batch {len(states)}")
+        # The encoder's pre-lookahead convolution consumes ``pre_lookahead_len``
+        # frames of right context and keeps no left cache, so a non-final chunk
+        # must carry at least one full kernel. Only the final chunk is allowed
+        # to be shorter: ``forward_chunk`` zero-pads it by the lookahead width.
+        lookahead = self._pre_lookahead_len()
+        if lookahead is not None and not last_chunk:
+            num_frames = int(tokens.shape[1])
+            if num_frames <= lookahead:
+                raise RuntimeError(
+                    "MiniCPMO45Code2WavBatchError "
+                    f'{{"reason":"chunk_below_lookahead_window","frames":{num_frames},'
+                    f'"minimum":{lookahead + 1}}}'
+                )
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
