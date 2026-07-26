@@ -15,7 +15,11 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.model_region import (
+    ModelRegion,
+    execute_model_region,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     Transformer2DModelOutput,
     WanTransformer3DModel,
@@ -143,48 +147,6 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
 
-        # P1 (RFC #4710): reference-hint cache (lossy, opt-in). None = disabled.
-        # These enable/reset/disable methods are the model-provided contract the generic
-        # RefHintCacheBackend drives (see cache/ref_hint_cache/backend.py).
-        self._ref_hint_cache = None
-
-    def enable_ref_hint_cache(self, refresh_interval: int = 2) -> None:
-        """Enable P1 (RFC #4710): cache the VACE reference hints and reuse them on
-        non-refresh steps. Lossy / opt-in. ``refresh_interval`` = recompute every K steps
-        (a large value caches once at the first step and reuses for the rest)."""
-        from vllm_omni.diffusion.cache.ref_hint_cache import RefHintCacheState
-
-        self._ref_hint_cache = RefHintCacheState(refresh_interval)
-
-    def reset_ref_hint_cache(self) -> None:
-        """Clear cached hints; call at the start of each generation/request."""
-        if self._ref_hint_cache is not None:
-            self._ref_hint_cache.reset()
-
-    def disable_ref_hint_cache(self) -> None:
-        """Turn P1 off (back to always recomputing the hints)."""
-        self._ref_hint_cache = None
-
-    def _ref_hint_begin_call(self):
-        """P1 hot-path helper: consult the reference-hint cache for this forward.
-
-        INVARIANT: the transformer forward is called exactly once per (denoising step, CFG
-        branch), and the branches within a step are visited in a fixed order. The cache
-        derives ``branch`` from the call index within a step (see RefHintCacheState), so any
-        change to the forward scheduling — batched vs sequential CFG, extra forwards per
-        step, reordering cond/uncond — MUST be reflected in the cache contract or isolation
-        across CFG branches breaks. ``denoise_step_idx is None`` (warmup / no forward
-        context) always refreshes, so the cache is a safe no-op.
-
-        Returns ``(branch, should_refresh)``; ``should_refresh=True`` (branch possibly None)
-        means recompute the hints this step.
-        """
-        cache = self._ref_hint_cache
-        if cache is None:
-            return None, True
-        step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-        return cache.begin_call(step_idx)
-
     def embed_vace_context(
         self,
         vace_context: torch.Tensor,
@@ -291,23 +253,17 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 sp_size,
             )
 
-        # VACE: embed context and run conditioning blocks.
-        # P1 (RFC #4710): optionally reuse the hints computed at an earlier denoising step
-        # (lossy, opt-in via enable_ref_hint_cache). Disabled -> identical to the original.
-        # The reuse decision (and its branch/step INVARIANT) lives in _ref_hint_begin_call.
+        # VACE: expose the reference-hint computation as one semantic model region.
+        # With no framework handler, execute_model_region directly invokes this code.
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
-            hint_cache = self._ref_hint_cache
-            branch, should_refresh = self._ref_hint_begin_call()
-            if hint_cache is not None and not should_refresh:
-                # reuse: skip the vace_blocks recompute entirely
-                vace_hints = hint_cache.get(branch)
-            else:
+
+            def compute_vace_hints() -> list[torch.Tensor]:
                 full_seq_len = hidden_states.shape[1] * sp_size
                 control_hidden_states = self.embed_vace_context(
                     vace_context.to(hidden_states.dtype), full_seq_len, sp_size
                 )
-                vace_hints = []
+                hints = []
                 for i, block in enumerate(self.vace_blocks):
                     conditioning_states, control_hidden_states = block(
                         hidden_states,
@@ -317,9 +273,14 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                         rotary_emb,
                         hidden_states_mask,
                     )
-                    vace_hints.append(conditioning_states)
-                if hint_cache is not None:
-                    hint_cache.store(branch, vace_hints)
+                    hints.append(conditioning_states)
+                return hints
+
+            vace_hints = execute_model_region(
+                ModelRegion.REFERENCE_HINTS,
+                self,
+                compute_vace_hints,
+            )
 
         # Normalize scale to per-layer list
         if vace_hints is not None and isinstance(vace_context_scale, (int, float)):

@@ -465,7 +465,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+            model_region_handler = (
+                self.cache_backend.get_model_region_handler()
+                if self.cache_backend is not None and self.cache_backend.is_enabled()
+                else None
+            )
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=od_config,
+                model_region_handler=model_region_handler,
+            ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(

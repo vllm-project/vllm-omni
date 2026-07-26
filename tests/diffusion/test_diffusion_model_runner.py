@@ -262,6 +262,9 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
         def is_enabled(self):
             return True
 
+        def get_model_region_handler(self):
+            return None
+
     runner = _make_runner(cache_backend=_EnabledCacheBackend(), cache_backend_name="cache_dit")
     req = _make_request(skip_cache_refresh=True)
 

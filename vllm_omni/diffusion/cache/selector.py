@@ -17,8 +17,8 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
-    - ref_hint: Uses RefHintCacheBackend for reference-hint reuse (RFC #4710, P1; lossy;
-      model-level integration, currently Wan-VACE)
+    - ref_hint: Uses RefHintCacheBackend for reference-hint reuse/forecasting
+      through the generic model-region seam (RFC #4710, P1; currently Wan-VACE)
 
     Args:
         cache_backend: Cache backend name ("cache_dit", "tea_cache",

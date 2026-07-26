@@ -1,34 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for RefHintCacheBackend (RFC #4710, P1): the lossy opt-in gate and
-multi-expert (transformer / transformer_2) handling. Uses fake transformers/pipelines --
-no model or GPU. Skipped headlessly since the backend imports ``vllm.logger``."""
+"""CPU tests for the framework-side RefHintCacheBackend."""
+
+from typing import cast
 
 import pytest
+import torch
+import torch.nn as nn
 
 pytest.importorskip("vllm")
 
 from vllm_omni.diffusion.cache.ref_hint_cache import RefHintCacheBackend  # noqa: E402
 from vllm_omni.diffusion.data import DiffusionCacheConfig  # noqa: E402
+from vllm_omni.diffusion.forward_context import (  # noqa: E402
+    ForwardContext,
+    override_forward_context,
+)
+from vllm_omni.diffusion.model_region import ModelRegion  # noqa: E402
 
 
-class _VaceLikeTransformer:
-    """Implements the ref_hint contract; records how it was driven."""
-
+class _VaceLikeTransformer(nn.Module):
     def __init__(self):
-        self.enabled_with = None
-        self.reset_count = 0
-
-    def enable_ref_hint_cache(self, refresh_interval):
-        self.enabled_with = refresh_interval
-
-    def reset_ref_hint_cache(self):
-        self.reset_count += 1
+        super().__init__()
+        self.vace_blocks = nn.ModuleList([nn.Identity()])
 
 
-class _PlainTransformer:
-    """A non-reference-conditioned model: no ref_hint hooks."""
+class _PlainTransformer(nn.Module):
+    pass
 
 
 class _FakePipeline:
@@ -44,52 +43,111 @@ def _cfg(**kw):
 
 
 def test_lossy_interval_requires_acknowledgement():
-    """K>=2 (reuse -> lossy) without acknowledgement is refused (RFC #4710 <=8% gate)."""
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=2))
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=2))
     with pytest.raises(ValueError, match="acknowledge_lossy"):
-        be.enable(_FakePipeline(_VaceLikeTransformer()))
+        backend.enable(_FakePipeline(_VaceLikeTransformer()))
 
 
-def test_acknowledged_lossy_interval_enables():
-    t = _VaceLikeTransformer()
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=2, ref_hint_acknowledge_lossy=True))
-    be.enable(_FakePipeline(t))
-    assert be.enabled and t.enabled_with == 2
+def test_lossless_interval_is_exempt_and_exposes_handler():
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    backend.enable(_FakePipeline(_VaceLikeTransformer()))
+    assert backend.enabled
+    assert backend.get_model_region_handler() is backend
 
 
-def test_lossless_interval_is_exempt_from_gate():
-    """K=1 recomputes every step (lossless) -> no acknowledgement needed."""
-    t = _VaceLikeTransformer()
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
-    be.enable(_FakePipeline(t))
-    assert be.enabled and t.enabled_with == 1
+def test_both_experts_get_isolated_state_and_reset():
+    first, second = _VaceLikeTransformer(), _VaceLikeTransformer()
+    pipeline = _FakePipeline(first, second)
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    backend.enable(pipeline)
+    assert set(backend._states) == {id(first), id(second)}
 
-
-def test_both_experts_are_cached_and_reset():
-    """Multi-expert (Wan2.2 VACE): both transformer and transformer_2 are driven."""
-    t1, t2 = _VaceLikeTransformer(), _VaceLikeTransformer()
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
-    be.enable(_FakePipeline(t1, t2))
-    assert t1.enabled_with == 1 and t2.enabled_with == 1
-    be.refresh(_FakePipeline(t1, t2), num_inference_steps=30)
-    assert t1.reset_count == 1 and t2.reset_count == 1
+    for state in backend._states.values():
+        branch, _ = state.begin_call(0)
+        state.store(branch, 0, [torch.tensor([1.0])])
+    backend.refresh(pipeline, num_inference_steps=30)
+    assert all(state.misses == 0 and state._history == {} for state in backend._states.values())
 
 
 def test_second_expert_only_config():
-    """A transformer_2-only config must work, not crash on the missing first expert."""
-    t2 = _VaceLikeTransformer()
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
-    be.enable(_FakePipeline(transformer_2=t2))
-    assert t2.enabled_with == 1
+    second = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    backend.enable(_FakePipeline(transformer_2=second))
+    assert set(backend._states) == {id(second)}
 
 
 def test_no_transformer_raises():
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
     with pytest.raises(ValueError, match="transformer_2"):
-        be.enable(_FakePipeline())
+        backend.enable(_FakePipeline())
 
 
 def test_unsupported_model_raises():
-    be = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
-    with pytest.raises(ValueError, match="does not support"):
-        be.enable(_FakePipeline(_PlainTransformer()))
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    with pytest.raises(ValueError, match="does not expose"):
+        backend.enable(_FakePipeline(_PlainTransformer()))
+
+
+def test_reuse_strategy_skips_compute_on_second_step():
+    owner = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="reuse",
+            ref_hint_acknowledge_lossy=True,
+        )
+    )
+    backend.enable(_FakePipeline(owner))
+    context = ForwardContext()
+    calls = 0
+
+    def compute():
+        nonlocal calls
+        calls += 1
+        return [torch.tensor([float(calls)])]
+
+    with override_forward_context(context):
+        context.denoise_step_idx = 0
+        first = backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        context.denoise_step_idx = 1
+        second = backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+
+    assert calls == 1
+    assert torch.equal(first[0], second[0])
+
+
+def test_forecast50_uses_two_fresh_values_and_damped_prediction():
+    owner = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="forecast50",
+            ref_hint_acknowledge_lossy=True,
+        )
+    )
+    backend.enable(_FakePipeline(owner))
+    context = ForwardContext()
+    values = iter((0.0, 2.0))
+
+    def compute():
+        return [torch.tensor([next(values)])]
+
+    with override_forward_context(context):
+        context.denoise_step_idx = 0
+        backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        context.denoise_step_idx = 1
+        backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        context.denoise_step_idx = 2
+        forecast = backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+
+    # Nominal gain 0.5 is limited by the 0.25 trust region:
+    # 2 + 0.25 * (2 - 0) = 2.5.
+    assert torch.equal(forecast[0], torch.tensor([2.5]))
+
+
+def test_unrelated_region_behavior_is_direct_compute():
+    owner = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
+    backend.enable(_FakePipeline(owner))
+    sentinel = [torch.tensor([7.0])]
+    assert backend.execute(cast(ModelRegion, "other"), owner, lambda: sentinel) is sentinel

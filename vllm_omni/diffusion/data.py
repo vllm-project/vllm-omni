@@ -380,6 +380,8 @@ class DiffusionCacheConfig:
                     mag_ratios, mag_calibrate
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
+        - ref_hint: ref_hint_refresh_interval, ref_hint_strategy,
+                    ref_hint_acknowledge_lossy
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -410,14 +412,15 @@ class DiffusionCacheConfig:
     mag_calibrate: bool = False
 
     # Reference-hint cache parameters [ref_hint only] (RFC #4710, P1 — lossy, opt-in)
-    # Recompute the reference hints every K denoising steps and reuse them in between
-    # (large K -> compute once at the first step and reuse for the rest). Only applies to
-    # reference-conditioned models implementing the hint contract (e.g. Wan-VACE).
+    # Recompute reference hints every K denoising steps and approximate them in between.
+    # Only applies to models exposing the reference-hints semantic region (e.g. Wan-VACE).
     ref_hint_refresh_interval: int = 2
-    # Reuse (ref_hint_refresh_interval >= 2) is lossy and can degrade output beyond RFC
-    # #4710's <=8% mean-DINOv2 guidance (measured ~20% DINOv2 drop at K=2), so it must be
-    # explicitly acknowledged. The backend refuses to enable a reusing interval unless this
-    # is True; ref_hint_refresh_interval=1 recomputes every step (lossless) and is exempt.
+    # "reuse": return the latest fresh hints; "forecast50": use the two latest
+    # fresh observations and a damped first-order prediction (nominal gain 0.5,
+    # with a trust-region cap to prevent early-step overshoot).
+    ref_hint_strategy: str = "reuse"
+    # Any skipped hint computation is approximate and must be explicitly acknowledged.
+    # ref_hint_refresh_interval=1 recomputes every step and is exempt.
     ref_hint_acknowledge_lossy: bool = False
 
     # cache-dit parameters [cache-dit only]

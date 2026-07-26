@@ -22,12 +22,17 @@ All backends implement the same interface:
 - is_enabled(): Check if cache is enabled
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
 
 from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.model_region import ModelRegionHandler
 
 
 class CacheBackend(ABC):
@@ -99,6 +104,10 @@ class CacheBackend(ABC):
             True if cache is enabled, False otherwise.
         """
         return self.enabled
+
+    def get_model_region_handler(self) -> ModelRegionHandler | None:
+        """Return a request-scoped semantic-region handler, if this backend has one."""
+        return None
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"
