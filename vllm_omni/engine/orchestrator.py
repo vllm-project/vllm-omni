@@ -627,7 +627,7 @@ class Orchestrator:
                     self._shutdown_event.wait(),
                     timeout=self._duplex_reaper_interval_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 plane = self.duplex_control_plane
                 if plane is not None:
                     try:

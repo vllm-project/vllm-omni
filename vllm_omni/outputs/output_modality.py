@@ -8,7 +8,14 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+from enum import Enum, Flag, auto
+
+try:
+    from enum import StrEnum
+except ImportError:
+
+    class StrEnum(str, Enum):
+        """Python 3.10-compatible subset used by explicit string enums."""
 
 _MODALITY_ALIASES: dict[str, str] = {
     "speech": "audio",
