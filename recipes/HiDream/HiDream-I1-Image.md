@@ -26,7 +26,7 @@ Use this recipe when you want a known-good starting point for serving
 
 ## Hardware Support
 
-This recipe currently documents single-GPU and two-GPU CFG-Parallel serving configurations.
+This recipe documents single CUDA GPU and two CUDA GPU serving configurations.
 
 ## GPU
 
