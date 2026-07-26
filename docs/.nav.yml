@@ -22,6 +22,7 @@ nav:
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
+      - GO-1-Air: user_guide/examples/offline_inference/go1_air.md
       - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
