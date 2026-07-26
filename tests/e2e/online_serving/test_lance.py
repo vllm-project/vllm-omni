@@ -13,11 +13,11 @@ declaration fails this test rather than silently degrading output.
 Equivalent to running:
 
     vllm-omni serve "bytedance-research/Lance" --omni \\
-        --pipeline lance --enforce-eager --trust-remote-code --port 8091
+        --deploy-config vllm_omni/deploy/lance.yaml --port 8091
 
     # text2img
     python3 examples/offline_inference/text_to_image/text_to_image.py \\
-        --model bytedance-research/Lance --pipeline lance \\
+        --model bytedance-research/Lance --deploy-config vllm_omni/deploy/lance.yaml \\
         --prompt "A cute corgi astronaut" \\
         --extra-body '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}'
 """
@@ -51,20 +51,14 @@ _LANCE_EXTRA_BODY = {
     "timestep_shift": 3.5,
 }
 
-# Lance is single-stage diffusion — no deploy YAML.  Pass the engine
-# knobs that used to live in ``vllm_omni/deploy/lance.yaml`` via CLI
-# flags so ``create_default_diffusion`` builds the stage config.
+# Select the Lance pipeline via its deploy YAML. The YAML already carries the
+# engine knobs (pipeline: lance, max_num_seqs: 1, enforce_eager, trust_remote_code,
+# enable_prefix_caching: false, async_chunk: false), so no other flags are needed.
+# NB: a bare ``--pipeline lance`` flag no longer exists — argparse abbreviates it
+# to ``--pipeline-parallel-size`` and fails on the non-int value.
 _LANCE_SERVE_ARGS = [
-    "--pipeline",
-    "lance",
-    "--max-num-batched-tokens",
-    "32768",
-    "--max-num-seqs",
-    "1",
-    "--enforce-eager",
-    "--trust-remote-code",
-    "--no-enable-prefix-caching",
-    "--no-async-chunk",
+    "--deploy-config",
+    "vllm_omni/deploy/lance.yaml",
 ]
 
 test_params = [
