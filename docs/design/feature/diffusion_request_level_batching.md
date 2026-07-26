@@ -82,7 +82,7 @@ The scheduler derives its capacity from `max_num_seqs` through
 can decide whether admission wait is useful before scheduling a new wave.
 
 Batch compatibility is controlled by
-[`SamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py). The key
+[`RequestBatchSamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py). The key
 contains shape-sensitive and guidance-sensitive fields, including output count
 and LoRA identity. Requests with incompatible shapes, CFG settings, output
 counts, LoRA adapters, or LoRA scales are kept in separate batches.
@@ -147,7 +147,7 @@ outputs do not fall back to pickle IPC for tensor payloads.
 
 - Only pipelines that declare the request-batch contract use fused batch
   execution.
-- Batches are homogeneous under `SamplingParamsKey`; heterogeneous resolution or
+- Batches are homogeneous under `RequestBatchSamplingParamsKey`; heterogeneous resolution or
   incompatible guidance settings do not co-batch yet.
 - FIFO scheduling can reduce batching opportunities when an incompatible
   request is at the front of the queue.

@@ -1,0 +1,34 @@
+[
+    {
+        "test_name": "test_lingbot_video_single_device",
+        "description": "Single-device LingBot dense T2V baseline at 320x192, 9 frames, 2 steps.",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "robbyant/lingbot-video-dense-1.3b",
+            "serve_args": {
+                "model-class-name": "LingBotVideoPipeline",
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "320x192_frames9_steps2",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 320,
+                "height": 192,
+                "num-frames": 9,
+                "fps": 24,
+                "num-inference-steps": 2,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "warmup-requests": 1,
+                "warmup-concurrency": 1,
+                "warmup-num-inference-steps": 2,
+                "enable-negative-prompt": true,
+                "skip-performance-assertion": true
+            }
+        ]
+    }
+]

@@ -54,7 +54,7 @@ from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -486,7 +486,7 @@ class HunyuanImage3Pipeline(
             self._pipeline = HunyuanImage3Text2ImagePipeline(model=self, scheduler=self.scheduler, vae=self.vae)
         return self._pipeline
 
-    def _validate_step_request(self, state: "DiffusionRequestState") -> None:
+    def _validate_step_request(self, state: "StepRequestState") -> None:
         prompt = state.prompt
         sampling = state.sampling
         if prompt is None:
@@ -584,7 +584,7 @@ class HunyuanImage3Pipeline(
 
     def _extract_step_prompt_inputs(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
     ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
         sampling = state.sampling
         return self._extract_prompt_inputs(
@@ -610,7 +610,7 @@ class HunyuanImage3Pipeline(
 
     def _restore_injected_ar_kv(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
@@ -755,7 +755,7 @@ class HunyuanImage3Pipeline(
 
     def _prompt_kv_prefix_lens(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> list[int] | None:
@@ -774,7 +774,7 @@ class HunyuanImage3Pipeline(
 
     def _merge_step_model_inputs(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
         first_step: bool,
@@ -828,7 +828,7 @@ class HunyuanImage3Pipeline(
 
     def _restore_prompt_kv_cache(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
@@ -855,7 +855,7 @@ class HunyuanImage3Pipeline(
 
     def _capture_prompt_kv_cache(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
@@ -1838,9 +1838,9 @@ class HunyuanImage3Pipeline(
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         del kwargs
         self._validate_step_request(state)
         pipe = self.pipeline
@@ -1955,7 +1955,7 @@ class HunyuanImage3Pipeline(
         }
         return state
 
-    def _step_group_key(self, state: "DiffusionRequestState") -> tuple[Any, ...]:
+    def _step_group_key(self, state: "StepRequestState") -> tuple[Any, ...]:
         if _STEP_CFG_FACTOR not in state.extra:
             raise ValueError(f"Missing Hunyuan CFG factor for request {state.request_id}.")
         if _STEP_MODEL_KWARGS not in state.extra:
@@ -1989,16 +1989,16 @@ class HunyuanImage3Pipeline(
 
     def _split_step_groups(
         self,
-        states: list["DiffusionRequestState"],
-    ) -> list[list["DiffusionRequestState"]]:
-        grouped: dict[tuple[Any, ...], list[DiffusionRequestState]] = {}
+        states: list["StepRequestState"],
+    ) -> list[list["StepRequestState"]]:
+        grouped: dict[tuple[Any, ...], list[StepRequestState]] = {}
         for state in states:
             grouped.setdefault(self._step_group_key(state), []).append(state)
         return list(grouped.values())
 
     @staticmethod
     def _step_row_order(
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         cfg_factor: int,
     ) -> tuple[list[int], list[int]]:
         row_state_indexes = [state_idx for _ in range(cfg_factor) for state_idx in range(len(states))]
@@ -2006,7 +2006,7 @@ class HunyuanImage3Pipeline(
         return row_state_indexes, row_branches
 
     @staticmethod
-    def _validate_step_group_states(states: list["DiffusionRequestState"]) -> tuple[bool, int]:
+    def _validate_step_group_states(states: list["StepRequestState"]) -> tuple[bool, int]:
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty group.")
 
@@ -2043,7 +2043,7 @@ class HunyuanImage3Pipeline(
 
     def _split_merged_kwargs_to_states(
         self,
-        states: list["DiffusionRequestState"],
+        states: list["StepRequestState"],
         merged_kwargs: dict[str, Any],
         row_state_indexes: list[int],
         row_branches: list[int],
@@ -2094,7 +2094,7 @@ class HunyuanImage3Pipeline(
             state.extra[_STEP_MODEL_KWARGS] = next_kwargs
             state.extra[_STEP_INPUT_IDS] = None
 
-    def _denoise_step_group(self, states: list["DiffusionRequestState"]) -> torch.Tensor:
+    def _denoise_step_group(self, states: list["StepRequestState"]) -> torch.Tensor:
         first_step, cfg_factor = self._validate_step_group_states(states)
         row_state_indexes, row_branches = self._step_row_order(states, cfg_factor)
         latents = torch.cat([state.latents for state in states], dim=0)
@@ -2179,7 +2179,7 @@ class HunyuanImage3Pipeline(
 
     def step_scheduler(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -2200,7 +2200,7 @@ class HunyuanImage3Pipeline(
 
     def post_decode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         output_type = kwargs.get("output_type", "pil")
@@ -2209,7 +2209,6 @@ class HunyuanImage3Pipeline(
         if output_type == "latent":
             return DiffusionOutput(
                 output=latents,
-                custom_output={},
                 stage_durations=getattr(self, "stage_durations", None),
             )
 
@@ -2232,12 +2231,14 @@ class HunyuanImage3Pipeline(
         )
 
         cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
-        custom_output = {}
+        metadata = {}
         if any(text is not None for text in cot_text_list):
-            custom_output["ar_generated_text"] = cot_text_list[0]
+            metadata["text"] = {"ar_generated_text": cot_text_list[0]}
         return DiffusionOutput(
-            output=image[0],
-            custom_output=custom_output,
+            output={
+                "payload": {"image": image[0]},
+                "metadata": metadata,
+            },
             stage_durations=getattr(self, "stage_durations", None),
         )
 
@@ -2302,12 +2303,14 @@ class HunyuanImage3Pipeline(
 
         outputs = self._generate(**model_inputs, **kwargs)
         image = outputs[0]
-        custom_output = {}
+        metadata = {}
         if any(t is not None for t in cot_text_list):
-            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+            metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(
-            output=image,
-            custom_output=custom_output,
+            output={
+                "payload": {"image": image},
+                "metadata": metadata,
+            },
             stage_durations=stage_durations,
         )

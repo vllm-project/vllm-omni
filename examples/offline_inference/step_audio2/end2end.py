@@ -232,32 +232,42 @@ def main(args):
         raise ValueError(f"Unknown query type: {args.query_type}")
 
     # Initialize vLLM-Omni with Step-Audio2
-    # Resolve stage config path
+    # Resolve deploy config path. Keep explicit stage_configs_path for legacy
+    # custom configs, but use bundled deploy configs by default.
+    deploy_config_path = None
+    stage_config_path = None
+    if args.stage_configs_path and args.deploy_config:
+        raise ValueError("--stage-configs-path and --deploy-config are mutually exclusive")
     if args.stage_configs_path:
         stage_config_path = args.stage_configs_path
+    elif args.deploy_config:
+        deploy_config_path = args.deploy_config
     else:
-        configs_dir = Path(__file__).parent.parent.parent.parent / "vllm_omni/model_executor/stage_configs"
+        configs_dir = Path(__file__).parent.parent.parent.parent / "vllm_omni/deploy"
         if args.query_type == "audio_to_text":
             # ASR only needs Thinker (Stage 0), no Token2Wav
-            stage_config_path = str(configs_dir / "step_audio_2_asr.yaml")
-            if not os.path.exists(stage_config_path):
-                stage_config_path = str(configs_dir / "step_audio_2.yaml")
+            deploy_config_path = str(configs_dir / "step_audio_2_asr.yaml")
         else:
             # TTS/S2ST need both stages
-            stage_config_path = str(configs_dir / "step_audio_2.yaml")
+            deploy_config_path = str(configs_dir / "step_audio_2.yaml")
 
-    omni_llm = Omni(
-        model=model_name,
-        log_stats=args.enable_stats,
-        log_file=("step_audio2_pipeline.log" if args.enable_stats else None),
-        init_sleep_seconds=args.init_sleep_seconds,
-        batch_timeout=args.batch_timeout,
-        init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
-        stage_configs_path=stage_config_path,
-        worker_backend=args.worker_backend,
-        ray_address=args.ray_address,
-    )
+    omni_kwargs = {
+        "model": model_name,
+        "log_stats": args.enable_stats,
+        "log_file": ("step_audio2_pipeline.log" if args.enable_stats else None),
+        "init_sleep_seconds": args.init_sleep_seconds,
+        "batch_timeout": args.batch_timeout,
+        "init_timeout": args.init_timeout,
+        "worker_backend": args.worker_backend,
+        "ray_address": args.ray_address,
+        "trust_remote_code": True,
+    }
+    if stage_config_path is not None:
+        omni_kwargs["stage_configs_path"] = stage_config_path
+    else:
+        omni_kwargs["deploy_config"] = deploy_config_path
+
+    omni_llm = Omni(**omni_kwargs)
 
     # Configure sampling parameters for each stage
     # Stage 0 (Thinker): Generate text and audio tokens
@@ -405,16 +415,21 @@ def parse_args():
         help=(
             "Model path (required). Can be:\n"
             "  - Local path: /path/to/step-audio-2\n"
-            "  - HuggingFace ID: stepfun-ai/Step-Audio2-mini"
+            "  - HuggingFace ID: stepfun-ai/Step-Audio-2-mini"
         ),
     )
     parser.add_argument(
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to stage config YAML file (default: use built-in step_audio_2.yaml)",
+        help="Path to a legacy stage config YAML file (default: use bundled deploy config)",
     )
-
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to a deploy config YAML file (default: use bundled Step-Audio2 deploy config)",
+    )
     # Query configuration
     parser.add_argument(
         "--query-type",

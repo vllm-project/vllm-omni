@@ -254,7 +254,7 @@ done
 
 ```bash
 vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+    --enforce-eager --boundary-ratio 1.0
 ```
 
 #### Start with Optimization Presets

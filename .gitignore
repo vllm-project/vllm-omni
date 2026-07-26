@@ -248,6 +248,7 @@ datasets/
 
 # Output files
 outputs/
+!vllm_omni/outputs/
 results/
 generated/
 output_*/
@@ -258,7 +259,6 @@ configs/production.yaml
 configs/development.yaml
 
 # Docker
-.dockerignore
 Dockerfile.dev
 discussion
 tmp_test

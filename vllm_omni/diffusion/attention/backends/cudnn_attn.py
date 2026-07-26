@@ -51,7 +51,6 @@ class CuDNNAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.requires_gqa = num_heads != num_kv_heads
 
     def forward_cuda(
         self,
@@ -64,6 +63,7 @@ class CuDNNAttentionImpl(AttentionImpl):
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode="broadcast_k")
 
+        enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         # Pin cuDNN exclusively. A priority list like [CUDNN, FLASH, MATH] hits a
         # PyTorch SDPA dispatch quirk: when FLASH rejects a non-None attn_mask,
@@ -85,7 +85,7 @@ class CuDNNAttentionImpl(AttentionImpl):
                     dropout_p=0.0,
                     is_causal=self.causal,
                     scale=self.softmax_scale,
-                    enable_gqa=self.requires_gqa,
+                    enable_gqa=enable_gqa,
                 )
         except RuntimeError as e:
             if "No available kernel" not in str(e):
@@ -102,6 +102,6 @@ class CuDNNAttentionImpl(AttentionImpl):
                 dropout_p=0.0,
                 is_causal=self.causal,
                 scale=self.softmax_scale,
-                enable_gqa=self.requires_gqa,
+                enable_gqa=enable_gqa,
             )
         return output.permute(0, 2, 1, 3)

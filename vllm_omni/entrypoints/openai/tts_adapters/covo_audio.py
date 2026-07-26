@@ -15,6 +15,11 @@ class CovoAudioAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fused_thinker_talker"})
     name = "covo_audio"
 
+    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
+
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:

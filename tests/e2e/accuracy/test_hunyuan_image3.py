@@ -141,7 +141,6 @@ _DEPLOY_CONFIG = {
     "connectors": {
         "shared_memory_connector": {
             "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [
@@ -298,7 +297,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -331,7 +330,10 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if ro and getattr(ro, "outputs", None):
             cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not cot_text:
-            ar_text = getattr(out, "custom_output", {}).get("ar_generated_text")
+            multimodal_output = getattr(out, "multimodal_output", {}) or {}
+            metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+            text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+            ar_text = text_metadata.get("ar_generated_text") if isinstance(text_metadata, dict) else None
             if isinstance(ar_text, list):
                 cot_text = "\n".join(text for text in ar_text if text)
             else:
@@ -365,6 +367,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
         "300",
         "--init-timeout",
         "900",
+        "--trust-remote-code",
     ]
     try:
         with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
@@ -488,7 +491,12 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
+        with OmniRunner(
+            model,
+            deploy_config=deploy_config_path,
+            mode="text-to-image",
+            trust_remote_code=True,
+        ) as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,

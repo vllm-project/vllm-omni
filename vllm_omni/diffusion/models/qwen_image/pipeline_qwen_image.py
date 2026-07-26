@@ -50,7 +50,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -75,8 +75,19 @@ def get_qwen_image_post_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     def post_process_func(
-        images: torch.Tensor,
+        images: torch.Tensor | dict[str, Any],
     ):
+        if isinstance(images, dict) and isinstance(images.get("payload"), dict):
+            payload = dict(images["payload"])
+            image_payload = payload.get("image")
+            if image_payload is None:
+                raise ValueError("Qwen-Image postprocess expected payload['image'] in output envelope.")
+            payload["image"] = image_processor.postprocess(image_payload)
+            metadata = images.get("metadata") or {}
+            return {
+                "payload": payload,
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
         return image_processor.postprocess(images)
 
     return post_process_func
@@ -786,9 +797,9 @@ class QwenImagePipeline(
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
@@ -975,7 +986,7 @@ class QwenImagePipeline(
 
     def step_scheduler(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -996,7 +1007,7 @@ class QwenImagePipeline(
 
     def post_decode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents from *state*."""

@@ -34,6 +34,7 @@ vllm_omni/model_executor/models/
 └── your_model_name/              # Model directory (e.g., qwen3_omni)
     ├── __init__.py               # Exports main model class
     ├── your_model.py             # Main unified model class
+    ├── pipeline.py               # Pipeline topology registry entry
     ├── your_model_stage1_implementation.py      # Stage 1 implementation (e.g., thinker)
     ├── your_model_stage2_implementation.py      # Stage 2 implementation (e.g., talker)
     └── your_model_stage3_implementation.py      # Stage 3 implementation (e.g., code2wav)
@@ -42,9 +43,13 @@ vllm_omni/model_executor/models/
 vllm_omni/model_executor/stage_input_processors/
 └── your_model_name.py            # Stage transition processors
 
-vllm_omni/model_executor/stage_configs/
-└── your_model_name.yaml          # Stage configuration file
+vllm_omni/deploy/
+└── your_model_name.yaml          # Deployment configuration file
 ```
+
+New in-tree models should register their `PipelineConfig` in
+`vllm_omni/config/pipeline_registry.py`; use `--stage-configs-path` only for
+custom legacy `stage_args` YAMLs.
 
 ## Step-by-Step Implementation
 
@@ -535,7 +540,7 @@ Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is 
 
 ## Testing
 
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+For comprehensive testing guidelines, please refer to the [Test Writing Guide](../ci/test_writing_guide.md).
 
 ## Adding a Model Recipe
 

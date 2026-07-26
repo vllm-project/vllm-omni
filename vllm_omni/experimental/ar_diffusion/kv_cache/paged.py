@@ -153,7 +153,7 @@ def chunk_window_skipped_tokens(
     Pure function so the eviction policy is unit-testable without constructing a
     manager. Two strategies:
 
-    - ``reset_at_boundary`` (DreamZero): at each chunk boundary everything past
+    - ``reset_at_boundary``: at each chunk boundary everything past
       the sink is dropped.
     - otherwise (VGGT-style sliding replace): keep the last ``window`` tokens
       (plus the sink); the skip count snaps down to a chunk boundary so a chunk
@@ -182,6 +182,25 @@ class ChunkWindowManager(SlidingWindowManager):
             sliding_window=self.sliding_window,
             sink_chunks=spec.sink_chunks,
             reset_at_boundary=spec.reset_at_boundary,
+        )
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        """Free the middle gap while preserving the leading attention sink."""
+        del num_prompt_tokens
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return
+        sink_blocks = self.kv_cache_spec.sink_chunks
+        num_skipped_blocks = num_skipped_tokens // self.block_size
+        self._remove_blocks_in_range(
+            request_id,
+            sink_blocks,
+            sink_blocks + num_skipped_blocks,
         )
 
 

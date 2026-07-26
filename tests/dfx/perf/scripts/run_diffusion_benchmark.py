@@ -8,15 +8,21 @@ This runner separates two concepts:
 2. ``benchmark_endpoint``: which serving API the benchmark client calls.
    Examples: ``/v1/chat/completions`` and ``/v1/videos``.
 
-A config JSON file is REQUIRED via --test-config-file:
+A config JSON file may be passed via --test-config-file. If omitted, every ``*.json`` under
+``tests/dfx/perf/tests/`` is loaded and pytest ``-m`` filters by each case's ``mark``:
+  pytest run_diffusion_benchmark.py -m "diffusion"
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
 
-All benchmark results for a session are consolidated into a single JSON file under
-BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
-Each entry in the file contains the test metadata (test_name, endpoint, benchmark_params,
-timestamp) together with the raw metrics returned by the benchmark script.
+Optional JSON field ``mark`` is applied as pytest marks on that case via
+``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
+
+All benchmark results are written under BENCHMARK_RESULT_DIR (override via the
+DIFFUSION_BENCHMARK_DIR environment variable). Each source JSON file gets one
+aggregated ``diffusion_result_{config_stem}_{hardware}_{timestamp}.json`` (JSON array
+of all runs from cases in that file). Bulk load without ``--test-config-file`` uses
+the same per-file aggregation; ``-m`` only selects which cases run.
 """
 
 import json
@@ -35,8 +41,15 @@ import psutil
 import pytest
 
 from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
-
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+from tests.dfx.conftest import (
+    create_paired_benchmark_pytest_params,
+    get_runtime_resource_label,
+    hardware_json_value,
+    is_diffusion_perf_config,
+    resolve_pytest_marks,
+    resource_label_for_filename,
+)
+from tests.helpers.runtime import get_open_port
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
@@ -126,6 +139,10 @@ _BRANCHPOINT_COMMIT_SHA: str | None = None
 DIFFUSION_RESULT_TEMPLATE_PATH = Path(__file__).parent / "diffusion_result_template.json"
 
 
+_DIFFUSION_SOURCE_CONFIG_KEY = "_source_config_file"
+_PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+
+
 def _get_config_file_from_argv() -> str | None:
     """Read --test-config-file from sys.argv at import time so pytest parametrize can use it.
 
@@ -142,9 +159,6 @@ def _get_config_file_from_argv() -> str | None:
 
 
 CONFIG_FILE_PATH = _get_config_file_from_argv()
-if CONFIG_FILE_PATH is None:
-    print("No config file provided, using default config file: tests/dfx/perf/tests/test_qwen_image_vllm_omni.json")
-    CONFIG_FILE_PATH = "tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -184,28 +198,85 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
         raise RuntimeError(f"Failed to load configuration file: {str(e)}")
 
 
-BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+def load_diffusion_benchmark_configs(
+    config_path: str | None = None,
+    *,
+    config_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load one diffusion benchmark JSON, or merge all ``*.json`` under *config_dir*."""
+    if config_path is not None:
+        configs = load_configs(config_path)
+        source = str(Path(config_path).resolve())
+        for cfg in configs:
+            cfg.setdefault(_DIFFUSION_SOURCE_CONFIG_KEY, source)
+        return configs
+    if config_dir is None:
+        raise ValueError("load_diffusion_benchmark_configs requires config_path or config_dir")
+    configs: list[dict[str, Any]] = []
+    for path in sorted(config_dir.glob("*.json")):
+        source = str(path.resolve())
+        for cfg in load_configs(str(path)):
+            cfg[_DIFFUSION_SOURCE_CONFIG_KEY] = source
+            configs.append(cfg)
+    if not configs:
+        raise ValueError(f"No benchmark JSON files found under {config_dir}")
+    return configs
 
-_config_stem = Path(CONFIG_FILE_PATH).stem  # e.g. "test_qwen_image_vllm_omni"
-AGGREGATED_RESULT_FILE = BENCHMARK_RESULT_DIR / f"diffusion_result_{_config_stem}_{_SESSION_TIMESTAMP}.json"
+
+if CONFIG_FILE_PATH is None:
+    _all_configs = load_diffusion_benchmark_configs(config_dir=_PERF_TESTS_DIR)
+    BENCHMARK_CONFIGS = [cfg for cfg in _all_configs if is_diffusion_perf_config(cfg)]
+    print(
+        f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} diffusion case(s) from "
+        f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} omni/tts; "
+        f"use -m to filter, e.g. -m diffusion)"
+    )
+else:
+    BENCHMARK_CONFIGS = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+
+_AGGREGATED_RESULT_FILES_BY_SOURCE: dict[str, Path] = {}
 
 
-def _append_to_aggregated_file(record: dict[str, Any]) -> None:
-    """Thread-safe append of *record* to the session-level aggregated JSON file.
+def _normalized_source_path(source_file: str) -> str:
+    return str(Path(source_file).resolve())
 
-    The file contains a JSON array; each call loads the existing array (or
-    starts a new one), appends the record, and writes the file back atomically.
-    """
+
+def _aggregated_result_file_for_source(source_file: str) -> Path:
+    """One session aggregate per source JSON (same naming as single ``--test-config-file``)."""
+    key = _normalized_source_path(source_file)
+    if key not in _AGGREGATED_RESULT_FILES_BY_SOURCE:
+        stem = Path(key).stem
+        resource = resource_label_for_filename(get_runtime_resource_label())
+        if resource:
+            result_name = f"diffusion_result_{stem}_{resource}_{_SESSION_TIMESTAMP}.json"
+        else:
+            result_name = f"diffusion_result_{stem}_{_SESSION_TIMESTAMP}.json"
+        _AGGREGATED_RESULT_FILES_BY_SOURCE[key] = BENCHMARK_RESULT_DIR / result_name
+    return _AGGREGATED_RESULT_FILES_BY_SOURCE[key]
+
+
+def _write_result_record(record: dict[str, Any]) -> Path:
+    """Append one benchmark record to the aggregate file for its source JSON."""
+    source_file = record.get("source_file") or CONFIG_FILE_PATH
+    if not source_file:
+        raise ValueError("benchmark record missing source_file")
+    target = _aggregated_result_file_for_source(str(source_file))
     with _RESULT_LOCK:
         BENCHMARK_RESULT_DIR.mkdir(parents=True, exist_ok=True)
-        if AGGREGATED_RESULT_FILE.exists():
-            with open(AGGREGATED_RESULT_FILE, encoding="utf-8") as f:
+        if target.exists():
+            with open(target, encoding="utf-8") as f:
                 records: list[dict] = json.load(f)
         else:
             records = []
         records.append(record)
-        with open(AGGREGATED_RESULT_FILE, "w", encoding="utf-8") as f:
+        with open(target, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
+    return target
+
+
+def _append_to_aggregated_file(record: dict[str, Any]) -> None:
+    """Backward-compatible wrapper; prefer :func:`_write_result_record`."""
+    _write_result_record(record)
 
 
 _server_lock = threading.Lock()
@@ -213,14 +284,6 @@ _server_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _get_open_port() -> int:
-    """Return an available TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 1200, proc: subprocess.Popen | None = None) -> None:
@@ -312,7 +375,7 @@ class DiffusionServer:
         self.model = server_cfg["model"]
         self.serve_args = server_cfg["serve_args"]
         self.host = "127.0.0.1"
-        self.port = port if port is not None else _get_open_port()
+        self.port = port if port is not None else get_open_port(self.host)
         self.proc: subprocess.Popen | None = None
         self.test_name: str = ""
 
@@ -482,6 +545,7 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "serve_args": _build_serve_args(serve_args_dict),
                 "benchmark_endpoint": cfg.get("benchmark_endpoint", cfg.get("benchmark_backend")),
                 "server_params": cfg["server_params"],
+                "mark": cfg.get("mark"),
             }
         )
     return result
@@ -496,19 +560,29 @@ def _test_param_mapping(configs: list[dict[str, Any]]) -> dict[str, list[dict]]:
     return mapping
 
 
-def _make_server(server_cfg: dict[str, Any]) -> DiffusionServer:
-    """Factory: return a vLLM-Omni diffusion server instance for the config."""
-    return DiffusionServer(server_cfg=server_cfg)
+def _marks_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[pytest.MarkDecorator]]:
+    return {str(cfg["test_name"]): resolve_pytest_marks(cfg.get("mark")) for cfg in configs}
+
+
+def _paired_diffusion_benchmark_pytest_params(configs: list[dict[str, Any]]) -> list[Any]:
+    """Paired params for ``run_diffusion_benchmark.py``; same shape as omni runner."""
+    test_param_map = _test_param_mapping(configs)
+    server_entries = [(cfg, cfg["test_name"]) for cfg in _unique_server_params(configs)]
+    return create_paired_benchmark_pytest_params(server_entries, test_param_map, _marks_by_test_name(configs))
 
 
 # ---------------------------------------------------------------------------
 # Parametrize data
 # ---------------------------------------------------------------------------
 
-server_params = _unique_server_params(BENCHMARK_CONFIGS)
 test_param_map = _test_param_mapping(BENCHMARK_CONFIGS)
+paired_benchmark_params = _paired_diffusion_benchmark_pytest_params(BENCHMARK_CONFIGS)
 
-benchmark_indices: list[int] = list(range(max(len(v) for v in test_param_map.values())))
+
+def _make_server(server_cfg: dict[str, Any]) -> DiffusionServer:
+    """Factory: return a vLLM-Omni diffusion server instance for the config."""
+    return DiffusionServer(server_cfg=server_cfg)
+
 
 # ---------------------------------------------------------------------------
 # Pytest fixtures
@@ -534,16 +608,13 @@ def diffusion_server(request):
 
 
 @pytest.fixture
-def benchmark_params(request, diffusion_server):
-    """Yield the benchmark params dict for the current (server, index) pair."""
-    param_index: int = request.param
-    test_name = diffusion_server.test_name
+def benchmark_params(request):
+    """Benchmark params for the paired server/index parametrization."""
+    test_name, param_index = request.param
 
     params_list = test_param_map.get(test_name, [])
     if not params_list:
         raise ValueError(f"No benchmark params for test: {test_name}")
-    if param_index >= len(params_list):
-        pytest.skip(f"Param index {param_index} out of range for {test_name} (has {len(params_list)} params)")
 
     current = param_index + 1
     total = len(params_list)
@@ -575,8 +646,8 @@ def run_benchmark(
     The raw metrics are written to a temporary file by the subprocess.  After
     the run completes the metrics are merged with full metadata (test_name,
     endpoint, benchmark_params, timestamp, flat reporting fields) and appended
-    to the session-wide aggregated JSON file (AGGREGATED_RESULT_FILE).  The
-    temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
+    to ``diffusion_result_{config_stem}_{hardware}_{timestamp}.json`` for the
+    source JSON file. The temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
     to a .log file under BENCHMARK_RESULT_DIR/logs/; its path is stored in
     the record.
     """
@@ -586,7 +657,12 @@ def run_benchmark(
     log_dir = BENCHMARK_RESULT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     endpoint_label = endpoint_filename_token(endpoint)
-    log_file = log_dir / f"{test_name}_{endpoint_label}_{timestamp}.log"
+    resource_label = get_runtime_resource_label()
+    hw_for_filename = resource_label_for_filename(resource_label)
+    if hw_for_filename:
+        log_file = log_dir / f"{test_name}_{hw_for_filename}_{endpoint_label}_{timestamp}.log"
+    else:
+        log_file = log_dir / f"{test_name}_{endpoint_label}_{timestamp}.log"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
@@ -696,7 +772,7 @@ def run_benchmark(
         "Model": model,
         "Framework": server_type,
         "API Endpoint": endpoint,
-        "Hardware": "",
+        "Hardware": hardware_json_value(resource_label),
         "Deployment": "",
         "Task": params.get("task", "t2i"),
         "Dataset": params.get("dataset", "random"),
@@ -728,8 +804,8 @@ def run_benchmark(
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,
     }
-    _append_to_aggregated_file(record)
-    print(f"\n  Result appended to: {AGGREGATED_RESULT_FILE}")
+    result_path = _write_result_record(record)
+    print(f"\n  Result saved to: {result_path}")
     print(f"  Log saved to:       {log_file}")
 
     return metrics
@@ -807,7 +883,7 @@ def assert_result(
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
     """Return the default client-side benchmark endpoint for a diffusion task."""
-    if task in {"t2v", "i2v", "ti2v"}:
+    if task in {"t2v", "i2v", "ti2v", "v2v"}:
         return "/v1/videos"
     if task in {"t2i", "i2i", "ti2i"}:
         return "/v1/chat/completions"
@@ -932,12 +1008,10 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
-    "diffusion_server",
-    server_params,
-    ids=[p["test_name"] for p in server_params],
-    indirect=True,
+    "diffusion_server,benchmark_params",
+    paired_benchmark_params,
+    indirect=["diffusion_server", "benchmark_params"],
 )
-@pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
     """Run the diffusion performance benchmark and verify request completion.
 
@@ -962,7 +1036,10 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, req
             test_name=test_name,
             endpoint=endpoint,
             server_cfg=server_cfg,
-            source_file=cast(str, CONFIG_FILE_PATH),
+            source_file=server_cfg.get(
+                _DIFFUSION_SOURCE_CONFIG_KEY,
+                CONFIG_FILE_PATH or f"{_PERF_TESTS_DIR}/*.json",
+            ),
         )
 
         print(f"\n{'=' * 60}")
@@ -980,7 +1057,9 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, req
             if key in result:
                 print(f"  {key}: {result[key]:.4f}")
 
-        print(f"\n  Aggregated results: {AGGREGATED_RESULT_FILE}")
+        source = server_cfg.get(_DIFFUSION_SOURCE_CONFIG_KEY) or CONFIG_FILE_PATH
+        if source:
+            print(f"\n  Aggregated results: {_aggregated_result_file_for_source(str(source))}")
         print("=" * 60)
 
         assert_baseline = request.config.getoption("--assert-baseline", default=False)

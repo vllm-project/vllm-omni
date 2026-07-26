@@ -80,6 +80,7 @@ class ComponentQuantizationConfig(QuantizationConfig):
         component_configs: dict[str, QuantizationConfig | None],
         default_config: QuantizationConfig | None = None,
     ) -> None:
+        super().__init__()
         self._components = component_configs
         self._default = default_config
         self._sorted_prefixes = sorted(self._components.keys(), key=len, reverse=True)

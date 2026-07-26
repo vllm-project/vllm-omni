@@ -7,8 +7,9 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
@@ -40,15 +41,40 @@ except ValueError:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    # ------------------------------------------------------------------ #
+    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
+    # ------------------------------------------------------------------ #
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    # ------------------------------------------------------------------ #
-    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
-    # ------------------------------------------------------------------ #
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            adapter.segment_finished_requests.discard(session.request_id)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.additional_information = update.additional_information or None
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
@@ -68,7 +94,6 @@ class OmniSchedulerMixin:
             )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
-            self.running,
             connector_output.stage_recv_req_ids if connector_output else set(),
         )
 
