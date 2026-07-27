@@ -295,9 +295,24 @@ def test_forward_uses_request_guidance_scale_when_true_cfg_scale_unset():
 
     diffuse_call = {}
 
-    def _fake_diffuse(*args, **kwargs):
-        del args
-        diffuse_call.update(kwargs)
+    def _fake_diffuse(
+        prompt_embeds_t5,
+        prompt_embeds_llama3,
+        pooled_prompt_embeds,
+        negative_prompt_embeds_t5,
+        negative_prompt_embeds_llama3,
+        negative_pooled_prompt_embeds,
+        latents,
+        timesteps,
+        do_true_cfg,
+        true_cfg_scale,
+    ):
+        diffuse_call.update(
+            {
+                "do_true_cfg": do_true_cfg,
+                "true_cfg_scale": true_cfg_scale,
+            }
+        )
         raise StopAfterDiffuseError
 
     pipeline.check_inputs = lambda *args, **kwargs: None
@@ -332,9 +347,24 @@ def test_forward_enables_cfg_with_precomputed_negative_embeds():
 
     diffuse_call = {}
 
-    def _fake_diffuse(*args, **kwargs):
-        del args
-        diffuse_call.update(kwargs)
+    def _fake_diffuse(
+        prompt_embeds_t5,
+        prompt_embeds_llama3,
+        pooled_prompt_embeds,
+        negative_prompt_embeds_t5,
+        negative_prompt_embeds_llama3,
+        negative_pooled_prompt_embeds,
+        latents,
+        timesteps,
+        do_true_cfg,
+        true_cfg_scale,
+    ):
+        diffuse_call.update(
+            {
+                "do_true_cfg": do_true_cfg,
+                "negative_prompt_embeds_t5": negative_prompt_embeds_t5,
+            }
+        )
         raise StopAfterDiffuseError
 
     embeds = _fake_encode_outputs(batch_size=1)
