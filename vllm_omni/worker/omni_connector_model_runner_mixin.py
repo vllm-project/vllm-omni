@@ -711,6 +711,12 @@ class OmniConnectorModelRunnerMixin:
         results = self._broadcast_tp_payload_packet(results)
         if not results:
             return None
+        logger.info(
+            "[DIAG-5437][stage2-recv] stage=%s consumed_req_ids=%s payload_keys=%s",
+            self._stage_id,
+            list(results.keys()),
+            {rid: (sorted(p.keys()) if isinstance(p, dict) else type(p).__name__) for rid, p in results.items()},
+        )
         with self._lock:
             self._stage_recv_req_ids.update(results.keys())
             for req_id in results:
@@ -771,6 +777,15 @@ class OmniConnectorModelRunnerMixin:
         result = should_accumulate_full_payload_output(
             model_config,
             getattr(self, "_custom_process_func", None),
+        )
+        logger.info(
+            "[DIAG-5437][accum-gate] stage=%s async_chunk=%s final_output=%s next_stage_func=%r model_stage=%s -> %s",
+            getattr(model_config, "model_stage", None),
+            getattr(model_config, "async_chunk", None),
+            getattr(model_config, "final_output", None),
+            getattr(model_config, "custom_process_next_stage_input_func", None),
+            getattr(model_config, "model_stage", None),
+            result,
         )
         self._should_accumulate_full_payload_output_cached = result
         return result
@@ -873,6 +888,15 @@ class OmniConnectorModelRunnerMixin:
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
+        logger.info(
+            "[DIAG-5437][accum] req=%s first=%s keys=%s codes.audio=%s",
+            req_id,
+            existing is None,
+            sorted(pooler_output.keys()) if isinstance(pooler_output, dict) else type(pooler_output).__name__,
+            tuple(pooler_output["codes.audio"].shape)
+            if isinstance(pooler_output, dict) and isinstance(pooler_output.get("codes.audio"), torch.Tensor)
+            else "n/a",
+        )
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
 
@@ -920,6 +944,12 @@ class OmniConnectorModelRunnerMixin:
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
+        logger.info(
+            "[DIAG-5437][flush] stage=%s finished_req_ids=%s pending=%s",
+            self._stage_id,
+            finished_req_ids,
+            list(self._pending_full_payload_send.keys()),
+        )
         if not (finished_req_ids & pending_req_ids):
             return
 
@@ -999,6 +1029,14 @@ class OmniConnectorModelRunnerMixin:
                     sorted(payload.keys()),
                     code_len,
                     meta.get("left_context_size"),
+                )
+                logger.info(
+                    "[DIAG-5437][send] req=%s payload_keys=%s code_len=%s finished=%s last_chunk=%s",
+                    req_id,
+                    sorted(payload.keys()),
+                    code_len,
+                    meta.get("finished"),
+                    meta.get("last_chunk"),
                 )
 
             external_req_id = self._resolve_external_req_id(request, req_id)

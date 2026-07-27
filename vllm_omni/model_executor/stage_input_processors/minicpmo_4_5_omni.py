@@ -398,6 +398,14 @@ def tts2code2wav(
 
     # full_payload delivers the complete sequence once; this is the terminal chunk.
     finished = True
+    logger.info(
+        "[DIAG-5437][sync-bridge] req=%s audio_type=%s audio_shape=%s new_codes_len=%d finished=%s",
+        request_id,
+        type(audio).__name__,
+        tuple(audio.shape) if isinstance(audio, torch.Tensor) else "n/a",
+        len(new_codes),
+        finished,
+    )
 
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
 

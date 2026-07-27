@@ -457,6 +457,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
             finished = is_eos or reached_limit
+            if finished:
+                logger.info(
+                    "[DIAG-5437][TTS-finish] req=%s step=%d is_eos=%s reached_limit=%s",
+                    request_id, step, is_eos, reached_limit,
+                )
             state["finished"] = finished
             if not is_eos:
                 codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
@@ -480,6 +485,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": {"finished": terminal_flags},
         }
+        # [DIAG-5437] Trace Stage1 TTS output per make_omni_output call.
+        _diag_finished = [bool(t.item()) for t in terminal_flags] if terminal_flags else []
+        _diag_shapes = [
+            tuple(c.shape) if isinstance(c, torch.Tensor) else type(c).__name__
+            for c in codec_deltas
+        ]
+        logger.info(
+            "[DIAG-5437][TTS] n_req=%d finished=%s codes_shapes=%s",
+            len(codec_deltas),
+            _diag_finished,
+            _diag_shapes,
+        )
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,

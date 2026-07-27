@@ -1196,7 +1196,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             pooler_inter, pooler_client = pooler_output, pooler_output
 
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
-        if pooler_inter and self._should_accumulate_full_payload_output():
+        _accum_gate = self._should_accumulate_full_payload_output()
+        logger.info(
+            "[DIAG-5437][stage1-accum-call] gate=%s pooler_inter_empty=%s n_req=%d",
+            _accum_gate,
+            not bool(pooler_inter),
+            len(req_ids_output_copy) if pooler_inter else 0,
+        )
+        if pooler_inter and _accum_gate:
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
