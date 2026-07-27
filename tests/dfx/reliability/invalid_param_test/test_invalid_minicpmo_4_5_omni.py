@@ -14,14 +14,14 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni, pytest.mark.full_model]
 
-_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 _MINICPMO_SERVER = [
     pytest.param(
         OmniServerParams(
             model="openbmb/MiniCPM-o-4_5",
             stage_config_path=_MINICPMO_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
                 "--no-async-chunk",

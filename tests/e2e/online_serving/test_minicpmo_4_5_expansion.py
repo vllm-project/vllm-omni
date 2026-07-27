@@ -18,14 +18,14 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
             ],

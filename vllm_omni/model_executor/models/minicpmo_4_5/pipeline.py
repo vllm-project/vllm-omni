@@ -7,7 +7,8 @@ Stage 1: Talker  — MiniCPMTTS, emits codec tokens.
 Stage 2: Code2Wav — codec tokens to the final audio waveform.
 
 The thinker -> talker bridge uses ``llm2tts``. The talker -> Code2Wav bridge
-streams request-routed codec chunks.
+uses ``tts2code2wav_async_chunk`` in async_chunk mode and ``tts2code2wav`` in
+full-payload (sync, ``--no-async-chunk``) mode.
 """
 
 from vllm_omni.config.stage_config import (
@@ -61,6 +62,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.llm2tts",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav",
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(

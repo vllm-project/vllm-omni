@@ -1,9 +1,10 @@
 """
 E2E Online tests for MiniCPM-o 4.5 model with multimodal input and audio / text output.
 
-MiniCPM-o 4.5 has ``async_chunk: false``, ``max_num_seqs: 1`` on both stages,
-and the vocoder runs in-process inside the talker stage rather than as a separate
-Code2Wav stage.
+MiniCPM-o 4.5 is a three-stage pipeline: Stage 0 Thinker (text), Stage 1 Talker
+(TTS codec), Stage 2 Code2Wav (vocoder). The talker -> Code2Wav bridge supports
+both async_chunk (streaming) and full-payload (``--no-async-chunk``) modes, so the
+tests below exercise the sync path as well.
 """
 
 import os
@@ -18,14 +19,14 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
                 "--no-async-chunk",
@@ -201,7 +202,6 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni

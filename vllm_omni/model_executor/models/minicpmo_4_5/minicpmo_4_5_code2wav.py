@@ -117,7 +117,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
-        self.model_path = str(vllm_config.model_config.model)
+        model_name_or_path = str(vllm_config.model_config.model)
+        if not os.path.isdir(model_name_or_path):
+            from huggingface_hub import snapshot_download
+
+            model_name_or_path = snapshot_download(model_name_or_path)
+        self.model_path = model_name_or_path
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
         self._owned_prompt_wavs: dict[str, tuple[str, str]] = {}
