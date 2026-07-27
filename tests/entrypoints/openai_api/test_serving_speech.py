@@ -47,9 +47,9 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
 )
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
-    SAMPLE_RATE,
     SPEAKER_EMBEDDING_DIM,
 )
 from vllm_omni.outputs import OmniRequestOutput
@@ -1741,8 +1741,8 @@ class TestTTSMethods:
             ref_text="Two reference speakers.",
         )
         ref_audio_data = [
-            ([0.1, 0.2, 0.3], SAMPLE_RATE),
-            ([0.4, 0.5], SAMPLE_RATE),
+            ([0.1, 0.2, 0.3], 16000),
+            ([0.4, 0.5], 24000),
         ]
 
         prompt = speech_server._build_ming_dense_prompt(
@@ -1754,8 +1754,13 @@ class TestTTSMethods:
 
         info = prompt["additional_information"]
         assert KEY_SPEAKER_EMBEDDING not in info
-        assert KEY_SPEAKER_WAVEFORM not in info
+        torch.testing.assert_close(
+            info[KEY_SPEAKER_WAVEFORM],
+            torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], dtype=torch.float32),
+        )
         assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3, 2]
+        assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000, 24000]
+        assert info["prompt_waveform"].shape[-1] > info[KEY_SPEAKER_WAVEFORM].shape[-1]
         assert info["voice_name"] == "uploaded_voice"
         assert info["voice_created_at"] == 123
         assert prompt["prompt_token_ids"].count(777) == 2
@@ -1775,12 +1780,14 @@ class TestTTSMethods:
 
         prompt = speech_server._build_ming_dense_prompt(
             request,
-            ref_audio_data=([0.1, 0.2, 0.3], SAMPLE_RATE),
+            ref_audio_data=([0.1, 0.2, 0.3], 16000),
         )
 
         info = prompt["additional_information"]
         assert info[KEY_SPEAKER_WAVEFORM].shape == (1, 3)
         assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3]
+        assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000]
+        assert "prompt_waveform" not in info
         assert KEY_SPEAKER_EMBEDDING not in info
 
     def test_ming_adapter_legacy_audio_only_voice_forwards_audio_to_worker(

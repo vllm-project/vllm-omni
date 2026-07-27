@@ -16,6 +16,7 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 from .audio_prep import coerce_prompt_waveform, coerce_speaker_embeddings
 from .constants import (
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
 )
@@ -79,7 +80,10 @@ def _load_speaker_extractor(wrapper: Any) -> MingSpeakerEmbeddingExtractor:
     return extractor
 
 
-def _speaker_waveforms_from_info(info_dict: dict[str, Any]) -> list[torch.Tensor]:
+def _speaker_waveforms_from_info(
+    info_dict: dict[str, Any],
+    default_sample_rate: int,
+) -> list[tuple[torch.Tensor, int]]:
     raw_waveform = info_dict.get(KEY_SPEAKER_WAVEFORM)
     if raw_waveform is None:
         raw_waveform = info_dict.get("prompt_waveform")
@@ -89,23 +93,34 @@ def _speaker_waveforms_from_info(info_dict: dict[str, Any]) -> list[torch.Tensor
     waveform = coerce_prompt_waveform(raw_waveform)
     raw_lengths = info_dict.get(KEY_SPEAKER_WAVEFORM_LENGTHS)
     if raw_lengths is None:
-        return [waveform]
-    lengths = torch.as_tensor(raw_lengths).detach().reshape(-1).to(torch.int64).cpu().tolist()
-    if not lengths or any(int(length) <= 0 for length in lengths):
-        raise ValueError(f"Invalid Ming speaker waveform lengths: {lengths}")
-    if sum(int(length) for length in lengths) > int(waveform.shape[-1]):
-        raise ValueError(
-            "Ming speaker waveform lengths exceed the waveform size: "
-            f"lengths={lengths}, waveform_samples={int(waveform.shape[-1])}"
-        )
+        parts = [waveform]
+    else:
+        lengths = torch.as_tensor(raw_lengths).detach().reshape(-1).to(torch.int64).cpu().tolist()
+        if not lengths or any(int(length) <= 0 for length in lengths):
+            raise ValueError(f"Invalid Ming speaker waveform lengths: {lengths}")
+        if sum(int(length) for length in lengths) > int(waveform.shape[-1]):
+            raise ValueError(
+                "Ming speaker waveform lengths exceed the waveform size: "
+                f"lengths={lengths}, waveform_samples={int(waveform.shape[-1])}"
+            )
 
-    parts = []
-    offset = 0
-    for length in lengths:
-        end = offset + int(length)
-        parts.append(waveform[:, offset:end])
-        offset = end
-    return parts
+        parts = []
+        offset = 0
+        for length in lengths:
+            end = offset + int(length)
+            parts.append(waveform[:, offset:end])
+            offset = end
+
+    raw_sample_rates = info_dict.get(KEY_SPEAKER_SAMPLE_RATES)
+    if raw_sample_rates is None:
+        sample_rates = [int(default_sample_rate)] * len(parts)
+    else:
+        sample_rates = torch.as_tensor(raw_sample_rates).detach().reshape(-1).to(torch.int64).cpu().tolist()
+        if len(sample_rates) != len(parts) or any(int(sample_rate) <= 0 for sample_rate in sample_rates):
+            raise ValueError(
+                f"Invalid Ming speaker sample rates: sample_rates={sample_rates}, waveform_count={len(parts)}"
+            )
+    return [(waveform_part, int(sample_rate)) for waveform_part, sample_rate in zip(parts, sample_rates, strict=True)]
 
 
 def _resolve_speaker_embeddings(wrapper: Any, info_dict: dict[str, Any]) -> list[torch.Tensor] | None:
@@ -137,17 +152,16 @@ def _resolve_speaker_embeddings(wrapper: Any, info_dict: dict[str, Any]) -> list
                 logger.debug("Speaker cache HIT for Ming-TTS speaker '%s'", voice_name)
                 return cached_embeddings
 
-    waveforms = _speaker_waveforms_from_info(info_dict)
-    if not waveforms:
+    waveform_inputs = _speaker_waveforms_from_info(info_dict, int(wrapper.ming_config.sample_rate))
+    if not waveform_inputs:
         if cache_key is not None:
             raise ValueError(f"Ming-TTS speaker '{voice_name}' was requested without reference audio on cache miss")
         return None
 
     extractor = _load_speaker_extractor(wrapper)
-    sample_rate = int(wrapper.ming_config.sample_rate)
     embeddings = [
         extractor.extract_from_waveform(waveform, sample_rate).detach().reshape(-1).to(torch.float32).cpu()
-        for waveform in waveforms
+        for waveform, sample_rate in waveform_inputs
     ]
     resolved = coerce_speaker_embeddings(embeddings)
     if cache_key is not None and resolved is not None:

@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
     LATENT_DIM,
@@ -164,12 +165,27 @@ def test_ming_stage0_speaker_extraction_splits_multiple_waveforms():
         {
             KEY_SPEAKER_WAVEFORM: torch.arange(10, dtype=torch.float32).reshape(1, -1),
             KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([4, 6]),
+            KEY_SPEAKER_SAMPLE_RATES: torch.tensor([16000, 24000]),
         },
     )
 
     assert embeddings is not None and len(embeddings) == 2
     assert [call[0].shape[-1] for call in wrapper._speaker_extractor.calls] == [4, 6]
-    assert all(call[1] == SAMPLE_RATE for call in wrapper._speaker_extractor.calls)
+    assert [call[1] for call in wrapper._speaker_extractor.calls] == [16000, 24000]
+
+
+def test_ming_stage0_speaker_extraction_rejects_mismatched_sample_rates():
+    wrapper = _make_ming_speaker_wrapper()
+
+    with pytest.raises(ValueError, match="Invalid Ming speaker sample rates"):
+        _resolve_speaker_embeddings(
+            wrapper,
+            {
+                KEY_SPEAKER_WAVEFORM: torch.arange(10, dtype=torch.float32).reshape(1, -1),
+                KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([4, 6]),
+                KEY_SPEAKER_SAMPLE_RATES: torch.tensor([16000]),
+            },
+        )
 
 
 def test_ming_stage0_direct_speaker_embedding_bypasses_extractor():
