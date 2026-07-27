@@ -1249,3 +1249,71 @@ class TestPromptIdsClampPaddingConvention:
         # of range even for the vocab_size+1 penalty bins of a narrower head.
         with pytest.raises(RuntimeError):
             get_token_bin_counts_and_mask(self._padded_prompt(), self.LOGITS_VOCAB, 1)
+
+
+class TestSparseAudioMarkerRobustness:
+    """RFC #5450 C3: `_is_sparse_audio_marker` must not crash on tensor/array
+    markers, and the combined prefix-cache payload builder must never ship one
+    request's data as another's."""
+
+    def test_marker_list_and_str_forms(self):
+        marker = GPUARModelRunner._is_sparse_audio_marker
+        assert marker(["1"]) is True
+        assert marker(["0"]) is False
+        assert marker("true") is True
+        assert marker("off") is False
+
+    def test_marker_scalar_tensor_and_array(self):
+        marker = GPUARModelRunner._is_sparse_audio_marker
+        assert marker(torch.tensor(1)) is True
+        assert marker(torch.tensor([0])) is False
+        assert marker(np.array(1)) is True
+        assert marker(np.array([0])) is False
+
+    def test_marker_multi_element_tensor_does_not_crash(self):
+        # `bool(tensor)` used to raise "Boolean value of Tensor with more than
+        # one element is ambiguous"; now warns and treats it as no-marker.
+        marker = GPUARModelRunner._is_sparse_audio_marker
+        assert marker(torch.ones(3)) is False
+        assert marker(np.ones((2, 2))) is False
+
+    def test_combined_payload_unwraps_aligned_list(self):
+        combined = {"codes.audio": {"req-1": [torch.zeros(1), torch.ones(1)]}}
+        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", idx=1)
+        assert torch.equal(payload["codes.audio"], torch.ones(1))
+
+    def test_combined_payload_broadcasts_shared_singleton(self):
+        # Length-1 lists are batch-shared passthrough metadata (e.g.
+        # `meta.sparse_audio: ["1"]`) duplicated per request by the merge.
+        combined = {"meta.sparse_audio": {"req-1": ["1"]}}
+        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", idx=2)
+        assert payload["meta.sparse_audio"] == "1"
+
+    def test_combined_payload_misalignment_raises_not_request_zero(self):
+        # A short multi-element list used to silently return `v[0]` - request
+        # 0's payload shipped under request `rid`. It must fail loudly instead.
+        combined = {"codes.audio": {"req-3": [torch.zeros(1), torch.ones(1)]}}
+        with pytest.raises(ValueError, match="req-3"):
+            GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-3", idx=2)
+
+    def test_combined_payload_uses_sparse_index_under_sparse_routing(self):
+        # Batch [r0, r1, r2], sparse outputs only for [r1, r2]: producers
+        # align per-request lists to the SPARSE order, so r1 (batch idx 1,
+        # sparse idx 0) must get element 0 and r2 (batch idx 2, sparse idx 1)
+        # element 1. Indexing by batch idx shipped r2's payload to r1 and
+        # went out of range for r2.
+        sparse_mm_index = {"r1": 0, "r2": 1}
+        combined = {
+            "codes.audio": {
+                "r1": [torch.zeros(1), torch.ones(1)],
+                "r2": [torch.zeros(1), torch.ones(1)],
+            }
+        }
+        p1 = GPUARModelRunner._build_combined_prefix_cache_mm_payload(
+            combined, rid="r1", idx=1, audio_sparse_output=True, sparse_mm_index=sparse_mm_index
+        )
+        p2 = GPUARModelRunner._build_combined_prefix_cache_mm_payload(
+            combined, rid="r2", idx=2, audio_sparse_output=True, sparse_mm_index=sparse_mm_index
+        )
+        assert torch.equal(p1["codes.audio"], torch.zeros(1))
+        assert torch.equal(p2["codes.audio"], torch.ones(1))

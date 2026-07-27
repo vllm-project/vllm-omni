@@ -530,6 +530,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return any(str(item).lower() in ("1", "true", "yes", "on") for item in value)
         if isinstance(value, str):
             return value.lower() in ("1", "true", "yes", "on")
+        # Defensive hardening: markers ride `multimodal_outputs`, so tensors or
+        # arrays can appear. `bool()` on a multi-element tensor/ndarray raises
+        # ("Boolean value ... is ambiguous"); only a scalar has an unambiguous
+        # truth value. In-tree producers emit `["1"]` (voxcpm2) today.
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return bool(value.item())
+            logger.warning("Ignoring non-scalar sparse-audio marker tensor of shape %s.", tuple(value.shape))
+            return False
+        if isinstance(value, np.ndarray):
+            if value.size == 1:
+                return bool(value.reshape(()).item())
+            logger.warning("Ignoring non-scalar sparse-audio marker array of shape %s.", value.shape)
+            return False
         return bool(value)
 
     def capture_model(self) -> int:
@@ -886,10 +900,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         *,
         rid: str,
         idx: int,
+        audio_sparse_output: bool = False,
+        sparse_mm_index: dict[str, int] | None = None,
     ) -> dict[str, object]:
+        # Sparse-audio producers emit per-request lists aligned to the sparse
+        # request order (`meta.req_id`), not the batch order; under sparse
+        # routing the request's sparse index selects its element.
+        list_idx = idx
+        if audio_sparse_output and sparse_mm_index is not None:
+            sparse_idx = sparse_mm_index.get(rid)
+            if sparse_idx is not None:
+                list_idx = sparse_idx
+
         def _unwrap_lists(v):
             if isinstance(v, list):
-                return v[idx] if idx < len(v) else v[0]
+                if list_idx < len(v):
+                    return v[list_idx]
+                if len(v) == 1:
+                    # Length-1 lists are batch-shared passthrough metadata
+                    # (e.g. `meta.sparse_audio: ["1"]`) that the prefix-cache
+                    # merge broadcasts to every request; unwrap the shared
+                    # element.
+                    return v[0]
+                # A multi-element list shorter than the request's batch index
+                # is per-request data that lost alignment; returning `v[0]`
+                # here would silently ship request 0's payload as request
+                # `rid`'s.
+                raise ValueError(
+                    f"Combined prefix-cache mm payload misaligned for request {rid}: "
+                    f"index {list_idx} out of range for per-request list of length {len(v)}."
+                )
             if isinstance(v, dict):
                 return {k: _unwrap_lists(sv) for k, sv in v.items()}
             return v
@@ -918,6 +958,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 combined_multimodal_outputs,
                 rid=rid,
                 idx=idx,
+                audio_sparse_output=audio_sparse_output,
+                sparse_mm_index=sparse_mm_index,
             )
 
         mm_payload: dict[str, object] = {}
@@ -932,11 +974,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if sparse_idx is None:
                     continue
                 if sparse_idx >= len(mm_val):
-                    logger.warning(
-                        "Sparse multimodal payload mismatch for request %s: index %d >= %d.",
+                    # Misalignment means the sparse-marker protocol broke; the
+                    # request's output for this key is dropped, so be loud.
+                    logger.error(
+                        "Sparse multimodal payload mismatch for request %s: index %d >= %d; dropping key %s.",
                         rid,
                         sparse_idx,
                         len(mm_val),
+                        mm_key,
                     )
                     continue
                 sparse_val = mm_val[sparse_idx]
