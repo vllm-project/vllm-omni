@@ -192,8 +192,6 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
     return _codec_scalars(pooling_output)
 
 
-
-
 def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
     request_payload = getattr(transfer_manager, "request_payload", None)
     if isinstance(request_payload, dict):
@@ -288,10 +286,7 @@ def tts2code2wav_async_chunk(
     pending = state["pending"]
     pending.extend(_extract_codec_delta(multimodal_output, request_id))
     request_finished = getattr(request, "is_finished", None)
-    finished = bool(
-        is_finished
-        or (callable(request_finished) and request_finished())
-    )
+    finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     if not finished and len(pending) < chunk_frames:
         return None
@@ -456,10 +451,7 @@ def tts2code2wav(
     pending = state["pending"]
     pending.extend(new_codes_step)
     request_finished = getattr(request, "is_finished", None)
-    finished = bool(
-        is_finished
-        or (callable(request_finished) and request_finished())
-    )
+    finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     if not finished and len(pending) < chunk_frames:
         return None
