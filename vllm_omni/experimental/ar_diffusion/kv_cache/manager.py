@@ -71,6 +71,11 @@ class ARDiffusionRequestAdapter:
         self.num_preemptions = 0
         # vLLM watermark gate reads this; map the request lifecycle onto it.
         self.status = RequestStatus.WAITING
+        # vLLM 0.26 KVCacheManager.allocate_slots reads this when computing
+        # remove_skipped_blocks. Always 0 here: an AR-Diffusion request only
+        # advances num_computed_tokens on on_chunk_committed(), so there are
+        # never optimistically-counted in-flight tokens to subtract.
+        self.num_in_flight_tokens = 0
 
     @property
     def num_computed_tokens(self) -> int:

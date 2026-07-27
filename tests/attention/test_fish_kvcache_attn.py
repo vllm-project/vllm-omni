@@ -100,8 +100,9 @@ def _decode_kv_cache(
     head_size: int = 128,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    # vLLM >=0.23.0 KV cache layout: key/value live on dim 1.
-    return torch.zeros((num_blocks, 2, block_size, num_kv_heads, head_size), dtype=dtype)
+    # vLLM >=0.23.0 KV cache layout: (num_blocks, num_kv_heads, block_size,
+    # 2*head_size) with K and V packed in the last dimension.
+    return torch.zeros((num_blocks, num_kv_heads, block_size, 2 * head_size), dtype=dtype)
 
 
 def test_fish_kvcache_enabled_by_default(monkeypatch):
@@ -221,10 +222,11 @@ def _vllm_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
 
 
 def test_fish_kvcache_backend_unbinds_kv_on_vllm_cache_layout(monkeypatch):
-    # vLLM >=0.23.0 lays the KV cache out as (num_blocks, 2, block_size,
-    # num_kv_heads, head_size). The backend must unbind on dim 1 so each of
-    # key/value comes back as the 4-D (num_blocks, block_size, num_kv_heads,
-    # head_size) tensor the decode kernel expects.
+    # vLLM >=0.23.0 lays out the KV cache as (num_blocks, num_kv_heads,
+    # block_size, 2*head_size) with K and V packed in the last dimension.
+    # The backend must split on the content dim so each of key/value comes
+    # back as the 4-D (num_blocks, block_size, num_kv_heads, head_size)
+    # tensor the decode kernel expects.
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
@@ -232,7 +234,8 @@ def test_fish_kvcache_backend_unbinds_kv_on_vllm_cache_layout(monkeypatch):
 
     num_blocks, block_size, num_kv_heads, head_size = 8, 16, 8, 128
     cache_shape = _vllm_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
-    assert cache_shape == (num_blocks, 2, block_size, num_kv_heads, head_size)
+    # Upstream now returns a 4-D packed shape: (B, H, N, 2*D).
+    assert cache_shape == (num_blocks, num_kv_heads, block_size, 2 * head_size)
 
     captured = {}
 
@@ -262,20 +265,21 @@ def test_fish_kvcache_backend_unbinds_kv_on_vllm_cache_layout(monkeypatch):
 def test_fish_kvcache_vllm_cache_unbinds_then_falls_back_until_contiguous(monkeypatch):
     # End-to-end with the real vLLM cache layout and the real (unmocked) guard.
     #
-    # The point of the unbind(1) fix: unbind(0) raised "too many values to
-    # unpack" on the 5-D vLLM 0.23.0 layout, so the request crashed outright.
-    # unbind(1) makes the request *work* again -- it unpacks cleanly and the
-    # backend gracefully falls back to the original attention with correct
-    # output. This test guards that fix and must NOT depend on the fast path
-    # firing.
+    # The point of the transpose+split fix: unbind(1) on the old 5-D layout
+    # raised "too many values to unpack" on the vLLM 0.23.0 layout, and the
+    # upstream now packs K/V into the last dimension (4-D shape). The
+    # transpose(1, 2) + split correctly unpacks into separate key/value tensors
+    # and the backend gracefully falls back to the original attention with
+    # correct output. This test guards that fix and must NOT depend on the fast
+    # path firing.
     #
-    # It also documents a known limitation (tracked separately): unbind(1) on
-    # the interleaved (num_blocks, 2, ...) layout yields *non-contiguous*
-    # key/value views, which the guard rejects on the is_contiguous() check.
-    # So the dimensions are compatible (4-D, block_size=16, head_size=128) --
-    # the only thing keeping the fast path from engaging is contiguity, not
-    # shape. Making the fast path actually fire would require a .contiguous()
-    # copy and is out of scope here.
+    # It also documents a known limitation (tracked separately):
+    # transpose(1, 2) on the interleaved (B, H, N, 2*D) layout yields
+    # *non-contiguous* key/value views, which the guard rejects on the
+    # is_contiguous() check. So the dimensions are compatible (4-D,
+    # block_size=16, head_size=128) -- the only thing keeping the fast path
+    # from engaging is contiguity, not shape. Making the fast path actually
+    # fire would require a .contiguous() copy and is out of scope here.
     fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
@@ -300,13 +304,14 @@ def test_fish_kvcache_vllm_cache_unbinds_then_falls_back_until_contiguous(monkey
     output = torch.zeros_like(query)
     kv_cache = torch.zeros(cache_shape, dtype=torch.float16)
 
-    # Root cause record: unbind(1) gives the right 4-D shape but a non-contiguous view.
-    key_cache, value_cache = kv_cache.unbind(1)
+    # Root cause record: transpose(1,2) + split gives the right 4-D shape but
+    # a non-contiguous view.
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
     assert tuple(key_cache.shape) == (num_blocks, block_size, num_kv_heads, head_size)
     assert not key_cache.is_contiguous()
 
-    # unbind(1) no longer crashes (unbind(0) would have raised here) and the
-    # request completes via the correct fallback path.
+    # transpose+split no longer crashes (unbind(1) would have raised here) and
+    # the request completes via the correct fallback path.
     result = model.layers[0].self_attn.attn.impl.forward(None, query, None, None, kv_cache, _metadata(), output)
 
     assert result is output

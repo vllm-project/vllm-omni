@@ -69,6 +69,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        # vLLM 0.26: one entry per KV cache group; max_model_len=8 with
+        # block_sizes=[1] means one group of 8 blocks.
+        max_num_blocks_per_req=[8],
     )
     input_batch.add_request(
         CachedRequestState(
@@ -802,3 +805,95 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["codes.audio"], codes[1:2])
     assert output.multimodal_outputs is None
+
+
+# --- builder gap-fill: contract corners not covered by the tests above ---
+def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatch):
+    """The internal pooler_output feeds full-payload accumulation only; the wire
+    object's ``pooler_output`` is always None (builder NOTE at gpu_ar:1738)."""
+    runner = _make_async_output_runner()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("audio", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "accumulate_full_payload_output",
+        lambda self, rid, payload, request: None,
+    )
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 2},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"foo": torch.tensor([10.0, 20.0, 30.0])},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert output.pooler_output is None
+
+
+def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
+    """The inter-stage vs client-mm partition: a client-root key ("audio") lands in
+    ``multimodal_outputs`` while inter-stage keys ("hidden") stay in
+    ``inter_stage_outputs`` (partition_flat_payload / _CLIENT_MM_ROOT_KEYS)."""
+    runner = _make_async_output_runner()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("audio", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 2},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        staged_hidden_states_cpu=None,
+        # "audio" root is a client mm key; "codes.audio" root ("codes") is inter-stage.
+        multimodal_outputs={"audio": torch.tensor([10.0, 20.0, 30.0])},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    # Client mm key routed to the wire multimodal_outputs, per request.
+    assert output.multimodal_outputs is not None
+    assert "audio" in output.multimodal_outputs[0]
+    # Inter-stage hidden stayed on inter_stage_outputs and did NOT leak to client.
+    assert output.inter_stage_outputs is not None
+    assert "hidden" in output.inter_stage_outputs[0]
+    assert "audio" not in output.inter_stage_outputs[0]

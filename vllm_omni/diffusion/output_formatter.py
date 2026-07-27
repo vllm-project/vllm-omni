@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import TypeGuard, cast
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output
@@ -150,6 +150,13 @@ def format_diffusion_outputs(
         model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
         audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
 
+    stream_metadata = _stream_metadata_from_diffusion_output(diffusion_output)
+    if stream_metadata:
+        existing_stream = postprocess_output.metadata.get("stream")
+        merged_stream = dict(existing_stream) if isinstance(existing_stream, Mapping) else {}
+        merged_stream.update(stream_metadata)
+        postprocess_output.metadata["stream"] = merged_stream
+
     return _format_single_prompt_output(
         request=request,
         prompt=request.prompt,
@@ -161,6 +168,27 @@ def format_diffusion_outputs(
         is_audio_output=is_audio_output,
         audio_sample_rate=audio_sample_rate,
         finished=diffusion_output.finished,
+    )
+
+
+def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) -> DiffusionMetadata | None:
+    has_stream_data = (
+        diffusion_output.total_chunks > 1
+        or not diffusion_output.finished
+        or bool(diffusion_output.started_event_ids)
+        or bool(diffusion_output.active_event_ids)
+        or bool(diffusion_output.completed_event_ids)
+    )
+    if not has_stream_data:
+        return None
+    return cast(
+        DiffusionMetadata,
+        {
+            "generation_chunk_index": diffusion_output.chunk_index,
+            "started_event_ids": diffusion_output.started_event_ids,
+            "active_event_ids": diffusion_output.active_event_ids,
+            "completed_event_ids": diffusion_output.completed_event_ids,
+        },
     )
 
 

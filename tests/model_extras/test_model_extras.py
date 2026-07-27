@@ -533,15 +533,29 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
-        {
-            "text_guidance_scale",
-            "cfg_range",
-            "num_inference_steps",
-        }
+    for model_class_name in (
+        "MammothModa2DiTPipeline",
+        "MammothModa2ForConditionalGeneration",
+        "Mammothmoda2Model",
+    ):
+        assert get_extra_body_params(model_class_name) == frozenset(
+            {
+                "text_guidance_scale",
+                "cfg_range",
+                "num_inference_steps",
+            }
+        )
+        assert get_extra_output_params(model_class_name) == frozenset()
+        assert should_init_extra_args_for_non_diffusion_stages(model_class_name) is True
+
+    wrapper_prompt = build_text_to_image_prompt(
+        "MammothModa2ForConditionalGeneration",
+        prompt="a cat",
+        negative_prompt=None,
+        height=256,
+        width=256,
     )
-    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+    assert wrapper_prompt["additional_information"]["omni_task"] == ["t2i"]
 
 
 @pytest.mark.core_model
@@ -568,5 +582,8 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "ar_height": [32],
             "image_height": [512],
             "image_width": [768],
+            "eol_token_id": [152064],
+            "visual_token_start_id": [152072],
+            "visual_token_end_id": [168456],
         },
     }

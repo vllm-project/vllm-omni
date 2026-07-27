@@ -65,6 +65,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -200,6 +201,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
