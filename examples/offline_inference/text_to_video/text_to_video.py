@@ -365,7 +365,7 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
     val = getattr(result, "peak_memory_mb", 0.0)
     if not val:
-        inner = getattr(result, "request_output", None)
+        inner = result
         if isinstance(inner, list):
             inner = inner[0] if inner else None
         val = getattr(inner, "peak_memory_mb", 0.0)
@@ -525,8 +525,8 @@ def main():
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

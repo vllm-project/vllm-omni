@@ -1454,7 +1454,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
-                res = omni_res.request_output
+                res = omni_res
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
@@ -2324,7 +2324,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for omni_outputs in final_outputs:
             choices_data = []
-            if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
+            if not omni_outputs.finished:
                 continue
 
             # Filter outputs based on requested modalites
@@ -2333,7 +2333,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             if omni_outputs.final_output_type == "text":
-                if omni_outputs.request_output is not None:
+                if omni_outputs.stage_id is not None or omni_outputs.outputs:
                     (
                         choices_data,
                         usage,
@@ -2348,7 +2348,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         role,
                         reasoning_parser,
                     )
-                    final_res = omni_outputs.request_output
+                    final_res = omni_outputs
                 else:
                     # Diffusion pipeline text output (e.g. single-stage
                     # img2text / text2text) — no AR request_output, so build
@@ -2449,7 +2449,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         role: str,
         reasoning_parser: ReasoningParser | None = None,
     ):
-        final_res = omni_outputs.request_output
+        final_res = omni_outputs
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
         else:
@@ -2697,7 +2697,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
     ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
         choices: list[ChatCompletionResponseChoice] = []
-        final_res = omni_outputs.request_output
+        final_res = omni_outputs
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
         # The attribute is attached dynamically when stage audio arrives; fall
@@ -2820,7 +2820,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         from PIL import Image
 
         choices: list[ChatCompletionResponseChoice] = []
-        final_res = omni_outputs.request_output
 
         # Handle profiling data
         stage_durations = omni_outputs.stage_durations
@@ -2832,10 +2831,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # First check omni_outputs.images directly (for diffusion mode via from_diffusion)
         if omni_outputs.images:
             images = omni_outputs.images
-        # Fall back to request_output for pipeline mode
-        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
-        elif final_res is not None and final_res.outputs:
-            completion_output = final_res.outputs[0]
+        # Fall back to completion outputs for pipeline mode (multimodal_output
+        # is attached to CompletionOutput by AR stages).
+        elif omni_outputs.outputs:
+            completion_output = omni_outputs.outputs[0]
             if hasattr(completion_output, "multimodal_output") and completion_output.multimodal_output:
                 image_data = completion_output.multimodal_output.get("image")
                 if image_data is not None:
@@ -3299,7 +3298,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
 
-        req_out = getattr(result, "request_output", None)
+        req_out = result
         if req_out:
             prompt_obj = getattr(req_out, "prompt", None)
             if isinstance(prompt_obj, dict):
@@ -3309,7 +3308,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
-        req_out = getattr(result, "request_output", None)
+        req_out = result
         if req_out:
             prompt_obj = getattr(req_out, "prompt", None)
             if isinstance(prompt_obj, dict):
@@ -3319,7 +3318,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
-        req_out = getattr(result, "request_output", None)
+        req_out = result
         if req_out:
             prompt_obj = getattr(req_out, "prompt", None)
             if isinstance(prompt_obj, dict):
@@ -3351,8 +3350,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stage_id = getattr(output, "stage_id", None)
                 metrics = getattr(output, "metrics", None) if return_stage_metrics else None
                 if final_output_type == "text" and stage_id == 0:
-                    request_output = output.request_output
-                    for completion in request_output.outputs:
+                    for completion in output.outputs:
                         text = completion.text or ""
                         if not text:
                             continue

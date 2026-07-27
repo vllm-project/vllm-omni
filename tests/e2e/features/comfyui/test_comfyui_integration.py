@@ -171,11 +171,11 @@ def _build_text_output(text: str = "This is a test response.") -> OmniRequestOut
         metrics=None,
         lora_request=None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_text",
         finished=True,
         final_output_type="text",
-        request_output=request_output,
     )
 
 
@@ -200,11 +200,11 @@ def _build_audio_chat_output(num_samples: int = 24000) -> OmniRequestOutput:
         metrics=None,
         lora_request=None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_audio_chat",
         finished=True,
         final_output_type="audio",
-        request_output=request_output,
     )
 
 
@@ -240,11 +240,11 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
         images=[_build_image_output(color="blue")],
         finished=True,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_img_chat",
         finished=True,
         final_output_type="image",
-        request_output=request_output,
     )
 
 

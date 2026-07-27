@@ -180,10 +180,10 @@ def create_mock_audio_output_for_test(
     audio_tensor = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, num_samples))
     mock_request_output = MockRequestOutput(request_id=request_id, audio_tensor=audio_tensor)
 
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        mock_request_output,
         stage_id=0,
         final_output_type="audio",
-        request_output=mock_request_output,
     )
 
 
@@ -2250,10 +2250,10 @@ class TestStreamingResponse:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 
@@ -3341,10 +3341,10 @@ class TestWAVStreaming:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 

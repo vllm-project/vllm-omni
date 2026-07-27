@@ -69,10 +69,10 @@ def _make_text_omni_output(
         ],
         finished=finish_reason is not None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        res,
         request_id=request_id,
         final_output_type="text",
-        request_output=res,
         finished=finish_reason is not None,
     )
 
@@ -108,12 +108,12 @@ def _make_audio_omni_output(
         outputs=[completion],
         finished=True,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        res,
         request_id=request_id,
         stage_id=stage_id,
         replica_id=replica_id,
         final_output_type="audio",
-        request_output=res,
         finished=True,
     )
 
@@ -151,7 +151,7 @@ def _build_serving_chat():
     )
     instance._create_audio_choice = MagicMock(
         side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
-            index=omni_res.request_output.outputs[0].index,
+            index=omni_res.outputs[0].index,
             role=role,
         )
     )

@@ -352,8 +352,8 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract output from result
-    output = OmniRequestOutput.unwrap_result(result)
+    # omni.generate() returns a list for sync calls; unwrap single-result list.
+    output = result[0] if isinstance(result, list) else result
 
     if not output.images:
         raise ValueError("No video frames found in OmniRequestOutput.")

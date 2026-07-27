@@ -140,7 +140,18 @@ def _run_generate(
             request,
             sampling_params_list=_build_sampling_params(model_case, seed),
         )
-        return _extract_output_array(outputs[0])
+        end = time.perf_counter()
+        first_output = outputs[0]
+        req_out = first_output
+        frames = req_out.images[0]
+        if isinstance(frames, torch.Tensor):
+            frames = frames.detach().cpu().numpy()
+        elif isinstance(frames, Image.Image):
+            frames = np.array(frames)
+        # frames shape: (batch, num_frames, height, width, channels)
+        cost = (end - start) * 1000
+        return frames, cost
+        cleanup_dist_env_and_memory()
 
 
 @pytest.mark.full_model

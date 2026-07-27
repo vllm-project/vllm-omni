@@ -2517,7 +2517,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         mm = getattr(res, "multimodal_output", None)
         ro = None
         if not mm:
-            ro = getattr(res, "request_output", None)
+            ro = res
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             # MultimodalOutputProcessor attaches mm_accumulated on per-completion outputs.
