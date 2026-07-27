@@ -21,6 +21,7 @@ from vllm_omni.diffusion.models.joy_image.cfg_parallel import JoyImageEditCFGPar
 from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
     JoyImageAttention,
     JoyImageEditTransformer3DModel,
+    _raise_if_unsupported_tensor_parallel,
 )
 from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     JOY_MAX_IMAGE_SEQ_LEN,
@@ -292,6 +293,43 @@ def test_joy_hsdp_is_explicitly_unsupported():
 
     _raise_if_unsupported_hsdp(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False)))
     _raise_if_unsupported_hsdp(SimpleNamespace())
+
+
+def test_joy_tensor_parallelism_is_explicitly_unsupported():
+    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+        _raise_if_unsupported_tensor_parallel(
+            SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2))
+        )
+
+    _raise_if_unsupported_tensor_parallel(
+        SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
+    )
+    _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace()))
+    _raise_if_unsupported_tensor_parallel(SimpleNamespace())
+    _raise_if_unsupported_tensor_parallel(None)
+
+
+def test_transformer_rejects_tensor_parallelism_before_building_layers():
+    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+        JoyImageEditTransformer3DModel(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2)),
+            in_channels=4,
+            out_channels=4,
+            hidden_size=32,
+            text_dim=16,
+            num_layers=1,
+            num_attention_heads=4,
+            patch_size=(1, 2, 2),
+        )
+
+
+def test_pipeline_rejects_tensor_parallelism_before_loading_components():
+    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+        JoyImageEditPipeline(
+            od_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=2)
+            )
+        )
 
 
 def test_component_discovery_treats_vae_as_offload_peer():

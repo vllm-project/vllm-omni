@@ -28,6 +28,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _raise_if_unsupported_tensor_parallel(od_config: OmniDiffusionConfig | None) -> None:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1) or 1
+    if tensor_parallel_size > 1:
+        raise ValueError(
+            "JoyImageEditPipeline and JoyImageEditTransformer3DModel do not support "
+            "Tensor Parallelism yet. "
+            "Please set `tensor_parallel_size=1`, or implement TP-aware linear layers "
+            "and TP parity tests."
+        )
+
+
 def _as_3tuple(value: int | list[int] | tuple[int, int, int]) -> tuple[int, int, int]:
     if isinstance(value, int):
         return (value, value, value)
@@ -408,6 +420,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
         **_: Any,
     ) -> None:
         super().__init__()
+        _raise_if_unsupported_tensor_parallel(od_config)
         self.od_config = od_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels

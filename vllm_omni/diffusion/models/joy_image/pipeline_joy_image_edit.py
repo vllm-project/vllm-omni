@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.joy_image.cfg_parallel import (
 )
 from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
     JoyImageEditTransformer3DModel,
+    _raise_if_unsupported_tensor_parallel,
 )
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -362,6 +363,7 @@ class JoyImageEditPipeline(
         # Joy has no `_hsdp_shard_conditions` yet, so fail before generic
         # HSDP setup reaches the transformer.
         _raise_if_unsupported_hsdp(od_config)
+        _raise_if_unsupported_tensor_parallel(od_config)
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
