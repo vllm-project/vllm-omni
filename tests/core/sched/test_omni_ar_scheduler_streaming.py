@@ -57,13 +57,22 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
-def _run_resumable_segment_stop(session: Request) -> None:
+def _run_resumable_segment_stop(
+    session: Request,
+    *,
+    session_finished: bool = False,
+):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.should_advance.return_value = False
-    sched._update_request_with_output.return_value = ([42], True)
-    sched._handle_stopped_request.return_value = False
+
+    def stop_request(request: Request, _token_ids: list[int]):
+        request.status = RequestStatus.FINISHED_STOPPED
+        return [42], True
+
+    sched._update_request_with_output.side_effect = stop_request
+    sched._handle_stopped_request.return_value = session_finished
     sched.chunk_transfer_adapter = None
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
@@ -91,7 +100,7 @@ def _run_resumable_segment_stop(session: Request) -> None:
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
 
-    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+    return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
 
 @pytest.mark.parametrize("outstanding_async_tokens", [0, 1, 2])
@@ -114,6 +123,68 @@ def test_resumable_segment_stop_reconciles_async_placeholders(
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
     assert session._output_token_ids == []
+
+
+def test_resumable_session_terminal_is_not_marked_as_segment_boundary() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+
+    outputs = _run_resumable_segment_stop(session, session_finished=True)
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason is not None
+    assert output.is_segment_finished is False
+
+
+def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
+    """A decode step that neither stops nor carries an inter-stage payload.
+
+    ``finished`` is only assigned when the request stops, yet the async-chunk
+    save condition reads it for every request, so this step used to raise
+    ``UnboundLocalError: cannot access local variable 'finished'``.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._update_request_with_output.return_value = ([42], False)
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = MagicMock()
+    sched.running = [session]
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+    model_runner_output.inter_stage_outputs = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    # Nothing to hand downstream: no payload, no segment boundary, not finished.
+    sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:

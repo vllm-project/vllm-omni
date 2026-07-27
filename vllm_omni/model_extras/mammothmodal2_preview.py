@@ -66,5 +66,29 @@ MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS = frozenset(
         "num_inference_steps",
     }
 )
+
+
+def build_x_to_text_prompt(
+    model: str,
+    prompt: str,
+    has_image: bool,
+) -> tuple[dict[str, Any], list[int] | None]:
+    """Build MammothModa2's chat prompt for text-output tasks."""
+    del model
+    vision = "<|vision_start|><|image_pad|><|vision_end|>" if has_image else ""
+    return (
+        {
+            "prompt": (
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                f"<|im_start|>user\n{vision}{prompt}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            ),
+            "modalities": ["text"],
+            "additional_information": {"omni_task": ["chat"]},
+        },
+        None,
+    )
+
+
 MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS = frozenset()
 MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES = True

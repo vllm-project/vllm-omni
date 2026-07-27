@@ -608,8 +608,16 @@ def llm2tts(
             or list(llm_output.prompt_token_ids)
         )
         llm_output_ids = getattr(output, "token_ids", None)
+        cumulative_output_ids = getattr(output, "cumulative_token_ids", None)
         if llm_output_ids is None:
-            llm_output_ids = getattr(output, "cumulative_token_ids", [])
+            llm_output_ids = cumulative_output_ids or []
+        elif cumulative_output_ids is not None and len(cumulative_output_ids) > len(llm_output_ids):
+            # DELTA outputs (any streaming client) carry only the newest tokens,
+            # while the forwarded hidden states span prompt + whole reply. With
+            # the delta alone, tts_bos lands at the end of full_token_ids, the
+            # tts_bos..tts_eos slice collapses to nothing and the Talker is
+            # conditioned on an empty span, so the reply is silent.
+            llm_output_ids = cumulative_output_ids
         # Always copy: CompletionOutput.token_ids can alias the upstream
         # detokenizer's live token list. Forwarding that exact object as the
         # talker prompt makes the stage-1 streaming update extend the list

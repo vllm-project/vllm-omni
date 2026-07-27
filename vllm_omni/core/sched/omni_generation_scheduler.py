@@ -480,6 +480,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
+            is_segment_finished = False
             routed_experts = None
 
             # One-shot generation request: finish after its current input unit
@@ -503,6 +504,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                is_segment_finished = not finished
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -556,6 +558,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        is_segment_finished=is_segment_finished,
                     )
                 )
             else:
@@ -570,6 +573,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
+            is_segment_finished = not finished
             kv_transfer_params = None
             if finished:
                 kv_transfer_params = self._free_request(request)
@@ -587,6 +591,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     events=request.take_events(),
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
+                    is_segment_finished=is_segment_finished,
                 )
             )
             stopped_running_reqs.add(request)
