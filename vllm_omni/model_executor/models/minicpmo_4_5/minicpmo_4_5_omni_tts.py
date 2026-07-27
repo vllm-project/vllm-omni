@@ -480,6 +480,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": {"finished": terminal_flags},
         }
+        # [DIAG-5437] Trace whether Stage1 TTS ever emits a finished=True chunk.
+        if terminal_flags:
+            _diag_any = any(bool(t.item()) for t in terminal_flags)
+            if _diag_any:
+                logger.info(
+                    "[DIAG-5437][TTS] finished flags=%s (req_count=%d) — source of meta.finished",
+                    [bool(t.item()) for t in terminal_flags],
+                    len(terminal_flags),
+                )
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,

@@ -1786,6 +1786,8 @@ class OmniConnectorModelRunnerMixin:
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
+                    # [DIAG-5437] Confirm Stage2 received a finished=True chunk from Stage1.
+                    logger.info("[DIAG-5437][stage2-recv] req=%s is_finished=True (payload keys=%s)", req_id, sorted(payload_data.keys()) if isinstance(payload_data, dict) else None)
                 # Local cache (RFC §2.4) — merge, don't replace, so that
                 # earlier chunk keys (e.g. thinker_prefill_embeddings from
                 # chunk 0) are not overwritten by later chunks.

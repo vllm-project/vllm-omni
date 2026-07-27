@@ -303,6 +303,13 @@ def tts2code2wav_async_chunk(
     state["codec_end"] = codec_end
 
     last_chunk = bool(finished and not pending)
+    # [DIAG-5437] Trace Stage1->Stage2 bridge termination decision.
+    logger.info(
+        "[DIAG-5437][bridge] req=%s is_finished=%s pending=%d last_chunk=%s "
+        "state_segment_end=%s state_turn_end=%s",
+        request_id, finished, len(pending), last_chunk,
+        bool(state.get("segment_end", False)), bool(state.get("turn_end", False)),
+    )
     if last_chunk:
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
