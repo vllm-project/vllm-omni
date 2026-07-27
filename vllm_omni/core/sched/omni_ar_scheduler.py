@@ -652,8 +652,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         If request_ids is None, all requests will be finished.
 
         Returns:
-            Tuple of (req_id, client_index) for requests that were aborted. Will not
-            include any that were already finished.
+            The Request objects that were aborted. Will not include any that
+            were already finished.
         """
         # TODO(yrr): chunk transfer adapter & input_coordinator unified to one
         if self.chunk_transfer_adapter:
