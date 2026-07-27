@@ -780,6 +780,10 @@ def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_ada
 class _HashableRequest(SimpleNamespace):
     """SimpleNamespace that can be added to a set (needed by scheduler internals)."""
 
+    # vLLM 0.26: update_from_output settles this counter for every scheduled
+    # request; real Requests initialise it to 0 (vllm/v1/request.py).
+    num_in_flight_tokens = 0
+
     def __hash__(self):
         return hash(self.request_id)
 
