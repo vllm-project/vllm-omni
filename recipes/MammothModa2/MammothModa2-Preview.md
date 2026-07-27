@@ -1,19 +1,20 @@
 # MammothModa2-Preview
 
-> MammothModa2-Preview text-to-image generation through the shared offline image example
+> MammothModa2-Preview generation and understanding through shared offline examples
 
 ## Summary
 
 - Vendor: ByteDance Research
 - Model: `bytedance-research/MammothModa2-Preview`
-- Task: Text-to-image generation (AR → DiT two-stage pipeline)
+- Task: Text-to-image generation (AR → DiT two-stage pipeline), plus
+  image-to-text understanding (AR stage)
 - Mode: Offline inference
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe to run MammothModa2-Preview text-to-image through the shared
-offline image example (`text_to_image.py`) instead of a model-specific script.
+Use this recipe to run MammothModa2-Preview through shared task-oriented
+offline examples. Text-to-image uses the shared image example (`text_to_image.py`) instead of a model-specific script.
 The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
@@ -28,8 +29,10 @@ flags. Image size uses the standard `--height` / `--width` flags.
 
 - Upstream model:
   [`bytedance-research/MammothModa2-Preview`](https://huggingface.co/bytedance-research/MammothModa2-Preview)
-- Related offline example:
+- Related text-to-image example:
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- Related T2T/I2T example:
+  [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Declared parameters:
   [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)
 - Deploy config:
@@ -99,6 +102,25 @@ so unknown keys for MammothModa2 are silently dropped:
 
 `--height` and `--width` must be multiples of 16.
 
+Run text-to-text through the shared understanding example. It recognizes the
+MammothModa2 checkpoint and automatically selects `mammoth_moda2_ar.yaml`:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Preview \
+  --prompt "Explain multimodal generation in three sentences."
+```
+
+Add an image for image-to-text or image summarization. The shared example
+uses MammothModa2's chat and vision-token template:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Preview \
+  --image /path/to/input.jpg \
+  --prompt "Please summarize the content of this image."
+```
+
 #### Verification
 
 The example writes the generated image to the `--output` path. Confirm the file
@@ -107,4 +129,48 @@ exists and is a valid image:
 ```bash
 ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
+```
+
+### Image-to-Text (I2T, simplest)
+
+For the simplest offline image-understanding run, use a short inline Python
+snippet from the repository root:
+
+```python
+from PIL import Image
+from vllm import SamplingParams
+from vllm.multimodal.image import convert_image_mode
+from vllm_omni import Omni
+
+def main():
+    prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+        "Summarize this image.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    omni = Omni(
+        model="./MammothModa2-Preview",
+        deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
+    )
+    try:
+        outputs = list(
+            omni.generate(
+                [{
+                    "prompt": prompt,
+                    "multi_modal_data": {"image": convert_image_mode(Image.open("./image.png"), "RGB")},
+                    "additional_information": {"omni_task": ["chat"]},
+                }],
+                [SamplingParams(temperature=0.2, top_p=0.9, top_k=-1, max_tokens=512, seed=42)],
+            )
+        )
+    finally:
+        omni.close()
+
+    ro = getattr(outputs[-1], "request_output", outputs[-1])
+    print(ro.outputs[0].text.strip())
+
+if __name__ == "__main__":
+    main()
 ```

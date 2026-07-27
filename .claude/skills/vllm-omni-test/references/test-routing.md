@@ -2,7 +2,7 @@
 
 Use this reference to map testing goals to levels, markers, and runnable commands.
 
-**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
+**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/test_system_overview.md`).
 
 ## Model-centric e2e filename convention (L2–L4)
 

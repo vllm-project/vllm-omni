@@ -77,7 +77,7 @@ def _make_diffusion_model_runner(*, pipeline, streaming_output: bool = True) -> 
         model_class_name="HeliosPipeline",
         streaming_output=streaming_output,
     )
-    runner.supports_step_mode = lambda: True
+    runner._supports_step_mode = lambda: True
     return runner
 
 

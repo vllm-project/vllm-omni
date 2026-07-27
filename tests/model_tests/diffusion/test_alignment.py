@@ -30,7 +30,6 @@ EXCLUDED_MODELS = [
     "OvisImagePipeline",
     "WanPipeline",
     "WanVACEPipeline",
-    "LTX2Pipeline",
     "LTX2ImageToVideoPipeline",
     "LTX2TwoStagesPipeline",
     "LTX2ImageToVideoTwoStagesPipeline",

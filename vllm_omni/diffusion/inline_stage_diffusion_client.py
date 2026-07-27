@@ -139,8 +139,13 @@ class InlineStageDiffusionClient(StageClientBase):
                         result.request_id = request_id
                     self._output_queue.put_nowait(result)
             else:
-                results = await self._engine.step(request)
-                result = results[0]
+                # Non-streaming callers share the streaming engine path but
+                # only publish the final output.
+                result = None
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                if result is None:
+                    raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:
                     result.request_id = request_id
                 self._output_queue.put_nowait(result)

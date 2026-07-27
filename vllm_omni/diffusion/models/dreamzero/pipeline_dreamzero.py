@@ -3,7 +3,7 @@
 
 """DreamZero pipeline for vllm-omni.
 
-Entry point for DiffusionEngine.step() -> pipeline.forward(req)
+Entry point for DiffusionEngine.step_streaming() -> pipeline.forward(req)
 """
 
 from __future__ import annotations
@@ -11,10 +11,12 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -52,7 +54,14 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SIGMA_SHIFT,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.experimental.ar_diffusion.capability import (
+    ARDiffusionCrossAttentionKVSpec,
+    ARDiffusionKVBranchSpec,
+    ARDiffusionKVCacheSpec,
+)
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -92,18 +101,128 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     """DreamZero world model pipeline.
 
     Multi-output: predict_noise() returns (video_pred, action_pred).
-    CFG: video gets standard CFG, action takes positive branch only.
+    CFG: video gets standard CFG, action takes the positive KV branch only.
 
-    KV is managed by the AR-Diffusion engine: ``self._ar_diffusion_kv_state`` is set by the
-    runner before ``forward()`` and the pipeline routes all KV access (get / update /
-    commit / reset) through the pool-backed state. Purely duck-typed (no engine import).
+    KV is managed by the AR-Diffusion engine through the explicit capability
+    methods below. The runner binds one session state only for ``forward()``.
     """
 
-    _ar_diffusion_kv_state = None  # set by the runner before each forward
+    _POSITIVE_BRANCH = "positive"
+    _NEGATIVE_BRANCH = "negative"
+    _ar_diffusion_kv_state = None
+    state: DreamZeroState | None
+
+    def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
+        """Describe DreamZero's local KV geometry to the generic runner."""
+        transformer = self.transformer
+        frame_tokens = int(transformer.frame_seqlen)
+        max_attention_tokens = int(transformer.blocks[0].self_attn.max_attention_size)
+        cfg_world = int(get_classifier_free_guidance_world_size())
+        negative_local_index = 0 if cfg_world >= 2 else 1
+        cross_attention = [
+            ARDiffusionCrossAttentionKVSpec("text", int(transformer.text_len)),
+        ]
+        if transformer.model_type == "i2v":
+            cross_attention.append(ARDiffusionCrossAttentionKVSpec("image", 257))
+        return ARDiffusionKVCacheSpec(
+            num_layers=int(transformer.num_layers),
+            num_kv_heads=int(transformer.blocks[0].self_attn.tp_num_heads),
+            head_size=int(transformer.dim // transformer.num_heads),
+            tokens_per_frame=frame_tokens,
+            frames_per_block=int(transformer.num_frame_per_block),
+            window_frames=max_attention_tokens // frame_tokens,
+            kv_branches=(
+                ARDiffusionKVBranchSpec(self._POSITIVE_BRANCH, 0),
+                ARDiffusionKVBranchSpec(self._NEGATIVE_BRANCH, negative_local_index),
+            ),
+            session_capacity=MAX_DREAMZERO_SESSIONS,
+            cross_attention=tuple(cross_attention),
+            max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
+        )
+
+    @contextmanager
+    def bind_ar_diffusion_state(self, session_id, state):
+        """Bind runner-owned KV only for the duration of one forward."""
+        if self._ar_diffusion_kv_state is not None:
+            raise RuntimeError("DreamZero AR-Diffusion state is already bound")
+        if state.session_id != session_id:
+            raise ValueError(f"DreamZero bound session mismatch: {state.session_id!r} != {session_id!r}")
+        self._ar_diffusion_kv_state = state
+        try:
+            yield
+        finally:
+            self._ar_diffusion_kv_state = None
+
+    def reset_ar_diffusion_session(self, session_id: str) -> None:
+        """Reset DreamZero-owned state after the runner releases session KV."""
+        self._drop_ar_diffusion_session_state(session_id)
+
+    def close_ar_diffusion_session(self, session_id: str) -> None:
+        """Drop DreamZero-owned state after close, eviction, or failed forward."""
+        self._drop_ar_diffusion_session_state(session_id)
+
+    def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
+        """Remove model state and clear the compatibility alias when it points there."""
+        removed = self._states.pop(str(session_id or "default"), None)
+        if removed is not None and getattr(self, "state", None) is removed:
+            self.state = None
+
+    @staticmethod
+    def _ar_warmup_robot_obs(height: int, width: int, n_frames: int, session_id: str) -> dict:
+        image = (
+            np.zeros((height, width, 3), dtype=np.uint8)
+            if n_frames == 1
+            else np.zeros((n_frames, height, width, 3), dtype=np.uint8)
+        )
+        return {
+            "observation/exterior_image_0_left": image,
+            "observation/exterior_image_1_left": image,
+            "observation/wrist_image_left": image,
+            "observation/joint_position": np.zeros(7, dtype=np.float32),
+            "observation/cartesian_position": np.zeros(6, dtype=np.float32),
+            "observation/gripper_position": np.zeros(1, dtype=np.float32),
+            "prompt": "warmup",
+            "session_id": session_id,
+        }
+
+    def ar_diffusion_warmup_requests(self, session_id: str) -> Iterable[OmniDiffusionRequest]:
+        """Yield DreamZero-valid requests covering each resident window shape."""
+        spec = self.ar_diffusion_kv_cache_spec()
+        n_forwards = 1 + math.ceil(max(0, spec.window_frames - 1) / spec.frames_per_block)
+        raw_kv_config = getattr(self.od_config, "ar_diffusion_kv_config", None)
+        if raw_kv_config is None and isinstance(self.od_config.model_config, dict):
+            raw_kv_config = self.od_config.model_config.get("ar_diffusion_kv_config")
+        capture_reset = (
+            bool(raw_kv_config.get("warmup_capture_reset", False))
+            if isinstance(raw_kv_config, dict)
+            else bool(getattr(raw_kv_config, "warmup_capture_reset", False))
+        )
+        if capture_reset:
+            n_forwards += 1
+        policy_config = self.od_config.model_config.get("policy_server_config", {})
+        height, width = (int(value) for value in policy_config.get("image_resolution", [180, 320]))
+        for index in range(n_forwards):
+            n_frames = 1 if index == 0 else 4
+            robot_obs = self._ar_warmup_robot_obs(height, width, n_frames, session_id)
+            sampling_params = OmniDiffusionSamplingParams(
+                extra_args={
+                    "reset": index == 0,
+                    "session_id": session_id,
+                    "robot_obs": robot_obs,
+                }
+            )
+            yield OmniDiffusionRequest(
+                prompt="warmup",
+                sampling_params=sampling_params,
+                request_id=f"ardiffusion-warmup-{index}",
+            )
+
+    def _ar_branch(self, is_negative: bool) -> str:
+        return self._NEGATIVE_BRANCH if is_negative else self._POSITIVE_BRANCH
 
     def _kv_get(self, state, is_negative, seq_len=None, update_kv_cache=False):
         return self._ar_diffusion_kv_state.get_kv_caches(
-            is_negative,
+            self._ar_branch(is_negative),
             seq_len=seq_len,
             commit_current=update_kv_cache,
         )
@@ -115,11 +234,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return
 
     def _kv_commit(self, is_negative: bool):
-        self._ar_diffusion_kv_state.commit_paged_context(is_negative)
+        self._ar_diffusion_kv_state.commit_paged_context(self._ar_branch(is_negative))
 
     def _kv_get_cross(self, state, is_negative):
         """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
-        return self._ar_diffusion_kv_state.get_cross_kv_caches(is_negative)
+        kv_branch = self._ar_branch(is_negative)
+        text_caches = self._ar_diffusion_kv_state.get_cross_attention_kv(kv_branch, "text")
+        if "image" in self._ar_diffusion_kv_state.kv_cache.cross_attention_lengths:
+            image_caches = self._ar_diffusion_kv_state.get_cross_attention_kv(kv_branch, "image")
+            for text_cache, image_cache in zip(text_caches, image_caches, strict=True):
+                text_cache["k_img"] = image_cache["k"]
+                text_cache["v_img"] = image_cache["v"]
+        return text_caches
 
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
         """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
@@ -133,32 +259,41 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         after the image is encoded so ``clip_feature`` is available.
         """
         s = self._ar_diffusion_kv_state
-        need_text = not s._cross_text_populated.get(is_negative, False)
+        kv_branch = self._ar_branch(is_negative)
+        need_text = not s.is_cross_attention_populated(kv_branch, "text")
         need_img = (
             clip_feature is not None
-            and getattr(self.transformer, "model_type", "t2v") == "i2v"
-            and not s._cross_img_populated.get(is_negative, False)
+            and self.transformer.model_type == "i2v"
+            and not s.is_cross_attention_populated(kv_branch, "image")
         )
         if not need_text and not need_img:
             return
         projected = self.transformer.text_embedding(context) if need_text else None
         img_ctx = self.transformer.img_emb(clip_feature) if need_img else None
-        for i, block in enumerate(self.transformer.blocks):
-            ca = block.cross_attn
-            n, d = ca.tp_num_heads, ca.head_dim
-            k = v = None
-            if projected is not None:
-                k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
-                v = ca.v(projected).unflatten(2, (n, d))
-            k_img = v_img = None
-            if img_ctx is not None:
-                k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
-                v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
-            s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
-        if need_text:
-            s._cross_text_populated[is_negative] = True
-        if need_img:
-            s._cross_img_populated[is_negative] = True
+        if projected is not None:
+
+            def text_layer_kv():
+                for block in self.transformer.blocks:
+                    ca = block.cross_attn
+                    n, d = ca.tp_num_heads, ca.head_dim
+                    yield (
+                        ca.norm_k(ca.k(projected)).unflatten(2, (n, d)),
+                        ca.v(projected).unflatten(2, (n, d)),
+                    )
+
+            s.populate_cross_attention(kv_branch, "text", text_layer_kv())
+        if img_ctx is not None:
+
+            def image_layer_kv():
+                for block in self.transformer.blocks:
+                    ca = block.cross_attn
+                    n, d = ca.tp_num_heads, ca.head_dim
+                    yield (
+                        ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d)),
+                        ca.v_img(img_ctx).unflatten(2, (n, d)),
+                    )
+
+            s.populate_cross_attention(kv_branch, "image", image_layer_kv())
         logger.info(
             "AR-Diffusion CROSS POPULATE [%s]: %d layers, text=%s img=%s",
             "neg" if is_negative else "pos",
@@ -179,7 +314,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         image half repopulates on the restart forward.
         """
         state.reset(clear_video_latents=clear_video_latents)
-        self._ar_diffusion_kv_state.reset(keep_cross_text=not clear_video_latents)
+        keep_cross = ("text",) if not clear_video_latents else ()
+        self._ar_diffusion_kv_state.reset(keep_cross_attention=keep_cross)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
@@ -298,7 +434,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
-        self._max_session_states = MAX_DREAMZERO_SESSIONS
         self.state = self._get_or_create_state("default")
 
         # DiT step cache is configured by StepCacheBackend
@@ -373,9 +508,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if state is None:
             state = DreamZeroState()
             self._states[session_key] = state
-            max_states = getattr(self, "_max_session_states", MAX_DREAMZERO_SESSIONS)
-            while len(self._states) > max_states:
-                self._states.popitem(last=False)
         else:
             self._states.move_to_end(session_key)
         return state
@@ -536,6 +668,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if not torch.cuda.is_available():
             return
 
+        state = self.state
+        if state is None:
+            state = self._get_or_create_state("default")
+            self.state = state
         device = next(self.text_encoder.parameters()).device
         with torch.inference_mode():
             try:
@@ -547,18 +683,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
             try:
                 image = torch.zeros(1, 1, 3, 180, 320, dtype=torch.bfloat16, device=device)
-                self._encode_image(image, self.num_frames, 180, 320, state=self.state)
+                self._encode_image(image, self.num_frames, 180, 320, state=state)
             except Exception as exc:
                 logger.warning("DreamZero compile warmup (image_encoder) skipped: %s", exc)
 
             try:
-                self.state.reset_vae_encoder_stream()
+                state.reset_vae_encoder_stream()
                 dummy_video = torch.zeros(1, 3, 1, 180, 320, dtype=torch.bfloat16, device=device)
-                self._vae_stream_seed(self.state, dummy_video[:, :, :1])
+                self._vae_stream_seed(state, dummy_video[:, :, :1])
                 for _ in range(4):
-                    self._vae_stream_append_frame(self.state, dummy_video[:, :, :1])
+                    self._vae_stream_append_frame(state, dummy_video[:, :, :1])
                 self._vae_stream_get_observation_latents(
-                    self.state,
+                    state,
                     self.num_frame_per_block,
                     dtype=torch.bfloat16,
                 )
@@ -1034,7 +1170,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         state_features = kwargs.get("state_features")
         embodiment_id = kwargs.get("embodiment_id")
 
-        # Shared kwargs for predict_noise (both cond & uncond branches)
+        # Shared kwargs for predict_noise (both conditional and unconditional branches)
         common_kwargs = dict(
             seq_len=seq_len,
             current_start_frame=state.current_start_frame,
@@ -1163,7 +1299,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
-        """Full inference step. Called by DiffusionEngine.step()."""
+        """Full inference step. Called by DiffusionEngine.step_streaming()."""
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:
@@ -1236,21 +1372,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         text_tokens = text_inputs["input_ids"].to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
 
-        # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
-        # on the next inference request after websocket reset/session switch.
-        if extra_args.get("reset", False):
+        # Explicit request reset is handled by ARDiffusionModelRunner before it
+        # binds this forward. Model-detected prompt/window resets still happen
+        # here because they depend on tokenized DreamZero state.
+        reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
+        if reset_reason == "session":
             self._kv_reset(state)
-        else:
-            # Auto-reset based on model state (before accumulation). Both a "session"
-            # reset and an "inference" (window-boundary) reset clear the model-local
-            # KV window, so route both through _kv_reset to drop the AR-Diffusion pool window
-            # too and stay parity-exact; "inference" keeps the accumulated video
-            # latents (reset_inference_state == reset(clear_video_latents=False)).
-            reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
-            if reset_reason == "session":
-                self._kv_reset(state)
-            elif reset_reason == "inference":
-                self._kv_reset(state, clear_video_latents=False)
+        elif reset_reason == "inference":
+            self._kv_reset(state, clear_video_latents=False)
         state.language = text_tokens
 
         # Frame accumulation: stitched single frame -> multi-frame video
@@ -1280,7 +1409,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if state.prompt_embeds is None:
             state.prompt_embeds = self._encode_text(text_tokens, attention_mask)
         prompt_embeds = state.prompt_embeds
-        # Negative prompt for CFG uncond branch (model constant)
+        # Negative prompt for the unconditional CFG branch (model constant)
         negative_prompt_embeds = None
         if self.cfg_scale > 1.0:
             if self._negative_prompt_embeds_cache is None:

@@ -32,7 +32,7 @@ Current engine/runtime limitations:
 
 - Continuous batching with `max_num_seqs > 1` is experimental and documented in
   [Continuous Batching for Step-Wise Diffusion](diffusion_continuous_batching.md).
-  Keep `max_num_seqs=1` if you want the older conservative behavior.
+  Keep `max_num_seqs=1` for the conservative single-request step path.
 - `cache_backend` is not supported in step mode.
 - Request-mode extras such as KV transfer are not wired into step mode yet.
 - Unsupported pipelines now fail early during model loading instead of failing on the first request.
