@@ -216,13 +216,11 @@ def _assert_realtime_accuracy(
                    transcribes these clips reliably, so a failure here now points
                    at the model, not the ASR grader.
         threshold: Minimum cosine similarity (with length penalty) required to
-                   pass. Default 0.8 for sync mode. The async_chunk variant uses
-                   a lower threshold (0.35) because whisper large-v3 may only
-                   transcribe the first sentence of short Chinese TTS clips under
-                   async_chunk codec variability, and the cosine_similarity_text
-                   length penalty (2*min/(sum)) lowers the score for partial
-                   transcripts even when the first sentence is perfectly correct
-                   (max ~0.636 for 7 vs 15 chars with perfect n-gram match).
+                   pass. Default 0.8. Do not lower per-callsite without data:
+                   at 0.35 the assertion no longer detects real audio
+                   regressions. If a variant genuinely needs a different gate
+                   (e.g. whisper partial transcripts under async_chunk), propose
+                   it in its own PR with measurements.
     """
     final_text = (result["transcription_text"] or "").strip()
     assert final_text, "Expected non-empty transcription (model text stream)"
@@ -260,7 +258,7 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         _assert_realtime_smoke(result)
-        _assert_realtime_accuracy(result, threshold=0.35)
+        _assert_realtime_accuracy(result)
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
