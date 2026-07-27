@@ -480,6 +480,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
+            is_segment_finished = False
             routed_experts = None
 
             # One-shot generation request: finish after its current input unit
@@ -503,6 +504,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                is_segment_finished = not finished
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -556,6 +558,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        is_segment_finished=is_segment_finished,
                     )
                 )
             else:
@@ -570,6 +573,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
+            is_segment_finished = not finished
             kv_transfer_params = None
             if finished:
                 kv_transfer_params = self._free_request(request)
@@ -587,6 +591,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     events=request.take_events(),
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
+                    is_segment_finished=is_segment_finished,
                 )
             )
             stopped_running_reqs.add(request)
@@ -685,26 +690,4 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = update.prompt_token_ids or ()
-        session.additional_information = update.additional_information or None
-        # Update block hashes for the new tokens.
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(session.prompt_token_ids)
-        session.arrival_time = update.arrival_time
-        session.sampling_params = update.sampling_params
-        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
-        if session in self.skipped_waiting:
-            self.skipped_waiting.remove_requests((session,))
-            self._enqueue_waiting_request(session)
-
-        if self.log_stats:
-            session.record_event(EngineCoreEventType.QUEUED)
+        self._replace_streaming_session(session, update)

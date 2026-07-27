@@ -1,177 +1,9 @@
-# Multi-Level Automated Testing System Documentation
+# Test Writing Guide
 
-## Document Overview
+This document describes how to author tests for each CI level (L1–L5). For the level matrix, CI triggers, and Buildkite upload behavior, see [Test System Overview](./test_system_overview.md).
 
-This testing system aims to build a complete, efficient, and well-structured quality assurance framework for the development, integration, and release of model services. It draws on the concept of the test pyramid from modern software engineering, progressively expanding testing activities from basic code logic verification to complex end-to-end (E2E) functionality, performance, accuracy, and even long-term stability validation.
+## Test Directory Structure
 
-Through five levels (L1-L5) and common (Common) specifications, the system clarifies the testing objectives, scope, execution frequency, and required resources for different development stages (e.g., each commit, PR merge, daily build, pre-release). This ensures that models meet high standards for functionality, performance, and reliability across various deployment scenarios (online serving and offline inference).
-
-<table>
-  <thead>
-    <tr>
-      <th>Level</th>
-      <th>Scope & Focus</th>
-      <th>Model Coverage Strategy</th>
-      <th>Feature Coverage Strategy</th>
-      <th>Interface Coverage Strategy</th>
-      <th>Tags</th>
-      <th>Time Cost</th>
-      <th>Test Dir</th>
-      <th>Doc</th>
-      <th>Frequency</th>
-      <th>Hardware</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="2"><strong>Common</strong></td>
-      <td>Contribution Guideline & PR checklist</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>.github/PULL_REQUEST_TEMPLATE.md <a href="../tests_style/"> Test Style (PR Checklist)</a></td>
-      <td>/</td>
-      <td>/</td>
-    </tr>
-    <tr>
-      <td>CI Failure Description</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td><a href="../failures/"> CI Failures</a></td>
-      <td>/</td>
-      <td>/</td>
-    </tr>
-    <tr>
-      <td><strong>L1</strong><br>(Unit & Logic)</td>
-      <td>Unit tests for components like entrypoints, models</td>
-      <td>/</td>
-      <td>/</td>
-      <td>/</td>
-      <td><code>core_model and cpu</code></td>
-      <td rowspan="2">&lt;15min</td>
-      <td>/tests/{component_name}/test_xxx</td>
-      <td>
-        <a href="#chapter-1-l1-l2-level-testing-unit-testing-and-basic-end-to-end-verification">Chapter 1</a><br>
-        Section 1 L1&amp;L2: Purpose, Test Content, Directory Location, Example
-      </td>
-      <td>PR with ready label (also can run locally)</td>
-      <td>CPU</td>
-    </tr>
-    <tr>
-      <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
-      <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
-      <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
-      <td>High-priority features (using random lightweight models)</td>
-      <td>High-priority interfaces (using random lightweight models)</td>
-      <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
-      <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
-      </td>
-      <td>
-        <a href="#chapter-1-l1-l2-level-testing-unit-testing-and-basic-end-to-end-verification">Chapter 1</a><br>
-        L1&amp;L2: Purpose, Test Content, Directory Location, Example
-      </td>
-      <td>PR with ready label</td>
-      <td>GPU</td>
-    </tr>
-    <tr>
-      <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
-      <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
-      <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
-      <td>Medium-priority features (using random lightweight models)</td>
-      <td>Medium-priority interfaces (using random lightweight models)</td>
-      <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
-      <td>&lt;30min</td>
-      <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
-      </td>
-      <td>
-        <a href="#chapter-2-l3-level-testing-core-integration-performance-and-accuracy-verification">Chapter 2</a><br>
-        L3: Purpose, Test Content, Directory Location, Example
-      </td>
-      <td>PR Merged (Also run L1&L2 Tests)</td>
-      <td>GPU</td>
-    </tr>
-    <tr>
-      <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
-      <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
-      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
-      <td>Low-priority features (using real weights)</td>
-      <td>Low-priority interfaces (using real weights)</td>
-      <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
-      <td>&lt;3 hour</td>
-      <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx<br>
-        <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test_qwen3_omni_*.json (Omni), test_tts.json (TTS),<br>
-        test_voxcpm2.json, test_higgs_audio_v3.json, and<br>
-        /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
-        <strong>Doc Test:</strong><br>
-        tests/examples/online_serving/test_{model_name}.py<br>
-        tests/examples/offline_inference/test_{model_name}.py<br>
-        <strong>Accuracy Test:</strong><br>
-        /tests/e2e/accuracy/test_{model_name}.py
-      </td>
-      <td>
-        <a href="#chapter-3-l4-level-testing-full-functionality-performance-and-documentation-testing">Chapter 3</a><br>
-        L4: Purpose, Test Content, Directory Location, Example
-      </td>
-      <td>Nightly</td>
-      <td>GPU</td>
-    </tr>
-    <tr>
-      <td><strong>L5</strong><br>(Stability & Reliability)</td>
-      <td>Online: long-term stability test + reliability test</td>
-      <td>Long-term stability and reliability testing for high-priority models<br>Low-priority models: function and doc testing</td>
-      <td>/</td>
-      <td>Invalid-parameter validation for high-priority interfaces</td>
-      <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
-      <td> Depends on reality </td>
-      <td>
-        <strong>Stability:</strong><br>
-        /tests/dfx/stability/tests/test_qwen3_omni.json<br>
-        /tests/dfx/stability/tests/test_wan22.json<br>
-        <strong>Reliability:</strong><br>
-        tests/dfx/reliability/test_reliability_{model_key}.py<br>
-        (e.g. <code>test_reliability_qwen3_omni.py</code>, <code>test_reliability_wan22.py</code>, <code>test_reliability_hunyuan_image.py</code>, <code>test_reliability_voxcpm2.py</code>)
-      </td>
-      <td>
-        <a href="#chapter-4-l5-level-testing-stability-and-reliability-testing">Chapter 4</a><br>
-        L5: Purpose, Test Content, Directory Location, Example
-      </td>
-      <td>Weekly / Days before Release</td>
-      <td>GPU</td>
-    </tr>
-  </tbody>
-</table>
-
-
----
-<details>
-<summary> The folder structure for tests file based on the 5 levels design</summary>
 Legend: `✅` = test exists, `⬜` = suggested to add.
 ```
 vllm_omni/                                    tests/
@@ -304,134 +136,219 @@ vllm_omni/                                    tests/
 # vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
 ```
 
+## Markers for Tests
 
-</details>
+By adding markers before test functions, tests can later be executed uniformly by simply declaring the corresponding marker type.
 
+### Current Markers
+Defined in `pyproject.toml`:
 
-## Common Specifications
+| Marker             | Description                                               |
+| ------------------ | --------------------------------------------------------- |
+| `core_model`       | L1&L2 tests (run in each PR)                              |
+| `advanced_model`   | L3 tests (run on each merge to main)                 |
+| `full_model`       | L4 tests (run nightly) |
+| `diffusion`        | Diffusion model tests                                     |
+| `omni`             | Omni multimodal model tests |
+| `tts`              | TTS model tests     |
+| `cache`            | Cache backend tests                                       |
+| `parallel`         | Parallelism/distributed tests                             |
+| `cpu`              | Tests that run on CPU                                     |
+| `gpu`              | Tests that run on GPU *                                   |
+| `cuda`             | Tests that run on CUDA *                                  |
+| `rocm`             | Tests that run on AMD/ROCm *                              |
+| `xpu`              | Tests that run on Intel XPU *                             |
+| `npu`              | Tests that run on NPU/Ascend *                            |
+| `H100`             | Tests that require H100 GPU  *                            |
+| `L4`               | Tests that require L4 GPU *                               |
+| `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                 |
+| `A2`               | Tests that require A2 NPU *                               |
+| `A3`               | Tests that require A3 NPU *                               |
+| `distributed_cuda` | Tests that require multi cards on CUDA platform *         |
+| `distributed_rocm` | Tests that require multi cards on ROCm platform  *        |
+| `distributed_npu`  | Tests that require multi cards on NPU platform  *         |
+| `skipif_cuda`      | Skip if the num of CUDA cards is less than the required * |
+| `skipif_rocm`      | Skip if the num of ROCm cards is less than the required * |
+| `skipif_npu`       | Skip if the num of NPU cards is less than the required *  |
+| `slow`             | Slow tests (may skip in quick CI)                         |
+| `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
+| `local_model`      | Tests requiring local / non-HF-hub model weights          |
 
-Before entering specific testing levels, the project establishes two common specifications aimed at standardizing the development process and quickly locating issues.
+\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility).
 
-1.  ***PR Checklist ([Tests Style](../ci/tests_style.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
-2.  ***CI Failure Explanation ([CI Failures](../ci/failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
+#### Example usage for markers
 
-## Notes
+```python
+from tests.helpers.mark import hardware_test
 
-### Diff-aware Buildkite uploads (`source_file_dependencies`)
-
-L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/cuda/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
-
-#### What `source_file_dependencies` is
-
-- A **uploader-only** YAML key on a Buildkite step or group. **Buildkite does not understand it**; `upload_pipeline.py` always **removes** it from the YAML that is uploaded.
-- A list of path **prefixes** (directories or individual files). If **any** changed file in the diff equals a prefix or starts with `prefix/`, the step is kept; otherwise the step (or entire group) is **omitted** from the uploaded pipeline.
-
-#### When filtering runs
-
-| Build context | Changed files used for matching |
-| --- | --- |
-| Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
-| `main` branch push | `git diff --name-only <commit>^..<commit>` |
-| Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
-
-Docs-only PRs are handled earlier in bootstrap (`.buildkite/cuda/pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
-
-#### Where it is configured
-
-| Level | Pipeline file | Upload entry |
-| --- | --- | --- |
-| L2 | `.buildkite/cuda/test-ready.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-ready.yml` (from `cuda/pipeline.yml`) |
-| L3 | `.buildkite/cuda/test-merge.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-merge.yml` (from `cuda/pipeline.yml`) |
-
-Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
-
-#### Current skip policy (L2 / L3)
-
-To balance CI cost and coverage:
-
-- **Always run** (no `source_file_dependencies`): baseline groups outside E2E Test—e.g. Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
-- **Diff-gated** (`source_file_dependencies` set): **every leaf job under the E2E Test group** in `test-ready.yml` and `test-merge.yml`, regardless of queue (`mithril-h100-pool`, `gpu_1_queue`, or `gpu_4_queue`). Each step lists the smallest set of prefixes that should trigger it—typically:
-  - pytest file(s) exercised by the job (online and/or offline);
-  - model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`;
-  - related `vllm_omni/model_executor/stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable.
-
-Adding a new E2E step: add `source_file_dependencies` on the leaf job with those prefixes. Prefer **per-step** deps rather than a broad group-level list unless every child shares the same paths.
-
-#### YAML examples
-
-H100 E2E (kubernetes / `mithril-h100-pool`):
-
-```yaml
-      - label: "Diffusion · Qwen Image Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen_image.py
-          - vllm_omni/diffusion/models/qwen_image/
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
-        agents:
-          queue: "mithril-h100-pool"
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(
+   res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
+   num_cards=2,
+)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_audio()
+    ...
 ```
 
-Docker E2E (`gpu_1_queue` / `gpu_4_queue`)—same key, same upload-time filtering:
+#### Decorator: `@hardware_test`
 
-```yaml
-      - label: "TTS · Qwen3-TTS CustomVoice Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
-          - vllm_omni/model_executor/models/qwen3_tts/
-          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
-          - vllm_omni/deploy/qwen3_tts.yaml
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
-        agents:
-          queue: "gpu_4_queue"
+This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
+
+1. **Applies platform and resource markers**  
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `B60`, `A2`, `A3`).
+   ```
+   @pytest.mark.cuda
+   @pytest.mark.L4
+   ```
+2. **Handles multi-card (distributed) scenarios**  
+   For tests requiring multiple cards, it automatically adds distributed markers such as `distributed_cuda`, `distributed_rocm`, or `distributed_npu`.
+   ```
+   @pytest.mark.distributed_cuda(num_cards=num_cards)
+   ```
+3. **Supports flexible card requirements**  
+   Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
+
+4. **Integrates resource validation**  
+   On CUDA, adds a skip marker (`skipif_cuda`) if the system does not have the required number of devices.
+   Support for `skipif_rocm` and `skipif_npu` will be implemented later.
+
+
+5. **Works with pytest filtering**  
+   Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "distributed_cuda and L4"`).
+
+##### Example usage for decorator
+- Single call for multiple platforms:
+    ```python
+    @hardware_test(
+        res={"cuda": "L4", "rocm": "MI325", "xpu": "B60", "npu": "A2"},
+        num_cards={"cuda": 2, "rocm": 2, "xpu": 2, "npu": 2},
+    )
+    ```
+    or
+    ```python
+    @hardware_test(
+        res={"cuda": "L4", "rocm": "MI325", "xpu": "B60", "npu": "A2"},
+        num_cards=2,
+    )
+    ```
+- `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), XPU (B60), MUSA (S5000), NPU (A2/A3)
+- `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
+- Distributed markers (`distributed_cuda`, `distributed_rocm`, `distributed_npu`) are auto-added for multi-card cases
+- Filtering examples:
+    - CUDA only: `pytest -m "distributed_cuda and L4"`
+    - ROCm only: `pytest -m "distributed_rocm and MI325"`
+    - NPU only: `pytest -m "distributed_npu"`
+
+#### Function: `hardware_marks`
+
+`hardware_marks` returns a list of pytest mark objects with the same signature as `@hardware_test`. Use it when you need more flexibility, such as attaching hardware marks to individual `pytest.param` entries rather than an entire test function.
+
+```python
+from tests.helpers.mark import hardware_marks
+
+MULTI_CARD_MARKS = hardware_marks(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2
+)
+
+@pytest.mark.parametrize("omni_server", [
+    pytest.param(OmniServerParams(...), id="case_001", marks=MULTI_CARD_MARKS),
+], indirect=True)
+def test_feature(omni_server):
+    ...
 ```
 
-A **group** may also define `source_file_dependencies`; nested steps inherit filtering as a unit—the whole group is dropped if no prefix matches.
+#### JSON `mark` field (L4 perf configs)
 
-#### Local dry-run
+Perf JSON under `tests/dfx/perf/tests/` can attach pytest marks per **case** (`test_name` block). Parsed by `tests.dfx.conftest.resolve_pytest_marks` and applied to each parametrized run in `run_benchmark.py` / `run_diffusion_benchmark.py`.
 
-```bash
-# Render filtered YAML to stdout (no upload)
-python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same semantics as `hardware_marks()` above), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, or `diffusion`.
 
-# Confirm uploader-only keys are stripped
-python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
-# (no output expected)
+```json
+{
+  "test_name": "test_cosmos3_t2i_official_demo_2gpu",
+  "mark": [
+    {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+    "full_model",
+    "diffusion"
+  ],
+  "server_type": "vllm-omni",
+  "server_params": { "...": "..." },
+  "benchmark_params": [{ "name": "1024x1024_steps4", "...": "..." }]
+}
 ```
 
-On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `skip '…' (no changes under …)` for omitted steps.
+- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Nightly CI perf steps: `--test-config-file tests/dfx/perf/tests/test_<model>_vllm_omni.json` (file selects cases; no `-m`)
+- Result filenames use **runtime** GPU detection (`get_runtime_resource_label`); `H100` is omitted on the default CI pool
 
-#### Related
+See [L4 performance test examples](./test_examples/l4_performance_tests.inc.md) for the full schema.
 
-- Implementation: `.buildkite/cuda/scripts/upload_pipeline.py`
-- L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
+### Add Support for a New Platform
 
-### Test helper environment variables
+If you want to add support for a new platform (e.g., "tpu" for a new accelerator), follow these steps:
 
-Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+1. **Extend the marker list in your pytest config** so that platform/resource markers are defined:
+   ```toml
+   # In pyproject.toml or pytest.ini
+   [tool.pytest.ini_options]
+   markers = [
+       # ... existing markers ...
+       "tpu: Tests that require TPU device",
+       "TPU_V3: Tests that require TPU v3 hardware",
+       "distributed_tpu: Tests that require multiple TPU devices",
+   ]
+   ```
+2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
+   ```python
+   # In vllm-omni/tests/helpers/mark.py
 
-| Variable | Accepted values | Description |
-| -------- | --------------- | ----------- |
-| `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+   def tpu_marks(*, res: str, num_cards: int):
+       test_platform = pytest.mark.tpu
+       if res == "TPU_V3":
+           test_resource = pytest.mark.TPU_V3
+       else:
+           raise ValueError(
+               f"Invalid TPU resource type: {res}. Supported: TPU_V3")
 
-Example (Linux / macOS):
+       if num_cards == 1:
+           return [test_platform, test_resource]
+       else:
+           test_distributed = pytest.mark.distributed_tpu(num_cards=num_cards)
+           # Optionally: add skipif_tpu when implemented
+           return [test_platform, test_resource, test_distributed]
+   ```
+3. **Update `hardware_marks` to recognize your new platform**:
+    In the relevant place (see the `hardware_marks` implementation), add:
+    ```python
+    if platform == "tpu":
+        marks = tpu_marks(res=resource, num_cards=cards)
+    ```
+    (`hardware_test` calls `hardware_marks` internally, so both will pick up the change.)
+4. **(Recommended) Add a test using your new markers**:
+   ```python
+   @hardware_test(
+       res={"tpu": "TPU_V3"},
+       num_cards=2,
+   )
+   def test_my_tpu_feature():
+       ...
+   ```
 
-```bash
-export VLLM_OMNI_KEEP_REQUEST_MEDIA=1
-pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
-```
+**Summary**:  
+- Add pytest markers for your new platform/resources  
+- Implement a marker function (`xxx_marks`)  
+- Plug into `hardware_marks`  
+- You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers, distribution, and isolation!
 
-Example (Windows PowerShell):
+See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).
 
-```powershell
-$env:VLLM_OMNI_KEEP_REQUEST_MEDIA = "1"
-pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
-```
+## Test case style
 
-## Chapter 1: L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
+### L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
-### 1.1 Testing Purpose
+#### 1.1 Testing Purpose
 
 L1 and L2 level testing form the foundation of the quality assurance system. L1 level testing focuses on verifying the internal logic correctness of code units (e.g., functions, classes), ensuring each independent component behaves as designed.
 
@@ -439,7 +356,7 @@ L2 level testing builds upon L1 by introducing GPU resources and verifying that 
 
 
 
-### 1.2 Testing Content and Scope
+#### 1.2 Testing Content and Scope
 
 -   ***L1 (Unit & Logic Testing)***:
 -   -   ***Scope***: Tests internal functions and methods of core components such as `entrypoints`, `models`.
@@ -454,7 +371,7 @@ L2 level testing builds upon L1 by introducing GPU resources and verifying that 
         -   **Omni multimodal** (`assert_omni_response`): L2 asserts successful completion; keyword, transcript, and cross-modal similarity checks run only at L3+.
     -   ***Characteristic***: Requires ***GPU*** resources to perform model computations.
 
-### 1.3 Test Directory and Execution Files
+#### 1.3 Test Directory and Execution Files
 
 A clear directory structure is key to managing test cases efficiently.
 
@@ -464,10 +381,10 @@ A clear directory structure is key to managing test cases efficiently.
 -   -   Online Serving: `/tests/e2e/online_serving/test_{model_name}.py`
     -   Offline Inference: `/tests/e2e/offline_inference/test_{model_name}.py`
 
-### 1.4 Execution Method and Example
+#### 1.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR with ready label`**. That is, when a developer adds a "ready for review" or similar label to a PR on platforms like GitHub, L1 and L2 tests are automatically triggered.
--   ***Diff-aware step skipping***: On L2, **E2E Test** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) prefixes (H100 and docker queues alike); non-E2E groups still always upload. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
+-   ***Diff-aware step skipping***: On L2, **E2E Test** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](ci_settings.md#step-filtering) prefixes; non-E2E groups still always upload. See [CI Settings — Diff-aware CI](ci_settings.md#diff-aware-ci).
 -   ***Execution Environment***: L1 uses ***CPU*** environment; L2 requires ***GPU*** environment.
 -   ***Script Example***:
 
@@ -535,7 +452,7 @@ def test_cap_and_align_mel_length_no_mismatch(repeats, code_len, max_mel_frames)
 
 <details>
 <summary> L2 Test Examples</summary>
-You can refer to Test Examples in Chapter 2 to see example test cases that incorporate both L2 and L3 testing logic.
+You can refer to Test Examples in the L3 section to see example test cases that incorporate both L2 and L3 testing logic.
 </details>
 
 -   -   ***Run Command***:
@@ -543,9 +460,9 @@ You can refer to Test Examples in Chapter 2 to see example test cases that incor
     `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py`
     `pytest -s -v -m 'core_model and cpu' --run-level=core_model`
 
-## Chapter 2: L3 Level Testing - Core Integration, Performance, and Accuracy Verification
+### L3 Level Testing - Core Integration, Performance, and Accuracy Verification
 
-### 2.1 Testing Purpose
+#### 2.1 Testing Purpose
 
 L3 level testing executes after code is merged into the main branch. Its core purpose is to verify the integration effect, key performance indicators, and output accuracy of ***real models*** in ***multiple deployment scenarios***
 
@@ -553,30 +470,30 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
 
 
-### 2.2 Testing Content and Scope
+#### 2.2 Testing Content and Scope
 
 -   ***Deployment Scenarios***: Covers richer `online` and `offline` deployment configurations, which may include different hardware configurations, batch sizes, concurrency levels, etc.
 -   ***Core Verification***:
 -   1.  ***Inference Functionality***: Ensures real models can perform forward computation normally and return results.
     2.  ***Accuracy Compliance***: Verifies that the model's evaluation metrics (e.g., accuracy) meet the expected baseline, preventing code changes from introducing accuracy issues.
     3.  ***Important Performance***: Verifies whether performance (e.g., P99 latency, throughput) in core scenarios meets preset thresholds.
--   ***L3 response validation (`advanced_model`)***: At `--run-level advanced_model`, `tests/helpers/assertions.py` adds semantic checks on top of L2 payload gates (see Chapter 1):
+-   ***L3 response validation (`advanced_model`)***: At `--run-level advanced_model`, `tests/helpers/assertions.py` adds semantic checks on top of L2 payload gates (see L1 & L2 above):
     -   **Speech / TTS** (`assert_audio_speech_response`): Whisper transcript of returned audio vs `request_config["input"]` (cosine similarity &gt; 0.9 when input text is set); optional `min_audio_bytes` floor; PCM harmonic-to-noise ratio when `response_format` is `pcm`; **preset voice gender** via `_assert_preset_voice_gender_from_audio` when `voice` matches a known preset in `_PRESET_VOICE_GENDER_MAP` (pitch/F0-based classifier; skipped for unknown voices or `pcm` output).
     -   **Omni multimodal** (`assert_omni_response`): non-empty text/audio outputs; `key_words` in transcript or text; text–audio similarity / containment; preset **`speaker`** gender check (same helper as TTS).
     -   **Diffusion** (`assert_*_diffusion_response`): image/video dimension and frame-count parity with request parameters where configured.
     -   **Accuracy suites**: pixel/video similarity and metric baselines under `/tests/e2e/accuracy/` (separate from inline helper assertions).
 
-### 2.3 Test Directory and Execution Files
+#### 2.3 Test Directory and Execution Files
 
 -   ***Functional Testing***:
 -   -   Online Serving: `/tests/e2e/online_serving/test_{model_name}_expansion.py`
     -   Offline Inference: `/tests/e2e/offline_inference/test_{model_name}_expansion.py`
     -   (Note: `_expansion.py` likely means it contains more comprehensive scenario cases compared to L2 tests).
 
-### 2.4 Execution Method and Example
+#### 2.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch (typically via `merge-test` label on the PR before merge).
--   ***Diff-aware step skipping***: Same [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) mechanism as L2—**all E2E Test** leaf steps are diff-gated; other L3 groups always upload. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
+-   ***Diff-aware step skipping***: Same [`source_file_dependencies`](ci_settings.md#step-filtering) mechanism as L2—**all E2E Test** leaf steps are diff-gated; other L3 groups always upload. See [CI Settings — Diff-aware CI](ci_settings.md#diff-aware-ci).
 -   ***Execution Environment***: ***GPU*** servers.
 -   ***Script Example***:
 
@@ -692,27 +609,27 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Implicit Validation**: `send_omni_request`, `send_audio_speech_request`, and `send_diffusion_request` call `assert_*_response` helpers with the session `--run-level`. At `core_model`, checks are limited to success plus cheap payload sanity (non-empty audio/media, format/content-type, optional `min_audio_bytes`). At `advanced_model` and `full_model`, deep validation adds Whisper transcripts, keyword/similarity, diffusion dimension checks, PCM HNR, etc.
 
-    **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
+    **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](test_system_overview.md#test-helper-environment-variables)).
 
 -   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 
 -   ***Run Command (L4 nightly expansion)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}_expansion.py -m full_model --run-level=full_model`
 
-## Chapter 3: L4 Level Testing - Full Functionality, Performance, and Documentation Testing
+### L4 Level Testing - Full Functionality, Performance, and Documentation Testing
 
-### 3.1 Testing Purpose
+#### 3.1 Testing Purpose
 
 L4 level testing is a comprehensive quality audit before a version release. It expands upon L3, executing ***full*** functional scenarios, conducting systematic ***performance stress tests***, and simultaneously verifying the correctness of accompanying ***example documentation***. Its purpose is to perform deep validation of the system during off-peak nighttime hours, providing quality trend reports for daytime development and data support for release decisions.
 
 
 
-### 3.2 Testing Content and Scope
+#### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
 -   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen3_omni_*.json` (Omni), `test_tts.json` / `test_voxcpm2.json` / `test_higgs_audio_v3.json` (TTS), and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file` in nightly **Perf Test** steps) to drive throughput, latency, and memory benchmarks. Each JSON **case** may declare an optional top-level **`mark`** array: exactly one ``hardware_marks`` object plus pytest marker name strings (`full_model`, `omni` / `tts` / `diffusion`, …). Runners attach those marks to each parametrized `(server, benchmark index)` pair so **local** bulk runs can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Nightly CI perf jobs select workloads by **`--test-config-file`**, not `-m`. Details are in the Performance Tests example below.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
-### 3.3 Test Directory and Execution Files
+#### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
 -   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
@@ -720,7 +637,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
     -   `tests/examples/online_serving/test_{model_name}.py`
     -   `tests/examples/offline_inference/test_{model_name}.py`
 
-### 3.4 Execution Method and Example
+#### 3.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`Nightly`**, automatically executed every night.
 -   ***Execution Environment***: ***GPU*** server clusters to meet the resource demands of performance testing.
@@ -740,20 +657,20 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 
 -   ***Run Command***: (Specific commands would depend on the performance testing tool and configuration defined in `nightly.json`).
 
-## Chapter 4: L5 Level Testing - Stability and Reliability Testing
+### L5 Level Testing - Stability and Reliability Testing
 
-### 4.1 Testing Purpose
+#### 4.1 Testing Purpose
 
 L5 level testing focuses on the performance of model services under ***long-running*** and ***abnormal fault*** scenarios. It aims to uncover deep-seated issues that only manifest under sustained pressure or extreme conditions, such as memory leaks, resource contention, gradual performance degradation, and lack of fault tolerance mechanisms. This is the final, yet crucial, line of defense for ensuring service high availability and production environment robustness.
 
 
 
-### 4.2 Testing Content and Scope
+#### 4.2 Testing Content and Scope
 
 -   ***Long-term Stability (Stability) Testing***: Uses JSON under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` and `test_wan22.json`) to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
 -   ***Reliability Testing***: Uses pytest suites under `tests/dfx/reliability/` to inject controlled faults against a **live** `vllm_omni serve` instance (same **`omni_server` / `omni_server_function`** fixture style as E2E). Current suites emphasize **GPU memory pressure** (CUDA sidecar “memory hog”), **worker / runtime process kill** (`SIGKILL` on `VLLM::Worker` for Qwen3-Omni, `multiprocessing.spawn` for Wan2.2 video workers, or `vLLM-Omni::` for HunyuanImage DiT workers), **large multimodal chat**, **`/v1/videos`**, **`/v1/images/generations`**, or **`/v1/audio/speech`** jobs under OOM, **`/health` → 503** and **fast-fail / non-hanging concurrent** requests after kill, and **OpenAI-style 5xx error contracts** (e.g. text vs text+audio under OOM). **Post-fault recovery** checks exist where enabled (some cases may be `skip` while issues are tracked). See the Reliability `<details>` block in Section 4.4 for file-level responsibilities and CI markers (`slow`, `hardware_test`, POSIX-only kill).
 
-### 4.3 Test Directory and Execution Files
+#### 4.3 Test Directory and Execution Files
 
 -   ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
 -   ***Reliability Test Suite*** (`tests/dfx/reliability/`):
@@ -765,7 +682,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
     -   `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
     -   `README.md` — Short local run commands for this directory.
 
-### 4.4 Execution Method and Example
+#### 4.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 -   ***Execution Environment***: ***GPU*** servers, requiring a stable and exclusive testing environment.
@@ -799,7 +716,7 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 }
 ```
 
-#### Parameter Explanation
+##### Parameter Explanation
 
 ***Overview***
 
@@ -809,16 +726,16 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 | server_params    | Yes      | Server-side configuration parameters (model, stage configuration, etc.)     |
 | benchmark_params | Yes      | Stability benchmark running parameters (supports multiple configurations)   |
 
-#### server_params Configuration
+##### server_params Configuration
 
-##### Basic Parameters
+###### Basic Parameters
 
 | Parameter         | Required | Example                            | Description                         |
 | ----------------- | -------- | ---------------------------------- | ----------------------------------- |
 | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path                  |
 | stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name       |
 
-##### Dynamic Configuration (update/delete)
+###### Dynamic Configuration (update/delete)
 
 Supports incremental modifications based on the basic configuration:
 
@@ -828,9 +745,9 @@ Supports incremental modifications based on the basic configuration:
 | delete    | Delete specified configuration items |
 
 ***Example***:
-You can refer to Test Examples in Chapter 3.4
+You can refer to Test Examples in L4 §3.4
 
-#### benchmark_params Configuration
+##### benchmark_params Configuration
 
 For stability testing, the key parameters are:
 
@@ -840,18 +757,18 @@ For stability testing, the key parameters are:
     -   `max_concurrency`: Maximum number of concurrent requests. When this is used, `request_rate` is set to `inf` internally.
 -   **num_prompts_per_batch**: Number of prompts sent in each batch. Multiple batches will be executed sequentially within `duration_sec`.
 
-All other optional parameters follow the same rules as the in Chapter 3.4.
+All other optional parameters follow the same rules as in L4 §3.4.
 
 </details>
 
 <details>
 <summary> Reliability test suite (<code>tests/dfx/reliability</code>)</summary>
 
-#### Purpose and relationship to stability
+##### Purpose and relationship to stability
 
 Reliability tests are **short fault-injection** integration runs (L5 **(b)** in `tests/dfx/reliability/README.md`). They complement **stability** JSON-driven long runs: instead of hours of steady traffic, they **perturb** the server (GPU OOM sidecar, fatal signals on selected processes) and check **failure mode** and **latency bounds** (e.g. chat or `/v1/videos` must not hang under concurrent fault-time load).
 
-#### Directory layout
+##### Directory layout
 
 | Path | Responsibility |
 | ---- | -------------- |
@@ -863,13 +780,13 @@ Reliability tests are **short fault-injection** integration runs (L5 **(b)** in 
 | `test_reliability_voxcpm2.py` | VoxCPM2: `/v1/audio/speech` under OOM (error contract), **SIGKILL** on `VLLM::` workers and serve/tree targets, health / fast-fail / concurrent speech requests; some OOM cases may be skipped while tracked in issues. |
 | `README.md` | Minimal run / collect examples. |
 
-#### Parametrization and markers
+##### Parametrization and markers
 
 - Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths (including XPU substitutions where applicable) and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
 - Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** or **`@hardware_test(res={"cuda": "L4"}, num_cards=1)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100; VoxCPM2 **1**× L4).
 - **Process-kill** tests use **`@pytest.mark.skipif(os.name == "nt", ...)`** because injection uses POSIX **`pgrep` / `kill`**.
 
-#### CI trigger
+##### CI trigger
 
 Weekly Buildkite (`.buildkite/cuda/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
 
@@ -887,7 +804,7 @@ pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
 pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
 ```
 
-#### Local commands
+##### Local commands
 
 ```bash
 pytest --collect-only tests/dfx/reliability
@@ -897,7 +814,7 @@ pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
 pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 ```
 
-#### Adding a new model suite
+##### Adding a new model suite
 
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
 2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e stage-config directory (same pattern as existing files).
@@ -908,7 +825,3 @@ pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 
 -   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
     -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)
-
-## Summary
-
-This multi-level testing system achieves continuous, progressive validation of model service quality by tightly integrating testing activities with the development workflow (commit, review, merge, release). From rapid unit testing to comprehensive end-to-end testing, and further to in-depth performance, stability, and reliability verification, each level has clear objectives, collectively building a robust quality protection net. By following this system, teams can deliver high-quality, highly reliable model services more efficiently.

@@ -239,6 +239,6 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
-    if bot_task is not None:
+    if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:
         extra_body.setdefault("bot_task", bot_task)
     args.extra_body = extra_body

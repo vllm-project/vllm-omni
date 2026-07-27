@@ -1,10 +1,17 @@
+import asyncio
 from collections.abc import Sequence
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker import gpu_input_batch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
@@ -23,6 +30,79 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     )
     runner._request_needs_downstream_stage_payload = lambda rid: rid in downstream_req_ids
     return runner
+
+
+def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
+    requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
+    request = OpenAICreateSpeechRequest.model_validate(
+        {"input": "Hello", "extra_params": requested},
+    )
+
+    class Adapter:
+        def validate(self, request):
+            return None
+
+        async def build(self, request, sampling_params_list, has_inline_ref_audio):
+            return PreparedRequest(prompt={"prompt": request.input}, tts_params={}, model_type="higgs_audio_v3")
+
+    engine = SimpleNamespace(
+        errored=False,
+        default_sampling_params_list=[SamplingParams(temperature=1.0, top_p=0.95, top_k=50)],
+        generate=lambda **kwargs: kwargs["sampling_params_list"],
+    )
+    serving = object.__new__(OmniOpenAIServingSpeech)
+    serving.engine_client = engine
+    serving.model_config = SimpleNamespace(async_chunk=True)
+    serving._tts_model_type = "higgs_audio_v3"
+    serving._get_tts_adapter = lambda: Adapter()
+    serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
+
+    _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
+    stage0_params = stage_sampling_params[0]
+
+    monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        vocab_size=1024,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+    )
+    input_batch.add_request(
+        CachedRequestState(
+            req_id="speech-test",
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=stage0_params,
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+    )
+    input_batch.sampling_metadata = input_batch._make_sampling_metadata()
+
+    received = []
+    runner = object.__new__(GPUARModelRunner)
+    runner.input_batch = input_batch
+    runner.model = SimpleNamespace(
+        prefer_model_sampler=True,
+        skips_model_sampler_output_token_history=True,
+        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+    )
+    runner.sampler = SimpleNamespace()
+    logits = torch.zeros((1, 4))
+
+    output = runner._sample(logits, spec_decode_metadata=None)
+
+    assert output == "model-sampler"
+    assert len(received) == 1
+    sampling_metadata = received[0]
+    torch.testing.assert_close(sampling_metadata.temperature, torch.tensor([requested["temperature"]]))
+    torch.testing.assert_close(sampling_metadata.top_p, torch.tensor([requested["top_p"]]))
+    assert sampling_metadata.top_k.tolist() == [requested["top_k"]]
 
 
 def test_resolve_pooler_payload_req_ids_audio_terminal_stage_keeps_payload():
@@ -663,6 +743,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     # inter_stage_outputs mirrors multimodal_outputs (PR #4792).
     assert output.inter_stage_outputs is not None
     assert output.multimodal_outputs is not None
+    assert output.inter_stage_outputs is output.multimodal_outputs
     assert torch.equal(output.inter_stage_outputs[0]["hidden"], output.multimodal_outputs[0]["hidden"])
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], output.multimodal_outputs[1]["hidden"])
     assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))

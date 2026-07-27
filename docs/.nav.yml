@@ -16,13 +16,11 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
-      - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
@@ -56,6 +54,7 @@ nav:
     - Diffusion Features:
       - Overview: user_guide/diffusion_features.md
       - Feature Compatibility: user_guide/feature_compatibility.md
+      - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
