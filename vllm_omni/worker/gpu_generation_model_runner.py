@@ -167,10 +167,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
-            if scheduler_output.total_num_scheduled_tokens <= 0:
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -179,7 +175,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self._execute_mm_encoder(scheduler_output)
                     return self.attach_omni_connector_output(make_empty_encoder_model_runner_output(scheduler_output))
 
-            if not num_scheduled_tokens:
+            # OMNI: keep this block in lock-step with the same block in
+            # GPUARModelRunner.execute_model.
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if num_scheduled_tokens <= 0:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
