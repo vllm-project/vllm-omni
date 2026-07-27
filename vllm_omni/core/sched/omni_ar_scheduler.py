@@ -452,7 +452,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped = logprob_validation_failed
             is_segment_finished = False
             finished = False
-            new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
