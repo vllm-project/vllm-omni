@@ -632,6 +632,32 @@ def test_ltx_guidance_rescale_handles_zero_variance_prediction():
     torch.testing.assert_close(actual, torch.zeros_like(cond))
 
 
+def test_ltx_audio_guidance_rescale_ignores_sp_padding_tokens():
+    logical_cond = torch.tensor([[[1.0, 2.0], [3.0, 5.0]]])
+    logical_uncond = torch.tensor([[[0.5, -1.0], [2.0, 1.0]]])
+    guidance = LTXModalityGuidance(cfg_scale=3.0, rescale_scale=1.0)
+    expected = combine_guided_x0(
+        cond=logical_cond,
+        uncond_text=logical_uncond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+    )
+    padded_cond = torch.cat([logical_cond, torch.tensor([[[1000.0, -1000.0]]])], dim=1)
+    padded_uncond = torch.cat([logical_uncond, torch.tensor([[[-500.0, 500.0]]])], dim=1)
+
+    actual = combine_guided_x0(
+        cond=padded_cond,
+        uncond_text=padded_uncond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+        rescale_token_count=2,
+    )
+
+    torch.testing.assert_close(actual[:, :2], expected)
+
+
 def test_ltx_guidance_builds_per_sample_stg_and_modality_masks():
     plan = LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.request_guidance)
     perturbations = build_perturbation_kwargs(plan, batch_size=2, reference=torch.ones(8, 1, 1))

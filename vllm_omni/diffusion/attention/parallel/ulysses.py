@@ -387,13 +387,13 @@ class UlyssesParallelAttention:
                 else:
                     if attn_metadata.attn_mask is None:
                         attn_metadata.attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,
                             device=query.device,
                         )
                     elif attn_metadata.joint_attn_mask is None:
                         attn_metadata.joint_attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.attn_mask.shape[1]],
                             dtype=torch.bool,
                             device=query.device,
                         )
@@ -404,9 +404,10 @@ class UlyssesParallelAttention:
                     )
 
             if attn_metadata.attn_mask is not None:
-                # the final attn_mask is ready, the length should be aligedn with query length
-                assert attn_metadata.attn_mask.shape[1] == query.shape[1], (
-                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
+                # A 2D attention mask is a key-padding mask. Q and K lengths
+                # may differ for cross-attention.
+                assert attn_metadata.attn_mask.shape[1] == key.shape[1], (
+                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != key length: {key.shape[1]}"
                 )
                 attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
         return query, key, value, attn_metadata, ctx

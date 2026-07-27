@@ -199,6 +199,7 @@ class TestCFGParallelHelpers:
             ),
             attention_kwargs=None,
             audio_scheduler=SimpleNamespace(sigmas=torch.stack([audio_sigma])),
+            original_audio_num_frames=state.audio.shape[1],
         )
 
         actual_video, actual_audio = executor.predict_parallel_guidance(

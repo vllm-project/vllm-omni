@@ -299,6 +299,20 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if attention_mask is not None:
+            backend_name = self.attn_backend.get_name().upper()
+            backend_ignores_mask = not self.attn_backend.supports_attention_mask()
+            # FlashAttention's varlen helper applies one 2D padding mask to
+            # both Q and K. A key-only cross-attention mask therefore needs
+            # SDPA when Q and K lengths differ. Non-2D masks also cannot use
+            # that varlen path.
+            flash_mask_needs_sdpa = backend_name.startswith("FLASH_ATTN") and (
+                attention_mask.ndim != 2 or query.shape[1] != key.shape[1]
+            )
+            if backend_ignores_mask or flash_mask_needs_sdpa:
+                return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
