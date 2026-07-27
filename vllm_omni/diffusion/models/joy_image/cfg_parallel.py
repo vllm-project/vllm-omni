@@ -40,7 +40,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     continue
                 self._current_timestep = timestep
 
-                latents[:, : image_latents.shape[1]] = image_latents
+                latents = torch.cat([image_latents, latents[:, image_latents.shape[1] :]], dim=1)
                 latent_model_input = latents
                 timestep_expand = timestep.expand(latents.shape[0]).to(device=latents.device)
 
@@ -70,7 +70,7 @@ class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     output_slice=None,
                 )
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, latents, do_true_cfg)
-                latents[:, : image_latents.shape[1]] = image_latents
+                latents = torch.cat([image_latents, latents[:, image_latents.shape[1] :]], dim=1)
                 pbar.update()
         return latents
 

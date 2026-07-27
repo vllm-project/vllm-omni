@@ -500,6 +500,66 @@ def test_joy_diffuse_preserves_scheduler_timestep_dtype_for_time_embedding():
     assert mixin.captured_timestep_dtype == torch.float32
 
 
+def test_joy_diffuse_replaces_reference_latents_out_of_place():
+    class FakeProgressBar:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def update(self):
+            pass
+
+    class FakeScheduler:
+        def set_begin_index(self, index):
+            self.begin_index = index
+
+    class FakeMixin(JoyImageEditCFGParallelMixin):
+        def __init__(self):
+            self.scheduler = FakeScheduler()
+            self.scheduler_returned_latents = None
+            self._interrupt = False
+
+        @property
+        def interrupt(self):
+            return self._interrupt
+
+        def progress_bar(self, total):
+            return FakeProgressBar()
+
+        def predict_noise_maybe_with_cfg(self, **kwargs):
+            return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+        def scheduler_step_maybe_with_cfg(self, noise_pred, timestep, latents, do_true_cfg):
+            stepped = latents.clone()
+            stepped[:, :1] = -5
+            self.scheduler_returned_latents = stepped
+            return stepped
+
+    mixin = FakeMixin()
+    latents = torch.arange(3, dtype=torch.float32).view(1, 3, 1, 1, 1, 1)
+    original_latents = latents.clone()
+    image_latents = torch.full((1, 1, 1, 1, 1, 1), 100.0)
+
+    output = mixin.diffuse(
+        latents=latents,
+        image_latents=image_latents,
+        prompt_embeds=torch.zeros(1, 2, 4),
+        prompt_embeds_mask=torch.ones(1, 2, dtype=torch.long),
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        timesteps=torch.tensor([999.125], dtype=torch.float32),
+        do_true_cfg=False,
+        true_cfg_scale=1.0,
+    )
+
+    assert torch.equal(latents, original_latents)
+    assert mixin.scheduler_returned_latents is not None
+    assert torch.equal(mixin.scheduler_returned_latents[:, :1], torch.full_like(image_latents, -5))
+    assert torch.equal(output[:, :1], image_latents)
+
+
 def test_format_qwen_multimodal_prompt_matches_diffusers_image_placeholder_replacement():
     formatted = _format_qwen_multimodal_prompt("make it brighter")
 
