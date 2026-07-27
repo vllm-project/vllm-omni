@@ -2114,7 +2114,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if grammar_output is not None:
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
 
-        # Correct padding values of prompt_token_ids to match the logits vocabulary size
+        # Correct padding values of prompt_token_ids to match the logits vocabulary size.
+        # `max=logits_vocab` (NOT `logits_vocab - 1`) is deliberate: upstream penalty
+        # computation allocates `vocab_size + 1` bins and drops the last column, so
+        # `vocab_size` is the designed padding value that never affects penalties
+        # (vllm/model_executor/layers/utils.py::get_token_bin_counts_and_mask). Clamping
+        # one lower would count padding as real occurrences of the last vocab token.
         if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
             smd = self.input_batch.sampling_metadata
             if smd.prompt_token_ids is not None:

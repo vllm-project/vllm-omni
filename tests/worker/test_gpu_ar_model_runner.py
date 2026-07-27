@@ -1198,3 +1198,54 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
 
     assert torch.equal(output.inter_stage_outputs[0]["codes.ref"], ref_codes[0])
     assert torch.equal(output.inter_stage_outputs[2]["codes.ref"], ref_codes[2])
+
+
+class TestPromptIdsClampPaddingConvention:
+    """Pin the `clamp(max=logits_vocab)` in `GPUARModelRunner.sample_tokens`.
+
+    The audit (RFC #5450 C2) originally flagged the clamp as an off-by-one
+    (OOB index). It is not: upstream penalties allocate `vocab_size + 1` bins
+    and drop the last column, so `vocab_size` is the designed padding value
+    (vllm/model_executor/layers/utils.py::get_token_bin_counts_and_mask).
+    These tests pin that contract so a future "fix" cannot re-break it.
+    """
+
+    LOGITS_VOCAB = 8
+    BATCH_VOCAB = 10  # wider input_batch vocab; its pad value is BATCH_VOCAB
+
+    def _padded_prompt(self):
+        # Two real tokens + two padding slots padded with the batch vocab size.
+        return torch.tensor([[1, 2, self.BATCH_VOCAB, self.BATCH_VOCAB]])
+
+    def test_clamp_to_logits_vocab_keeps_padding_inert(self):
+        from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
+
+        # The runner's exact expression.
+        clamped = self._padded_prompt().clamp(max=self.LOGITS_VOCAB)
+
+        _, mask = get_token_bin_counts_and_mask(clamped, self.LOGITS_VOCAB, 1)
+
+        expected = torch.zeros(1, self.LOGITS_VOCAB, dtype=torch.bool)
+        expected[0, 1] = True
+        expected[0, 2] = True
+        # Pad ids landed in the dropped (vocab_size-th) bin: no penalty effect.
+        assert torch.equal(mask, expected)
+
+    def test_clamp_one_lower_would_corrupt_last_token_penalties(self):
+        from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
+
+        # The "fix" the audit first proposed - shown here to be the actual bug:
+        # padding would count as occurrences of the last real vocab token.
+        clamped = self._padded_prompt().clamp(max=self.LOGITS_VOCAB - 1)
+
+        _, mask = get_token_bin_counts_and_mask(clamped, self.LOGITS_VOCAB, 1)
+
+        assert bool(mask[0, self.LOGITS_VOCAB - 1])
+
+    def test_unclamped_padding_overflows_penalty_bins(self):
+        from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
+
+        # Why the clamp exists: the batch-level pad value (BATCH_VOCAB) is out
+        # of range even for the vocab_size+1 penalty bins of a narrower head.
+        with pytest.raises(RuntimeError):
+            get_token_bin_counts_and_mask(self._padded_prompt(), self.LOGITS_VOCAB, 1)
