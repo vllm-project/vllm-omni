@@ -609,6 +609,29 @@ def test_build_engine_args_stage_model_overrides_parent_model():
     assert engine_args["model"] == "/stage/model"
 
 
+def test_build_engine_args_keeps_full_payload_connector_spec():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        engine_args={"async_chunk": False},
+        default_sampling_params={},
+    )
+    connector_spec = {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "sender"},
+    }
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        "/parent/model",
+        stage_connector_spec=connector_spec,
+    )
+
+    assert engine_args["stage_connector_spec"] == connector_spec
+
+
 def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
