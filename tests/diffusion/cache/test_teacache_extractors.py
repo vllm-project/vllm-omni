@@ -586,6 +586,16 @@ class TestHiDreamExtractor:
         with pytest.raises(ValueError, match="img_ids.*img_sizes"):
             extract_hidream_image_context(hidream_module, **inputs)
 
+    def test_pre_patchified_inputs_require_3d_hidden_states(self, hidream_module, sample_inputs):
+        """Test pre-patchified inputs require 3D hidden_states, matching forward()."""
+        inputs = sample_inputs.copy()
+        inputs["hidden_states_masks"] = torch.ones(self.BATCH_SIZE, self.PATCH_TOKENS)
+        inputs["img_ids"] = torch.zeros(self.BATCH_SIZE, self.PATCH_TOKENS, 3)
+        inputs["img_sizes"] = [(2, 2)]
+
+        with pytest.raises(ValueError, match="3D tensors"):
+            extract_hidream_image_context(hidream_module, **inputs)
+
     def test_encoder_hidden_states_is_none(self, hidream_module, sample_inputs):
         """HiDream keeps text conditioning inside block closures, not CacheContext."""
         context = extract_hidream_image_context(hidream_module, **sample_inputs)

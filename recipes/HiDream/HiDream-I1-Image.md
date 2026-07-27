@@ -51,8 +51,8 @@ vllm serve ${MODEL_NAME_OR_PATH} \
    --port 8092 \
    --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
    --tensor-parallel-size 1 \
-   --vae_use_slicing \
-   --vae_use_tiling
+   --vae-use-slicing \
+   --vae-use-tiling
 ```
 
 
@@ -118,7 +118,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --height 1024 --width 1024 \
   --num-inference-steps 50 --guidance-scale 5.0 \
   --tensor-parallel-size 1 \
-  --vae_use_slicing --vae_use_tiling \
+  --vae-use-slicing --vae-use-tiling \
   --cache-backend tea_cache \
   --cache-config '{"rel_l1_thresh": 0.2}' \
   --output hidream_teacache.png

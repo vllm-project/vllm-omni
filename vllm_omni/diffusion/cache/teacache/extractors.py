@@ -1330,6 +1330,11 @@ def extract_hidream_image_context(
 
     if hidden_states_masks is not None and (img_ids is None or img_sizes is None):
         raise ValueError("if `hidden_states_masks` is passed, `img_ids` and `img_sizes` must also be passed.")
+    elif hidden_states_masks is not None and hidden_states.ndim != 3:
+        raise ValueError(
+            "if `hidden_states_masks` is passed, `hidden_states` must be a 3D tensors with shape"
+            "(batch_size, patch_height * patch_width, patch_size * patch_size * channels)"
+        )
 
     state = _prepare_hidream_teacache_state(
         module,
