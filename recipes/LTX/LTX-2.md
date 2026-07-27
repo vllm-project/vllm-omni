@@ -7,10 +7,10 @@
 | Model | Checkpoint | Task | `--model-class-name` | Batching |
 |---|---|---|---|---|
 | LTX-2 | `Lightricks/LTX-2` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
-| LTX-2 | `Lightricks/LTX-2` | Ordinary two-stage T2V | `LTX2TwoStagePipeline` | No |
+| LTX-2 | `Lightricks/LTX-2` | Ordinary two-stage T2V/I2V | `LTX2TwoStagePipeline` | No |
 | LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Ordinary two-stage T2V | `LTX2TwoStagePipeline` | No |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Ordinary two-stage T2V/I2V | `LTX2TwoStagePipeline` | No |
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
 LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
@@ -24,7 +24,8 @@ distilled mode is selected explicitly rather than inferred from the checkpoint
 name or metadata; always pass `--model-class-name LTX2DistilledPipeline`.
 
 `LTX2TwoStagePipeline` runs the regular checkpoint at half resolution, then
-upsamples and refines with the matching distilled LoRA. It needs these sidecar
+upsamples and refines with the matching distilled LoRA. Omit `image` for T2V
+or provide one initial image for I2V. It needs these sidecar
 files from `Lightricks/LTX-2` or `Lightricks/LTX-2.3` respectively:
 
 | Model | Distilled LoRA | Spatial upsampler |
@@ -132,8 +133,7 @@ vllm serve diffusers/LTX-2.3-Diffusers --omni \
   --model-class-name LTX2TwoStagePipeline --stage-init-timeout 600
 ```
 
-The one-stage and distilled entries handle both T2V and I2V; ordinary
-two-stage currently exposes T2V only. A T2V request using the selected
+All three entries handle both T2V and I2V. A T2V request using the selected
 recipe's default guidance is:
 
 ```bash
@@ -147,7 +147,7 @@ curl -X POST http://localhost:8000/v1/videos/sync \
   -o ltx_t2v.mp4
 ```
 
-For I2V on the one-stage or distilled entry, provide exactly one initial image:
+For I2V on any entry, provide exactly one initial image:
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/sync \
@@ -271,7 +271,7 @@ noted below.
 | Argument | Type/default | Meaning and constraints |
 |---|---|---|
 | `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and per-request sampling parameters. |
-| `image` | image or batch, `None` | One-stage and distilled only. Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
+| `image` | image or batch, `None` | Supported by all entries. Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
 | `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
 | `negative_prompt` | string or list, `None` | Fallback after request values and before the recipe default; mutually exclusive with negative embeddings. |
 | `height` | `int`, `None` | Request → direct value → recipe default; divisible by 32 one-stage or 64 two-stage. |

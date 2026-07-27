@@ -24,7 +24,6 @@ class LTX2TwoStagePipeline(LTX2Pipeline):
     component_profile = LTX2_TWO_STAGE_COMPONENT_PROFILE
     pipeline_recipe = LTX2_TWO_STAGE_RECIPE
     supports_request_batch = False
-    support_image_input = False
 
 
 class LTX2DistilledPipeline(LTX2Pipeline):

@@ -285,28 +285,26 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
     assert pipe.pipeline_recipe is LTX23_TWO_STAGE_RECIPE
 
 
-def test_ltx_one_stage_entry_exposes_batch_image_and_distributed_decode_contracts():
+def test_ltx_entries_expose_batch_image_and_distributed_decode_contracts():
     assert LTX2Pipeline.supports_request_batch
     assert LTX2Pipeline.support_image_input
     assert LTX2Pipeline.unified_text_image_entry
     assert LTX2Pipeline.distributed_video_decode
     assert not LTX2TwoStagePipeline.supports_request_batch
-    assert not LTX2TwoStagePipeline.support_image_input
+    assert LTX2TwoStagePipeline.support_image_input
+    assert LTX2TwoStagePipeline.unified_text_image_entry
     assert not LTX2DistilledPipeline.supports_request_batch
     assert LTX2DistilledPipeline.support_image_input
     assert LTX2DistilledPipeline.unified_text_image_entry
 
 
-def test_ltx_two_stage_rejects_request_embedded_images():
+def test_ltx_two_stage_resolves_request_embedded_images():
     pipe = object.__new__(LTX2TwoStagePipeline)
     request_inputs = SimpleNamespace(latents=None)
-    object.__setattr__(pipe, "_resolve_request_inputs", lambda *_args, **_kwargs: request_inputs)
-    req = SimpleNamespace(
-        prompts=[{"prompt": "image conditioned", "multi_modal_data": {"image": torch.zeros(3, 8, 8)}}]
-    )
+    image = torch.zeros(3, 8, 8)
+    req = SimpleNamespace(prompts=[{"prompt": "image conditioned", "multi_modal_data": {"image": image}}])
 
-    with pytest.raises(ValueError, match="does not support `image` input"):
-        pipe._forward_request(req)
+    assert pipe._resolve_request_image(req, None, request_inputs) is image
 
 
 def test_ltx_dmd2_entries_retain_their_task_boundaries():
@@ -756,7 +754,8 @@ def test_denoise_executor_owns_progress_and_interrupt():
     torch.testing.assert_close(state.audio, torch.tensor(11.0))
 
 
-def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
+@pytest.mark.parametrize("pipeline_cls", [LTX2TwoStagePipeline, LTX2DistilledPipeline])
+def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
     request_inputs = LTXRequestInputs(
         prompt="prompt",
         negative_prompt="",
@@ -833,12 +832,15 @@ def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
             return latents.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
 
     prompt_context_sentinel = prompt_context
-    pipeline = object.__new__(LTX2DistilledPipeline)
+    pipeline = object.__new__(pipeline_cls)
     torch.nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
     pipeline.latent_upsampler = FakeUpsampler()
+    activated_slots = []
+    if pipeline_cls is LTX2TwoStagePipeline:
+        pipeline._phase_weights = SimpleNamespace(activate=activated_slots.append)
     object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
     object.__setattr__(pipeline, "run_phase", run_phase)
     object.__setattr__(pipeline, "decode_phase", decode_phase)
@@ -848,14 +850,17 @@ def test_ltx2_distilled_two_stage_executes_declarative_phase_plan():
 
     assert len(phase_calls) == 2
     assert phase_calls[1][2] is prompt_context_sentinel
+    if pipeline_cls is LTX2TwoStagePipeline:
+        assert activated_slots == [None, "ltx_distilled"]
     torch.testing.assert_close(output.output[0], torch.full((1, 128, 1, 2, 2), 3.0))
     torch.testing.assert_close(output.output[1], torch.full((1, 8, 1, 2), 4.0))
 
 
-def test_ltx2_distilled_stage2_reapplies_final_resolution_i2v_conditioning():
+@pytest.mark.parametrize("pipeline_cls", [LTX2TwoStagePipeline, LTX2DistilledPipeline])
+def test_ltx_two_stage_stage2_reapplies_final_resolution_i2v_conditioning(pipeline_cls):
     from vllm_omni.diffusion.models.ltx2 import ltx2_latents
 
-    pipeline = object.__new__(LTX2DistilledPipeline)
+    pipeline = object.__new__(pipeline_cls)
     torch.nn.Module.__init__(pipeline)
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
