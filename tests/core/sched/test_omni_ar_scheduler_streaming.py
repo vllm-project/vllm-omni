@@ -73,6 +73,9 @@ def _run_resumable_segment_stop(
 
     sched._update_request_with_output.side_effect = stop_request
     sched._handle_stopped_request.return_value = session_finished
+    # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
+    # MagicMock iterates empty and fails to unpack at the call site.
+    sched._free_request.return_value = (None, None)
     sched.chunk_transfer_adapter = None
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
