@@ -3031,7 +3031,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     allowed_local_media_path="",
                     allowed_media_domains=None,
                 )
-            
+
             # Decode reference images if provided
             pil_images: list[Image.Image] = []
             for img_str in reference_images:
