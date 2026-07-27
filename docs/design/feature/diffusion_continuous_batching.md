@@ -71,7 +71,7 @@ The scheduler derives its batch capacity from `max_num_seqs` through
 `max_num_running_reqs`.
 
 Batch admission is gated by
-[`SamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py),
+[`StepBatchSamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py),
 which is built from shape-sensitive and CFG-sensitive sampling fields. This is
 the core correctness rule for batching: requests are only co-batched when they
 share the same denoise tensor contract.
@@ -100,9 +100,10 @@ request-mode prompt semantics, see
 ## Runner
 
 The runner keeps persistent per-request execution state in
-[`DiffusionRequestState`](gh-file:vllm_omni/diffusion/worker/utils.py),
-while the scheduler owns a separate lightweight request state for queueing and
-lifecycle tracking.
+[`StepRequestState`](gh-file:vllm_omni/diffusion/worker/utils.py),
+while the scheduler owns a separate lightweight
+[`SchedulerRequestState`](gh-file:vllm_omni/diffusion/sched/interface.py)
+for queueing and lifecycle tracking.
 
 For each step, the runner builds an
 [`InputBatch`](gh-file:vllm_omni/diffusion/worker/input_batch.py) from the
@@ -138,9 +139,10 @@ compatibility gating and runner-side `StepInputBatch` packing.
 
 ## Current Limitations
 
-- Experimental feature; use `max_num_seqs=1` for the older conservative path.
+- Experimental feature; use `max_num_seqs=1` for the conservative single-request
+  step path.
 - Only native pipelines that already support `step_execution=True`.
-- Only homogeneous batches keyed by `SamplingParamsKey` are supported.
+- Only homogeneous batches keyed by `StepBatchSamplingParamsKey` are supported.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired
   into the batched step-wise path yet.
 - Future work can relax the current same-shape restriction with richer

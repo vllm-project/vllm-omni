@@ -12,6 +12,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
     ARDiffusionKVConfig,
@@ -194,16 +195,29 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
         block_size=BLOCK,
         max_model_len=4096,
         available_bytes=avail,
-        cross_attn_length=L,
+        kv_branches=(ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0)),
+        session_capacity=1,
+        cross_attention_lengths={"text": L},
         device=torch.device("cpu"),
     )
     cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
     expected = compute_num_blocks(avail - cross_bytes, 0.5, kv.spec.page_size_bytes * 2)
     assert kv.num_blocks == expected
-    assert expected > 2 * (2 + 1) + 2  # above the min-blocks floor, so the deduction is what's tested
+    assert expected > 1 * (2 + 1) + 2  # above the local-slot floor, so the cross deduction is what's tested
 
 
-def _make_kv(*, local_branches, num_frame_per_block=2, window_chunks=9):
+def _make_kv(
+    *,
+    local_branches,
+    num_frame_per_block=2,
+    window_chunks=9,
+    max_scratch_tokens_per_branch=0,
+):
+    kv_branches = (
+        (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0))
+        if local_branches == 1
+        else (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1))
+    )
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks),
         num_layers=1,
@@ -214,41 +228,75 @@ def _make_kv(*, local_branches, num_frame_per_block=2, window_chunks=9):
         max_model_len=4096,
         available_bytes=1 << 16,  # tiny -> the floor binds
         device=torch.device("cpu"),
-        local_branches=local_branches,
-        num_frame_per_block=num_frame_per_block,
+        kv_branches=kv_branches,
+        session_capacity=1,
+        frames_per_block=num_frame_per_block,
+        max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
     )
 
 
 def test_pool_floor_is_branch_aware():
-    """CFG-parallel rank (one local branch) sizes for one window + in-flight chunk;
-    a single-process run (both branches) sizes for two. Scratch scales the same way."""
+    """CFG-parallel rank (one local kv_branch) sizes for one window + in-flight chunk;
+    a single-process run (both kv_branches) sizes for two. Scratch scales the same way."""
     one = _make_kv(local_branches=1)
     two = _make_kv(local_branches=2)
 
     assert one.managed_num_blocks == 1 * (9 + 2) + 2  # 13
     assert two.managed_num_blocks == 2 * (9 + 2) + 2  # 24
-    assert one.scratch_num_blocks == one.scratch_blocks_per_branch
-    assert two.scratch_num_blocks == 2 * two.scratch_blocks_per_branch
-    assert one.num_blocks_total == 13 + one.scratch_blocks_per_branch
+    assert one.scratch_num_blocks == one.scratch_blocks_per_kv_branch
+    assert two.scratch_num_blocks == 2 * two.scratch_blocks_per_kv_branch
+    assert one.scratch_blocks_per_kv_branch == 2
+    assert one.num_blocks_total == 13 + one.scratch_blocks_per_kv_branch
+
+
+def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):
+    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 8  # six video blocks + two auxiliary blocks
+
+
+def test_scratch_env_override_cannot_reduce_declared_minimum(monkeypatch):
+    monkeypatch.setenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "1")
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 8
 
 
 def test_scratch_maps_to_slot_zero_with_one_local_branch():
-    """A CFG-parallel rank runs exactly one branch: whichever CFG side it is,
+    """A CFG-parallel rank runs exactly one kv_branch: whichever CFG side it is,
     its scratch lands in the rank's single slot (no dead second slot)."""
     one = _make_kv(local_branches=1)
-    assert one.scratch_block_ids(True, 0, 2) == one.scratch_block_ids(False, 0, 2)
+    assert one.scratch_block_ids("positive", 0, 2) == one.scratch_block_ids("negative", 0, 2)
 
     two = _make_kv(local_branches=2)
-    assert two.scratch_block_ids(True, 0, 2) != two.scratch_block_ids(False, 0, 2)
+    assert two.scratch_block_ids("positive", 0, 2) != two.scratch_block_ids("negative", 0, 2)
 
 
 def test_scratch_exhaustion_still_raises():
     one = _make_kv(local_branches=1)
-    cap = one.scratch_blocks_per_branch
+    cap = one.scratch_blocks_per_kv_branch
     with pytest.raises(RuntimeError, match="scratch blocks exhausted"):
-        one.scratch_block_ids(False, 0, cap + 1)
+        one.scratch_block_ids("positive", 0, cap + 1)
 
 
-def test_invalid_local_branches_rejected():
-    with pytest.raises(ValueError, match="local_branches"):
-        _make_kv(local_branches=3)
+def test_non_contiguous_branch_indices_rejected():
+    with pytest.raises(ValueError, match="contiguous"):
+        ARDiffusionKVCache(
+            ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2),
+            num_layers=1,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float32,
+            block_size=BLOCK,
+            max_model_len=4096,
+            available_bytes=1 << 16,
+            kv_branches=(ARDiffusionKVBranchSpec("main", 1),),
+            session_capacity=1,
+        )

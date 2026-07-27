@@ -20,10 +20,13 @@ class OmniNewRequestData(NewRequestData):
         external_req_id: Optional external request ID for tracking
         additional_information: Optional serialized additional information
             dictionary containing tensors or lists
+        model_intermediate_buffer: Optional runner-owned payload for
+            GPUModelRunner.model_intermediate_buffer
     """
 
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
+    model_intermediate_buffer: dict[str, object] | None = None
 
     @classmethod
     def from_request(
@@ -56,6 +59,7 @@ class OmniNewRequestData(NewRequestData):
             prompt_is_token_ids=getattr(request, "prompt_is_token_ids", None),
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
 
 
@@ -73,7 +77,7 @@ class OmniCachedRequestData(CachedRequestData):
 
 @dataclass
 class OmniChunkRecvHandle:
-    """Minimal identifier carried from scheduler to runner for chunk-recv
+    """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
     The runner's ``register_chunk_recv`` only consumes ``request_id`` and

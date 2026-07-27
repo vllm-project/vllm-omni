@@ -1,11 +1,11 @@
 from typing import Any
 
 from vllm_omni.diffusion.cache.base import CacheBackend
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
-from vllm_omni.diffusion.cache.magcache.backend import MagCacheBackend
+from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
+from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.ref_hint_cache.backend import RefHintCacheBackend
 from vllm_omni.diffusion.cache.stepcache import StepCacheBackend
-from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 

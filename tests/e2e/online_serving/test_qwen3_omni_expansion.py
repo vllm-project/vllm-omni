@@ -411,6 +411,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5248")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_client) -> None:

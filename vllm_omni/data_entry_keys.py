@@ -61,12 +61,20 @@ class OmniPayloadMeta(TypedDict, total=False):
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
+    request_id: str
+    chunk_seq: int
+    cache_epoch: int
+    codec_chunk_frames: int
+    codec_left_context_frames: int
+    code_flat_numel: int
+    last_chunk: bool
     req_id: list[str]
     left_context_size: int
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
+    replace_streaming_prompt: bool
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -82,6 +90,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    omni_final_stage_id: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -150,12 +159,17 @@ class MetaStruct(_StructBase):
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None
+    request_id: str | None = None
+    chunk_seq: int | None = None
+    cache_epoch: int | None = None
+    last_chunk: bool | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
+    replace_streaming_prompt: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None

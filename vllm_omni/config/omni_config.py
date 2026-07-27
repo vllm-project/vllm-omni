@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Structured vLLM-Omni configuration classes.
 
-This module is additive for Phase 2 of RFC #4021.  ``VllmOmniConfig.from_registry``
-builds the structured view directly from the pipeline registry and deploy config
-so parity can be proven before later PRs cut consumers over to these classes.
+This module is additive for Phase 2 of RFC #4021.
+``VllmOmniConfig.from_pipeline_config`` builds the structured view from an
+already-resolved pipeline and deploy config so parity can be proven before
+later PRs cut consumers over to these classes.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeAlias, TypedDict, cast
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config.utils import config
@@ -108,6 +109,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     sequence_parallel_size: int
     ulysses_degree: int
     ring_degree: int
+    allgather_degree: int
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
@@ -215,10 +217,7 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     return result
 
 
-def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None) -> Path:
-    if deploy_config_path is None:
-        return _DEPLOY_DIR / f"{model_type}.yaml"
-
+def _resolve_deploy_path(deploy_config_path: str) -> Path:
     deploy_path = Path(deploy_config_path)
     if not deploy_path.exists() and deploy_path.parent == Path("."):
         bare_name = deploy_path.name
@@ -230,17 +229,27 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
     return deploy_path
 
 
-def _registered_pipeline_keys() -> list[str]:
-    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+def _get_deploy_config(
+    pipeline_cfg: PipelineConfig,
+    user_deploy_config: DeployConfig | None,
+    deploy_config_path: str | None,
+) -> tuple[DeployConfig, str | None]:
+    """Select user-provided, pipeline-default, or empty deploy settings."""
+    if user_deploy_config is not None:
+        loaded_path = str(_resolve_deploy_path(deploy_config_path)) if deploy_config_path is not None else None
+        return copy.deepcopy(user_deploy_config), loaded_path
 
-    return sorted(OMNI_PIPELINES)
+    if deploy_config_path is not None:
+        resolved_path = _resolve_deploy_path(deploy_config_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Deploy config not found: {resolved_path}")
+        return load_deploy_config(resolved_path), str(resolved_path)
 
+    if pipeline_cfg.default_deploy_config_name is not None:
+        default_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+        return load_deploy_config(default_path), str(default_path)
 
-def _resolve_registered_pipeline(model_type: str) -> PipelineConfig | None:
-    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-
-    registered = OMNI_PIPELINES[model_type]
-    return registered(None) if callable(registered) else registered
+    return DeployConfig(), None
 
 
 @config
@@ -352,6 +361,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
+    allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
@@ -362,7 +372,11 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
-        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+        self.sequence_parallel_size = (
+            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        )
+        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
+            raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
@@ -456,6 +470,8 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     pin_cpu_memory: bool = True
+    diffusion_compile_granularity: Literal["regional", "full"] = "regional"
+    diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None
@@ -813,7 +829,6 @@ class VllmOmniOrchestratorConfig:
     omni_dp_size_local: int = Field(default=1, ge=1)
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
-    shm_threshold_bytes: int = Field(default=65536, ge=0)
     batch_timeout: int = Field(default=10, ge=0)
 
 
@@ -1225,52 +1240,41 @@ class VllmOmniConfig:
         raise KeyError(f"no stage {stage_id}")
 
     @classmethod
-    def from_registry(
+    def from_pipeline_config(
         cls,
-        model_type: str,
+        pipeline_cfg: PipelineConfig,
+        *,
+        user_deploy_config: DeployConfig | None = None,
         deploy_config_path: str | None = None,
         cli_overrides: dict[str, Any] | None = None,
     ) -> VllmOmniConfig:
-        """Create a structured config from a registered pipeline and deploy YAML."""
+        """Create a structured config from a resolved pipeline and deploy YAML."""
         if cli_overrides is None:
             cli_overrides = {}
 
-        deploy_path = _resolve_deploy_path(model_type, deploy_config_path)
-        loaded_deploy_config_path = str(deploy_path) if deploy_path.exists() else None
-        if loaded_deploy_config_path is not None:
-            deploy = load_deploy_config(deploy_path)
-        else:
-            deploy = DeployConfig()
+        deploy, loaded_deploy_config_path = _get_deploy_config(
+            pipeline_cfg,
+            user_deploy_config,
+            deploy_config_path,
+        )
 
-        pipeline_key = deploy.pipeline or model_type
-        if pipeline_key not in _registered_pipeline_keys():
-            raise KeyError(
-                f"Pipeline {pipeline_key!r} not in registry "
-                f"(resolved from {deploy_path.name!r}). Available: "
-                f"{_registered_pipeline_keys()}"
-            )
-        pipeline = _resolve_registered_pipeline(pipeline_key)
-        if pipeline is None:
-            raise ValueError(
-                f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig without an HF config"
-            )
-
-        deploy_for_registry = copy.deepcopy(deploy)
         if cli_overrides.get("async_chunk") is not None:
-            deploy_for_registry.async_chunk = bool(cli_overrides["async_chunk"])
+            deploy.async_chunk = bool(cli_overrides["async_chunk"])
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
-                setattr(deploy_for_registry, name, _copy_value(cli_overrides[name]))
+                setattr(deploy, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides(deploy_for_registry)
-        _validate_async_chunk_support(pipeline, deploy_for_registry)
-        deploy_by_id = {stage.stage_id: stage for stage in deploy_for_registry.stages}
+        deploy = _apply_platform_overrides(deploy)
+        if len(pipeline_cfg.stages) <= 1:
+            deploy.async_chunk = False
+        _validate_async_chunk_support(pipeline_cfg, deploy)
+        deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
 
         stage_configs = tuple(
             _build_stage_config(
-                pipeline,
-                deploy_for_registry,
+                pipeline_cfg,
+                deploy,
                 topology,
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
@@ -1279,7 +1283,7 @@ class VllmOmniConfig:
                 ),
                 model=model,
             )
-            for topology in pipeline.stages
+            for topology in pipeline_cfg.stages
         )
 
         orchestrator_config = VllmOmniOrchestratorConfig(
@@ -1287,7 +1291,7 @@ class VllmOmniConfig:
             **_orchestrator_cli_overrides(cli_overrides),
         )
         return cls(
-            pipeline_config=pipeline,
+            pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
         )

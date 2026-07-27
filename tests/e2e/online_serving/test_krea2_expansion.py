@@ -31,7 +31,7 @@ from PIL import Image
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
 # vLLM-Omni-compatible PEFT repackaging of krea/Krea-2-LoRA-darkbrush (264 modules, r=alpha=32).
