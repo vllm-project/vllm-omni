@@ -1183,7 +1183,11 @@ class Orchestrator:
             return
 
         request_finished = False
-        if finished and self.stage_pools[stage_id].final_output:
+        if (
+            finished
+            and self.stage_pools[stage_id].final_output
+            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
+        ):
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)

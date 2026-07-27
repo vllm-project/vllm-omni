@@ -35,6 +35,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
@@ -983,7 +985,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         # Sample per-codebook
         cb_logits_2d = cb_logits.reshape(-1, cb_logits.shape[-1])
-        codes_2d = self._sample_audio_codes(cb_logits_2d)
+        codes_2d = self._sample_audio_codes(
+            cb_logits_2d,
+            sampling_metadata,
+            int(cb_logits.shape[1]),
+        )
         codes_flat = codes_2d.view(cb_logits.shape[0], cb_logits.shape[1]).to(torch.long)
 
         self._update_delay_state_batched(
@@ -1337,23 +1343,42 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._postprocess_audio_rows = num_rows
         self._postprocess_audio_active_rows = 0
 
-    def _sample_audio_codes(self, logits_2d: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _expand_audio_sampling_params(
+        sampling_metadata: SamplingMetadata, logits_2d: torch.Tensor, num_codebooks: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, remainder = divmod(int(logits_2d.shape[0]), num_codebooks)
+        if remainder:
+            raise ValueError(f"audio codebook logits rows must be divisible by {num_codebooks}")
+
+        def expand(value, default, dtype):
+            if value is None:
+                value = torch.full((batch_size,), default, device=logits_2d.device, dtype=dtype)
+            else:
+                value = torch.as_tensor(value, device=logits_2d.device, dtype=dtype).expand(batch_size)
+            return value.repeat_interleave(num_codebooks)
+
+        return (
+            expand(sampling_metadata.temperature, 0.0 if sampling_metadata.all_greedy else 1.0, logits_2d.dtype),
+            expand(sampling_metadata.top_k, logits_2d.shape[-1], torch.long),
+            expand(sampling_metadata.top_p, 1.0, logits_2d.dtype),
+        )
+
+    def _sample_audio_codes(
+        self, logits_2d: torch.Tensor, sampling_metadata: SamplingMetadata, num_codebooks: int = 8
+    ) -> torch.Tensor:
         """Replicate upstream sampling: temperature → top-k → top-p → multinomial."""
         x = logits_2d.float()
-        top_k = 50
-        top_p = 0.95
-        if 0 < top_k < x.shape[-1]:
-            kth = x.topk(top_k, dim=-1).values[..., -1:]
-            x = x.masked_fill(x < kth, float("-inf"))
-        if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = x.sort(dim=-1, descending=True)
-            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-            sorted_mask = cumprobs > top_p
-            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
-            sorted_mask[..., 0] = False
-            mask = torch.zeros_like(x, dtype=torch.bool)
-            mask.scatter_(-1, sorted_idx, sorted_mask)
-            x = x.masked_fill(mask, float("-inf"))
+        temperatures, top_ks, top_ps = self._expand_audio_sampling_params(sampling_metadata, x, num_codebooks)
+        top_ks = torch.where(top_ks <= 0, torch.full_like(top_ks, x.shape[-1]), top_ks)
+        top_ks = top_ks.clamp(max=x.shape[-1])
+        top_ps = top_ps.clamp(min=0.0, max=1.0)
+        temperatures = torch.where(torch.isfinite(temperatures), temperatures, torch.ones_like(temperatures))
+        top_ps = torch.where(torch.isfinite(top_ps), top_ps, torch.ones_like(top_ps))
+        greedy = temperatures <= 0
+        safe_temperatures = torch.where(greedy, torch.ones_like(temperatures), temperatures)
+        x.div_(safe_temperatures.unsqueeze(-1))
+        x = apply_top_k_top_p(x, top_ks, top_ps)
         # Detect all-masked rows BEFORE softmax (softmax of all-inf yields NaN).
         has_finite = torch.isfinite(x).any(dim=-1)
         all_masked = ~has_finite
@@ -1362,7 +1387,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         safe_x = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(x), x)
         probs = safe_x.softmax(dim=-1)
         sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        return torch.where(all_masked, fallback, sampled)
+        sampled = torch.where(all_masked, fallback, sampled)
+        return torch.where(greedy, logits_2d.argmax(dim=-1), sampled)
 
     # ------------------------------------------------------------------ omni output
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
