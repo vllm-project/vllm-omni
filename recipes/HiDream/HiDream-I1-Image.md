@@ -107,7 +107,7 @@ curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: applicatio
 
 ### 2x A800 80GB (CFG-Parallel)
 
-Use CFG-Parallel to run the positive and negative guidance branches on separate GPUs. Requires a negative prompt and `guidance_scale > 1`.
+Use CFG-Parallel to run the positive and negative guidance branches on separate GPUs. Requires a negative prompt and `true_cfg_scale > 1` or `guidance_scale > 1`.
 
 #### Command
 
@@ -133,7 +133,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
   --negative-prompt "low quality, blurry" \
   --seed 42 \
-  --guidance-scale 5.0 \
+  --cfg-scale 5.0 \
   --tensor-parallel-size 1 \
   --cfg-parallel-size 2 \
   --num-images-per-prompt 1 \

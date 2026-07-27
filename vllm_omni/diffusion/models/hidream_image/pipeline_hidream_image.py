@@ -819,6 +819,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         do_true_cfg: bool,
         true_cfg_scale: float,
     ) -> torch.Tensor:
+        self.transformer.do_true_cfg = do_true_cfg
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -924,7 +925,10 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         generator = req.sampling_params.generator or generator
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
-        true_cfg_scale = req.sampling_params.true_cfg_scale or guidance_scale
+        if req.sampling_params.true_cfg_scale is None:
+            true_cfg_scale = guidance_scale
+        else:
+            true_cfg_scale = req.sampling_params.true_cfg_scale
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0
@@ -998,8 +1002,11 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
                 and negative_pooled_prompt_embeds is not None
             )
         )
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        has_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        do_true_cfg = self.do_classifier_free_guidance or has_true_cfg
+        true_cfg_scale = true_cfg_scale if has_true_cfg else guidance_scale
 
         # 3. Encode prompt
         lora_scale = self.attention_kwargs.get("scale", None) if self.attention_kwargs is not None else None
@@ -1019,7 +1026,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             negative_prompt_2=negative_prompt_2,
             negative_prompt_3=negative_prompt_3,
             negative_prompt_4=negative_prompt_4,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            do_classifier_free_guidance=do_true_cfg,
             prompt_embeds_t5=prompt_embeds_t5,
             prompt_embeds_llama3=prompt_embeds_llama3,
             negative_prompt_embeds_t5=negative_prompt_embeds_t5,
