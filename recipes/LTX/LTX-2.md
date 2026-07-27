@@ -409,6 +409,11 @@ bundled offline CLI do not currently expose `sigmas`.
   `--max-num-seqs 1`.
 - `--cfg-parallel-size` shards the complete LTX guidance plan, including STG,
   modality guidance, and rescale-compatible prediction gathering.
+- LTX sequence parallelism may append internal zero-padding to the audio
+  latent sequence. Pure Ulysses masks those tokens and keeps request RNG
+  invariant across SP sizes. Ring SP cannot consume that key-padding mask, so
+  requests whose logical audio length is not divisible by the SP size fail
+  with an actionable error; use `ring_degree=1` or a divisible request shape.
 
 ## Operational Notes
 

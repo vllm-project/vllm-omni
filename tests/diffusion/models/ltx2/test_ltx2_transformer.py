@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 from torch import nn
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel, _make_rms_norm
+from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
+    LTX2AudioVideoAttnProcessor,
+    LTX2VideoTransformer3DModel,
+    _make_rms_norm,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -66,3 +73,22 @@ def test_ltx_sp_plan_shards_video_and_audio_timesteps_together(rope_type):
     assert video_timestep.expected_dims == audio_timestep.expected_dims == 2
     assert not video_timestep.split_output
     assert not audio_timestep.split_output
+
+
+def test_ltx_sp_keeps_cross_attention_key_padding_mask(monkeypatch):
+    monkeypatch.setattr(LTX2AudioVideoAttnProcessor, "_is_sp_enabled", staticmethod(lambda: True))
+    processor = LTX2AudioVideoAttnProcessor()
+    hidden_states = torch.zeros(1, 3, 4)
+    encoder_hidden_states = torch.zeros(1, 4, 4)
+    key_padding_mask = torch.tensor([[True, True, True, False]])
+
+    actual = processor._prepare_attention_mask(
+        SimpleNamespace(),
+        hidden_states,
+        encoder_hidden_states,
+        key_padding_mask,
+        batch_size=1,
+        sequence_length=4,
+    )
+
+    torch.testing.assert_close(actual, key_padding_mask)

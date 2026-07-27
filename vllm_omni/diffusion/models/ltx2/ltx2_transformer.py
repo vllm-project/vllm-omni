@@ -396,10 +396,9 @@ class LTX2AudioVideoAttnProcessor:
             return None
 
         if self._is_sp_enabled():
-            # In SP, Ulysses expects a 2D padding mask that matches query length.
-            # For cross-attention, encoder sequence length != query length, so drop the mask.
-            if encoder_hidden_states is not None and encoder_hidden_states.shape[1] != hidden_states.shape[1]:
-                return None
+            # Ulysses consumes a replicated 2D key-padding mask after Q/K/V
+            # all-to-all. This also supports cross-attention where Q and K have
+            # different sequence lengths.
             return to_ltx_padding_mask(attention_mask)
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
@@ -1836,6 +1835,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_sigma: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1869,6 +1869,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)`.
             audio_encoder_attention_mask (`torch.Tensor`, *optional*):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)` for audio modeling.
+            audio_attention_mask (`torch.Tensor`, *optional*):
+                Optional audio-token key padding mask shared by audio self-attention and audio-to-video attention.
             num_frames (`int`, *optional*):
                 The number of latent video frames. Used if calculating the video coordinates for RoPE.
             height (`int`, *optional*):
@@ -2052,6 +2054,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "audio_self_attention_mask": audio_attention_mask,
+                "a2v_cross_attention_mask": audio_attention_mask,
                 "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),
                 "audio_self_attention_perturbation_mask": perturbation_mask_for("audio_self_attention", block_idx),
                 "a2v_cross_attention_perturbation_mask": perturbation_mask_for("a2v_cross_attention", block_idx),

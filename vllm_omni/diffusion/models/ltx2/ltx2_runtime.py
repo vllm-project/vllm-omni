@@ -728,6 +728,7 @@ class LTXRuntime(
             noise_pred_audio,
             timestep,
         )
+        audio = latent_ops.clear_audio_padding(audio, forward_ctx.original_audio_num_frames)
         return latent_ops.LTXAVState(video=video, audio=audio)
 
     def _unpack_and_denormalize_stage(
