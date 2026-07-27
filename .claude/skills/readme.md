@@ -27,6 +27,9 @@ include:
 - `run-minicpmo-ascend-perf-cycle`: takes one daily MiniCPM-o Ascend performance
   hypothesis through baseline measurement, implementation, validation,
   experiment recording, an atomic commit, and an authorized safe push
+- `profile-minicpmo-ascend`: captures a controlled online MiniCPM-o NPU trace,
+  summarizes torch_npu/CANN exports, compares matching captures, and converts
+  evidence into a bounded performance hypothesis
 - `quantization`: guides quantization method selection, model integration,
   checkpoint loading, and quality/performance validation for vLLM-Omni
 - `add-omni-model`: covers addition of new omni-modality model support

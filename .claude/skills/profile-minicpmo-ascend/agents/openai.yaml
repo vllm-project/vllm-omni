@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile MiniCPM-o Ascend"
+  short_description: "Capture and analyze MiniCPM-o Ascend NPU profiles"
+  default_prompt: "Use $profile-minicpmo-ascend to capture and analyze one controlled MiniCPM-o Ascend profiling run."

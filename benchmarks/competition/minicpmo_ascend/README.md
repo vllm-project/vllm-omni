@@ -82,6 +82,44 @@ bash benchmarks/competition/minicpmo_ascend/run_daily_omni.sh
 This requests text only and disables thinking so A-D answer extraction is
 stable. Replace it with the official effect suite as soon as one is released.
 
+## 5. Capture an NPU profile
+
+Keep profiling separate from score measurements. The profile runner generates
+a temporary deploy config, starts a clean server, warms it outside the capture
+window, profiles a fixed request, stops the server, and emits a unified JSON
+and Markdown summary:
+
+```bash
+MODEL=/path/to/MiniCPM-o-4_5 \
+PROFILE_ID=stage2-baseline \
+PROFILE_STAGES=2 \
+bash benchmarks/competition/minicpmo_ascend/run_profile.sh
+```
+
+Use a unique `PROFILE_ID` for every capture; the runner refuses to mix a new
+capture into a non-empty artifact directory.
+
+Profile all stages only when stage ownership is unclear:
+
+```bash
+PROFILE_ID=all-stages-baseline PROFILE_STAGES=0,1,2 \
+bash benchmarks/competition/minicpmo_ascend/run_profile.sh
+```
+
+Artifacts are written under
+`artifacts/minicpmo_ascend/profiles/<profile-id>/`. Compare the same workload,
+stage selection, profiler configuration, and environment with:
+
+```bash
+.venv/bin/python -m benchmarks.competition.minicpmo_ascend.profile_analysis compare \
+  artifacts/minicpmo_ascend/profiles/baseline/profile_analysis.json \
+  artifacts/minicpmo_ascend/profiles/candidate/profile_analysis.json \
+  --output artifacts/minicpmo_ascend/profiles/comparison.json
+```
+
+Profiler timing is diagnostic evidence and must never replace the unprofiled
+baseline/candidate benchmark.
+
 ## Formal-run rules
 
 - Use clean server restarts and record warmup separately from measurements.
