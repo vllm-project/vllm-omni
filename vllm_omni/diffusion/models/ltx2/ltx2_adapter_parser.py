@@ -116,9 +116,7 @@ class LTXAdapterParser:
                 a_shape = tuple(handle.get_slice(key_a).get_shape())
                 b_shape = tuple(handle.get_slice(key_b).get_shape())
                 if len(a_shape) != 2 or len(b_shape) != 2 or b_shape[1] != a_shape[0]:
-                    raise ValueError(
-                        f"Invalid LoRA pair for {official_name}: A={a_shape}, B={b_shape}."
-                    )
+                    raise ValueError(f"Invalid LoRA pair for {official_name}: A={a_shape}, B={b_shape}.")
 
                 source_module = _to_diffusers_module_name(official_name)
                 resolved = _resolve_lora_target(self.transformer, source_module)
@@ -128,9 +126,7 @@ class LTXAdapterParser:
                 module, shard_id = resolved
                 target_id = (module, shard_id)
                 if target_id in seen:
-                    raise ValueError(
-                        f"Official LTX LoRA contains duplicate target {module!r}, slice {shard_id!r}."
-                    )
+                    raise ValueError(f"Official LTX LoRA contains duplicate target {module!r}, slice {shard_id!r}.")
                 seen.add(target_id)
                 targets.append(
                     AdapterTarget(

@@ -36,7 +36,7 @@ class LTXPhaseRecipe:
     sigmas: tuple[float, ...] | None = None
     noise_scale: float = 0.0
     input_transform: Literal["initial", "spatial_upsample"] = "initial"
-    transformer_phase: str = "base"
+    adapter_slot: str | None = None
     allow_guidance_override: bool = True
     use_official_sigma_schedule: bool = True
 
@@ -173,7 +173,6 @@ def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipeli
                 guidance=one_stage_recipe.request_guidance,
                 spatial_downscale=2,
                 noise_scale=1.0,
-                transformer_phase="base",
             ),
             LTXPhaseRecipe(
                 name="refine",
@@ -181,7 +180,7 @@ def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipeli
                 sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
                 noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
                 input_transform="spatial_upsample",
-                transformer_phase="distilled_lora",
+                adapter_slot="ltx_distilled",
                 allow_guidance_override=False,
                 use_official_sigma_schedule=False,
             ),

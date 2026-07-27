@@ -47,6 +47,7 @@ from .ltx2_guidance import (
     LTXGuidanceExecutor,
     LTXGuidancePlan,
 )
+from .ltx2_phase_weights import LTXPhaseWeights, build_ltx_phase_weights
 from .ltx2_recipes import (
     LTXPhaseRecipe,
     LTXPipelineRecipe,
@@ -150,6 +151,7 @@ class LTXRuntime(
         super().__init__()
         self._guidance_plan = LTXGuidancePlan.build(self.pipeline_recipe.request_guidance)
         initialize_pipeline_components(self, od_config)
+        self._phase_weights: LTXPhaseWeights | None = build_ltx_phase_weights(self)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -205,6 +207,8 @@ class LTXRuntime(
             max_sequence_length=max_sequence_length,
         )
         image = self._resolve_request_image(req, image, request_inputs)
+        if image is not None and not self.support_image_input:
+            raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
         request_sigmas = self._resolve_request_sigmas(req, sigmas)
         validate_pipeline_request(
             request_inputs,
@@ -214,12 +218,12 @@ class LTXRuntime(
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
-        phase_adapter = getattr(self, "_phase_adapter", None)
-        if phase_adapter is not None and any(
+        phase_weights = getattr(self, "_phase_weights", None)
+        if phase_weights is not None and any(
             getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
         ):
             raise ValueError(
-                f"{self.__class__.__name__} cannot compose a request LoRA with its internal stage-2 adapter."
+                f"{self.__class__.__name__} cannot compose a request LoRA with its internal phase adapter."
             )
         return self._run_recipe(req, request_inputs, request_sigmas=request_sigmas, image=image)
 
@@ -265,8 +269,20 @@ class LTXRuntime(
         return self.decode_phase(output_phase)
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
-        """Hook for a future phase-weight strategy."""
         self._active_phase_name = phase.name
+        phase_weights = getattr(self, "_phase_weights", None)
+        if phase_weights is None:
+            if phase.adapter_slot is not None:
+                raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
+            return
+        phase_weights.activate(phase.adapter_slot)
+
+    def eval(self):
+        result = super().eval()
+        phase_weights = getattr(self, "_phase_weights", None)
+        if phase_weights is not None:
+            phase_weights.finalize()
+        return result
 
     def prepare_latents(
         self,
@@ -340,9 +356,9 @@ class LTXRuntime(
 
     @property
     def denoise_transformer(self) -> nn.Module:
-        phase_adapter = getattr(self, "_phase_adapter", None)
-        if phase_adapter is not None:
-            return phase_adapter.transformer
+        phase_weights = getattr(self, "_phase_weights", None)
+        if phase_weights is not None:
+            return phase_weights.transformer
         return self.transformer
 
     def _transformer_cache_context(self, context_name: str):
@@ -865,4 +881,7 @@ class LTXRuntime(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        phase_weights = getattr(self, "_phase_weights", None)
+        if phase_weights is not None:
+            weights = phase_weights.prepare_weights(weights)
         return AutoWeightsLoader(self).load_weights(weights)
