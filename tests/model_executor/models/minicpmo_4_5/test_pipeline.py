@@ -152,6 +152,7 @@ class TestDeployTopology:
         assert "skip_mm_profiling" not in stages[0].yaml_engine_args
         assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
         assert stages[2].yaml_engine_args["skip_mm_profiling"] is True
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_async_chunk")
         assert stages[1].yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
         assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
@@ -192,6 +193,14 @@ class TestDeployTopology:
         assert code2wav.sync_process_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
         )
+
+    def test_no_async_chunk_selects_full_payload_processor(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_batching.yaml")
+        deploy.async_chunk = False
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+        assert stages[1].yaml_engine_args["async_chunk"] is False
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
 
 
 def test_code2wav_model_is_lazily_registered() -> None:

@@ -782,7 +782,7 @@ def build_engine_args_dict(
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
     if stage_connector_spec:
-        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec)
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config

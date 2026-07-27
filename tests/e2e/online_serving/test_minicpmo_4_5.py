@@ -1,9 +1,8 @@
 """
 E2E Online tests for MiniCPM-o 4.5 model with multimodal input and audio / text output.
 
-MiniCPM-o 4.5 has ``async_chunk: false``, ``max_num_seqs: 1`` on both stages,
-and the vocoder runs in-process inside the talker stage rather than as a separate
-Code2Wav stage.
+These tests explicitly disable async chunking to exercise the full-payload
+Thinker -> Talker -> Code2Wav path.
 """
 
 import os
@@ -65,7 +64,6 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -99,7 +97,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text + audio output via OpenAI API.
-    This exercises the talker TTS region detection and in-process token2wav vocoder.
+    This exercises Talker TTS region detection and full-payload Code2Wav handoff.
     Deploy Setting: default 2GPU
     Input Modal: text
     Output Modal: text + audio
@@ -201,7 +199,6 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
