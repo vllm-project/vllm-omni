@@ -31,6 +31,7 @@ import tempfile
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -49,7 +50,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model]
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -409,6 +410,7 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     torch.testing.assert_close(v_full, expected_value)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize(
     "test_model_cls",
     [
