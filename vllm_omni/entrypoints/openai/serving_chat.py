@@ -79,7 +79,7 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
@@ -186,6 +186,63 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # parser_cls may be None (no tool parser configured); guard accordingly
         tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
         return request.tools and tp_cls is not None and self.enable_auto_tools and request.tool_choice in ["auto", None]
+
+    @staticmethod
+    def _stage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _has_minicpmo45_stage(self) -> bool:
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = self._stage_get(stage, "engine_args")
+            model_arch = self._stage_get(engine_args, "model_arch")
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                return True
+        return False
+
+    def _fix_minicpmo45_audio_stream_output_kinds(
+        self,
+        sampling_params_list: list[Any],
+        output_modalities: list[str] | tuple[str, ...] | None,
+    ) -> list[Any]:
+        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+
+        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
+        That is correct for token-level text streaming, but MiniCPM-o 4.5's
+        Talker consumes the completed TTS span plus aligned thinker hidden
+        states. If Stage0 is DELTA, llm2tts receives one generated token at a
+        time and repeatedly starts tiny, independent TTS streams. The API then
+        never represents one coherent audio response.
+
+        For this model, stream the audio stage, not the thinker-to-talker
+        boundary.
+        """
+        if not output_modalities or "audio" not in output_modalities:
+            return sampling_params_list
+        if not self._has_minicpmo45_stage():
+            return sampling_params_list
+
+        stage_configs = getattr(self.engine_client, "stage_configs", []) or []
+        for idx, stage in enumerate(stage_configs):
+            if idx >= len(sampling_params_list):
+                break
+            sp = sampling_params_list[idx]
+            if not hasattr(sp, "output_kind"):
+                continue
+
+            engine_args = self._stage_get(stage, "engine_args")
+            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+
+            model_stage = self._stage_get(engine_args, "model_stage")
+            if model_stage == "llm":
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
+            elif model_stage == "tts":
+                sp.output_kind = RequestOutputKind.DELTA
+        return sampling_params_list
 
     @classmethod
     def for_diffusion(
@@ -455,6 +512,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
+        if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
+            return self.create_error_response("'modalities' must be a list of strings.")
+        allowed_modalities = set(engine_output_modalities)
+        if is_single_stage_diffusion(self.engine_client):
+            allowed_modalities.add("text")
+        unsupported = set(request.modalities) - allowed_modalities
+        if unsupported:
+            return self.create_error_response(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+            )
+
         if request.modalities and "audio" in request.modalities:
             audio_format_check = self._resolve_audio_format(request)
             if isinstance(audio_format_check, ErrorResponse):
@@ -593,6 +662,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+                if request.stream:
+                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                        sampling_params_list,
+                        output_modalities,
+                    )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -1935,6 +2009,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    if isinstance(choices_data, ErrorResponse):
+                        logger.error(
+                            "Skipping audio chunk for request %s: %s",
+                            request_id,
+                            choices_data.error.message,
+                        )
+                        continue
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2207,6 +2288,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ]
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                if isinstance(choices_data, ErrorResponse):
+                    return choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2534,7 +2617,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ):
+    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
@@ -2554,7 +2637,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             audio_tensor = audio_data
         if audio_tensor is None:
-            return self._create_error_response("Audio generation completed but no audio was produced.")
+            if not stream:
+                return self._create_error_response("Audio generation completed but no audio was produced.")
+            # A streamed message can legitimately carry no waveform: the talker
+            # may emit an empty speech segment, and Stage 2 then reports the
+            # chunk with metadata only. Emit an empty audio delta so the
+            # caller's finish_reason bookkeeping still runs and the stream
+            # terminates normally instead of raising mid-generation.
+            return [
+                ChatCompletionResponseStreamChoice(
+                    index=output.index,
+                    delta=DeltaMessage(role=role, content=""),
+                    logprobs=None,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                )
+                for output in final_res.outputs
+            ]
         audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)

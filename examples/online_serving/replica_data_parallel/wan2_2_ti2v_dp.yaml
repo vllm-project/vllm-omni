@@ -8,36 +8,20 @@
 # run_server.sh substitutes __NUM_REPLICAS__ / __DEVICES__ from env before serving.
 # For tensor_parallel_size = 1, `devices` lists one GPU per replica (pool mode):
 # num_replicas=4 -> devices "0,1,2,3".
+#
+# Stage topology (diffusion DiT, video output) comes from the registered
+# WanPipeline, which auto-detects TI2V-5B mode from model_index.json; this file
+# carries deployment knobs only.
+trust_remote_code: true
+distributed_executor_backend: mp
 
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: diffusion
-    runtime:
-      num_replicas: __NUM_REPLICAS__
-      devices: "__DEVICES__"
-      max_batch_size: 1
-    engine_args:
-      model_stage: dit
-      # `model_class_name` takes the diffusion registry KEY (WanPipeline), which
-      # resolves to the Wan22Pipeline class. Wan2.2 TI2V-5B is served by the base
-      # WanPipeline, which auto-detects TI2V-5B mode from model_index.json.
-      model_class_name: WanPipeline
-      max_num_seqs: 1
-      enforce_eager: true
-      trust_remote_code: true
-      distributed_executor_backend: "mp"
-      vae_use_tiling: true
-      parallel_config:
-        tensor_parallel_size: 1
-
-    final_output: true
-    final_output_type: video
-    is_comprehension: false
+    num_replicas: __NUM_REPLICAS__
+    devices: "__DEVICES__"
+    max_num_seqs: 1
+    tensor_parallel_size: 1
+    enforce_eager: true
+    vae_use_tiling: true
     default_sampling_params:
       seed: 42
-
-runtime:
-  enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1

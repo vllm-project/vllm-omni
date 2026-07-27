@@ -35,6 +35,7 @@ class OmniRequest(Request):
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
+        model_intermediate_buffer: dict | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -48,6 +49,8 @@ class OmniRequest(Request):
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+        # Runner-owned runtime payload.
+        self.model_intermediate_buffer: dict | None = model_intermediate_buffer
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -94,6 +97,7 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
@@ -117,6 +121,7 @@ class OmniStreamingUpdate:
     arrival_time: float
     sampling_params: SamplingParams | None
     additional_information: AdditionalInformationPayload | None = None
+    model_intermediate_buffer: dict | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -129,4 +134,5 @@ class OmniStreamingUpdate:
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
             additional_information=request.additional_information,
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
