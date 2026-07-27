@@ -25,6 +25,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 

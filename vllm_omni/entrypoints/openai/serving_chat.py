@@ -2835,6 +2835,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # is attached to CompletionOutput by AR stages).
         elif omni_outputs.outputs:
             completion_output = omni_outputs.outputs[0]
+            final_res = omni_outputs
             if hasattr(completion_output, "multimodal_output") and completion_output.multimodal_output:
                 image_data = completion_output.multimodal_output.get("image")
                 if image_data is not None:
