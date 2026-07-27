@@ -1,14 +1,14 @@
-# Stage B — GPU validation TODO (Cosmos3 session-memory port, RFC #4480)
+# Stage B — GPU validation TODO (Cosmos3 session-state port, RFC #4480)
 
 These changes were authored on a **CPU-only box (no torch/vllm)**, so only
 syntax (`py_compile`) and standalone adapter logic were checked. The following
 **must run on a GPU box (H100 / L40S) with the full env** before opening the PR.
 
-## What changed (all gated behind `enable_session_memory_manager`, default off)
+## What changed (all gated behind `enable_session_state_manager`, default off)
 
 - `state_cosmos3_adapter.py` (new) — `Cosmos3StateAdapter`: per-(layer,branch)
-  `EncodeOnceKV` holding `{"is_init","k","v"}`, session-keyed; **no EncodeOnceKV
-  generalization, no shared-contract change** (option c).
+  model-specific `Cosmos3UNDKV`, session-keyed; **no dense-KV generalization
+  in the shared contract**.
 - `tests/cosmos3/test_session_memory_equivalence.py` (new) — CPU adapter tests
   (equivalence + concurrency isolation).
 - `pipeline_cosmos3.py` — opt-in in `__init__`; `_get_or_create_cosmos3_state` +
@@ -27,7 +27,7 @@ syntax (`py_compile`) and standalone adapter logic were checked. The following
    T2V + I2V, current `main` vs this branch → output latents `max_abs_diff == 0`.
    This is the critical check that the `diffuse()`/transformer edits didn't change
    the default path.
-3. **Flag ON bit-equivalence:** `enable_session_memory_manager=true`, same
+3. **Flag ON bit-equivalence:** `enable_session_state_manager=true`, same
    prompt/seed → output identical to flag OFF (freqs recompute is lossless;
    per-layer dict store/rebuild is lossless).
 4. **Concurrency:** two interleaved requests with different prompts, flag ON →

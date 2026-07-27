@@ -12,10 +12,64 @@ from vllm_omni.model_extras import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
     build_text_to_image_prompt,
+    build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"model_type": "bagel"}, "bagel"),
+        ({"architectures": ["HunyuanImage3ForConditionalGeneration"]}, "hunyuan_image3"),
+        ({"model_type": "mammothmoda2"}, "mammoth_moda2"),
+        ({"model_type": "qwen2_vl"}, "generic"),
+    ],
+)
+def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[str, object], expected: str) -> None:
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", lambda *args: config)
+    assert get_x_to_text_model_family("unused") == expected
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_bagel_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
+    assert prompt == {
+        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "modalities": ["text"],
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammoth_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("mammoth_moda2", "unused", "Hello.", has_image=False)
+    assert prompt == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nHello.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "modalities": ["text"],
+        "additional_information": {"omni_task": ["chat"]},
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_generic_x_to_text_prompt_builder() -> None:
+    assert build_x_to_text_prompt("generic", "unused", "Hello.", has_image=False) == (
+        {"prompt": "Hello.", "modalities": ["text"]},
+        None,
+    )
 
 
 @pytest.mark.core_model
@@ -60,8 +114,9 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+@pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_name: str) -> None:
+    assert get_extra_body_params(pipeline_name) == frozenset(
         {
             "flow_shift",
             "max_sequence_length",
@@ -98,7 +153,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
             "session_id",
         }
     )
-    assert get_extra_output_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+    assert get_extra_output_params(pipeline_name) == frozenset(
         {
             "action",
             "raw_action_dim",
@@ -106,7 +161,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
             "action_mode",
         }
     )
-    assert should_init_extra_args_for_non_diffusion_stages("Cosmos3OmniDiffusersPipeline") is False
+    assert should_init_extra_args_for_non_diffusion_stages(pipeline_name) is False
 
 
 @pytest.mark.core_model
@@ -224,9 +279,10 @@ def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
+@pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+def test_cosmos3_text_to_image_prompt_builder_selects_image_modality(pipeline_name: str) -> None:
     assert build_text_to_image_prompt(
-        "Cosmos3OmniDiffusersPipeline",
+        pipeline_name,
         prompt="a red sports car at golden hour",
         negative_prompt="blurry, distorted",
         height=1024,
@@ -237,7 +293,7 @@ def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
         "negative_prompt": "blurry, distorted",
     }
     assert build_text_to_image_prompt(
-        "Cosmos3OmniDiffusersPipeline",
+        pipeline_name,
         prompt="a red sports car",
         negative_prompt=None,
     ) == {"prompt": "a red sports car", "modalities": ["image"]}

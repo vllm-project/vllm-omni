@@ -15,6 +15,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import KVPrefetchJob
 from vllm_omni.platforms import current_omni_platform
 
 from .factory import OmniConnectorFactory
@@ -856,8 +857,20 @@ class OmniKVTransferManager:
 
             payloads.append(local_payload)
 
+        padding = None
+        if not branch_roles and cfg_size == 2 and main_payload:
+            # AR didn't split KV by branch; cfg follower needs the same
+            # positive KV for shared-prefix reuse. Only safe for cfg_size == 2:
+            # for cfg_size > 2 every rank must get its own KV, which we can't
+            # assign here, so padding stays None and the runner raises.
+            # Shallow dict copy: shares PKV tensors with main_payload. Safe
+            # only because the send path (cfg_scatter -> pack -> to_gpu_tensor)
+            # reads tensors to serialize, never mutates in place. Any async/
+            # KV-pool path that mutates req.past_key_values mid-scatter must
+            # clone tensors here instead.
+            padding = dict(main_payload)
         while len(payloads) < cfg_size:
-            payloads.append(None)
+            payloads.append(padding)
 
         return payloads[:cfg_size]
 
@@ -1193,16 +1206,14 @@ class OmniKVTransferManager:
                 logger.exception("Failed to release KV pool buffer")
         buffers.clear()
 
-    def start_prefetch(
-        self, kv_prefetch_jobs: dict[str, Any] | None, target_device: torch.device | None = None
-    ) -> None:
+    def start_prefetch(self, kv_prefetch_job: KVPrefetchJob | None, target_device: torch.device | None = None) -> None:
         """Kick off a background KV load (non-blocking). No-op unless prefetch enabled."""
-        if not (self._async_prefetch and self.config.need_recv_cache) or not kv_prefetch_jobs:
+        if not (self._async_prefetch and self.config.need_recv_cache) or not kv_prefetch_job:
             return
         # Followers receive via collective distribute; bg pull would consume the owner's payload.
         if self.topo_config.is_follower:
             return
-        rid = kv_prefetch_jobs.get("request_id")
+        rid = kv_prefetch_job.get("request_id")
         if not rid:
             return
         # Memory pressure → skip prefetch; sync receive handles it.
@@ -1216,7 +1227,7 @@ class OmniKVTransferManager:
             self._discard_future(stale_rid)
         if rid in self._prefetch_futures:
             return
-        sender_info = kv_prefetch_jobs.get("kv_sender_info")
+        sender_info = kv_prefetch_job.get("kv_sender_info")
         if not sender_info:
             # No explicit endpoint → bg receive would target wrong sender under multi-replica.
             logger.debug("Skip KV prefetch for %s: stub has no kv_sender_info", rid)

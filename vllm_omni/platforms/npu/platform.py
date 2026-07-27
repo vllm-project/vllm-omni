@@ -37,8 +37,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
+        from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
+            apply_qwen3_tts_tokenizer_v2_patch,
+        )
 
         apply_qwen3_tts_code2wav_patch()
+        apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
 
     @classmethod
@@ -71,7 +75,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/npu/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:

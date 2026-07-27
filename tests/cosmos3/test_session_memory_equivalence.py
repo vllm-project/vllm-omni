@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from vllm_omni.diffusion.memory import SessionMemoryManager
 
-from vllm_omni.diffusion.models.cosmos3.state_cosmos3_adapter import Cosmos3StateAdapter
+from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import (
+    Cosmos3StateAdapter,
+)
+from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,10 +29,10 @@ def _fake_cached_kv(seed: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return [(torch.randn(1, SEQ, DIM, generator=g), torch.randn(1, SEQ, DIM, generator=g)) for _ in range(LAYERS)]
 
 
-def _adapter(session_id: str, manager: SessionMemoryManager | None = None) -> Cosmos3StateAdapter:
-    # `manager is not None`, not `manager or ...`: an empty SessionMemoryManager is
+def _adapter(session_id: str, manager: SessionStateManager | None = None) -> Cosmos3StateAdapter:
+    # `manager is not None`, not `manager or ...`: an empty SessionStateManager is
     # falsy (it defines __len__), so `or` would silently swap in a fresh manager.
-    return Cosmos3StateAdapter(session_id, manager if manager is not None else SessionMemoryManager())
+    return Cosmos3StateAdapter(session_id, manager if manager is not None else SessionStateManager())
 
 
 def _assert_kv_equal(got: list | None, expected: list) -> None:
@@ -125,7 +127,7 @@ def test_reset_clears_both_branches() -> None:
 
 
 def test_two_sessions_do_not_clobber() -> None:
-    manager = SessionMemoryManager()
+    manager = SessionStateManager()
     a, b = _adapter("A", manager), _adapter("B", manager)
     kv_a, kv_b = _fake_cached_kv(10), _fake_cached_kv(20)
     a.set_branch_kv(False, kv_a)
@@ -136,7 +138,7 @@ def test_two_sessions_do_not_clobber() -> None:
 
 
 def test_fresh_adapter_same_session_sees_prior_state() -> None:
-    manager = SessionMemoryManager()
+    manager = SessionStateManager()
     kv = _fake_cached_kv(7)
     _adapter("s", manager).set_branch_kv(False, kv)
     again = Cosmos3StateAdapter("s", manager)
@@ -146,7 +148,7 @@ def test_fresh_adapter_same_session_sees_prior_state() -> None:
 def test_adapter_survives_session_lru_eviction() -> None:
     # An in-use adapter keeps its state even after the manager evicts its
     # session id from the lookup table (LRU bounded by max_sessions).
-    manager = SessionMemoryManager(max_sessions=2)
+    manager = SessionStateManager(max_sessions=2)
     a = _adapter("active", manager)
     kv = _fake_cached_kv(11)
     a.set_branch_kv(False, kv)

@@ -134,3 +134,17 @@ def test_runner_rejects_multi_sequence_config():
     fake = SimpleNamespace(od_config=SimpleNamespace(max_num_seqs=4))
     with pytest.raises(ValueError, match="max_num_seqs=1"):
         ARDiffusionModelRunner._preallocate_kv_cache(fake)
+
+
+def test_execute_model_accepts_kv_prefetch_job_kwarg():
+    """Regression: the worker passes ``kv_prefetch_job`` to every runner
+    (added with the KV prefetch path, #4448); the AR-Diffusion override must
+    accept and forward it or DreamZero crashes on the warm-up dummy run."""
+    import inspect
+
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+    for cls in (DiffusionModelRunner, ARDiffusionModelRunner):
+        params = inspect.signature(cls.execute_model).parameters
+        assert "kv_prefetch_job" in params, cls

@@ -179,6 +179,59 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     assert get_current_diffusion_config_or_none() is None
 
 
+def test_hsdp_processes_quantized_weights_before_sharding(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = object()
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = mocker.Mock(side_effect=lambda _model: events.append("load"))  # type: ignore[method-assign]
+    loader._process_weights_after_loading = mocker.Mock(  # type: ignore[method-assign]
+        side_effect=lambda _model, _device: events.append("process")
+    )
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.quantization.hsdp_fp8.prepare_fp8_layers_for_fsdp",
+        side_effect=lambda _model: events.append("prepare"),
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: events.append("shard"),
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"))
+
+    assert events == ["load", "process", "prepare", "shard"]
+
+
 def test_get_all_weights(prefetch_helios_model, mock_tp_group):
     """Ensure that get all weights on a tiny model resolves to nonempty weights."""
     od_config = OmniDiffusionConfig(

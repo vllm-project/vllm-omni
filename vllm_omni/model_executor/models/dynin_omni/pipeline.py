@@ -23,6 +23,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.dynin_omni"
 
 DYNIN_OMNI_PIPELINE = PipelineConfig(
     model_type="dynin_omni",
+    default_deploy_config_name="dynin_omni.yaml",
     model_arch="DyninOmniForConditionalGeneration",
     # Arch-fallback safety net: route by hf_config.architectures when the
     # auto-detected model_type does not match the registry key exactly.

@@ -20,7 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
 from vllm_omni.engine import PromptEmbedsPayload
-from vllm_omni.request import OmniRequest
+from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,7 +32,12 @@ def test_omni_params_are_keyword_only():
     came first positionally and broke positional ``Request(...)`` construction.
     """
     params = inspect.signature(OmniRequest.__init__).parameters
-    for name in ("prompt_embeds", "external_req_id", "additional_information"):
+    for name in (
+        "prompt_embeds",
+        "external_req_id",
+        "additional_information",
+        "model_intermediate_buffer",
+    ):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
 
 
@@ -87,3 +92,21 @@ def test_keyword_omni_params_round_trip():
     # The serialized payload is retained and decoded into a tensor on the base.
     assert req.prompt_embeds_payload is payload
     assert torch.equal(req.prompt_embeds, torch.from_numpy(arr))
+
+
+def test_model_intermediate_buffer_round_trips_to_streaming_update():
+    buffer = {"duplex": {"turn_id": 3}}
+    request = OmniRequest(
+        request_id="req-model-buffer",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=16),
+        pooling_params=None,
+        resumable=True,
+        model_intermediate_buffer=buffer,
+    )
+
+    update = OmniStreamingUpdate.from_request(request)
+
+    assert update is not None
+    assert request.model_intermediate_buffer is buffer
+    assert update.model_intermediate_buffer is buffer

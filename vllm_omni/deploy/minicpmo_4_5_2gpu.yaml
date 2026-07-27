@@ -1,0 +1,2 @@
+# Backward-compatible name for the canonical two-GPU batching profile.
+base_config: minicpmo_4_5_batching.yaml

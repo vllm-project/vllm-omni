@@ -463,6 +463,31 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool) -> bool:
+        """
+        Check if CFG parallel configuration is valid.
+
+        Args:
+            true_cfg_scale: The classifier-free guidance scale value
+            has_neg_prompt: Whether a negative prompt is provided
+
+        Returns:
+            True if CFG parallel configuration is valid, False otherwise
+        """
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
+
     def scheduler_step(
         self,
         noise_pred: torch.Tensor | tuple[torch.Tensor, ...],

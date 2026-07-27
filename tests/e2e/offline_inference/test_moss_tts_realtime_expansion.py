@@ -24,7 +24,11 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Realtime"
 DEPLOY_CONFIG = get_deploy_config_path("moss_tts_realtime.yaml")
-_OMNI_RUNNER_PARAM = (MODEL, DEPLOY_CONFIG, {"stage_init_timeout": 300})
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    DEPLOY_CONFIG,
+    {"stage_init_timeout": 300, "trust_remote_code": True},
+)
 
 pytestmark = [
     pytest.mark.slow,

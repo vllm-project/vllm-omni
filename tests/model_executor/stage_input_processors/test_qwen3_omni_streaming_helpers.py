@@ -251,6 +251,29 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["hidden_states"]["output"].shape[0] == 2
 
 
+def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-1",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+    prompt = {
+        "additional_information": {
+            "speaker": ["ethan"],
+            "language": ["English"],
+        }
+    }
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt)
+
+    assert talker_prompt["additional_information"] == {
+        "speaker": ["ethan"],
+        "language": ["English"],
+    }
+
+
 def test_accumulator_replaces_keys_in_replace_set() -> None:
     """REPLACE-key semantics: subsequent emissions of the same key replace, not append."""
     from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
