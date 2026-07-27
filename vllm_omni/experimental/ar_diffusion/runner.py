@@ -11,6 +11,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.stage_payload import STAGE_PAYLOAD_PROMPT_KEY
+from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -21,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -61,6 +64,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
+        # Per-request server-side forward E2E times (seconds), recorded in
+        # execute_model. This is the worker-side compute time — the analog of the
+        # upstream server's per-request E2E — and excludes the engine<->worker IPC
+        # that the client's omni.generate wall time includes. Read (and cleared)
+        # by the ar_diffusion_perf_stats worker RPC for the perf-compare summary.
         self._perf_e2e_times: list[float] = []
 
     @staticmethod
@@ -84,9 +92,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
-        if self.device is None or torch.device(self.device).type != "cuda":
-            raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
-        return int(torch.cuda.mem_get_info(self.device)[0])
+        # Platform-portable free-memory query (RFC #4590 targets Intel XPU): the
+        # platform layer dispatches to torch.{cuda,xpu}.mem_get_info, so KV
+        # preallocation is not pinned to CUDA.
+        if self.device is None:
+            raise RuntimeError("AR-Diffusion KV preallocation requires a device")
+        return int(current_omni_platform.get_free_memory(self.device))
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -229,10 +240,28 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._sessions.move_to_end(session_id)
         return state
 
-    @staticmethod
-    def _request_session(req: OmniDiffusionRequest) -> tuple[str, dict]:
+    def _resolve_session_id(self, req: OmniDiffusionRequest) -> str:
+        """Resolve the AR-Diffusion session id for this request.
+
+        Monolithic path: ``sampling_params.extra_args["session_id"]``. Denoise
+        stage: the transition processor mirrors the encode payload's public
+        ``scalar_fields["session_id"]`` into both ``extra_args["session_id"]`` and
+        the prompt, so reading extra_args covers both. Falls back to the payload's
+        public ``scalar_fields`` directly if extra_args did not carry it (handling
+        both a live ``StagePayload`` and a msgpack-flattened plain dict).
+        """
         extra_args = req.sampling_params.extra_args or {}
-        return str(extra_args.get("session_id") or "default"), extra_args
+        session_id = extra_args.get("session_id")
+        if session_id is None and self.model_stage == DENOISE:
+            prompt = req.prompt
+            extra = prompt.get("extra") if isinstance(prompt, dict) else getattr(prompt, "extra", None)
+            payload = extra.get(STAGE_PAYLOAD_PROMPT_KEY) if isinstance(extra, dict) else None
+            if payload is not None:
+                scalar_fields = (
+                    payload.get("scalar_fields") if isinstance(payload, dict) else getattr(payload, "scalar_fields", {})
+                )
+                session_id = (scalar_fields or {}).get("session_id")
+        return str(session_id or "default")
 
     def execute_model(
         self,
@@ -245,7 +274,20 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
-        session_id, extra_args = self._request_session(req)
+        # Disaggregated encode/decode stages own NO AR-Diffusion KV: they run
+        # conditions encode / VAE decode only. Route them straight to the base
+        # runner's role dispatch without touching the session pool (RFC #4590
+        # §9.1: KV/session state lives exclusively on the denoise stage). The
+        # denoise stage (and the monolithic path) keep the session attach below.
+        if self.model_stage in (ENCODE, DECODE):
+            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+
+        # For the denoise stage the session id arrives in the payload metadata
+        # (mirrored to extra_args by the transition processor); for the monolithic
+        # path it is the request's own extra_args["session_id"]. reset/close flags
+        # are always read from the request's extra_args.
+        session_id = self._resolve_session_id(req)
+        extra_args = req.sampling_params.extra_args or {}
         if extra_args.get("reset", False):
             self.reset_session(session_id)
         state = self._get_or_create_session(session_id)
@@ -256,12 +298,28 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             if self.device is not None and torch.device(self.device).type == "cuda":
                 torch.accelerator.synchronize(self.device)
         except Exception:
+            # Transactional containment: a forward that died partway may have
+            # written some layers' K/V into allocated-but-uncommitted blocks and
+            # advanced model-local state. Release the whole session (KV pool blocks
+            # freed via state.close(); model-local state dropped via the pipeline's
+            # close notification) so the next request with this session id starts
+            # clean instead of tripping the pending-commit guard or reading
+            # half-written KV.
             self._release_session(
                 session_id,
                 reset_model=False,
                 reason="forward_exception",
                 suppress_errors=True,
             )
+            # RFC #4590 Part A: also drop the committed session-progress record so
+            # the torn-down session cannot leave the ordering authority mid-stream.
+            # After teardown the next chunk must arrive as an explicit reset (fresh
+            # epoch), which re-syncs both stages; a bare continuation is then
+            # rejected instead of silently resuming a session whose KV/model state
+            # was wiped. Guarded so non-session pipelines are unaffected.
+            progress = getattr(self.pipeline, "_session_progress", None)
+            if progress is not None and hasattr(progress, "drop"):
+                progress.drop(session_id)
             logger.warning(
                 "AR-Diffusion forward failed for session=%s; KV and model state were released",
                 session_id,

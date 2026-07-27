@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
@@ -17,6 +19,88 @@ logger = logging.getLogger(__name__)
 FRAMES_PER_CHUNK = 4
 
 
+@dataclass
+class DreamZeroStageCarrier:
+    """DreamZero-private inter-phase carrier for disaggregated execution (RFC #4590).
+
+    ``forward()`` is refactored into three phase methods
+    (``_run_encode_phase`` / ``_run_denoise_phase`` / ``_run_decode_phase``) that
+    read and write this carrier. In the monolithic path all three run in one
+    process on one carrier, so the composition is byte-identical to the original
+    forward. In the disaggregated path each phase runs in its own worker and the
+    carrier's stable fields are marshalled through a ``StagePayload`` by the
+    pipeline's ``pack_stage_state`` / ``unpack_stage_state`` hooks.
+
+    This is model-private state (kept out of the generic ``StepRequestState``
+    per RFC §2.3): it is stored on ``StepRequestState.extra`` and interpreted
+    only by DreamZero. The AR-Diffusion KV / live session objects are NEVER placed
+    here — they stay on the denoise worker.
+    """
+
+    # -- identity / control (crosses every boundary) --
+    session_id: str = "default"
+    # Session-progress routing metadata (RFC #4590 Part A). Stamped by the encode
+    # stage from the SessionProgressCoordinator so the denoise stage (the commit
+    # authority) can validate ordering across the process boundary without
+    # decoding model-private schema: reject a stale/duplicate/gapped sequence or a
+    # pre-reset epoch BEFORE touching the AR-Diffusion KV. ``session_epoch`` is
+    # bumped on an explicit/session reset (fences old in-flight attempts);
+    # ``sequence_no`` is monotonic per (session, epoch) and is independent of
+    # ``current_start_frame`` (which resets to 0 at an AR window boundary with NO
+    # epoch bump); ``attempt_id`` distinguishes retries of the same sequence.
+    session_epoch: int = 0
+    sequence_no: int = 0
+    attempt_id: str = ""
+    embodiment_name: str = ""
+    # The exact key passed to get_transform() at encode time, so decode selects
+    # the identical transform (preserves monolithic-forward behavior exactly).
+    transform_embodiment: str = ""
+    # Reset decision computed at encode from the encode-session state; the
+    # denoise worker applies the SAME reset to its engine KV window.
+    reset_reason: str | None = None
+    explicit_reset: bool = False
+    do_true_cfg: bool = False
+    # Window position at the start of this forward. Both encode and denoise track
+    # csf on their own DreamZeroState; it is carried so the denoise worker aligns
+    # its KV window with the conditions the encode worker produced.
+    current_start_frame: int = 0
+
+    # -- geometry (encode -> denoise) --
+    height: int = 0
+    width: int = 0
+    seq_len: int = 0
+    frame_seqlen: int = 0
+
+    # -- encoded conditions (encode -> denoise), stable/read-only during denoise --
+    prompt_embeds: torch.Tensor | None = None
+    negative_prompt_embeds: torch.Tensor | None = None
+    clip_feas: torch.Tensor | None = None
+    ys: torch.Tensor | None = None
+    image_latent: torch.Tensor | None = None
+    state_features: torch.Tensor | None = None
+    embodiment_id: torch.Tensor | None = None
+
+    # -- initial noise (encode -> denoise). Carried explicitly so the denoise
+    #    worker uses exactly the encode-seeded noise (deterministic parity). --
+    noise_obs: torch.Tensor | None = None
+    noise_action: torch.Tensor | None = None
+
+    # -- timestep schedule params (encode -> denoise) --
+    num_inference_steps: int = 0
+    sigma_shift: float = 1.0
+
+    # -- postprocess inputs (encode -> ... -> decode) --
+    # Raw padded observation state for relative->absolute action recovery.
+    state_for_postprocess: torch.Tensor | None = None
+
+    # -- denoise outputs (denoise -> decode) --
+    video_out: torch.Tensor | None = None
+    action_out: torch.Tensor | None = None
+
+    # -- opaque extras for forward-compat --
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
 class DreamZeroState:
     """Pipeline persistent state across forward() calls.
 
@@ -24,7 +108,7 @@ class DreamZeroState:
         - Created once in DreamZeroPipeline.__init__()
         - Mutated every forward() call (frame append, KV cache grow)
         - reset() on new session / language change
-        - reset_inference_state() on local_attn_size exceeded (KV only)
+        - reset(clear_video_latents=False) on local_attn_size exceeded (KV only)
     """
 
     def __init__(self) -> None:
@@ -98,7 +182,7 @@ class DreamZeroState:
         self.video_latents_across_time = []
 
     # ------------------------------------------------------------------
-    # Reset / should_reset
+    # Reset / reset_reason
     # ------------------------------------------------------------------
 
     def reset(self, *, clear_video_latents: bool = True) -> None:
@@ -134,10 +218,6 @@ class DreamZeroState:
         self.vae_encoder_out: torch.Tensor | None = None
         self.vae_pending_body_frames: torch.Tensor | None = None
 
-    def reset_inference_state(self) -> None:
-        """Reset KV/frame state after local attention rolls without dropping video latents."""
-        self.reset(clear_video_latents=False)
-
     def reset_reason(
         self,
         text_tokens: torch.Tensor | None,
@@ -169,7 +249,3 @@ class DreamZeroState:
             return "inference"
 
         return None
-
-    def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
-        """Determine if state should be reset before this forward()."""
-        return self.reset_reason(text_tokens, num_video_frames, local_attn_size) is not None

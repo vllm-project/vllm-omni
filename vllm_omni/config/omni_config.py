@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
+    _EXECUTION_TYPE_TO_STAGE_WORKER,
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
@@ -38,11 +39,11 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
 )
 
-_EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
-    StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
-    StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
-    StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
-}
+# ``_EXECUTION_TYPE_TO_STAGE_WORKER`` (the execution-type -> (stage_type,
+# worker_type) mapping) is the single source of truth in ``stage_config`` and is
+# imported above. This module's ``_resolve_execution_mode`` looks it up directly
+# (no fallback), while ``stage_config._resolve_execution_mode`` uses ``.get()``
+# with a legacy default -- the two lookups differ on purpose.
 
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 

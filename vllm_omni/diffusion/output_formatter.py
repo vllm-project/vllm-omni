@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import Any, TypeGuard
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output
@@ -106,7 +106,17 @@ def format_empty_diffusion_outputs(
     request: OmniDiffusionRequest,
     *,
     finished: bool = True,
+    custom_output: dict[str, Any] | None = None,
 ) -> list[OmniRequestOutput]:
+    """Format a stage output with no user-visible payload (``output.output is None``).
+
+    Disaggregated encode/denoise stages intentionally have no image/action
+    output of their own -- they hand off a :class:`StagePayload` via
+    ``custom_output`` instead (see ``_intermediate_output`` in
+    ``diffusion_model_runner.py``). ``custom_output`` must be forwarded here so
+    the generic stage-transition processor can find that payload downstream;
+    dropping it would silently break every disaggregated pipeline.
+    """
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
@@ -115,6 +125,7 @@ def format_empty_diffusion_outputs(
             metrics={},
             latents=None,
             finished=finished,
+            custom_output=custom_output,
         )
     ]
 

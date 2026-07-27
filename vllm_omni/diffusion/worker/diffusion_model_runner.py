@@ -32,11 +32,31 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import (
+    StageBoundary,
+    StagePayload,
+    supports_disaggregated_execution,
+    supports_step_execution,
+)
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.stage_payload import (
+    STAGE_PAYLOAD_OUTPUT_KEY,
+    STAGE_PAYLOAD_PROMPT_KEY,
+    StagePayloadError,
+)
+from vllm_omni.diffusion.stage_roles import (
+    EXECUTION_PATH_DECODE,
+    EXECUTION_PATH_DENOISE,
+    EXECUTION_PATH_ENCODE,
+    EXECUTION_PATH_MODEL_DEFINED,
+    EXECUTION_PATH_MONOLITHIC,
+    is_disaggregated_role,
+    normalize_stage_role,
+    resolve_execution_path,
+)
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -145,6 +165,41 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _target_device(self) -> torch.device | None:
         return getattr(self.pipeline, "device", None)
 
+    # ------------------------------------------------------------------
+    # Disaggregated-diffusion stage role (RFC #4590)
+    # ------------------------------------------------------------------
+
+    @property
+    def model_stage(self) -> str:
+        """Canonical stage role for this runner (``diffusion`` when unset).
+
+        ``diffusion`` (or ``None``/empty) means the monolithic single-worker
+        fallback: this runner owns the whole ``forward()`` and its execution
+        path is unchanged from before RFC #4590.
+        """
+        return normalize_stage_role(getattr(self.od_config, "model_stage", None))
+
+    @property
+    def is_disaggregated_stage(self) -> bool:
+        """True when this runner is an encode/denoise/decode stage."""
+        return is_disaggregated_role(getattr(self.od_config, "model_stage", None))
+
+    def supports_disaggregated_mode(self) -> bool:
+        """Return whether the loaded pipeline can run as a disaggregated stage."""
+        return self.pipeline is not None and supports_disaggregated_execution(self.pipeline)
+
+    def _require_disaggregated_pipeline(self) -> None:
+        """Raise a clear startup error if a disaggregated role lacks capability."""
+        if not self.supports_disaggregated_mode():
+            raise ValueError(
+                "Stage requested disaggregated role "
+                f"{self.model_stage!r} but pipeline "
+                f"{type(self.pipeline).__name__ if self.pipeline else self.od_config.model_class_name} "
+                "does not implement the DiffusionV2Atoms disaggregation contract "
+                "(supports_disaggregated_execution flag + pack_stage_state / "
+                "unpack_stage_state / required_components_for_stage)."
+            )
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -240,7 +295,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "DiffusionV2Atoms; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -248,6 +303,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
+
+        # Disaggregated-diffusion capability check (RFC #4590): a stage that
+        # declares an encode/denoise/decode role requires a pipeline that
+        # implements the disaggregated protocol. Fail fast at startup rather
+        # than mid-forward.
+        if self.is_disaggregated_stage:
+            self._require_disaggregated_pipeline()
+            # Stage-aware continuous batching is not implemented: a disaggregated
+            # stage runs one request at a time through execute_model. Enforce
+            # max_num_seqs==1 at startup so a misconfigured deploy fails fast here
+            # rather than mid-serving when the scheduler tries to batch (the batch
+            # path is also rejected at runtime in execute_model_batch).
+            max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
+            if max_num_seqs != 1:
+                raise ValueError(
+                    f"Disaggregated stage {self.model_stage!r} requires max_num_seqs==1 "
+                    f"(stage-aware continuous batching is not implemented); got "
+                    f"max_num_seqs={max_num_seqs}. Set max_num_seqs: 1 for this stage."
+                )
+        self._log_stage_startup()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)
@@ -533,13 +608,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
         """
-        Execute a forward pass for the given requests.
+        Execute a forward pass for the given request.
+
+        Dispatches on the stage role (RFC #4590):
+
+        * ``diffusion`` / unset  -> the existing monolithic single-request path
+          (unchanged behavior).
+        * ``encode``             -> :meth:`execute_encode_stage`.
+        * ``denoise``            -> :meth:`execute_denoise_stage`.
+        * ``decode``             -> :meth:`execute_decode_stage`.
+        * any other declared role -> :meth:`execute_model_defined_stage`.
 
         Args:
-            req: A diffusion request containing a list of prompts to process.
+            req: A diffusion request containing a prompt to process.
 
         Returns:
-            DiffusionOutput with generated results.
+            DiffusionOutput with generated results (encode/denoise stages return
+            an intermediate output carrying a StagePayload; decode and
+            monolithic stages return the user-visible result).
 
         Note:
             We use torch.no_grad() for HSDP because HSDP2's fully_shard requires access
@@ -547,6 +633,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             not track. For non-HSDP inference, we use torch.inference_mode() for better
             performance.
         """
+        role = self.model_stage
+        path = resolve_execution_path(role)
+        if path == EXECUTION_PATH_ENCODE:
+            return self.execute_encode_stage(req)
+        if path == EXECUTION_PATH_DENOISE:
+            return self.execute_denoise_stage(req)
+        if path == EXECUTION_PATH_DECODE:
+            return self.execute_decode_stage(req)
+        if path == EXECUTION_PATH_MODEL_DEFINED:
+            # A model-declared custom role (not one of the built-in three).
+            return self.execute_model_defined_stage(role, req)
+
+        assert path == EXECUTION_PATH_MONOLITHIC
+        return self._execute_monolithic(req, kv_prefetch_job=kv_prefetch_job)
+
+    def _execute_monolithic(
+        self, req: OmniDiffusionRequest, kv_prefetch_job: KVPrefetchJob | None = None
+    ) -> DiffusionOutput:
+        """The original monolithic single-request path (unchanged)."""
         runner_output = self._execute_request_list(
             [req],
             od_config=self.od_config,
@@ -559,6 +664,239 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         assert output is not None
         return output
 
+    def execute_model_defined_stage(self, role: str, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Hook for model-declared custom stage roles.
+
+        The base runner has no built-in path for roles outside
+        encode/denoise/decode. A pipeline that declares support for a custom
+        role should subclass the runner (or override this) to handle it. Raising
+        here keeps unknown roles from silently taking the monolithic path.
+        """
+        raise ValueError(
+            f"Stage role {role!r} has no built-in execution path and pipeline "
+            f"{type(self.pipeline).__name__ if self.pipeline else self.od_config.model_class_name} "
+            "does not override execute_model_defined_stage()."
+        )
+
+    # ------------------------------------------------------------------
+    # Disaggregated-stage execution (RFC #4590)
+    # ------------------------------------------------------------------
+
+    def _log_stage_startup(self) -> None:
+        """Log stage role, capability, and (when known) loaded components."""
+        components = "n/a"
+        if self.supports_disaggregated_mode():
+            try:
+                spec = type(self.pipeline).required_components_for_stage(self.model_stage)
+                components = spec.describe()
+            except Exception:  # pragma: no cover - logging must not fail startup
+                components = "unknown"
+        logger.info(
+            "Diffusion stage startup: pipeline=%s stage_id=%s model_stage=%s disaggregated_capable=%s components=%s",
+            type(self.pipeline).__name__ if self.pipeline else self.od_config.model_class_name,
+            getattr(self.od_config, "stage_id", 0),
+            self.model_stage,
+            self.supports_disaggregated_mode(),
+            components,
+        )
+
+    def _grad_context(self):
+        """Return the grad context used by all forward paths (HSDP-aware)."""
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        return torch.no_grad() if use_hsdp else torch.inference_mode()
+
+    def _create_state_from_request(self, req: OmniDiffusionRequest) -> StepRequestState:
+        """Build a fresh runner-local state from a raw request (encode stage)."""
+        state = StepRequestState(
+            request_id=req.request_id,
+            sampling=copy.deepcopy(req.sampling_params),
+            prompt=req.prompt,
+            kv_sender_info=req.kv_sender_info,
+        )
+        # Seed the per-request RNG generator via the shared upstream helper
+        # (_initialize_generator takes the sampling params directly).
+        self._initialize_generator(state.sampling)
+        return state
+
+    def _extract_incoming_payload(self, req: OmniDiffusionRequest) -> StagePayload:
+        """Pull the upstream StagePayload out of a request prompt.
+
+        The generic transition processor places it in the prompt's ``extra``
+        sub-dict under :data:`STAGE_PAYLOAD_PROMPT_KEY`. Raise a clear,
+        request-scoped error if it is missing or malformed.
+
+        The request crosses the out-of-process (multiproc) stage boundary via
+        msgpack, which does not preserve dataclass identity: the payload
+        arrives here as a plain ``dict`` rather than a ``StagePayload``
+        instance. Rehydrate it before validating.
+        """
+        prompt = req.prompt
+        extra = None
+        if isinstance(prompt, dict):
+            extra = prompt.get("extra")
+        elif hasattr(prompt, "extra"):
+            extra = getattr(prompt, "extra")
+        payload = extra.get(STAGE_PAYLOAD_PROMPT_KEY) if isinstance(extra, dict) else None
+        if payload is None:
+            raise StagePayloadError(
+                f"Request {req.request_id!r} reached stage {self.model_stage!r} without a "
+                f"StagePayload in prompt['extra'][{STAGE_PAYLOAD_PROMPT_KEY!r}]; "
+                f"pipeline={type(self.pipeline).__name__}."
+            )
+        if isinstance(payload, dict) and not isinstance(payload, StagePayload):
+            payload = StagePayload.from_dict(payload)
+        if not isinstance(payload, StagePayload):
+            raise StagePayloadError(
+                f"Request {req.request_id!r} stage {self.model_stage!r}: payload is "
+                f"{type(payload).__name__}, expected StagePayload."
+            )
+        payload.validate()
+        # Request-identity cross-check: the payload the transition processor
+        # routed into this request must belong to this request. A mismatch means
+        # request A's stage output was delivered to request B (a routing/queue
+        # bug) — fail loud before restoring the wrong request's state or KV,
+        # rather than silently denoising A's conditions under B's session.
+        if payload.request_id != req.request_id:
+            raise StagePayloadError(
+                f"Stage {self.model_stage!r} received a StagePayload for request "
+                f"{payload.request_id!r} on request {req.request_id!r} "
+                f"(boundary={payload.boundary.value}); cross-request payload routing is a bug."
+            )
+        return payload
+
+    def _intermediate_output(
+        self,
+        state: StepRequestState,
+        payload: StagePayload,
+    ) -> DiffusionOutput:
+        """Wrap an exported payload as an intermediate (non-final) stage output.
+
+        The payload rides in ``custom_output`` under
+        :data:`STAGE_PAYLOAD_OUTPUT_KEY`; the generic transition processor reads
+        it there. ``to_cpu=True`` guarantees the receiving process never touches
+        a live device tensor (payload tensors are already host-resident, but
+        stage_durations and any stray tensors are normalized here too).
+        """
+        output = DiffusionOutput(
+            output=None,
+            custom_output={STAGE_PAYLOAD_OUTPUT_KEY: payload},
+            finished=True,
+            to_cpu=True,
+        )
+        attach_stage_durations(state, output)
+        output.peak_memory_mb = max(output.peak_memory_mb, state.peak_memory_mb)
+        return output
+
+    def _reset_peak_memory(self) -> bool:
+        """Reset peak-memory stats on the primary rank; return is_primary."""
+        is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if is_primary and current_omni_platform.is_available():
+            current_omni_platform.reset_peak_memory_stats()
+        return is_primary
+
+    def execute_encode_stage(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Encode stage: validate + encode conditions + prepare latents/timesteps.
+
+        Produces an intermediate output carrying an encode->denoise payload. Does
+        NOT run the DiT, advance the scheduler, or decode. Runner-local state is
+        released once the payload is handed off (the payload is self-contained).
+        """
+        self._require_disaggregated_pipeline()
+        with self._grad_context():
+            is_primary = self._reset_peak_memory()
+            clear_pipeline_stage_durations(self.pipeline)
+            state = self._create_state_from_request(req)
+            try:
+                # Run under the diffusion forward context for parity with the
+                # monolithic/denoise/decode paths (encoders may consult it).
+                # Drive the DiffusionV2Atoms encode chain explicitly:
+                # init_state -> check_inputs -> encode -> prepare.
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_encode_stage"):
+                        state = self.pipeline.init_state(state)
+                        state = self.pipeline.check_inputs(state)
+                        state = self.pipeline.encode(state)
+                        state = self.pipeline.prepare(state)
+                merge_stage_durations(state, consume_pipeline_stage_durations(self.pipeline))
+                payload = self.pipeline.pack_stage_state(state, StageBoundary.ENCODE_TO_DIT)
+            finally:
+                # Encode owns no persistent state; drop any cache entry eagerly.
+                self.state_cache.pop(req.request_id, None)
+            if is_primary:
+                state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
+            logger.debug("encode stage: request %s payload exported (%s)", req.request_id, payload.summary())
+            return self._intermediate_output(state, payload)
+
+    def execute_denoise_stage(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Denoise stage: restore state from payload, run the DiT denoise loop.
+
+        Creates a fresh runner-local state from the request (so request-level
+        sampling/generator/session plumbing is preserved), unpacks the incoming
+        stage payload into it (``unpack_stage_state`` mutates the existing state —
+        it never fabricates one), runs the pipeline's whole-request ``diffuse``
+        atom, and packs a denoise->decode payload. Any live session/KV state the
+        denoise stage owns (AR-Diffusion KV) is attached by the runner subclass
+        before this call — never via the payload. Never re-runs encode.
+        """
+        self._require_disaggregated_pipeline()
+        with self._grad_context():
+            is_primary = self._reset_peak_memory()
+            clear_pipeline_stage_durations(self.pipeline)
+            payload = self._extract_incoming_payload(req)
+            payload.expect_boundary(StageBoundary.ENCODE_TO_DIT)
+            state = self._create_state_from_request(req)
+            state = self.pipeline.unpack_stage_state(payload, state)
+            self.state_cache[req.request_id] = state
+            try:
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_denoise_stage"):
+                        state = self.pipeline.diffuse(state)
+                out_payload = self.pipeline.pack_stage_state(state, StageBoundary.DIT_TO_DECODE)
+                merge_stage_durations(state, consume_pipeline_stage_durations(self.pipeline))
+            finally:
+                # For the first (non-streaming) implementation the whole request
+                # denoises in one call, so its state is releasable now. Streaming
+                # session retention is handled by the pipeline via its own session
+                # map, not this cache.
+                self.state_cache.pop(req.request_id, None)
+            if is_primary:
+                state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
+            logger.debug("denoise stage: request %s payload exported (%s)", req.request_id, out_payload.summary())
+            return self._intermediate_output(state, out_payload)
+
+    def execute_decode_stage(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Decode stage: restore decode state, run VAE/postprocess, return output.
+
+        Restores only what decode needs, runs decode + postprocess, and returns
+        the normal user-visible ``DiffusionOutput``. Never instantiates or runs
+        the DiT, advances a scheduler, or re-runs encoders.
+        """
+        self._require_disaggregated_pipeline()
+        with self._grad_context():
+            is_primary = self._reset_peak_memory()
+            clear_pipeline_stage_durations(self.pipeline)
+            payload = self._extract_incoming_payload(req)
+            payload.expect_boundary(StageBoundary.DIT_TO_DECODE)
+            state = self._create_state_from_request(req)
+            state = self.pipeline.unpack_stage_state(payload, state)
+            self.state_cache[req.request_id] = state
+            try:
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_decode_stage"):
+                        state = self.pipeline.decode(state)
+                        output = self.pipeline.postprocess(state)
+                if output is None:
+                    raise RuntimeError(f"Decode stage produced no output for request {req.request_id!r}.")
+                self._attach_stepwise_metrics(state, output)
+            finally:
+                self.state_cache.pop(req.request_id, None)
+            if is_primary:
+                peak = self._sample_peak_memory_mb()
+                state.peak_memory_mb = max(state.peak_memory_mb, peak)
+                output.peak_memory_mb = max(output.peak_memory_mb, state.peak_memory_mb)
+            logger.debug("decode stage: request %s produced final output", req.request_id)
+            return output
+
     def execute_model_batch(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -570,6 +908,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
+        # Stage-aware batch guard (RFC #4590 §B.2): the batch path runs the
+        # monolithic whole-request ``pipeline.forward(batch)``, which composes
+        # encode+denoise+decode in one process. A disaggregated encode/denoise/
+        # decode worker must NEVER take that path — it would silently re-run the
+        # phases this stage does not own (and, for denoise, bypass the per-stage
+        # payload/session plumbing). Stage-aware continuous batching is not yet
+        # implemented, so reject the batch path outright for disaggregated roles
+        # rather than let a role fall through to the monolithic forward.
+        if self.is_disaggregated_stage:
+            raise RuntimeError(
+                f"Disaggregated stage {self.model_stage!r} cannot use the monolithic "
+                "request-batch path (pipeline.forward(batch)); it must run through the "
+                "stage-specific execute_model dispatch. Set max_num_seqs=1 for "
+                "disaggregated stages (stage-aware continuous batching is not implemented)."
+            )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         return self._execute_request_list(
             reqs,
