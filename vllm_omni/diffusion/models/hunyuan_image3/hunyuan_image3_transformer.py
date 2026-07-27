@@ -76,11 +76,12 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -1620,7 +1621,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             self.shared_mlp = None
 
         enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
-        self.experts = HunyuanFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -2100,7 +2101,7 @@ class HunyuanImage3Model(nn.Module):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = HunyuanFusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
@@ -2381,6 +2382,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
+        current_omni_platform.reset_diffusion_fused_moe_forward_context()
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
