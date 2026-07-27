@@ -8,6 +8,7 @@ from tests.diffusion.offloader.test_diffusion_cpu_offload import (
     _skip_if_gated_repo_inaccessible,
 )
 from tests.helpers.env import DeviceMemoryMonitor
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -22,6 +23,11 @@ IMAGE_VIDEO_MODELS = {
 }
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+
+MODEL_MARKS = {
+    "riverclouds/qwen_image_random": pytest.mark.core_model,
+    "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
+}
 
 AUDIO_MODEL_PARAMS = {
     "runner_params": {},
@@ -91,6 +97,8 @@ def run_inference(
     return peak, output
 
 
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("model_name", list(MODELS.keys()))
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
@@ -128,8 +136,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     if model_name == "stabilityai/stable-audio-open-1.0":
-        audio_offload = output_offload[0]. multimodal_output.get("audio")
-        audio_no_offload = output_no_offload[0]. multimodal_output.get("audio")
+        audio_offload = output_offload[0].multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0].multimodal_output.get("audio")
         # Match the sibling cpu-offload test's tolerance: layerwise offload moves
         # blocks across the PCIe bus on a side stream, which can perturb cuBLAS
         # algorithm selection and produce ~ULP-level drift larger than 1e-3.
