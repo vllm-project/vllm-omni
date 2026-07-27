@@ -393,3 +393,32 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
+
+    def _gather_runtime_additional_information(self):
+        """NPU parity fix for MiniCPM-o-4.5 Code2Wav request_id injection.
+
+        On GPU, ``OmniGPUModelRunner._preprocess`` unconditionally writes
+        ``req_infos["request_id"] = req_id`` (gpu_model_runner.py:1756) so that
+        every stage's ``model_intermediate_buffer`` entry carries the engine
+        request id. The NPU runner inherits ``execute_model`` from vllm_ascend
+        and never runs omni's ``_preprocess``, so this id is otherwise missing
+        on NPU. This override mirrors that GPU step at the gather point (called
+        from ``_build_model_kwargs_extra`` -> forward), using the engine
+        authoritative ``input_batch.req_ids`` and writing it both top-level and
+        into ``meta`` so Code2Wav._parse_item (which reads either key) resolves
+        it. Only fills when absent, so async_chunk=True handoffs that already
+        carry the id are left untouched.
+        """
+        infos = super()._gather_runtime_additional_information()
+        for req_id, info in zip(self.input_batch.req_ids, infos):
+            if not isinstance(info, dict):
+                continue
+            if info.get("request_id"):
+                continue
+            meta = info.get("meta")
+            if not isinstance(meta, dict):
+                meta = {}
+                info["meta"] = meta
+            meta["request_id"] = req_id
+            info["request_id"] = req_id
+        return infos

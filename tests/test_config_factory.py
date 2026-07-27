@@ -131,6 +131,18 @@ class TestStageConfig:
         assert "max_num_seqs" not in omega_config.engine_args
         # Legacy field name for backward compatibility
         assert omega_config.engine_input_source == []
+        assert omega_config.session_mode == "turn"
+
+    def test_to_omegaconf_duplex_session_mode(self):
+        """Test that session mode is preserved as stage metadata."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            session_mode="duplex",
+        )
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.session_mode == "duplex"
 
     def test_to_omegaconf_with_runtime_overrides(self):
         """Test that runtime overrides are applied to OmegaConf output."""
@@ -322,6 +334,31 @@ class TestStageConfig:
         assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
         assert "ulysses_degree" not in omega_config.engine_args
         assert "ring_degree" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_allgather_override_recomputes_sequence_parallel_size(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "sequence_parallel_size": 1,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                    "allgather_degree": 1,
+                }
+            },
+            runtime_overrides={
+                "allgather_degree": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.allgather_degree == 2
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 2
+        assert "allgather_degree" not in omega_config.engine_args
         assert "sequence_parallel_size" not in omega_config.engine_args
 
     def test_to_omegaconf_diffusion_parallel_explicit_sequence_parallel_size_is_preserved(self):
@@ -1107,6 +1144,61 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_load_minicpmo_duplex_deploy_config(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "minicpmo_4_5_duplex.yaml"
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.session_mode == "duplex"
+        assert deploy.async_chunk is True
+        assert deploy.active_stream_window == 1
+        assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
+        assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
+        assert deploy.stages[1].enforce_eager is False
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 2048
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
+
+    @pytest.mark.parametrize(
+        ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
+        [
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "0", "1,2", "0", 2),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", "0", "1,2,3", "0", 3),
+            ("minicpmo_4_5_8x4090_stage1_replicas.yaml", "0,1,2,3", "4,5,6,7", "5", 4),
+        ],
+    )
+    def test_load_minicpmo_replica_deploy_configs(
+        self,
+        filename: str,
+        stage0_devices: str,
+        stage1_devices: str,
+        stage2_devices: str,
+        stage1_replicas: int,
+    ):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / filename
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.session_mode == "duplex"
+        assert [stage.yaml_runtime["devices"] for stage in stages] == [
+            stage0_devices,
+            stage1_devices,
+            stage2_devices,
+        ]
+        assert stages[0].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_runtime["num_replicas"] == stage1_replicas
+        assert all(stage.yaml_engine_args["async_scheduling"] is False for stage in stages[:2])
+        assert all("Async" not in (stage.scheduler_cls or "") for stage in stages[:2])
+
     def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
         deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
         custom_voice_dir = tmp_path / "voices"

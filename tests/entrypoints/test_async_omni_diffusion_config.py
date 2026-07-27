@@ -85,6 +85,8 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
             "tensor_parallel_size": None,
             "enable_expert_parallel": None,
             "enforce_eager": None,
+            "diffusion_compile_granularity": None,
+            "diffusion_compile_dynamic": None,
         }
     )[0]
 
@@ -94,6 +96,8 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
     assert parallel_config.tensor_parallel_size == 1
     assert parallel_config.enable_expert_parallel is False
     assert stage_cfg["engine_args"]["enforce_eager"] is False
+    assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "regional"
+    assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is True
 
 
 def test_default_stage_config_propagates_ulysses_mode():
@@ -256,6 +260,32 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
+
+
+def test_serve_cli_accepts_diffusion_compile_controls():
+    """Ensure both compile controls reach the diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Lightricks/LTX-Video-0.9.8-13B-distilled",
+            "--omni",
+            "--diffusion-compile-granularity",
+            "full",
+            "--no-diffusion-compile-dynamic",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.diffusion_compile_granularity == "full"
+    assert args.diffusion_compile_dynamic is False
+    assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "full"
+    assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():
