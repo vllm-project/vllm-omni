@@ -99,6 +99,16 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
     ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
+    ),
     "MammothModa2DiTPipeline": (
         "mammoth_moda2",
         "pipeline_mammothmoda2_dit",
@@ -359,6 +369,11 @@ _OMNI_MODELS = {
         "minicpmo_4_5",
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
+    "MiniCPMO45Code2Wav": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_code2wav",
+        "MiniCPMO45Code2Wav",
     ),
     "AuraQwen3VLForConditionalGeneration": (
         "aura_omni",

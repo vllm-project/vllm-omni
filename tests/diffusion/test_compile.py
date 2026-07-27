@@ -54,3 +54,23 @@ def test_regionally_compile_matches_wrapped_blocks_by_declared_container_attr(mo
     assert all(not block.compile_called for block in model.transformer_blocks)
     assert not model.other_blocks[0].compile_called
     assert model.transformer_blocks[0].forward("ok") == "compiled:ok"
+
+
+def test_regionally_compile_does_not_partially_mutate_on_setup_failure(monkeypatch):
+    model = _ModelWithWrappedRepeatedBlocks()
+    original_forwards = [block.forward.__func__ for block in model.transformer_blocks]
+    compile_calls = 0
+
+    def _compile(fn, *args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        if compile_calls == 2:
+            raise RuntimeError("compile setup failed")
+        return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs)
+
+    monkeypatch.setattr(compile_module.torch, "compile", _compile)
+
+    with pytest.raises(RuntimeError, match="compile setup failed"):
+        regionally_compile(model, dynamic=True)
+
+    assert [block.forward.__func__ for block in model.transformer_blocks] == original_forwards

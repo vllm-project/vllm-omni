@@ -27,6 +27,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
 
@@ -120,8 +121,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         )
         self.aggregator = Aggregator(llm_input_dim=self.hidden_size, **config.aggregator)
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
-        # CAMPPlus 192-dim -> hidden
-        self.spk_head = nn.Linear(192, self.hidden_size, bias=True)
+        self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.hidden_size, bias=True)
 
         # AudioVAE
         self.audio_vae, self._vae_weight_source = self._init_audio_vae(config, self.talker_dir, model_path)

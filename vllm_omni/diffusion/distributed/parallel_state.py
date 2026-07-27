@@ -309,6 +309,14 @@ def get_ring_parallel_rank():
     return get_sp_group().ring_rank
 
 
+def get_allgather_parallel_world_size():
+    return get_sp_group().allgather_world_size
+
+
+def get_allgather_parallel_rank():
+    return get_sp_group().allgather_rank
+
+
 def get_expert_parallel_group_ranks() -> list[list[int]]:
     assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
     assert _EXPERT_PARALLEL_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
@@ -555,13 +563,12 @@ def set_seq_parallel_pg(
     world_size: int,
     use_ulysses_low: bool = True,
     sp_group_ranks: list[list[int]] | None = None,
-) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
+    sp_allgather_degree: int = 1,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """
-    Initialize sequence-parallel Ulysses and Ring process groups.
+    Initialize Ulysses, Ring, and AllGather-KV process groups.
 
-    This builds sequence-parallel (SP) subgroups inside each data-parallel (DP)
-    slice. The SP group size is sp_ulysses_degree * sp_ring_degree, and
-    world_size must be divisible by that size.
+    AllGather-KV is mutually exclusive with Ulysses and Ring.
 
     Args:
         sp_ulysses_degree: Size of each Ulysses subgroup.
@@ -576,7 +583,7 @@ def set_seq_parallel_pg(
             ranges.
 
     Returns:
-        ulyssess_pg (torch.distributed.ProcessGroup): The Ulysses process group
+        ulysses_pg (torch.distributed.ProcessGroup): The Ulysses process group
             for this rank.
         ring_pg (torch.distributed.ProcessGroup): The Ring process group for
             this rank.
@@ -593,6 +600,31 @@ def set_seq_parallel_pg(
         - If sp_group_ranks is None, groups are auto-generated within each DP
           slice using offsets of size sp_size.
     """
+    if sp_allgather_degree > 1:
+        if sp_ulysses_degree > 1 or sp_ring_degree > 1:
+            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring")
+        sp_size = sp_allgather_degree
+        if sp_group_ranks is None:
+            sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
+        if len(sp_group_ranks) * sp_size != world_size or any(len(ranks) != sp_size for ranks in sp_group_ranks):
+            raise ValueError(f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}.")
+
+        ulysses_pg = ring_pg = allgather_pg = None
+        for group_ranks in sp_group_ranks:
+            group = torch.distributed.new_group(group_ranks)
+            if rank in group_ranks:
+                allgather_pg = group
+        for singleton_rank in range(world_size):
+            group = torch.distributed.new_group([singleton_rank])
+            if rank == singleton_rank:
+                ulysses_pg = group
+        for singleton_rank in range(world_size):
+            group = torch.distributed.new_group([singleton_rank])
+            if rank == singleton_rank:
+                ring_pg = group
+        assert ulysses_pg is not None and ring_pg is not None and allgather_pg is not None
+        return ulysses_pg, ring_pg, allgather_pg
+
     sp_size = sp_ring_degree * sp_ulysses_degree
     dp_size = world_size // sp_size
 
@@ -626,7 +658,7 @@ def set_seq_parallel_pg(
                     ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
                 for i in range(num_ring_pgs):
                     ring_ranks = group_ranks[i::num_ring_pgs]
@@ -646,7 +678,7 @@ def set_seq_parallel_pg(
                     ulysses_ranks = group_ranks[i::num_ulysses_pgs]
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
         if local_sp_group is not None:
             logger.info(
@@ -669,7 +701,7 @@ def set_seq_parallel_pg(
                     )
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
 
                 for i in range(num_ring_pgs):
                     ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
@@ -690,9 +722,15 @@ def set_seq_parallel_pg(
                     ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
 
-    return ulyssess_pg, ring_pg
+    allgather_pg = None
+    for singleton_rank in range(world_size):
+        group = torch.distributed.new_group([singleton_rank])
+        if rank == singleton_rank:
+            allgather_pg = group
+    assert allgather_pg is not None
+    return ulysses_pg, ring_pg, allgather_pg
 
 
 def initialize_model_parallel(
@@ -701,6 +739,7 @@ def initialize_model_parallel(
     sequence_parallel_size: int | None = None,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
+    allgather_degree: int = 1,
     tensor_parallel_size: int = 1,
     text_encoder_tensor_parallel_size: int | None = None,
     pipeline_parallel_size: int = 1,
@@ -718,9 +757,12 @@ def initialize_model_parallel(
         data_parallel_size: number of data parallelism groups.
         cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
         sequence_parallel_size: number of GPUs used for sequence parallelism.
-            sequence_parallel_size = ulysses_degree * ring_degree
+            Uses allgather_degree when AllGather-KV is enabled, otherwise
+            ulysses_degree * ring_degree.
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
+        allgather_degree: number of GPUs used for AllGather-KV sequence parallelism
+            (causal=False only). Mutually exclusive with ulysses/ring in v1.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         fully_shard_degree: number of GPUs used for fully sharded data parallelism (HSDP shard dimension).
@@ -764,16 +806,22 @@ def initialize_model_parallel(
             f"world_size ({world_size}) must be divisible by text encoder TP ({text_encoder_tensor_parallel_size})"
         )
 
-    if sequence_parallel_size is None:
-        sequence_parallel_size = ring_degree * ulysses_degree
-        logger.info(
-            f"sequence_parallel_size is not provided, using ring_degree * ulysses_degree = {sequence_parallel_size}"
+    if allgather_degree > 1:
+        assert ulysses_degree == 1 and ring_degree == 1, (
+            "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+            f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+            f"allgather_degree={allgather_degree}."
         )
 
-    if sequence_parallel_size != ring_degree * ulysses_degree:
+    expected_sequence_parallel_size = allgather_degree if allgather_degree > 1 else ring_degree * ulysses_degree
+    if sequence_parallel_size is None:
+        sequence_parallel_size = expected_sequence_parallel_size
+        logger.info("sequence_parallel_size is not provided, using %d", sequence_parallel_size)
+
+    if sequence_parallel_size != expected_sequence_parallel_size:
         raise ValueError(
-            "sequence_parallel_size is not equal to ring_degree * ulysses_degree,"
-            f" but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree}"
+            f"sequence_parallel_size must be {expected_sequence_parallel_size} for the configured SP mode, "
+            f"but got {sequence_parallel_size}"
         )
 
     dit_parallel_size = (
@@ -850,9 +898,10 @@ def initialize_model_parallel(
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
-    ulysses_pg, ring_pg = set_seq_parallel_pg(
+    ulysses_pg, ring_pg, allgather_pg = set_seq_parallel_pg(
         sp_ulysses_degree=ulysses_degree,
         sp_ring_degree=ring_degree,
+        sp_allgather_degree=allgather_degree,
         rank=get_world_group().rank_in_group,
         world_size=dit_parallel_size,
         sp_group_ranks=sp_group_ranks,
@@ -864,6 +913,7 @@ def initialize_model_parallel(
         parallel_mode="sequence",
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
+        allgather_group=allgather_pg,
     )
     if use_moe_parallel_mapping:
         # Diffusion normally uses its own SP group. Map it to vLLM PCP only for

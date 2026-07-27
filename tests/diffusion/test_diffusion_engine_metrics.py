@@ -80,27 +80,23 @@ class TestMetricKeys:
             "format_diffusion_outputs() — should only use 'preprocess_time_ms'"
         )
 
-    def test_metric_key_naming_consistency(self) -> None:
-        """Metric keys should map to the explicit timing fields."""
+    def test_timing_metric_key_naming_consistency(self) -> None:
+        """Timing metrics should be attached by the engine orchestration path."""
         source = _read_source(_FORMATTER_PATH)
         formatter_source = _get_function_source(source, None, "format_diffusion_outputs")
+        engine_source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(engine_source, "DiffusionEngine", "step_streaming")
         lines = formatter_source.split("\n")
 
-        found_exec = False
-        found_total = False
         for line in lines:
             if '"diffusion_engine_exec_time_ms"' in line:
-                found_exec = True
-                assert "timings.exec_time_s" in line, (
-                    "diffusion_engine_exec_time_ms should measure executor time only (timings.exec_time_s)"
-                )
+                raise AssertionError("diffusion_engine_exec_time_ms should be attached in step_streaming()")
             if '"diffusion_engine_total_time_ms"' in line:
-                found_total = True
-                assert "timings.total_time_ms" in line, (
-                    "diffusion_engine_total_time_ms should measure full step time (timings.total_time_ms)"
-                )
-        assert found_exec, "diffusion_engine_exec_time_ms key not found in format_diffusion_outputs()"
-        assert found_total, "diffusion_engine_total_time_ms key not found in format_diffusion_outputs()"
+                raise AssertionError("diffusion_engine_total_time_ms should be attached in step_streaming()")
+
+        assert '"diffusion_engine_exec_time_ms": exec_total_time * 1000' in step_streaming_source
+        assert '"diffusion_engine_total_time_ms": step_total_ms' in step_streaming_source
+        assert '"postprocess_time_ms": postprocess_time * 1000' in step_streaming_source
 
 
 class TestDummyRunAllocation:

@@ -57,10 +57,8 @@ def _make_executor(num_gpus: int = 1):
     Returns ``(executor, request_queue, result_queue)``.
     """
     od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False)
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_executor", lambda self: None)
-    executor = MultiprocDiffusionExecutor(od_cfg)
-    monkeypatch.undo()
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = od_cfg
 
     req_q: queue.Queue = queue.Queue()
     res_q: queue.Queue = queue.Queue()
@@ -73,7 +71,7 @@ def _make_executor(num_gpus: int = 1):
     executor._result_mq = mock_rmq
     executor._closed = False
     executor._processes = []
-    executor.is_failed = False
+    executor._is_failed = False
     executor._failure_callbacks = []
     return executor, req_q, res_q
 
@@ -93,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine._loop_started = False
     engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
-    engine.execute_fn = executor.execute_request
+    engine.execute_fn = executor.execute_batch
     return engine, executor, req_q, res_q
 
 
@@ -528,7 +526,7 @@ class TestWorkerProcRpcRankStatus:
 
         monkeypatch.setattr(torch.distributed, "all_gather_object", _all_gather_object)
 
-        result, should_reply = proc.execute_rpc(
+        result, should_reply = proc._execute_rpc(
             {
                 "method": "remove_lora",
                 "args": (),
@@ -551,7 +549,7 @@ class TestWorkerProcRpcRankStatus:
         proc.worker.execute_method = Mock(side_effect=RuntimeError("local boom"))
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
 
-        result, should_reply = proc.execute_rpc(
+        result, should_reply = proc._execute_rpc(
             {
                 "method": "add_lora",
                 "args": (),
@@ -577,7 +575,7 @@ class TestWorkerProcRpcRankStatus:
         proc = self._make_worker_proc()
 
         with pytest.raises(ValueError, match="collect_rank_status requires exec_all_ranks=True"):
-            proc.execute_rpc(
+            proc._execute_rpc(
                 {
                     "method": "ping",
                     "args": (),
@@ -596,7 +594,7 @@ class TestWorkerProcRpcRankStatus:
         proc.worker.execute_method = Mock(side_effect=original)
 
         with pytest.raises(ValueError) as excinfo:
-            proc.execute_rpc(
+            proc._execute_rpc(
                 {
                     "method": "bad",
                     "args": (),
@@ -622,7 +620,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
         executor._broadcast_mq = MagicMock()
         executor._result_mq = MagicMock()
         executor._result_mq.dequeue = MagicMock(side_effect=TimeoutError)
-        executor.is_failed = True
+        executor._is_failed = True
 
         with pytest.raises(EngineDeadError):
             executor.collective_rpc(
@@ -643,7 +641,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                executor.is_failed = True
+                executor._is_failed = True
                 raise TimeoutError
             return orig_dequeue(timeout=timeout)
 
@@ -920,7 +918,7 @@ def _make_short_lived_process() -> mp.Process:
 
 
 class TestMultiprocExecutorWorkerMonitor:
-    """Integration tests for ``start_worker_monitor``.
+    """Integration tests for ``_start_worker_monitor``.
 
     Uses real short-lived subprocesses so that OS-level sentinel fd
     readiness is exercised end-to-end.
@@ -928,17 +926,17 @@ class TestMultiprocExecutorWorkerMonitor:
 
     def test_worker_monitor_sets_is_failed_and_calls_callbacks_on_death(self):
         """When a worker process dies, the monitor thread must:
-        1. Set ``is_failed = True``
+        1. Set ``_is_failed = True``
         2. Call ``shutdown()`` (which sets ``_closed = True``)
         3. Invoke all registered failure callbacks
         """
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._closed = False
-        executor.is_failed = False
+        executor._is_failed = False
         executor._failure_callbacks = []
         executor._broadcast_mq = None
         executor._result_mq = None
-        executor.resources = None
+        executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
         executor._finalizer = lambda: None
 
@@ -948,35 +946,38 @@ class TestMultiprocExecutorWorkerMonitor:
         callback_called = threading.Event()
         executor.register_failure_callback(callback_called.set)
 
-        executor.start_worker_monitor()
+        executor._start_worker_monitor()
 
         # Wait for the process to exit and the monitor to react.
         proc.join(5)
-        assert _poll_flag(lambda: executor.is_failed), "is_failed was not set"
+        assert _poll_flag(lambda: executor._is_failed), "_is_failed was not set"
         assert executor._closed, "shutdown() was not called"
         assert callback_called.wait(timeout=2), "failure callback was not invoked"
+        assert executor.is_dead
 
     def test_worker_monitor_noop_when_already_closed(self):
         """If ``_closed`` is already True when the process dies (orderly
-        shutdown), the monitor must *not* set ``is_failed``."""
+        shutdown), the monitor must *not* set ``_is_failed``."""
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._closed = True  # already shut down
-        executor.is_failed = False
+        executor._is_failed = False
         executor._failure_callbacks = []
         executor._broadcast_mq = None
         executor._result_mq = None
-        executor.resources = None
+        executor._shutdown_cleaner = None
         executor._finalizer = lambda: None
 
         proc = _make_short_lived_process()
         executor._processes = [proc]
 
-        executor.start_worker_monitor()
+        executor._start_worker_monitor()
         proc.join(5)
 
         # Give the monitor thread a chance to run (it should early-return).
         time.sleep(0.3)
-        assert not executor.is_failed, "is_failed should remain False on orderly shutdown"
+        assert not executor._is_failed, "_is_failed should remain False on orderly shutdown"
+        # Orderly close still reports dead via the public accessor.
+        assert executor.is_dead
 
 
 class TestStageDiffusionClientProcMonitor:
