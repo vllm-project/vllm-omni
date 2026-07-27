@@ -2,6 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_ernie_image.py
 
+"""
+ERNIE-Image Transformer with Sequence Parallel support for both GPU and NPU.
+
+Key Differences:
+- GPU: Uses _sp_plan hooks for automatic sharding via SequenceParallelInput/Output
+- NPU: Manual shard/gather in forward() (no _sp_plan hooks for padding support)
+- GPU: LOCAL mask (2D [B, seq]) via UnifiedPrepare + _sp_plan
+- NPU: GLOBAL mask (4D [B, 1, S, S]) with full sequence length for Ulysses attention
+
+Both platforms:
+- Use _cache_dit_adapter_config (Cache-DiT Pattern_3) for cache acceleration
+- Use Ulysses SP (All-to-All over heads) via vLLM-Omni's UlyssesParallelAttention
+- Support padding for non-standard image sizes
+"""
+
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -28,6 +43,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -90,8 +106,19 @@ def _apply_rotary_emb(
     freqs_cos: torch.Tensor,
     freqs_sin: torch.Tensor,
 ) -> torch.Tensor:
-    cos_ = freqs_cos.unsqueeze(2).to(x.dtype)
-    sin_ = freqs_sin.unsqueeze(2).to(x.dtype)
+    # x can be [B, S, H, D] or [S, B, H, D]
+    # freqs_cos/freqs_sin are [B, S, D]
+    # Need to transpose freqs to match x format
+    if x.dim() == 4 and x.shape[0] != freqs_cos.shape[0]:
+        # x is [S, B, H, D], freqs are [B, S, D]
+        # Transpose freqs to [S, B, 1, D]
+        cos_ = freqs_cos.transpose(0, 1).unsqueeze(2).to(x.dtype)
+        sin_ = freqs_sin.transpose(0, 1).unsqueeze(2).to(x.dtype)
+    else:
+        # x is [B, S, H, D], freqs are [B, S, D]
+        cos_ = freqs_cos.unsqueeze(2).to(x.dtype)
+        sin_ = freqs_sin.unsqueeze(2).to(x.dtype)
+
     cos_ = cos_.repeat_interleave(2, dim=-1)
     sin_ = sin_.repeat_interleave(2, dim=-1)
     rot_dim = cos_.shape[-1]
@@ -318,6 +345,13 @@ class ErnieImageAttention(nn.Module):
             num_kv_heads=self.kv_num_heads,
         )
 
+        # Processor for custom attention logic (e.g., Ulysses SP)
+        self.processor = None
+
+    def set_processor(self, processor):
+        """Set custom attention processor."""
+        self.processor = processor
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -326,6 +360,11 @@ class ErnieImageAttention(nn.Module):
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Use custom processor if set (for Ulysses SP)
+        if self.processor is not None:
+            return self.processor(self, hidden_states, attention_mask, image_rotary_emb, **kwargs)
+
+        # Default GPU attention logic
         query, _ = self.to_q(hidden_states)
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
@@ -461,6 +500,14 @@ class ErnieImageAdaLNContinuous(nn.Module):
 
 
 class ErnieImageTransformer2DModel(nn.Module):
+    """
+    ERNIE-Image Transformer with Sequence Parallel support for both GPU and NPU.
+
+    GPU: Uses _sp_plan hooks for automatic sharding
+    NPU: Manual shard/gather in forward() for padding support
+    Both: Use Ulysses SP via vLLM-Omni's UlyssesParallelAttention
+    """
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "layers": ForwardPattern.Pattern_3,
@@ -516,6 +563,7 @@ class ErnieImageTransformer2DModel(nn.Module):
         qk_layernorm: bool = True,
         od_config: OmniDiffusionConfig = None,
         quant_config: "QuantizationConfig | None" = None,
+        **kwargs,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -578,6 +626,25 @@ class ErnieImageTransformer2DModel(nn.Module):
         nn.init.zeros_(self.final_linear.bias)
         self.gradient_checkpointing = False
 
+        self.sp_size = _get_sequence_parallel_world_size_or_one()
+
+        if current_omni_platform.is_npu():
+            self._sp_plan = {}
+            # NPU uses custom Ulysses processor to handle SP correctly
+            # The processor does: gather → RoPE → attention → scatter
+            # This ensures RoPE is applied AFTER gather (GLOBAL sequence)
+            if self.sp_size > 1:
+                from vllm_omni.diffusion.models.ernie_image.ulysses_attention import ErnieImageUlyssesAttnProcessorV2
+
+                logger.info(f"[ErnieImageTransformer] NPU: Configuring Ulysses processors for SP={self.sp_size}")
+                for layer in self.layers:
+                    if hasattr(layer, "self_attention"):
+                        attn = layer.self_attention
+                        # Skip vLLM's built-in SP (we handle it manually in processor)
+                        attn.attn.skip_sequence_parallel = True
+                        ulysses_processor = ErnieImageUlyssesAttnProcessorV2()
+                        attn.set_processor(ulysses_processor)
+
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
@@ -591,44 +658,219 @@ class ErnieImageTransformer2DModel(nn.Module):
         return_dict: bool = True,
     ) -> torch.Tensor | Transformer2DModelOutput:
         dtype = hidden_states.dtype
-        B, C, H, W = hidden_states.shape
-        p = self.patch_size
-        Hp, Wp = H // p, W // p
-
+        B, _, H, W = hidden_states.shape
+        p, Hp, Wp = self.patch_size, H // self.patch_size, W // self.patch_size
         N_img = Hp * Wp
+
+        if current_omni_platform.is_npu():
+            # NPU: Manual SP sharding for padding support
+            x, S_local, N_img_local, N_img_padded, attention_mask, rotary_pos_emb = self._prepare_npu(
+                hidden_states, text_bth, text_lens
+            )
+        else:
+            # GPU: Uses _sp_plan hooks for automatic sharding
+            x, S_local, N_img_local, N_img_padded, attention_mask, rotary_pos_emb = self._prepare_gpu(
+                hidden_states, text_bth, text_lens, N_img
+            )
+
+        # Shared: time embedding and transformer blocks
+        c = self._compute_time_embedding(timestep, dtype)
+        temb = self._compute_temb(c, S_local)
+        x = self._run_transformer_blocks(x, rotary_pos_emb, temb, attention_mask)
+        x = self.final_norm(x, c).type_as(x)
+
+        # Shared: extract image part and gather if needed
+        if current_omni_platform.is_npu():
+            x_img = self._gather_image_npu(x, N_img_local, N_img_padded, N_img)
+        else:
+            x_img = x[:N_img]
+
+        # Shared: output projection and reshape
+        return self._reshape_output(x_img, B, Hp, Wp, p, return_dict)
+
+    def _prepare_gpu(
+        self,
+        hidden_states: torch.Tensor,
+        text_bth: torch.Tensor,
+        text_lens: torch.Tensor,
+        n_img: int,
+    ) -> tuple[torch.Tensor, int, int, int, torch.Tensor, tuple]:
+        """GPU prepare: Uses unified_prepare and _sp_plan."""
         hidden_states, freqs_cos, freqs_sin, attention_mask = self.unified_prepare(hidden_states, text_bth, text_lens)
         attention_mask = self._slice_attention_mask_for_ring(attention_mask)
         rotary_pos_emb = (freqs_cos, freqs_sin)
-        S = hidden_states.shape[0]
+        s = hidden_states.shape[0]
+        return hidden_states, s, n_img, n_img, attention_mask, rotary_pos_emb
 
-        sample = self.time_proj(timestep)
-        sample = sample.to(dtype=dtype)
-        c = self.time_embedding(sample)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
-            t.unsqueeze(0).expand(S, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)
-        ]
+    def _prepare_npu(
+        self,
+        hidden_states: torch.Tensor,
+        text_bth: torch.Tensor,
+        text_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, int, int, torch.Tensor, tuple]:
+        """NPU prepare: Manual SP sharding for padding support."""
+        device = hidden_states.device
+        B, _, H, W = hidden_states.shape
+        Hp, Wp = H // self.patch_size, W // self.patch_size
+        N_img = Hp * Wp
 
-        for layer in self.layers:
-            temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    layer,
-                    hidden_states,
-                    rotary_pos_emb,
-                    temb,
-                    attention_mask,
-                )
+        sp_size = _get_sequence_parallel_world_size_or_one()
+
+        img_sbh = self.x_embedder(hidden_states).transpose(0, 1).contiguous()
+
+        if sp_size > 1:
+            from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
+
+            if N_img % sp_size != 0:
+                pad_size = sp_size - (N_img % sp_size)
+                pad_shape = list(img_sbh.shape)
+                pad_shape[0] = pad_size
+                padding = torch.zeros(pad_shape, dtype=img_sbh.dtype, device=img_sbh.device)
+                img_sbh = torch.cat([img_sbh, padding], dim=0)
+                N_img_padded = img_sbh.shape[0]
             else:
-                hidden_states = layer(hidden_states, rotary_pos_emb, temb, attention_mask)
-        hidden_states = self.final_norm(hidden_states, c).type_as(hidden_states)
-        patches = self.final_linear(hidden_states)[:N_img].transpose(0, 1).contiguous()
-        output = (
-            patches.view(B, Hp, Wp, p, p, self.out_channels)
-            .permute(0, 5, 1, 3, 2, 4)
-            .contiguous()
-            .view(B, self.out_channels, H, W)
+                N_img_padded = N_img
+
+            img_sbh = sp_shard(img_sbh, dim=0)
+            N_img_local = img_sbh.shape[0]
+        else:
+            N_img_local = N_img
+            N_img_padded = N_img
+
+        if self.text_proj is not None and text_bth.numel() > 0:
+            text_bth = self.text_proj(text_bth)
+        Tmax = text_bth.shape[1]
+        text_sbh = text_bth.transpose(0, 1).contiguous()
+
+        x = torch.cat([img_sbh, text_sbh], dim=0)
+
+        text_ids = (
+            torch.cat(
+                [
+                    torch.arange(Tmax, device=device, dtype=torch.float32).view(1, Tmax, 1).expand(B, -1, -1),
+                    torch.zeros((B, Tmax, 2), device=device),
+                ],
+                dim=-1,
+            )
+            if Tmax > 0
+            else torch.zeros((B, 0, 3), device=device)
         )
 
+        grid_yx = torch.stack(
+            torch.meshgrid(
+                torch.arange(Hp, device=device, dtype=torch.float32),
+                torch.arange(Wp, device=device, dtype=torch.float32),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+
+        if sp_size > 1 and N_img % sp_size != 0:
+            pad_size = sp_size - (N_img % sp_size)
+            pad_grid = torch.zeros((pad_size, 2), dtype=grid_yx.dtype, device=device)
+            grid_yx_padded = torch.cat([grid_yx, pad_grid], dim=0)
+        else:
+            grid_yx_padded = grid_yx
+
+        image_ids_full = torch.cat(
+            [
+                text_lens.float().view(B, 1, 1).expand(-1, N_img_padded, -1),
+                grid_yx_padded.view(1, N_img_padded, 2).expand(B, -1, -1),
+            ],
+            dim=-1,
+        )
+
+        if sp_size > 1:
+            from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
+
+            image_ids = sp_shard(image_ids_full, dim=1)
+        else:
+            image_ids = image_ids_full
+
+        rotary_pos_emb = self.pos_embed(torch.cat([image_ids, text_ids], dim=1))
+
+        valid_text = (
+            torch.arange(Tmax, device=device).view(1, Tmax) < text_lens.view(B, 1)
+            if Tmax > 0
+            else torch.zeros((B, 0), device=device, dtype=torch.bool)
+        )
+
+        if sp_size > 1:
+            img_mask_full = torch.ones((B, N_img_padded), device=device, dtype=torch.bool)
+            if N_img_padded != N_img:
+                img_mask_full[:, N_img:] = False
+            img_mask = sp_shard(img_mask_full, dim=1)
+            mask_1d = torch.cat([img_mask, valid_text], dim=1)
+        else:
+            mask_1d = torch.cat([torch.ones((B, N_img), device=device, dtype=torch.bool), valid_text], dim=1)
+
+        S = mask_1d.shape[1]
+        attention_mask = mask_1d.unsqueeze(1).unsqueeze(2).expand(B, 1, S, S)
+
+        return x, x.shape[0], N_img_local, N_img_padded, attention_mask, rotary_pos_emb
+
+    def _compute_time_embedding(self, timestep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Compute time embedding."""
+        sample = self.time_proj(timestep)
+        sample = sample.to(dtype=dtype)
+        return self.time_embedding(sample)
+
+    def _compute_temb(self, c: torch.Tensor, s: int) -> list[torch.Tensor]:
+        """Compute transformer embedding parameters."""
+        return [t.unsqueeze(0).expand(s, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)]
+
+    def _run_transformer_blocks(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        temb: list[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run transformer blocks with optional gradient checkpointing."""
+        for layer in self.layers:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                x = self._gradient_checkpointing_func(layer, x, rotary_pos_emb, temb, attention_mask)
+            else:
+                x = layer(x, rotary_pos_emb, temb, attention_mask)
+        return x
+
+    def _gather_image_npu(
+        self,
+        x: torch.Tensor,
+        n_img_local: int,
+        n_img_padded: int,
+        n_img: int,
+    ) -> torch.Tensor:
+        """Gather image hidden states for NPU."""
+        x_img_local = x[:n_img_local]
+
+        sp_size = _get_sequence_parallel_world_size_or_one()
+        if sp_size > 1:
+            from vllm_omni.diffusion.distributed.sp_sharding import sp_gather
+
+            x_img_full = sp_gather(x_img_local, dim=0)
+            if n_img_padded != n_img:
+                x_img_full = x_img_full[:n_img]
+            return x_img_full
+        return x_img_local
+
+    def _reshape_output(
+        self,
+        x_img: torch.Tensor,
+        b: int,
+        hp: int,
+        wp: int,
+        p: int,
+        return_dict: bool,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        """Reshape output from patches to image."""
+        patches = self.final_linear(x_img).transpose(0, 1).contiguous()
+        output = (
+            patches.view(b, hp, wp, p, p, self.out_channels)
+            .permute(0, 5, 1, 3, 2, 4)
+            .contiguous()
+            .view(b, self.out_channels, hp * p, wp * p)
+        )
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
