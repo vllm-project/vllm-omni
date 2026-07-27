@@ -13,10 +13,12 @@ This module:
 1. Expands DiT attention masks to ``[B, 1, S, S]`` before SDPA.
 2. Provides a MATH-backend SDPA context so inference can avoid the fused FA
    kernel entirely when the platform still incorrectly routes SDPA.
+3. Fuses the three gated residual Mul+Add pairs in each streaming DiT block.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 
@@ -27,6 +29,65 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _PATCHED = False
+_original_dit_block_forward_chunk = None
+_original_modulate = None
+
+
+def _fused_gated_residual_enabled() -> bool:
+    value = os.environ.get("VLLM_OMNI_MINICPMO_FUSED_GATED_RESIDUAL", "1")
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _fused_residual(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    branch: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``x + gate * branch`` as one elementwise NPU operation."""
+    return torch.addcmul(x, gate, branch)
+
+
+def _patched_dit_block_forward_chunk(
+    self,
+    x: torch.Tensor,
+    c: torch.Tensor,
+    cnn_cache: torch.Tensor | None = None,
+    att_cache: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+):
+    assert _original_dit_block_forward_chunk is not None
+    assert _original_modulate is not None
+    if x.device.type != "npu":
+        return _original_dit_block_forward_chunk(self, x, c, cnn_cache, att_cache, mask)
+
+    (
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        shift_conv,
+        scale_conv,
+        gate_conv,
+    ) = self.adaLN_modulation(c).chunk(9, dim=-1)
+    x_att, new_att_cache = self.attn.forward_chunk(
+        _original_modulate(self.norm1(x), shift_msa, scale_msa),
+        att_cache,
+        mask,
+    )
+    x = _fused_residual(x, gate_msa, x_att)
+    x_conv, new_cnn_cache = self.conv.forward_chunk(
+        _original_modulate(self.norm3(x), shift_conv, scale_conv),
+        cnn_cache,
+    )
+    x = _fused_residual(x, gate_conv, x_conv)
+    x = _fused_residual(
+        x,
+        gate_mlp,
+        self.mlp(_original_modulate(self.norm2(x), shift_mlp, scale_mlp)),
+    )
+    return x, new_cnn_cache, new_att_cache
 
 
 def _expand_attn_mask_for_npu(
@@ -147,8 +208,8 @@ def _disable_upsample_encoder_compile() -> None:
 
 
 def apply_cosyvoice2_dit_attn_npu_patch() -> None:
-    """Monkey-patch CosyVoice2 DiT Attention for Ascend FA mask constraints."""
-    global _PATCHED
+    """Apply CosyVoice2 DiT attention and residual patches for Ascend."""
+    global _PATCHED, _original_dit_block_forward_chunk, _original_modulate
     if _PATCHED:
         return
 
@@ -159,11 +220,21 @@ def apply_cosyvoice2_dit_attn_npu_patch() -> None:
         return
 
     attn_cls = getattr(decoder_dit, "Attention", None)
+    dit_block_cls = getattr(decoder_dit, "DiTBlock", None)
     if attn_cls is None:
         return
 
     attn_cls.forward = _patched_attention_forward  # type: ignore[method-assign]
     attn_cls.forward_chunk = _patched_attention_forward_chunk  # type: ignore[method-assign]
+    fused_residuals = dit_block_cls is not None and _fused_gated_residual_enabled()
+    if fused_residuals:
+        assert dit_block_cls is not None
+        _original_dit_block_forward_chunk = dit_block_cls.forward_chunk
+        _original_modulate = decoder_dit.modulate
+        dit_block_cls.forward_chunk = _patched_dit_block_forward_chunk  # type: ignore[method-assign]
     _disable_upsample_encoder_compile()
     _PATCHED = True
-    logger.info("Applied CosyVoice2 DiT Attention NPU patch (expand attn_mask to Bx1xSxS for aclnnFlashAttentionScore)")
+    logger.info(
+        "Applied CosyVoice2 DiT NPU patches (attention mask expand%s)",
+        " and fused gated residuals" if fused_residuals else "",
+    )
