@@ -101,9 +101,11 @@ The distilled recipe fixes both sigma schedules; `num_inference_steps` must be
 Ordinary two-stage defaults to a `1536 × 1024` final output. Stage 1 uses the
 selected one-stage recipe at half resolution; Stage 2 uses the fixed
 three-step positive-only schedule. All two-stage pipelines reject custom sigma
-schedules and request-provided video/audio latents. Online Transformer
-quantization is applied to both DiTs after merging the Stage 2 LoRA into full
-checkpoint tensors; already-quantized base checkpoints are unsupported.
+schedules and request-provided video/audio latents. Ordinary two-stage uses one
+DiT with a dynamic Stage 2 LoRA by default. Set
+`VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE=resident` before startup to create a second
+DiT with the Stage 2 LoRA pre-merged; this resident override requires an
+unquantized base checkpoint.
 
 ## Serving
 
@@ -355,8 +357,9 @@ bundled offline CLI do not currently expose `sigmas`.
   request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
   `tests/dfx/perf/scripts/run_diffusion_benchmark.py`.
-- Ordinary two-stage keeps a base DiT and a second DiT with the Stage 2 LoRA
-  merged; account for two Transformer copies when sizing GPU or host offload.
+- Ordinary two-stage keeps one base DiT plus the Stage 2 LoRA by default. The
+  `resident` override keeps two Transformer copies and should be sized
+  accordingly.
 
 ## References
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -18,6 +19,8 @@ from .ltx2_components import create_transformer_from_config, resolve_ltx_artifac
 from .ltx2_phase_adapter import LTXPhaseAdapterRuntime
 
 logger = init_logger(__name__)
+
+_LTX_TWO_STAGE_LORA_MODE_ENV = "VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE"
 
 
 class LTXPhaseWeights(Protocol):
@@ -73,6 +76,13 @@ def _uses_serialized_quantization(quant_config: Any) -> bool:
     return getattr(quant_config, "data_type", None) == "mx_fp" or any(
         bool(getattr(quant_config, name, False)) for name in serialized_flags
     )
+
+
+def _resolve_two_stage_lora_mode() -> str:
+    mode = os.getenv(_LTX_TWO_STAGE_LORA_MODE_ENV, "dynamic").strip().lower()
+    if mode not in {"resident", "dynamic"}:
+        raise ValueError(f"{_LTX_TWO_STAGE_LORA_MODE_ENV} must be either 'resident' or 'dynamic', got {mode!r}.")
+    return mode
 
 
 def _load_resident_lora_entries(transformer: nn.Module, path: str, dtype: torch.dtype) -> list[_LTXLoRAEntry]:
@@ -209,10 +219,7 @@ def build_ltx_phase_weights(pipeline: Any) -> LTXPhaseWeights | None:
             "request or static LoRA composition is not supported yet."
         )
 
-    model_config = getattr(pipeline.od_config, "model_config", {}) or {}
-    mode = model_config.get("ltx_two_stage_lora_mode", "resident")
-    if mode not in {"resident", "dynamic"}:
-        raise ValueError(f"model_config.ltx_two_stage_lora_mode must be either 'resident' or 'dynamic', got {mode!r}.")
+    mode = _resolve_two_stage_lora_mode()
     model_paths = getattr(pipeline.od_config, "model_paths", {}) or {}
     adapter_path = resolve_ltx_artifact(
         pipeline.od_config.model,
