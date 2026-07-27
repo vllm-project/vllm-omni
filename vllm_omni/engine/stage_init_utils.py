@@ -1063,6 +1063,16 @@ def get_stage_connector_spec(
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
+
+    # A stage can be an async producer without consuming chunks itself. Keep
+    # its connector for save_async(), but mark it sender-only so the scheduler
+    # does not park normal orchestrator-provided inputs waiting for a chunk.
+    target_stage = str(stage_id)
+    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
+        if from_stage == target_stage:
+            extra = dict(spec.extra or {})
+            extra.setdefault("role", "sender")
+            return {"name": spec.name, "extra": extra}
     return {}
 
 

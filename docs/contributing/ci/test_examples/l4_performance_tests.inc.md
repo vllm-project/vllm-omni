@@ -148,7 +148,7 @@ pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline \
   --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 ```
 
-See also [Markers for Tests](./tests_markers.md) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
+See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
 
 **`server_params` Configuration**
 

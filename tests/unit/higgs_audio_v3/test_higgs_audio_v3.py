@@ -250,6 +250,7 @@ class TestSamplerMethods:
 
         t = FakeTalker()
         t._sample_audio_codes = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes.__get__(t)
+        t._expand_audio_sampling_params = mod.HiggsAudioV3TalkerForConditionalGeneration._expand_audio_sampling_params
         return t
 
     def _make_batched_sampler_talker(self, num_rows=4):
@@ -300,8 +301,22 @@ class TestSamplerMethods:
             "_audio_seed_mask_from_step_input",
         ):
             setattr(t, name, getattr(cls, name).__get__(t))
+        t._expand_audio_sampling_params = cls._expand_audio_sampling_params
         t._device_cache_key = cls._device_cache_key
         return t
+
+    @staticmethod
+    def _sampling_metadata(temperature=1.0, top_k=50, top_p=0.95):
+        return type(
+            "SamplingMetadata",
+            (),
+            {
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "all_greedy": temperature is None,
+            },
+        )()
 
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
@@ -309,7 +324,7 @@ class TestSamplerMethods:
         logits = torch.full((10, 1026), float("-inf"))
         # Only token 500 is allowed for each row
         logits[:, 500] = 0.0
-        result = t._sample_audio_codes(logits)
+        result = t._sample_audio_codes(logits, self._sampling_metadata(), num_codebooks=1)
         assert result.shape == (10,)
         assert (result == 500).all(), f"Expected all 500, got {result.tolist()}"
 
@@ -320,9 +335,75 @@ class TestSamplerMethods:
         # Row 0: all masked
         # Row 1: only token 42 allowed
         logits[1, 42] = 0.0
-        result = t._sample_audio_codes(logits)
+        result = t._sample_audio_codes(logits, self._sampling_metadata(), num_codebooks=1)
         assert result.shape == (2,)
         assert result[1].item() == 42
+
+    def test_top_k_minus_one_disables_top_k_filtering(self, monkeypatch):
+        t = self._make_minimal_talker()
+        seen_probs = []
+
+        def fake_multinomial(probs, num_samples):
+            seen_probs.append(probs.clone())
+            return probs.argmax(dim=-1, keepdim=True)
+
+        monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+
+        logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+        metadata = self._sampling_metadata(
+            temperature=1.0,
+            top_k=-1,
+            top_p=1.0,
+        )
+
+        t._sample_audio_codes(logits, metadata, num_codebooks=1)
+
+        assert len(seen_probs) == 1
+        assert torch.count_nonzero(seen_probs[0][0]).item() == 4
+
+    def test_sampling_metadata_invalid_temperature_is_sanitized(self, monkeypatch):
+        t = self._make_minimal_talker()
+        seen = []
+        monkeypatch.setattr(
+            torch, "multinomial", lambda probs, num_samples: seen.append(probs) or probs.argmax(-1, True)
+        )
+        logits = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
+
+        result = t._sample_audio_codes(
+            logits,
+            self._sampling_metadata(torch.tensor([float("nan"), float("inf")])),
+            num_codebooks=1,
+        )
+
+        assert len(seen) == 1
+        assert torch.isfinite(seen[0]).all()
+        assert result.tolist() == [1, 0]
+
+    def test_sampling_metadata_is_expanded_per_request_and_vq(self, monkeypatch):
+        t = self._make_minimal_talker()
+        seen = []
+        monkeypatch.setattr(
+            torch, "multinomial", lambda probs, num_samples: seen.append(probs) or probs.argmax(-1, True)
+        )
+        cb_logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0]] * 2] * 2)  # [2 requests, 2 VQs, 4 vocab]
+        logits = cb_logits.reshape(-1, cb_logits.shape[-1])
+        metadata = self._sampling_metadata(
+            temperature=torch.tensor([0.5, 1.0]),
+            top_k=torch.tensor([1, 4]),
+            top_p=torch.tensor([1.0, 0.8]),
+        )
+
+        temperatures, top_ks, top_ps = t._expand_audio_sampling_params(metadata, logits, num_codebooks=2)
+        t._sample_audio_codes(logits, metadata, num_codebooks=2)
+
+        torch.testing.assert_close(temperatures, torch.tensor([0.5, 0.5, 1.0, 1.0]))
+        assert top_ks.tolist() == [1, 1, 4, 4]
+        torch.testing.assert_close(top_ps, torch.tensor([1.0, 1.0, 0.8, 0.8]))
+        assert len(seen) == 1
+        torch.testing.assert_close(seen[0][0], seen[0][1])
+        torch.testing.assert_close(seen[0][2], seen[0][3])
+        assert torch.count_nonzero(seen[0][0]).item() == 1
+        assert torch.count_nonzero(seen[0][2]).item() > 1
 
     def test_delay_masking_forces_boc_during_delay(self):
         """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
@@ -468,7 +549,9 @@ class TestSamplerMethods:
         t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
         t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
         t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
-        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._sample_audio_codes = lambda logits_2d, *args, **kwargs: torch.zeros(
+            int(logits_2d.shape[0]), dtype=torch.long
+        )
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 
@@ -499,7 +582,9 @@ class TestSamplerMethods:
         t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
         t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
         t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
-        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._sample_audio_codes = lambda logits_2d, *args, **kwargs: torch.zeros(
+            int(logits_2d.shape[0]), dtype=torch.long
+        )
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 

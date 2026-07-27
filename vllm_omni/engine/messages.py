@@ -106,3 +106,7 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     method: str
     stage_ids: list[int]
     results: list[object]
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("collective", self.rpc_id)
