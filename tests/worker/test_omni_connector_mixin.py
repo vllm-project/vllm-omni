@@ -141,7 +141,7 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         sender.shutdown_omni_connectors()
 
-    def test_send_chunk_does_not_retry_real_type_error(self):
+    def test_build_custom_process_payload_does_not_retry_real_type_error(self):
         connector = MockConnector(stage_id=0)
 
         sender = MixinHost()
@@ -159,11 +159,16 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
             return {"data": is_finished + "tail"}
 
         sender._custom_process_func = broken_process
+        sender._custom_process_supports_is_finished = sender._custom_process_supports_is_finished_kwarg()
 
         request = _make_request("req-1", "ext-req-1")
         request.is_finished = lambda: True
-        ok = sender.send_chunk(request, pooling_output={"value": 42})
-        self.assertFalse(ok)
+        payload = sender._build_custom_process_payload(
+            request_id="ext-req-1",
+            request=request,
+            pooling_output={"value": 42},
+        )
+        self.assertIsNone(payload)
         self.assertEqual(seen["calls"], 1)
 
         sender.shutdown_omni_connectors()
@@ -312,9 +317,6 @@ class TestMixinNoConnector(unittest.TestCase):
 
         sent = host.send_full_payload_outputs(None, {"req-1": {}})
         self.assertEqual(sent, [])
-
-        ok = host.send_chunk(_make_request("req-1"), pooling_output={})
-        self.assertFalse(ok)
 
         output = host.get_omni_connector_output()
         self.assertIsInstance(output, OmniConnectorOutput)
@@ -747,37 +749,6 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(req_id, host._request_ids_mapping)
         self.assertNotIn(ext_id, host._put_req_chunk)
 
-        host.shutdown_omni_connectors()
-
-
-class TestSendChunkCachesMapping(unittest.TestCase):
-    """Test that send_chunk caches internal→external req ID mapping."""
-
-    def test_send_chunk_populates_request_ids_mapping(self):
-        """send_chunk should cache the internal→external mapping."""
-        host = MixinHost()
-        host.init_omni_connectors(
-            model_config=_make_model_config(stage_id=0, async_chunk=True),
-        )
-        host._omni_connector = MockConnector(stage_id=0)
-        host._stage_id = 0
-        host._async_chunk = True
-
-        def mock_process(transfer_manager, pooling_output, request):
-            return {"data": "test", "finished": False}
-
-        host._custom_process_func = mock_process
-
-        request = _make_request("internal-1", "external-1")
-        host.send_chunk(request, pooling_output={"v": 1})
-
-        # The mapping should be cached
-        self.assertEqual(
-            host._request_ids_mapping.get("internal-1"),
-            "external-1",
-        )
-
-        time.sleep(0.1)
         host.shutdown_omni_connectors()
 
 

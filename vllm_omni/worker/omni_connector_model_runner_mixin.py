@@ -3,8 +3,8 @@
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
-threads handle async_chunk and full_payload_mode transfers; KV cache is delegated to
-the existing OmniKVTransferManager (to be absorbed later).
+threads handle full-payload transfers; KV cache is delegated to the existing
+OmniKVTransferManager (to be absorbed later).
 
 The mixin reports transfer results via OmniConnectorOutput so that the
 Scheduler can make scheduling decisions without ever touching a connector.
@@ -70,9 +70,9 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
 class OmniConnectorModelRunnerMixin:
     """Unified data-plane communication mixin for Model Runners.
 
-    Provides three transfer modes through a single pair of bg I/O threads:
-      - **full_payload_mode**: ``recv_full_payload_inputs`` / ``send_full_payload_outputs``
-      - **Streaming (async_chunk)**: ``recv_chunk`` / ``send_chunk``
+    Provides full-payload transfer through a single pair of bg I/O threads:
+      - ``register_chunk_recv`` + ``recv_full_payload_inputs`` on receive
+      - ``accumulate_full_payload_output`` + ``send_full_payload_outputs`` / ``flush_full_payload_outputs`` on send.
       - **KV cache**: ``send_kv_cache`` / ``recv_kv_cache`` (delegates to
         the existing ``OmniKVTransferManager``)
 
@@ -141,7 +141,7 @@ class OmniConnectorModelRunnerMixin:
         self._cached_ic: dict[str, int] = {}
         self._request_ids_mapping: dict[str, str] = {}
 
-        # -- async I/O state (shared by chunk + full_payload_mode) --
+        # -- background I/O state for full-payload transfers --
         self._pending_load_reqs: dict[str, Any] = {}
         self._finished_load_reqs: set[str] = set()
         self._pending_save_reqs: dict[str, deque] = {}
@@ -170,7 +170,7 @@ class OmniConnectorModelRunnerMixin:
         # Prevents re-registration after the finish sentinel has been received.
         self._chunk_stream_completed: set[str] = set()
 
-        # -- full_payload_mode: accumulate latest pooler_output per request,
+        # -- Full-payload output: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
 
@@ -234,14 +234,13 @@ class OmniConnectorModelRunnerMixin:
         Call this when a request is freed from the model runner to prevent
         memory leaks in the mixin's tracking dicts/sets.
 
-        Two senders use different keys: ``send_chunk`` keys per-request
-        state under the EXTERNAL id (after mapping resolution), while
-        ``send_full_payload_outputs`` keys under the INTERNAL id. To cover
-        both modes (and forward compat with id-rename scenarios) we attempt
-        cleanup against both keys; the entry that doesn't exist for the
-        active mode is a no-op pop.  Only the key that actually has pending
-        saves is added to ``_deferred_send_cleanup`` so the bg save's
-        decrement path drains it without leaving orphans.
+        ``send_full_payload_outputs`` keys per-request send state under the
+        INTERNAL id, while ``register_chunk_recv`` may have cached an
+        internal->external id mapping on the recv side. To cover both (and
+        forward compat with id-rename scenarios) we attempt cleanup against
+        both keys; the entry that doesn't exist is a no-op pop.  Only the key
+        that actually has pending saves is added to ``_deferred_send_cleanup``
+        so the bg save's decrement path drains it without leaving orphans.
         """
         # Force-flush any pending full-payload accumulator entry before
         # cleanup proceeds.  Without this, finished requests with no
@@ -564,36 +563,6 @@ class OmniConnectorModelRunnerMixin:
             return None
         return connector.get(from_stage, to_stage, connector_get_key)
 
-    def _recv_full_payload_result(
-        self,
-        connector: OmniConnectorBase,
-        from_stage: str,
-        to_stage: str,
-        connector_get_key: str,
-    ) -> Any:
-        """Receive one full-payload transfer on the local leader rank only."""
-        return self._recv_ordinary_stage_result(
-            connector,
-            from_stage,
-            to_stage,
-            connector_get_key,
-        )
-
-    def _recv_async_chunk_result(
-        self,
-        connector: OmniConnectorBase,
-        from_stage: str,
-        to_stage: str,
-        connector_get_key: str,
-    ) -> Any:
-        """Receive one ordinary async chunk on the local leader rank only."""
-        return self._recv_ordinary_stage_result(
-            connector,
-            from_stage,
-            to_stage,
-            connector_get_key,
-        )
-
     @staticmethod
     def _snapshot_payload(payload: Any) -> Any:
         if isinstance(payload, dict):
@@ -680,11 +649,11 @@ class OmniConnectorModelRunnerMixin:
                 self._chunk_stream_completed.add(req_id)
 
     # ------------------------------------------------------------------ #
-    #  full_payload_mode (recv_full_payload_inputs / send_full_payload_outputs)
+    #  Full-payload transfer (recv_full_payload_inputs / send_full_payload_outputs)
     # ------------------------------------------------------------------ #
 
     def recv_full_payload_inputs(self, scheduler_output: Any) -> dict[str, Any] | None:
-        """Check for incoming full_payload_mode stage inputs (non-blocking).
+        """Check for incoming full-payload stage inputs (non-blocking).
 
         Returns a dict mapping ``request_id -> engine_inputs`` for data
         that has arrived, or ``None`` if nothing is ready.  Stores full
@@ -851,7 +820,7 @@ class OmniConnectorModelRunnerMixin:
         pooler_output: Any,
         request: Any,
     ) -> None:
-        """Accumulate pooler_output for a request across steps (full_payload_mode).
+        """Accumulate pooler_output for a request across steps for full-payload transfer.
 
         Per-token tensors (2-D+, matching trailing dims) are concatenated
         along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
@@ -1023,15 +992,15 @@ class OmniConnectorModelRunnerMixin:
         return sent_ids
 
     # ------------------------------------------------------------------ #
-    #  Streaming chunk mode  (recv_chunk / send_chunk)
+    #  Payload receive registration
     # ------------------------------------------------------------------ #
 
     def register_chunk_recv(self, request: Any) -> None:
-        """Register a request for async chunk retrieval by the bg thread.
+        """Register a request for background payload retrieval.
 
         Stage-0 has no upstream producer so this is a no-op there.
         Skips requests whose batch data has already been received to
-        prevent the bg thread from polling for non-existent chunks.
+        prevent the bg thread from polling for unavailable payloads.
         """
         if self._stage_id == 0:
             return
@@ -1049,103 +1018,6 @@ class OmniConnectorModelRunnerMixin:
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
-
-    def recv_chunk(self) -> dict[str, Any]:
-        """Collect chunks received by the bg thread since last call.
-
-        Returns a dict ``{request_id: chunk_payload}`` for newly arrived
-        chunks.  Empty dict when nothing is ready.
-
-        This method reads from ``_finished_load_reqs`` without clearing
-        it -- ``get_omni_connector_output()`` is the sole consumer that
-        drains and resets ``_finished_load_reqs`` at the end of each
-        ``execute_model`` cycle.
-
-        Returns **shallow copies** of the cached payloads so that the
-        caller can read them without racing against the background recv
-        thread, which may concurrently mutate the live cache entries via
-        ``dict.update()``.
-        """
-        with self._lock:
-            finished = set(self._finished_load_reqs)
-            if not finished:
-                return {}
-            # Snapshot the payloads under the lock to avoid racing with
-            # _poll_single_request which does existing.update(payload_data)
-            # on the same dict objects.
-            result = {}
-            for rid in finished:
-                payload = self._local_stage_payload_cache.get(rid)
-                result[rid] = dict(payload) if isinstance(payload, dict) else payload
-
-        self._chunk_ready_req_ids.update(finished)
-        return result
-
-    def send_chunk(
-        self,
-        request: Any,
-        pooling_output: Any | None = None,
-    ) -> bool:
-        """Derive and enqueue one chunk for async sending.
-
-        Payload extraction runs in the caller thread (via
-        ``custom_process_stage_input_func``); the actual
-        ``connector.put()`` is done by the background save thread.
-        Non-KV data is identical across TP ranks; only rank 0 sends.
-        """
-        if self._omni_connector is None:
-            logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
-            return False
-        if not self.is_data_transfer_rank():
-            return True
-        raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
-        request_id = self._resolve_external_req_id(request, raw_req_id)
-        # Cache the internal→external mapping so that finish sentinels can
-        # resolve the external ID even after the request is freed.
-        if raw_req_id and raw_req_id != request_id:
-            self._request_ids_mapping.setdefault(raw_req_id, request_id)
-        chunk_id = self._put_req_chunk[request_id]
-
-        payload_data = self._build_custom_process_payload(
-            request_id=request_id,
-            request=request,
-            pooling_output=pooling_output,
-        )
-        if payload_data is None:
-            if chunk_id == 0:
-                logger.warning(
-                    "[Stage-%s] send_chunk: payload is None for req=%s chunk=%s (process_func=%s)",
-                    self._stage_id,
-                    request_id,
-                    chunk_id,
-                    self._custom_process_func,
-                )
-            return False
-
-        self._put_req_chunk[request_id] += 1
-        next_stage_id = self._next_stage_id
-        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
-
-        if chunk_id == 0:
-            logger.debug(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
-                self._stage_id,
-                request_id,
-                connector_put_key,
-            )
-
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
-        self._work_available.set()
-        return True
 
     # ------------------------------------------------------------------ #
     #  KV cache  (delegates to OmniKVTransferManager)
@@ -1723,20 +1595,12 @@ class OmniConnectorModelRunnerMixin:
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        if self._async_chunk:
-            result = self._recv_async_chunk_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
-        else:
-            result = self._recv_full_payload_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
+        result = self._recv_ordinary_stage_result(
+            connector,
+            str(target_stage_id),
+            str(self._stage_id),
+            connector_get_key,
+        )
 
         if result is None:
             return False
@@ -2082,10 +1946,11 @@ class OmniConnectorModelRunnerMixin:
         """Load the connector payload builder for the downstream stage.
 
         Preferred source is ``custom_process_next_stage_input_func``. Some
-        full_payload_mode configs (async_chunk=false) only expose the next-stage prompt builder via
-        ``custom_process_input_func`` (for example ``thinker2talker``), while the
-        connector payload builder lives beside it as ``thinker2talker_full_payload``.
-        In that case, derive the full_payload_mode builder path automatically.
+        stages only expose the next-stage prompt builder via
+        ``custom_process_input_func`` (for example ``thinker2talker``), while
+        the connector payload builder lives beside it as
+        ``thinker2talker_full_payload``. In that case, derive the connector
+        payload builder path automatically.
         """
         candidates: list[str] = []
 
