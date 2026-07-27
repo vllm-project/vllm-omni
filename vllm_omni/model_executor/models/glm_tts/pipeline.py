@@ -12,6 +12,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.glm_tts"
 
 GLM_TTS_PIPELINE = PipelineConfig(
     model_type="glm_tts",
+    default_deploy_config_name="glm_tts.yaml",
     model_arch="GLMTTSForConditionalGeneration",
     stages=(
         StagePipelineConfig(

@@ -12,10 +12,64 @@ from vllm_omni.model_extras import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
     build_text_to_image_prompt,
+    build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"model_type": "bagel"}, "bagel"),
+        ({"architectures": ["HunyuanImage3ForConditionalGeneration"]}, "hunyuan_image3"),
+        ({"model_type": "mammothmoda2"}, "mammoth_moda2"),
+        ({"model_type": "qwen2_vl"}, "generic"),
+    ],
+)
+def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[str, object], expected: str) -> None:
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", lambda *args: config)
+    assert get_x_to_text_model_family("unused") == expected
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_bagel_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
+    assert prompt == {
+        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "modalities": ["text"],
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammoth_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("mammoth_moda2", "unused", "Hello.", has_image=False)
+    assert prompt == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nHello.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "modalities": ["text"],
+        "additional_information": {"omni_task": ["chat"]},
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_generic_x_to_text_prompt_builder() -> None:
+    assert build_x_to_text_prompt("generic", "unused", "Hello.", has_image=False) == (
+        {"prompt": "Hello.", "modalities": ["text"]},
+        None,
+    )
 
 
 @pytest.mark.core_model

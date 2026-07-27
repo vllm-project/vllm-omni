@@ -4,9 +4,18 @@
 import pytest
 import torch
 
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
 
-DIMS = dict(num_layers=2, num_kv_heads=4, head_size=64, dtype=torch.float16, block_size=16)
+DIMS = dict(
+    num_layers=2,
+    num_kv_heads=4,
+    head_size=64,
+    dtype=torch.float16,
+    block_size=16,
+    kv_branches=(ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1)),
+    session_capacity=2,
+)
 
 
 def make_cache(*, chunk_size=16, window_chunks=2, available_bytes=1 << 24):
@@ -67,7 +76,7 @@ def test_num_computed_advances_per_chunk():
 
 
 def test_state_close_frees_both_branch_blocks():
-    """ARDiffusionKVState.close() returns both CFG branches' pool blocks to the pool.
+    """ARDiffusionKVState.close() returns both CFG kv_branches' pool blocks to the pool.
 
     This is the primitive the runner's LRU eviction relies on: when a session is
     evicted, close() must free the blocks both adapters hold, or session churn
@@ -80,12 +89,17 @@ def test_state_close_frees_both_branch_blocks():
 
     pos = kv.begin_request("bde__s")
     neg = kv.begin_request("bde__s__neg")
-    state = ARDiffusionKVState(kv, pos, neg, num_layers=kv.num_layers)
+    state = ARDiffusionKVState(
+        kv,
+        "s",
+        {"positive": pos, "negative": neg},
+        num_layers=kv.num_layers,
+    )
     for _ in range(3):
         for adapter in (pos, neg):
             kv.allocate_chunk(adapter)
             kv.commit_chunk(adapter)
-    # Both branches hold resident blocks now.
+    # Both kv_branches hold resident blocks now.
     assert kv.manager.block_pool.get_num_free_blocks() < free_total
 
     state.close()

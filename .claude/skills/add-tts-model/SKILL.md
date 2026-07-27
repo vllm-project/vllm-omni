@@ -307,7 +307,7 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
 
 ### Test Case Writing (CI Levels)
 
-**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming (`test_{slug}.py` / `test_{slug}_expansion.py`), Buildkite wiring, and copy-paste run commands. Also read [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md) and [tests_style.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/tests_style.md).
+**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming (`test_{slug}.py` / `test_{slug}_expansion.py`), Buildkite wiring, and copy-paste run commands. Also read [test_system_overview.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_system_overview.md) and [test_writing_guide.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_writing_guide.md).
 
 Classify the model's **CI priority** first (high / medium / low). High-priority TTS models are typically those on the integration hot path or listed in tracking issues such as [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); medium and low tiers cover the long tail. When unsure, ask the reviewer which tier applies.
 

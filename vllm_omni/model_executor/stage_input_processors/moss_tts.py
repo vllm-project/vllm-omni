@@ -291,17 +291,12 @@ def talker2codec_raw_async_chunk(
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
             transfer_manager.request_payload.pop(req_id, None)
             return OmniPayloadStruct(
-                # A non-empty sentinel is required so Stage-1 is scheduled.
-                # ``code_flat_numel=0`` tells the codec this is a control-only
-                # finish packet, not an audio code.
-                codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),
                 meta=MetaStruct(
                     req_id=[req_id],
                     left_context_size=0,
                     codec_streaming=True,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
-                    code_flat_numel=0,
                     stream_finished=torch.tensor(True, dtype=torch.bool),
                     finished=torch.tensor(True, dtype=torch.bool),
                 ),

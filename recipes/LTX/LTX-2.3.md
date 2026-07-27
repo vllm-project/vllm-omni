@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Lightricks
-- Model: `dg845/LTX-2.3-Diffusers`
+- Model: `diffusers/LTX-2.3-Diffusers`
 - Task: Text-to-video and image-to-video with synchronized audio generation
 - Mode: Online serving (pure diffusion)
 - Maintainer: @oglok
@@ -22,7 +22,7 @@ encoder, VAE, and vocoder components.
 ## References
 
 - Upstream raw checkpoints: <https://huggingface.co/Lightricks/LTX-2.3>
-- Diffusers-format checkpoint: <https://huggingface.co/dg845/LTX-2.3-Diffusers>
+- Diffusers-format checkpoint: <https://huggingface.co/diffusers/LTX-2.3-Diffusers>
 - Requires `diffusers >= 0.38.0` (install from git: `pip install git+https://github.com/huggingface/diffusers.git`)
 
 ## Serving
@@ -30,7 +30,7 @@ encoder, VAE, and vocoder components.
 ### Command
 
 ```bash
-vllm serve dg845/LTX-2.3-Diffusers \
+vllm serve diffusers/LTX-2.3-Diffusers \
   --omni \
   --model-class-name LTX23Pipeline \
   --stage-init-timeout 600
@@ -39,7 +39,7 @@ vllm serve dg845/LTX-2.3-Diffusers \
 For image-to-video:
 
 ```bash
-vllm serve dg845/LTX-2.3-Diffusers \
+vllm serve diffusers/LTX-2.3-Diffusers \
   --omni \
   --model-class-name LTX23ImageToVideoPipeline \
   --stage-init-timeout 600
@@ -55,7 +55,7 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/v1/videos \
   -F "prompt=A majestic bald eagle soaring over a misty mountain valley at dawn, golden sunlight breaking through clouds" \
   -F "negative_prompt=blurry, low quality, distorted, watermark" \
-  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "model=diffusers/LTX-2.3-Diffusers" \
   -F "num_frames=81" \
   -F "fps=24" \
   -F "size=768x512" \
@@ -66,7 +66,7 @@ curl -X POST http://localhost:8000/v1/videos \
 # Generate a 10-second video (241 frames)
 curl -X POST http://localhost:8000/v1/videos \
   -F "prompt=A cozy Japanese ramen shop at night in the rain, steam rising from bowls, neon signs reflecting on wet cobblestone streets" \
-  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "model=diffusers/LTX-2.3-Diffusers" \
   -F "num_frames=241" \
   -F "fps=24" \
   -F "size=768x512" \
@@ -76,7 +76,7 @@ curl -X POST http://localhost:8000/v1/videos \
 # Generate a 20-second video (481 frames)
 curl -X POST http://localhost:8000/v1/videos \
   -F "prompt=An underwater coral reef teeming with tropical fish, sea turtles gliding gracefully, National Geographic documentary style" \
-  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "model=diffusers/LTX-2.3-Diffusers" \
   -F "num_frames=481" \
   -F "fps=24" \
   -F "size=768x512" \
@@ -96,7 +96,7 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/v1/videos/sync \
   -F "prompt=A plush toy astronaut gently waving while the camera slowly pushes in." \
   -F "input_reference=@/absolute/path/to/reference.png" \
-  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "model=diffusers/LTX-2.3-Diffusers" \
   -F "num_frames=81" \
   -F "fps=24" \
   -F "size=768x512" \
@@ -111,7 +111,7 @@ curl -X POST http://localhost:8000/v1/videos/sync \
 - Memory usage: run a latest-head serving smoke or DFX benchmark on the target
   GPU before publishing load/peak VRAM numbers.
 - Checkpoint format: use a Diffusers-format checkpoint such as
-  `dg845/LTX-2.3-Diffusers`; the upstream `Lightricks/LTX-2.3` repository ships
+  `diffusers/LTX-2.3-Diffusers`; the upstream `Lightricks/LTX-2.3` repository ships
   raw safetensors and does not contain the subfolder configs required by this
   pipeline loader.
 - Key flags:

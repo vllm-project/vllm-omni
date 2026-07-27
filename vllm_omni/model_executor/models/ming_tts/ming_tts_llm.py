@@ -33,6 +33,7 @@ from .config_ming_tts import (
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
+from .constants import SPEAKER_EMBEDDING_DIM
 from .flowloss_head import FlowLoss
 from .patch_emission import (
     MING_STOP_REASON_CODES,
@@ -91,7 +92,7 @@ class MingLLMModel(nn.Module):
             **self.ming_config.ditar_config,
         )
         self.stop_head = nn.Linear(self.ming_config.llm_hidden_size, 2, bias=True)
-        self.spk_head = nn.Linear(192, self.ming_config.llm_hidden_size, bias=True)
+        self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.ming_config.llm_hidden_size, bias=True)
         self.flowloss.to(dtype=self.fm_dtype)
         self.linear_proj_audio.to(dtype=self.fm_dtype)
         self.stop_head.to(dtype=self.fm_dtype)

@@ -20,7 +20,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       # Tightened from 10ms to 1ms: chunks become available sooner under
       # cross-GPU pipelining, so connector idle waiting dominates if left high.
