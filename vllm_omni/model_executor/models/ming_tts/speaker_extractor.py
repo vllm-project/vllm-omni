@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.model_executor.models.ming_flash_omni.spk_embedding import SpkembExtractor
-from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .audio_prep import coerce_prompt_waveform, coerce_speaker_embeddings
 from .constants import (
@@ -136,12 +135,9 @@ def _resolve_speaker_embeddings(wrapper: Any, info_dict: dict[str, Any]) -> list
     if isinstance(created_at, torch.Tensor):
         created_at = created_at.detach().reshape(-1)[0].item() if created_at.numel() else 0
 
-    cache = getattr(wrapper, "_speaker_cache", None)
+    cache = wrapper._speaker_cache
     cache_key = None
     if isinstance(voice_name, str) and voice_name.strip():
-        if cache is None:
-            cache = get_speaker_cache()
-            wrapper._speaker_cache = cache
         cache_key = cache.make_cache_key(voice_name, model_type="ming_tts", created_at=int(created_at or 0))
         cached = cache.get(cache_key)
         if cached is not None:
