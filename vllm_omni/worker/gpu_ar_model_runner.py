@@ -1069,13 +1069,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     req_id,
                     num_computed_tokens=data.get("seq_len"),
                 )
-                if model_meta:
-                    data = {
-                        **data,
-                        "custom_metadata": {**(data.get("custom_metadata") or {}), **model_meta},
-                    }
-            except Exception as e:
-                logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
+            except Exception:
+                # A swallowed failure here used to ship the KV transfer WITHOUT
+                # the model's custom metadata and surface much later as a
+                # corrupt/incomplete transfer on the consumer stage. Fail at
+                # the point of the defect instead.
+                logger.exception("Failed to get custom KV-transfer metadata from model for %s", req_id)
+                raise
+            if model_meta:
+                data = {
+                    **data,
+                    "custom_metadata": {**(data.get("custom_metadata") or {}), **model_meta},
+                }
             merged[req_id] = data
         return merged
 

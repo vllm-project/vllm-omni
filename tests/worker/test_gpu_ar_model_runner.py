@@ -1360,7 +1360,11 @@ class TestMergeModelKvTransferMetadata:
 
         assert merged["r1"] is data
 
-    def test_merge_failure_keeps_original_entry(self):
+    def test_merge_failure_raises_instead_of_shipping_partial_transfer(self):
+        # RFC #5450 C7: the bare `except Exception -> logger.warning` used to
+        # drop the model's custom metadata and let the KV transfer proceed
+        # incomplete; the failure then surfaced much later on the consumer
+        # stage. It must fail at the defect instead.
         class _Model:
             def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
                 raise RuntimeError("boom")
@@ -1368,7 +1372,6 @@ class TestMergeModelKvTransferMetadata:
         data = {"seq_len": 2, "block_ids": [1], "custom_metadata": {"a": 1}}
         runner = self._runner_with_model(_Model())
 
-        merged = runner._merge_model_kv_transfer_metadata({"r1": data})
-
-        assert merged["r1"] is data
+        with pytest.raises(RuntimeError, match="boom"):
+            runner._merge_model_kv_transfer_metadata({"r1": data})
         assert data["custom_metadata"] == {"a": 1}
