@@ -37,6 +37,16 @@ _MODEL_COEFFICIENTS = {
     # Bagel transformer coefficients
     # Using Qwen's coefficients as reasonable default given shared architecture
     "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],
+    # Wan2.2 VACE preliminary default from Wan2.1-T2V-14B. VACE-specific
+    # calibration should override this through cache_config.coefficients once
+    # representative V2V measurements are available.
+    "WanVACETransformer3DModel": [
+        -3.03318725e05,
+        4.90537029e04,
+        -2.65530556e03,
+        5.87365115e01,
+        -3.15583525e-01,
+    ],
     # SenseNova-U1 transformer coefficients
     "SenseNovaU1ForCausalLM": [
         9.07281930e04,

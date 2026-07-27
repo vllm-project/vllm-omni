@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import vllm.ir
@@ -17,6 +18,9 @@ if TYPE_CHECKING:
     import torch
 
 
+CFGBranch = Literal["positive", "negative"]
+
+
 @dataclass
 class ForwardContext:
     """
@@ -28,6 +32,10 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    # Explicit classifier-free-guidance branch for the active model forward.
+    # Cache backends use this instead of inferring branch identity from call
+    # order, which can change between sequential and distributed execution.
+    cfg_branch: CFGBranch | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -146,6 +154,7 @@ def create_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    cfg_branch: CFGBranch | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
@@ -153,6 +162,7 @@ def create_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        cfg_branch=cfg_branch,
     )
 
 
@@ -178,6 +188,7 @@ def set_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    cfg_branch: CFGBranch | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -189,6 +200,7 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        cfg_branch=cfg_branch,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
@@ -212,6 +224,25 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+@contextmanager
+def set_forward_context_cfg_branch(branch: CFGBranch | None) -> Iterator[None]:
+    """Temporarily identify the CFG branch of the active model forward.
+
+    This is a no-op when a forward context is unavailable, which preserves
+    direct model/unit-test callers. Nested scopes restore the previous branch.
+    """
+    if _forward_context is None:
+        yield
+        return
+
+    previous_branch = _forward_context.cfg_branch
+    _forward_context.cfg_branch = branch
+    try:
+        yield
+    finally:
+        _forward_context.cfg_branch = previous_branch
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:

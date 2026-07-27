@@ -17,6 +17,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.diffusion.forward_context import set_forward_context_cfg_branch
 
 logger = init_logger(__name__)
 
@@ -115,10 +116,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Each rank computes one branch
                 if cfg_rank == 0:
                     logger.debug("CFG Parallel: Rank 0 computing positive branch")
-                    local_pred = _wrap(self.predict_noise(**positive_kwargs))
+                    with set_forward_context_cfg_branch("positive"):
+                        local_pred = _wrap(self.predict_noise(**positive_kwargs))
                 else:
                     logger.debug("CFG Parallel: Rank %d computing negative branch", cfg_rank)
-                    local_pred = _wrap(self.predict_noise(**negative_kwargs))
+                    with set_forward_context_cfg_branch("negative"):
+                        local_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -138,8 +141,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                with set_forward_context_cfg_branch("positive"):
+                    positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
+                with set_forward_context_cfg_branch("negative"):
+                    negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -154,7 +159,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**positive_kwargs)
+            with set_forward_context_cfg_branch("positive"):
+                pred = self.predict_noise(**positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred

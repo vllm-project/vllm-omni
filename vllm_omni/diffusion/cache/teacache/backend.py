@@ -10,6 +10,7 @@ interface using the hooks-based TeaCache system.
 
 from typing import Any
 
+import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
@@ -92,11 +93,50 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
     )
 
 
+def _get_wan_vace_transformers(pipeline: object) -> list[nn.Module]:
+    """Return the loaded high/low-noise VACE experts without duplicates."""
+    transformers: list[nn.Module] = []
+    seen_transformers: set[int] = set()
+    for attribute_name in ("transformer", "transformer_2"):
+        transformer = getattr(pipeline, attribute_name, None)
+        if transformer is None:
+            continue
+        if not isinstance(transformer, nn.Module):
+            raise TypeError(f"{attribute_name} must be a torch.nn.Module, got {type(transformer)}")
+        transformer_id = id(transformer)
+        if transformer_id not in seen_transformers:
+            transformers.append(transformer)
+            seen_transformers.add(transformer_id)
+    return transformers
+
+
+def enable_wan_vace_teacache(pipeline: object, config: DiffusionCacheConfig) -> None:
+    """Enable independent TeaCache state for every loaded Wan VACE expert."""
+    transformers = _get_wan_vace_transformers(pipeline)
+    if not transformers:
+        raise ValueError("Wan22VACEPipeline has no loaded transformer or transformer_2")
+
+    for transformer in transformers:
+        teacache_config = TeaCacheConfig(
+            transformer_type=transformer.__class__.__name__,
+            rel_l1_thresh=config.rel_l1_thresh,
+            coefficients=config.coefficients,
+        )
+        apply_teacache_hook(transformer, teacache_config)
+
+    logger.info(
+        "TeaCache applied to %d Wan VACE transformer(s) with rel_l1_thresh=%s",
+        len(transformers),
+        config.rel_l1_thresh,
+    )
+
+
 CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
+    "Wan22VACEPipeline": enable_wan_vace_teacache,
 }
 
 
@@ -195,6 +235,27 @@ class TeaCacheBackend(CacheBackend):
                 logger.debug(f"TeaCache state refreshed for HunyuanImage3 (num_inference_steps={num_inference_steps})")
             return
 
+        if pipeline.__class__.__name__ == "Wan22VACEPipeline":
+            transformers = _get_wan_vace_transformers(pipeline)
+            refreshed_count = 0
+            for transformer in transformers:
+                if not hasattr(transformer, "_hook_registry"):
+                    continue
+                hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
+                if hook is not None:
+                    transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
+                    refreshed_count += 1
+
+            if verbose and refreshed_count:
+                logger.debug(
+                    "TeaCache state refreshed for %d Wan VACE transformer(s) (num_inference_steps=%d)",
+                    refreshed_count,
+                    num_inference_steps,
+                )
+            elif verbose:
+                logger.warning("TeaCache hook not found on any Wan VACE transformer, nothing to refresh")
+            return
+
         # Extract transformer from pipeline
         transformer = pipeline.transformer
         if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
@@ -206,9 +267,7 @@ class TeaCacheBackend(CacheBackend):
                 transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
                 if verbose:
                     logger.debug(f"TeaCache state refreshed (num_inference_steps={num_inference_steps})")
-            else:
-                if verbose:
-                    logger.warning("TeaCache hook not found, nothing to refresh")
-        else:
-            if verbose:
-                logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+            elif verbose:
+                logger.warning("TeaCache hook not found, nothing to refresh")
+        elif verbose:
+            logger.warning("Transformer has no hook registry, TeaCache may not be applied")

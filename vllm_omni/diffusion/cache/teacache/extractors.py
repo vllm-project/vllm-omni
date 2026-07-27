@@ -19,12 +19,15 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_VACE_CACHE_INDICATOR_TOKEN_BINS = 64
 
 
 @dataclass
@@ -88,6 +91,20 @@ class CacheContext:
         extra_states: Optional dict for additional model-specific state.
             Use this for models that need to pass additional context beyond
             the standard fields.
+
+        cache_indicator: Optional model-specific cache-decision signal. When
+            present, TeaCache requires both this signal and modulated_input to
+            remain similar before reusing a residual. Keep it compact because
+            the previous value is retained in cache state.
+
+        cacheable: Whether this forward may read or update TeaCache state.
+            Set this to False for warmup or other forwards that do not belong
+            to a denoising step. The hook still executes the full transformer.
+
+        synchronize_cache_decision: Whether the cache distance must be reduced
+            across the sequence-parallel group. Enable this when modulated
+            inputs are rank-local shards so every rank takes the same control
+            flow through transformer collectives.
     """
 
     modulated_input: torch.Tensor
@@ -97,6 +114,9 @@ class CacheContext:
     run_transformer_blocks: Callable[[], tuple[torch.Tensor, ...]]
     postprocess: Callable[[torch.Tensor], Any]
     extra_states: dict[str, Any] | None = None
+    cache_indicator: torch.Tensor | None = None
+    cacheable: bool = True
+    synchronize_cache_decision: bool = False
 
     def validate(self) -> None:
         """
@@ -125,6 +145,9 @@ class CacheContext:
         if not isinstance(self.temb, torch.Tensor):
             raise TypeError(f"temb must be torch.Tensor, got {type(self.temb)}")
 
+        if self.cache_indicator is not None and not isinstance(self.cache_indicator, torch.Tensor):
+            raise TypeError(f"cache_indicator must be torch.Tensor or None, got {type(self.cache_indicator)}")
+
         # Validate callables
         if not callable(self.run_transformer_blocks):
             raise TypeError(f"run_transformer_blocks must be callable, got {type(self.run_transformer_blocks)}")
@@ -146,6 +169,19 @@ class CacheContext:
                 f"Device mismatch: modulated_input on {self.modulated_input.device}, "
                 f"hidden_states on {self.hidden_states.device}"
             )
+
+        if self.cache_indicator is not None:
+            if self.cache_indicator.shape[0] != self.hidden_states.shape[0]:
+                raise ValueError(
+                    f"Batch size mismatch: cache_indicator has batch size "
+                    f"{self.cache_indicator.shape[0]}, but hidden_states has "
+                    f"{self.hidden_states.shape[0]}"
+                )
+            if self.cache_indicator.device != self.hidden_states.device:
+                raise ValueError(
+                    f"Device mismatch: cache_indicator on {self.cache_indicator.device}, "
+                    f"hidden_states on {self.hidden_states.device}"
+                )
 
 
 def extract_qwen_context(
@@ -388,6 +424,252 @@ def extract_bagel_context(
         temb=packed_timestep_embeds,  # Approximate
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+    )
+
+
+def _build_vace_hint_cache_indicator(
+    vace_hints: list[torch.Tensor],
+    vace_context_scale: list[float],
+) -> torch.Tensor:
+    """Summarize VACE hints without retaining full activation-sized tensors.
+
+    Each layer contributes signed/absolute channel means plus coarse signed/
+    absolute token statistics. The spatial statistics detect rearrangements
+    that channel aggregates alone miss, while fixed-size pooling keeps retained
+    state small for long videos.
+    """
+    if len(vace_hints) != len(vace_context_scale):
+        raise ValueError(
+            "vace_context_scale must provide one value per VACE hint: "
+            f"got {len(vace_context_scale)} scale(s) for {len(vace_hints)} hint(s)"
+        )
+
+    per_layer_statistics: list[torch.Tensor] = []
+    for hint, hint_scale in zip(vace_hints, vace_context_scale, strict=True):
+        sequence_length = hint.shape[1]
+        if sequence_length == 0:
+            raise ValueError("VACE hints must have a non-empty sequence dimension")
+
+        # Reduce directly into fp32 instead of materializing an activation-sized
+        # ``hint.float()`` copy in the denoising hot path.
+        signed_channel_mean = hint.mean(dim=1, dtype=torch.float32)
+        absolute_channel_mean = torch.linalg.vector_norm(hint, ord=1, dim=1, dtype=torch.float32) / sequence_length
+        channel_count = hint.shape[2]
+        signed_token_mean = hint.mean(dim=2, dtype=torch.float32)
+        absolute_token_mean = torch.linalg.vector_norm(hint, ord=1, dim=2, dtype=torch.float32) / channel_count
+        token_bin_count = min(sequence_length, _VACE_CACHE_INDICATOR_TOKEN_BINS)
+        if sequence_length > token_bin_count:
+            signed_token_mean = F.adaptive_avg_pool1d(signed_token_mean.unsqueeze(1), token_bin_count).squeeze(1)
+            absolute_token_mean = F.adaptive_avg_pool1d(absolute_token_mean.unsqueeze(1), token_bin_count).squeeze(1)
+
+        per_layer_statistics.append(
+            torch.cat(
+                (
+                    signed_channel_mean * hint_scale,
+                    absolute_channel_mean * abs(hint_scale),
+                    signed_token_mean * hint_scale,
+                    absolute_token_mean * abs(hint_scale),
+                ),
+                dim=1,
+            )
+        )
+    return torch.stack(per_layer_statistics, dim=1)
+
+
+def extract_wan_vace_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.LongTensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_image: torch.Tensor | None = None,
+    return_dict: bool = True,
+    attention_kwargs: dict[str, object] | None = None,
+    vace_context: torch.Tensor | None = None,
+    vace_context_scale: float | list[float] = 1.0,
+) -> CacheContext:
+    """Extract TeaCache context for ``WanVACETransformer3DModel``.
+
+    VACE conditioning blocks are always evaluated. Their current-step hints
+    are summarized into ``cache_indicator`` so the main-block residual is only
+    reused when both timestep modulation and VACE conditioning remain similar.
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    del attention_kwargs  # The model's native forward currently ignores it.
+
+    if not hasattr(module, "blocks") or len(module.blocks) == 0:
+        raise ValueError("Module must have main transformer blocks")
+
+    batch_size, _, num_frames, height, width = hidden_states.shape
+    p_t, p_h, p_w = module.config.patch_size
+    post_patch_num_frames = num_frames // p_t
+    post_patch_height = height // p_h
+    post_patch_width = width // p_w
+
+    current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
+    if module._cached_rope_resolution == current_rope_resolution and module._cached_rope_emb is not None:
+        rotary_emb = module._cached_rope_emb
+    else:
+        freqs_cos, freqs_sin = module.rope(hidden_states)
+        rotary_emb = (
+            freqs_cos[..., 0::2].to(hidden_states.dtype),
+            freqs_sin[..., 1::2].to(hidden_states.dtype),
+        )
+        module._hidden_states_shape = hidden_states.shape
+        module._cached_rope_emb = rotary_emb
+        module._cached_rope_resolution = current_rope_resolution
+
+    hidden_states = module.patch_embedding(hidden_states)
+    hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+    if timestep.ndim == 2:
+        ts_seq_len = timestep.shape[1]
+        timestep = timestep.flatten()
+    else:
+        ts_seq_len = None
+
+    temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = module.condition_embedder(
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image,
+        timestep_seq_len=ts_seq_len,
+    )
+    timestep_proj = module.timestep_proj_prepare(timestep_proj, ts_seq_len)
+
+    if encoder_hidden_states_image is not None:
+        encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+    # Match WanVACETransformer3DModel.forward(): SP hooks shard the main tokens
+    # and per-token timestep projection before either VACE or main blocks run.
+    hidden_states = module._sp_shard_point(hidden_states)
+
+    hidden_states_mask = None
+    ctx = get_forward_context()
+    parallel_config = ctx.omni_diffusion_config.parallel_config
+    sp_size = parallel_config.sequence_parallel_size if parallel_config is not None else 1
+    if (
+        parallel_config is not None
+        and parallel_config.mask_sp_padding
+        and ctx.sp_original_seq_len is not None
+        and ctx.sp_padding_size > 0
+    ):
+        padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+        hidden_states_mask = torch.ones(
+            batch_size,
+            padded_seq_len,
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+    elif (
+        parallel_config is not None
+        and not parallel_config.mask_sp_padding
+        and ctx.sp_original_seq_len is not None
+        and ctx.sp_padding_size > 0
+    ):
+        logger.warning_once(
+            "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+            "Padding tokens are not masked from attention (mask_sp_padding=False), "
+            "which avoids the varlen attention path but may produce minor numerical differences. "
+            "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+            ctx.sp_padding_size,
+            ctx.sp_original_seq_len,
+            sp_size,
+        )
+
+    vace_hints = None
+    if vace_context is not None and module.vace_blocks is not None:
+        full_seq_len = hidden_states.shape[1] * sp_size
+        control_hidden_states = module.embed_vace_context(
+            vace_context.to(hidden_states.dtype),
+            full_seq_len,
+            sp_size,
+        )
+        vace_hints = []
+        for block in module.vace_blocks:
+            conditioning_states, control_hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                control_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
+            vace_hints.append(conditioning_states)
+
+    normalized_vace_context_scale: list[float] = []
+    if vace_hints is not None:
+        if isinstance(vace_context_scale, (int, float)):
+            normalized_vace_context_scale = [float(vace_context_scale)] * len(vace_hints)
+        else:
+            normalized_vace_context_scale = vace_context_scale
+
+    first_block = module.blocks[0]
+    if timestep_proj.ndim == 4:
+        shift_msa, scale_msa, _, _, _, _ = (first_block.scale_shift_table.unsqueeze(0) + timestep_proj).chunk(6, dim=2)
+        shift_msa = shift_msa.squeeze(2)
+        scale_msa = scale_msa.squeeze(2)
+    else:
+        shift_msa, scale_msa, _, _, _, _ = (first_block.scale_shift_table + timestep_proj).chunk(6, dim=1)
+    modulated_input = first_block.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
+
+    cache_indicator = (
+        _build_vace_hint_cache_indicator(vace_hints, normalized_vace_context_scale) if vace_hints else None
+    )
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = hidden_states
+        for block_idx, block in enumerate(module.blocks):
+            h = block(
+                h,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
+            if vace_hints is not None and module.vace_layers_mapping is not None:
+                vace_idx = module.vace_layers_mapping.get(block_idx)
+                if vace_idx is not None:
+                    h = h + vace_hints[vace_idx] * normalized_vace_context_scale[vace_idx]
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> object:
+        shift, scale = module.output_scale_shift_prepare(temb)
+        shift = shift.to(h.device)
+        scale = scale.to(h.device)
+        if shift.ndim == 2:
+            shift = shift.unsqueeze(1)
+            scale = scale.unsqueeze(1)
+
+        h = module.norm_out(h, scale, shift).type_as(h)
+        h = module.proj_out(h)
+        h = h.reshape(
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,
+        )
+        h = h.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = h.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        cache_indicator=cache_indicator,
+        cacheable=ctx.denoise_step_idx is not None,
+        synchronize_cache_decision=sp_size > 1,
     )
 
 
@@ -1258,6 +1540,7 @@ def extract_sensenova_u1_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "WanVACETransformer3DModel": extract_wan_vace_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
