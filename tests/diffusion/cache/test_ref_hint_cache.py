@@ -50,6 +50,16 @@ def test_full_reuse_large_k():
     assert st.misses == 1 and st.hits == 11
 
 
+def test_reuse_retains_only_latest_fresh_value():
+    st = RefHintCacheState[str](refresh_interval=2, strategy="reuse")
+    branch, _ = st.begin_call(0)
+    st.store(branch, 0, "h0")
+    branch, _ = st.begin_call(2)
+    st.store(branch, 2, "h2")
+
+    assert st.history(branch) == ((2, "h2"),)
+
+
 def test_first_use_of_a_branch_always_refreshes():
     """Even if step % K != 0, a branch never seen before must recompute (nothing to reuse)."""
     st = RefHintCacheState(refresh_interval=2)

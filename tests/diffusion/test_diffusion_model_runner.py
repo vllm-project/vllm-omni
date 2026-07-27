@@ -424,6 +424,36 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_ref_hint_refreshes_with_default_inference_steps():
+    class _EnabledCacheBackend:
+        def __init__(self):
+            self.refresh_calls = []
+
+        def is_enabled(self):
+            return True
+
+        def refresh(self, pipeline, num_inference_steps, verbose=True):
+            self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(
+        cache_backend=cache_backend,
+        cache_backend_name="ref_hint",
+    )
+    req = _make_request()
+    req.sampling_params.num_inference_steps = None
+
+    DiffusionModelRunner._refresh_cache_for_requests(
+        runner,
+        [req],
+        od_config=runner.od_config,
+    )
+
+    assert cache_backend.refresh_calls == [(runner.pipeline, 0, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestBatchPipeline()

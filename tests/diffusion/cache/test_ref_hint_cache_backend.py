@@ -42,6 +42,11 @@ def _cfg(**kw):
     return DiffusionCacheConfig(**kw)
 
 
+def test_quality_validated_strategy_is_default():
+    backend = RefHintCacheBackend(_cfg())
+    assert backend._strategy() == "forecast50"
+
+
 def test_lossy_interval_requires_acknowledgement():
     backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=2))
     with pytest.raises(ValueError, match="acknowledge_lossy"):

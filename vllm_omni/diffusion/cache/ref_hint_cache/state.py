@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Request-local scheduling and history for reference-hint reuse.
+"""Request-local scheduling and history for reference-hint acceleration.
 
 The state is independent of any model definition.  A framework-side model
 region handler calls :meth:`begin_call` exactly once for each invocation of a
@@ -26,7 +26,11 @@ SUPPORTED_REF_HINT_STRATEGIES = frozenset({_REUSE, _FORECAST50})
 
 
 class RefHintCacheState(Generic[ValueT]):
-    """Schedule refreshes and retain the two latest fresh values per CFG branch."""
+    """Schedule refreshes and retain strategy-specific history per CFG branch.
+
+    ``reuse`` keeps one fresh value; ``forecast50`` keeps the two observations
+    required by its first-order predictor.
+    """
 
     def __init__(self, refresh_interval: int = 2, strategy: str = _REUSE):
         if strategy not in SUPPORTED_REF_HINT_STRATEGIES:
@@ -82,4 +86,5 @@ class RefHintCacheState(Generic[ValueT]):
         self.misses += 1
         history = self._history.setdefault(branch, [])
         history.append((step, value))
-        del history[:-2]
+        retained_values = 2 if self.strategy == _FORECAST50 else 1
+        del history[:-retained_values]

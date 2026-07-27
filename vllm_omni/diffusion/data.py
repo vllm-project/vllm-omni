@@ -430,10 +430,11 @@ class DiffusionCacheConfig:
     # Recompute reference hints every K denoising steps and approximate them in between.
     # Only applies to models exposing the reference-hints semantic region (e.g. Wan-VACE).
     ref_hint_refresh_interval: int = 2
-    # "reuse": return the latest fresh hints; "forecast50": use the two latest
-    # fresh observations and a damped first-order prediction (nominal gain 0.5,
-    # with a trust-region cap to prevent early-step overshoot).
-    ref_hint_strategy: str = "reuse"
+    # "forecast50" (default): use the two latest fresh observations and a
+    # damped first-order prediction (nominal gain 0.5, with a trust-region cap
+    # to prevent early-step overshoot); "reuse": return the latest fresh hints.
+    # The published <=8% DINOv2 quality result uses forecast50.
+    ref_hint_strategy: str = "forecast50"
     # Any skipped hint computation is approximate and must be explicitly acknowledged.
     # ref_hint_refresh_interval=1 recomputes every step and is exempt.
     ref_hint_acknowledge_lossy: bool = False

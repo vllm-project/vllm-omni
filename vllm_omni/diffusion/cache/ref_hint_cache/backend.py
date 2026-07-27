@@ -72,7 +72,7 @@ class RefHintCacheBackend(CacheBackend):
         return transformers
 
     def _strategy(self) -> str:
-        strategy = str(getattr(self.config, "ref_hint_strategy", "reuse"))
+        strategy = str(getattr(self.config, "ref_hint_strategy", "forecast50"))
         if strategy not in SUPPORTED_REF_HINT_STRATEGIES:
             supported = ", ".join(sorted(SUPPORTED_REF_HINT_STRATEGIES))
             raise ValueError(f"Unsupported ref_hint_strategy={strategy!r}; expected one of: {supported}")
