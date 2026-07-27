@@ -16,14 +16,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
-    def __init__(self):
-        self.req_ids = ["req-1"]
-        self.req_id_to_index = {"req-1": 0}
-        self.num_reqs = 1
+    def __init__(self, num_reqs: int = 1):
+        self.req_ids = [f"req-{i + 1}" for i in range(num_reqs)]
+        self.req_id_to_index = {rid: i for i, rid in enumerate(self.req_ids)}
+        self.num_reqs = num_reqs
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs):
+def _make_runner(multimodal_outputs, num_reqs: int = 1):
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = ExecuteModelState(
         None,
@@ -40,7 +40,7 @@ def _make_runner(multimodal_outputs):
         None,
     )
     runner.kv_connector_output = None
-    runner.input_batch = _DummyInputBatch()
+    runner.input_batch = _DummyInputBatch(num_reqs)
     runner.use_async_scheduling = False
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
@@ -174,3 +174,41 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
 
     assert output is sentinel
     assert len(calls) == 1
+
+
+class TestSampleTokensBatched:
+    """RFC #5450 C5: `sample_tokens` must slice per request for num_reqs > 1.
+    The tensor branch's asserts used to force num_reqs == 1 and the list
+    branch built a length-1 payload misaligned with `req_ids`."""
+
+    def test_tensor_output_sliced_per_request(self):
+        multimodal_outputs = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+        runner = _make_runner(multimodal_outputs, num_reqs=2)
+
+        output = GPUGenerationModelRunner.sample_tokens(runner)
+
+        assert len(output.multimodal_outputs) == 2
+        assert torch.equal(output.multimodal_outputs[0]["model_outputs"], multimodal_outputs[0])
+        assert torch.equal(output.multimodal_outputs[1]["model_outputs"], multimodal_outputs[1])
+
+    def test_list_output_one_entry_per_request(self):
+        entries = [torch.zeros(2, 1), torch.ones(2, 1)]
+        runner = _make_runner(list(entries), num_reqs=2)
+
+        output = GPUGenerationModelRunner.sample_tokens(runner)
+
+        assert len(output.multimodal_outputs) == 2
+        assert torch.equal(output.multimodal_outputs[0]["model_outputs"], entries[0])
+        assert torch.equal(output.multimodal_outputs[1]["model_outputs"], entries[1])
+
+    def test_tensor_output_batch_mismatch_raises(self):
+        runner = _make_runner(torch.randn(1, 2, 3), num_reqs=2)
+
+        with pytest.raises(ValueError, match="leading dim 1 .* 2 requests"):
+            GPUGenerationModelRunner.sample_tokens(runner)
+
+    def test_list_output_batch_mismatch_raises(self):
+        runner = _make_runner([torch.randn(2, 1)], num_reqs=2)
+
+        with pytest.raises(ValueError, match="length 1 .* 2 requests"):
+            GPUGenerationModelRunner.sample_tokens(runner)

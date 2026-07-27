@@ -438,16 +438,29 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # pooler_output is no longer used for multimodal data.
         per_req_payloads: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
-            assert multimodal_outputs_raw.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
+            # One row per request. The old asserts (`shape[0] == 1` AND
+            # `shape[0] == num_reqs`) jointly forced num_reqs == 1, silently
+            # rejecting batched steps the generation scheduler does admit.
+            num_reqs = self.input_batch.num_reqs
+            if multimodal_outputs_raw.shape[0] != num_reqs:
+                raise ValueError(
+                    f"Multimodal output tensor has leading dim {multimodal_outputs_raw.shape[0]} "
+                    f"but the batch has {num_reqs} requests (one row per request; "
+                    "to return multiple tensors per request, use a dict)."
+                )
+            for i in range(num_reqs):
                 per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
-            assert len(multimodal_outputs_raw) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
+            # One entry per request. The old `len == 1` assert did not check
+            # num_reqs, so a batched step built a length-1 payload list that
+            # misaligned with `req_ids` downstream.
+            num_reqs = self.input_batch.num_reqs
+            if len(multimodal_outputs_raw) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list has length {len(multimodal_outputs_raw)} "
+                    f"but the batch has {num_reqs} requests (one entry per request; "
+                    "to return multiple lists per request, use a dict)."
+                )
             for out in multimodal_outputs_raw:
                 per_req_payloads.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
