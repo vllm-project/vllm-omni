@@ -145,7 +145,7 @@ class TestDeployTopology:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.pipeline == _PIPELINE_KEY
-        assert deploy.async_chunk is (filename != "minicpmo_4_5.yaml")
+        assert deploy.async_chunk is True
         assert [stage.stage_id for stage in stages] == [0, 1, 2]
         assert [stage.yaml_runtime["devices"] for stage in stages] == devices
         assert "additional_config" not in stages[1].yaml_engine_args
