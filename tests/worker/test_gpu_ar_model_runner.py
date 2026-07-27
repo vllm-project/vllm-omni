@@ -1409,3 +1409,92 @@ class TestDownstreamPayloadMemoization:
         # Cached value now authoritative for the request's lifetime.
         stages["r1"] = 0
         assert runner._request_needs_downstream_stage_payload("r1") is True
+
+
+class TestPreferModelSamplerNoneFallback:
+    """RFC #5450 C7: a `prefer_model_sampler` model returning None from
+    `sample()` DECLINES the step and the runner falls back to the default
+    sampler. The fallback is load-bearing (cosyvoice3/glm_tts decline for
+    empty-logits / inapplicable-stage steps), so it must keep working - now
+    as a documented contract with a one-time visibility log."""
+
+    def _runner(self, model_sample_result, default_result):
+        runner = object.__new__(GPUARModelRunner)
+        runner.input_batch = SimpleNamespace(
+            sampling_metadata="smd",
+            update_async_output_token_ids=lambda: None,
+        )
+        runner.model = SimpleNamespace(
+            prefer_model_sampler=True,
+            sample=lambda logits, metadata: model_sample_result,
+        )
+        runner._sampling_metadata_for_model_sampler = lambda smd: smd
+        runner._resolve_duplex_sampling_hook = lambda: None
+        runner.sampler = lambda logits, sampling_metadata: default_result
+        return runner
+
+    def test_none_falls_back_to_default_sampler_and_warns_once(self):
+        import logging
+
+        from vllm_omni.worker import gpu_ar_model_runner as ar_module
+
+        class _UniqueDecliningSampler:
+            prefer_model_sampler = True
+
+            @staticmethod
+            def sample(logits, metadata):
+                return None
+
+        sentinel = object()
+        runner = self._runner(model_sample_result=None, default_result=sentinel)
+        runner.model = _UniqueDecliningSampler()
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Capture(level=logging.WARNING)
+        ar_module.logger.addHandler(handler)
+        try:
+            for _ in range(3):
+                out = GPUARModelRunner._sample(runner, torch.zeros(1, 4), None)
+                assert out is sentinel
+        finally:
+            ar_module.logger.removeHandler(handler)
+
+        fallback_records = [r for r in records if "falling back to the default sampler" in r.getMessage()]
+        assert len(fallback_records) == 1
+        assert "_UniqueDecliningSampler" in fallback_records[0].getMessage()
+
+    def test_model_sampler_output_short_circuits_default(self):
+        model_out = object()
+        runner = self._runner(model_sample_result=model_out, default_result=object())
+
+        out = GPUARModelRunner._sample(runner, torch.zeros(1, 4), None)
+
+        assert out is model_out
+
+    def test_in_tree_declarer_inventory_is_exact(self):
+        # The contract's audience: exact inventory, so ADDING a declarer fails
+        # this test and the new model owner consciously signs up for the
+        # documented None-fallback semantics (update the set when they do).
+        import pathlib
+
+        import vllm_omni
+
+        models_dir = pathlib.Path(vllm_omni.__file__).parent / "model_executor" / "models"
+        declarers = {
+            p.parent.name
+            for p in models_dir.rglob("*.py")
+            if "prefer_model_sampler" in p.read_text(encoding="utf-8", errors="ignore")
+        }
+        assert declarers == {
+            "cosyvoice3",
+            "glm_tts",
+            "higgs_audio_v2",
+            "higgs_audio_v3",
+            "hunyuan_image3",
+            "minicpmo_4_5",
+        }

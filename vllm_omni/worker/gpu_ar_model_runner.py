@@ -1558,6 +1558,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
     ):
+        """Sample tokens, preferring the model's own sampler when declared.
+
+        Model-interface contract for `prefer_model_sampler` models: a custom
+        `model.sample(logits, sampling_metadata)` may return ``None`` to
+        DECLINE the step, and the runner then falls back to the default
+        sampler. Declarers rely on this deliberately for empty-logits or
+        inapplicable-stage steps (e.g. cosyvoice3, glm_tts), so the
+        fallthrough is load-bearing, not an error path; it is logged once per
+        model for visibility.
+        """
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -1585,6 +1595,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
+                # Contract: None => fall back to the default sampler (see
+                # docstring). If a custom sampler returns None by accident,
+                # its tokens silently come from the default sampler - the
+                # one-time log is the visibility hook for that case.
+                logger.warning_once(
+                    "prefer_model_sampler model %s returned None from sample(); falling back to the default sampler.",
+                    type(self.model).__name__,
+                )
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
