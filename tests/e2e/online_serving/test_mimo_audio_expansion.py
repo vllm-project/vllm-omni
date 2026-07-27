@@ -75,8 +75,6 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
@@ -100,8 +98,6 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.skip(reason="CI failed 8571")
