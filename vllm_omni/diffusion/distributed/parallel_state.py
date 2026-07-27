@@ -59,6 +59,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
+_TEXT_ENCODER_TP: GroupCoordinator | None = None
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -272,6 +273,11 @@ def get_world_group() -> GroupCoordinator:
 
 
 # SP
+def get_text_encoder_tp_group() -> GroupCoordinator:
+    assert _TEXT_ENCODER_TP is not None, "text encoder tensor parallel group is not initialized"
+    return _TEXT_ENCODER_TP
+
+
 def get_sp_group() -> SequenceParallelGroupCoordinator:
     assert _SP is not None, "pipeline model parallel group is not initialized"
     return _SP
@@ -472,6 +478,7 @@ def model_parallel_is_initialized():
         and _SP is not None
         and _PP is not None
         and vllm_parallel_state._TP is not None
+        and _TEXT_ENCODER_TP is not None
     )
 
 
@@ -695,6 +702,7 @@ def initialize_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
+    text_encoder_tensor_parallel_size: int | None = None,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
     hsdp_replicate_size: int = 1,
@@ -748,6 +756,13 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    if text_encoder_tensor_parallel_size is None:
+        text_encoder_tensor_parallel_size = tensor_parallel_size
+    if world_size % text_encoder_tensor_parallel_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by text encoder TP ({text_encoder_tensor_parallel_size})"
+        )
 
     if sequence_parallel_size is None:
         sequence_parallel_size = ring_degree * ulysses_degree
@@ -889,6 +904,19 @@ def initialize_model_parallel(
             group_name="dp",
         )
 
+    global _TEXT_ENCODER_TP
+    assert _TEXT_ENCODER_TP is None, "text encoder tensor parallel group is already initialized"
+    text_encoder_tp_group_ranks = [
+        list(range(start, start + text_encoder_tensor_parallel_size))
+        for start in range(0, world_size, text_encoder_tensor_parallel_size)
+    ]
+    _TEXT_ENCODER_TP = init_model_parallel_group(
+        group_ranks=text_encoder_tp_group_ranks,
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="tensor",
+    )
+
     global _FS, _EXPERT_PARALLEL_GROUP_RANKS
     assert _FS is None, "fully shard group is already initialized"
     _FS = init_model_parallel_group(
@@ -914,7 +942,7 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _TEXT_ENCODER_TP, _EXPERT_PARALLEL_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -939,6 +967,10 @@ def destroy_model_parallel():
     if vllm_parallel_state._TP:
         vllm_parallel_state._TP.destroy()
     vllm_parallel_state._TP = None
+
+    if _TEXT_ENCODER_TP:
+        _TEXT_ENCODER_TP.destroy()
+    _TEXT_ENCODER_TP = None
 
     if vllm_parallel_state._EP:
         vllm_parallel_state._EP.destroy()

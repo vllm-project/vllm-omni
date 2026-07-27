@@ -150,7 +150,10 @@ class DiffusionParallelConfig:
     """Number of data parallel groups."""
 
     tensor_parallel_size: int = 1
-    """Number of tensor parallel groups."""
+    """Number of tensor parallel groups used by the diffusion transformer."""
+
+    text_encoder_tensor_parallel_size: int | None = None
+    """Tensor parallel size for supported text encoders. Defaults to transformer TP."""
 
     enable_expert_parallel: bool = False
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
@@ -222,6 +225,8 @@ class DiffusionParallelConfig:
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
         assert self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
+        if self.text_encoder_tensor_parallel_size is not None:
+            assert self.text_encoder_tensor_parallel_size > 0, "Text encoder tensor parallel size must be > 0"
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
@@ -892,11 +897,12 @@ class OmniDiffusionConfig:
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
             self.parallel_config = DiffusionParallelConfig()
 
-        stage_tp = self.parallel_config.tensor_parallel_size
-        if self.text_encoder_tensor_parallel_size is None:
-            self.text_encoder_tensor_parallel_size = stage_tp
-        if self.text_encoder_tensor_parallel_size < 1:
-            raise ValueError("text_encoder_tensor_parallel_size must be positive")
+        if self.text_encoder_tensor_parallel_size is not None:
+            self.parallel_config.text_encoder_tensor_parallel_size = self.text_encoder_tensor_parallel_size
+        elif self.parallel_config.text_encoder_tensor_parallel_size is None:
+            self.parallel_config.text_encoder_tensor_parallel_size = self.parallel_config.tensor_parallel_size
+        # Keep the top-level attribute as a compatibility alias for existing deploy configs.
+        self.text_encoder_tensor_parallel_size = self.parallel_config.text_encoder_tensor_parallel_size
 
         if self.num_gpus is None:
             if self.parallel_config is not None:

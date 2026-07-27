@@ -30,7 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel, text_encoder_tp_context
+from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
@@ -183,7 +183,7 @@ class Wan22I2VPipeline(
                 fall_back_to_pt=True,
             ),
         ]
-        if od_config.text_encoder_tensor_parallel_size != 1:
+        if od_config.parallel_config.text_encoder_tensor_parallel_size != 1:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -242,7 +242,7 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
-        if od_config.text_encoder_tensor_parallel_size == 1:
+        if od_config.parallel_config.text_encoder_tensor_parallel_size == 1:
             self.text_encoder = from_pretrained_with_prefetch(
                 UMT5EncoderModel.from_pretrained,
                 model,
@@ -252,11 +252,9 @@ class Wan22I2VPipeline(
                 torch_dtype=dtype,
             ).to(self.device)
         else:
-            with text_encoder_tp_context(od_config.text_encoder_tensor_parallel_size):
-                self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
-                    device=self.device, dtype=dtype
-                )
-            self.text_encoder.tensor_parallel_size = od_config.text_encoder_tensor_parallel_size
+            self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+                device=self.device, dtype=dtype
+            )
 
         if self.has_image_encoder:
             self.image_processor = from_pretrained_with_prefetch(

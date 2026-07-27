@@ -4,57 +4,32 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from contextlib import contextmanager
-from functools import wraps
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import vllm.distributed.parallel_state as vllm_parallel_state
 from transformers import T5Config
-from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.distributed.parallel_state import get_text_encoder_tp_group
 
-@contextmanager
-def text_encoder_tp_context(tensor_parallel_size: int):
-    current_tp = vllm_parallel_state.get_tp_group()
-    if current_tp.world_size == tensor_parallel_size:
-        yield
-        return
-
-    from vllm_omni.diffusion.distributed import parallel_state as omni_parallel_state
-
-    candidate = omni_parallel_state._SP
-    if candidate is None or candidate.world_size != tensor_parallel_size:
-        raise ValueError(
-            f"text encoder TP {tensor_parallel_size} is unavailable; "
-            f"stage TP={current_tp.world_size}, SP={getattr(candidate, 'world_size', None)}"
-        )
-    old_tp = vllm_parallel_state._TP
-    vllm_parallel_state._TP = candidate
-    try:
-        yield
-    finally:
-        vllm_parallel_state._TP = old_tp
-
-
-def _use_text_encoder_tp(fn):
-    @wraps(fn)
-    def wrapped(self, *args, **kwargs):
-        with text_encoder_tp_context(self.tensor_parallel_size):
-            return fn(self, *args, **kwargs)
-
-    return wrapped
+from .parallel_layers import (
+    TextEncoderColumnParallelLinear as ColumnParallelLinear,
+)
+from .parallel_layers import (
+    TextEncoderMergedColumnParallelLinear as MergedColumnParallelLinear,
+)
+from .parallel_layers import (
+    TextEncoderQKVParallelLinear as QKVParallelLinear,
+)
+from .parallel_layers import (
+    TextEncoderRowParallelLinear as RowParallelLinear,
+)
+from .parallel_layers import (
+    TextEncoderVocabParallelEmbedding as VocabParallelEmbedding,
+)
 
 
 class T5SelfAttention(nn.Module):
@@ -74,7 +49,7 @@ class T5SelfAttention(nn.Module):
         self.relative_attention_num_buckets = config.relative_attention_num_buckets
         self.relative_attention_max_distance = config.relative_attention_max_distance
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_text_encoder_tp_group().world_size
         assert self.n_heads % tp_size == 0, f"num_heads ({self.n_heads}) must be divisible by tp_size ({tp_size})"
         self.n_heads_per_partition = self.n_heads // tp_size
 
@@ -145,7 +120,7 @@ class T5SelfAttention(nn.Module):
         # values: (query_length, key_length, num_heads)
         values = self.relative_attention_bias(relative_position_bucket)
         # Slice to local heads for this TP rank
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_text_encoder_tp_group().rank_in_group
         head_start = tp_rank * self.n_heads_per_partition
         head_end = head_start + self.n_heads_per_partition
         values = values[:, :, head_start:head_end]
@@ -365,7 +340,7 @@ class T5EncoderModel(nn.Module):
         super().__init__()
         self.config = config
         self.prefix = prefix
-        self.tensor_parallel_size = get_tensor_model_parallel_world_size()
+        self.tensor_parallel_size = get_text_encoder_tp_group().world_size
         self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
         self.encoder = T5Stack(config, self.shared, prefix=f"{prefix}.encoder")
 
@@ -380,7 +355,6 @@ class T5EncoderModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.shared(input_ids)
 
-    @_use_text_encoder_tp
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -389,7 +363,6 @@ class T5EncoderModel(nn.Module):
         hidden_states = self.encoder(input_ids, attention_mask=attention_mask)
         return (hidden_states,)
 
-    @_use_text_encoder_tp
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("qkv_proj", "q", "q"),
