@@ -149,49 +149,23 @@ Download the checkpoint:
 hf download bytedance-research/MammothModa2-Dev --local-dir ./MammothModa2-Dev
 ```
 
-Run image-to-text inference from the repository root:
+Run text-to-text through the shared understanding example. It recognizes the
+Dev checkpoint as MammothModa2 and automatically selects
+`mammoth_moda2_ar.yaml`:
 
-```python
-from PIL import Image
-from vllm import SamplingParams
-from vllm.multimodal.image import convert_image_mode
-from vllm_omni import Omni
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Dev \
+  --prompt "Explain multimodal generation in three sentences."
+```
 
-prompt = (
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-    "Summarize this image.<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
+Add an image for image-to-text or image summarization:
 
-omni = Omni(
-    model="./MammothModa2-Dev",
-    deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
-)
-try:
-    outputs = list(
-        omni.generate(
-            [{
-                "prompt": prompt,
-                "multi_modal_data": {
-                    "image": convert_image_mode(Image.open("./image.png"), "RGB"),
-                },
-                "additional_information": {"omni_task": ["chat"]},
-            }],
-            [SamplingParams(
-                temperature=0.2,
-                top_p=0.9,
-                top_k=-1,
-                max_tokens=512,
-                seed=42,
-            )],
-        )
-    )
-finally:
-    omni.close()
-
-request_output = getattr(outputs[-1], "request_output", outputs[-1])
-print(request_output.outputs[0].text.strip())
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Dev \
+  --image ./image.png \
+  --prompt "Please summarize the content of this image."
 ```
 
 The Dev checkpoint is approximately 47.55 GiB on disk. In the verified AR-only
