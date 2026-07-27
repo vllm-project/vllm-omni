@@ -120,11 +120,21 @@ python examples/offline_inference/image_to_image/image_edit.py \
 The Lance-native VAE prefill scatters Wan2.2 latents into the LLM query
 sequence; no separate image encoder is needed.
 
+The video tasks load the `Lance_3B_Video` sub-checkpoint. Point `--model` at
+that subfolder **inside the local snapshot** — `bytedance-research/Lance/Lance_3B_Video`
+is not a valid HF repo id (three path segments), so resolve the repo first and
+address the subfolder locally:
+
+```bash
+# resolves (and, if needed, downloads) the repo, printing its local snapshot dir
+LANCE_DIR=$(hf download bytedance-research/Lance)
+```
+
 #### Command — text-to-video
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
-    --model bytedance-research/Lance/Lance_3B_Video \
+    --model "$LANCE_DIR/Lance_3B_Video" \
     --model-class-name LancePipeline \
     --prompt "a cat playing piano, cinematic" \
     --height 480 --width 768 --num-frames 25 \
@@ -137,7 +147,7 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 
 ```bash
 python examples/offline_inference/image_to_video/image_to_video.py \
-    --model bytedance-research/Lance/Lance_3B_Video \
+    --model "$LANCE_DIR/Lance_3B_Video" \
     --model-class-name LancePipeline \
     --image /path/to/first.png \
     --prompt "the scene comes to life with smooth camera motion" \
@@ -147,9 +157,9 @@ python examples/offline_inference/image_to_video/image_to_video.py \
     --output /tmp/lance_i2v.mp4
 ```
 
-Use the `Lance_3B_Video` subfolder for any video path so the 3-D
-`latent_pos_embed` table is loaded; image / understanding paths can point at
-the top-level repo and resolve the right sub-checkpoint automatically.
+The video paths load the 3-D `latent_pos_embed` table from `Lance_3B_Video`;
+image / understanding tasks can point `--model` at the top-level repo and
+resolve the right sub-checkpoint automatically.
 
 > **Note**: the video task examples select the pipeline with
 > `--model-class-name` because they do not (yet) accept `--deploy-config`, and
