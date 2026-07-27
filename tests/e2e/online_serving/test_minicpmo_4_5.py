@@ -65,7 +65,6 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
