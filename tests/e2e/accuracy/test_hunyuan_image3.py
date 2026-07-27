@@ -29,9 +29,49 @@ from tests.e2e.accuracy.helpers import (
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner, OmniServer
-from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    build_prompt_tokens,
+    resolve_stop_token_ids,
+)
+
+# CoT structural markers that MUST appear in AR output text.
+# The AR trajectory under think_recaption mode is:
+#   <think> ... </think> <recaption> ... <relation_1> ... </relation_1>
+#   <relation_2> ... </relation_2> </recaption>
+# Test deploy config sets include_stop_str_in_output=True and
+# skip_special_tokens=False, so ALL opening and closing markers
+# should be present in the detokenized text.
+_THINK_CLOSE = "</" + "think>"  # avoid Python slash-t-as-TAB pitfall
+_COT_REQUIRED_MARKERS = (
+    "<recaption>",
+    "</recaption>",
+    "<relation_1>",
+    "</relation_1>",
+    "<relation_2>",
+    "</relation_2>",
+    _THINK_CLOSE,
+)
+
+
+def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
+    """Assert that the AR CoT output contains all required structural tags.
+
+    Guards against regressions where detokenizer stop-token stripping
+    or truncation logic loses CoT content.  Under the test deploy config
+    (include_stop_str_in_output=True, skip_special_tokens=False),
+    ALL markers should be present in the detokenized text.
+    """
+    missing = [m for m in _COT_REQUIRED_MARKERS if m not in cot_text]
+    assert not missing, (
+        f"[{label}] CoT text missing required structural markers: {missing}. "
+        f"This typically indicates that stop-token stripping or "
+        f"_truncate_at_cot_end truncation removed CoT content. "
+        f"CoT text length={len(cot_text)}, first 100 chars: {repr(cot_text[:100])}"
+    )
+
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
+os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
@@ -101,7 +141,6 @@ _DEPLOY_CONFIG = {
     "connectors": {
         "shared_memory_connector": {
             "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [
@@ -129,6 +168,7 @@ _DEPLOY_CONFIG = {
                 "stop_token_ids": [128025],
                 "detokenize": True,
                 "skip_special_tokens": False,
+                "include_stop_str_in_output": True,
             },
         },
         {
@@ -257,7 +297,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -290,7 +330,10 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if ro and getattr(ro, "outputs", None):
             cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not cot_text:
-            ar_text = getattr(out, "custom_output", {}).get("ar_generated_text")
+            multimodal_output = getattr(out, "multimodal_output", {}) or {}
+            metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+            text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+            ar_text = text_metadata.get("ar_generated_text") if isinstance(text_metadata, dict) else None
             if isinstance(ar_text, list):
                 cot_text = "\n".join(text for text in ar_text if text)
             else:
@@ -324,6 +367,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
         "300",
         "--init-timeout",
         "900",
+        "--trust-remote-code",
     ]
     try:
         with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
@@ -400,6 +444,8 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     ]
     print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
 
+    _assert_cot_structural_markers(online_cot, "ONLINE")
+
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {THRESHOLDS['cot_semantic_sim']}"
     )
@@ -445,7 +491,12 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
+        with OmniRunner(
+            model,
+            deploy_config=deploy_config_path,
+            mode="text-to-image",
+            trust_remote_code=True,
+        ) as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
@@ -507,6 +558,8 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
     ]
 
     print(tabulate(table, headers=["Metric", "Value", "L20x Reference"], tablefmt="grid"))
+
+    _assert_cot_structural_markers(omni_cot, "OFFLINE")
 
     assert cot_results["cot_semantic_sim"] >= THRESHOLDS["cot_semantic_sim"], (
         f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {THRESHOLDS['cot_semantic_sim']}"

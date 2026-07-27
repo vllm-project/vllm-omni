@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Literal,
     Protocol,
     runtime_checkable,
 )
@@ -14,13 +16,20 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
 @runtime_checkable
 class SupportImageInput(Protocol):
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"  # Default color format
+
+
+@dataclass(frozen=True)
+class ReferenceVideoDecodeSpec:
+    max_frames: int | None = None
+    keep: Literal["first", "last"] = "first"
 
 
 @runtime_checkable
@@ -45,17 +54,21 @@ class SupportsStepExecution(Protocol):
 
     supports_step_execution: ClassVar[bool] = True
 
-    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Prepare request-level inputs and return initialized state."""
+        ...
 
-    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
-        """Run one denoise step."""
+    def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
+        """Run one denoise forward on the runner-assembled batch."""
+        ...
 
-    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """Run one scheduler step."""
+        ...
 
-    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
-        """Decode output after denoise loop."""
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Decode output after denoise loop or at a partial chunk boundary."""
+        ...
 
 
 @runtime_checkable

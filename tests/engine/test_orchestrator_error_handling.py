@@ -161,3 +161,113 @@ async def test_diffusion_error_output_routed_as_finished(orchestrator_factory) -
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_diffusion_client_error_output_propagates_status_code(orchestrator_factory) -> None:
+    """A client-error OmniRequestOutput (e.g. a guardrail 4xx) from a diffusion
+    stage must surface as an ErrorMessage that carries status_code/error_type,
+    so the frontend can map it to the correct HTTP response instead of a 500.
+    """
+    stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    params = OmniDiffusionSamplingParams()
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-blocked",
+            prompt={"prompt": "blocked"},
+            original_prompt={"prompt": "blocked"},
+            sampling_params_list=[params],
+            final_stage_id=0,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        # Push a client-error output from the diffusion stage.
+        stage0.push_diffusion_output(
+            OmniRequestOutput.from_error(
+                "req-blocked",
+                "Input was blocked by Cosmos3 guardrails.",
+                status_code=400,
+                error_type="BadRequestError",
+            )
+        )
+
+        msg = await _get_any_output_message(orchestrator_fixture)
+
+        assert isinstance(msg, ErrorMessage)
+        assert msg.request_id == "req-blocked"
+        assert msg.stage_id == 0
+        assert msg.fatal is False
+        assert msg.status_code == 400
+        assert msg.error_type == "BadRequestError"
+        assert msg.error == "Input was blocked by Cosmos3 guardrails."
+
+        # Request state should be cleaned up.
+        await _wait_for(lambda: "req-blocked" not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "error_type"),
+    [
+        pytest.param(429, "RateLimitError", id="429-too-many-requests"),
+        pytest.param(413, "PayloadTooLargeError", id="413-payload-too-large"),
+        pytest.param(422, "UnprocessableEntityError", id="422-unprocessable-entity"),
+        pytest.param(403, "PermissionDeniedError", id="403-forbidden"),
+    ],
+)
+async def test_diffusion_client_error_output_propagates_non_400_status(
+    orchestrator_factory,
+    status_code: int,
+    error_type: str,
+) -> None:
+    """A diffusion-stage client error with a non-400 4xx status must be serialized
+    into an ErrorMessage that preserves that exact status_code/error_type.
+    """
+    stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    params = OmniDiffusionSamplingParams()
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-blocked",
+            prompt={"prompt": "blocked"},
+            original_prompt={"prompt": "blocked"},
+            sampling_params_list=[params],
+            final_stage_id=0,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        # Push a non-400 client-error output from the diffusion stage.
+        stage0.push_diffusion_output(
+            OmniRequestOutput.from_error(
+                "req-blocked",
+                "client error from diffusion stage",
+                status_code=status_code,
+                error_type=error_type,
+            )
+        )
+
+        msg = await _get_any_output_message(orchestrator_fixture)
+
+        assert isinstance(msg, ErrorMessage)
+        assert msg.request_id == "req-blocked"
+        assert msg.stage_id == 0
+        assert msg.fatal is False
+        assert msg.status_code == status_code
+        assert msg.error_type == error_type
+        assert msg.error == "client error from diffusion stage"
+
+        # Request state should be cleaned up.
+        await _wait_for(lambda: "req-blocked" not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.thread.join(timeout=5)

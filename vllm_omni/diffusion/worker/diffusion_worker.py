@@ -12,7 +12,8 @@ import gc
 import multiprocessing as mp
 import os
 import signal
-from collections.abc import Iterable, Iterator
+import traceback
+from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -41,12 +42,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -78,6 +80,10 @@ class _DiffusionVllmModelConfig:
 
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
+
+    @property
+    def is_diffusion(self) -> bool:
+        return False
 
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
@@ -159,6 +165,20 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         return vllm_config
 
 
+def _get_cumem_allocator_class() -> type:
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    return CuMemAllocator
+
+
+def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
+    ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+    ir_op_priority_func = get_diffusion_ir_op_priority_func(od_config)
+    if ir_op_priority_func is not None:
+        ir_op_priority = ir_op_priority_func(ir_op_priority, vllm_config=vllm_config)
+    return ir_op_priority
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -193,8 +213,32 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner using the platform-specified class
-        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        # Create model runner — one decision chain, in precedence order:
+        #   1. explicit od_config.diffusion_model_runner_cls (user override),
+        #   2. the runner declared by the engine class that engine_backend
+        #      selects (e.g. ARDiffusionEngine -> ARDiffusionModelRunner),
+        #   3. the platform default.
+        # Routing policy therefore lives on the engine class / config surface;
+        # engines never mutate od_config. Overrides must be import-path
+        # strings — guard with isinstance so a non-string (e.g. a Mock
+        # od_config in tests) doesn't shadow the platform hook.
+        runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
+        engine_runner = None
+        if not (isinstance(runner_override, str) and runner_override):
+            try:
+                from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+                engine_cls = DiffusionEngine.resolve_engine_class(self.od_config)
+                engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
+            except Exception:
+                logger.warning("Worker %s: engine_backend resolution failed; using platform runner", self.rank)
+                engine_runner = None
+        if isinstance(runner_override, str) and runner_override:
+            model_runner_cls_path = runner_override
+        elif isinstance(engine_runner, str) and engine_runner:
+            model_runner_cls_path = engine_runner
+        else:
+            model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
@@ -226,19 +270,35 @@ class DiffusionWorker:
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
-        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
+        parallel_config = self.od_config.parallel_config
+        vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
+        if parallel_config.enable_expert_parallel and self.od_config.is_moe:
+            # Diffusion uses its own DP/CFG/SP groups normally. vLLM groups are
+            # only remapped for expert-parallel runtimes that consume vLLM's
+            # FusedMoE/EP semantics.
+            vllm_config.parallel_config.data_parallel_size = (
+                parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
+            )
+            vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
         vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
-        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+        vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
+        if self.od_config.moe_backend != "auto":
+            logger.warning(
+                "Overriding MoE backend from default 'auto' to '%s' per deploy config.",
+                self.od_config.moe_backend,
+            )
+            vllm_config.kernel_config.moe_backend = self.od_config.moe_backend
         logger.info(
             "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
         )
         self.vllm_config = vllm_config
+        current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
 
         # Initialize distributed environment
         with (
@@ -255,6 +315,7 @@ class DiffusionWorker:
                 sequence_parallel_size=parallel_config.sequence_parallel_size,
                 ulysses_degree=parallel_config.ulysses_degree,
                 ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
@@ -327,10 +388,6 @@ class DiffusionWorker:
             lora_scale=self.od_config.lora_scale,
         )
 
-    def generate(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        """Generate output for the given requests."""
-        return self.execute_model(request, self.od_config)
-
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
 
@@ -352,7 +409,12 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_job: KVPrefetchJob | None = None,
+    ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -365,7 +427,29 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req)
+            output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
+        if profiler:
+            profiler.step()
+        return output
+
+    def execute_model_batch(
+        self, scheduler_output: DiffusionSchedulerOutput, od_config: OmniDiffusionConfig
+    ) -> BatchRunnerOutput:
+        """Batch forward: LoRA activate once, delegate to model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
+        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
+            sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
+            try:
+                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+            except Exception as exc:
+                if sp.lora_request is not None:
+                    raise
+                logger.warning("LoRA activation skipped: %s", exc)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
         return output
@@ -388,7 +472,7 @@ class DiffusionWorker:
         Newly scheduled requests register their (lora_request, lora_scale)
         in ``_step_lora_state`` so cached requests can resolve to the same
         adapter on later ticks. Finished requests are evicted. Batch
-        homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
+        homogeneity is enforced by the scheduler via ``StepBatchSamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
         for request_id in scheduler_output.finished_req_ids:
@@ -419,11 +503,6 @@ class DiffusionWorker:
                 raise
             logger.warning("LoRA activation skipped: %s", exc)
 
-    def load_weights(self, weights) -> set[str]:
-        """Load weights by delegating to the model runner."""
-        assert self.model_runner is not None, "Model runner not initialized"
-        return self.model_runner.load_weights(weights)
-
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 
@@ -438,15 +517,14 @@ class DiffusionWorker:
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
 
-    def sleep(self, level: int = 1) -> bool:
+    def sleep(self, level: int = 1) -> int:
         """
         Put the worker to sleep, offloading model weights.
 
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
-
+        CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 
         usage_before = allocator.get_current_usage()
@@ -498,8 +576,7 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
-
+        CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
@@ -513,7 +590,7 @@ class DiffusionWorker:
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
+    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
 
         try:
@@ -523,10 +600,11 @@ class DiffusionWorker:
 
             current_omni_platform.synchronize()
             free_before = current_omni_platform.get_free_memory(self.device)
-            self.sleep(level=task.level)
+            allocator_freed = self.sleep(level=task.level)
             current_omni_platform.synchronize()
             free_after = current_omni_platform.get_free_memory(self.device)
-            real_freed = max(0, free_after - free_before)
+            phys_freed = max(0, free_after - free_before)
+            real_freed = max(int(allocator_freed), phys_freed)
             logger.info(f"[Worker {self.rank}] Preparing ACK: freed_bytes={real_freed / GiB_bytes:.2f} GiB.")
 
             # Ensure all ranks have completed sleep before measuring memory and sending ACK
@@ -553,6 +631,8 @@ class DiffusionWorker:
                 metadata={
                     "source": f"Platform_{current_omni_platform.get_device_name()}",
                     "total_freed_gib": f"{real_freed / GiB_bytes:.2f}",
+                    "allocator_freed_gib": f"{allocator_freed / GiB_bytes:.2f}",
+                    "physical_freed_gib": f"{phys_freed / GiB_bytes:.2f}",
                     "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
@@ -567,7 +647,7 @@ class DiffusionWorker:
                     pass
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
 
         try:
@@ -618,8 +698,7 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
-
+            CuMemAllocator = _get_cumem_allocator_class()
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -629,6 +708,10 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        if self.model_runner is not None:
+            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+            if mgr is not None:
+                mgr.shutdown_prefetch()
         destroy_distributed_env()
 
 
@@ -707,7 +790,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         worker_extension_cls: str | None,
         custom_pipeline_args: dict[str, Any] | None = None,
-    ) -> DiffusionWorker:
+    ) -> "WorkerWrapperBase":
         """Create a worker instance. Override in subclasses for different worker types."""
         worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
         base_worker_class = resolve_obj_by_qualname(worker_cls_path)
@@ -720,7 +803,7 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: Any):
+    def _return_result(self, output: Any) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
             if isinstance(output, OmniACK):
@@ -733,17 +816,29 @@ class WorkerProc:
                     logger.warning("SHM pack failed for model output: %s", e)
             self.result_mq.enqueue(output)
 
-    def recv_message(self):
-        """Receive messages from broadcast queue."""
-        return self.mq.dequeue(indefinite=True)
+    def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
+        if not torch.distributed.is_initialized():
+            return [status]
 
-    def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
+        world_size = torch.distributed.get_world_size()
+        statuses: list[dict[str, Any] | None] = [None] * world_size
+        torch.distributed.all_gather_object(statuses, status)
+        missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
+        if missing_ranks:
+            logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
+        return [s for s in statuses if s is not None]
+
+    def _execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
         method = rpc_request["method"]
         args = rpc_request.get("args", ())
         kwargs = rpc_request.get("kwargs", {})
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+        collect_rank_status = rpc_request.get("collect_rank_status", False)
+
+        if collect_rank_status and not exec_all_ranks:
+            raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
@@ -751,15 +846,54 @@ class WorkerProc:
         if not should_execute:
             return None, False
 
+        result = None
+        rpc_exception: Exception | None = None
+        status: dict[str, Any] = {
+            "rank": self.gpu_id,
+            "ok": True,
+            "error": None,
+            "error_type": None,
+            "traceback": None,
+            "bool_result": None,
+        }
+
         try:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
-            return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            raise e
+            rpc_exception = e
+            status.update(
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": traceback.format_exc(),
+                }
+            )
 
-    def worker_busy_loop(self) -> None:
+        if isinstance(result, bool):
+            status["bool_result"] = result
+
+        if collect_rank_status:
+            rank_statuses = self._gather_rpc_rank_statuses(status)
+            if should_reply:
+                return (
+                    {
+                        "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                        "method": method,
+                        "result": result,
+                        "rank_statuses": rank_statuses,
+                    },
+                    True,
+                )
+            return None, False
+
+        if rpc_exception is not None:
+            raise rpc_exception
+        return result, should_reply
+
+    def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
@@ -784,21 +918,21 @@ class WorkerProc:
             if isinstance(msg, dict) and msg.get("type") == "sleep":
                 task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
                 ack = self.worker.handle_sleep_task(task)
-                self.return_result(ack)
+                self._return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "wake_up":
                 task = OmniWakeTask(tags=msg.get("tags"), task_id=msg.get("task_id", "local"))
                 ack = self.worker.handle_wake_task(task)
-                self.return_result(ack)
+                self._return_result(ack)
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
                 try:
-                    result, should_reply = self.execute_rpc(msg)
+                    result, should_reply = self._execute_rpc(msg)
                     if should_reply:
-                        self.return_result(result)
+                        self._return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        self._return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -806,7 +940,7 @@ class WorkerProc:
                 continue
 
             else:
-                # Handle generation request
+                # Handle direct generation requests.
                 try:
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
@@ -814,20 +948,15 @@ class WorkerProc:
                         f"Error executing forward in event loop: {e}",
                         exc_info=True,
                     )
-                    output = DiffusionOutput(error=str(e))
+                    output = DiffusionOutput.from_exception(e)
 
                 try:
-                    self.return_result(output)
+                    self._return_result(output)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending reply: {e}")
                     continue
 
         logger.info("event loop terminated.")
-        try:
-            self.worker.shutdown()
-        except Exception as exc:
-            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
-        self.context.term()
 
     @staticmethod
     def worker_main(
@@ -842,34 +971,62 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
+        shutdown_triggered = False
+
+        def signal_handler(signum: int, frame) -> None:
+            nonlocal shutdown_triggered
+            if not shutdown_triggered:
+                shutdown_triggered = True
+                raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
         set_death_signal(signal.SIGTERM)
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:
             import setproctitle
 
-            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+            setproctitle.setproctitle(f"vLLM-Omni::DiffusionWorker-{rank}")
         except ImportError:
             pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
-        worker_proc = WorkerProc(
-            od_config,
-            gpu_id=rank,
-            broadcast_handle=broadcast_handle,
-            wake_event=wake_event,
-            worker_extension_cls=worker_extension_cls,
-            custom_pipeline_args=custom_pipeline_args,
-        )
-        logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-            }
-        )
-        worker_proc.worker_busy_loop()
-        logger.info(f"Worker {rank}: Shutdown complete.")
+        worker_proc = None
+        try:
+            worker_proc = WorkerProc(
+                od_config,
+                gpu_id=rank,
+                broadcast_handle=broadcast_handle,
+                wake_event=wake_event,
+                worker_extension_cls=worker_extension_cls,
+                custom_pipeline_args=custom_pipeline_args,
+            )
+            logger.info(f"Worker {rank}: Scheduler loop started.")
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                }
+            )
+            worker_proc._worker_busy_loop()
+        except SystemExit:
+            logger.info("Worker %d: Shutdown signal received, starting cleanup.", rank)
+            raise
+        finally:
+            if worker_proc is not None:
+                try:
+                    worker_proc.worker.shutdown()
+                except Exception as exc:
+                    logger.warning("Worker %d: Shutdown encountered an error: %s", rank, exc)
+                worker_proc.context.term()
+            else:
+                # In case of signal interrupting worker_proc initialization
+                # where distributed env is initialized but worker_proc is still None
+                destroy_distributed_env()
+
+        logger.info("Worker %d: Shutdown complete.", rank)
 
 
 class WorkerWrapperBase:
@@ -970,48 +1127,30 @@ class WorkerWrapperBase:
 
         return worker_class
 
-    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """
-        Generate output for the given requests.
-
-        Args:
-            requests: List of diffusion requests
-
-        Returns:
-            DiffusionOutput with generated results
-        """
-        return self.worker.generate(requests)
-
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_job: KVPrefetchJob | None = None,
+    ) -> DiffusionOutput:
         """
         Execute a forward pass.
 
         Args:
-            reqs: List of diffusion requests
+            req: Diffusion request.
             od_config: OmniDiffusionConfig configuration
+            kv_prefetch_job: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config)
+        return self.worker.execute_model(req, od_config, kv_prefetch_job=kv_prefetch_job)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """
-        Load model weights.
-
-        Args:
-            weights: Iterable of (name, tensor) tuples
-
-        Returns:
-            Set of loaded weight names
-        """
-        return self.worker.load_weights(weights)
-
-    def sleep(self, level: int = 1) -> bool:
+    def sleep(self, level: int = 1) -> int:
         """
         Put the worker to sleep. The worker should not process any requests.
         The caller should guarantee that no requests are being processed
@@ -1019,11 +1158,11 @@ class WorkerWrapperBase:
 
         Args:
             level: The sleep level. Level 1 sleep will offload the model
-                weights and discard the kv cache.
-                Currently only support level 1.
+                weights and discard the kv cache. Level 2 also saves buffers.
+                Currently only support level 1 and level 2.
 
         Returns:
-            True on success
+            Bytes held by the allocator before sleeping.
         """
         return self.worker.sleep(level)
 
@@ -1044,10 +1183,10 @@ class WorkerWrapperBase:
         """
         return self.worker.wake_up(tags)
 
-    def handle_sleep_task(self, task):
+    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         return self.worker.handle_sleep_task(task)
 
-    def handle_wake_task(self, task):
+    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK | None:
         return self.worker.handle_wake_task(task)
 
     def shutdown(self) -> None:

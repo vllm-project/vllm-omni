@@ -46,6 +46,9 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = coordinator
+    scheduler.requests = {}
+    scheduler.running = []
+    scheduler.waiting = []
 
     def fake_finish_requests(self, request_ids, finished_status):
         assert request_ids == ["req-a", "req-b"]

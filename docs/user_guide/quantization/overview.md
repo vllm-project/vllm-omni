@@ -20,7 +20,7 @@ type has a different quantization scope.
 | NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ✅ | ❌ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ✅ | ❌ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ✅ | ❌ |
-| AMD ROCm | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ❌ |
+| AMD ROCm | ⭕ | ⭕ | ⭕ | ⭕ | ✅ | ⭕ | ⭕ | ❌ |
 | Intel XPU | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
 | Ascend NPU | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ |
 

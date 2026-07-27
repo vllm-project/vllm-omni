@@ -1,0 +1,37 @@
+# Stage config for Step-Audio2 CI tests
+# Single Thinker stage (audio/text understanding → text). ASR/text-output
+# tests don't need Token2Wav; a two-stage config would deadlock on stage-1 skip.
+
+# The following config has been verified on 2x 24GB GPU (L4/RTX3090/RTX4090).
+stage_args:
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: StepAudio2ThinkerForConditionalGeneration
+      tensor_parallel_size: 1
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.8
+      skip_mm_profiling: true
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: text  # Output text + audio tokens
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 256
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05

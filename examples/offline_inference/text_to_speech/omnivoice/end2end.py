@@ -21,7 +21,6 @@ import os
 import numpy as np
 import soundfile as sf
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -35,7 +34,7 @@ def run_e2e():
         help="Model name or path (HuggingFace or local)",
     )
     parser.add_argument(
-        "--stage-config",
+        "--deploy-config",
         type=str,
         default="vllm_omni/deploy/omnivoice.yaml",
     )
@@ -86,17 +85,16 @@ def run_e2e():
         default=None,
         help="Random seed for generation",
     )
-    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
 
-    if not os.path.exists(args.stage_config):
-        raise FileNotFoundError(f"Stage config not found: {args.stage_config}")
+    if not os.path.exists(args.deploy_config):
+        raise FileNotFoundError(f"Deploy config not found: {args.deploy_config}")
 
     print(f"Initializing OmniVoice with model={args.model}")
 
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.stage_config,
+        deploy_config=args.deploy_config,
         log_stats=True,
     )
 

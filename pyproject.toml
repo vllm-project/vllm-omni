@@ -36,44 +36,63 @@ classifiers = [
 [project.optional-dependencies]
 
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
-    "pytest-mock>=3.10.0",
-    "datasets>=2.14.0",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "pytest-mock==3.15.1",
+    "websockets==16.1",
+    "pytest-subtests==0.15.0",
+    "datasets==3.6.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
-    "openai-whisper>=20250625",
-    "psutil>=7.2.0",
-    "soundfile>=0.13.1",
-    "imageio[ffmpeg]>=0.6.0",
-    "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine-cuda13>=0.3.9",
-    "av", # for ComfyUI tests
-    "openpyxl>=3.0.0", # for nightly CI
-    "pyttsx3>=2.99",
-    "opencc>=1.2.0",
-    "mistune>=3.2.0", # for example tests
-    "torchmetrics>=1.4.0", # for accuracy similarity metrics
-    "ray[default]", # for RL test
-    "jiwer>=3.0.0",
-    "zhon>=2.0.0",
-    "zhconv>=1.4.2",
-    "scipy>=1.10.0",
-    "funasr>=1.0.0",
-    "lpips>=0.1.4", # for quantization fp8
-    "orjson>=3.11.7", # to make v1/embeddings API fast
-    "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
-    "torchdiffeq>=0.2.5" # for covo_audio Test
+    "openai-whisper==20250625",
+    "psutil==7.2.2",
+    "soundfile==0.14.0",
+    "imageio[ffmpeg]==2.37.4",
+    "opencv-python==5.0.0.93",
+    "mooncake-transfer-engine-cuda13==0.3.11.post1",
+    "av==18.0.0", # for ComfyUI tests
+    "openpyxl==3.1.5", # for nightly CI
+    "pyttsx3==2.99",
+    "opencc==1.4.1",
+    "mistune==3.3.4", # for example tests
+    "torchmetrics==1.9.0", # for accuracy similarity metrics
+    "ray[default]==2.56.1", # for RL test
+    "jiwer==4.0.0",
+    "zhon==2.1.1",
+    "zhconv==1.4.3",
+    "scipy==1.18.0",
+    "funasr==1.3.29",
+    "lpips==0.1.4", # for quantization fp8
+    "orjson==3.11.9", # to make v1/embeddings API fast
+    "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
+    "torchdiffeq==0.2.5", # for covo_audio Test
+    "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
+    "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
+    "s3tokenizer==0.3.0", # for tts test
+    "step-audio2==1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
 ]
 
 demo = [
-    "gradio>=6.7.0",
+    "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
+    "requests>=2.28.0",  # cli/stream_client HTTP
+    "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+forced-aligner = [
+    "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
 # Local-test-only extras
 local = [
     "FlagEmbedding",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
 ]
 
 docs = [
@@ -91,6 +110,12 @@ docs = [
     "pydantic",
 ]
 
+soulx-svs = [
+    "funasr>=1.0.0",
+    "g2pM>=0.1.2.5",
+    "g2p-en>=2.1.0",
+    "ToJyutping>=3.2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
@@ -101,6 +126,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 [project.scripts]
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
+# Register vllm-omni's model registrations on every vllm subprocess. vllm
+# auto-loads anything advertised under `vllm.general_plugins` in its own
+# `load_general_plugins()`, so worker subprocesses spawned by vllm (which
+# only import vllm, not vllm_omni) will still pick up the omni archs.
+[project.entry-points."vllm.general_plugins"]
+vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
+
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -108,7 +140,6 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]
-"vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -149,6 +180,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+# MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
+# These files keep upstream conventions (star imports, long lines, math-symbol
+# argument names) so they stay easy to diff against upstream releases.
+"vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+"vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
@@ -196,6 +232,7 @@ markers = [
     "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
@@ -224,6 +261,7 @@ markers = [
     "skipif_npu: Skip if the num of NPU cards is less than the required",
     "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
+    "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
 ]
@@ -249,6 +287,7 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    ".*updator.*",
     "byt5.*",
 ]
 extend-ignore-re = [
@@ -261,5 +300,12 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Step-Audio reasoning parser streams `</think>` tokens split across chunks
+# (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
+# parser logic and tests and is not a typo of "the"/"this".
+thi = "thi"
 ND = "ND"
 byt5 = "byt5"
+# "seeked" is the standard HTML media element DOM event name (fires when a
+# seek completes), used by the word-timestamps Gradio demo. Not a typo.
+seeked = "seeked"

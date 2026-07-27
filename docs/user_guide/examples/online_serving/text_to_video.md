@@ -13,6 +13,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` |
 
 ## Wan2.2 T2V
 
@@ -90,15 +91,25 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files
+  (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete/open
+  operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_TTL`: optional TTL for generated files in
+  seconds
+- `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL`: optional sweep interval in
+  seconds for enforcing file TTL; defaults to `300` when TTL is set
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__FILE_TTL=86400
+export VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL=300
 ```
+
+See also: [Configuration Options](../../../configuration/README.md)
 
 ## API Calls
 
@@ -285,14 +296,14 @@ done
 
 ```bash
 vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+    --enforce-eager --boundary-ratio 1.0
 ```
 
 For multi-GPU memory reduction, you can enable HSDP:
 
 ```bash
 vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0 \
+    --enforce-eager --boundary-ratio 1.0 \
     --use-hsdp --hsdp-shard-size 2
 ```
 
@@ -363,6 +374,17 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "guidance_scale=3.0" \
   -F "seed=42"
 ```
+
+## LTX-2.3
+
+LTX-2.3 uses a Diffusers-format checkpoint and a dedicated pipeline class:
+
+```bash
+vllm serve diffusers/LTX-2.3-Diffusers --omni --port 8098 \
+    --model-class-name LTX23Pipeline
+```
+
+Send requests through the same `/v1/videos` API shown in the LTX-2 example.
 
 ## Example materials
 

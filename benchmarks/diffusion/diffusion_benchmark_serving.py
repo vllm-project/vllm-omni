@@ -73,12 +73,17 @@ Usage:
             {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
         ]'
 
+    v2v:
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --endpoint /v1/videos --dataset random --task v2v --num-prompts 1 \
+        --height 720 --width 1280 --fps 24 --num-frames 189 --num-inference-steps 35
 
 """
 
 import argparse
 import ast
 import asyncio
+import base64
 import glob
 import json
 import logging
@@ -105,6 +110,9 @@ from PIL import Image
 from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
+
+_STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
+_RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 
 
 class BaseDataset(ABC):
@@ -538,11 +546,17 @@ class TraceDataset(BaseDataset):
         if not image_paths:
             single = row.get("image_path")
             image_paths = [single] if single else None
+        video_paths = row.get("video_paths")
+        if not video_paths:
+            single_video = row.get("video_path")
+            video_paths = [single_video] if single_video else None
 
         if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i", "it2i"]:
             raise ValueError(
                 f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
             )
+        if not video_paths and self.args.task == "v2v":
+            raise ValueError("Task v2v requires video input, but no video_path or video_paths found in trace row.")
 
         override_w = self.args.width
         override_h = self.args.height
@@ -566,6 +580,7 @@ class TraceDataset(BaseDataset):
             timestamp=timestamp,
             slo_ms=slo_ms,
             image_paths=image_paths,
+            video_paths=video_paths,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
         )
 
@@ -585,6 +600,8 @@ class CustomDataset(BaseDataset):
     - seed (optional): Random seed
     - image_paths (optional): List of input image paths for i2i/i2v/ti2i tasks
     - image_urls (optional): List of input image URLs (alternative to image_paths)
+    - video_paths (optional): List of input video paths for v2v tasks
+    - video_urls (optional): List of input video URLs (alternative to video_paths)
 
     Example JSONL for ti2i:
     {"prompt": "Add sunset lighting", "width": 1024, "height": 1024, "image_urls": ["https://example.com/image.jpg"]}
@@ -656,6 +673,42 @@ class CustomDataset(BaseDataset):
 
         return None
 
+    def _resolve_video_paths(self, item: dict) -> list[str] | None:
+        if "video_paths" in item and item["video_paths"]:
+            paths = item["video_paths"]
+            if isinstance(paths, str):
+                paths = [paths]
+
+            valid_paths = []
+            for path in paths:
+                if os.path.exists(path):
+                    valid_paths.append(path)
+                else:
+                    raise ValueError(f"Video file not found: {path}")
+
+            return valid_paths if valid_paths else None
+
+        if "video_urls" in item and item["video_urls"]:
+            urls = item["video_urls"]
+            if isinstance(urls, str):
+                urls = [urls]
+
+            downloaded_paths = []
+            for url in urls:
+                try:
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    suffix = os.path.splitext(url)[1] or ".mp4"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(response.content)
+                        downloaded_paths.append(tmp.name)
+                except Exception as e:
+                    raise ValueError(f"Failed to download video from {url}: {e}")
+
+            return downloaded_paths if downloaded_paths else None
+
+        return None
+
     def __len__(self) -> int:
         return len(self.data)
 
@@ -668,11 +721,22 @@ class CustomDataset(BaseDataset):
         height = item.get("height", self.args.height)
         num_inference_steps = item.get("num_inference_steps", self.args.num_inference_steps)
         seed = item.get("seed", self.args.seed)
-        reserved_keys = {"prompt", "width", "height", "num_inference_steps", "seed", "image_paths", "image_urls"}
+        reserved_keys = {
+            "prompt",
+            "width",
+            "height",
+            "num_inference_steps",
+            "seed",
+            "image_paths",
+            "image_urls",
+            "video_paths",
+            "video_urls",
+        }
         extra_body = {k: v for k, v in item.items() if k not in reserved_keys}
 
         # Handle image paths/URLs
         image_paths = self._resolve_image_paths(item)
+        video_paths = self._resolve_video_paths(item)
 
         return RequestFuncInput(
             prompt=prompt,
@@ -680,6 +744,7 @@ class CustomDataset(BaseDataset):
             model=self.model,
             seed=seed,
             image_paths=image_paths,
+            video_paths=video_paths,
             extra_body=extra_body,
             width=width,
             height=height,
@@ -733,6 +798,10 @@ class RandomDataset(BaseDataset):
             self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
+        if self.args.task == "v2v":
+            self._random_video_path = self._generate_random_video_paths()
+        else:
+            self._random_video_path = None
 
     def __len__(self) -> int:
         return self.num_prompts
@@ -752,13 +821,15 @@ class RandomDataset(BaseDataset):
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
             params.update(profile)
+        prompt = str(params.pop("prompt", f"Random prompt {idx} for benchmarking diffusion models"))
         return RequestFuncInput(
-            prompt=f"Random prompt {idx} for benchmarking diffusion models",
+            prompt=prompt,
             api_url=self.api_url,
             model=self.model,
             seed=self.args.seed,
             extra_body=extra_body,
             image_paths=self._random_image_path,
+            video_paths=self._random_video_path,
             **params,
         )
 
@@ -776,6 +847,35 @@ class RandomDataset(BaseDataset):
             img.save(image_path)
             image_paths.append(image_path)
         return image_paths
+
+    def _generate_random_video_paths(self) -> list[str]:
+        video_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_video.mp4")
+        try:
+            import cv2
+
+            profile = self.random_request_config[0] if self.random_request_config else {}
+            width = int(self.args.width or profile.get("width") or 1280)
+            height = int(self.args.height or profile.get("height") or 720)
+            num_frames = int(self.args.num_frames or profile.get("num_frames") or 16)
+            fps = float(self.args.fps or profile.get("fps") or 8)
+            writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError("cv2.VideoWriter failed to open")
+            for frame_idx in range(num_frames):
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
+                x = int((frame_idx / max(num_frames - 1, 1)) * max(width - 96, 1))
+                y = height // 2
+                frame[:, :, 0] = 24
+                frame[:, :, 1] = 32
+                frame[:, :, 2] = 48
+                frame[max(y - 36, 0) : min(y + 36, height), x : min(x + 96, width), :] = (64, 128, 220)
+                writer.write(frame)
+            writer.release()
+            return [video_path]
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to generate synthetic v2v input video. Install opencv-python or provide a custom dataset."
+            ) from e
 
 
 def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:
@@ -1013,6 +1113,81 @@ def calculate_metrics(
     return metrics
 
 
+def _save_generated_outputs(
+    outputs: list[RequestFuncOutput],
+    requests_list: list[RequestFuncInput],
+    save_dir: str,
+) -> None:
+    """Decode and save base64 images/videos from successful responses."""
+    os.makedirs(save_dir, exist_ok=True)
+    saved = 0
+    failed = 0
+
+    for idx, (req, out) in enumerate(zip(requests_list, outputs)):
+        if not out.success or not out.response_body:
+            continue
+
+        if isinstance(out.response_body, bytes):
+            fname = f"req_{idx:04d}.mp4"
+            fpath = os.path.join(save_dir, fname)
+            with open(fpath, "wb") as f:
+                f.write(out.response_body)
+            saved += 1
+            continue
+
+        media_urls: list[str] = []
+
+        # Chat-completions style: choices[*].message.content[*].image_url.url
+        choices = out.response_body.get("choices", [])
+        if isinstance(choices, list):
+            for choice in choices:
+                content = (choice or {}).get("message", {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "image_url":
+                        continue
+                    url = (item.get("image_url") or {}).get("url", "")
+                    if isinstance(url, str) and url.startswith("data:"):
+                        media_urls.append(url)
+
+        # Images endpoint style: data[*].b64_json
+        data_items = out.response_body.get("data", [])
+        if isinstance(data_items, list):
+            for data_item in data_items:
+                if not isinstance(data_item, dict):
+                    continue
+                b64_json = data_item.get("b64_json", "")
+                if isinstance(b64_json, str) and b64_json:
+                    media_urls.append(f"data:image/png;base64,{b64_json}")
+
+        for img_idx, url in enumerate(media_urls):
+            if "," not in url:
+                continue
+
+            try:
+                header, b64_data = url.split(",", 1)
+                ext = "png"
+                if "image/jpeg" in header:
+                    ext = "jpg"
+                elif "image/webp" in header:
+                    ext = "webp"
+                elif "video/mp4" in header:
+                    ext = "mp4"
+
+                img_bytes = base64.b64decode(b64_data)
+                fname = f"req_{idx:04d}_{img_idx}.{ext}"
+                fpath = os.path.join(save_dir, fname)
+                with open(fpath, "wb") as f:
+                    f.write(img_bytes)
+                saved += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Failed to save image for request {idx}: {e}", exc_info=True)
+
+    logger.info(f"Saved {saved} generated image(s) to {save_dir}. Failed to save {failed} image(s).")
+
+
 def wait_for_service(base_url: str, timeout: int = 120) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
@@ -1033,7 +1208,7 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
 
 
 def _default_endpoint_for_task(task: str) -> str:
-    if task in {"t2v", "i2v", "ti2v"}:
+    if task in {"t2v", "i2v", "ti2v", "v2v"}:
         return "/v1/videos"
     if task in {"i2i", "ti2i", "it2i"}:
         return "/v1/images/edits"
@@ -1047,7 +1222,7 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
-    VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
+    VIDEO_TASKS = {"t2v", "i2v", "ti2v", "v2v"}
     IMAGE_TASKS = {"t2i", "i2i", "ti2i", "it2i"}
 
     if args.task in VIDEO_TASKS:
@@ -1094,6 +1269,14 @@ async def benchmark(args):
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
+        for req in requests_list:
+            req.extra_body.setdefault(_RETURN_STAGE_METRICS_FIELD, True)
+    if args.extra_body:
+        extra_body = json.loads(args.extra_body)
+        for req in requests_list:
+            req.extra_body.update(extra_body)
 
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
@@ -1202,6 +1385,9 @@ async def benchmark(args):
 
     print("\n" + "=" * 60)
 
+    if args.save_dir:
+        _save_generated_outputs(outputs, requests_list, args.save_dir)
+
     if args.output_file:
         with open(args.output_file, "w") as f:
             json.dump(metrics, f, indent=2)
@@ -1242,7 +1428,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "it2i", "t2i"],
+        choices=["t2v", "i2v", "ti2v", "v2v", "ti2i", "i2i", "it2i", "t2i"],
         help="Task type.",
     )
     parser.add_argument(
@@ -1278,11 +1464,18 @@ if __name__ == "__main__":
         default=1,
         help="Number of warmup requests to run before measurement.",
     )
+    # NOTE Changed default from 1 to 2 because some models (e.g., Bagel) run
+    # `num_timesteps - 1` denoising iterations. A default of 1 results in 0 steps,
+    # which causes errors.
+    # TODO If this slightly longer warmup causes regression issues for other
+    # diffusion pipelines in the future, consider implementing model-specific
+    # overrides instead of a global default.
     parser.add_argument(
         "--warmup-num-inference-steps",
         type=int,
-        default=1,
-        help="num_inference_steps used for warmup requests.",
+        default=2,
+        help="Number of inference steps used for warmup requests. "
+        "Default is 2 to ensure at least one denoising step is executed.",
     )
     parser.add_argument(
         "--warmup-concurrency",
@@ -1323,6 +1516,13 @@ if __name__ == "__main__":
         default=3.0,
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Directory to save generated images/outputs for visual inspection. "
+        "If not set, generated outputs are discarded after metric collection.",
+    )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
     parser.add_argument(
         "--enable-negative-prompt",
@@ -1344,6 +1544,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="JSON object merged into every generated request body/form.",
+    )
+    parser.add_argument(
         "--num-input-images",
         type=int,
         default=1,
@@ -1357,6 +1563,11 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--return-stage-metrics",
+        action="store_true",
+        help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
 
     args = parser.parse_args()

@@ -38,7 +38,8 @@ from pathlib import Path
 import soundfile as sf
 import torch
 from vllm import SamplingParams
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 # Prevent multiprocessing from re-importing CUDA in the wrong context.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -155,7 +156,7 @@ def main(args) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="MOSS-TTS-Nano offline inference")
+    parser = TrackingArgumentParser(description="MOSS-TTS-Nano offline inference")
     parser.add_argument("--text", default="Hello, this is MOSS-TTS-Nano speaking.", help="Text to synthesize.")
     parser.add_argument(
         "--ref-audio",

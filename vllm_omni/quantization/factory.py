@@ -3,35 +3,82 @@
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
-The only extension point is _OVERRIDES for methods that need a
-different QuantizationConfig subclass in the OMNI context (e.g. GGUF).
+Out-of-tree integrations can register Omni-specific builders with
+register_quantization_override().
 """
 
 from __future__ import annotations
 
 import inspect
+import sys
 from collections.abc import Callable, Mapping
+from types import ModuleType
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import (
+
+
+# ---------------------------------------------------------------------------
+# Stub the ``humming`` package so that vLLM's lazy import inside
+# ``get_quantization_config()`` (which unconditionally does
+# ``from .humming import HummingConfig``) does not crash when the real
+# ``humming`` wheel is not installed.  Only populate the bare-minimum
+# names that ``humming.py`` accesses at module level.
+# ---------------------------------------------------------------------------
+def _register_humming_stubs() -> None:
+    """Register stub ``humming`` sub-modules so that the optional
+    humming quantization backend can be imported without the real wheel."""
+    if "humming" in sys.modules:
+        return  # already present (real or stub)
+
+    # --- sub-modules ---
+    submodules: dict[str, tuple[str, ...]] = {
+        "humming": (),
+        "humming.config": ("GemmType",),
+        "humming.dtypes": ("DataType",),
+        "humming.layer": ("HummingLayerMeta", "HummingMethod"),
+        "humming.schema": (
+            "BaseInputSchema",
+            "BaseWeightSchema",
+            "HummingInputSchema",
+            "HummingWeightSchema",
+        ),
+        "humming.utils": (),
+        "humming.utils.weight": ("quantize_weight",),
+    }
+
+    registry: dict[str, ModuleType] = {}
+    for name, attrs in submodules.items():
+        mod = ModuleType(name)
+        for attr in attrs:
+            setattr(mod, attr, type(attr, (), {}))
+        registry[name] = mod
+
+    # wire parent references
+    registry["humming"].config = registry["humming.config"]
+    registry["humming"].dtypes = registry["humming.dtypes"]
+    registry["humming"].layer = registry["humming.layer"]
+    registry["humming"].schema = registry["humming.schema"]
+    registry["humming"].utils = registry["humming.utils"]
+    registry["humming.utils"].weight = registry["humming.utils.weight"]
+
+    for name, mod in registry.items():
+        sys.modules[name] = mod
+
+
+_register_humming_stubs()
+
+from vllm.model_executor.layers.quantization import (  # noqa: E402
     QUANTIZATION_METHODS,
     get_quantization_config,
 )
-from vllm.model_executor.layers.quantization.base_config import (
+from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
     QuantizationConfig,
 )
 
-from .component_config import ComponentQuantizationConfig
+from .component_config import ComponentQuantizationConfig  # noqa: E402
 
 logger = init_logger(__name__)
-
-
-def _build_gguf(**kw: Any) -> QuantizationConfig:
-    """Lazy import to avoid pulling in CUDA/pynvml at module load time."""
-    from .gguf_config import DiffusionGGUFConfig
-
-    return DiffusionGGUFConfig(**kw)
 
 
 def _build_int8(**kw: Any) -> QuantizationConfig:
@@ -39,6 +86,13 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     from .int8_config import DiffusionInt8Config
 
     return DiffusionInt8Config(**kw)
+
+
+def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
+    """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
+    from .bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    return DiffusionBitsAndBytesConfig(**kw)
 
 
 def _build_mxfp8(**kw: Any) -> QuantizationConfig:
@@ -86,8 +140,8 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
-    "gguf": _build_gguf,
     "int8": _build_int8,
+    "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
@@ -96,7 +150,24 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "auto_round": _build_inc,
 }
 
-SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+def _compute_supported_quantization_methods() -> list[str]:
+    return list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+
+SUPPORTED_QUANTIZATION_METHODS: list[str] = _compute_supported_quantization_methods()
+
+
+def _refresh_registered_methods() -> None:
+    SUPPORTED_QUANTIZATION_METHODS[:] = _compute_supported_quantization_methods()
+    global _CACHED_ALIAS_MAP
+    _CACHED_ALIAS_MAP = None
+
+
+def register_quantization_override(method: str, builder: Callable[..., QuantizationConfig]) -> None:
+    """Register an Omni-specific quantization config builder."""
+    _OVERRIDES[_normalize_method_name(method)] = builder
+    _refresh_registered_methods()
 
 
 def _build_reverse_alias_map() -> dict[str, str]:

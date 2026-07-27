@@ -1,0 +1,17 @@
+# Experimental validation profile: one thinker and two Stage1 replicas.
+# This is not a recommended production entrypoint.
+#
+# Stage 0: GPU 0
+# Stage 1: replicas on GPU 1 and 2
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+
+stages:
+  - stage_id: 0
+    async_scheduling: false
+
+  - stage_id: 1
+    devices: "1,2"
+    num_replicas: 2
+    async_scheduling: false

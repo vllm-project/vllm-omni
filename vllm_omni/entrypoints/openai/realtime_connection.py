@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import cast
 from uuid import uuid4
 
 import numpy as np
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection as VllmRealtimeConnection
-from vllm.entrypoints.openai.realtime.protocol import TranscriptionDelta, TranscriptionDone
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -82,13 +82,21 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
         mm = getattr(output, "multimodal_output", None)
-        if not isinstance(mm, dict):
+        if mm is None:
+            return [], 24000
+        # Support both MultimodalPayload and plain dict
+        if not isinstance(mm, Mapping):
             return [], 24000
 
         sr = mm.get("sr") or mm.get("sample_rate") or mm.get("audio_sample_rate") or 24000
+        if isinstance(sr, (list, tuple)) and sr:
+            sr = sr[-1]
+        if hasattr(sr, "item"):
+            sr = sr.item()
+        sample_rate_hz = int(sr)
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         if key is None:
-            return [], int(sr)
+            return [], sample_rate_hz
 
         raw_audio = mm.get(key)
         chunks: list[np.ndarray] = []
@@ -101,7 +109,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             arr = self._tensor_to_numpy(raw_audio)
             if arr is not None and arr.size > 0:
                 chunks.extend(self._raw_waveform_to_deltas(arr))
-        return chunks, int(sr)
+        return chunks, sample_rate_hz
 
     @staticmethod
     def _pcm16_b64(audio_f32: np.ndarray) -> str:
@@ -120,7 +128,6 @@ class RealtimeConnection(VllmRealtimeConnection):
         full_text = ""
         prompt_token_ids_len = 0
         completion_tokens_len = 0
-        last_prompt_token_ids_len = 0  # detect Stage-0 segment rollover
         self._realtime_audio_ref = None
 
         # Coerce cumulative outputs to delta outputs; this ensures
@@ -139,40 +146,26 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
 
             async for output in result_gen:
-                # Handle delta texts; this is very similar to the client from vLLM
-                if output.outputs and len(output.outputs) > 0:
+                stage_id = getattr(output, "stage_id", None)
+                if stage_id == 0 and output.outputs:
                     first_output = output.outputs[0]
                     new_token_ids = list(first_output.token_ids)
-                    new_tokens_len = len(new_token_ids)
-
-                    cur_prompt_token_ids_len = len(output.prompt_token_ids or [])
-                    # Stage-0 segment rollover: buffer_realtime_audio may yield
-                    # multiple TokensPrompt segments and the second segment's
-                    # prompt_token_ids include the first segment's decoded output.
-                    # Clear accumulated full_text at the boundary so the
-                    # carried-over prefix is not duplicated in the final
-                    # TranscriptionDone.text.
-                    stage_id = getattr(output, "stage_id", None)
-                    if stage_id == 0 and cur_prompt_token_ids_len > last_prompt_token_ids_len > 0:
-                        full_text = ""
-                    last_prompt_token_ids_len = cur_prompt_token_ids_len
-
-                    if not prompt_token_ids_len and output.prompt_token_ids:
-                        prompt_token_ids_len = len(output.prompt_token_ids)
-
-                    if new_tokens_len:
+                    if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
+
+                    if output.prompt_token_ids:
+                        prompt_token_ids_len = max(
+                            prompt_token_ids_len,
+                            len(output.prompt_token_ids),
+                        )
 
                     delta_text = first_output.text or ""
                     full_text += delta_text
+                    completion_tokens_len += len(new_token_ids)
 
-                    # append output to input if there was any delta text
                     if delta_text:
                         await self.send(TranscriptionDelta(delta=delta_text))
 
-                    completion_tokens_len += new_tokens_len
-
-                # Handle audio chunking; this is Omni specific
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
 
                 for chunk in audio_chunks:

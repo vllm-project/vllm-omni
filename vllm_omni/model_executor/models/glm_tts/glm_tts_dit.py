@@ -472,10 +472,6 @@ class GLMTTSDiT(nn.Module):
         self.num_heads = heads
         self.spkr_emb_adaln = spkr_emb_adaln
 
-        # Frame rates for block-causal mask token→mel conversion
-        self._input_frame_rate: float = 25.0
-        self._mel_framerate: float = 50.0
-
         # Speaker embedding dimension for AdaLN
         if spkr_emb_adaln:
             additional_dim = spkr_dim + 256 if use_wavlm_emb else spkr_dim

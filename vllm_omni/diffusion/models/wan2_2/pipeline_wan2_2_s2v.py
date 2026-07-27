@@ -13,7 +13,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -42,6 +42,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -282,61 +283,60 @@ def get_wan22_s2v_pre_process_func(
     """
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            # -- Reference image --
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if raw_image is None:
-                raise ValueError(
-                    "No reference image provided. S2V requires a reference image. "
-                    'Set `"multi_modal_data": {"image": <path or PIL.Image>, ...}`'
-                )
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image).convert("RGB")
-            elif isinstance(raw_image, PIL.Image.Image):
-                image = raw_image
-            else:
-                raise TypeError(f"Unsupported image type {type(raw_image)}")
-
-            # -- Audio --
-            raw_audio = multi_modal_data.get("audio", None) if multi_modal_data is not None else None
-            if raw_audio is None:
-                raise ValueError(
-                    "No audio provided. S2V requires an audio file path. "
-                    'Set `"multi_modal_data": {"audio": "<path>", ...}`'
-                )
-
-            # -- Compute target size --
-            max_area = 720 * 1280
-            if request.sampling_params.height is not None and request.sampling_params.width is not None:
-                height, width = request.sampling_params.height, request.sampling_params.width
-            else:
-                ref_h, ref_w = image.height, image.width
-                height, width = _get_size_less_than_area(ref_h, ref_w, target_area=max_area)
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = height
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = width
-
-            # Resize + center-crop reference image to target size
-            resize_op = transforms.Resize(min(height, width))
-            crop_op = transforms.CenterCrop((height, width))
-            ref_pil = crop_op(resize_op(image))
-
-            prompt["multi_modal_data"]["image"] = ref_pil
-            prompt["additional_information"]["audio_path"] = raw_audio
-            prompt["additional_information"]["pose_video"] = (
-                multi_modal_data.get("pose_video", None) if multi_modal_data is not None else None
+        # -- Reference image --
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if raw_image is None:
+            raise ValueError(
+                "No reference image provided. S2V requires a reference image. "
+                'Set `"multi_modal_data": {"image": <path or PIL.Image>, ...}`'
             )
-            prompt["additional_information"]["init_first_frame"] = (
-                multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image).convert("RGB")
+        elif isinstance(raw_image, PIL.Image.Image):
+            image = raw_image
+        else:
+            raise TypeError(f"Unsupported image type {type(raw_image)}")
+
+        # -- Audio --
+        raw_audio = multi_modal_data.get("audio", None) if multi_modal_data is not None else None
+        if raw_audio is None:
+            raise ValueError(
+                'No audio provided. S2V requires an audio file path. Set `"multi_modal_data": {"audio": "<path>", ...}`'
             )
-            request.prompts[i] = prompt
+
+        # -- Compute target size --
+        max_area = 720 * 1280
+        if request.sampling_params.height is not None and request.sampling_params.width is not None:
+            height, width = request.sampling_params.height, request.sampling_params.width
+        else:
+            ref_h, ref_w = image.height, image.width
+            height, width = _get_size_less_than_area(ref_h, ref_w, target_area=max_area)
+            if request.sampling_params.height is None:
+                request.sampling_params.height = height
+            if request.sampling_params.width is None:
+                request.sampling_params.width = width
+
+        # Resize + center-crop reference image to target size
+        resize_op = transforms.Resize(min(height, width))
+        crop_op = transforms.CenterCrop((height, width))
+        ref_pil = crop_op(resize_op(image))
+
+        prompt["multi_modal_data"]["image"] = ref_pil
+        prompt["additional_information"]["audio_path"] = raw_audio
+        prompt["additional_information"]["pose_video"] = (
+            multi_modal_data.get("pose_video", None) if multi_modal_data is not None else None
+        )
+        prompt["additional_information"]["init_first_frame"] = (
+            multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
+        )
+        request.prompt = prompt
 
         return request
 
@@ -482,6 +482,7 @@ class Wan22S2VPipeline(
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
+    dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(
         self,
@@ -605,13 +606,17 @@ class Wan22S2VPipeline(
 
         t5_checkpoint = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
         self.text_encoder = UMT5EncoderModel(_WAN_UMT5_CONFIG)
-        self.text_encoder = _load_wan_t5_as_umt5(self.text_encoder, t5_checkpoint, dtype=dtype).to(self.device)
+        _cpu_offload = self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload
+        self.text_encoder = _load_wan_t5_as_umt5(self.text_encoder, t5_checkpoint, dtype=dtype)
+        if not _cpu_offload:
+            self.text_encoder = self.text_encoder.to(self.device)
 
         # -- VAE (original Wan2.1 VAE, loaded via diffusers from_single_file) --
         vae_pth = os.path.join(model_path, "Wan2.1_VAE.pth")
         self.vae = DistributedAutoencoderKLWan.from_single_file(vae_pth, torch_dtype=dtype)
         self.vae.init_distributed()
-        self.vae = self.vae.to(self.device)
+        if not _cpu_offload:
+            self.vae = self.vae.to(self.device)
 
         # -- Audio encoder (wav2vec2) --
         wav2vec_path = os.path.join(model_path, "wav2vec2-large-xlsr-53-english")
@@ -929,21 +934,19 @@ class Wan22S2VPipeline(
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """Forward pass through the S2V transformer to predict noise.
 
-        The S2V model returns a list of tensors (one per batch element).
-        We take the first element since S2V processes one sample at a time.
+        With return_dict=False, the model returns (output,) where output is [B, C, T, H, W].
+        We squeeze batch dim since S2V processes one sample at a time.
         """
         if current_model is None:
             current_model = self.transformer
-        # WanModel_S2V's norm layers compute in float32; autocast ensures
-        # the float32→bfloat16 casts happen automatically (matching the
-        # original Wan2.2 inference path).
         param_dtype = next(current_model.parameters()).dtype
         with torch.amp.autocast(self.device.type, dtype=param_dtype):
             result = current_model(**kwargs)
-        # WanModel_S2V.forward returns a list of tensors
         if isinstance(result, list):
             return result[0]
-        return result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            return result[0].squeeze(0)
+        return result.sample.squeeze(0)
 
     def diffuse(
         self,
@@ -996,32 +999,29 @@ class Wan22S2VPipeline(
                 latent_model_input = [latents.to(device)]
                 timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
 
-                # -- Positive (conditional) prediction kwargs --
                 positive_kwargs = {
-                    "x": latent_model_input,
-                    "t": timestep,
-                    "context": prompt_embeds[0:1],
-                    "seq_len": max_seq_len,
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds[0:1],
                     "cond_states": cond_latents,
                     "motion_latents": input_motion_latents,
                     "ref_latents": ref_latents,
-                    "motion_frames": motion_frames,
                     "drop_motion_frames": drop_first_motion,
-                    "audio_emb": positive_audio_emb,
+                    "encoder_hidden_states_audio": positive_audio_emb,
+                    "return_dict": False,
                 }
 
                 if do_true_cfg:
                     negative_kwargs = {
-                        "x": latent_model_input,
-                        "t": timestep,
-                        "context": negative_prompt_embeds[0:1],
-                        "seq_len": max_seq_len,
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds[0:1],
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
-                        "motion_frames": motion_frames,
                         "drop_motion_frames": drop_first_motion,
-                        "audio_emb": negative_audio_emb,
+                        "encoder_hidden_states_audio": negative_audio_emb,
+                        "return_dict": False,
                     }
                 else:
                     negative_kwargs = None
@@ -1054,7 +1054,7 @@ class Wan22S2VPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | None = None,
@@ -1174,7 +1174,7 @@ class Wan22S2VPipeline(
         ref_latents = self.encode_ref_image(image, height, width, device=device).to(dtype=dtype)
 
         # ---- 4. Initial motion latents (zeros) ----
-        motion_frames = self.motion_frames
+        motion_frames = min(self.motion_frames, infer_frames - 1)
         motion_pixels = torch.zeros(
             [1, 3, motion_frames, height, width],
             dtype=dtype,
@@ -1288,6 +1288,10 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
+            if self.od_config.enable_cpu_offload and not getattr(self.od_config.parallel_config, "use_hsdp", False):
+                self.transformer.to("cpu")
+                current_omni_platform.empty_cache()
+
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
                 decode_latents = torch.cat([motion_latents, latents_for_decode], dim=2)

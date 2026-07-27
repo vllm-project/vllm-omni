@@ -12,7 +12,7 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A serene mountain landscape at sunset"
@@ -24,6 +24,20 @@ NEGATIVE_PROMPT = "blurry, low quality, distorted"
 # that provide good performance improvements.
 def _get_diffusion_feature_cases(model: str):
     return [
+        # CFG Parallel + Tensor Parallel + CPU offload
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--cfg-parallel-size",
+                    "2",
+                    "--tensor-parallel-size",
+                    "2",
+                    "--enable-cpu-offload",
+                ],
+            ),
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
         # Cache-DiT + CFG Parallel + Tensor Parallel
         pytest.param(
             OmniServerParams(

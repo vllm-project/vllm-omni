@@ -14,14 +14,14 @@ from vllm_omni.model_executor.models.covo_audio.prompt_utils import (
 
 models = ["tencent/Covo-Audio-Chat"]
 stage_config = get_deploy_config_path("covo_audio.yaml")
-test_params = [(model, stage_config) for model in models]
+test_params = [(model, stage_config, {"trust_remote_code": True}) for model in models]
 
 
 def get_question():
     return "请回答这段音频里的问题。"
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)

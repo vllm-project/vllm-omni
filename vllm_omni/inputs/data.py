@@ -21,33 +21,39 @@ from vllm.inputs.engine import TokensInput
 
 
 class OmniTextPrompt(TextPrompt):
-    """Text prompt with optional embeddings and additional information.
+    """Text prompt with optional embeddings and stage payloads.
 
     Extends TextPrompt to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     negative_prompt: NotRequired[str]
+    # Using modalities field to differentiate between different tasks for the same pipeline
+    # for example Cosmos3OmniDiffusersPipeline handles t2i and t2v in the same pipeline.
+    modalities: NotRequired[list[str]]
     prompt_embeds: NotRequired[torch.Tensor]
     negative_prompt_embeds: NotRequired[torch.Tensor]
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniTokensPrompt(TokensPrompt):
-    """Tokens prompt with optional embeddings and additional information.
+    """Tokens prompt with optional embeddings and stage payloads.
 
     Extends TokensPrompt to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     negative_prompt: NotRequired[str]
@@ -58,10 +64,11 @@ class OmniTokensPrompt(TokensPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniTokenInputs(TokensInput):
-    """Token inputs with optional embeddings and additional information.
+    """Token inputs with optional embeddings and stage payloads.
 
     Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
@@ -69,8 +76,9 @@ class OmniTokenInputs(TokensInput):
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
             aligned with token IDs
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the inputs
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the inputs.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     # New: optional prompt embeddings aligned with token ids
@@ -81,18 +89,20 @@ class OmniTokenInputs(TokensInput):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniEmbedsPrompt(EmbedsPrompt):
-    """Embeddings prompt with optional additional information.
+    """Embeddings prompt with optional stage payloads.
 
     Extends EmbedsPrompt to support additional information payloads
     for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     # New: optional prompt embeddings aligned with token ids
@@ -102,6 +112,7 @@ class OmniEmbedsPrompt(EmbedsPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniCustomPrompt(TypedDict, total=False):
@@ -140,6 +151,7 @@ def token_inputs_omni(
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
     additional_information: dict[str, Any] | None = None,
+    model_intermediate_buffer: dict[str, Any] | None = None,
 ) -> OmniTokenInputs:
     """Construct token inputs with optional embeddings and metadata.
 
@@ -151,8 +163,9 @@ def token_inputs_omni(
         prompt: Optional prompt string
         cache_salt: Optional cache salt for prefix caching
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists)
+        additional_information: Legacy optional dictionary containing
+            additional information (tensors or lists).
+        model_intermediate_buffer: Optional runner-owned stage payload.
 
     Returns:
         OmniTokenInputs instance with the provided data
@@ -167,6 +180,8 @@ def token_inputs_omni(
         inputs["prompt_embeds"] = prompt_embeds
     if additional_information is not None:
         inputs["additional_information"] = additional_information
+    if model_intermediate_buffer is not None:
+        inputs["model_intermediate_buffer"] = model_intermediate_buffer
 
     return inputs
 
@@ -245,6 +260,7 @@ class OmniDiffusionSamplingParams:
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
+    guidance_scale_2_provided: bool = False
     guidance_rescale: float = 0.0
     strength: float | None = None  # I2I: Z-Image specific now, uses to control denoising start timestep
     decode_timestep: float | list[float] | None = None
@@ -323,6 +339,15 @@ class OmniDiffusionSamplingParams:
 
     @property
     def resolved_frame_rate(self) -> float | None:
+        """Frame rate the model should run at, or ``None`` if the user did not provide one.
+
+        Precedence is ``frame_rate`` (the model-internal rate) over ``fps`` (the
+        request/output-encoding alias). Returns ``None`` when neither was set, which is
+        the model-agnostic "fps not provided" signal the video serving layer emits when
+        the request omits fps. Consumers MUST treat ``None`` as "use your own default" and
+        guard the read (e.g. ``req.sampling_params.resolved_frame_rate or 24.0``); never
+        feed it into arithmetic unguarded.
+        """
         if self.frame_rate is not None:
             return float(self.frame_rate)
 

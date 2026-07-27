@@ -1,17 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities.
+"""Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities."""
 
-These tests verify HSDP configuration logic without requiring a distributed environment.
-"""
+import gc
+import os
+import socket
 
 import pytest
+import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.tensor import DeviceMesh, DTensor
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+from vllm_omni.diffusion.distributed.hsdp import (
+    HSDPInferenceConfig,
+    _unshardable_parameters,
+    shard_model,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu, pytest.mark.core_model]
+
+
+class _PackedBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+        self.packed_weight = nn.Parameter(torch.ones(2, 2, dtype=torch.uint8), requires_grad=False)
+        self.input_global_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+
+
+class _PackedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = _PackedBlock()
+        self.root_weight = nn.Parameter(torch.ones(2))
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.fixture(scope="module")
+def cpu_process_group():
+    if dist.is_initialized():
+        yield
+        return
+
+    master_port = _find_free_port()
+    os.environ.update(
+        {
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(master_port),
+        }
+    )
+    dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"):
+            os.environ.pop(key, None)
+        gc.collect()
+
+
+def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
+    model = _PackedModel()
+    ignored_params = _unshardable_parameters(model)
+    expected_ignored = {model.block.packed_weight, model.block.input_global_scale}
+    assert ignored_params == expected_ignored
+
+    packed_weight = model.block.packed_weight
+    input_global_scale = model.block.input_global_scale
+    shard_model(
+        model,
+        mesh=DeviceMesh("cpu", [0]),
+        hsdp_shard_conditions=[lambda name, _module: name == "block"],
+        ignored_params=ignored_params,
+    )
+
+    assert isinstance(model.block.weight, DTensor)
+    assert isinstance(model.root_weight, DTensor)
+    assert model.block.packed_weight is packed_weight
+    assert model.block.input_global_scale is input_global_scale
+    assert not isinstance(model.block.packed_weight, DTensor)
+    assert not isinstance(model.block.input_global_scale, DTensor)
 
 
 class TestHSDPInferenceConfig:

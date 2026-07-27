@@ -176,7 +176,7 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | None,
+    multimodal_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -188,6 +188,7 @@ def talker2code2wav_async_chunk(
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
+    pooling_output = multimodal_output
 
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)

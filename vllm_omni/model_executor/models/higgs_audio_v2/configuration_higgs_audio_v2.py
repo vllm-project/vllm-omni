@@ -155,15 +155,3 @@ class HiggsAudioV2Config(PretrainedConfig):
     @property
     def num_real_codes(self) -> int:
         return self.audio_stream_bos_id  # i.e. 1024 for the boson-ai checkpoint
-
-    # The full vocab size of each per-codebook output head.
-    @property
-    def codebook_output_size(self) -> int:
-        return self.codebook_size  # i.e. 1026 for the boson-ai checkpoint
-
-    # Canonical MusicGen-style delay pattern used by
-    # `HiggsAudioV2DelayPatternLogitsProcessor`: codebook k starts emitting
-    # real codes only after k frames. Kept as a function so subclasses can
-    # override if upstream ever publishes a different convention.
-    def default_delay_pattern(self) -> list[int]:
-        return list(range(self.num_codebooks))

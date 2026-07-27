@@ -6,6 +6,8 @@ Tests that standard OpenAI API parameters (max_tokens, temperature, etc.)
 are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
+from types import SimpleNamespace
+
 import pytest
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
@@ -485,6 +487,35 @@ def test_build_sampling_params_list_empty_stop_preserves_yaml(serving_chat, mock
     # Empty lists should NOT override — YAML defaults are preserved
     assert comprehension_params.stop == []
     assert comprehension_params.stop_token_ids == []
+
+
+def test_to_sampling_params_list_pads_missing_tail_stage_with_defaults():
+    """AURA callers may pass 3 semantic model params for a 4-stage engine pipeline."""
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    instance = object.__new__(OmniOpenAIServingChat)
+    default_params = [
+        SamplingParams(max_tokens=10),
+        SamplingParams(max_tokens=20),
+        SamplingParams(max_tokens=30),
+        SamplingParams(max_tokens=40),
+    ]
+    instance.engine_client = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm") for _ in range(4)],
+        default_sampling_params_list=default_params,
+    )
+
+    result = instance._to_sampling_params_list(
+        [
+            {"max_tokens": 1},
+            {"max_tokens": 2},
+            {"max_tokens": 3},
+        ]
+    )
+
+    assert len(result) == 4
+    assert [params.max_tokens for params in result] == [1, 2, 3, 40]
+    assert result[3] is not default_params[3]
 
 
 # =============================================================================

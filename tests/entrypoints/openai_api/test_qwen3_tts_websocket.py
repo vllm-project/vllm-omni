@@ -102,7 +102,7 @@ async def _run_ws_session(host: str, port: int, model: str) -> dict:
 class TestQwen3TTSWebSocket:
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=4)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", tts_ws_server_params, indirect=True)
     def test_streaming_pcm_output(self, omni_server) -> None:
         result = asyncio.run(_run_ws_session(omni_server.host, omni_server.port, omni_server.model))
@@ -113,9 +113,9 @@ class TestQwen3TTSWebSocket:
         session_done = result["session_done"]
 
         assert session_done is not None
-        assert session_done["total_sentences"] == 2
-        assert len(starts) == 2
-        assert len(dones) == 2
+        assert session_done["total_sentences"] == 1
+        assert len(starts) == 1
+        assert len(dones) == 1
 
         for idx, start in enumerate(starts):
             assert start["type"] == "audio.start"

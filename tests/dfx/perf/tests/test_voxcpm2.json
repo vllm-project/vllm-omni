@@ -1,9 +1,24 @@
 [
   {
     "test_name": "test_voxcpm2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "tts"
+    ],
     "server_params": {
       "model": "openbmb/VoxCPM2",
-      "trust_remote_code": true
+      "trust_remote_code": true,
+      "extra_cli_args": [
+        "--trust-remote-code"
+      ]
     },
     "benchmark_params": [
       {
@@ -23,10 +38,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            600
+            137.645
           ],
           "median_audio_rtf": [
-            0.2
+            0.0497
           ]
         }
       },
@@ -47,13 +62,13 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            3500
+            475.3357
           ],
           "median_audio_rtf": [
-            0.85
+            0.1243
           ],
           "audio_throughput": [
-            8
+            36.6358
           ]
         }
       },
@@ -100,10 +115,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            350
+            79.6927
           ],
           "median_audio_rtf": [
-            0.15
+            0.0423
           ]
         }
       },
@@ -127,13 +142,13 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            3000
+            262.6212
           ],
           "median_audio_rtf": [
-            0.5
+            0.0753
           ],
           "audio_throughput": [
-            10
+            103.5843
           ]
         }
       },
@@ -157,13 +172,13 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            500
+            80.1095
           ],
           "median_audio_rtf": [
-            0.3
+            0.0479
           ],
           "audio_throughput": [
-            5
+            17.2918
           ]
         }
       },

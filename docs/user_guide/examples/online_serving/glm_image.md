@@ -19,7 +19,7 @@ both stages on a single GPU, override per stage:
 
 ```bash
 vllm serve zai-org/GLM-Image --omni --port 8091 \
-    --stage-0-devices 0 --stage-1-devices 0
+    --stage-overrides '{"0": {"devices": "0"}, "1": {"devices": "0"}}'
 ```
 
 ## API Calls

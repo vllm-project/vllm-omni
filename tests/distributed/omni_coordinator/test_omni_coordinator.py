@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import threading
 import time
 
 import pytest
@@ -48,6 +49,33 @@ def _drain_sub_messages(sub: zmq.Socket, max_seconds: float = 0.4) -> None:
         _recv_replica_list(sub, timeout_ms=50)
 
 
+def test_omni_coordinator_wait_for_shutdown_unblocks_on_close():
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    coordinator = OmniCoordinator(
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
+        heartbeat_timeout=1000.0,
+    )
+
+    waiter = threading.Thread(target=coordinator.wait_for_shutdown)
+    waiter.start()
+    time.sleep(0.05)
+    assert waiter.is_alive()
+
+    coordinator.close()
+    waiter.join(timeout=1.0)
+    assert not waiter.is_alive()
+
+
 def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
     """Rapid updates should be coalesced into fewer PUB messages."""
     router_addr = get_engine_client_zmq_addr(
@@ -68,13 +96,13 @@ def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
-    sub.connect(pub_addr)
+    sub.connect(coordinator.pub_zmq_addr)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     time.sleep(0.3)  # PUB/SUB slow-joiner
 
     client = OmniCoordClientForStage(
-        router_addr,
+        coordinator.router_zmq_addr,
         "tcp://stage:coalesce",
         "tcp://stage:coalesce-out",
         0,
@@ -131,7 +159,7 @@ def test_omni_coordinator_registration_broadcast():
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
-    sub.connect(pub_addr)
+    sub.connect(coordinator.pub_zmq_addr)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     # ZMQ PUB/SUB slow-joiner: allow SUB to connect before clients register.
@@ -139,9 +167,9 @@ def test_omni_coordinator_registration_broadcast():
 
     # Create 3 stage clients; each auto-registers on init.
     clients = [
-        OmniCoordClientForStage(router_addr, "tcp://stage:10001", "tcp://stage:10001-out", 0),
-        OmniCoordClientForStage(router_addr, "tcp://stage:10002", "tcp://stage:10002-out", 0),
-        OmniCoordClientForStage(router_addr, "tcp://stage:10003", "tcp://stage:10003-out", 1),
+        OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:10001", "tcp://stage:10001-out", 0),
+        OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:10002", "tcp://stage:10002-out", 0),
+        OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:10003", "tcp://stage:10003-out", 1),
     ]
 
     msg = _wait_for_replica_list(sub, expected_count=3)
@@ -183,19 +211,19 @@ def test_omni_coordinator_heartbeat_timeout_handling():
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
-    sub.connect(pub_addr)
+    sub.connect(coordinator.pub_zmq_addr)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     time.sleep(0.3)
 
     # A and B: real clients that send heartbeats every 5s.
-    client_a = OmniCoordClientForStage(router_addr, "tcp://stage:a", "tcp://stage:a-out", 0)
-    client_b = OmniCoordClientForStage(router_addr, "tcp://stage:b", "tcp://stage:b-out", 0)
+    client_a = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:a", "tcp://stage:a-out", 0)
+    client_b = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:b", "tcp://stage:b-out", 0)
 
     # C: raw DEALER that sends only registration, no heartbeat.
     dealer_ctx = zmq.Context.instance()
     dealer_c = dealer_ctx.socket(zmq.DEALER)
-    dealer_c.connect(router_addr)
+    dealer_c.connect(coordinator.router_zmq_addr)
     reg_event = {
         "input_addr": "tcp://stage:c",
         "output_addr": "tcp://stage:c-out",
@@ -254,12 +282,12 @@ def test_omni_coordinator_replica_shutdown_handling():
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
-    sub.connect(pub_addr)
+    sub.connect(coordinator.pub_zmq_addr)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     time.sleep(0.3)  # PUB/SUB slow-joiner
 
-    client = OmniCoordClientForStage(router_addr, "tcp://stage:shutdown", "tcp://stage:shutdown-out", 0)
+    client = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:shutdown", "tcp://stage:shutdown-out", 0)
 
     msg = _wait_for_replica_list(sub, expected_count=1)
     assert msg is not None

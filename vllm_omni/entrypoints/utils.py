@@ -1,4 +1,4 @@
-import argparse
+import json
 import os
 import types
 from collections import Counter
@@ -12,8 +12,9 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.config.stage_config import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -24,79 +25,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = init_logger(__name__)
 
 
-def _warn_deprecated_explicit_keys(kwargs: dict[str, Any]) -> None:
-    if "cli_explicit_keys" in kwargs:
-        import warnings
-
-        warnings.warn(
-            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-
-
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
-
-
-def detect_explicit_cli_keys(
-    argv: list[str],
-    parser: argparse.ArgumentParser | None = None,
-) -> set[str]:
-    """Walk ``argv`` and return the set of ``dest`` attribute names the user
-    explicitly provided (e.g. ``--max-num-seqs 64`` → ``max_num_seqs``).
-
-    Used to distinguish user-typed CLI args from argparse default values so
-    deploy YAMLs are not silently overridden by parser defaults. Shared
-    across online (``vllm serve``) and offline (scripts, examples, tests,
-    CI) entry points — offline callers that parse CLI args via argparse
-    should invoke this on ``sys.argv[1:]`` and pass the result through to
-    ``AsyncOmni`` / ``Omni`` via the ``_cli_explicit_keys`` kwarg.
-
-    When ``parser`` is provided, each token is looked up in the parser's
-    action table to find its real ``dest``. This correctly handles flags
-    with ``dest=`` overrides, alias flags (e.g. ``--usp`` /
-    ``--ulysses-degree`` both mapping to ``ulysses_degree``), and
-    ``--disable-foo`` / ``store_false`` patterns that map to a differently
-    named dest. Callers with access to an ``argparse.ArgumentParser`` should
-    always pass it.
-
-    When ``parser`` is ``None``, a name-based heuristic is used as a
-    fallback (hyphens → underscores, plus a ``no_`` prefix strip for
-    ``argparse.BooleanOptionalAction``). This is correct for simple flags
-    but silently misidentifies ``--disable-X``-style flags and explicit
-    ``dest=`` overrides, so prefer the parser-aware form.
-    """
-    if parser is not None:
-        dest_map: dict[str, str] = {}
-        for action in parser._actions:
-            for opt in action.option_strings:
-                dest_map[opt] = action.dest
-        explicit: set[str] = set()
-        for tok in argv:
-            if not tok.startswith("--"):
-                continue
-            flag = tok.split("=", 1)[0]
-            dest = dest_map.get(flag)
-            if dest is not None:
-                explicit.add(dest)
-        return explicit
-
-    # Fallback: name-based heuristic (legacy path for callers without a parser).
-    explicit = set()
-    for tok in argv:
-        if not tok.startswith("--"):
-            continue
-        name = tok[2:].split("=", 1)[0]
-        if not name:
-            continue
-        attr = name.replace("-", "_")
-        explicit.add(attr)
-        # BooleanOptionalAction: --no-foo records as dest `foo`, not `no_foo`.
-        if attr.startswith("no_"):
-            explicit.add(attr[3:])
-    return explicit
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -358,6 +289,9 @@ def resolve_model_config_path(model: str) -> str:
                 )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
+    if model_type == "vla" and _looks_like_dreamzero(model):
+        model_type = "dreamzero"
+
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
         normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
     else:
@@ -380,58 +314,89 @@ def resolve_model_config_path(model: str) -> str:
 
 def load_stage_configs_from_model(
     model: str,
+    *,
+    trust_remote_code: bool,
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-    **deprecated_kwargs: Any,
-) -> list:
+    strategy_config_path: str | None = None,
+) -> tuple[list, str | None]:
     """Load stage configurations from model's default config file.
 
     For models registered in the pipeline registry (new path), uses
-    ``StageConfigFactory.create_from_model()`` which merges
+    ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
     For other models (legacy path), loads stage configs from YAML.
 
     Args:
         model: Model name or path (used to determine model_type)
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
+        strategy_config_path: Optional path to a composable-parallel
+            ``strategy.yaml`` whose derived sizing is overlaid onto the
+            registry-merged stages (opt-in; ignored on the legacy YAML path).
 
     Returns:
-        List of stage configuration dictionaries
+        ``(stage_configs, omni_lb_policy)``: the list of stage configuration
+        dictionaries plus the strategy-derived pipeline-wide ``omni_lb_policy``
+        (``None`` when no strategy set one). The policy is returned rather than
+        written into a caller-provided mutable dict.
     """
-    _warn_deprecated_explicit_keys(deprecated_kwargs)
-
     if base_engine_args is None:
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+    cli_overrides["trust_remote_code"] = trust_remote_code
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
                 cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
-    stages = StageConfigFactory.create_from_model(
+    # Current runtime initialization still consumes legacy OmegaConf stage
+    # configs. ``StageConfigFactory.create_from_model`` now produces the
+    # structured ``VllmOmniConfig`` object; future RFC #4021 changes will
+    # migrate the engine/runtime consumers and replace this legacy resolver.
+    strategy_specs = None
+    if strategy_config_path is not None:
+        from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
+
+        strategy_specs = load_strategy_specs(strategy_config_path)
+
+    stages, omni_lb_policy = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
+        trust_remote_code=trust_remote_code,
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
+        strategy_specs=strategy_specs,
     )
     if stages is not None:
         # Convert StageConfig objects to OmegaConf for backward compat
-        return [stage.to_omegaconf() for stage in stages]
+        return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
-    # Legacy fallback: load from YAML
+    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
+    # applied here (it overlays onto registry-merged stages), so warn rather than
+    # silently dropping the operator's --strategy-config.
+    if strategy_config_path is not None:
+        logger.warning(
+            "--strategy-config (%s) was provided but model %r resolves via the "
+            "legacy stage_configs YAML path, which does not support "
+            "composable-parallel strategies; the strategy is ignored. Use a "
+            "registry-based model to apply it.",
+            strategy_config_path,
+            model,
+        )
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
-        return []
+        return [], None
     stage_configs = load_stage_configs_from_yaml(
         config_path=stage_config_path,
         base_engine_args=base_engine_args,
         prefer_stage_engine_args=True,
     )
-    return stage_configs
+    return stage_configs, None
 
 
 def load_stage_configs_from_yaml(
@@ -570,30 +535,56 @@ def filter_stages(
         return stage_configs
 
 
+def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
+    """Parse the ``--stage-overrides`` value into a per-stage override dict.
+
+    ``value`` may be a raw JSON string (as supplied on the CLI) or an
+    already-parsed mapping. Returns ``None`` when no overrides are given.
+
+    Raises:
+        ValueError: when ``value`` is a string that is not valid JSON.
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
+    return value
+
+
 def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
     kwargs: dict | None,
+    *,
+    trust_remote_code: bool,
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-    **deprecated_kwargs: Any,
-) -> tuple[str, list]:
+    strategy_config_path: str | None = None,
+) -> tuple[str, list, str | None]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
     Args:
         model: Model name or path
         stage_configs_path: Optional path to legacy YAML (stage_args format)
         kwargs: Engine arguments to merge with stage configs
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
         deploy_config_path: Optional path to deploy YAML (new format).
             Mutually exclusive with ``stage_configs_path``.
         stage_overrides: Per-stage overrides from ``--stage-overrides`` JSON.
             Keys are stage_id strings, values are dicts of overrides.
+        strategy_config_path: Optional path to a composable-parallel
+            ``strategy.yaml`` overlaid onto the registry-merged stages.
 
     Returns:
-        Tuple of (config_path, stage_configs)
+        Tuple of ``(config_path, stage_configs, omni_lb_policy)`` — the last is
+        the strategy-derived pipeline-wide load-balancer policy (``None`` when no
+        strategy set one), returned for the engine to apply.
     """
     if stage_configs_path is not None and deploy_config_path is not None:
         raise ValueError(
@@ -621,15 +612,16 @@ def load_and_resolve_stage_configs(
                 stage_configs_path,
             )
 
-    _warn_deprecated_explicit_keys(deprecated_kwargs)
-
+    omni_lb_policy: str | None = None
     if deploy_config_path is not None:
         config_path = deploy_config_path
-        stage_configs = load_stage_configs_from_model(
+        stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -639,10 +631,12 @@ def load_and_resolve_stage_configs(
                 stage_configs = []
     elif stage_configs_path is None:
         config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(
+        stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -657,7 +651,7 @@ def load_and_resolve_stage_configs(
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
     logger.debug(f"stage_configs: {stage_configs}")
 
-    return config_path, stage_configs
+    return config_path, stage_configs, omni_lb_policy
 
 
 def get_final_stage_id_for_e2e(

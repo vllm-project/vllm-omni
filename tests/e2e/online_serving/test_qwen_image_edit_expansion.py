@@ -33,6 +33,16 @@ def _get_diffusion_feature_cases(model: str):
             OmniServerParams(
                 model=model,
                 server_args=[
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
                     "--cache-backend",
                     "cache_dit",
                     "--enable-layerwise-offload",

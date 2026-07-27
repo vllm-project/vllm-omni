@@ -586,8 +586,17 @@ class TestDistributedReceive:
                 return_value=0,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once()
         assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
@@ -642,6 +651,15 @@ class TestDistributedReceive:
                 return_value=1,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
         ):
             assert mgr.receive_multi_kv_cache_distributed(req) is True
 
@@ -666,7 +684,27 @@ class TestDistributedReceive:
         world_group = _MockBroadcastGroup(world_size=2, rank_in_group=1)
         mgr.receive_multi_kv_cache = MagicMock(return_value=True)
 
-        with patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group):
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=None),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
+        ):
             assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once_with(req, None, torch.device("cpu"))
@@ -722,7 +760,7 @@ class TestDistributedReceive:
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         # Verify behavior based on role
         if is_owner:
@@ -817,7 +855,7 @@ class TestDistributedReceive:
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         # Verify behavior based on role
         if role == "owner":
@@ -897,6 +935,76 @@ class TestDistributedReceive:
 
 
 # ── TP auto-detect ───────────────────────────────────────────────────
+
+
+class TestBuildCfgRankLocalPayloads:
+    """Guard _build_cfg_rank_local_payloads padding logic for the
+    cfg_size==2 / no branch_roles scenario (hunyuan-image shared-prefix reuse)."""
+
+    def test_cfg_size2_no_branch_roles_copies_main_payload_to_follower(self):
+        """When AR doesn't split KV by branch, cfg follower (rank 1) should
+        receive a copy of the positive KV, not None."""
+        req = SimpleNamespace(
+            request_id="req-1",
+            past_key_values=SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+            kv_metadata={"seq_len": 10},
+            sampling_params=SimpleNamespace(),
+        )
+        payloads = OmniKVTransferManager._build_cfg_rank_local_payloads(req, cfg_size=2)
+
+        assert len(payloads) == 2
+        # Rank 0: main payload (always present)
+        assert payloads[0] is not None
+        assert "past_key_values" in payloads[0]
+        # Rank 1: must also be non-None — same positive KV for shared-prefix reuse
+        assert payloads[1] is not None
+        assert payloads[1]["past_key_values"] is req.past_key_values
+        assert payloads[1]["kv_metadata"] == {"seq_len": 10}
+
+    def test_cfg_size3_no_branch_roles_keeps_none_padding(self):
+        """When cfg_size > 2 and no branch_roles, padding stays None (safety guard)."""
+        req = SimpleNamespace(
+            request_id="req-1",
+            past_key_values=SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+            kv_metadata={"seq_len": 10},
+            sampling_params=SimpleNamespace(),
+        )
+        payloads = OmniKVTransferManager._build_cfg_rank_local_payloads(req, cfg_size=3)
+
+        assert len(payloads) == 3
+        assert payloads[0] is not None
+        assert payloads[1] is None
+        assert payloads[2] is None
+
+    def test_empty_main_payload_keeps_none_padding(self):
+        """When main_payload is empty, padding stays None even with cfg_size==2."""
+        req = SimpleNamespace(
+            request_id="req-1",
+            sampling_params=SimpleNamespace(),
+        )
+        payloads = OmniKVTransferManager._build_cfg_rank_local_payloads(req, cfg_size=2)
+
+        assert len(payloads) == 2
+        # No past_key_values → main_payload is empty dict → falsy → padding stays None
+        assert payloads[1] is None
+
+    def test_with_branch_roles_uses_original_behavior(self):
+        """When branch_roles exist, follower payload comes from branch KV, not padding."""
+        req = SimpleNamespace(
+            request_id="req-1",
+            past_key_values=SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+            kv_metadata={"seq_len": 10},
+            sampling_params=SimpleNamespace(
+                cfg_text_past_key_values=SimpleNamespace(key_cache=[torch.tensor([2.0])]),
+                cfg_text_kv_metadata={"source": "cfg_text"},
+            ),
+        )
+        payloads = OmniKVTransferManager._build_cfg_rank_local_payloads(req, cfg_size=2)
+
+        assert len(payloads) == 2
+        assert payloads[0] is not None
+        assert payloads[1] is not None
+        assert payloads[1]["sp.cfg_active_branch"] == "cfg_text"
 
 
 class TestAutoDetectTP:

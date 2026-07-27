@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm_omni.diffusion import diffusion_engine
+from vllm_omni.diffusion import io_support
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -13,12 +13,12 @@ def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.Mo
         dummy_run_num_frames = 2
 
     monkeypatch.setattr(
-        diffusion_engine.DiffusionModelRegistry,
+        io_support.DiffusionModelRegistry,
         "_try_load_model_cls",
         lambda model_class_name: JointAudioVideoModel,
     )
 
-    assert diffusion_engine.get_dummy_run_num_frames("joint_audio_video", supports_audio_input=False) == 2
+    assert io_support.get_dummy_run_num_frames("joint_audio_video", supports_audio_input=False) == 2
 
 
 def test_dummy_run_num_frames_keeps_audio_output_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -26,12 +26,12 @@ def test_dummy_run_num_frames_keeps_audio_output_default(monkeypatch: pytest.Mon
         support_audio_output = True
 
     monkeypatch.setattr(
-        diffusion_engine.DiffusionModelRegistry,
+        io_support.DiffusionModelRegistry,
         "_try_load_model_cls",
         lambda model_class_name: AudioOutputModel,
     )
 
-    assert diffusion_engine.get_dummy_run_num_frames("audio_output", supports_audio_input=False) == 2
+    assert io_support.get_dummy_run_num_frames("audio_output", supports_audio_input=False) == 2
 
 
 def test_dummy_run_num_frames_defaults_to_single_frame(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -39,19 +39,19 @@ def test_dummy_run_num_frames_defaults_to_single_frame(monkeypatch: pytest.Monke
         pass
 
     monkeypatch.setattr(
-        diffusion_engine.DiffusionModelRegistry,
+        io_support.DiffusionModelRegistry,
         "_try_load_model_cls",
         lambda model_class_name: VideoOnlyModel,
     )
 
-    assert diffusion_engine.get_dummy_run_num_frames("video_only", supports_audio_input=False) == 1
+    assert io_support.get_dummy_run_num_frames("video_only", supports_audio_input=False) == 1
 
 
 def test_dummy_run_num_frames_uses_audio_input_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        diffusion_engine.DiffusionModelRegistry,
+        io_support.DiffusionModelRegistry,
         "_try_load_model_cls",
         lambda model_class_name: None,
     )
 
-    assert diffusion_engine.get_dummy_run_num_frames("unknown", supports_audio_input=True) == 2
+    assert io_support.get_dummy_run_num_frames("unknown", supports_audio_input=True) == 2

@@ -1,0 +1,19 @@
+# Reference deploy knobs for Qwen/Qwen3-ForcedAligner-0.6B, the shared forced
+# aligner for streaming TTS word timestamps. Pass with --forced-aligner-config;
+# --forced-aligner overrides the model path without editing this file.
+#
+# Run as LLM(runner="pooling") with pooling_task="token_classify". Prompt tokens,
+# chat template and word segmentation are Qwen-specific and live in
+# qwen3_force_align_processor (not configurable here).
+
+forced_aligner:
+  model: Qwen/Qwen3-ForcedAligner-0.6B
+  runner: pooling
+  architecture: Qwen3ASRForcedAlignerForTokenClassification
+  pooling_task: token_classify
+
+  gpu_memory_utilization: 0.30
+
+  dtype: bfloat16
+  max_model_len: 4096
+  trust_remote_code: true

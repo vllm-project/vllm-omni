@@ -10,7 +10,7 @@ This guide demonstrates how to use the newly added features for extending vLLM-O
 Three main features enable custom pipeline extension:
 
 1. **`WorkerWrapperBase`**: A wrapper class that enables dynamic worker extension with custom functionality
-2. **`load_format`**: A parameter that controls how diffusion models are loaded, including support for custom pipelines
+2. **`diffusion_load_format`**: A parameter that controls how diffusion models are loaded, including support for custom pipelines
 3. **`CustomPipelineWorkerExtension`**: An extension class that enables pipeline re-initialization with custom implementations
 
 ## Features
@@ -27,15 +27,15 @@ Three main features enable custom pipeline extension:
 
 **Location:** `vllm_omni/diffusion/worker/diffusion_worker.py`
 
-### load_format Parameter
+### diffusion_load_format parameter
 
-The `load_format` parameter controls how diffusion models are loaded. It supports the following values:
+The `diffusion_load_format` parameter controls the initial diffusion model load. The relevant values are:
 
 - **`"default"`**: Standard model loading using the model registry (default behavior)
-- **`"custom_pipeline"`**: Load a custom pipeline class specified by `custom_pipeline_name`
-- **`"dummy"`**: Skip model loading (useful for testing or when pipeline will be initialized separately)
+- **`"dummy"`**: Skip the initial model load; use this with `custom_pipeline_args["pipeline_class"]` for the custom pipeline workflow below
+- **`"diffusers"`**: Load through the Hugging Face Diffusers adapter
 
-**Location:** `vllm_omni/diffusion/model_loader/diffusers_loader.py`
+**Location:** `vllm_omni/diffusion/data.py` (`OmniDiffusionConfig`)
 
 ### CustomPipelineWorkerExtension
 
@@ -54,20 +54,24 @@ Create a custom pipeline class that extends an existing pipeline. In this exampl
 
 ```python
 # custom_pipeline.py
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenImageEditPipeline
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 import torch
 
 class CustomPipeline(QwenImageEditPipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
 
-    def forward(self, req, prompt=None, negative_prompt=None, **kwargs):
+    def forward(self, req: DiffusionRequestBatch):
+        # Optionally customize sampling parameters
+        actual_num_steps = req.sampling_params.num_inference_steps or 50
+        req.sampling_params.num_inference_steps = actual_num_steps
+
         # Call parent's forward to get normal output
-        output = super().forward(req=req, prompt=prompt, negative_prompt=negative_prompt, **kwargs)
+        output = super().forward(req=req)
 
         # Add custom trajectory data
-        actual_num_steps = req.sampling_params.num_inference_steps or kwargs.get('num_inference_steps', 50)
         output.trajectory_timesteps = torch.linspace(1000, 0, actual_num_steps, dtype=torch.float32)
         output.trajectory_latents = torch.randn(actual_num_steps, 1, 16, 64, 64, dtype=torch.float32)
 

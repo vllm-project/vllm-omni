@@ -144,7 +144,6 @@ _DYNIN_CONFIG_CANDIDATE_RELPATHS = (
     "configs/dynin_omni.yaml",
     "models/configs/dynin_omni.yaml",
     "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml",
-    "vllm_omni/model_executor/stage_configs/dynin_omni.yaml",
     "dynin_omni.yaml",
 )
 
@@ -482,7 +481,6 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
     for bundled in (
         module_root / "configs" / "dynin_omni.yaml",
         module_root / "models" / "configs" / "dynin_omni.yaml",
-        module_root.parent / "stage_configs" / "dynin_omni.yaml",
     ):
         if bundled.exists():
             return str(bundled)

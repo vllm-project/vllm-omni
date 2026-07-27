@@ -14,7 +14,7 @@ import torch
 # ── Load modules without triggering vllm_omni.__init__ ─────────────
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_ENGINE_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "engine"
+_OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
 
 
 def _load_module(name: str, filepath: Path):
@@ -26,12 +26,16 @@ def _load_module(name: str, filepath: Path):
 
 
 _om_mod = _load_module(
-    "vllm_omni.engine.output_modality",
-    _ENGINE_DIR / "output_modality.py",
+    "vllm_omni.outputs.output_modality",
+    _OUTPUTS_DIR / "output_modality.py",
+)
+_load_module(
+    "vllm_omni.outputs.utils",
+    _OUTPUTS_DIR / "utils.py",
 )
 _mm_mod = _load_module(
-    "vllm_omni.engine.mm_outputs",
-    _ENGINE_DIR / "mm_outputs.py",
+    "vllm_omni.outputs.mm_outputs",
+    _OUTPUTS_DIR / "mm_outputs.py",
 )
 
 OutputModality = _om_mod.OutputModality
@@ -81,7 +85,7 @@ def test_multimodal_payload_and_completion_output():
     assert p is not None
     assert "waveform" in p.tensors and torch.equal(p.primary_tensor, data["waveform"])
     assert p.metadata["sample_rate"] == 16000
-    assert not p.is_empty and len(p) == 1
+    assert not p.is_empty and len(p) == 2  # 1 tensor + 1 metadata
 
     # None/empty returns None
     assert MultimodalPayload.from_dict(None) is None
@@ -125,7 +129,7 @@ def test_output_modality_printed_examples(capsys):
     print(f"    tensors keys : {list(p.tensors.keys())}")
     print(f"    primary_tensor: shape={p.primary_tensor.shape}, dtype={p.primary_tensor.dtype}")
     print(f"    metadata      : {p.metadata}")
-    print(f"    is_empty={p.is_empty}, len={len(p)}")
+    print(f"    is_empty={p.is_empty}, len={len(p)}")  # len = tensors + metadata
     print(f"  from_dict(None) -> {MultimodalPayload.from_dict(None)}")
     print(f"  from_dict({{}})   -> {MultimodalPayload.from_dict({})}")
 

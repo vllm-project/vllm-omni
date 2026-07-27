@@ -20,7 +20,7 @@ def _streaming_context() -> SimpleNamespace:
 
 
 def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNamespace) -> None:
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r1",
         [1, 2],
         [10, 11],
@@ -28,13 +28,11 @@ def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNam
     )
     assert inc_p == [1, 2]
     assert inc_o == [10, 11]
-    assert merged == [1, 2, 10, 11]
-    assert thinker_in == [1, 2]
 
 
 def test_get_streaming_talker_tokens_second_segment_accumulates(_streaming_context: SimpleNamespace) -> None:
     q3._get_streaming_talker_tokens("r2", [1, 2], [10, 11], streaming_context=_streaming_context)
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r2",
         [1, 2, 3, 4],
         [10, 11, 12, 13],
@@ -42,14 +40,12 @@ def test_get_streaming_talker_tokens_second_segment_accumulates(_streaming_conte
     )
     assert inc_p == [3, 4]
     assert inc_o == [12, 13]
-    assert merged == [1, 2, 10, 3, 4, 12, 13]
-    assert thinker_in == [1, 2, 10, 3, 4]
 
 
 def test_get_streaming_talker_tokens_new_prompt_len_snapshot_truncates(
     _streaming_context: SimpleNamespace,
 ) -> None:
-    inc_p, inc_o, merged, thinker_in = q3._get_streaming_talker_tokens(
+    inc_p, inc_o = q3._get_streaming_talker_tokens(
         "r3",
         [1, 2, 3, 4, 5, 6],
         [10],
@@ -58,8 +54,6 @@ def test_get_streaming_talker_tokens_new_prompt_len_snapshot_truncates(
     )
     assert inc_p == [1, 2, 3, 4]
     assert inc_o == [10]
-    assert merged == [1, 2, 3, 4, 10]
-    assert thinker_in == [1, 2, 3, 4]
 
 
 def test_get_streaming_talker_tokens_clear_state(_streaming_context: SimpleNamespace) -> None:
@@ -80,6 +74,72 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
     assert d3 == 1
     state = q3._get_qwen3_streaming_state("c1", _streaming_context)
     assert state.talker2code2wav_last_seq_len == 0
+
+
+def test_streaming_input_prefill_chunk_is_cached() -> None:
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    request = SimpleNamespace(
+        external_req_id="rt-1",
+        output_token_ids=[100],
+        all_token_ids=[151644, 872, 100],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = torch.ones(2, 3)
+    thinker_hid = torch.full((2, 3), 2.0)
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is None
+    cached = transfer_manager._pending_streaming_prefills["rt-1"]
+    assert torch.equal(cached["embed"]["prefill"], thinker_emb)
+    assert torch.equal(cached["hidden_states"]["output"], thinker_hid)
+    assert cached["ids"]["all"] == request.all_token_ids
+    assert cached["ids"]["prompt"] == request.prompt_token_ids
+
+
+def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
+    transfer_manager = SimpleNamespace(
+        _pending_streaming_prefills={
+            "rt-2": {
+                "embed": {"prefill": torch.ones(2, 3)},
+                "hidden_states": {"output": torch.full((2, 3), 2.0)},
+                "ids": {"all": [151644, 872, 100], "prompt": [151644, 872]},
+            }
+        }
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-2",
+        output_token_ids=[101],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = torch.full((1, 3), 3.0)
+    thinker_hid = torch.full((1, 3), 4.0)
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is not None
+    assert payload.embed.prefill.shape == (3, 3)
+    assert payload.hidden_states.output.shape == (3, 3)
+    assert payload.ids.all == [151644, 872, 100]
+    assert payload.ids.prompt == [151644, 872]
+    assert "rt-2" not in transfer_manager._pending_streaming_prefills
 
 
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
@@ -103,7 +163,7 @@ def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [10, 20, 11, 21, 12, 22]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_drops_count_matched_terminal_row() -> None:
@@ -144,7 +204,7 @@ def test_talker2code2wav_full_payload_drops_rows_aligned_to_non_codec_ids() -> N
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 0, 0]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
@@ -164,7 +224,7 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 7, 0, 8, 0, 9]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
@@ -187,9 +247,31 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["ids"]["all"] == [151644, 872, 3]
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
-    assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-1",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+    prompt = {
+        "additional_information": {
+            "speaker": ["ethan"],
+            "language": ["English"],
+        }
+    }
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt)
+
+    assert talker_prompt["additional_information"] == {
+        "speaker": ["ethan"],
+        "language": ["English"],
+    }
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:
@@ -880,7 +962,7 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
     prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
     out = thinker2talker_token_only(src, prompt=prompt)
     assert len(out) == 1
-    assert out[0]["prompt_token_ids"] == [0]  # talker self-tokenizes; dummy id
+    assert out[0]["prompt_token_ids"] == [0]
     info = out[0]["additional_information"]
     assert info["text"] == "hello world"
     assert info["voice_name"] == "ZH_FEMALE"

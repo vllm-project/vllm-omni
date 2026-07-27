@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Iterable
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
 logger = init_logger(__name__)
+
+_STATS_INTERVAL_S = 1.0
 
 # Upper bound on how long a request may sit in full-payload-input wait
 # (the state ``OmniSchedulingCoordinator`` records via ``_waiting_since``)
@@ -22,19 +27,23 @@ logger = init_logger(__name__)
 # Scope: this constant only covers the full-payload coordinator path
 # (``input_coordinator``).  The async-chunk path uses
 # ``chunk_transfer_adapter`` and is not affected by this constant.
-_INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "300")
+_INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
 except ValueError:
     logger.warning(
-        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 300 seconds.",
+        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 600 seconds.",
         _INPUT_WAIT_TIMEOUT_RAW,
     )
-    DEFAULT_INPUT_WAIT_TIMEOUT_S = 300.0
+    DEFAULT_INPUT_WAIT_TIMEOUT_S = 600.0
 
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    # ------------------------------------------------------------------ #
+    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
+    # ------------------------------------------------------------------ #
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -42,9 +51,30 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    # ------------------------------------------------------------------ #
-    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
-    # ------------------------------------------------------------------ #
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            adapter.segment_finished_requests.discard(session.request_id)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.additional_information = update.additional_information or None
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
@@ -64,7 +94,6 @@ class OmniSchedulerMixin:
             )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
-            self.running,
             connector_output.stage_recv_req_ids if connector_output else set(),
         )
 
@@ -147,27 +176,128 @@ class OmniSchedulerMixin:
             pending_input_registrations=pending_input_registrations,
         )
 
-    def _replace_session_with_streaming_update(
-        self,
-        session: Request,
-        update: StreamingUpdate,
-    ) -> None:
-        """For streaming input: Replace an existing streaming session payload with the latest update."""
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = update.prompt_token_ids or ()
-        session.additional_information = update.additional_information or None
-        # Update block hashes for the new tokens.
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(session.prompt_token_ids)
-        session.arrival_time = update.arrival_time
-        session.sampling_params = update.sampling_params
-        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        now = time.monotonic()
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+            return None
+        self._last_stats_time = now
+        return super().make_stats(*args, **kwargs)
 
-        if self.log_stats:
-            session.record_event(EngineCoreEventType.QUEUED)
+    def _realign_request_status_to_queues(
+        self,
+        request_ids: str | Iterable[str] | None,
+    ) -> None:
+        """Realign ``request.status`` to actual queue membership.
+
+        ``OmniChunkTransferAdapter._process_chunk_queue`` stamps
+        ``requests_origin_status[req.id] = WAITING`` (or ``RUNNING``) when
+        first parking a request in a chunk-transfer deque. On the next
+        tick, when the chunk arrives, ``_process_chunk_queue`` sets
+        ``request.status = target_status`` and continues, but
+        ``requests_origin_status`` is left at its first-park value -- no
+        hook updates it on the ``waiting → running`` admit transition
+        that ``super().schedule()`` later performs. The table stays
+        stale until the request makes another deque round-trip.
+
+        If an abort lands in the gap between admit and the next deque
+        round-trip, ``chunk_transfer_adapter.finish_requests`` reads the
+        stale ``WAITING`` from ``requests_origin_status``, stomps it
+        onto ``request.status``, and the upstream
+        ``Scheduler.finish_requests`` else branch silently fails to
+        remove from ``self.running`` -- the request stays alive in
+        ``self.running`` and the worker's ``input_batch`` slot leaks.
+        After ``max_num_seqs`` such aborts every new request hangs at
+        ``chunks=0`` until the client times out.
+
+        Realign here: if a request lives in ``self.running`` but its
+        status is not ``RUNNING``, set it to ``RUNNING``; symmetrically
+        flip ``RUNNING → WAITING`` when the request is actually in
+        ``self.waiting``. This is a localized safety net for
+        ``requests_origin_status`` staleness on the admit transition;
+        it does not touch the adapter's invariants and is complementary
+        to the chunk-transfer-adapter deque purge that already runs
+        inside ``process_pending_chunks`` / ``restore_queues``.
+
+        Note on scope: only the ``async_chunk`` path actually triggers
+        the ``requests_origin_status`` staleness this helper repairs.
+        When ``async_chunk`` is disabled, no chunk-transfer round-trip
+        occurs between admit and finish, so the realignment walk is a
+        cheap O(n) no-op over an already-aligned set. The call is kept
+        unconditional in ``finish_requests`` to (a) keep the abort path
+        uniform and (b) defend any future configuration that re-enables
+        chunk transfer from rediscovering the same regression.
+
+        See https://github.com/vllm-project/vllm-omni/pull/3774 and the
+        residual-hang reproduction discussed in that PR.
+        """
+        # Mirror the upstream Scheduler.finish_requests resolution of
+        # ``request_ids`` so realignment touches exactly the set that
+        # ``super().finish_requests`` will then walk.
+        if isinstance(request_ids, str):
+            ids_to_align: Iterable[str] = (request_ids,)
+        elif request_ids is None:
+            ids_to_align = list(self.requests.keys())
+        else:
+            ids_to_align = list(request_ids)
+
+        if not ids_to_align:
+            return
+
+        running_ids = {r.request_id for r in self.running}
+        waiting_ids = {r.request_id for r in self.waiting}
+
+        for rid in ids_to_align:
+            req = self.requests.get(rid)
+            if req is None or req.is_finished():
+                continue
+            if rid in running_ids and req.status != RequestStatus.RUNNING:
+                req.status = RequestStatus.RUNNING
+            elif rid in waiting_ids and req.status == RequestStatus.RUNNING:
+                req.status = RequestStatus.WAITING
+
+    def _purge_finished_from_running(self) -> None:
+        """Defensive post-finish sweep of ``self.running``.
+
+        Belt-and-suspenders to ``_realign_request_status_to_queues``:
+        even after status realignment lets upstream
+        ``Scheduler.finish_requests`` pick the right removal branch,
+        a future regression or an unexpected ``status`` mid-transition
+        could still leave already-finished entries in ``self.running``.
+        Sweeping here guarantees the worker's ``input_batch`` slot is
+        not pinned by a freed request.
+
+        Complementary to ``_realign_request_status_to_queues``: realign
+        is preventive (fix ``status`` before ``super().finish_requests``
+        so the right branch fires); this purge is defensive (sweep the
+        residue after ``super().finish_requests`` so any stale entries
+        are reclaimed).
+
+        Scope of the predicate. ``is_finished()`` covers entries the
+        upstream ``finish_requests`` already drained from ``self.requests``
+        but failed to remove from ``self.running``; the
+        ``request_id not in self.requests`` arm catches the same surface
+        from a different angle and is the post-cleanup mirror of the
+        deque purge ``_purge_untracked_chunk_requests`` already runs at
+        the chunk-transfer-adapter layer. It does **not** by itself make
+        arbitrary direct deletions of ``self.requests`` safe -- callers
+        that pop ``self.requests`` outside the standard finish path
+        still have to go through ``_free_request`` (or equivalent) for
+        block / connector / coordinator cleanup. This sweep only
+        reclaims the ``self.running`` slot reference.
+
+        In-place via ``self.running[:] = ...`` for minor consistency
+        with idiomatic vLLM scheduler mutation; upstream
+        ``Scheduler.finish_requests`` itself rebinds ``self.running``,
+        so list identity across the whole call is not preserved -- the
+        slice form is just to avoid an extra rebind inside this helper.
+
+        Assumes the upstream V1 invariant that scheduler ticks are
+        serialized on a single thread; in-place mutation here is no more
+        racy than the rest of the scheduler under that assumption.
+
+        See https://github.com/vllm-project/vllm-omni/pull/3774
+        discussion.
+        """
+        if not self.running:
+            return
+        self.running[:] = [req for req in self.running if not req.is_finished() and req.request_id in self.requests]

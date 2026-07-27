@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 from vllm.assets.image import ImageAsset
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunnerHandler
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -30,7 +31,7 @@ _OMNI_RUNNER_PARAM = (
 )
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
@@ -45,6 +46,7 @@ def _sampling_512() -> OmniDiffusionSamplingParams:
     )
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_flux_kontext_text_to_image(omni_runner_handler: OmniRunnerHandler):
     """Test FluxKontext text-to-image generation with real model."""
     request_config = {
@@ -55,6 +57,7 @@ def test_flux_kontext_text_to_image(omni_runner_handler: OmniRunnerHandler):
     omni_runner_handler.send_diffusion_request(request_config)
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_flux_kontext_image_edit(omni_runner_handler: OmniRunnerHandler):
     """Test FluxKontext image-to-image editing with real model."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")

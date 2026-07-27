@@ -345,6 +345,14 @@ def test_parse_score_payload_handles_raw_json_and_delimited_json():
     assert parse_score_payload(wrapped)["score"] == [6]
 
 
+def test_parse_score_payload_handles_qwen_vl_nested_score_dicts():
+    qwen_style = '{"score": [{"naturalness": 8, "artifact_free": 7}], "reasoning": "good quality"}'
+    assert parse_score_payload(qwen_style)["score"] == [8, 7]
+
+    nested_values = '{"score": [{"score": 9}, {"score": 6}], "reasoning": "ok"}'
+    assert parse_score_payload(nested_values)["score"] == [9, 6]
+
+
 def test_summarize_gedit_generated_records_groups_by_task_and_language():
     records = []
     for group in GEDIT_GROUPS[:2]:

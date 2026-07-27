@@ -104,10 +104,9 @@ def expand_cfg_prompts(
 ) -> list[_CfgExpandedPrompt]:
     """Expand a text-to-image request into one CFG-text companion (opt-in).
 
-    Triggers only when a non-empty
-    ``sampling_params.extra_args["image_gen"]["negative_prompt"]`` is set on
-    the stage-0 params; otherwise returns ``[]`` and the pipeline falls back
-    to zero negative (Ming's default behavior).
+    Triggers only when a non-empty `negative_prompt` is set flat on the stage-0 params
+    (`sampling_params.extra_args`); otherwise returns an empty list
+    and the pipeline falls back to zero negative (Ming's default behavior).
     """
     if not isinstance(prompt, dict):
         return []
@@ -115,8 +114,7 @@ def expand_cfg_prompts(
         return []
 
     extra_args = getattr(sampling_params, "extra_args", None) or {}
-    image_gen_args = extra_args.get("image_gen") or {}
-    negative = image_gen_args.get("negative_prompt")
+    negative = extra_args.get("negative_prompt")
     if not isinstance(negative, str) or not negative.strip():
         return []
 
@@ -203,18 +201,6 @@ def _resolve_image_patch_token_id(stage: Any) -> int:
     except AttributeError:
         pass
     return token_id
-
-
-def _validate_stage_inputs(stage_list, engine_input_source):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    stage_id = engine_input_source[0]
-    if stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {stage_id}")
-    stage = stage_list[stage_id]
-    if stage.engine_outputs is None:
-        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
-    return stage, stage.engine_outputs
 
 
 def _ensure_list(x) -> list[int]:
@@ -340,7 +326,7 @@ def _resolve_token_ids_from_stage_or_defaults(
 def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | None:
     """Read ``byte5_text`` from the diffusion-stage sampling_params.
 
-    Looks up ``sampling_params.extra_args["image_gen"]["byte5_text"]`` (the
+    Looks up `sampling_params.extra_args["byte5_text"]` key (the
     explicit API surface for ByT5 glyph text). Returns ``None`` if absent or
     malformed, so callers can fall back to other sources.
     """
@@ -349,10 +335,9 @@ def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | Non
     extra = getattr(sampling_params, "extra_args", None)
     if not isinstance(extra, dict):
         return None
-    image_gen = extra.get("image_gen")
-    if not isinstance(image_gen, dict):
-        return None
-    texts = image_gen.get("byte5_text")
+    texts = extra.get("byte5_text")
+    if isinstance(texts, str):
+        texts = [texts]
     if isinstance(texts, list) and texts:
         return [t for t in texts if isinstance(t, str)]
     return None
@@ -373,10 +358,9 @@ def thinker2imagegen(
     CFG negative conditioning. Unknown-suffix outputs are skipped.
 
     ``sampling_params`` is the diffusion stage's own SamplingParams, supplied
-    by the orchestrator. ByT5 explicit ``byte5_text`` is read from
-    ``sampling_params.extra_args.image_gen.byte5_text`` (preferred); falls
-    back to ``prompt.image_gen_extra_args.byte5_text``, then to auto-extraction
-    from quoted prompt text.
+    by the orchestrator. ByT5 explicit ``byte5_text`` is read from the flat
+    `sampling_params.extra_args.byte5_text` key (preferred); otherwise it is
+    auto-extracted from quoted prompt text.
     """
     thinker_outputs = source_outputs
     image_patch_token_id, image_end_token_id, num_query_tokens = _resolve_token_ids_from_stage_or_defaults(stage=None)
@@ -429,17 +413,10 @@ def thinker2imagegen(
         if ref_image is not None:
             extra["reference_image"] = ref_image
 
-        # ByT5 glyph text: prefer sampling_params (stage-1 explicit API), then
-        # prompt.image_gen_extra_args (serving_chat path), then auto-extract
-        # from quoted prompt text.
+        # ByT5 glyph text: prefer the flat byte5_text on sampling_params
+        # (stage-1 explicit API), else auto-extract from quoted prompt text.
         prompt_text = prompt.get("prompt", "")
-        sp_byte5 = _extract_byte5_from_sampling_params(sampling_params)
-        if sp_byte5:
-            byte5_texts: list[str] | None = sp_byte5
-        else:
-            ig_extra = prompt.get("image_gen_extra_args") or {}
-            cand = ig_extra.get("byte5_text")
-            byte5_texts = cand if isinstance(cand, list) and cand else None
+        byte5_texts: list[str] | None = _extract_byte5_from_sampling_params(sampling_params)
 
         if byte5_texts:
             extra["byte5_text"] = [
@@ -458,20 +435,10 @@ def thinker2imagegen(
     return [{"prompt": "", "extra": extra}]
 
 
-def thinker2talker(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+def _build_talker_inputs(
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
-    """Build talker stage inputs from thinker stage outputs.
-
-    Extracts the generated text from thinker output and constructs
-    a talker input prompt with the text and any speaker/instruction info
-    from the original request.
-    """
-    _, source_outputs = _validate_stage_inputs(stage_list, engine_input_source)
-
     if not isinstance(prompt, list):
         prompt = [prompt]
 
@@ -492,8 +459,6 @@ def thinker2talker(
         # the talker's spk_head wants a torch tensor.
         spk_emb = additional_info.get("spk_emb", None)
         if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
-            import torch
-
             spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
 
         # Omni speech path mirrors upstream `omni_audio_generation`:
@@ -535,97 +500,21 @@ def thinker2talker(
     return talker_inputs
 
 
-# ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
-# ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
-# initialised for this arch and the consumer never waits on a connector
-# payload.  Data flows through ``additional_information`` written by
-# ``thinker2talker_token_only`` (wired as ``sync_process_input_func``
-# in the pipeline) or the legacy ``thinker2talker`` (wired as
-# ``custom_process_input_func``).
-
-
 def thinker2talker_token_only(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
-    """Sync-side builder for the non-async-chunk thinker→talker path.
-
-    Ports the legacy ``thinker2talker`` body to the new stage-input-processor signature
-    (``source_outputs`` instead of ``stage_list, engine_input_source``).
-    Body is otherwise identical: extracts the
-    generated text from each thinker output and packages it with the
-    request's voice/speaker additional_information for the talker.
-    """
-    if not isinstance(prompt, list):
-        prompt = [prompt]
-
-    talker_inputs: list[OmniTokensPrompt] = []
-    for i, source_output in enumerate(source_outputs):
-        output = source_output.outputs[0]
-
-        generated_text = output.text if hasattr(output, "text") and output.text else ""
-
-        original_prompt = prompt[i] if i < len(prompt) else None
-        additional_info: dict[str, Any] = {}
-        if original_prompt is not None and hasattr(original_prompt, "additional_information"):
-            additional_info = original_prompt.additional_information or {}
-
-        spk_emb = additional_info.get("spk_emb", None)
-        if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
-            import torch
-
-            spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
-
-        talker_info = {
-            "ming_task": "omni",
-            "text": generated_text,
-            "spk_emb": spk_emb,
-            "voice_name": additional_info.get("voice_name", "DB30"),
-            "prompt_text": additional_info.get("prompt_text", None),
-            "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
-            "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
-            "max_text_length": additional_info.get("max_text_length", 50),
-        }
-
-        talker_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information=talker_info,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return talker_inputs
+    """Sync-side builder for the non-async-chunk thinker→talker path."""
+    return _build_talker_inputs(source_outputs, prompt)
 
 
 thinker2talker_token_only._is_sync_input = True
-
-
-def thinker2talker_full_payload(
-    transfer_manager,
-    pooling_output,
-    request,
-):
-    """Producer-side payload builder — no-op.
-
-    ming_flash_omni's thinker emits no heavy tensor to ship via the
-    worker connector (the bridge passes text only, and speaker metadata
-    arrives through the USER request's additional_information).
-    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
-    function is never invoked at runtime; it is retained for forward
-    compatibility with the connector path.
-    """
-    del transfer_manager, pooling_output, request
-    return None
 
 
 __all__ = [
     "CFG_TEXT_SUFFIX",
     "expand_cfg_prompts",
     "thinker2imagegen",
-    "thinker2talker",
-    "thinker2talker_full_payload",
     "thinker2talker_token_only",
 ]

@@ -243,6 +243,12 @@ class CovoAudioForConditionalGeneration(
             else lambda *args, **kwargs: None
         )
 
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def fused_thinker_talker_preprocess(
         self,
         input_ids: torch.Tensor | None,

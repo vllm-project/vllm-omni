@@ -30,10 +30,9 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SAMPLE_RATE = 24_000
 DEFAULT_TEXTS = (
@@ -43,7 +42,7 @@ DEFAULT_TEXTS = (
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Offline higgs-audio v2 inference")
+    parser = TrackingArgumentParser(description="Offline higgs-audio v2 inference")
     parser.add_argument(
         "--model",
         type=str,
@@ -88,7 +87,6 @@ def parse_args():
         default=None,
         help="Transcript of the reference clip. Required when --ref-audio is set.",
     )
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

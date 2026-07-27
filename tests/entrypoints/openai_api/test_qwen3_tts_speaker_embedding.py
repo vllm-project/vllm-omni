@@ -28,7 +28,7 @@ MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 # A synthetic 1024-dim speaker embedding (all 0.1 — not a real voice, but
-# exercises the full code path through the talker's _build_prompt_embeds).
+# exercises the full code path through Qwen3TTSPromptEmbedsBuilder.build_prompt_embeds).
 DUMMY_EMBEDDING_1024 = [0.1] * 1024
 DUMMY_EMBEDDING_2048 = [0.1] * 2048
 
@@ -141,6 +141,7 @@ class TestSpeakerEmbeddingBase:
             "x_vector_only_mode": True,
             "response_format": "pcm",
             "stream": True,
+            "stream_format": "audio",
             "max_new_tokens": MAX_NEW_TOKENS,
         }
         with httpx.Client(timeout=120.0) as client:

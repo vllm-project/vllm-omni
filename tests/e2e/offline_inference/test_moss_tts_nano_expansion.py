@@ -29,10 +29,11 @@ STAGE_CONFIG = get_deploy_config_path("moss_tts_nano.yaml")
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,
+    {"trust_remote_code": True},
 )
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
@@ -120,7 +121,6 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
     """English TTS produces non-empty 48 kHz stereo audio."""
@@ -133,7 +133,6 @@ def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese TTS produces non-empty audio."""
@@ -146,7 +145,6 @@ def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Same seed produces identical waveforms."""
@@ -159,7 +157,6 @@ def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) ->
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Batch of two requests returns audio for each."""

@@ -1,0 +1,31 @@
+# Step-Audio2 online CI deploy: thinker only (audio/text -> text).
+#
+# The two-stage topology can deadlock when an audio-to-text request skips the
+# Token2Wav stage, so this config explicitly selects the ASR pipeline.
+# Keeps the legacy 1x 24GB CI sizing; validated here on 1x H100-80GB.
+pipeline: step_audio_2_asr
+async_chunk: false
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    tensor_parallel_size: 1
+    max_model_len: 1024
+    max_num_batched_tokens: 1024
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.7
+    skip_mm_profiling: true
+    enforce_eager: true
+    async_scheduling: false
+    hf_overrides:
+      architectures: ["StepAudio2ThinkerForConditionalGeneration"]
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 256
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05

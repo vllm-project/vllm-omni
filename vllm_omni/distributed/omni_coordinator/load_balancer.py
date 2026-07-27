@@ -6,7 +6,6 @@ from __future__ import annotations
 import random
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from enum import Enum
 from typing import Any, TypedDict
 
@@ -122,22 +121,6 @@ class LeastQueueLengthBalancer(LoadBalancer):
         return random.choice(candidates)
 
 
-def build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
-    """Translate ``--omni-lb-policy`` (string) into a per-pool LB factory."""
-    try:
-        normalized = LoadBalancingPolicy(policy)
-    except ValueError as exc:
-        valid = ", ".join(p.value for p in LoadBalancingPolicy)
-        raise ValueError(f"unknown --omni-lb-policy {policy!r} (valid: {valid})") from exc
-    if normalized is LoadBalancingPolicy.RANDOM:
-        return RandomBalancer
-    if normalized is LoadBalancingPolicy.ROUND_ROBIN:
-        return RoundRobinBalancer
-    if normalized is LoadBalancingPolicy.LEAST_QUEUE_LENGTH:
-        return LeastQueueLengthBalancer
-    raise ValueError(f"unhandled load balancing policy {normalized!r}")
-
-
 __all__ = [
     "Task",
     "LoadBalancingPolicy",
@@ -145,5 +128,4 @@ __all__ = [
     "RandomBalancer",
     "RoundRobinBalancer",
     "LeastQueueLengthBalancer",
-    "build_load_balancer_factory",
 ]

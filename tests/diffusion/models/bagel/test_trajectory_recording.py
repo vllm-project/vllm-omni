@@ -19,7 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
-# generate_image uses timesteps[:-1], so actual steps = NUM_TIMESTEPS - 1
+# Official BAGEL samples num_timesteps points then drops the terminal t=0,
+# yielding num_timesteps - 1 denoise steps.
 EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
@@ -27,6 +28,9 @@ def _make_mock_bagel(mocker: MockerFixture):
     """Create a mock Bagel with forward returning constant velocity."""
     mock = mocker.MagicMock(spec=Bagel)
     mock._sp_size = 1
+    # MagicMock would otherwise auto-return a truthy stub for this flag; pin it
+    # to the official BAGEL schedule convention (num_timesteps points).
+    mock._denoise_schedule_extra_step = False
 
     # forward returns a small constant velocity so x_t changes each step
     def fake_forward(self, x_t, **kwargs):

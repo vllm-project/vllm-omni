@@ -102,6 +102,7 @@ plugins:
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building
+        - "vllm_omni.experimental"  # avoid importing optional serving deps (openai, fastapi, uvicorn, httpx) in mkdocs building
   - mkdocstrings:
       handlers:
         python:

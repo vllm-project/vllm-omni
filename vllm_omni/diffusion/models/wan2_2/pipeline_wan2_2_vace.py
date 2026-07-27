@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -96,68 +97,66 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
     import numpy as np
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if not multi_modal_data:
-                request.prompts[i] = prompt
-                continue
+        if not multi_modal_data:
+            request.prompt = prompt
+            return request
 
-            # Handle reference images for R2V
-            # "image" is the standard key from online serving (SupportImageInput convention)
-            # "reference_images" is the offline API key for backwards compatibility
-            ref_images = multi_modal_data.get("image") or multi_modal_data.get("reference_images")
-            if ref_images is not None:
-                if isinstance(ref_images, str):
-                    ref_images = [PIL.Image.open(ref_images).convert("RGB")]
-                elif isinstance(ref_images, PIL.Image.Image):
-                    ref_images = [ref_images]
-                elif isinstance(ref_images, list):
-                    ref_images = [
-                        PIL.Image.open(img).convert("RGB") if isinstance(img, str) else img for img in ref_images
-                    ]
+        # Handle reference images for R2V
+        # "image" is the standard key from online serving (SupportImageInput convention)
+        # "reference_images" is the offline API key for backwards compatibility
+        ref_images = multi_modal_data.get("image") or multi_modal_data.get("reference_images")
+        if ref_images is not None:
+            if isinstance(ref_images, str):
+                ref_images = [PIL.Image.open(ref_images).convert("RGB")]
+            elif isinstance(ref_images, PIL.Image.Image):
+                ref_images = [ref_images]
+            elif isinstance(ref_images, list):
+                ref_images = [PIL.Image.open(img).convert("RGB") if isinstance(img, str) else img for img in ref_images]
 
-                # Calculate dimensions from first reference image if not provided
-                if request.sampling_params.height is None or request.sampling_params.width is None:
-                    first_img = ref_images[0]
-                    max_area = 480 * 832  # VACE default is 480p
-                    aspect_ratio = first_img.height / first_img.width
-                    mod_value = 16
-                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            # Calculate dimensions from first reference image if not provided
+            if request.sampling_params.height is None or request.sampling_params.width is None:
+                first_img = ref_images[0]
+                max_area = 480 * 832  # VACE default is 480p
+                aspect_ratio = first_img.height / first_img.width
+                mod_value = 16
+                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-                    if request.sampling_params.height is None:
-                        request.sampling_params.height = height
-                    if request.sampling_params.width is None:
-                        request.sampling_params.width = width
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = height
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = width
 
-                prompt["additional_information"]["reference_images"] = ref_images
+            prompt["additional_information"]["reference_images"] = ref_images
 
-            # Handle source video for V2V / MV2V
-            source_video = multi_modal_data.get("video")
-            if source_video is not None:
-                if isinstance(source_video, list) and len(source_video) > 0:
-                    if isinstance(source_video[0], str):
-                        source_video = [PIL.Image.open(f).convert("RGB") for f in source_video]
-                prompt["additional_information"]["source_video"] = source_video
+        # Handle source video for V2V / MV2V
+        source_video = multi_modal_data.get("video")
+        if source_video is not None:
+            if isinstance(source_video, list) and len(source_video) > 0:
+                if isinstance(source_video[0], str):
+                    source_video = [PIL.Image.open(f).convert("RGB") for f in source_video]
+            prompt["additional_information"]["source_video"] = source_video
 
-            # Handle mask for MV2V / inpainting
-            mask = multi_modal_data.get("mask")
-            if mask is not None:
-                if isinstance(mask, list) and len(mask) > 0:
-                    if isinstance(mask[0], str):
-                        mask = [PIL.Image.open(m).convert("L") for m in mask]
-                elif isinstance(mask, str):
-                    mask = [PIL.Image.open(mask).convert("L")]
-                elif isinstance(mask, PIL.Image.Image):
-                    mask = [mask]
-                prompt["additional_information"]["mask"] = mask
+        # Handle mask for MV2V / inpainting
+        mask = multi_modal_data.get("mask")
+        if mask is not None:
+            if isinstance(mask, list) and len(mask) > 0:
+                if isinstance(mask[0], str):
+                    mask = [PIL.Image.open(m).convert("L") for m in mask]
+            elif isinstance(mask, str):
+                mask = [PIL.Image.open(mask).convert("L")]
+            elif isinstance(mask, PIL.Image.Image):
+                mask = [mask]
+            prompt["additional_information"]["mask"] = mask
 
-            request.prompts[i] = prompt
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -198,6 +197,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         attention_kwargs: dict[str, object],
         vace_context: torch.Tensor | None,
         vace_context_scale: float,
+        boundary_timestep: float | None = None,
     ) -> torch.Tensor:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -205,6 +205,11 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
                 set_forward_context_denoise_step_idx(step_idx)
+
+                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                else:
+                    current_model = self.transformer if self.transformer is not None else self.transformer_2
 
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
@@ -219,6 +224,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                     "vace_context": vace_context,
                     "vace_context_scale": vace_context_scale,
                     "return_dict": False,
+                    "current_model": current_model,
                 }
                 negative_kwargs = (
                     {
@@ -229,6 +235,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                         "vace_context": vace_context,
                         "vace_context_scale": vace_context_scale,
                         "return_dict": False,
+                        "current_model": current_model,
                     }
                     if do_true_cfg
                     else None
@@ -461,7 +468,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         height: int = 480,
@@ -598,7 +605,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 )
 
         num_reference_images = 0
-        if self.transformer.vace_patch_embedding is not None:
+        # Either expert may be the one loaded (boundary_ratio 0.0/1.0 skips one),
+        # so read it from whichever transformer exists.
+        active_transformer = self.transformer if self.transformer is not None else self.transformer_2
+        if active_transformer.vace_patch_embedding is not None:
             video, mask, ref_images_processed = self.preprocess_conditions(
                 video=source_video,
                 mask=source_mask,
@@ -640,6 +650,19 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
+        # MoE boundary: only the two-expert checkpoints (Wan2.2 A14B) have a
+        # transformer_2 to switch to. For single-expert VACE (e.g. Wan2.1) this
+        # stays None and diffuse() uses the same transformer for every step.
+        boundary_timestep = None
+        if self.transformer_2 is not None:
+            boundary_ratio = (
+                self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+            )
+            if boundary_ratio is None:
+                boundary_ratio = 0.875
+                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -650,6 +673,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             attention_kwargs=attention_kwargs,
             vace_context=vace_context,
             vace_context_scale=vace_context_scale,
+            boundary_timestep=boundary_timestep,
         )
 
         self._current_timestep = None

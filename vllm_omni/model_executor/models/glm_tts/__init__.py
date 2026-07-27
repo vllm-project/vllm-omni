@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-TTS model support for vLLM-Omni.
 
-GLM-TTS is a two-stage text-to-speech system:
-  - Stage 0 (LLM): Llama-based AR model generates speech tokens from text
-  - Stage 1 (DiT): Flow matching model converts speech tokens to mel-spectrogram
-
-Reference: https://github.com/zai-org/GLM-TTS
-"""
-
-from vllm_omni.model_executor.models.glm_tts.glm_tts import (
-    GLMTTSForConditionalGeneration,
-)
-
-__all__ = [
-    "GLMTTSForConditionalGeneration",
-]
+# NOTE: Do not import model classes in this file. Importing any
+# submodule in this package triggers __init__.py execution, and
+# both the model registry and pipeline registry import submodules
+# directly — heavy imports here would be loaded as a side effect
+# even though nothing depends on these re-exports.

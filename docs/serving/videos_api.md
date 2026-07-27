@@ -67,8 +67,10 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input_reference` | file | null | Uploaded reference image for image-to-video requests |
-| `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` |
+| `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
+| `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
+| `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
 | `num_frames` | integer | model default | Number of generated frames |
@@ -80,6 +82,8 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `flow_shift` | number | null | Scheduler flow-shift value |
 | `true_cfg_scale` | number | null | True CFG scale when supported by the model |
 | `seed` | integer | null | Random seed for reproducibility |
+| `generate_sound` | boolean | false | Request model-generated audio for video models that support sound generation |
+| `sound_duration` | number | null | Duration in seconds for generated audio; defaults to generated video duration |
 | `negative_prompt` | string | null | Text describing what to avoid in the generated video |
 | `enable_frame_interpolation` | boolean | null | Enable post-generation frame interpolation |
 | `frame_interpolation_exp` | integer | null | Interpolation exponent; `1=2x`, `2=4x`, and so on |
@@ -123,6 +127,65 @@ curl -s http://localhost:8091/v1/videos \
   -F "fps=16"
 ```
 
+### Video-to-Video
+
+For models that support video conditioning, upload the reference video with
+`input_reference`:
+
+```bash
+curl -s http://localhost:8091/v1/videos \
+  -F "prompt=continue this motion with consistent subjects and lighting" \
+  -F "input_reference=@input.mp4;type=video/mp4" \
+  -F "width=1280" \
+  -F "height=720" \
+  -F "num_frames=80" \
+  -F "fps=16"
+```
+
+You can also pass a JSON-safe video URL or `data:video/...;base64,...` payload
+through `video_reference`. Do not send `video_reference` together with
+`input_reference` or `image_reference`.
+
+```bash
+curl -s http://localhost:8091/v1/videos \
+  -F "prompt=continue this motion with consistent subjects and lighting" \
+  -F 'video_reference={"video_url":"https://example.com/input.mp4"}' \
+  -F "width=1280" \
+  -F "height=720" \
+  -F "num_frames=80" \
+  -F "fps=16"
+```
+
+JSON references currently support `image_url`/`video_url`; `file_id` references
+are not implemented yet. Models may expose additional V2V controls through
+`extra_params`. For example, Cosmos3 supports
+`condition_frame_indexes_vision` and `condition_video_keep` to select which
+decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
+transfer options such as `control_path`, `control_guidance`,
+`control_guidance_interval`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
+Cosmos3 recipe for complete examples.
+
+### Speech-to-Video
+
+For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both
+an image reference and an audio reference. The `audio_reference` field accepts a
+JSON string with `audio_url` pointing to an HTTP(s) URL or base64 data URL.
+
+```bash
+curl -s http://localhost:8091/v1/videos \
+  -F "prompt=A person singing" \
+  -F 'image_reference={"image_url": "https://example.com/face.png"}' \
+  -F 'audio_reference={"audio_url": "https://example.com/speech.mp3"}' \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.5" \
+  -F "fps=16"
+```
+
+
 ### Synchronous Generation
 
 ```bash
@@ -137,16 +200,24 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_STORAGE_PATH` to control where asynchronous video outputs are
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
 stored:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+> `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
+> use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
 ## Model-Specific Examples
 
-For complete text-to-video and image-to-video walkthroughs, see:
+For complete text-to-video, image-to-video, and model-specific video-to-video
+walkthroughs, see:
 
 - [Text-to-Video](../user_guide/examples/online_serving/text_to_video.md)
 - [Image-to-Video](../user_guide/examples/online_serving/image_to_video.md)
+- [Speech-to-Video](../user_guide/examples/online_serving/speech_to_video.md)
+  for Wan2.2-S2V audio-driven lip-sync generation
+- [Cosmos3 recipes](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano.md)
+  for model-specific video-to-video examples and conditioning controls

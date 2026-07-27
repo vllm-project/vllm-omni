@@ -335,6 +335,7 @@ def build_payload(
         "ref_audio": encode_audio_to_base64(ref_audio),
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
+        **({"stream_format": "audio"} if stream else {}),
     }
 
 

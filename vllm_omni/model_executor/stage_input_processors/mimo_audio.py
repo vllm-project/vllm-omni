@@ -1,7 +1,6 @@
 from typing import Any
 
 import torch
-from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
@@ -10,7 +9,6 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
-from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
 
 logger = init_logger(__name__)
@@ -19,8 +17,8 @@ logger = init_logger(__name__)
 # sequence fed to stage-1 must not exceed this, otherwise gpu_input_batch
 # add_request will fail with a broadcast error when copying prompt_token_ids
 # into token_ids_cpu. Keep in sync with the stage-1 ``max_model_len`` in
-# ``vllm_omni/model_executor/stage_configs/mimo_audio.yaml`` and the offline
-# example ``examples/offline_inference/mimo_audio/end2end.py``.
+# ``vllm_omni/deploy/mimo_audio.yaml`` and the offline example
+# ``examples/offline_inference/mimo_audio/end2end.py``.
 MAX_CODE2WAV_TOKENS = 18192
 
 # Minimum safe values for codec streaming parameters.
@@ -137,19 +135,19 @@ def _to_code_tensor(codes: Any) -> torch.Tensor | None:
 
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
-    Async chunk version: convert stage-0 pooling_output to code2wav payload (pooling / connector accumulation).
+    Async chunk version: convert stage-0 multimodal_output to code2wav payload (pooling / connector accumulation).
 
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
     # Null guard: chunk_transfer_adapter calls this every emit step
-    # including no-output steps where pooling_output is None.
-    if pooling_output is None or not isinstance(pooling_output, dict):
+    # including no-output steps where multimodal_output is None.
+    if multimodal_output is None or not isinstance(multimodal_output, dict):
         if is_finished:
             connector = getattr(transfer_manager, "connector", None)
             raw_cfg = getattr(connector, "config", {}) or {}
@@ -187,10 +185,8 @@ def llm2code2wav_async_chunk(
 
     # Text-only paths (e.g. modalities=["text"]) yield no codec pooling output;
     # stage-0 still drives the chunk transfer adapter, so treat None as "no codes
-    # this step" rather than letting `.get()` raise AttributeError — an unhandled
-    # error here drops the chunk, starves stage-1 of the finished payload, and
-    # the stage subprocesses die before the final token is emitted.
-    po_codes = pooling_output.get("codes", {}) if pooling_output is not None else {}
+    # this step" rather than letting `.get()` raise AttributeError.
+    po_codes = multimodal_output.get("codes", {}) if multimodal_output is not None else {}
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
@@ -232,88 +228,6 @@ def llm2code2wav_async_chunk(
     )
 
 
-def llm2code2wav(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """
-    Process talker outputs to create code2wav inputs.
-
-    Workflow:
-    1. Extract talker's codec code outputs (8-layer RVQ codes)
-    2. Flatten codes for code2wav input
-    3. Package for code2wav stage
-
-    Args:
-        prompt: Original prompt data
-        requires_multimodal_data: Whether multimodal data is required
-
-    Returns:
-        List of OmniTokensPrompt for code2wav stage
-    """
-    talker_outputs = source_outputs
-    code2wav_inputs = []
-
-    # Process each talker output
-    for i, talker_output in enumerate(talker_outputs):
-        output = talker_output.outputs[0]
-
-        # Extract codec codes from talker output
-        # Expected shape: [8, seq_len] (8-layer RVQ codes)
-        mm = output.multimodal_output
-        mm_codes = mm.get("codes", {})
-        mm_hs = mm.get("hidden_states", {})
-        if "audio" in mm_codes:
-            codec_codes = mm_codes["audio"].to(torch.long)  # [seq_batch_size, 1, 8, 4]
-            is_all_zero = (codec_codes == 0).all(dim=(1, 2, 3))
-            non_zero_indices = (~is_all_zero).nonzero(as_tuple=True)[0]
-            if len(non_zero_indices) == 0:
-                # All codec codes are zero - skip this request with a warning
-                request_id = getattr(talker_output, "request_id", f"unknown_{i}")
-                logger.warning(
-                    "Skipping request %s: all codec codes are zero (empty output from Stage-0). "
-                    "This may indicate the model failed to generate valid audio codes.",
-                    request_id,
-                )
-            else:
-                if len(non_zero_indices) < codec_codes.shape[0]:
-                    codec_codes = codec_codes[non_zero_indices]
-        elif "output" in mm_hs and "audio" not in mm_codes:
-            codec_codes = torch.zeros(1, 1, 8, 4, dtype=torch.long)
-        else:
-            raise ValueError(f"Invalid multimodal_output: {output.multimodal_output}")
-
-        pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4)
-
-        code_final = prepend_and_flatten_colmajor(codec_codes, pad_vec)
-        code_final = code_final.tolist()
-
-        # Guard against flattened sequences longer than code2wav's max_model_len.
-        # Without this, add_request raises ``could not broadcast input array
-        # from shape (N,) into shape (max_model_len,)`` and kills the engine
-        # core (see issue #2683). Mirrors the offline end2end.py safeguard.
-        if len(code_final) > MAX_CODE2WAV_TOKENS:
-            request_id = getattr(talker_output, "request_id", f"unknown_{i}")
-            logger.warning(
-                "Request %s: code_final len=%d > MAX_CODE2WAV_TOKENS=%d, truncating.",
-                request_id,
-                len(code_final),
-                MAX_CODE2WAV_TOKENS,
-            )
-            code_final = code_final[:MAX_CODE2WAV_TOKENS]
-
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=code_final,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return code2wav_inputs
-
-
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # AR runner's `flatten_payload` converts the model emit
@@ -331,8 +245,9 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
 def _filter_zero_codec_rows(codec_codes: torch.Tensor) -> torch.Tensor:
     """Drop zero-padded codec rows from a 4-D `[N, 1, 8, 4]` tensor.
 
-    Mirrors the zero-row filter in the orchestrator-path `llm2code2wav`
-    body (see this file's ``llm2code2wav`` around line 224).
+    Shared by the sync placeholder builder (``llm2code2wav_token_only``) and
+    the full-payload producer (``llm2code2wav_full_payload``) so both size the
+    downstream codec sequence off the same non-zero frames.
     """
     if codec_codes.ndim != 4 or codec_codes.numel() == 0:
         return codec_codes

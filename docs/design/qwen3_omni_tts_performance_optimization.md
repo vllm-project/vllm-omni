@@ -411,6 +411,8 @@ Notes:
 - `runtime.max_batch_size` controls stage-level batching.
 - Thinker/Talker commonly use `enforce_eager: false` for CUDA Graph paths.
 - Code2Wav often remains eager (`enforce_eager: true`) depending on runtime behavior.
+- Qwen3-Omni defaults `VLLM_USE_FLASHINFER_MOE_FP16=0`. The Triton has been more stable & faster
+ than the FlashInfer CUTLASS unquantized MoE backend on recent vLLM rebases.
 
 #### 2) Enable async chunk
 

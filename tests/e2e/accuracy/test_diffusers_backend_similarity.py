@@ -218,7 +218,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to("cuda")
-
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         _diffusers_dummy_run(pipe)
 
         generator = torch.Generator(device="cuda").manual_seed(SEED)
@@ -338,7 +338,7 @@ def test_diffusers_backend_i2v_matches_diffusers(
 
 
 def _diffusers_dummy_run(pipe: DiffusionPipeline) -> None:
-    from vllm_omni.diffusion.diffusion_engine import supports_multimodal_input
+    from vllm_omni.diffusion.io_support import supports_multimodal_input
 
     supports_image_input, supports_audio_input = supports_multimodal_input(
         SimpleNamespace(

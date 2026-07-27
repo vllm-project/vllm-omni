@@ -6,9 +6,13 @@ The detailed RFC document is maintained outside this repository (local/internal 
 - Fault helpers: `conftest.py`, `helpers.py`
 - Qwen3 tests: `test_reliability_qwen3_omni.py`
 - Wan2.2 tests: `test_reliability_wan22.py`
+- HunyuanImage tests: `test_reliability_hunyuan_image.py`
+- VoxCPM2 tests: `test_reliability_voxcpm2.py`
 
 ```bash
 pytest --collect-only tests/dfx/reliability
 pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow
 pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 ```
