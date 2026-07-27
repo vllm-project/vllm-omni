@@ -850,6 +850,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
                     true_cfg_scale,
                     positive_kwargs,
                     negative_kwargs,
+                    cfg_normalize=False,
                 )
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
@@ -921,9 +922,9 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or guidance_scale
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
+        true_cfg_scale = req.sampling_params.true_cfg_scale or guidance_scale
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0
@@ -988,9 +989,14 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         elif pooled_prompt_embeds is not None:
             batch_size = pooled_prompt_embeds.shape[0]
 
-        # TODO: CFG guidance configuration
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
+        has_neg_prompt = (
+            negative_prompt is not None
+            or (negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None)
+            or (
+                negative_prompt_embeds_t5 is not None
+                and negative_prompt_embeds_llama3 is not None
+                and negative_pooled_prompt_embeds is not None
+            )
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)

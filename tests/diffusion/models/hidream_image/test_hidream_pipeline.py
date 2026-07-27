@@ -222,6 +222,7 @@ def test_diffuse_calls_predict_noise_maybe_with_cfg_per_timestep():
     assert len(predict_calls) == 2
     assert predict_calls[0]["do_true_cfg"] is True
     assert predict_calls[0]["true_cfg_scale"] == 5.0
+    assert predict_calls[0]["cfg_normalize"] is False
     assert set(predict_calls[0]["positive_kwargs"]) == {
         "hidden_states",
         "timesteps",
@@ -284,3 +285,84 @@ def test_guidance_scale_triggers_sequential_cfg_path(monkeypatch: pytest.MonkeyP
     torch.testing.assert_close(predict_calls[1]["encoder_hidden_states_t5"], embeds[1])
     torch.testing.assert_close(predict_calls[1]["encoder_hidden_states_llama3"], embeds[3])
     torch.testing.assert_close(predict_calls[1]["pooled_embeds"], embeds[5])
+
+
+def test_forward_uses_request_guidance_scale_when_true_cfg_scale_unset():
+    pipeline = _make_hidream_pipeline()
+
+    class StopAfterDiffuseError(Exception):
+        pass
+
+    diffuse_call = {}
+
+    def _fake_diffuse(*args, **kwargs):
+        del args
+        diffuse_call.update(kwargs)
+        raise StopAfterDiffuseError
+
+    pipeline.check_inputs = lambda *args, **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: _fake_encode_outputs(batch_size=1)
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 4, 2, 2)
+    pipeline.prepare_timesteps = lambda *args, **kwargs: (torch.tensor([1.0]), 1)
+    pipeline.check_cfg_parallel_validity = lambda *args, **kwargs: True
+    pipeline.diffuse = _fake_diffuse
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="hidream-guidance-scale",
+                prompt={"prompt": "prompt-a", "negative_prompt": "negative-a"},
+                sampling_params=_make_hidream_sampling(guidance_scale=4.2, true_cfg_scale=None),
+            )
+        ]
+    )
+
+    with pytest.raises(StopAfterDiffuseError):
+        pipeline.forward(batch)
+
+    assert diffuse_call["true_cfg_scale"] == 4.2
+    assert diffuse_call["do_true_cfg"] is True
+
+
+def test_forward_enables_cfg_with_precomputed_negative_embeds():
+    pipeline = _make_hidream_pipeline()
+
+    class StopAfterDiffuseError(Exception):
+        pass
+
+    diffuse_call = {}
+
+    def _fake_diffuse(*args, **kwargs):
+        del args
+        diffuse_call.update(kwargs)
+        raise StopAfterDiffuseError
+
+    embeds = _fake_encode_outputs(batch_size=1)
+
+    pipeline.check_inputs = lambda *args, **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: embeds
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 4, 2, 2)
+    pipeline.prepare_timesteps = lambda *args, **kwargs: (torch.tensor([1.0]), 1)
+    pipeline.check_cfg_parallel_validity = lambda *args, **kwargs: True
+    pipeline.diffuse = _fake_diffuse
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="hidream-precomputed-neg",
+                prompt={"prompt": "prompt-a"},
+                sampling_params=_make_hidream_sampling(),
+            )
+        ]
+    )
+
+    with pytest.raises(StopAfterDiffuseError):
+        pipeline.forward(
+            batch,
+            negative_prompt_embeds_t5=embeds[1],
+            negative_prompt_embeds_llama3=embeds[3],
+            negative_pooled_prompt_embeds=embeds[5],
+        )
+
+    assert diffuse_call["do_true_cfg"] is True
+    assert diffuse_call["negative_prompt_embeds_t5"] is not None
