@@ -561,7 +561,8 @@ class OmniServeCommand(CLISubcommand):
             help="Diffusion attention config. Accepts JSON or vLLM-style dotted flags. "
             "Examples: "
             "--diffusion-attention-config.default.backend FLASH_ATTN, "
-            "--diffusion-attention-config.per_role.self.backend SPARSE_BLOCK, "
+            "--diffusion-attention-config.default.backend TRTLLM_ATTN "
+            "--diffusion-attention-config.default.skip_softmax.target_sparsity 0.5, "
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',

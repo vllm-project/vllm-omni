@@ -30,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():

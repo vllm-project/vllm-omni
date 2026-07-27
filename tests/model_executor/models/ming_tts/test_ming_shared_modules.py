@@ -12,17 +12,24 @@ from vllm_omni.model_executor.models.common.ming.fm import Solver
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
+    KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
+    KEY_SPEAKER_WAVEFORM,
+    KEY_SPEAKER_WAVEFORM_LENGTHS,
     LATENT_DIM,
     LLM_HIDDEN_SIZE,
     LLM_VOCAB_SIZE,
     PATCH_SIZE,
     SAMPLE_RATE,
+    SPEAKER_EMBEDDING_DIM,
     VAE_PATCH_SIZE,
 )
 from vllm_omni.model_executor.models.ming_tts.flowloss_head import FlowLoss
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
+from vllm_omni.model_executor.models.ming_tts.speaker_extractor import _resolve_speaker_embeddings
 from vllm_omni.model_executor.models.ming_tts.validation import validate_ming_tts_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
@@ -97,6 +104,122 @@ def test_ming_instruction_parser_preserves_dense_and_flash_defaults():
         SimpleNamespace(instructions="calm", language="粤语", voice="灵小甄")
     )
     assert flash_fields == {"风格": "calm"}
+
+
+class _FakeMingSpeakerExtractor:
+    def __init__(self):
+        self.calls: list[tuple[torch.Tensor, int]] = []
+
+    def extract_from_waveform(self, waveform, sample_rate):
+        waveform = torch.as_tensor(waveform).detach().clone()
+        self.calls.append((waveform, int(sample_rate)))
+        return torch.full((SPEAKER_EMBEDDING_DIM,), float(len(self.calls)), dtype=torch.float32)
+
+
+def _make_ming_speaker_wrapper():
+    return SimpleNamespace(
+        _speaker_cache=SpeakerEmbeddingCache(max_bytes=1024 * 1024),
+        _speaker_extractor=_FakeMingSpeakerExtractor(),
+        ming_config=SimpleNamespace(sample_rate=SAMPLE_RATE),
+    )
+
+
+def test_ming_stage0_speaker_cache_extracts_once_and_honors_created_at():
+    wrapper = _make_ming_speaker_wrapper()
+    waveform = torch.arange(12, dtype=torch.float32).reshape(1, -1)
+    info = {
+        KEY_SPEAKER_WAVEFORM: waveform,
+        KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([12]),
+        "voice_name": "UploadedVoice",
+        "voice_created_at": 123,
+    }
+
+    first = _resolve_speaker_embeddings(wrapper, info)
+    cached = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            "voice_name": "uploadedvoice",
+            "voice_created_at": 123,
+        },
+    )
+    refreshed = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            **info,
+            "voice_created_at": 124,
+        },
+    )
+
+    assert first is not None and cached is not None and refreshed is not None
+    torch.testing.assert_close(first[0], cached[0])
+    assert torch.all(first[0] == 1)
+    assert torch.all(refreshed[0] == 2)
+    assert len(wrapper._speaker_extractor.calls) == 2
+
+
+def test_ming_stage0_speaker_extraction_splits_multiple_waveforms():
+    wrapper = _make_ming_speaker_wrapper()
+
+    embeddings = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            KEY_SPEAKER_WAVEFORM: torch.arange(10, dtype=torch.float32).reshape(1, -1),
+            KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([4, 6]),
+            KEY_SPEAKER_SAMPLE_RATES: torch.tensor([16000, 24000]),
+        },
+    )
+
+    assert embeddings is not None and len(embeddings) == 2
+    assert [call[0].shape[-1] for call in wrapper._speaker_extractor.calls] == [4, 6]
+    assert [call[1] for call in wrapper._speaker_extractor.calls] == [16000, 24000]
+
+
+def test_ming_stage0_speaker_extraction_rejects_mismatched_sample_rates():
+    wrapper = _make_ming_speaker_wrapper()
+
+    with pytest.raises(ValueError, match="Invalid Ming speaker sample rates"):
+        _resolve_speaker_embeddings(
+            wrapper,
+            {
+                KEY_SPEAKER_WAVEFORM: torch.arange(10, dtype=torch.float32).reshape(1, -1),
+                KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([4, 6]),
+                KEY_SPEAKER_SAMPLE_RATES: torch.tensor([16000]),
+            },
+        )
+
+
+def test_ming_stage0_prompt_waveform_does_not_trigger_speaker_extraction():
+    wrapper = _make_ming_speaker_wrapper()
+
+    embeddings = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            "prompt_waveform": torch.ones((1, 10)),
+            "prompt_text": "Reference transcript.",
+        },
+    )
+
+    assert embeddings is None
+    assert not wrapper._speaker_extractor.calls
+
+
+def test_ming_stage0_direct_speaker_embedding_bypasses_extractor():
+    wrapper = _make_ming_speaker_wrapper()
+    direct = torch.full((SPEAKER_EMBEDDING_DIM,), 0.25)
+
+    embeddings = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            KEY_SPEAKER_EMBEDDING: direct,
+            KEY_SPEAKER_WAVEFORM: torch.ones((1, 10)),
+            "voice_name": "direct",
+            "voice_created_at": 1,
+        },
+    )
+
+    assert embeddings is not None
+    torch.testing.assert_close(embeddings[0], direct)
+    assert not wrapper._speaker_extractor.calls
 
 
 def _make_ming_logits_model(vocab_size=8):

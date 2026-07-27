@@ -342,7 +342,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
     monkeypatch.setattr(
         runtime_mod,
-        "extract_stage_metadata",
+        "extract_legacy_stage_metadata",
         lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
     )
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
@@ -836,9 +836,9 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
     assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
 
 
-def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
+def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
     """ROCm default attention logic only applies to LLM stages, not diffusion."""
-    from vllm_omni.engine.stage_init_utils import extract_stage_metadata
+    from vllm_omni.engine.stage_init_utils import extract_legacy_stage_metadata
 
     monkeypatch.setattr("vllm_omni.engine.stage_init_utils.current_omni_platform.is_rocm", lambda: True)
 
@@ -852,7 +852,7 @@ def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeyp
         final_output_type=None,
     )
 
-    metadata = extract_stage_metadata(stage_cfg)
+    metadata = extract_legacy_stage_metadata(stage_cfg)
 
     assert metadata.stage_type == "diffusion"
     assert "diffusion_attention_config" not in stage_cfg.engine_args
