@@ -15,21 +15,23 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-import vllm_omni
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-DEPLOY_DIR = Path(vllm_omni.__file__).parent / "deploy"
+# Discover siblings of a known config so a future dreamzero*.yaml is covered
+# without editing this test.
+DEPLOY_DIR = Path(get_deploy_config_path("dreamzero.yaml")).parent
 
 
 def _dreamzero_stages() -> list[tuple[str, int, dict]]:
     stages = []
-    for config_path in sorted(DEPLOY_DIR.glob("dreamzero*.yaml")):
-        config = yaml.safe_load(config_path.read_text())
+    for name in sorted(path.name for path in DEPLOY_DIR.glob("dreamzero*.yaml")):
+        config = yaml.safe_load(Path(get_deploy_config_path(name)).read_text())
         for index, stage in enumerate(config.get("stages") or []):
-            stages.append((config_path.name, index, stage))
+            stages.append((name, index, stage))
     return stages
 
 
