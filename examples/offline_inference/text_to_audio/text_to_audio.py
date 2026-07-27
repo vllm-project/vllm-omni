@@ -43,6 +43,7 @@ from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 AUDIOX_TASKS = ("t2a", "t2m", "v2a", "v2m", "tv2a", "tv2m")
