@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/spkemb_extractor.py
+from __future__ import annotations
+
 import os
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torchaudio
@@ -19,6 +21,9 @@ from .constants import (
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
 )
+
+if TYPE_CHECKING:
+    from .ming_tts import MingTTSForConditionalGeneration
 
 logger = init_logger(__name__)
 _EXTRACTOR_LOAD_LOCK = threading.Lock()
@@ -65,7 +70,7 @@ class MingSpeakerEmbeddingExtractor:
         return [self.extract_from_file(path) for path in audio_paths]
 
 
-def _load_speaker_extractor(wrapper: Any) -> MingSpeakerEmbeddingExtractor:
+def _load_speaker_extractor(wrapper: MingTTSForConditionalGeneration) -> MingSpeakerEmbeddingExtractor:
     extractor = getattr(wrapper, "_speaker_extractor", None)
     if extractor is not None:
         return extractor
@@ -120,7 +125,10 @@ def _speaker_waveforms_from_info(
     return [(waveform_part, int(sample_rate)) for waveform_part, sample_rate in zip(parts, sample_rates, strict=True)]
 
 
-def _resolve_speaker_embeddings(wrapper: Any, info_dict: dict[str, Any]) -> list[torch.Tensor] | None:
+def _resolve_speaker_embeddings(
+    wrapper: MingTTSForConditionalGeneration,
+    info_dict: dict[str, Any],
+) -> list[torch.Tensor] | None:
     direct_embedding = info_dict.get(KEY_SPEAKER_EMBEDDING, info_dict.get("speaker_embedding"))
     use_zero_spk_emb = bool(info_dict.get("use_zero_spk_emb", False))
     if direct_embedding is not None or use_zero_spk_emb:
