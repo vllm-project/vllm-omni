@@ -672,8 +672,6 @@ class HiDreamBlock(nn.Module):
 
 
 class HiDreamImageTransformer2DModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["double_stream_blocks", "single_stream_blocks"]
-
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         parts = name.split(".")
