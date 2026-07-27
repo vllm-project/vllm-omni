@@ -249,7 +249,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledTwoStagePipeline",
         )
     },
-    "HunyuanImage3Pipeline": {
+    # HunyuanImage3 keys on the model architecture name that ``get_model_class_name``
+    # reports at runtime for its AR+DiT / AR-only / DiT-only deploys
+    # (``od_config.model_class_name`` == the diffusion registry arch key). The
+    # "HunyuanImage3Pipeline" alias is kept for any path that surfaces the
+    # pipeline class name instead.
+    "HunyuanImage3ForCausalMM": {
         "extra_body_params": HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
         "extra_output_params": HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
         "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
@@ -285,6 +290,9 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
 # submodule, so both names must resolve to the same request builders.
 _EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 _EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+# Alias: some code paths surface HunyuanImage3's pipeline class name rather than
+# the architecture name; point both at the same spec.
+_EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
