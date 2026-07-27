@@ -43,6 +43,20 @@ class OmniTextPrompt(TextPrompt):
     model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
+class OmniInteractionEvent(OmniTextPrompt, total=False):
+    """Prompt-event payload for mid-stream interactions."""
+
+    pass
+
+
+class OmniInteractionPrompt(TypedDict, total=False):
+    """Mid-stream interaction payload."""
+
+    event_id: NotRequired[str]
+    event: NotRequired[OmniInteractionEvent]
+    transition_chunks: NotRequired[int]
+
+
 class OmniTokensPrompt(TokensPrompt):
     """Tokens prompt with optional embeddings and stage payloads.
 

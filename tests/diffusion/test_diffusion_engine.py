@@ -392,6 +392,57 @@ class TestRequestBatchCapability:
         warmup.assert_called_once_with()
 
 
+class TestDiffusionCompileConfig:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_config_defaults_to_dynamic_regional_compile(self) -> None:
+        config = OmniDiffusionConfig(model="test")
+
+        assert config.diffusion_compile_granularity == "regional"
+        assert config.diffusion_compile_dynamic is True
+
+    def test_from_kwargs_preserves_compile_controls(self) -> None:
+        config = OmniDiffusionConfig.from_kwargs(
+            model="test",
+            diffusion_compile_granularity="full",
+            diffusion_compile_dynamic=False,
+        )
+
+        assert config.diffusion_compile_granularity == "full"
+        assert config.diffusion_compile_dynamic is False
+
+    def test_config_rejects_invalid_compile_granularity(self) -> None:
+        with pytest.raises(ValueError, match="diffusion_compile_granularity"):
+            OmniDiffusionConfig(model="test", diffusion_compile_granularity="block")
+
+    def test_config_rejects_non_boolean_compile_dynamic(self) -> None:
+        with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
+            OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
+
+    @pytest.mark.parametrize(
+        "kwargs, feature",
+        [
+            ({"parallel_config": {"ulysses_degree": 2}, "num_gpus": 2}, "sequence parallelism"),
+            (
+                {
+                    "parallel_config": {"use_hsdp": True, "hsdp_shard_size": 2},
+                    "num_gpus": 2,
+                },
+                "HSDP",
+            ),
+            ({"enable_cpu_offload": True}, "CPU offload"),
+            ({"enable_layerwise_offload": True}, "layerwise offload"),
+        ],
+    )
+    def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
+        with pytest.raises(ValueError, match=feature):
+            OmniDiffusionConfig(
+                model="test",
+                diffusion_compile_granularity="full",
+                **kwargs,
+            )
+
+
 class TestRequestBatchAdmission:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

@@ -50,7 +50,7 @@ if TYPE_CHECKING:
         DuplexSessionLifecycleMessage,
     )
     from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
-    from vllm_omni.inputs.data import OmniPromptType
+    from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -1005,6 +1005,46 @@ class AsyncOmni(EngineClient, OmniBase):
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        *,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Apply a midway interaction to an active streaming diffusion request.
+
+        ``request_id`` is the external id created by the server-side session,
+        matching the value passed to :meth:`generate`.
+        """
+        event = interaction.get("event")
+        prompt = event.get("prompt") if isinstance(event, dict) else None
+        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("prompt must be non-empty")
+        transition_chunks = interaction.get("transition_chunks")
+        if transition_chunks is not None and transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+
+        if self.num_stages != 1:
+            raise ValueError("interaction requires single-stage diffusion")
+        stage_meta = self.engine.get_stage_metadata(0)
+        if stage_meta.stage_type != "diffusion":
+            raise ValueError("interaction requires a diffusion stage")
+
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if not internal_ids:
+            raise ValueError(f"No active request for interaction: {request_id!r}")
+        if len(internal_ids) > 1:
+            raise ValueError(
+                f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
+            )
+
+        await self.engine.submit_interaction_async(
+            internal_ids[0],
+            interaction=interaction,
+        )
+        if self.log_stats:
+            logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
 
     async def _abort_internal_requests(self, request_id: str | Iterable[str]):
         """Abort request(s) via the Orchestrator given internal request IDs,

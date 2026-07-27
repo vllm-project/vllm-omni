@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
@@ -27,6 +28,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
@@ -202,11 +205,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         self.make_empty_intermediate_tensors = self.tts_model.make_empty_intermediate_tensors
 
+    def _boundary_embeddings(self) -> torch.Tensor:
+        """Embed the ``<text_eos><audio_bos>`` tail every condition ends with."""
+        ids = torch.tensor(
+            [self._text_eos_id, self._tts_bos_id],
+            device=self.emb_text.weight.device,
+            dtype=torch.long,
+        )
+        return self.emb_text(ids)
+
     def _build_condition_embeddings(
         self,
         tts_token_ids: torch.Tensor,
         tts_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if tts_token_ids.numel() == 0 or tts_hidden_states.numel() == 0:
+            # The thinker can legally emit an empty speech segment (<|tts_bos|>
+            # immediately followed by a boundary token) when it decides not to
+            # speak. Condition on the boundary tokens alone, which matches the
+            # 2-token scheduler prompt the stage bridge builds for an empty
+            # handoff.
+            return self._boundary_embeddings()
         device = self.emb_text.weight.device
         dtype = self.emb_text.weight.dtype
         token_ids = tts_token_ids.to(device=device, dtype=torch.long).reshape(-1)
@@ -220,9 +239,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         hidden_embeds = self.projector_semantic(hidden)
         if self._normalize:
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
-        text_eos = self.emb_text(torch.tensor([self._text_eos_id], device=device, dtype=torch.long))
-        audio_bos = self.emb_text(torch.tensor([self._tts_bos_id], device=device, dtype=torch.long))
-        return torch.cat([text_embeds + hidden_embeds, text_eos, audio_bos], dim=0)
+        return torch.cat([text_embeds + hidden_embeds, self._boundary_embeddings()], dim=0)
 
     def preprocess(
         self,
@@ -255,8 +272,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"hidden_states={type(hidden_states).__name__}, "
                     f"available_keys={available}"
                 )
-            if token_ids.numel() == 0 or hidden_states.numel() == 0:
-                raise ValueError("MiniCPM-o Talker conditioning must not be empty")
+            # An empty condition means the thinker chose not to speak: finish the
+            # request up front so it emits zero audio codes instead of killing
+            # the stage engine.
+            empty_condition = token_ids.numel() == 0 or hidden_states.numel() == 0
+            if empty_condition:
+                logger.warning_once(
+                    "MiniCPM-o Talker received an empty condition (request %s); this request produces no audio.",
+                    info_dict.get("request_id"),
+                )
             full_embeds = self._build_condition_embeddings(token_ids, hidden_states)
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
             if offset == 0 and span_len > full_embeds.shape[0]:
@@ -288,7 +312,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             state = {
                 "step": 0,
                 "max_tokens": max_tokens,
-                "finished": False,
+                "finished": empty_condition,
             }
             request_id = str(info_dict.get("request_id", "0"))
             request_states = getattr(self, "_request_audio_states", None)
@@ -311,6 +335,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         current = (info_dict.get("audio_codes", {}) or {}).get("current")
         if not isinstance(current, torch.Tensor) or current.numel() != 1:
+            if state.get("finished"):
+                # A request that finished before sampling any code can still be
+                # scheduled for decode steps while sampling min_tokens masks the
+                # stop token. make_omni_output ignores its hidden states, so any
+                # shape-correct embedding will do.
+                weight = self.emb_code[0].weight
+                return input_ids, weight.new_zeros((span_len, weight.shape[1])), {}
             raise RuntimeError("MiniCPM-o Talker decode is missing the previous request-local audio code")
         code = current.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(1)
         embeds = self.emb_code[0](code)

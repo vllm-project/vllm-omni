@@ -459,12 +459,15 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False

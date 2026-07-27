@@ -424,6 +424,25 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-granularity",
+            choices=["regional", "full"],
+            default=None,
+            help=(
+                "Compilation scope for the generic diffusion model runner. "
+                "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
+                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-dynamic",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Use dynamic shapes for the selected generic diffusion compile scope. "
+                "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,
@@ -472,6 +491,14 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
+        )
+        omni_config_group.add_argument(
+            "--allgather-degree",
+            dest="allgather_degree",
+            type=int,
+            default=None,
+            help="AllGather-KV Sequence Parallelism degree for non-causal diffusion attention. "
+            "Equivalent to setting DiffusionParallelConfig.allgather_degree.",
         )
         omni_config_group.add_argument(
             "--diffusion-quantization-config",
@@ -534,7 +561,8 @@ class OmniServeCommand(CLISubcommand):
             help="Diffusion attention config. Accepts JSON or vLLM-style dotted flags. "
             "Examples: "
             "--diffusion-attention-config.default.backend FLASH_ATTN, "
-            "--diffusion-attention-config.per_role.self.backend SPARSE_BLOCK, "
+            "--diffusion-attention-config.default.backend TRTLLM_ATTN "
+            "--diffusion-attention-config.default.skip_softmax.target_sparsity 0.5, "
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',

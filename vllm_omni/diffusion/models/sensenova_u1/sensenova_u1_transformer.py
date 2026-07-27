@@ -32,7 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, SensenovaCachedAdapter
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, SensenovaCachedAdapter
 
 logger = init_logger(__name__)
 

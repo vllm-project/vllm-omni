@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.prompt_update import PromptUpdateMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
@@ -155,7 +156,12 @@ def get_helios_pre_process_func(
 
 
 class HeliosPipeline(
-    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    PromptUpdateMixin,
+    SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
@@ -894,9 +900,12 @@ class HeliosPipeline(
 
         output = current_latents if extra["output_type"] == "latent" else current_video
         completed_chunk_index = state.chunk_index
+        prompt_update_metadata = state.extra.pop("prompt_update_chunk_metadata", {})
         state.chunk_index += 1
         finished = state.request_denoise_completed
         if not finished:
+            # Apply queued/advancing prompt updates before preparing the next chunk.
+            self._apply_prompt_update_at_chunk_boundary(state)
             self._prepare_next_chunk(state)
         else:
             self._current_timestep = None
@@ -908,6 +917,9 @@ class HeliosPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
+            started_event_ids=prompt_update_metadata.get("started_event_ids", []),
+            active_event_ids=prompt_update_metadata.get("active_event_ids", []),
+            completed_event_ids=prompt_update_metadata.get("completed_event_ids", []),
             finished=finished,
         )
 
@@ -1585,12 +1597,13 @@ class HeliosPipeline(
         negative_prompt: str | list[str] | None = None,
         do_classifier_free_guidance: bool = True,
         num_videos_per_prompt: int = 1,
-        max_sequence_length: int = 226,
+        max_sequence_length: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         device = device or self.device
         dtype = dtype or self.text_encoder.dtype
+        max_sequence_length = max_sequence_length or 226
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt_clean = [self._prompt_clean(p) for p in prompt]

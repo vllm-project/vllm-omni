@@ -384,6 +384,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             stopped = False
             is_segment_finished = False
+            finished = False
             new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
@@ -429,8 +430,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
-                is_segment_finished = True
                 finished = self._handle_stopped_request(request)
+                is_segment_finished = not finished
+                if finished:
+                    request.resumable = False
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -494,7 +497,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or is_segment_finished):
+            if self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or is_segment_finished or finished
+            ):
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,

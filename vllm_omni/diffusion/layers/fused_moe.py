@@ -6,7 +6,6 @@ from typing import Any
 import torch
 import vllm.distributed.parallel_state as _vllm_ps
 import vllm.forward_context as _vllm_fc
-from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -50,18 +49,18 @@ def _set_forward_context_dp_metadata(num_tokens: int) -> None:
     forward_context.dp_metadata = _vllm_fc.DPMetadata(torch.tensor(gathered_num_tokens, dtype=torch.int64))
 
 
-class HunyuanFusedMoEDefault:
-    """Adapter that configures the upstream FusedMoE ``MoERunner`` for HunyuanImage3.
+class FusedMoE:
+    """Adapter that configures the upstream FusedMoE ``MoERunner`` for diffusion models.
 
     Upstream commit dc68bd8c41 refactored FusedMoE from a class (``nn.Module``)
     into a factory function that returns a ``MoERunner`` instance, whose expert
     weights live in a ``routed_experts`` submodule
     (``...experts.routed_experts.w13_weight`` / ``...w2_weight``).
 
-    This adapter builds that runner, installs the omni-specific forward-context
-    setup and one-shot kernel-initialisation hook, and returns the runner
-    *directly* from ``__new__`` so the parent MoE block registers it as a real
-    ``nn.Module`` submodule.
+    This adapter builds that runner, installs the diffusion forward-context
+    setup and additional platform hooks, and returns the runner *directly* from
+    ``__new__`` so the parent MoE block registers it as a real ``nn.Module``
+    submodule.
 
     Returning the runner (rather than wrapping it in a plain object that holds it
     in an attribute) is required for correctness: a non-Module wrapper hides the
@@ -71,9 +70,11 @@ class HunyuanFusedMoEDefault:
     """
 
     def __new__(cls, *, prefix: str = "", **kwargs: Any) -> Any:
+        current_omni_platform.prepare_diffusion_op_runtime("fused_moe")
+
         # Current vLLM FusedMoE handles output reduction internally.
         kwargs.pop("reduce_results", None)
-        # FusedMoE is now a factory function — call it to get a MoERunner.
+        # FusedMoE is now a factory function; call it to get a MoERunner.
         from vllm.model_executor.layers.fused_moe import FusedMoE as _FusedMoE
 
         moe_runner = _FusedMoE(prefix=prefix, **kwargs)
@@ -91,21 +92,7 @@ class HunyuanFusedMoEDefault:
                 _set_forward_context_dp_metadata(hidden_states.shape[0])
 
         moe_runner.register_forward_pre_hook(_num_tokens_pre_hook, with_kwargs=True)
-
-        # One-shot lazy kernel initialisation on the first forward (no-op unless
-        # the runner exposes an uninitialised quant_method). Mirrors the prior
-        # wrapper behaviour exactly, just bound to the runner module.
-        init_handle: Any = None
-
-        def _kernel_init_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
-            nonlocal init_handle
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None and getattr(quant_method, "moe_kernel", None) is None:
-                quant_method.process_weights_after_loading(module)
-            if init_handle is not None:
-                init_handle.remove()
-
-        init_handle = moe_runner.register_forward_pre_hook(_kernel_init_pre_hook, with_kwargs=True)
+        current_omni_platform.register_additional_diffusion_fused_moe_hooks(moe_runner)
 
         return moe_runner
 
@@ -131,38 +118,6 @@ class HunyuanFusedMoEDefault:
         )
 
         return fused_moe_make_expert_params_mapping(
-            model,
-            ckpt_gate_proj_name=ckpt_gate_proj_name,
-            ckpt_down_proj_name=ckpt_down_proj_name,
-            ckpt_up_proj_name=ckpt_up_proj_name,
-            num_experts=num_experts,
-            num_redundant_experts=num_redundant_experts,
-        )
-
-
-class HunyuanFusedMoE:
-    def __new__(cls, *, prefix: str = "", **kwargs: Any) -> Any:
-        op_name = "hunyuan_fused_moe"
-        current_omni_platform.prepare_diffusion_op_runtime(op_name)
-        impl = resolve_obj_by_qualname(
-            current_omni_platform.get_diffusion_model_impl_qualname(op_name),
-        )
-        return impl(prefix=prefix, **kwargs)
-
-    @classmethod
-    def make_expert_params_mapping(
-        cls,
-        model: Any,
-        ckpt_gate_proj_name: str,
-        ckpt_down_proj_name: str,
-        ckpt_up_proj_name: str,
-        num_experts: int,
-        num_redundant_experts: int = 0,
-    ) -> list[tuple[str, str, int, str]]:
-        impl = resolve_obj_by_qualname(
-            current_omni_platform.get_diffusion_model_impl_qualname("hunyuan_fused_moe"),
-        )
-        return impl.make_expert_params_mapping(
             model,
             ckpt_gate_proj_name=ckpt_gate_proj_name,
             ckpt_down_proj_name=ckpt_down_proj_name,
