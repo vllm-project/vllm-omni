@@ -176,7 +176,7 @@ def _generate_image(omni, args, prompt, seed):
     elapsed = time.perf_counter() - start
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
-    req_out = OmniRequestOutput.unwrap_result(outputs)
+    req_out = outputs[0] if isinstance(outputs, list) else outputs
     if not req_out.images:
         raise ValueError("Could not extract image output from result.")
     img = req_out.images[0]
