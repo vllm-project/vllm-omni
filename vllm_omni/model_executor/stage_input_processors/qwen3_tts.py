@@ -15,7 +15,9 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
+    compute_ramp_emit,
     max_ic_for_chunk_size,
+    parse_chunk_ramp,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -84,6 +86,12 @@ def talker2code2wav_async_chunk(
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
     ref_code_context_frames = int(cfg.get("ref_code_context_frames") or left_context_size_config)
 
+    # Ramp: parse once per transfer_manager (config is static for the adapter's
+    # lifetime). When active, ramp replaces IC/steady entirely — skip dynamic IC.
+    if not hasattr(transfer_manager, "_ramp_parsed"):
+        transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_size)
+    ramp = transfer_manager._ramp_parsed
+
     # Per-request override takes priority over dynamic IC.
     fixed_initial_chunk_size = configured_initial_chunk_size > 0
     initial_chunk_size = configured_initial_chunk_size
@@ -100,7 +108,8 @@ def talker2code2wav_async_chunk(
             fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
-    if not fixed_initial_chunk_size:
+    # Skipped when ramp is active (ramp replaces IC/steady entirely).
+    if ramp is None and not fixed_initial_chunk_size:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
         if _ic_cache is None:
             _ic_cache = {}
@@ -143,21 +152,30 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
-
-    if use_first_chunk and length <= initial_chunk_size:
-        if not finished and length < initial_chunk_size:
+    if ramp is not None:
+        chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
+        if not emit:
             return None
-        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+        if context_length == 0:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
     else:
-        # The initial chunk is only for TTFA. After that, return to the normal
-        # codec chunk size so Code2Wav is not flooded by repeated tiny windows.
-        initial_coverage = initial_chunk_size if use_first_chunk else 0
-        adjusted = length - initial_coverage
-        if not finished and adjusted % chunk_size != 0:
-            return None
-        chunk_length = adjusted % chunk_size
-        context_length = chunk_length if chunk_length != 0 else chunk_size
+        use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+
+        if use_first_chunk and length <= initial_chunk_size:
+            if not finished and length < initial_chunk_size:
+                return None
+            context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+        else:
+            initial_coverage = initial_chunk_size if use_first_chunk else 0
+            adjusted = length - initial_coverage
+            if not finished and adjusted % chunk_size != 0:
+                return None
+            chunk_length = adjusted % chunk_size
+            context_length = chunk_length if chunk_length != 0 else chunk_size
 
     end_index = min(length, left_context_size_config + context_length)
     left_context_size = max(0, end_index - context_length)

@@ -31,6 +31,7 @@ def get_question(prompt_type: str = "text") -> str:
     return prompts.get(prompt_type, prompts["text"])
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -87,6 +88,7 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
