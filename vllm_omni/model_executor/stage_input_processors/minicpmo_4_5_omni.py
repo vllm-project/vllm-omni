@@ -181,6 +181,34 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
     return _codec_scalars(pooling_output)
 
 
+def _producer_finished(multimodal_output: Any) -> bool:
+    """Read the producer-reported ``meta.finished`` termination flag.
+
+    MiniCPM-o's TTS Talker emits ``meta.finished`` (a per-token list of bools,
+    the final token ``True``) in its ``OmniOutput``.  The scheduler-level
+    ``request.is_finished()`` is not always set in lock-step with that signal
+    (notably under full-modality *mix* inputs, vllm-project/vllm-omni#5437),
+    so the async-chunk bridge must also honor the producer's own termination
+    flag to flush the last codec window and mark ``last_chunk``.  For models
+    that don't emit ``meta.finished`` this returns ``False`` (no-op).
+    """
+    if isinstance(multimodal_output, Mapping):
+        meta = multimodal_output.get("meta")
+        if not isinstance(meta, Mapping):
+            meta = {}
+        finished = meta.get("finished")
+    elif hasattr(multimodal_output, "multimodal_outputs"):
+        mm = getattr(multimodal_output, "multimodal_outputs", None)
+        finished = mm.get("finished") if isinstance(mm, Mapping) else None
+    else:
+        finished = None
+    if isinstance(finished, torch.Tensor):
+        finished = finished.detach().cpu().reshape(-1).tolist()
+    if isinstance(finished, Sequence) and not isinstance(finished, (str, bytes, bytearray)):
+        return any(bool(x) for x in finished)
+    return bool(finished)
+
+
 def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
     request_payload = getattr(transfer_manager, "request_payload", None)
     if isinstance(request_payload, dict):
@@ -274,9 +302,21 @@ def tts2code2wav_async_chunk(
 
     pending = state["pending"]
     pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    producer_finished = _producer_finished(multimodal_output)
     request_finished = getattr(request, "is_finished", None)
-    finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    finished = bool(
+        is_finished
+        or (callable(request_finished) and request_finished())
+        or producer_finished
+    )
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    logger.info(
+        "[FIX-5437][bridge] req=%s is_finished=%s producer_finished=%s "
+        "scheduler_finished=%s finished=%s pending=%d chunk_frames=%d",
+        request_id, is_finished, producer_finished,
+        bool(callable(request_finished) and request_finished()),
+        finished, len(pending), chunk_frames,
+    )
     if not finished and len(pending) < chunk_frames:
         return None
 
@@ -303,13 +343,6 @@ def tts2code2wav_async_chunk(
     state["codec_end"] = codec_end
 
     last_chunk = bool(finished and not pending)
-    # [DIAG-5437] Trace Stage1->Stage2 bridge termination decision.
-    logger.info(
-        "[DIAG-5437][bridge] req=%s is_finished=%s pending=%d last_chunk=%s "
-        "state_segment_end=%s state_turn_end=%s",
-        request_id, finished, len(pending), last_chunk,
-        bool(state.get("segment_end", False)), bool(state.get("turn_end", False)),
-    )
     if last_chunk:
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
