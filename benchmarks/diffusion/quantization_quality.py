@@ -158,7 +158,6 @@ def _build_omni_kwargs(args, quantization=None):
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)

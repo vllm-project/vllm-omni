@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for OmniRequestOutput class."""
 
-import dataclasses
-
 import pytest
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -54,9 +52,7 @@ class TestFromStageOutput:
     def test_copies_request_output_content(self):
         """Content from a vLLM RequestOutput is flattened onto the new object."""
         source = _make_text_request_output(text="copied text")
-        out = OmniRequestOutput.from_stage_output(
-            source, request_id="req-1", stage_id=0, final_output_type="text"
-        )
+        out = OmniRequestOutput.from_stage_output(source, request_id="req-1", stage_id=0, final_output_type="text")
 
         assert out.prompt == "test prompt"
         assert out.prompt_token_ids == [1, 2, 3]
@@ -69,12 +65,8 @@ class TestFromStageOutput:
     def test_copies_omni_content(self):
         """Diffusion fields are copied when source is another OmniRequestOutput."""
         image = Image.new("RGB", (64, 64), color="blue")
-        inner = OmniRequestOutput.from_diffusion(
-            request_id="req-diff", images=[image], prompt="a cat"
-        )
-        outer = OmniRequestOutput.from_stage_output(
-            inner, request_id="req-diff", stage_id=0, final_output_type="image"
-        )
+        inner = OmniRequestOutput.from_diffusion(request_id="req-diff", images=[image], prompt="a cat")
+        outer = OmniRequestOutput.from_stage_output(inner, request_id="req-diff", stage_id=0, final_output_type="image")
 
         assert len(outer.images) == 1
         assert outer.images[0] is image
@@ -91,9 +83,7 @@ class TestFromStageOutput:
             prompt_token_ids=[7, 8, 9],
             finished=False,
         )
-        out = OmniRequestOutput.from_stage_output(
-            source, request_id="duck-1", stage_id=2
-        )
+        out = OmniRequestOutput.from_stage_output(source, request_id="duck-1", stage_id=2)
 
         assert out.prompt == "duck prompt"
         assert out.prompt_token_ids == [7, 8, 9]
@@ -103,9 +93,7 @@ class TestFromStageOutput:
     def test_request_id_always_copied_from_source(self):
         """request_id is always copied from source, even when passed in kwargs."""
         source = _make_text_request_output(request_id="source-id")
-        out = OmniRequestOutput.from_stage_output(
-            source, request_id="kwargs-id", stage_id=1
-        )
+        out = OmniRequestOutput.from_stage_output(source, request_id="kwargs-id", stage_id=1)
         # Source wins — request_id is content, not a control field.
         assert out.request_id == "source-id"
 
@@ -149,7 +137,6 @@ class TestFromStageOutput:
 
 
 class TestDataclassSafety:
-
     def test_from_stage_output_is_classmethod(self):
         """from_stage_output must be a classmethod."""
         assert callable(OmniRequestOutput.from_stage_output)
@@ -228,9 +215,7 @@ class TestMsgpackRoundTrip:
         )
 
         source = _make_text_request_output(text="no recursion")
-        out = OmniRequestOutput.from_stage_output(
-            source, request_id="rec-1", stage_id=0
-        )
+        out = OmniRequestOutput.from_stage_output(source, request_id="rec-1", stage_id=0)
 
         encoder = OmniMsgpackEncoder()
         encoded = encoder.encode(out)

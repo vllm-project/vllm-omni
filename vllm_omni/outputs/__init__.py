@@ -194,9 +194,7 @@ class OmniRequestOutput(RequestOutput):
                 setattr(self, name, getattr(source, name))
 
     @classmethod
-    def from_stage_output(
-        cls, source: RequestOutput, **kwargs: Any
-    ) -> "OmniRequestOutput":
+    def from_stage_output(cls, source: RequestOutput, **kwargs: Any) -> "OmniRequestOutput":
         """Create an OmniRequestOutput from a stage's raw output.
 
         Copies generation content (``outputs``, ``prompt``, ``prompt_token_ids``,
@@ -394,5 +392,3 @@ class OmniRequestOutput(RequestOutput):
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
-
-
