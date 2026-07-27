@@ -27,7 +27,7 @@ class LTX2TwoStagePipeline(LTX2Pipeline):
 
 
 class LTX2DistilledPipeline(LTX2Pipeline):
-    """Unified LTX-2 distilled two-stage T2V/I2V entry."""
+    """Unified LTX-2/LTX-2.3 full-distilled two-stage T2V/I2V entry."""
 
     pipeline_kind = "distilled_two_stage"
     component_profile = LTX2_DISTILLED_COMPONENT_PROFILE
