@@ -1,20 +1,24 @@
-# MiniCPM-o 4.5 default deploy: single-GPU layout.
-#
-# Both stages are co-located on GPU 0:
-#   Stage 0 (thinker): multimodal understanding, ~80% mem.
-#   Stage 1 (talker) : MiniCPMTTS + in-process Token2Wav vocoder, ~10% mem
-#                      (talker LM plus the vocoder that emits the waveform).
-#
-# Other GPU layouts: minicpmo_4_5_3gpu.yaml, minicpmo_4_5_8x4090.yaml.
-async_chunk: false
+# MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
+pipeline: minicpmo_4_5
+async_chunk: true
 
 trust_remote_code: true
 enable_prefix_caching: false
 
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+
 stages:
   - stage_id: 0
-    max_num_seqs: 16
-    gpu_memory_utilization: 0.8
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.65
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -31,20 +35,41 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Talker only consumes runtime_additional_information[0]; any value > 1
-    # makes concurrent requests share request-0's audio (mm_outputs fallback).
-    max_num_seqs: 1
-    gpu_memory_utilization: 0.1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
     enforce_eager: false
     max_num_batched_tokens: 8192
     devices: "0"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    # Codec sampling comes from the checkpoint's tts_config. These parameters
+    # govern only vLLM's binary continue/stop token.
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 1
+      min_tokens: 50
+      max_tokens: 2048
+      stop_token_ids: [1]
       seed: 42
       detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
 
 platforms:
   npu:

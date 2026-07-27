@@ -396,7 +396,6 @@ class StageRuntime:
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
-
                 replicas.append(
                     ReplicaInitPlan(
                         replica_id=replica_id,
