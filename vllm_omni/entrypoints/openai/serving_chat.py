@@ -3045,7 +3045,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
 
-
             # Build generation kwargs
             gen_prompt: OmniTextPrompt = {
                 "prompt": prompt,
