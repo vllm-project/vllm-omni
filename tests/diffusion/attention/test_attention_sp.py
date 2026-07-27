@@ -666,10 +666,13 @@ def ulysses_attention_on_test_model(
         cfg_parallel_size=1,
     )
 
-    od_config = OmniDiffusionConfig(
+    od_config = OmniDiffusionConfig.from_kwargs(
         model="test_model",
         dtype=dtype,
         parallel_config=parallel_config,
+        # This regression targets pytorch_attn_forward(). Do not let an
+        # installed FA/FA3 backend silently bypass the SDPA Ring path.
+        diffusion_attention_backend="TORCH_SDPA",
     )
 
     # Initialize model parallel
