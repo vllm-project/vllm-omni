@@ -3183,6 +3183,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
+            for name in ("temperature", "top_p", "top_k"):
+                if (value := request.extra_params.get(name)) is not None:
+                    setattr(sampling_params_list[0], name, value)
             if sampling_params_list[0].extra_args is None:
                 sampling_params_list[0].extra_args = {}
             sampling_params_list[0].extra_args.update(request.extra_params)

@@ -236,6 +236,38 @@ def test_missing_conditioning_fails_clearly() -> None:
         )
 
 
+def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(8, 4)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    talker._text_eos_id = 5
+    talker._tts_bos_id = 6
+
+    _, embeds, updates = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        request_id="req-empty",
+        tts_token_ids=torch.empty(0, dtype=torch.long),
+        tts_hidden_states=torch.empty(0, 4),
+    )
+
+    assert torch.equal(embeds, talker.emb_text(torch.tensor([5, 6])))
+    assert updates["audio_state"]["finished"] is True
+
+    # Stage 1's sampling min_tokens keeps scheduling decode steps until the stop
+    # token becomes eligible, and those steps have no previous code to embed.
+    _, decode_embeds, _ = talker.preprocess(
+        torch.zeros(1, dtype=torch.long),
+        None,
+        request_id="req-empty",
+        audio_state=updates["audio_state"],
+        audio_codes=updates["audio_codes"],
+    )
+
+    assert decode_embeds.shape == (1, 4)
+
+
 def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
     talker = _make_talker()
     talker._request_generators["req-done"] = torch.Generator()

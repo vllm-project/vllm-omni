@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-License-Identifier: Copyright contributors to the vLLM project
-"""Invalid audio format rejection on MiniCPM-o 4.5: ``POST /v1/completions``."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Invalid audio format rejection on MiniCPM-o 4.5: ``POST /v1/chat/completions``."""
 
 import os
 

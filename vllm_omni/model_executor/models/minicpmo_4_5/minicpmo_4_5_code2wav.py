@@ -51,6 +51,23 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
+# Keys the runner stamps on every step regardless of stage input (see
+# OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
+# override). A step carrying only these has no producer payload at all.
+_RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+
+
+def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
+    """Whether this step carries anything the Talker stage actually sent.
+
+    Any real async-chunk payload brings producer metadata along, whether the
+    transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
+    """
+    if any(key not in _RUNNER_STAMPED_KEYS for key in info):
+        return True
+    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
+
+
 @dataclass(frozen=True)
 class _RequestState:
     cache_epoch: int
@@ -77,6 +94,7 @@ class _WorkItem:
     duplex_epoch: int | None
     segment_end: bool
     turn_end: bool
+    has_payload: bool = True
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -210,6 +228,32 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not isinstance(meta, Mapping):
             meta = info
         request_id = str(_scalar(meta.get("request_id"), _scalar(info.get("request_id"), "")))
+        if not _carries_stage_payload(info, meta):
+            # The producer attached nothing to this step, only the bookkeeping
+            # the runner stamps on every request. The stage was scheduled on
+            # the placeholder prompt that async-chunk pre-warm submits before
+            # the first codec window arrives: those tokens are reserved slots,
+            # not codec data, and one bogus frame is shorter than the vocoder's
+            # lookahead window. Such a step carries no producer metadata at
+            # all, so it cannot be held to the payload contract below either.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id or state_id,
+                cache_epoch=0,
+                chunk_seq=0,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+                last_chunk=False,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=None,
+                segment_text="",
+                duplex_turn_id=None,
+                duplex_epoch=None,
+                segment_end=False,
+                turn_end=False,
+                has_payload=False,
+            )
         if not request_id:
             raise _batch_error("missing_request_id", output_index=index)
         cache_epoch = int(_scalar(meta.get("cache_epoch"), 0))
@@ -407,7 +451,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         compute_items = [item for item in items if item.tokens.numel() > 0]
-        invalid_empty = [item.request_id for item in items if not item.last_chunk and item.tokens.numel() == 0]
+        invalid_empty = [
+            item.request_id for item in items if item.has_payload and not item.last_chunk and item.tokens.numel() == 0
+        ]
         if invalid_empty:
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 

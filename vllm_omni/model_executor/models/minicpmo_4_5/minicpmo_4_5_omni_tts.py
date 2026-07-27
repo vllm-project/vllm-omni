@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
@@ -27,6 +28,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
@@ -273,6 +276,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # request up front so it emits zero audio codes instead of killing
             # the stage engine.
             empty_condition = token_ids.numel() == 0 or hidden_states.numel() == 0
+            if empty_condition:
+                logger.warning_once(
+                    "MiniCPM-o Talker received an empty condition (request %s); this request produces no audio.",
+                    info_dict.get("request_id"),
+                )
             full_embeds = self._build_condition_embeddings(token_ids, hidden_states)
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
             if offset == 0 and span_len > full_embeds.shape[0]:

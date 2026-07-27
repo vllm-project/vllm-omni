@@ -625,6 +625,13 @@ class OmniDiffusionConfig:
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = 32
 
+    # Opt-in: route per-session world-model state through the shared
+    # SessionStateManager (RFC #4480) instead of the model's bespoke cache.
+    # Default off; the bespoke path remains the default. A *set*
+    # OMNI_DIFFUSION_SESSION_STATE_MANAGER environment variable overrides this
+    # in both directions. See docs/features/session_state_manager.md.
+    enable_session_state_manager: bool = False
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
@@ -1267,6 +1274,9 @@ class DiffusionOutput:
     finished: bool = True
     chunk_index: int = 0
     total_chunks: int = 1
+    started_event_ids: list[str] = field(default_factory=list)
+    active_event_ids: list[str] = field(default_factory=list)
+    completed_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
