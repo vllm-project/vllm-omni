@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -32,6 +33,33 @@ class SupportImageInput(Protocol):
 class ReferenceVideoDecodeSpec:
     max_frames: int | None = None
     keep: Literal["first", "last"] = "first"
+
+
+@dataclass(frozen=True)
+class OutputDimensions:
+    width: int
+    height: int
+
+
+@runtime_checkable
+class SupportsOutputDimensions(Protocol):
+    """Resolve the effective output dimensions before request dispatch."""
+
+    @classmethod
+    def resolve_output_dimensions(
+        cls,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        extra_args: Mapping[str, Any] | None = None,
+    ) -> OutputDimensions | None: ...
+
+
+@runtime_checkable
+class SupportsOutputCountLimit(Protocol):
+    """Declare a per-prompt output-count limit for API validation."""
+
+    max_outputs_per_prompt: ClassVar[int]
 
 
 @runtime_checkable

@@ -63,6 +63,12 @@ example `{"resolution":"720p","ratio":"16:9"}`. The `2k` and `4k` entries
 only define output dimensions; whether they run successfully depends on the
 checkpoint, GPU memory, and memory optimizations available in the deployment.
 
+For `/v1/images/generations`, the server resolves these aliases to their final
+pixel dimensions before applying `--max-generated-image-size`. Requests above
+the configured limit return HTTP 400 before engine dispatch. LingBot produces
+one output per prompt; image requests with `n>1` are also rejected with HTTP
+400.
+
 LingBot TI2V accepts exactly one image reference. Image editing, video
 references, audio references, batching, and Refiner execution are not supported
 by this pipeline mode.

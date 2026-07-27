@@ -13,6 +13,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_request,
     resolve_lingbot_mode,
     resolve_lingbot_num_frames,
+    resolve_lingbot_output_dimensions,
     resolve_lingbot_size,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -177,6 +178,25 @@ def test_resolve_lingbot_size_validates_sources_and_alignment():
         resolve_lingbot_size(width=320, height=192, resolution="192p", ratio="9:16")
     with pytest.raises(ValueError, match="multiples of 16"):
         resolve_lingbot_size(width=321, height=192)
+
+
+def test_resolve_lingbot_output_dimensions_matches_request_priority():
+    dimensions = resolve_lingbot_output_dimensions(
+        sampling_width=480,
+        sampling_height=480,
+        extra_args={"resolution": "720p", "ratio": "16:9"},
+    )
+    assert (dimensions.width, dimensions.height) == (736, 1280)
+
+    dimensions = resolve_lingbot_output_dimensions(
+        sampling_width=480,
+        sampling_height=480,
+        extra_args={"width": 320, "height": 192},
+    )
+    assert (dimensions.width, dimensions.height) == (320, 192)
+
+    dimensions = resolve_lingbot_output_dimensions()
+    assert (dimensions.width, dimensions.height) == (480, 480)
 
 
 def test_normalize_lingbot_request_uses_mode_defaults_and_preserves_empty_negative():

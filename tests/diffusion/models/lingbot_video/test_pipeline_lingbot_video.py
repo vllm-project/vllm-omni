@@ -68,6 +68,7 @@ def test_component_discovery_declarations():
     assert LingBotVideoPipeline._encoder_modules == ["text_encoder"]
     assert LingBotVideoPipeline._vae_modules == ["vae"]
     assert LingBotVideoPipeline.supports_step_execution is False
+    assert LingBotVideoPipeline.max_outputs_per_prompt == 1
 
 
 def test_extra_body_params_include_video_flow_shift_alias():
@@ -418,7 +419,20 @@ class _CorruptingScheduler:
         return (latents + 7.0,)
 
 
-def test_ti2v_reinjects_clean_prefix_and_conditions_both_cfg_branches():
+@pytest.mark.parametrize(
+    ("guidance_scale", "batch_cfg", "expected_prompts", "expected_transformer_calls"),
+    [
+        pytest.param(2.0, False, ["positive", "negative"], 4, id="sequential-cfg"),
+        pytest.param(2.0, True, ["positive", "negative"], 2, id="batched-cfg"),
+        pytest.param(1.0, False, ["positive"], 2, id="cfg-disabled"),
+    ],
+)
+def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
+    guidance_scale,
+    batch_cfg,
+    expected_prompts,
+    expected_transformer_calls,
+):
     from vllm_omni.diffusion.models.lingbot_video import (
         LingBotGenerationMode,
         LingBotImageCondition,
@@ -453,15 +467,18 @@ def test_ti2v_reinjects_clean_prefix_and_conditions_both_cfg_branches():
         width=16,
         num_frames=9,
         num_inference_steps=2,
-        guidance_scale=2.0,
+        guidance_scale=guidance_scale,
         shift=3.0,
         output_type="latent",
+        batch_cfg=batch_cfg,
     )
 
-    assert [call[0] for call in encode_calls] == ["positive", "negative"]
+    assert [call[0] for call in encode_calls] == expected_prompts
     assert all(call[1] == [vlm_image] for call in encode_calls)
-    assert len(pipeline.transformer.latent_inputs) == 4
-    assert all(torch.equal(item[:, :, :1], condition.clean_latent) for item in pipeline.transformer.latent_inputs)
+    assert len(pipeline.transformer.latent_inputs) == expected_transformer_calls
+    for item in pipeline.transformer.latent_inputs:
+        expected_prefix = condition.clean_latent.expand(item.shape[0], -1, -1, -1, -1)
+        assert torch.equal(item[:, :, :1], expected_prefix)
     assert torch.equal(latents[:, :, :1], condition.clean_latent)
     assert torch.equal(latents[:, :, 1:], torch.full((1, 1, 2, 1, 1), 14.0))
 

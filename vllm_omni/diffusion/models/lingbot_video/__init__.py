@@ -22,6 +22,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_num_frames,
     normalize_lingbot_request,
     resolve_lingbot_num_frames,
+    resolve_lingbot_output_dimensions,
     resolve_lingbot_size,
 )
 
@@ -40,5 +41,6 @@ __all__ = [
     "normalize_lingbot_request",
     "prepare_ti2v_image_condition",
     "resolve_lingbot_num_frames",
+    "resolve_lingbot_output_dimensions",
     "resolve_lingbot_size",
 ]

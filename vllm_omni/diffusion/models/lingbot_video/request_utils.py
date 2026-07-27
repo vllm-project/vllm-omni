@@ -13,6 +13,8 @@ from typing import Any
 from PIL import Image
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.models.interface import OutputDimensions
+
 logger = init_logger(__name__)
 
 LINGBOT_RUNTIME_PROMPT_FIELDS = frozenset(
@@ -294,6 +296,56 @@ def _first_not_none(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
 
 
+def resolve_lingbot_output_dimensions(
+    *,
+    sampling_width: Any = None,
+    sampling_height: Any = None,
+    extra_args: Mapping[str, Any] | None = None,
+    prompt_fields: Mapping[str, Any] | None = None,
+    default_width: int = 480,
+    default_height: int = 480,
+) -> OutputDimensions:
+    """Resolve the dimensions that LingBot will use for generation."""
+    extra_args = extra_args or {}
+    prompt_fields = prompt_fields or {}
+    requested_width = _first_not_none(
+        _pick(extra_args, "width"),
+        _pick(prompt_fields, "width"),
+    )
+    requested_height = _first_not_none(
+        _pick(extra_args, "height"),
+        _pick(prompt_fields, "height"),
+    )
+    size = _first_not_none(
+        _pick(extra_args, "size"),
+        _pick(prompt_fields, "size"),
+    )
+    resolution = _first_not_none(
+        _pick(extra_args, "resolution"),
+        _pick(prompt_fields, "resolution"),
+    )
+    ratio = _first_not_none(
+        _pick(extra_args, "ratio"),
+        _pick(prompt_fields, "ratio"),
+    )
+    if requested_width is not None or requested_height is not None:
+        width, height = requested_width, requested_height
+    elif size is not None or resolution is not None or ratio is not None:
+        width = height = None
+    else:
+        width, height = sampling_width, sampling_height
+    if width is None and height is None and size is None and resolution is None and ratio is None:
+        width, height = default_width, default_height
+    resolved_height, resolved_width = resolve_lingbot_size(
+        width=width,
+        height=height,
+        size=size,
+        resolution=resolution,
+        ratio=ratio,
+    )
+    return OutputDimensions(width=resolved_width, height=resolved_height)
+
+
 def _request_context(extra_args: Mapping[str, Any]) -> Mapping[str, Any] | None:
     context = extra_args.get("_vllm_request_context")
     if context is None:
@@ -402,41 +454,15 @@ def normalize_lingbot_request(
     else:
         num_frames = normalize_lingbot_num_frames(default_num_frames)
 
-    requested_width = _first_not_none(
-        _pick(extra_args, "width"),
-        _pick(prompt_fields, "width"),
+    dimensions = resolve_lingbot_output_dimensions(
+        sampling_width=sampling.width,
+        sampling_height=sampling.height,
+        extra_args=extra_args,
+        prompt_fields=prompt_fields,
+        default_width=default_width,
+        default_height=default_height,
     )
-    requested_height = _first_not_none(
-        _pick(extra_args, "height"),
-        _pick(prompt_fields, "height"),
-    )
-    size = _first_not_none(
-        _pick(extra_args, "size"),
-        _pick(prompt_fields, "size"),
-    )
-    resolution = _first_not_none(
-        _pick(extra_args, "resolution"),
-        _pick(prompt_fields, "resolution"),
-    )
-    ratio = _first_not_none(
-        _pick(extra_args, "ratio"),
-        _pick(prompt_fields, "ratio"),
-    )
-    if requested_width is not None or requested_height is not None:
-        width, height = requested_width, requested_height
-    elif size is not None or resolution is not None or ratio is not None:
-        width = height = None
-    else:
-        width, height = sampling.width, sampling.height
-    if width is None and height is None and size is None and resolution is None and ratio is None:
-        width, height = default_width, default_height
-    height, width = resolve_lingbot_size(
-        width=width,
-        height=height,
-        size=size,
-        resolution=resolution,
-        ratio=ratio,
-    )
+    width, height = dimensions.width, dimensions.height
     num_inference_steps = sampling.num_inference_steps
     if num_inference_steps is None:
         num_inference_steps = _first_not_none(_pick(extra_args, "num_inference_steps"), default_num_inference_steps)

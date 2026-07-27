@@ -224,6 +224,17 @@ def test_client(mock_async_diffusion):
 
 
 @pytest.fixture
+def lingbot_test_client(test_client):
+    test_client.app.state.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args={"model_class_name": "LingBotVideoPipeline"},
+        )
+    ]
+    return test_client
+
+
+@pytest.fixture
 def async_omni_test_client():
     """Create test client with mocked AsyncOmni engine."""
     from fastapi import FastAPI
@@ -975,6 +986,54 @@ def test_generate_images_max_size_rejected(async_omni_test_client):
         },
     )
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("extra_params", "expected_size"),
+    [
+        pytest.param({"width": 2048, "height": 2048}, "2048x2048", id="width-height"),
+        pytest.param({"size": "2048x2048"}, "2048x2048", id="size"),
+        pytest.param({"resolution": "4k", "ratio": "16:9"}, "2176x3840", id="resolution-ratio"),
+    ],
+)
+def test_lingbot_effective_dimensions_cannot_bypass_image_size_limit(
+    lingbot_test_client,
+    mock_async_diffusion,
+    extra_params,
+    expected_size,
+):
+    response = lingbot_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": "320x192",
+            "extra_params": extra_params,
+        },
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST.value
+    assert expected_size in response.json()["detail"]
+    assert "exceeds the maximum allowed size" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
+
+
+def test_lingbot_multiple_outputs_rejected_before_engine_dispatch(
+    lingbot_test_client,
+    mock_async_diffusion,
+):
+    response = lingbot_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 2,
+            "size": "320x192",
+        },
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "supports at most 1 output per prompt" in response.json()["detail"]
+    assert "n=2" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
 
 
 def test_generate_multiple_images(test_client):
