@@ -45,7 +45,13 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.ming_tts.constants import (
+    KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
+    KEY_SPEAKER_WAVEFORM,
+    KEY_SPEAKER_WAVEFORM_LENGTHS,
+    SPEAKER_EMBEDDING_DIM,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -1014,7 +1020,6 @@ class TestTTSMethods:
         right = np.full(32000, -0.25, dtype=np.float32)
         samples = np.stack((left, right), axis=-1)
         mocker.patch("soundfile.read", return_value=(samples, 16000))
-        mock_extract = mocker.patch.object(speech_server, "_extract_ming_speaker_embeddings_from_ref_audio")
         saved: dict[str, object] = {}
 
         def fake_save_file(tensors, path, metadata=None):
@@ -1038,7 +1043,6 @@ class TestTTSMethods:
             )
         )
 
-        mock_extract.assert_not_called()
         tensors = saved["tensors"]
         metadata = saved["metadata"]
         assert isinstance(tensors, dict)
@@ -1669,16 +1673,20 @@ class TestTTSMethods:
 
         mock_get_emb.assert_called_once_with("emb_voice")
         mock_get_audio.assert_not_called()
-        mock_prompt.assert_called_once_with(req, ref_audio_data=None)
+        mock_prompt.assert_called_once_with(
+            req,
+            ref_audio_data=None,
+            voice_name=None,
+            voice_created_at=0,
+        )
         prompt_request = mock_prompt.call_args.args[0]
         assert prompt_request.speaker_embedding == fake_embedding
         assert len(prompt_request.speaker_embedding) == SPEAKER_EMBEDDING_DIM
         assert prepared.prompt["additional_information"]["speaker_count"] == 1
         assert prepared.model_type == "ming_tts"
 
-    def test_ming_adapter_uploaded_audio_uses_cached_embedding(self, speech_server, mocker: MockerFixture):
-        """Cached Ming audio voices skip repeated speaker extraction."""
-        speech_server._speaker_cache.clear()
+    def test_ming_adapter_uploaded_audio_forwards_worker_cache_metadata(self, speech_server, mocker: MockerFixture):
+        """Ming audio voices defer extraction and cache ownership to Stage-0."""
         speech_server.uploaded_speakers = {
             "audio_voice": {
                 "name": "audio_voice",
@@ -1691,25 +1699,11 @@ class TestTTSMethods:
         }
         ref_audio_source = "data:audio/wav;base64,ZmFrZWF1ZGlv"
         ref_audio_data = ([0.0, 0.1], 16000)
-        fake_embedding = [0.2] * SPEAKER_EMBEDDING_DIM
-        cache_key = speech_server._speaker_cache.make_cache_key(
-            "audio_voice",
-            model_type="ming_tts",
-            created_at=123,
-        )
-        speech_server._speaker_cache.put(
-            cache_key,
-            {"speaker_embedding": torch.tensor(fake_embedding)},
-        )
         mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
         mocker.patch.object(
             speech_server,
             "_resolve_ref_audio",
             new=mocker.AsyncMock(return_value=ref_audio_data),
-        )
-        mock_extract = mocker.patch.object(
-            speech_server,
-            "_extract_ming_speaker_embeddings_from_ref_audio",
         )
         mock_prompt = mocker.patch.object(
             speech_server,
@@ -1721,13 +1715,82 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice")
         prepared = asyncio.run(adapter.build(req, [], False))
 
-        mock_extract.assert_not_called()
-        mock_prompt.assert_called_once_with(req, ref_audio_data=ref_audio_data)
+        mock_prompt.assert_called_once_with(
+            req,
+            ref_audio_data=ref_audio_data,
+            voice_name="audio_voice",
+            voice_created_at=123,
+        )
         assert req.ref_text == "Reference transcript."
-        assert req.speaker_embedding == pytest.approx(fake_embedding)
+        assert req.speaker_embedding is None
         assert prepared.model_type == "ming_tts"
 
-    def test_ming_adapter_legacy_audio_only_voice_falls_back_and_caches(
+    def test_build_ming_prompt_forwards_audio_segments_and_worker_cache_metadata(self, speech_server):
+        class FakeTokenizer:
+            unk_token_id = -1
+
+            def encode(self, text):
+                return [777] if text == "<|vision_pad|>" else [1]
+
+            def convert_tokens_to_ids(self, token):
+                return 888 if token == "<audioPatch>" else self.unk_token_id
+
+        speech_server._tts_tokenizer = FakeTokenizer()
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_text="Two reference speakers.",
+        )
+        ref_audio_data = [
+            ([0.1, 0.2, 0.3], 16000),
+            ([0.4, 0.5], 24000),
+        ]
+
+        prompt = speech_server._build_ming_dense_prompt(
+            request,
+            ref_audio_data=ref_audio_data,
+            voice_name="uploaded_voice",
+            voice_created_at=123,
+        )
+
+        info = prompt["additional_information"]
+        assert KEY_SPEAKER_EMBEDDING not in info
+        torch.testing.assert_close(
+            info[KEY_SPEAKER_WAVEFORM],
+            torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], dtype=torch.float32),
+        )
+        assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3, 2]
+        assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000, 24000]
+        assert info["prompt_waveform"].shape[-1] > info[KEY_SPEAKER_WAVEFORM].shape[-1]
+        assert info["voice_name"] == "uploaded_voice"
+        assert info["voice_created_at"] == 123
+        assert prompt["prompt_token_ids"].count(777) == 2
+
+    def test_build_ming_prompt_forwards_speaker_waveform_without_ref_text(self, speech_server):
+        class FakeTokenizer:
+            unk_token_id = -1
+
+            def encode(self, text):
+                return [1]
+
+            def convert_tokens_to_ids(self, token):
+                return 888 if token == "<audioPatch>" else self.unk_token_id
+
+        speech_server._tts_tokenizer = FakeTokenizer()
+        request = OpenAICreateSpeechRequest(input="Hello")
+
+        prompt = speech_server._build_ming_dense_prompt(
+            request,
+            ref_audio_data=([0.1, 0.2, 0.3], 16000),
+        )
+
+        info = prompt["additional_information"]
+        assert info[KEY_SPEAKER_WAVEFORM].shape == (1, 3)
+        assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3]
+        assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000]
+        assert "prompt_waveform" not in info
+        assert KEY_SPEAKER_EMBEDDING not in info
+
+    def test_ming_adapter_legacy_audio_only_voice_forwards_audio_to_worker(
         self,
         speech_server,
         mocker: MockerFixture,
@@ -1753,20 +1816,13 @@ class TestTTSMethods:
         }
         ref_audio_source = "data:audio/wav;base64,ZmFrZWF1ZGlv"
         ref_audio_data = ([0.0, 0.1], 16000)
-        fake_embedding = [0.4] * SPEAKER_EMBEDDING_DIM
         mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
         mocker.patch.object(
             speech_server,
             "_resolve_ref_audio",
             new=mocker.AsyncMock(return_value=ref_audio_data),
         )
-        mock_extract = mocker.patch.object(
-            speech_server,
-            "_extract_ming_speaker_embeddings_from_ref_audio",
-            return_value=[fake_embedding],
-        )
-        mock_to_thread = mocker.spy(asyncio, "to_thread")
-        mocker.patch.object(
+        mock_prompt = mocker.patch.object(
             speech_server,
             "_build_ming_dense_prompt",
             return_value={"additional_information": {"speaker_count": 1}},
@@ -1778,22 +1834,25 @@ class TestTTSMethods:
         second_req = OpenAICreateSpeechRequest(input="Hello again", voice="legacy_audio_voice")
         second_prepared = asyncio.run(adapter.build(second_req, [], False))
 
-        mock_extract.assert_called_once_with([ref_audio_data])
-        mock_to_thread.assert_called_once_with(mock_extract, [ref_audio_data])
-        assert first_req.speaker_embedding == pytest.approx(fake_embedding)
-        assert second_req.speaker_embedding == pytest.approx(fake_embedding)
+        assert first_req.speaker_embedding is None
+        assert second_req.speaker_embedding is None
         assert first_req.ref_text == "Reference transcript."
         assert second_req.ref_text == "Reference transcript."
         assert first_prepared.model_type == "ming_tts"
         assert second_prepared.model_type == "ming_tts"
-        cache_key = speech_server._speaker_cache.make_cache_key(
-            "legacy_audio_voice",
-            model_type="ming_tts",
-            created_at=456,
+        assert mock_prompt.call_count == 2
+        mock_prompt.assert_any_call(
+            first_req,
+            ref_audio_data=ref_audio_data,
+            voice_name="legacy_audio_voice",
+            voice_created_at=456,
         )
-        cached = speech_server._speaker_cache.get(cache_key)
-        assert cached is not None
-        torch.testing.assert_close(cached["speaker_embedding"], torch.tensor(fake_embedding))
+        mock_prompt.assert_any_call(
+            second_req,
+            ref_audio_data=ref_audio_data,
+            voice_name="legacy_audio_voice",
+            voice_created_at=456,
+        )
 
     # ── regression: full flow from issue #1603 ──
 

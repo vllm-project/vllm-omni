@@ -22,9 +22,10 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -33,9 +34,7 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp

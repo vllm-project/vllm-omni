@@ -49,13 +49,17 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Entrypoint Test with H100"
-        timeout_in_minutes: 60
+        # TEMPORARY 60 -> 90: engine startup/sleep-wake is ~13-15 min slower per
+        # run on the vLLM 0.26 image (model loading ~2x, init ~2x; see builds
+        # 2915 vs 2916), which pushed this suite past 60 min. Revert once the
+        # 0.26 startup regression is understood and fixed.
+        timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model"
         mirror_hardwares: h100_2
 
       - label: "Entrypoint Test with L4"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
         mirror_hardwares: l4_1

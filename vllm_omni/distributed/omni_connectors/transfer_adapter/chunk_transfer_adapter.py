@@ -317,7 +317,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
+                    # Terminal stops no longer count as segment boundaries
+                    # (is_segment_finished is False when the request finishes,
+                    # see #5383), but the processor must still flush its
+                    # accumulated tail on the terminal chunk — otherwise the
+                    # downstream stage receives the finished marker without
+                    # the final payload (#5413).
+                    is_finished=is_segment_finished or is_finished,
                 )
 
             except Exception as e:

@@ -70,13 +70,31 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
-        if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
-        raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
+    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
 
     @classmethod
-    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+    def register_additional_diffusion_fused_moe_hooks(cls, moe_runner: Any) -> None:
+        # One-shot lazy kernel initialisation on the first forward (no-op unless
+        # the runner exposes an uninitialised quant_method). Mirrors the prior
+        # wrapper behaviour exactly, just bound to the runner module.
+        init_handle: Any = None
+
+        def _kernel_init_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
+            nonlocal init_handle
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and getattr(quant_method, "moe_kernel", None) is None:
+                quant_method.process_weights_after_loading(module)
+            if init_handle is not None:
+                init_handle.remove()
+
+        init_handle = moe_runner.register_forward_pre_hook(
+            _kernel_init_pre_hook,
+            with_kwargs=True,
+        )
+
+    @classmethod
+    def reset_diffusion_fused_moe_forward_context(cls) -> None:
         return None
 
     @classmethod
@@ -137,8 +155,21 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
-    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+    def init_diffusion_worker_vllm_config(
+        cls,
+        vllm_config: Any,
+    ) -> None:
         """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+        device: torch.device,
+    ) -> None:
+        """Initialize platform-specific runtime state for diffusion model runners."""
         return None
 
     @classmethod

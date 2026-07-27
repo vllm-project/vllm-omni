@@ -9,6 +9,11 @@ from typing import Any
 # bespoke MammothModa2 example used to convert image dimensions -> AR grid dims.
 _PATCH_SIZE = 16
 
+# Shared by Preview and Dev (see ``t2i_generation_config.json``).
+_EOL_TOKEN_ID = 152064
+_VISUAL_TOKEN_START_ID = 152072
+_VISUAL_TOKEN_END_ID = 168456
+
 _AR_SYSTEM_PROMPT = "You are a helpful image generator."
 
 
@@ -26,9 +31,8 @@ def build_text_to_image_prompt(
 
     Model-specific sampling knobs (``text_guidance_scale``, ``cfg_range``,
     ``num_inference_steps``) flow separately via ``extra_body`` -> ``extra_args``.
-    Config-derived token ids (``eol_token_id``, ``visual_token_start_id``,
-    ``visual_token_end_id``, ``visual_ids``) are sourced inside the AR stage
-    rather than passed by the caller -- see the ar2dit stage input processor.
+    The structural token ids are included in ``additional_information`` so the
+    AR sampler can apply the same constraints for both Preview and Dev.
 
     MammothModa2 t2i uses classifier-free guidance via ``text_guidance_scale``
     and has no explicit negative-prompt path, so ``negative_prompt`` is accepted
@@ -52,6 +56,9 @@ def build_text_to_image_prompt(
             "ar_height": [ar_height],
             "image_height": [h],
             "image_width": [w],
+            "eol_token_id": [_EOL_TOKEN_ID],
+            "visual_token_start_id": [_VISUAL_TOKEN_START_ID],
+            "visual_token_end_id": [_VISUAL_TOKEN_END_ID],
         },
     }
 

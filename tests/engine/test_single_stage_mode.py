@@ -450,7 +450,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -477,7 +477,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -550,7 +550,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="llm",
@@ -609,7 +609,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="diffusion",
@@ -943,7 +943,7 @@ class TestSingleStageReplicaInitialization:
         plan = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
-        mocker.patch.object(runtime_mod, "extract_stage_metadata", return_value=remote_metadata)
+        mocker.patch.object(runtime_mod, "extract_legacy_stage_metadata", return_value=remote_metadata)
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_diffusion_proc", side_effect=_fake_connect)
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",

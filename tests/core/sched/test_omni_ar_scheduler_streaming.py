@@ -73,6 +73,9 @@ def _run_resumable_segment_stop(
 
     sched._update_request_with_output.side_effect = stop_request
     sched._handle_stopped_request.return_value = session_finished
+    # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
+    # MagicMock iterates empty and fails to unpack at the call site.
+    sched._free_request.return_value = (None, None)
     sched.chunk_transfer_adapter = None
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
@@ -135,6 +138,23 @@ def test_resumable_session_terminal_is_not_marked_as_segment_boundary() -> None:
     output = outputs[session.client_index].outputs[0]
     assert output.finish_reason is not None
     assert output.is_segment_finished is False
+
+
+def test_update_from_output_settles_in_flight_tokens() -> None:
+    """vLLM 0.26: schedule() increments num_in_flight_tokens per scheduled
+    token; update_from_output must decrement it symmetrically. If the
+    decrement is dropped the counter grows monotonically and both readers
+    (allocate_slots, _connector_finished) clamp
+    max(0, num_computed_tokens - num_in_flight_tokens) to zero forever,
+    silently freezing sliding-window block freeing.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_in_flight_tokens = 1  # as left by schedule() for this step
+
+    _run_resumable_segment_stop(session)
+
+    assert session.num_in_flight_tokens == 0
 
 
 def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
