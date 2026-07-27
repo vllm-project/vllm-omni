@@ -271,6 +271,7 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
         "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights.LTXResidentLoRAController",
         lambda *_args: SimpleNamespace(),
     )
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "resident")
 
     pipe = LTX2TwoStagePipeline(
         od_config=SimpleNamespace(
@@ -1174,14 +1175,13 @@ def test_ltx_resident_lora_copies_mapping_and_namespace_configs(config):
     assert copied is not config
 
 
-def _make_phase_weight_factory_pipeline(mode: str):
+def _make_phase_weight_factory_pipeline():
     return SimpleNamespace(
         pipeline_recipe=LTX2_TWO_STAGE_RECIPE,
         component_profile=LTX23_TWO_STAGE_COMPONENT_PROFILE,
         transformer=object(),
         od_config=SimpleNamespace(
             model="unused",
-            model_config={"ltx_two_stage_lora_mode": mode},
             model_paths={"distilled_lora": "/models/distilled.safetensors"},
             lora_path=None,
             dtype=torch.float32,
@@ -1190,19 +1190,25 @@ def _make_phase_weight_factory_pipeline(mode: str):
 
 
 def test_ltx_phase_weight_factory_selects_resident_mode(monkeypatch):
-    pipeline = _make_phase_weight_factory_pipeline("resident")
+    pipeline = _make_phase_weight_factory_pipeline()
     resident = object()
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " ReSiDeNt ")
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(ltx2_phase_weights, "LTXResidentLoRAController", lambda pipe, path: resident)
 
     assert ltx2_phase_weights.build_ltx_phase_weights(pipeline) is resident
 
 
-def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch):
-    pipeline = _make_phase_weight_factory_pipeline("dynamic")
+@pytest.mark.parametrize("mode", [None, " DyNaMiC "])
+def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
+    pipeline = _make_phase_weight_factory_pipeline()
     manifest = object()
     installed = []
 
+    if mode is None:
+        monkeypatch.delenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", mode)
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(
         ltx2_phase_weights,
@@ -1225,6 +1231,14 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch):
 
     assert isinstance(runtime, DynamicRuntime)
     assert installed == [True]
+
+
+def test_ltx_phase_weight_factory_rejects_invalid_environment_mode(monkeypatch):
+    pipeline = _make_phase_weight_factory_pipeline()
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "auto")
+
+    with pytest.raises(ValueError, match="VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE"):
+        ltx2_phase_weights.build_ltx_phase_weights(pipeline)
 
 
 def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch):
