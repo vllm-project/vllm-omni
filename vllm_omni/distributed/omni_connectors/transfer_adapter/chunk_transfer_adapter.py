@@ -20,6 +20,45 @@ from .base import OmniTransferAdapterBase
 logger = get_connector_logger(__name__)
 
 
+def _extract_producer_finished(multimodal_output: Any) -> bool:
+    """Return True if a producer stage flagged its payload as finished.
+
+    MiniCPM-o's TTS stage emits ``meta.finished`` (per-step audio EOS /
+    max-tokens) on its terminal chunk but does NOT emit
+    ``meta.is_segment_finished``. The async-chunk bridge
+    (``tts2code2wav_async_chunk``) only consults ``is_segment_finished`` and
+    ``request.is_finished()``, so it never observes a finished signal; the
+    downstream Code2Wav stage then never receives ``meta.finished=True`` and
+    the stream hangs until client timeout (vllm-project/vllm-omni#5437).
+    Honoring the producer's own flag fixes the termination path without
+    touching models that don't emit it (it is a no-op for them).
+    """
+
+    def _flag_true(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            return bool(value.reshape(-1)[0].item())
+        if isinstance(value, (bool, int)):
+            return bool(value)
+        return False
+
+    if multimodal_output is None:
+        return False
+    if isinstance(multimodal_output, Mapping):
+        meta = multimodal_output.get("meta")
+        if isinstance(meta, Mapping) and "finished" in meta:
+            fin = meta["finished"]
+            if isinstance(fin, Sequence) and not isinstance(fin, (str, bytes, bytearray)):
+                return any(_flag_true(item) for item in fin)
+            return _flag_true(fin)
+    if isinstance(multimodal_output, Sequence) and not isinstance(
+        multimodal_output, (str, bytes, bytearray)
+    ):
+        return any(_extract_producer_finished(item) for item in multimodal_output)
+    return False
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -303,6 +342,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
+        # [FIX-5437] Honor a producer stage's own finished flag. MiniCPM-o TTS
+        # emits meta.finished on its terminal chunk but not meta.is_segment_finished,
+        # so the async-chunk bridge never sees a finished signal and the stream
+        # hangs until client timeout (vllm-project/vllm-omni#5437). Lifting it
+        # here also drives the payload's meta.finished injected below (~line 334).
+        producer_finished = _extract_producer_finished(multimodal_output)
+        if producer_finished:
+            is_finished = True
+            is_segment_finished = True
+        logger.info(
+            "[FIX-5437][send] req=%s producer_finished=%s is_finished=%s is_segment_finished=%s",
+            getattr(request, "external_req_id", "?"),
+            producer_finished, is_finished, is_segment_finished,
+        )
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
