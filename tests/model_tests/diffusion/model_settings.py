@@ -38,5 +38,17 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
-    )
+    ),
+    "LTX2Pipeline": DiffusionModelTestOpts(
+        model="Lightricks/LTX-2",
+        builder=diff_model_builders.tiny_ltx2_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        check_determinism=False,
+        check_multi_output=False,
+        extra_test_groups=[
+            [DiffusionAccs.HSDP, DiffusionAccs.CACHE_DIT],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
+            [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
+        ],
+    ),
 }

@@ -1,0 +1,35 @@
+[
+    {
+        "test_name": "test_boogu_image_single_device",
+        "description": "Single-device baseline (no parallelism), concurrency sweep 1/2/4 at 512x512, 28 steps. Baselines recorded on 1x A40 46GB (measured c1/c2/c4: qps 0.0611/0.0609/0.0611, latency_mean 16.37/31.22/55.77 s, peak mem 36754 MB) with ~10% margin.",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Base",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": [1, 2, 4],
+                "warmup-requests": 4,
+                "warmup-concurrency": 4,
+                "warmup-num-inference-steps": 28,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": {"1": 0.0549, "2": 0.0547, "4": 0.0549},
+                    "latency_mean": {"1": 18.0, "2": 34.3, "4": 61.4},
+                    "peak_memory_mb_max": 40500,
+                    "peak_memory_mb_mean": 40500
+                }
+            }
+        ]
+    }
+]

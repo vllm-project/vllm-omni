@@ -27,7 +27,7 @@ DELAY_BASE = 0.01
 
 
 class MockDiffusionEngine:
-    async def step(self, request):
+    async def step_streaming(self, request):
         def simulate_step_delay(height, width, num_inference_steps) -> float:
             return (height / BASE_HEIGHT) * (width / BASE_WIDTH) * (num_inference_steps / BASE_INFER_STEPS)
 
@@ -37,7 +37,7 @@ class MockDiffusionEngine:
         )
         delay = DELAY_BASE + delay_scale * DELAY_BASE
         await asyncio.sleep(delay)
-        return [MockOmniRequestOutput(request_id=request.request_id)]
+        yield [MockOmniRequestOutput(request_id=request.request_id)]
 
 
 @pytest.mark.asyncio

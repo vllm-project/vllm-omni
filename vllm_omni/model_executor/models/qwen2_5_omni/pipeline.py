@@ -17,6 +17,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen2_5_omni"
 
 QWEN2_5_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen2_5_omni",
+    default_deploy_config_name="qwen2_5_omni.yaml",
     model_arch="Qwen2_5OmniForConditionalGeneration",
     stages=(
         StagePipelineConfig(

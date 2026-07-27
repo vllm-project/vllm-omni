@@ -121,6 +121,8 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,
     Qwen2_5OmniThinkerMultiModalProcessor,
+    _get_request_video_use_audio_in_video,
+    _get_video_second_per_grid_t,
     _presampled_videos_hf_kwargs,
 )
 from vllm_omni.quantization.component_config import (
@@ -134,6 +136,14 @@ except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
 logger = init_logger(__name__)
+
+_THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+
+def _ensure_thinker_architecture(config: PretrainedConfig) -> None:
+    """Give the nested Thinker config the architecture required by MoE LoRA."""
+    if not config.architectures:
+        config.architectures = [_THINKER_ARCHITECTURE]
 
 
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
@@ -626,9 +636,6 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
     def get_data_parser(self):
         feature_extractor = self.get_feature_extractor()
 
-        # Install the Omni parser, which keeps video metadata from vLLM's
-        # video loader (see Qwen2_5OmniVideoProcessorItems); the parser
-        # inherited from Qwen2AudioProcessingInfo would drop it.
         return Qwen2_5OmniThinkerMultiModalDataParser(
             spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
             target_sr=feature_extractor.sampling_rate,
@@ -686,10 +693,8 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         mm_data = dict(mm_data)
-        mm_kwargs = dict(mm_kwargs)
-        audios = mm_data.pop("audios", [])
-
         mm_kwargs = dict(_presampled_videos_hf_kwargs(mm_data, mm_kwargs))
+        audios = mm_data.pop("audios", [])
 
         def pad_to_hop_length(x: np.ndarray, hop_length: int) -> np.ndarray:
             length = x.shape[-1]
@@ -787,22 +792,8 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         mm_item_counts = mm_items.get_all_counts()
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
-        use_audio_in_video = False
-        if "video" in mm_kwargs:
-            for item in mm_kwargs["video"]:
-                if item and item["use_audio_in_video"].data:
-                    use_audio_in_video = True
-                else:
-                    use_audio_in_video = False
-            # for mutilmodality cache
-            if any(item is None for item in mm_kwargs["video"]):
-                video_token_id = self.info.get_hf_config().video_token_id
-                audio_token_id = self.info.get_hf_config().audio_token_id
-                video_audio_item_num = sum(id in (video_token_id, audio_token_id) for id in prompt_ids)
-                audio_updates_num = len(mm_prompt_updates.get("audio", []))
-                video_updates_num = len(mm_prompt_updates.get("video", []))
-                if video_audio_item_num != video_updates_num + audio_updates_num:
-                    use_audio_in_video = True
+        video_use_audio_in_video = self._get_video_use_audio_in_video(mm_kwargs, mm_prompt_updates)
+        use_audio_in_video = any(video_use_audio_in_video)
 
         # normal case with `use_audio_in_video=False`
         if is_update_applied:
@@ -821,7 +812,11 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                     prompt_ids,
                     filtered_updates,
                 )
-                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
+                mm_placeholders = self._derive_audio_from_video_placeholders(
+                    mm_placeholders,
+                    mm_prompt_updates,
+                    video_use_audio_in_video,
+                )
             else:
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
@@ -935,25 +930,30 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             token_id = image_token_id if modality == "image" else video_token_id
             return [token_id] * (int(grid_thw.prod()) // merge_length)
 
-        use_audio_in_video = hf_processor_mm_kwargs.get("use_audio_in_video", False)
+        num_videos = len(out_mm_data.get("video_grid_thw", []))
+        video_use_audio_in_video = _get_request_video_use_audio_in_video(
+            hf_processor_mm_kwargs,
+            num_videos,
+        )
         thinker_config = self.info.get_hf_config()
 
-        def get_replacement_qwen2_use_audio_in_video(item_idx: int):
+        def get_replacement_qwen2_video(item_idx: int):
             nonlocal audio_in_video_item_idx
+
+            if not video_use_audio_in_video[item_idx]:
+                return get_replacement_qwen2_vision(item_idx, modality="video")
+
             audio_num_features = audio_output_lengths[audio_in_video_item_idx]
             video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
 
             audio_in_video_item_idx += 1
 
-            # Prefer the HF-computed value (temporal_patch_size / sampled fps)
-            # over request kwargs;
-            second_per_grid_ts = out_mm_data.get("second_per_grid_ts")
-            if second_per_grid_ts is None:
-                second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts", None)
-            if second_per_grid_ts is not None:
-                video_second_per_grid_t = float(second_per_grid_ts[item_idx])
-            else:
-                video_second_per_grid_t = 2.0
+            video_second_per_grid_t = _get_video_second_per_grid_t(
+                out_mm_data,
+                hf_processor_mm_kwargs,
+                item_idx,
+                default=2.0,
+            )
 
             placeholder = self.get_updates_use_audio_in_video(
                 thinker_config=thinker_config,
@@ -962,12 +962,6 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 video_second_per_grid_t=video_second_per_grid_t,
             )
             return PromptUpdateDetails.select_token_id(placeholder, embed_token_id=video_token_id)
-
-        video_replacement_fn = (
-            get_replacement_qwen2_use_audio_in_video
-            if use_audio_in_video
-            else partial(get_replacement_qwen2_vision, modality="video")
-        )
 
         return [
             PromptReplacement(
@@ -983,7 +977,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             PromptReplacement(
                 modality="video",
                 target=video_token,
-                replacement=video_replacement_fn,
+                replacement=get_replacement_qwen2_video,
             ),
         ]
 
@@ -991,6 +985,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         self,
         placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
         mm_prompt_updates: MultiModalPromptUpdates,
+        video_use_audio_in_video: Sequence[bool] | None = None,
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         """
         Helper to derive audio placeholders from video placeholders when
@@ -1000,34 +995,62 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             return placeholders
 
         num_videos = len(placeholders["video"])
-        num_audios = len(mm_prompt_updates.get("audio", []))
-        if num_audios != num_videos:
+        if video_use_audio_in_video is None:
+            video_use_audio_in_video = [True] * num_videos
+        elif len(video_use_audio_in_video) != num_videos:
             raise ValueError(
-                f"use_audio_in_video requires equal number of audio and video items, got {num_audios=}, {num_videos=}"
+                "use_audio_in_video must contain one boolean per video, "
+                f"but found {len(video_use_audio_in_video)} values for "
+                f"{num_videos} videos."
+            )
+
+        num_audio_in_video = sum(video_use_audio_in_video)
+        num_audios = len(mm_prompt_updates.get("audio", []))
+        if num_audios != num_audio_in_video:
+            raise ValueError(
+                "use_audio_in_video requires equal number of audio and video "
+                f"items using audio, got {num_audios=}, {num_audio_in_video=}"
             )
 
         tokenizer = self.info.get_tokenizer()
         processor = self.info.get_hf_processor()
         audio_token_id = tokenizer.get_vocab()[processor.audio_token]
+        video_token_id = tokenizer.get_vocab()[processor.video_token]
 
         result_placeholders = dict(placeholders)
         audio_placeholders = []
+        video_placeholders = []
 
-        # Each video is paired with one audio
+        # Each video using audio is paired with one audio
+        audio_idx = 0
         for video_idx, video_placeholder in enumerate(placeholders["video"]):
             # Create is_embed mask selecting only audio tokens
-            audio_is_embed = torch.tensor(video_placeholder.tokens) == audio_token_id
+            placeholder_tokens = torch.tensor(video_placeholder.tokens)
+            audio_is_embed = placeholder_tokens == audio_token_id
+            video_is_embed = placeholder_tokens == video_token_id
 
-            audio_placeholder = PlaceholderFeaturesInfo(
-                modality="audio",
+            if video_use_audio_in_video[video_idx]:
+                audio_placeholder = PlaceholderFeaturesInfo(
+                    modality="audio",
+                    item_idx=audio_idx,
+                    start_idx=video_placeholder.start_idx,
+                    tokens=video_placeholder.tokens,
+                    is_embed=audio_is_embed,
+                )
+                audio_placeholders.append(audio_placeholder)
+                audio_idx += 1
+
+            video_placeholder_with_mask = PlaceholderFeaturesInfo(
+                modality="video",
                 item_idx=video_idx,
                 start_idx=video_placeholder.start_idx,
                 tokens=video_placeholder.tokens,
-                is_embed=audio_is_embed,
+                is_embed=video_is_embed,
             )
-            audio_placeholders.append(audio_placeholder)
+            video_placeholders.append(video_placeholder_with_mask)
 
         result_placeholders["audio"] = audio_placeholders
+        result_placeholders["video"] = video_placeholders
         return result_placeholders
 
     def _get_raw_input_ids(
@@ -1106,6 +1129,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     Qwen3OmniMoeConditionalGenerationMixin,
     SupportsTranscription,
 ):
+    # PEFT stores the expert LoRA matrices with an explicit expert dimension.
+    is_3d_moe_weight: bool = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "thinker.lm_head.": "language_model.lm_head.",
@@ -1149,6 +1175,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
+        _ensure_thinker_architecture(thinker_config)
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config
@@ -1529,10 +1556,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         Iterate over multimodal features sorted by position offset.
 
         Yields: (offset, modality, feature_data) where feature_data contains:
-        - image: {"grid_t", "grid_h", "grid_w", "t_factor"}
+        - image: {"grid_t", "grid_h", "grid_w", "t_factor",
+                  "placeholder_len"}
         - video: {"grid_t", "grid_h", "grid_w", "t_factor",
-                  "use_audio_in_video", "audio_feature_length"}
-        - audio: {"audio_feature_length"}
+                  "use_audio_in_video", "audio_feature_length",
+                  "placeholder_len"}
+        - audio: {"audio_feature_length", "placeholder_len"}
         """
         config = self.config
         spatial_merge_size = config.vision_config.spatial_merge_size
@@ -1555,6 +1584,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                         "grid_h": h // spatial_merge_size,
                         "grid_w": w // spatial_merge_size,
                         "t_factor": position_id_per_seconds,
+                        "placeholder_len": mm_feature.mm_position.length,
                     },
                 )
             elif modality == "video":
@@ -1576,12 +1606,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                         "t_factor": second_per_grid_ts * position_id_per_seconds,
                         "use_audio_in_video": use_audio_in_video,
                         "audio_feature_length": audio_for_video.get(offset),
+                        "placeholder_len": mm_feature.mm_position.length,
                     },
                 )
             elif modality == "audio":
                 if offset not in paired_audio_offsets:
                     audio_len = mm_feature.data["audio_feature_lengths"].data.item()
-                    yield offset, "audio", {"audio_feature_length": audio_len}
+                    yield (
+                        offset,
+                        "audio",
+                        {
+                            "audio_feature_length": audio_len,
+                            "placeholder_len": mm_feature.mm_position.length,
+                        },
+                    )
 
     def _compute_interleaved_positions(self, start_idx: int, data: dict[str, Any]) -> tuple[np.ndarray, int]:
         """
@@ -1594,9 +1632,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         grid_h = data["grid_h"]
         grid_w = data["grid_w"]
         t_factor = data["t_factor"]
-        audio_feature_length = data["audio_feature_length"]
-
-        audio_len = self._compute_audio_token_count(audio_feature_length)
+        num_video = grid_t * grid_h * grid_w
+        placeholder_len = data.get("placeholder_len")
+        if placeholder_len is None:
+            audio_feature_length = data["audio_feature_length"]
+            audio_len = self._compute_audio_token_count(audio_feature_length)
+        else:
+            audio_len = max(0, int(placeholder_len) - num_video - 2)
 
         h_index = np.tile(np.arange(grid_h).reshape(1, -1, 1), (grid_t, 1, grid_w)).flatten()
         w_index = np.tile(np.arange(grid_w).reshape(1, 1, -1), (grid_t, grid_h, 1)).flatten()
@@ -1612,8 +1654,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         pos_ids_list: list[np.ndarray] = []
         video_idx, audio_idx = 0, 0
-        num_video = grid_t * grid_h * grid_w
-
         while video_idx < num_video and audio_idx < audio_len:
             if video_t_values[video_idx] <= audio_t_values[audio_idx]:
                 pos_ids_list.append(video_pos[:, video_idx : video_idx + 1])
@@ -1703,9 +1743,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         seq_len = len(input_tokens)
 
         llm_pos_ids_list: list[np.ndarray] = []
+        feature_summaries: list[dict[str, Any]] = []
         st = 0
 
         for offset, modality, data in self.iter_mm_features(mm_features):
+            feature_summaries.append(
+                {
+                    "offset": offset,
+                    "modality": modality,
+                    "placeholder_len": data.get("placeholder_len"),
+                    "use_audio_in_video": data.get("use_audio_in_video"),
+                }
+            )
             text_len = offset - st
             st_idx = int(llm_pos_ids_list[-1].max()) + 1 if llm_pos_ids_list else 0
 
@@ -1713,19 +1762,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 llm_pos_ids_list.append(np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx)
                 st_idx += text_len
 
-            bos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
-            llm_pos_ids_list.append(bos_pos)
-            st_idx += 1
-
             if modality == "audio":
                 audio_tokens = self._compute_audio_token_count(data["audio_feature_length"])
                 audio_pos = np.broadcast_to(np.arange(audio_tokens), (3, audio_tokens)) + st_idx
                 llm_pos_ids_list.append(audio_pos)
-                st_idx = int(audio_pos.max()) + 1
-
-                eos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
-                llm_pos_ids_list.append(eos_pos)
-                st = offset + 1 + audio_tokens + 1
+                st = offset + int(data.get("placeholder_len", audio_tokens))
 
             elif modality == "image":
                 grid_t = data["grid_t"]
@@ -1739,11 +1780,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 llm_pos_ids_list.append(grid_indices.reshape(3, -1) + st_idx)
 
                 image_len = grid_t * grid_h * grid_w
-                st_idx = int(llm_pos_ids_list[-1].max()) + 1
-
-                eos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
-                llm_pos_ids_list.append(eos_pos)
-                st = offset + 1 + image_len + 1
+                st = offset + int(data.get("placeholder_len", image_len))
 
             elif modality == "video":
                 grid_t = data["grid_t"]
@@ -1758,26 +1795,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     llm_pos_ids_list.append(grid_indices.reshape(3, -1) + st_idx)
 
                     video_len = grid_t * grid_h * grid_w
-                    st_idx = int(llm_pos_ids_list[-1].max()) + 1
-
-                    eos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
-                    llm_pos_ids_list.append(eos_pos)
-                    st = offset + 1 + video_len + 1
+                    st = offset + int(data.get("placeholder_len", video_len))
                 else:
-                    audio_bos_pos = np.broadcast_to(np.array([st_idx - 1]), (3, 1))
+                    audio_bos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
                     llm_pos_ids_list.append(audio_bos_pos)
+                    st_idx += 1
 
-                    pos_ids, _ = self._compute_interleaved_positions(st_idx, data)
+                    pos_ids, token_count = self._compute_interleaved_positions(st_idx, data)
                     llm_pos_ids_list.append(pos_ids)
                     st_idx = int(pos_ids.max()) + 1
 
                     eos_pos = np.broadcast_to(np.array([st_idx]), (3, 1))
                     llm_pos_ids_list.append(eos_pos)
-                    llm_pos_ids_list.append(eos_pos)
 
-                    video_len = grid_t * grid_h * grid_w
-                    audio_len = self._compute_audio_token_count(data["audio_feature_length"])
-                    st = offset + 2 + video_len + audio_len + 2
+                    st = offset + int(data.get("placeholder_len", token_count + 2))
 
         if st < seq_len:
             st_idx = int(llm_pos_ids_list[-1].max()) + 1 if llm_pos_ids_list else 0
@@ -1786,7 +1817,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
         if llm_positions.shape[1] != seq_len:
-            raise RuntimeError("Position ids length mismatch with input ids length")
+            raise RuntimeError(
+                "Position ids length mismatch with input ids length: "
+                f"positions={llm_positions.shape[1]}, input_ids={seq_len}, "
+                f"features={feature_summaries}"
+            )
 
         mrope_position_delta = int(llm_positions.max()) + 1 - seq_len
         return torch.from_numpy(llm_positions), mrope_position_delta

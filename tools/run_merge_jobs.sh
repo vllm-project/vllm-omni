@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Extract steps from .buildkite/test-merge.yml that contain pytest, synthesize
+# Extract steps from .buildkite/cuda/test-merge.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
 # after each step's Buildkite "key" when present (otherwise a slug of the label).
 #
@@ -21,17 +21,17 @@
 # Usage:
 #   bash tools/run_merge_jobs.sh
 #   REPO_ROOT=/path/to/vllm-omni bash tools/run_merge_jobs.sh --model-type diffusion --dry-run
-#   YML=/path/to/vllm-omni/.buildkite/test-merge.yml bash tools/run_merge_jobs.sh
+#   YML=/path/to/vllm-omni/.buildkite/cuda/test-merge.yml bash tools/run_merge_jobs.sh
 #
 # Repository / YAML (no dependency on where this script lives):
-#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/test-merge.yml
+#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-merge.yml
 #   • Or set YML (or --yaml) — repo root is inferred as parent of the .buildkite directory
 #   • Or run from inside the clone: git rev-parse --show-toplevel, else walk up from $PWD,
-#     then from the script's directory, until .buildkite/test-merge.yml exists
+#     then from the script's directory, until .buildkite/cuda/test-merge.yml exists
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-merge.yml (default: $REPO_ROOT/.buildkite/test-merge.yml)
+#   YML           - path to test-merge.yml (default: $REPO_ROOT/.buildkite/cuda/test-merge.yml)
 #   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/merge_jobs);
 #                   per-job *.log plus timing_summary.log after the run
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
@@ -41,7 +41,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILDKITE_REL=".buildkite/test-merge.yml"
+BUILDKITE_REL=".buildkite/cuda/test-merge.yml"
 DEFAULT_LOG_SUBDIR="merge_jobs"
 
 # shellcheck source=tools/run_jobs_common.sh

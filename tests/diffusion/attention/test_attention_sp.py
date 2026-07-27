@@ -31,7 +31,11 @@ import tempfile
 import pytest
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.allgather_kv import (
+    AllGatherKVParallelAttention,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -155,14 +159,267 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         return hidden_states
 
 
+class _MockAllGatherSPGroup:
+    def __init__(self, *, rank: int, gather_chunks: list[list[torch.Tensor]]) -> None:
+        self.allgather_group = object()
+        self.allgather_world_size = len(gather_chunks[0])
+        self.allgather_rank = rank
+        self._gather_chunks = list(gather_chunks)
+        self.gathered_input_shapes: list[tuple[int, ...]] = []
+
+    def all_gather(self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False, group=None):
+        assert not separate_tensors
+        assert group is self.allgather_group
+        self.gathered_input_shapes.append(tuple(input_.shape))
+        chunks = self._gather_chunks.pop(0)
+        return torch.cat(chunks, dim=dim)
+
+
+def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
+    rank = 1
+    joint_len = 1
+    img_seq_local = 2
+    img_seq_full = 4
+    key_chunks = [
+        torch.full((1, img_seq_local, 1, 1), 10.0),
+        torch.full((1, img_seq_local, 1, 1), 20.0),
+    ]
+    value_chunks = [
+        torch.full((1, img_seq_local, 1, 1), 30.0),
+        torch.full((1, img_seq_local, 1, 1), 40.0),
+    ]
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks]),
+    )
+
+    query = torch.zeros((1, img_seq_local, 1, 1))
+    key = key_chunks[rank]
+    value = value_chunks[rank]
+    joint = torch.ones((1, joint_len, 1, 1))
+    mask = torch.arange((joint_len + img_seq_full) * (joint_len + img_seq_full))
+    mask = (mask % 2 == 0).view(1, 1, joint_len + img_seq_full, joint_len + img_seq_full)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="front",
+    )
+
+    q_local, k_full, v_full, metadata_local, _ = strategy.pre_attention(query, key, value, metadata)
+
+    expected_rows = torch.cat(
+        [
+            mask[..., :joint_len, :],
+            mask[
+                ...,
+                joint_len + rank * img_seq_local : joint_len + (rank + 1) * img_seq_local,
+                :,
+            ],
+        ],
+        dim=-2,
+    )
+    assert q_local.shape[1] == joint_len + img_seq_local
+    assert k_full.shape[1] == joint_len + img_seq_full
+    assert v_full.shape[1] == joint_len + img_seq_full
+    torch.testing.assert_close(k_full[:, joint_len:], torch.cat(key_chunks, dim=1))
+    torch.testing.assert_close(v_full[:, joint_len:], torch.cat(value_chunks, dim=1))
+    assert metadata_local is not None
+    assert torch.equal(metadata_local.attn_mask, expected_rows)
+
+
+def test_allgather_kv_slices_rear_joint_dense_mask():
+    rank = 1
+    joint_len = 1
+    img_seq_local = 2
+    img_seq_full = 4
+    key_chunks = [torch.zeros((1, img_seq_local, 1, 1)) for _ in range(2)]
+    value_chunks = [torch.zeros_like(chunk) for chunk in key_chunks]
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks]),
+    )
+    query = torch.zeros((1, img_seq_local, 1, 1))
+    joint = torch.ones((1, joint_len, 1, 1))
+    mask = torch.arange((img_seq_full + joint_len) ** 2)
+    mask = (mask % 2 == 0).view(1, 1, img_seq_full + joint_len, img_seq_full + joint_len)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="rear",
+    )
+
+    q_local, _, _, metadata_local, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], metadata)
+
+    img_start = rank * img_seq_local
+    expected_rows = torch.cat(
+        [
+            mask[..., img_start : img_start + img_seq_local, :],
+            mask[..., img_seq_full : img_seq_full + joint_len, :],
+        ],
+        dim=-2,
+    )
+    assert q_local.shape[1] == img_seq_local + joint_len
+    assert metadata_local is not None
+    assert torch.equal(metadata_local.attn_mask, expected_rows)
+
+
+def test_allgather_kv_rejects_invalid_joint_strategy():
+    chunks = [[torch.zeros((1, 2, 1, 1)) for _ in range(2)] for _ in range(2)]
+    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=chunks))
+    joint = torch.ones((1, 1, 1, 1))
+    metadata = AttentionMetadata(
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="back",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported joint_strategy"):
+        strategy.pre_attention(torch.zeros((1, 2, 1, 1)), chunks[0][0], chunks[1][0], metadata)
+
+
+def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=1,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    query = torch.zeros((1, 2, 1, 1))
+    key = torch.zeros((1, 2, 1, 1))
+    value = torch.zeros((1, 2, 1, 1))
+    joint = torch.ones((1, 1, 1, 1))
+    metadata = AttentionMetadata(
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        full_attn_spans=[
+            [
+                (0, 1),  # joint span: kept on every rank.
+                (2, 5),  # image span crossing rank 0 and rank 1 image shards.
+            ]
+        ],
+    )
+
+    _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert metadata_out is not None
+    assert metadata_out.full_attn_spans == [[(0, 1), (2, 5)]]
+    assert metadata_out.query_ranges == (
+        QueryRange(0, 1, 0),
+        QueryRange(1, 3, 3),
+    )
+
+
+def test_allgather_kv_query_ranges_include_reused_prefix_offset():
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=1,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    query = torch.zeros((1, 2, 1, 1))
+    key = torch.zeros((1, 2, 1, 1))
+    value = torch.zeros((1, 2, 1, 1))
+    joint_query = torch.ones((1, 1, 1, 1))
+    # K/V retain two reused AR-prefix tokens that have already been removed
+    # from Q and from the attention mask's query rows.
+    joint_key = torch.ones((1, 3, 1, 1))
+    joint_value = torch.ones((1, 3, 1, 1))
+    mask = torch.arange(5 * 7).view(1, 1, 5, 7)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint_query,
+        joint_key=joint_key,
+        joint_value=joint_value,
+        full_attn_spans=[[(0, 7)]],
+    )
+
+    _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert metadata_out is not None
+    assert metadata_out.query_ranges == (
+        QueryRange(0, 1, 2),
+        QueryRange(1, 3, 5),
+    )
+    expected_mask = torch.cat([mask[..., :1, :], mask[..., 3:5, :]], dim=-2)
+    assert torch.equal(metadata_out.attn_mask, expected_mask)
+
+
+def test_allgather_kv_allows_empty_full_attn_spans():
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=0,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    query = torch.zeros((1, 2, 1, 1))
+    key = torch.zeros((1, 2, 1, 1))
+    value = torch.zeros((1, 2, 1, 1))
+    metadata = AttentionMetadata(full_attn_spans=[[]])
+
+    _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert metadata_out is not None
+    assert metadata_out.full_attn_spans == [[]]
+    assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
+
+
+def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
+    rank = 0
+    img_seq_local = 2
+    kv_heads = 2
+    repeat_num = 2
+    q_heads = kv_heads * repeat_num
+    key_chunks = [
+        torch.arange(1 * img_seq_local * kv_heads * 1, dtype=torch.float32).view(1, img_seq_local, kv_heads, 1),
+        torch.arange(100, 100 + 1 * img_seq_local * kv_heads * 1, dtype=torch.float32).view(
+            1, img_seq_local, kv_heads, 1
+        ),
+    ]
+    value_chunks = [chunk + 1000 for chunk in key_chunks]
+    sp_group = _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks])
+    strategy = AllGatherKVParallelAttention(sp_group)
+
+    query = torch.zeros((1, img_seq_local, q_heads, 1))
+    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], AttentionMetadata())
+
+    assert sp_group.gathered_input_shapes == [
+        (1, img_seq_local, kv_heads, 1),
+        (1, img_seq_local, kv_heads, 1),
+    ]
+    assert k_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    assert v_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    expected_key = torch.cat(key_chunks, dim=1)
+    expected_value = torch.cat(value_chunks, dim=1)
+    torch.testing.assert_close(k_full, expected_key)
+    torch.testing.assert_close(v_full, expected_value)
+
+
 @pytest.mark.parametrize(
     "test_model_cls",
     [
         TestMultiLayerAttentionModel,
     ],
 )
-@pytest.mark.parametrize("ulysses_degree", [2])
-@pytest.mark.parametrize("ring_degree", [2])
+@pytest.mark.parametrize(
+    ("ulysses_degree", "ring_degree", "allgather_degree"),
+    [
+        pytest.param(2, 2, 1, id="ulysses-ring"),
+        pytest.param(1, 1, 2, id="allgather-kv"),
+    ],
+)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
@@ -175,6 +432,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
+    allgather_degree: int,
     test_model_cls: type[torch.nn.Module],
     dtype: torch.dtype,
     causal: bool,
@@ -186,8 +444,8 @@ def test_sequence_parallel(
     num_heads: int,
     head_size: int,
 ):
-    """Test Ulysses attention by comparing with and without SP enabled."""
-    sequence_parallel_size = ulysses_degree * ring_degree
+    """Compare Ulysses/Ring and AllGather-KV SP against a single-rank run."""
+    sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
 
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
@@ -223,6 +481,7 @@ def test_sequence_parallel(
                 use_compile,
                 1,  # ulysses_degree = 1
                 1,  # ring_degree = 1
+                1,  # allgather_degree = 1 (baseline: no AllGather-KV SP)
                 1,  # sequence_parallel_size = 1
                 baseline_output_file,
                 model_state_file,
@@ -233,7 +492,10 @@ def test_sequence_parallel(
         )
 
         # Step 2: Run with SP enabled
-        print(f"\n[SP Test] Running with SP (ulysses_degree={ulysses_degree}, ring_degree={ring_degree})...")
+        print(
+            "\n[SP Test] Running with SP "
+            f"(ulysses={ulysses_degree}, ring={ring_degree}, allgather={allgather_degree})..."
+        )
         torch.multiprocessing.spawn(
             ulysses_attention_on_test_model,
             args=(
@@ -250,6 +512,7 @@ def test_sequence_parallel(
                 use_compile,
                 ulysses_degree,
                 ring_degree,
+                allgather_degree,
                 sequence_parallel_size,
                 sp_output_file,
                 model_state_file,
@@ -345,6 +608,7 @@ def ulysses_attention_on_test_model(
     use_compile: bool,
     ulysses_degree: int,
     ring_degree: int,
+    allgather_degree: int,
     sequence_parallel_size: int,
     output_file: str,
     model_state_file: str,
@@ -356,7 +620,11 @@ def ulysses_attention_on_test_model(
     RANDOM_SEED = 42
     seed_everything(RANDOM_SEED)
 
-    mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+    if allgather_degree > 1:
+        sp_kind = f"allgather={allgather_degree}"
+    else:
+        sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+    mode_str = "Baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -384,6 +652,7 @@ def ulysses_attention_on_test_model(
         sequence_parallel_size=sequence_parallel_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
+        allgather_degree=allgather_degree,
         cfg_parallel_size=1,
     )
 
@@ -400,6 +669,7 @@ def ulysses_attention_on_test_model(
         sequence_parallel_size=sequence_parallel_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
+        allgather_degree=allgather_degree,
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
     )
@@ -519,7 +789,11 @@ def ulysses_attention_on_test_model(
             with open(output_file, "wb") as f:
                 pickle.dump(output_np, f)
 
-            mode_str = "baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+            if allgather_degree > 1:
+                sp_kind = f"allgather={allgather_degree}"
+            else:
+                sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+            mode_str = "baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
             print(
                 f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"
                 f"  - batch_size={batch_size}, seq_len={seq_len}\n"

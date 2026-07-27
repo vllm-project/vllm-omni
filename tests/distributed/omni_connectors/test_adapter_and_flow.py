@@ -8,6 +8,7 @@ from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import get_connectors_config_for_stage
+from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -142,11 +143,10 @@ def test_recv_no_connector():
 def test_shm_connector_flow(mocker: MockerFixture):
     """
     Verify the full flow: Send -> Adapter -> Connector -> Adapter -> Recv.
-    Using real SharedMemoryConnector (inline mode for simplicity).
+    Using real SharedMemoryConnector and key-addressed SHM metadata.
     """
     # 1. Setup Connector
-    config = {"shm_threshold_bytes": 1024, "inline_small_payloads": True}
-    connector = SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({})
     connectors_map = {("0", "1"): connector}
 
     # 2. Setup Data
@@ -216,6 +216,22 @@ def test_get_connectors_for_stage():
     stage_2_config = get_connectors_config_for_stage(config, stage_id=2)
     assert "from_stage_1" in stage_2_config
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
+
+
+def test_outgoing_only_async_stage_uses_sender_connector_spec():
+    config = OmniTransferConfig(
+        connectors={
+            ("1", "2"): ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra={"codec_chunk_frames": 25},
+            )
+        }
+    )
+
+    spec = get_stage_connector_spec(config, stage_id=1, async_chunk=True)
+
+    assert spec["name"] == "SharedMemoryConnector"
+    assert spec["extra"] == {"codec_chunk_frames": 25, "role": "sender"}
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):
