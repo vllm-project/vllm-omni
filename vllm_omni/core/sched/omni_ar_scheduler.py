@@ -266,6 +266,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+
+            self._refill_cached_all_token_ids(scheduler_output)
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
@@ -280,6 +282,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _refill_cached_all_token_ids(self, scheduler_output) -> None:
+        """Refill ``all_token_ids`` for scheduled cached requests.
+
+        The AR talker leaves the persistent batch every decode step, so the
+        runner's resume path (``gpu_model_runner``) reads ``all_token_ids`` for
+        each cached request. The base scheduler omits it as an optimization when
+        a request is not in the persistent batch, so refill it here for any
+        cached request still tracked in ``self.requests``.
+        """
+        cached = scheduler_output.scheduled_cached_reqs
+        cached_ids = getattr(cached, "req_ids", None)
+        if not cached_ids:
+            return
+        atid = cached.all_token_ids
+        for rid in cached_ids:
+            if rid in atid:
+                continue
+            r = self.requests.get(rid)
+            if r is not None:
+                atid[rid] = list(r.all_token_ids)
 
     def update_from_output(
         self,

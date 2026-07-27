@@ -743,10 +743,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # scheduled in the previous step and needs to be added again.
 
                 if self.use_async_scheduling and num_output_tokens > 0:
-                    # We must recover the output token ids for resumed requests in the
-                    # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                    # The AR talker leaves the persistent batch each decode step, so
+                    # this resume path runs every step; all_token_ids is refilled
+                    # scheduler-side and .get guards the rare case it is absent.
+                    resumed_token_ids = req_data.all_token_ids.get(req_id)
+                    if resumed_token_ids is not None:
+                        req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
