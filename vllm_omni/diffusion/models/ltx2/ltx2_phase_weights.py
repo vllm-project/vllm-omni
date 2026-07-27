@@ -1,22 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Resident stage-2 LoRA weights for official LTX two-stage pipelines."""
+"""Phase-specific Transformer weights for LTX pipeline recipes."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
 from .ltx2_adapter_parser import LTXAdapterParser, iter_adapter_tensors
-from .ltx2_components import create_transformer_from_config
+from .ltx2_components import create_transformer_from_config, resolve_ltx_artifact
+from .ltx2_phase_adapter import LTXPhaseAdapterRuntime
 
 logger = init_logger(__name__)
+
+
+class LTXPhaseWeights(Protocol):
+    """Common lifecycle for resident and dynamic phase-specific weights."""
+
+    @property
+    def transformer(self) -> nn.Module: ...
+
+    def prepare_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]: ...
+
+    def finalize(self) -> None: ...
+
+    def activate(self, adapter_slot: str | None) -> None: ...
+
 
 @dataclass(frozen=True)
 class _LTXLoRAEntry:
@@ -73,7 +91,7 @@ def _load_resident_lora_entries(transformer: nn.Module, path: str, dtype: torch.
 
 
 class LTXResidentLoRAController:
-    """Keep base and stage-2 LoRA weights as two offloadable DiT modules."""
+    """Keep base and refinement weights as two offloadable DiT modules."""
 
     def __init__(self, pipeline: Any, adapter_path: str) -> None:
         self.pipeline = pipeline
@@ -84,7 +102,7 @@ class LTXResidentLoRAController:
         quant_config = getattr(pipeline.od_config, "quantization_config", None)
         if _uses_serialized_quantization(quant_config):
             raise ValueError(
-                "LTX resident LoRA mode requires an unquantized base checkpoint so the stage-2 adapter can be "
+                "LTX resident LoRA mode requires an unquantized base checkpoint so the refinement adapter can be "
                 "merged before quantization; serialized quantized checkpoints are not supported."
             )
 
@@ -100,18 +118,18 @@ class LTXResidentLoRAController:
             raise RuntimeError("LTX resident LoRA mode requires a transformer weight source.")
         pipeline.weights_sources.append(replace(source, prefix="transformer_2."))
         pipeline._dit_modules = ["transformer", "transformer_2"]
-        logger.info("Using resident LTX stage-2 LoRA weights")
+        logger.info("Using resident LTX refinement-phase LoRA weights")
 
     @property
     def transformer(self) -> nn.Module:
         return getattr(self.pipeline, self.active_transformer_name)
 
     @torch.no_grad()
-    def merge_stage2_weights(
+    def prepare_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Merge LoRA into full stage-2 tensors before the standard loader."""
+        """Merge LoRA into full refinement tensors before the standard loader."""
         if self._merged:
             raise RuntimeError("LTX resident LoRA weights have already been merged.")
 
@@ -130,13 +148,13 @@ class LTXResidentLoRAController:
         if fusion_device.type == "cuda" and not torch.cuda.is_available():
             fusion_device = torch.device("cpu")
         merged_modules: set[str] = set()
-        stage2_prefix = "transformer_2."
+        refinement_prefix = "transformer_2."
         weight_suffix = ".weight"
 
         for name, weight in weights:
             module_name = None
-            if name.startswith(stage2_prefix) and name.endswith(weight_suffix):
-                module_name = name[len(stage2_prefix) : -len(weight_suffix)]
+            if name.startswith(refinement_prefix) and name.endswith(weight_suffix):
+                module_name = name[len(refinement_prefix) : -len(weight_suffix)]
             entry = entries_by_module.get(module_name) if module_name is not None else None
             if entry is not None:
                 delta = self._compute_delta(entry, fusion_device, weight.dtype)
@@ -151,7 +169,7 @@ class LTXResidentLoRAController:
 
         missing = set(entries_by_module) - merged_modules
         if missing:
-            raise ValueError(f"LTX stage-2 checkpoint is missing LoRA target weights: {sorted(missing)}.")
+            raise ValueError(f"LTX refinement checkpoint is missing LoRA target weights: {sorted(missing)}.")
         self._merged = True
 
     @staticmethod
@@ -160,21 +178,53 @@ class LTXResidentLoRAController:
         lora_b = entry.lora_b.to(device=device, dtype=dtype)
         return torch.matmul(lora_b, lora_a)
 
-    def enter(self, transformer_phase: str) -> None:
+    def finalize(self) -> None:
         if not self._merged:
             raise RuntimeError("LTX resident LoRA weights have not been finalized.")
-        if transformer_phase == "base":
+
+    def activate(self, adapter_slot: str | None) -> None:
+        self.finalize()
+        if adapter_slot is None:
             self.active_transformer_name = "transformer"
-        elif transformer_phase == "distilled_lora":
+        elif adapter_slot == "ltx_distilled":
             self.active_transformer_name = "transformer_2"
         else:
-            raise ValueError(f"Unsupported LTX Transformer phase: {transformer_phase!r}.")
+            raise ValueError(f"Unknown LTX phase adapter slot {adapter_slot!r}.")
 
-    def set_active(self, adapter_name: str | None) -> None:
-        """Match the fixed-slot API used by the dynamic phase adapter."""
-        if adapter_name is None:
-            self.enter("base")
-        elif adapter_name == "ltx_distilled":
-            self.enter("distilled_lora")
-        else:
-            raise ValueError(f"Unknown LTX phase adapter slot {adapter_name!r}.")
+
+def build_ltx_phase_weights(pipeline: Any) -> LTXPhaseWeights | None:
+    """Build the fixed phase-weight strategy required by a pipeline recipe."""
+    adapter_slots = {phase.adapter_slot for phase in pipeline.pipeline_recipe.phases if phase.adapter_slot is not None}
+    if not adapter_slots:
+        return None
+    if adapter_slots != {"ltx_distilled"}:
+        raise ValueError(f"Unsupported LTX phase adapter slots: {sorted(adapter_slots)}.")
+
+    profile = pipeline.component_profile
+    if profile.distilled_lora_filename is None or profile.artifact_repo_id is None:
+        raise ValueError(f"{profile.name} does not declare the required distilled adapter artifact.")
+    if getattr(pipeline.od_config, "lora_path", None) is not None:
+        raise ValueError(
+            f"{pipeline.__class__.__name__} reserves LoRA execution for its phase adapter; "
+            "request or static LoRA composition is not supported yet."
+        )
+
+    model_config = getattr(pipeline.od_config, "model_config", {}) or {}
+    mode = model_config.get("ltx_two_stage_lora_mode", "resident")
+    if mode not in {"resident", "dynamic"}:
+        raise ValueError(f"model_config.ltx_two_stage_lora_mode must be either 'resident' or 'dynamic', got {mode!r}.")
+    model_paths = getattr(pipeline.od_config, "model_paths", {}) or {}
+    adapter_path = resolve_ltx_artifact(
+        pipeline.od_config.model,
+        profile.artifact_repo_id,
+        profile.distilled_lora_filename,
+        explicit_path=model_paths.get("distilled_lora"),
+    )
+
+    if mode == "resident":
+        return LTXResidentLoRAController(pipeline, adapter_path)
+
+    manifest = LTXAdapterParser(pipeline.transformer).parse(adapter_path, name="ltx_distilled")
+    runtime = LTXPhaseAdapterRuntime(pipeline.transformer, manifest, dtype=pipeline.od_config.dtype)
+    runtime.install_structure()
+    return runtime

@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.models.ltx2 import ltx2_components, ltx2_phase_adapter
+from vllm_omni.diffusion.models.ltx2 import ltx2_components, ltx2_phase_adapter, ltx2_phase_weights
 from vllm_omni.diffusion.models.ltx2.ltx2_adapter_parser import (
     AdapterTarget,
     AdapterTensorSource,
@@ -45,12 +45,12 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     combine_guided_x0,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
-from vllm_omni.diffusion.models.ltx2.ltx2_lora import (
+from vllm_omni.diffusion.models.ltx2.ltx2_phase_adapter import LTXPhaseAdapterRuntime
+from vllm_omni.diffusion.models.ltx2.ltx2_phase_weights import (
     LTXResidentLoRAController,
     _LTXLoRAEntry,
     _transformer_config_to_dict,
 )
-from vllm_omni.diffusion.models.ltx2.ltx2_phase_adapter import LTXPhaseAdapterRuntime
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_ONE_STAGE_RECIPE,
@@ -264,11 +264,11 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
     monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
     monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage.resolve_ltx_artifact",
+        "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights.resolve_ltx_artifact",
         lambda *_args, **_kwargs: "/tmp/adapter.safetensors",
     )
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage.LTXResidentLoRAController",
+        "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights.LTXResidentLoRAController",
         lambda *_args: SimpleNamespace(),
     )
 
@@ -295,6 +295,18 @@ def test_ltx_one_stage_entry_exposes_batch_image_and_distributed_decode_contract
     assert not LTX2DistilledPipeline.supports_request_batch
     assert LTX2DistilledPipeline.support_image_input
     assert LTX2DistilledPipeline.unified_text_image_entry
+
+
+def test_ltx_two_stage_rejects_request_embedded_images():
+    pipe = object.__new__(LTX2TwoStagePipeline)
+    request_inputs = SimpleNamespace(latents=None)
+    object.__setattr__(pipe, "_resolve_request_inputs", lambda *_args, **_kwargs: request_inputs)
+    req = SimpleNamespace(
+        prompts=[{"prompt": "image conditioned", "multi_modal_data": {"image": torch.zeros(3, 8, 8)}}]
+    )
+
+    with pytest.raises(ValueError, match="does not support `image` input"):
+        pipe._forward_request(req)
 
 
 def test_ltx_dmd2_entries_retain_their_task_boundaries():
@@ -693,6 +705,13 @@ def test_ltx2_distilled_pipeline_shares_recipe_runtime():
     assert issubclass(LTX2DistilledPipeline, LTX2Pipeline)
     assert LTX2DistilledPipeline._run_recipe is LTXRuntime._run_recipe
     assert "_forward_request" not in LTX2DistilledPipeline.__dict__
+
+
+def test_ltx_two_stage_entry_is_a_thin_pipeline_variant():
+    assert "_run_recipe" not in LTX2TwoStagePipeline.__dict__
+    assert "_forward_request" not in LTX2TwoStagePipeline.__dict__
+    assert "load_weights" not in LTX2TwoStagePipeline.__dict__
+    assert issubclass(LTX2TwoStagePipeline, LTX2Pipeline)
 
 
 def test_ltx_variants_share_denoise_loop_and_i2v_conditioning():
@@ -1113,20 +1132,20 @@ def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, step
     assert (recipe.width, recipe.height) == (1536, 1024)
     assert recipe.num_inference_steps == steps
     assert stage1.spatial_downscale == 2
-    assert stage1.transformer_phase == "base"
+    assert stage1.adapter_slot is None
     assert stage1.guidance.video.stg_blocks == (stg_block,)
     assert stage1.guidance.audio.stg_blocks == (stg_block,)
     assert stage2.input_transform == "spatial_upsample"
-    assert stage2.transformer_phase == "distilled_lora"
+    assert stage2.adapter_slot == "ltx_distilled"
     assert stage2.guidance == LTXGuidanceSpec.positive_only()
     assert stage2.num_inference_steps == 3
     assert stage2.sigmas == (0.909375, 0.725, 0.421875, 0.0)
 
 
-def test_ltx_two_stage_entries_select_the_official_transformer_phases():
+def test_ltx_two_stage_entries_select_the_official_adapter_slots():
     phase_switches = []
     ordinary_pipeline = object.__new__(LTX2TwoStagePipeline)
-    ordinary_pipeline._phase_adapter = SimpleNamespace(set_active=phase_switches.append)
+    ordinary_pipeline._phase_weights = SimpleNamespace(activate=phase_switches.append)
     for phase in LTX2_TWO_STAGE_RECIPE.phases:
         ordinary_pipeline._enter_phase(phase)
     assert phase_switches == [None, "ltx_distilled"]
@@ -1148,6 +1167,59 @@ def test_ltx_resident_lora_copies_mapping_and_namespace_configs(config):
 
     assert copied == {"num_layers": 2, "cross_attn_mod": True}
     assert copied is not config
+
+
+def _make_phase_weight_factory_pipeline(mode: str):
+    return SimpleNamespace(
+        pipeline_recipe=LTX2_TWO_STAGE_RECIPE,
+        component_profile=LTX23_TWO_STAGE_COMPONENT_PROFILE,
+        transformer=object(),
+        od_config=SimpleNamespace(
+            model="unused",
+            model_config={"ltx_two_stage_lora_mode": mode},
+            model_paths={"distilled_lora": "/models/distilled.safetensors"},
+            lora_path=None,
+            dtype=torch.float32,
+        ),
+    )
+
+
+def test_ltx_phase_weight_factory_selects_resident_mode(monkeypatch):
+    pipeline = _make_phase_weight_factory_pipeline("resident")
+    resident = object()
+    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
+    monkeypatch.setattr(ltx2_phase_weights, "LTXResidentLoRAController", lambda pipe, path: resident)
+
+    assert ltx2_phase_weights.build_ltx_phase_weights(pipeline) is resident
+
+
+def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch):
+    pipeline = _make_phase_weight_factory_pipeline("dynamic")
+    manifest = object()
+    installed = []
+
+    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
+    monkeypatch.setattr(
+        ltx2_phase_weights,
+        "LTXAdapterParser",
+        lambda transformer: SimpleNamespace(parse=lambda path, name: manifest),
+    )
+
+    class DynamicRuntime:
+        def __init__(self, transformer, parsed_manifest, *, dtype):
+            assert transformer is pipeline.transformer
+            assert parsed_manifest is manifest
+            assert dtype is torch.float32
+
+        def install_structure(self):
+            installed.append(True)
+
+    monkeypatch.setattr(ltx2_phase_weights, "LTXPhaseAdapterRuntime", DynamicRuntime)
+
+    runtime = ltx2_phase_weights.build_ltx_phase_weights(pipeline)
+
+    assert isinstance(runtime, DynamicRuntime)
+    assert installed == [True]
 
 
 def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch):
@@ -1182,7 +1254,7 @@ def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch)
         return _TinyTransformer()
 
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_lora.create_transformer_from_config",
+        "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights.create_transformer_from_config",
         create_transformer,
     )
     lora_entries = [
@@ -1195,14 +1267,14 @@ def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch)
         )
     ]
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_lora._load_resident_lora_entries",
+        "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights._load_resident_lora_entries",
         lambda *args: lora_entries,
     )
 
     controller = LTXResidentLoRAController(pipe, "unused.safetensors")
     assert created_configs == [({"num_layers": 1, "cross_attn_mod": True}, quant_config)]
 
-    pipe._resident_lora_controller = controller
+    pipe._phase_weights = controller
     base_weight = torch.eye(2)
     loaded = pipe.load_weights(
         [
@@ -1223,9 +1295,9 @@ def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch)
     assert modules.dit_names == ["transformer", "transformer_2"]
     assert pipe.weights_sources[1].prefix == "transformer_2."
 
-    controller.enter("base")
+    controller.activate(None)
     assert controller.transformer is pipe.transformer
-    controller.enter("distilled_lora")
+    controller.activate("ltx_distilled")
     assert controller.transformer is pipe.transformer_2
 
 
@@ -1257,12 +1329,12 @@ def test_ltx_phase_adapter_keeps_one_transformer_and_switches_a_fixed_slot(tmp_p
     assert {name for name, _ in transformer.named_parameters()} == {"proj.base_layer.weight"}
     with torch.no_grad():
         transformer.proj.base_layer.weight.copy_(torch.eye(2))
-    runtime.finalize_adapter_data()
+    runtime.finalize()
 
     x = torch.tensor([[1.0, 1.0]])
-    runtime.set_active(None)
+    runtime.activate(None)
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[1.0, 1.0]]))
-    runtime.set_active("ltx_distilled")
+    runtime.activate("ltx_distilled")
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[10.0, 13.0]]))
 
 
@@ -1390,7 +1462,7 @@ def test_ltx_resident_lora_requires_every_adapter_target(monkeypatch):
     controller.adapter_path = "unused.safetensors"
     controller._merged = False
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_lora._load_resident_lora_entries",
+        "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights._load_resident_lora_entries",
         lambda *args: [
             _LTXLoRAEntry(
                 module_name="missing",
@@ -1403,7 +1475,7 @@ def test_ltx_resident_lora_requires_every_adapter_target(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="missing LoRA target weights"):
-        list(controller.merge_stage2_weights([("transformer_2.proj.weight", torch.eye(2))]))
+        list(controller.prepare_weights([("transformer_2.proj.weight", torch.eye(2))]))
 
 
 class TestLTXRequestParsing:

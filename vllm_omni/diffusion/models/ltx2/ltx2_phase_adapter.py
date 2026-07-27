@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Runtime for a fixed LTX two-stage adapter slot.
+"""Runtime for a fixed LTX refinement-phase adapter slot.
 
 This module intentionally knows nothing about official LTX safetensors names.
 It receives an :class:`AdapterManifest` and makes the existing LTX transformer
@@ -127,9 +127,7 @@ def _build_layout(layer: nn.Module, target: AdapterTarget) -> _AdapterLayout:
             output_start=0,
         )
 
-    raise TypeError(
-        f"LTX phase adapter target {target.module!r} has unsupported layer type {type(layer).__name__}."
-    )
+    raise TypeError(f"LTX phase adapter target {target.module!r} has unsupported layer type {type(layer).__name__}.")
 
 
 class _AdapterPiece(nn.Module):
@@ -284,7 +282,14 @@ class LTXPhaseAdapterRuntime:
                 return f"{target_name}.base_layer.{name[len(prefix) :]}"
         return name
 
-    def finalize_adapter_data(self) -> None:
+    def prepare_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Keep base weights on the transformer's standard loading path."""
+        return weights
+
+    def finalize(self) -> None:
         """Stream rank-local A/B buffers after base weight processing completes."""
         if not self._installed:
             raise RuntimeError("LTX phase adapter structure must be installed before materialization.")
@@ -301,11 +306,11 @@ class LTXPhaseAdapterRuntime:
         self._materialized = True
         logger.info("Materialized %d LTX phase-adapter tensor pairs for slot %s", len(loaded), self.manifest.name)
 
-    def set_active(self, adapter_name: str | None) -> None:
-        if adapter_name is not None:
-            if adapter_name != self.manifest.name:
-                raise ValueError(f"Unknown LTX phase adapter slot {adapter_name!r}.")
+    def activate(self, adapter_slot: str | None) -> None:
+        if adapter_slot is not None:
+            if adapter_slot != self.manifest.name:
+                raise ValueError(f"Unknown LTX phase adapter slot {adapter_slot!r}.")
             if not self._materialized:
                 raise RuntimeError("LTX phase adapter data must be materialized before activation.")
         for wrapper in self._wrappers.values():
-            wrapper.set_active(adapter_name)
+            wrapper.set_active(adapter_slot)
