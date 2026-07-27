@@ -188,6 +188,21 @@ def test_ming_stage0_speaker_extraction_rejects_mismatched_sample_rates():
         )
 
 
+def test_ming_stage0_prompt_waveform_does_not_trigger_speaker_extraction():
+    wrapper = _make_ming_speaker_wrapper()
+
+    embeddings = _resolve_speaker_embeddings(
+        wrapper,
+        {
+            "prompt_waveform": torch.ones((1, 10)),
+            "prompt_text": "Reference transcript.",
+        },
+    )
+
+    assert embeddings is None
+    assert not wrapper._speaker_extractor.calls
+
+
 def test_ming_stage0_direct_speaker_embedding_bypasses_extractor():
     wrapper = _make_ming_speaker_wrapper()
     direct = torch.full((SPEAKER_EMBEDDING_DIM,), 0.25)

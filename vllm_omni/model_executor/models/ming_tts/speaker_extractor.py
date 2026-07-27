@@ -86,8 +86,6 @@ def _speaker_waveforms_from_info(
 ) -> list[tuple[torch.Tensor, int]]:
     raw_waveform = info_dict.get(KEY_SPEAKER_WAVEFORM)
     if raw_waveform is None:
-        raw_waveform = info_dict.get("prompt_waveform")
-    if raw_waveform is None:
         return []
 
     waveform = coerce_prompt_waveform(raw_waveform)
