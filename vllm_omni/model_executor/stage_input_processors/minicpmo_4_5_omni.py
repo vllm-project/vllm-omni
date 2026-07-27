@@ -461,10 +461,6 @@ def tts2code2wav(
         or (callable(request_finished) and request_finished())
     )
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    logger.info(
-        "[DIAG-5437][sync-bridge] req=%s step_delta=%d pending=%d finished=%s chunk_frames=%d",
-        request_id, len(new_codes_step), len(pending), finished, chunk_frames,
-    )
     if not finished and len(pending) < chunk_frames:
         return None
 
