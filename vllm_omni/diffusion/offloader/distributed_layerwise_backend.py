@@ -96,6 +96,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # Backward link to previous hook for fallback (cache-dit skip)
         self._prev_hook: DistributedLayerwiseOffloadHook | None = None
 
+        # Marks the first hook in a shared-buffer group.  When multiple DiT
+        # groups share the same 2 GPU buffers, another group may have
+        # overwritten this group's slot between forwards.  The first block
+        # must always sync-prefetch on entry to ensure it loads the correct
+        # weights, even if is_materialized sees a non-empty tensor left by
+        # the other group.
+        self._is_group_first: bool = False
+
         # Parameters/buffers of the current and next blocks
         self.block_parameters: dict[str, nn.Parameter] = {}
         self.block_buffers: dict[str, torch.Tensor] = {}
@@ -391,8 +399,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     # ------------------------------------------------------------------ #
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
-        # If previous hook was skipped (e.g. by cache-dit), sync-prefetch this block
-        if not self.is_materialized and self._prev_hook is not None:
+        # If this is the first block in a shared-buffer group, always
+        # sync-prefetch — another group may have overwritten our slot.
+        # A non-empty view into the shared buffer does NOT prove the
+        # weights belong to this group.
+        if self._is_group_first and self._prev_hook is not None:
+            self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+            self._prev_hook.get_weights(self.current_slot)
+        elif not self.is_materialized and self._prev_hook is not None:
+            # Previous hook was skipped (e.g. by cache-dit), sync-prefetch
             self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             self._prev_hook.get_weights(self.current_slot)
 
@@ -886,6 +901,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             sub_hooks[i]._prev_hook = sub_hooks[i - 1]
         for i, hook in enumerate(sub_hooks):
             hook.current_slot = i % 2
+        # Mark first hook in this group — it must always sync-prefetch on
+        # entry because another group may have overwritten the shared slot.
+        if sub_hooks:
+            sub_hooks[0]._is_group_first = True
 
         # Defer buffer allocation and prefetch to enable() unified allocation
         self._all_hook_groups.append(sub_hooks)
@@ -1087,6 +1106,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # Initialize alternating slots
             for i, hook in enumerate(block_hooks):
                 hook.current_slot = i % 2
+
+            # Mark first hook in this group — shared buffers may be
+            # overwritten by other groups between forwards.
+            if block_hooks:
+                block_hooks[0]._is_group_first = True
 
             # Defer buffer allocation — collected for unified allocation below
             self._all_hook_groups.append(block_hooks)

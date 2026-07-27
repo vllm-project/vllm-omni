@@ -437,3 +437,54 @@ class TestGetBlocksAttrNames:
         DistributedLayerwiseOffloadBackend.set_blocks_attr_names(model, ["new_blocks"])
         assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
         assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]
+
+
+class TestCrossGroupSharedBuffer:
+    """Regression test: when multiple DiT groups share the same 2 GPU
+    buffers, the first block of each group must always sync-prefetch on
+    entry, because another group may have overwritten the shared slot.
+    """
+
+    def test_group_first_hook_forces_sync_prefetch(self, dist_group, patched_offload_runtime):
+        """Verify _is_group_first=True forces sync-prefetch in pre_forward
+        even when is_materialized returns True."""
+        block_a = TinyBlock(_make_values(1.0))
+        block_b = TinyBlock(_make_values(10.0))
+
+        hook_a = DistributedLayerwiseOffloadHook(
+            next_block=block_b,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+        )
+        hook_a.initialize_hook(block_a)
+
+        # Prefetch to make block_a "materialized" (non-empty params)
+        hook_a.prefetch_layer(hook_a.current_slot, non_blocking=False)
+        assert hook_a.is_materialized
+
+        # Track sync-prefetch calls
+        sync_called = [False]
+        orig = hook_a.prefetch_layer
+
+        def tracking(slot, non_blocking=True):
+            if not non_blocking:
+                sync_called[0] = True
+            orig(slot, non_blocking=non_blocking)
+
+        hook_a.prefetch_layer = tracking
+
+        # Case 1: _is_group_first=False, materialized → no sync-prefetch
+        hook_a._is_group_first = False
+        sync_called[0] = False
+        hook_a.pre_forward(block_a)
+        assert not sync_called[0], "Materialized block should not sync-prefetch without _is_group_first"
+
+        # Case 2: _is_group_first=True, materialized → MUST sync-prefetch
+        hook_a._is_group_first = True
+        hook_a._prev_hook = hook_a
+        sync_called[0] = False
+        hook_a.pre_forward(block_a)
+        assert sync_called[0], "_is_group_first must force sync-prefetch even when materialized"
