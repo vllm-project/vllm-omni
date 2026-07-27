@@ -1317,3 +1317,58 @@ class TestSparseAudioMarkerRobustness:
         )
         assert torch.equal(p1["codes.audio"], torch.zeros(1))
         assert torch.equal(p2["codes.audio"], torch.ones(1))
+
+
+class TestMergeModelKvTransferMetadata:
+    """RFC #5450 C4: model KV-transfer metadata must merge into a COPY of the
+    scheduler's finished-request data - `scheduler_output` can be shared with
+    the engine-core process and must never be mutated by the runner."""
+
+    def _runner_with_model(self, model):
+        runner = object.__new__(GPUARModelRunner)
+        runner.model = model
+        return runner
+
+    def test_merge_does_not_mutate_scheduler_data(self):
+        class _Model:
+            def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
+                return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
+
+        original_meta = {"a": 1}
+        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        runner = self._runner_with_model(_Model())
+
+        merged = runner._merge_model_kv_transfer_metadata(original)
+
+        # The manager sees the merged view...
+        assert merged["r1"]["custom_metadata"] == {"a": 1, "talker_codes": [7], "seen_tokens": 3}
+        assert merged["r1"]["seq_len"] == 3
+        # ...while the engine-shared originals are untouched.
+        assert original["r1"]["custom_metadata"] is original_meta
+        assert original_meta == {"a": 1}
+        assert "talker_codes" not in original["r1"]["custom_metadata"]
+
+    def test_merge_without_model_meta_passes_entry_through(self):
+        class _Model:
+            def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
+                return None
+
+        data = {"seq_len": 2, "block_ids": [1]}
+        runner = self._runner_with_model(_Model())
+
+        merged = runner._merge_model_kv_transfer_metadata({"r1": data})
+
+        assert merged["r1"] is data
+
+    def test_merge_failure_keeps_original_entry(self):
+        class _Model:
+            def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
+                raise RuntimeError("boom")
+
+        data = {"seq_len": 2, "block_ids": [1], "custom_metadata": {"a": 1}}
+        runner = self._runner_with_model(_Model())
+
+        merged = runner._merge_model_kv_transfer_metadata({"r1": data})
+
+        assert merged["r1"] is data
+        assert data["custom_metadata"] == {"a": 1}

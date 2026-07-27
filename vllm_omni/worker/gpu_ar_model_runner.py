@@ -1045,6 +1045,40 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         payload.update(mm_payload)
         return payload
 
+    def _merge_model_kv_transfer_metadata(
+        self,
+        finished_reqs: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Merge model-provided KV-transfer metadata into a COPY of the
+        scheduler's finished-request data.
+
+        `scheduler_output` (and its per-request dicts) can be shared with the
+        engine-core process, so it must not be mutated here — the ngram block
+        in `execute_model` `replace()`-copies for exactly the same reason. The
+        merged mapping is only consumed by
+        `kv_transfer_manager.handle_finished_requests_kv_transfer`.
+        """
+        merged: dict[str, dict[str, Any]] = {}
+        for req_id, data in finished_reqs.items():
+            try:
+                # NOTE: seq_len is the same as num_computed_tokens_cpu in current
+                # async scheduling, since both exclude async placeholders. We use
+                # seq_len since we control it, just in case upstream async scheduler
+                # semantics change in the future.
+                model_meta = self.model.get_kv_transfer_metadata(
+                    req_id,
+                    num_computed_tokens=data.get("seq_len"),
+                )
+                if model_meta:
+                    data = {
+                        **data,
+                        "custom_metadata": {**(data.get("custom_metadata") or {}), **model_meta},
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
+            merged[req_id] = data
+        return merged
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1075,24 +1109,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
-            for req_id, data in finished_reqs.items():
-                try:
-                    # NOTE: seq_len is the same as num_computed_tokens_cpu in current
-                    # async scheduling, since both exclude async placeholders. We use
-                    # seq_len since we control it, just in case upstream async scheduler
-                    # semantics change in the future.
-                    num_computed = data.get("seq_len")
-
-                    model_meta = self.model.get_kv_transfer_metadata(
-                        req_id,
-                        num_computed_tokens=num_computed,
-                    )
-                    if model_meta:
-                        existing = data.get("custom_metadata") or {}
-                        existing.update(model_meta)
-                        data["custom_metadata"] = existing
-                except Exception as e:
-                    logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
+            finished_reqs = self._merge_model_kv_transfer_metadata(finished_reqs)
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
             finished_reqs=finished_reqs,
             kv_caches=self.kv_caches,
