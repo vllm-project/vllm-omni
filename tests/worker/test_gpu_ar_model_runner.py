@@ -1375,3 +1375,37 @@ class TestMergeModelKvTransferMetadata:
         with pytest.raises(RuntimeError, match="boom"):
             runner._merge_model_kv_transfer_metadata({"r1": data})
         assert data["custom_metadata"] == {"a": 1}
+
+
+class TestDownstreamPayloadMemoization:
+    """RFC #5450 C7: `_request_needs_downstream_stage_payload` must not
+    memoize before the deciding marker exists - the final-stage id arrives via
+    `model_intermediate_buffer`, which can be unpopulated on the first call."""
+
+    def _runner(self, stages):
+        runner = object.__new__(GPUARModelRunner)
+        runner._downstream_payload_cache = {}
+        runner._request_final_stage_id = lambda rid: stages[rid]
+        return runner
+
+    def test_missing_marker_defaults_true_without_memoizing(self):
+        stages = {"r1": None}
+        runner = self._runner(stages)
+
+        assert runner._request_needs_downstream_stage_payload("r1") is True
+        # Not cached: the answer must refresh once the marker arrives.
+        assert "r1" not in runner._downstream_payload_cache
+
+        stages["r1"] = 0  # marker lands: this stage IS the final stage
+        assert runner._request_needs_downstream_stage_payload("r1") is False
+        assert runner._downstream_payload_cache["r1"] is False
+
+    def test_memoizes_once_marker_known(self):
+        stages = {"r1": 2}
+        runner = self._runner(stages)
+
+        assert runner._request_needs_downstream_stage_payload("r1") is True
+        assert runner._downstream_payload_cache["r1"] is True
+        # Cached value now authoritative for the request's lifetime.
+        stages["r1"] = 0
+        assert runner._request_needs_downstream_stage_payload("r1") is True

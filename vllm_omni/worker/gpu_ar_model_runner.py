@@ -473,9 +473,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         cached = self._downstream_payload_cache.get(req_id)
         if cached is not None:
             return cached
-        # Conservative default: keep payload if marker is missing.
         final_stage_id = self._request_final_stage_id(req_id)
-        needs_payload = final_stage_id is None or final_stage_id > 0
+        if final_stage_id is None:
+            # Conservative default while the marker is missing: keep the
+            # payload, but do NOT memoize - the marker arrives via
+            # `model_intermediate_buffer`, which may be unpopulated on the
+            # first call (memoizing here pinned the request to True forever,
+            # never refreshing once the marker landed).
+            return True
+        needs_payload = final_stage_id > 0
         self._downstream_payload_cache[req_id] = needs_payload
         return needs_payload
 
