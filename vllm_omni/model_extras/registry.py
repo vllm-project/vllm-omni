@@ -243,6 +243,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request adapters.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
     if not model_class_name:

@@ -11,6 +11,7 @@ Generate text from text or image inputs with vLLM-Omni's shared offline entrypoi
 | `ByteDance-Seed/BAGEL-7B-MoT` | Yes | Yes | `vllm_omni/deploy/bagel.yaml` |
 | `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | `vllm_omni/deploy/hunyuan_image3_ar.yaml` |
 | `bytedance-research/MammothModa2-Preview` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
+| `bytedance-research/MammothModa2-Dev` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
 
 The script recognizes these model families from `config.json`, applies the
 model-specific prompt format, and selects an AR-only deploy for HunyuanImage-3
@@ -42,6 +43,14 @@ python examples/offline_inference/x_to_text/x_to_text.py \
   --prompt "Explain multimodal inference in three concise sentences."
 ```
 
+The same command supports the Dev checkpoint:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model bytedance-research/MammothModa2-Dev \
+  --prompt "Explain multimodal inference in three concise sentences."
+```
+
 ## Image-To-Text
 
 Pass one image with `--image`. The default question can be replaced with any
@@ -69,6 +78,9 @@ python examples/offline_inference/x_to_text/x_to_text.py \
   --image image.png \
   --prompt "Describe this image in detail."
 ```
+
+Use `bytedance-research/MammothModa2-Dev` in the same command to run I2T with
+the Dev checkpoint.
 
 ## Key Arguments
 

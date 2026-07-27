@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 import huggingface_hub
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -63,7 +64,11 @@ def omni_snapshot_download(model_id: str) -> str:
 
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
-    if os.environ.get("VLLM_USE_MODELSCOPE", False):
+    # Read through ``vllm.envs`` so the flag keeps vLLM's semantics (only
+    # "true", case-insensitive, enables ModelScope). Reading the raw variable
+    # here made every non-empty value truthy, so ``VLLM_USE_MODELSCOPE=0``
+    # took the ModelScope path while the rest of the stack stayed on HF.
+    if envs.VLLM_USE_MODELSCOPE:
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)

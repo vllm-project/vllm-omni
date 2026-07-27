@@ -13,6 +13,8 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
@@ -58,7 +60,9 @@ class SupportsStepExecution(Protocol):
         """Prepare request-level inputs and return initialized state."""
         ...
 
-    def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
+    def denoise_step(
+        self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any
+    ) -> torch.Tensor | None:
         """Run one denoise forward on the runner-assembled batch."""
         ...
 
@@ -100,3 +104,30 @@ def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
     return isinstance(pipeline, SupportsStepExecution)
+
+
+@runtime_checkable
+class SupportsPromptUpdate(Protocol):
+    """Optional protocol for pipelines that support midway prompt updates.
+
+    Pipelines typically implement this via
+    :class:`~vllm_omni.diffusion.prompt_update.PromptUpdateMixin`.
+    """
+
+    supports_prompt_update: ClassVar[bool] = True
+
+    def prepare_prompt_update(
+        self,
+        state: StepRequestState,
+        prompt: str,
+        event_id: str,
+        transition_chunks: int | None = None,
+    ) -> None:
+        """Encode and queue a prompt update on request-local state."""
+        ...
+
+
+def supports_prompt_update(pipeline: object) -> bool:
+    """Return whether ``pipeline`` implements :class:`SupportsPromptUpdate`."""
+
+    return isinstance(pipeline, SupportsPromptUpdate)
