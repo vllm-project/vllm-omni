@@ -334,13 +334,6 @@ def mock_get_config(monkeypatch):
             _mock_length_from_prompt_token_ids_or_embeds,
         )
 
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.async_omni.init_tokenizer_from_configs", _mock_init_tokenizer_from_configs, raising=False
-    )
-    async_omni_path = "vllm_omni.entrypoints.async_omni"
-    if async_omni_path in sys.modules:
-        setattr(sys.modules[async_omni_path], "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
-
     fake_hf_config = _ns()
     fake_hf_config.model_type = "qwen2_5_omni"
 

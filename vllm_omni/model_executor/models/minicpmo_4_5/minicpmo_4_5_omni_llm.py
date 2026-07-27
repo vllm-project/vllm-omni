@@ -105,8 +105,6 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     NestedTensors,
 )
-
-from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
@@ -128,6 +126,7 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+
 
 # vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
 # _encode_tokens uses tokenizer.encode() as the only code path.
