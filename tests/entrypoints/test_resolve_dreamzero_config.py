@@ -24,6 +24,10 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
     resolved = resolve_omni_config(
         "GEAR-Dreams/DreamZero-DROID",
         trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides=None,
+        stage_overrides=None,
+        strategy_config_path=None,
     )
     engine_args = resolved.stage_configs[0].engine_args
 
@@ -34,6 +38,9 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
 
 
 def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch):
+    def _get_hf_config(path, _model):
+        return None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]}
+
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
         lambda path, _model, **_kwargs: (

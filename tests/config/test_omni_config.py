@@ -1253,6 +1253,29 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
+def test_diffusion_config_none_values_preserve_dataclass_defaults():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    normalized = OmniDiffusionConfig.normalize_init_kwargs(
+        {
+            "lora_scale": None,
+            "enable_sleep_mode": None,
+            "diffusers_load_kwargs": None,
+        }
+    )
+
+    assert "lora_scale" not in normalized
+    assert "enable_sleep_mode" not in normalized
+    assert normalized["diffusers_load_kwargs"] == {}
+
+    config = OmniDiffusionConfig.from_kwargs(
+        lora_scale=None,
+        enable_sleep_mode=None,
+    )
+    assert config.lora_scale == 1.0
+    assert config.enable_sleep_mode is False
+
+
 @pytest.mark.parametrize(
     ("canonical_key", "alias_key", "canonical_value", "alias_value"),
     [

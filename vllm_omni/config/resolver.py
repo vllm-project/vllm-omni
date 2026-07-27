@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import types
 from collections import Counter
 from collections.abc import Mapping
@@ -9,10 +8,14 @@ from typing import Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.data import resolve_model_class_name
+from vllm_omni.diffusion.registry import DiffusionModelRegistry
+from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
 logger = init_logger(__name__)
 
@@ -119,18 +122,6 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
-def _parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
-    """Parse ``--stage-overrides`` JSON or pass through an existing mapping."""
-    if not value:
-        return None
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
-    return value
-
-
 def _flatten_stage_overrides(
     cli_overrides: dict[str, Any],
     stage_overrides: Mapping[str, Mapping[str, Any]] | None,
@@ -146,29 +137,20 @@ def _flatten_stage_overrides(
 def _load_strategy_specs(strategy_config_path: str | None) -> Mapping[Any, Any] | None:
     if strategy_config_path is None:
         return None
-    from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
 
     return load_strategy_specs(strategy_config_path)
 
 
-def _resolve_registered_pipeline(
+def _build_registered_resolution(
+    structured_config: VllmOmniConfig,
+    *,
     model: str,
     cli_overrides: dict[str, Any],
-    *,
     trust_remote_code: bool,
     deploy_config_path: str | None,
     strategy_config_path: str | None,
-) -> tuple[VllmOmniConfig | None, tuple[Any, ...], str | None]:
-    """Resolve registry metadata and the temporary runtime compatibility view."""
-    structured_config = StageConfigFactory.create_from_model(
-        model,
-        trust_remote_code=trust_remote_code,
-        cli_overrides=cli_overrides,
-        deploy_config_path=deploy_config_path,
-    )
-    if structured_config is None:
-        return None, (), None
-
+) -> OmniConfigResolution:
+    """Build the temporary runtime view for an already-resolved pipeline."""
     # Runtime consumers have not yet moved to typed per-stage configs. Use the
     # factory-owned compatibility bridge instead of reimplementing legacy YAML
     # discovery and merging in this resolver.
@@ -185,7 +167,12 @@ def _resolve_registered_pipeline(
             "but the runtime compatibility stage configs could not be built."
         )
 
-    return structured_config, tuple(stage.to_omegaconf() for stage in legacy_stages), omni_lb_policy
+    return OmniConfigResolution(
+        config_path=structured_config.orchestrator_config.deploy_config_path,
+        stage_configs=tuple(stage.to_omegaconf() for stage in legacy_stages),
+        omni_lb_policy=omni_lb_policy,
+        endpoint_restrictions=tuple(structured_config.pipeline_config.endpoint_restrictions),
+    )
 
 
 def _resolve_generic_diffusion_model_class(
@@ -193,10 +180,6 @@ def _resolve_generic_diffusion_model_class(
     cli_overrides: Mapping[str, Any],
 ) -> tuple[bool, str | None]:
     """Detect generic diffusion support and its serving pipeline class."""
-    from vllm_omni.diffusion.data import resolve_model_class_name
-    from vllm_omni.diffusion.registry import DiffusionModelRegistry
-    from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
-
     model_class_name = cli_overrides.get("model_class_name") or resolve_model_class_name(
         model,
         str(cli_overrides.get("diffusion_load_format") or "default"),
@@ -210,30 +193,31 @@ def _resolve_generic_diffusion_model_class(
 def resolve_omni_config(
     model: str,
     *,
-    trust_remote_code: bool = False,
-    deploy_config_path: str | None = None,
-    cli_overrides: Mapping[str, Any] | None = None,
-    stage_overrides: Mapping[str, Mapping[str, Any]] | str | None = None,
-    strategy_config_path: str | None = None,
+    trust_remote_code: bool,
+    deploy_config_path: str | None,
+    cli_overrides: Mapping[str, Any] | None,
+    stage_overrides: Mapping[str, Mapping[str, Any]] | None,
+    strategy_config_path: str | None,
 ) -> OmniConfigResolution:
     """Resolve registry/deploy inputs through the single public entrypoint."""
     normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
     normalized_overrides["trust_remote_code"] = trust_remote_code
-    _flatten_stage_overrides(normalized_overrides, _parse_stage_overrides(stage_overrides))
+    _flatten_stage_overrides(normalized_overrides, stage_overrides)
 
-    structured_config, stage_configs, omni_lb_policy = _resolve_registered_pipeline(
+    structured_config = StageConfigFactory.create_from_model(
         model,
-        normalized_overrides,
         trust_remote_code=trust_remote_code,
+        cli_overrides=normalized_overrides,
         deploy_config_path=deploy_config_path,
-        strategy_config_path=strategy_config_path,
     )
     if structured_config is not None:
-        return OmniConfigResolution(
-            config_path=structured_config.orchestrator_config.deploy_config_path,
-            stage_configs=stage_configs,
-            omni_lb_policy=omni_lb_policy,
-            endpoint_restrictions=tuple(structured_config.pipeline_config.endpoint_restrictions),
+        return _build_registered_resolution(
+            structured_config,
+            model=model,
+            cli_overrides=normalized_overrides,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+            strategy_config_path=strategy_config_path,
         )
 
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)

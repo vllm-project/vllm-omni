@@ -1593,6 +1593,10 @@ class OmniDiffusionConfig:
     def normalize_init_kwargs(cls, raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
         config_kwargs = normalize_omni_diffusion_kwargs(raw_kwargs)
         valid_fields = {f.name for f in fields(cls)}
+        # Remaining ``None`` values mean "unset" at the CLI/deploy boundary.
+        # Drop them so non-optional dataclass defaults are not overwritten.
+        # Fields where ``None`` has normalization semantics (for example dtype
+        # and nullable container inputs) are handled above before this filter.
         return {key: value for key, value in config_kwargs.items() if key in valid_fields and value is not None}
 
     @classmethod

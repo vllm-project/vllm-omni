@@ -17,9 +17,13 @@ import vllm_omni.config.resolver as resolver_module
 import vllm_omni.engine.async_omni_engine as async_engine_module
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.resolver import OmniConfigResolution, _parse_stage_overrides
+from vllm_omni.config.resolver import OmniConfigResolution
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
+from vllm_omni.entrypoints.cli.serve import (
+    OmniServeCommand,
+    _parse_stage_overrides,
+    run_headless,
+)
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -171,7 +175,7 @@ def test_run_headless_rejects_non_multiprocess_worker_backend() -> None:
 
 
 # ---------------------------------------------------------------------------
-# --stage-overrides parsing parity (headless vs standard path)
+# --stage-overrides parsing at the serving boundary
 # ---------------------------------------------------------------------------
 
 
@@ -181,30 +185,28 @@ def test_parse_stage_overrides_valid_json() -> None:
     assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
 
 
-def test_parse_stage_overrides_none_and_empty_return_none() -> None:
-    """No overrides (None / empty string) resolve to ``None``."""
-    assert _parse_stage_overrides(None) is None
-    assert _parse_stage_overrides("") is None
+def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
 
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--stage-overrides",
+            '{"0": {"devices": "0,1"}}',
+        ]
+    )
 
-def test_parse_stage_overrides_empty_dict_returns_none() -> None:
-    """An empty dict is falsy and must resolve to ``None``, locking in parity
-    with the original standard-path ``if stage_overrides_json:`` falsy check."""
-    assert _parse_stage_overrides({}) is None
-
-
-def test_parse_stage_overrides_passes_through_non_str() -> None:
-    """An already-parsed mapping is returned unchanged (identity)."""
-    overrides = {"0": {"devices": "0"}}
-    assert _parse_stage_overrides(overrides) is overrides
+    assert args.stage_overrides == {"0": {"devices": "0,1"}}
 
 
 def test_parse_stage_overrides_invalid_json_raises() -> None:
-    """Invalid JSON raises ValueError whose message matches the standard path
-    verbatim: the ``--stage-overrides is not valid JSON:`` prefix AND the
-    ``Got: <repr>`` suffix echoing the raw input."""
+    """Invalid JSON fails at the serving boundary with the raw input."""
     bad = "{not valid json}"
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
         _parse_stage_overrides(bad)
     message = str(excinfo.value)
     assert message.startswith("--stage-overrides is not valid JSON:")
@@ -304,7 +306,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
         stage_id=0,
         deploy_config="/tmp/deploy.yaml",
         strategy_config="/tmp/strategy.yaml",
-        stage_overrides='{"0": {"devices": "0,1"}, "1": {"devices": "2"}}',
+        stage_overrides={"0": {"devices": "0,1"}, "1": {"devices": "2"}},
     )
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
@@ -315,12 +317,11 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
 
 
-def test_run_headless_invalid_stage_overrides_raises() -> None:
-    """Invalid ``--stage-overrides`` JSON in headless mode fails fast with the
-    shared ValueError instead of being silently ignored."""
-    args = _make_headless_args(stage_id=0, stage_overrides="{not valid json}")
-    with pytest.raises(ValueError, match="--stage-overrides is not valid JSON"):
-        run_headless(args)
+def test_parse_stage_overrides_rejects_non_mapping_values() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="JSON object"):
+        _parse_stage_overrides('["not", "a", "mapping"]')
+    with pytest.raises(argparse.ArgumentTypeError, match="override objects"):
+        _parse_stage_overrides('{"0": "not a mapping"}')
 
 
 def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFixture) -> None:
@@ -469,6 +470,80 @@ def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path
         "structured": [deploy_path, deploy_path],
         "legacy": [deploy_path, deploy_path],
     }
+
+
+def test_standard_and_headless_resolve_identical_default_diffusion_config(mocker: MockerFixture) -> None:
+    """Both startup paths must use the same generic-diffusion fallback."""
+    mocker.patch.object(StageConfigFactory, "create_from_model", return_value=None)
+    mocker.patch.object(
+        resolver_module,
+        "_resolve_generic_diffusion_model_class",
+        return_value=(True, "FluxPipeline"),
+    )
+    mocker.patch(
+        "vllm_omni.config.config_factory.supports_audio_output",
+        return_value=False,
+    )
+
+    resolutions: list[OmniConfigResolution] = []
+    resolve = resolver_module.resolve_omni_config
+
+    def _record_resolve(*args, **kwargs):
+        resolved = resolve(*args, **kwargs)
+        resolutions.append(resolved)
+        return resolved
+
+    mocker.patch.object(async_engine_module, "resolve_omni_config", side_effect=_record_resolve)
+    mocker.patch.object(resolver_module, "resolve_omni_config", side_effect=_record_resolve)
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.get_headless_replica_devices",
+        return_value=[None],
+    )
+    launch_headless = mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.launch_headless_diffusion_replicas",
+    )
+
+    model = "black-forest-labs/FLUX.2-klein-4B"
+    diffusion_overrides = {
+        "dtype": "float16",
+        "ulysses_degree": 2,
+        "diffusion_compile_dynamic": False,
+    }
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._omni_lb_policy = "random"
+    standard_path, standard_stages = engine._resolve_stage_configs(
+        model,
+        dict(diffusion_overrides),
+        trust_remote_code=False,
+    )
+
+    run_headless(
+        _make_headless_args(
+            explicit_keys=frozenset(diffusion_overrides),
+            model=model,
+            stage_id=0,
+            **diffusion_overrides,
+        )
+    )
+
+    assert len(resolutions) == 2
+    standard_resolution, headless_resolution = resolutions
+
+    def _stage_snapshot(resolution: OmniConfigResolution) -> list[dict]:
+        return [OmegaConf.to_container(stage, resolve=True) for stage in resolution.stage_configs]
+
+    assert standard_path is None
+    assert headless_resolution.config_path is None
+    assert _stage_snapshot(standard_resolution) == _stage_snapshot(headless_resolution)
+    assert [OmegaConf.to_container(stage, resolve=True) for stage in standard_stages] == _stage_snapshot(
+        headless_resolution
+    )
+    assert headless_resolution.stage_by_id(0).stage_type == "diffusion"
+    assert headless_resolution.stage_by_id(0).engine_args.model_class_name == "FluxPipeline"
+    assert headless_resolution.stage_by_id(0).final_output_type == "image"
+    launch_headless.assert_called_once()
+    assert launch_headless.call_args.kwargs["stage_cfg"] is headless_resolution.stage_by_id(0)
 
 
 def test_run_headless_rejects_both_config_path_flags() -> None:
