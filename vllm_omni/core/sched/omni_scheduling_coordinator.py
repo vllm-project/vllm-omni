@@ -17,7 +17,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
-from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.core.sched.output import OmniInputRecvHandle
 
 logger = init_logger(__name__)
 
@@ -109,7 +109,7 @@ class OmniSchedulingCoordinator:
         # can call register_chunk_recv().  Typed concretely (not list[Any]) so
         # the surrounding OmniSchedulerOutput stays msgspec-friendly across
         # default, PD-disagg, and multi-node executor IPC paths.
-        self.pending_input_registrations: list[OmniChunkRecvHandle] = []
+        self.pending_input_registrations: list[OmniInputRecvHandle] = []
 
         # Monotonic timestamp recording when each request first entered
         # WAITING_FOR_INPUT.  Used by collect_timed_out_request_ids() to
@@ -169,7 +169,7 @@ class OmniSchedulingCoordinator:
                 to_remove.append(request)
                 self._waiting_for_input.append(request)
                 self.pending_input_registrations.append(
-                    OmniChunkRecvHandle(
+                    OmniInputRecvHandle(
                         request_id=request.request_id,
                         external_req_id=getattr(request, "external_req_id", None),
                     )
@@ -182,7 +182,7 @@ class OmniSchedulingCoordinator:
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
                     self.pending_input_registrations.append(
-                        OmniChunkRecvHandle(
+                        OmniInputRecvHandle(
                             request_id=request.request_id,
                             external_req_id=getattr(request, "external_req_id", None),
                         )

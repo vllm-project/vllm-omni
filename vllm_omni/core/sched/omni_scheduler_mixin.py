@@ -11,7 +11,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -22,13 +27,14 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import (
-    OmniChunkRecvHandle,
+    OmniInputRecvHandle,
     OmniNewRequestData,
     OmniSchedulerOutput,
 )
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.engine import OmniEngineCoreOutput
 
 logger = init_logger(__name__)
 
@@ -132,6 +138,28 @@ class OmniSchedulerMixin:
             connector_output.stage_recv_req_ids if connector_output else set(),
         )
 
+    def _before_omni_schedule(self, model_mode: str) -> None:
+        """Apply connector readiness and park requests awaiting stage input."""
+        self._consume_pending_connector_output(model_mode)
+        self._process_pending_input_timeouts()
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting,
+                self.running,
+                scheduler_requests=self.requests,
+            )
+
+    def _restore_omni_wait_queues(self) -> None:
+        """Restore requests temporarily parked by Omni input gates."""
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.restore_queues(
+                self.waiting,
+                self.running,
+                scheduler_requests=self.requests,
+            )
+        if self.input_coordinator:
+            self.input_coordinator.restore_queues(self.waiting)
+
     def _process_pending_input_timeouts(self) -> None:
         """Force-fail requests waiting on the full-payload coordinator too long.
 
@@ -193,7 +221,7 @@ class OmniSchedulerMixin:
         base: SchedulerOutput,
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
-        pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        pending_input_registrations: list[OmniInputRecvHandle] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -219,6 +247,121 @@ class OmniSchedulerMixin:
             else OmniNewRequestData.from_base(data, self.requests.get(data.req_id))
             for data in scheduler_output.scheduled_new_reqs
         ]
+
+    def _postprocess_omni_schedule_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        include_cached_payloads: bool = False,
+    ) -> None:
+        """Enrich new requests and apply async-chunk output bookkeeping."""
+        self._rewrap_scheduled_new_reqs(scheduler_output)
+        if not self.chunk_transfer_adapter:
+            return
+        if include_cached_payloads:
+            self.chunk_transfer_adapter.postprocess_scheduler_output(
+                scheduler_output,
+                self.requests,
+            )
+        else:
+            self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
+
+    def _make_omni_engine_output(
+        self,
+        request: Request,
+        *,
+        new_token_ids: list[int],
+        finish_reason: Any = None,
+        new_logprobs: Any = None,
+        new_prompt_logprobs_tensors: Any = None,
+        pooling_output: Any = None,
+        multimodal_output: Any = None,
+        stop_reason: Any = None,
+        prefill_stats: Any = None,
+        kv_transfer_params: Any = None,
+        routed_experts: Any = None,
+        num_nans_in_logits: int = 0,
+        is_segment_finished: bool | None = False,
+        new_prompt_len_snapshot: int | None = None,
+    ) -> OmniEngineCoreOutput:
+        """Build the common request-output envelope used by LLM schedulers."""
+        return OmniEngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=new_token_ids,
+            finish_reason=finish_reason,
+            new_logprobs=new_logprobs,
+            new_prompt_logprobs_tensors=new_prompt_logprobs_tensors,
+            pooling_output=pooling_output,
+            multimodal_output=multimodal_output,
+            stop_reason=stop_reason,
+            events=request.take_events(),
+            prefill_stats=prefill_stats,
+            kv_transfer_params=kv_transfer_params,
+            trace_headers=request.trace_headers,
+            routed_experts=routed_experts,
+            num_nans_in_logits=num_nans_in_logits,
+            is_segment_finished=is_segment_finished,
+            new_prompt_len_snapshot=new_prompt_len_snapshot,
+        )
+
+    def _append_request_output(
+        self,
+        outputs: dict[int, list[EngineCoreOutput]],
+        request: Request,
+        **output_fields: Any,
+    ) -> None:
+        outputs[request.client_index].append(
+            OmniSchedulerMixin._make_omni_engine_output(
+                self,
+                request,
+                **output_fields,
+            )
+        )
+
+    def _handle_failed_kv_load_outputs(
+        self,
+        failed_request_ids: set[str] | None,
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> list[Request]:
+        """Finish unrecoverable KV loads and emit their terminal outputs."""
+        if not failed_request_ids or self.recompute_kv_load_failures:
+            return []
+        requests = [self.requests[req_id] for req_id in failed_request_ids]
+        self.finish_requests(failed_request_ids, RequestStatus.FINISHED_ERROR)
+        for request in requests:
+            OmniSchedulerMixin._append_request_output(
+                self,
+                outputs,
+                request,
+                new_token_ids=[],
+                finish_reason=request.get_finished_reason(),
+            )
+        return requests
+
+    def _attach_finished_request_sets(
+        self,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+        *,
+        synthesize_abort_outputs: bool,
+    ) -> None:
+        """Attach finished IDs while keeping AR's synthetic-abort policy explicit."""
+        finished_req_ids = self.finished_req_ids_dict
+        if not finished_req_ids:
+            return
+        for client_index, finished_set in finished_req_ids.items():
+            output = engine_core_outputs.get(client_index)
+            if output is None:
+                output = EngineCoreOutputs()
+                engine_core_outputs[client_index] = output
+            if synthesize_abort_outputs:
+                emitted = {item.request_id for item in output.outputs}
+                output.outputs.extend(
+                    EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT)
+                    for req_id in finished_set
+                    if req_id not in emitted
+                )
+            output.finished_requests = finished_set
+        finished_req_ids.clear()
 
     def _remove_stopped_requests_from_queues(
         self,
