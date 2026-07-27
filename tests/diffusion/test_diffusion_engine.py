@@ -14,6 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
@@ -29,6 +30,8 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @dataclass
@@ -582,9 +585,7 @@ def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
     assert moved is value
 
 
-@pytest.mark.diffusion
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
     tensor = torch.arange(8, dtype=torch.float32, device="cuda")
     other = torch.arange(4, dtype=torch.int64, device="cuda")
@@ -610,6 +611,7 @@ async def _consume_final_output(generator):
     return final_output
 
 
+@pytest.mark.cpu
 @pytest.mark.asyncio
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
@@ -625,9 +627,14 @@ async def test_async_add_req_and_stream_response():
     engine._loop_started = False
     engine.main_loop = None
     engine.supports_request_batch = False
+    engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
-    engine._finalize_finished_request = lambda rid, out, err: out.result
+    def _finalize(rid, out, err=None):
+        # Stream consumers stop on ``finished``; keep result_data for assertions.
+        return SimpleNamespace(result_data=out.result.result_data, finished=True)
+
+    engine._finalize_finished_request = _finalize
 
     def mock_execute_batch(sched_output):
         request_ids = sched_output.scheduled_request_ids

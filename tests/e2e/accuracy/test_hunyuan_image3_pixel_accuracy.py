@@ -15,6 +15,7 @@ from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
@@ -33,8 +34,8 @@ P99_THRESHOLD = 3e-1
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
+BASELINE_PATH = get_asset_path("hunyuan/hunyuan_baseline.png")
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-BASELINE_PATH = _REPO_ROOT / "tests" / "assets" / "hunyuan" / "hunyuan_baseline.png"
 _OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).

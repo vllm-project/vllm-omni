@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
 from transformers import PreTrainedModel
 
 from vllm_omni.model_executor.models.dynin_omni.dynin_omni_token2audio import (
     _ensure_transformers_tied_weights_compat,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_transformers_tied_weights_compat(monkeypatch):

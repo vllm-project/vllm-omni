@@ -31,6 +31,8 @@ from vllm_omni.diffusion.data import (
     parse_attention_config,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 class TestAttentionSpec:
     def test_construct_no_extra(self):
@@ -282,6 +284,13 @@ class TestBuildAttentionConfig:
 
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_diffusion_attention_backend_env(self, monkeypatch):
+        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
+        # build_attention_config(); clear it so these tests assert config defaults,
+        # not whatever the process inherited from CI / sibling tests.
+        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")

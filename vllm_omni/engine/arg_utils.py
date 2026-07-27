@@ -393,7 +393,7 @@ class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
 # Fields in ``SHARED_FIELDS`` (e.g. ``model``, ``log_stats``) flow to BOTH
 # orchestrator and engine by design.
 #
-# Invariants enforced by ``tests/test_arg_utils.py``:
+# Invariants enforced by ``tests/engine/test_arg_utils_shared_fields.py``:
 #
 #   1. ``OrchestratorArgs`` ∩ ``OmniEngineArgs`` ⊆ ``SHARED_FIELDS``
 #   2. Every CLI flag is classifiable into one of the three buckets
