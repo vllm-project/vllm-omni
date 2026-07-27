@@ -40,6 +40,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
@@ -577,6 +578,8 @@ class Orchestrator:
                 self.duplex_control_plane.dispatch(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
+            elif msg_type == "interaction":
+                await self._handle_interaction(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
@@ -767,6 +770,44 @@ class Orchestrator:
             abort=True,
         )
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    async def _handle_interaction(self, msg: InteractionMessage) -> None:
+        """Handle a midway interaction for an active streaming diffusion request."""
+        stage_id = 0
+        request_id = msg.request_id
+        event_id = msg.interaction.get("event_id")
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"No active request for interaction: {request_id}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
+            return
+
+        try:
+            await self.stage_pools[stage_id].submit_interaction(request_id, msg.interaction)
+        except Exception as exc:
+            logger.info(
+                "[Orchestrator] Failed interaction for req %s: %s",
+                request_id,
+                exc,
+                exc_info=True,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"Failed interaction for request {request_id}: {exc}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
 
     async def _abort_request_ids(self, request_ids: list[str]) -> None:
         """Forward abort requests to all stage pools."""

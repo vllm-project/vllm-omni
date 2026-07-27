@@ -55,6 +55,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -71,7 +72,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
@@ -1702,6 +1703,30 @@ class AsyncOmniEngine:
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
         self.abort(request_ids)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Send an interaction control message to the Orchestrator."""
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+
+        self.request_queue.sync_q.put_nowait(
+            InteractionMessage(
+                request_id=request_id,
+                interaction=interaction,
+            )
+        )
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Async interaction API."""
+        self.submit_interaction(request_id, interaction)
 
     def collective_rpc(
         self,
