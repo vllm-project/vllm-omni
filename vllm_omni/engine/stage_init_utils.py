@@ -713,7 +713,7 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
+    if stage_connector_spec:
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
@@ -1054,19 +1054,17 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
+    """Return the first connector spec for a stage data-plane edge."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
-
-    if not async_chunk:
-        return {}
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
 
-    # A stage can be an async producer without consuming chunks itself. Keep
-    # its connector for save_async(), but mark it sender-only so the scheduler
-    # does not park normal orchestrator-provided inputs waiting for a chunk.
+    # A producer does not consume connector data itself. Keep its connector
+    # for both async-chunk and terminal full-payload sends, but mark it
+    # sender-only so the scheduler does not park orchestrator-provided inputs
+    # waiting for an upstream payload.
     target_stage = str(stage_id)
     for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:
