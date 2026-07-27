@@ -75,6 +75,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 # stage output, these are copied onto the OmniRequestOutput itself so that
 # the object IS the RequestOutput instead of holding one.
 _REQUEST_OUTPUT_CONTENT_ATTRS = (
+    "request_id",
     "prompt",
     "prompt_token_ids",
     "prompt_logprobs",
@@ -99,10 +100,6 @@ _OMNI_CONTENT_ATTRS = (
     "_multimodal_output",
     "_custom_output",
 )
-
-# Dynamic attributes that must not be copied verbatim onto the wrapper:
-# they collide with properties defined on OmniRequestOutput.
-_COPY_SKIP_ATTRS = frozenset({"request_output", "multimodal_output", "custom_output"})
 
 
 @dataclass
@@ -176,43 +173,53 @@ class OmniRequestOutput(RequestOutput):
     error_status_code: int | None = None
     error_type: str | None = None
 
-    def _copy_content_from(self, source: Any) -> None:
+    def _copy_content_from(self, source: RequestOutput) -> None:
         """Copy generation content from a stage output into this object.
 
-        ``source`` may be a vLLM ``RequestOutput``, another
-        ``OmniRequestOutput``, or a duck-typed stand-in (tests use mocks and
-        SimpleNamespace). Attribute presence is checked against the source's
-        instance ``__dict__`` so that auto-created Mock attributes are not
-        copied. Control fields set by the wrapper (stage_id,
-        final_output_type, metrics, stage_durations, ...) are intentionally
-        not copied.
+        *source* should be a vLLM ``RequestOutput`` or a subclass such as
+        ``OmniRequestOutput``.  Control fields (``stage_id``,
+        ``final_output_type``, ``stage_durations``, ``peak_memory_mb``,
+        ``error``, ...) are intentionally not copied.
         """
-        source_vars = getattr(source, "__dict__", None)
+        # RequestOutput attributes — guaranteed on any RequestOutput.
+        for name in _REQUEST_OUTPUT_CONTENT_ATTRS:
+            setattr(self, name, getattr(source, name))
 
-        def _has(name: str) -> bool:
-            if source_vars is not None:
-                return name in source_vars
-            return hasattr(source, name)
-
-        for name in _REQUEST_OUTPUT_CONTENT_ATTRS + _OMNI_CONTENT_ATTRS:
-            if _has(name):
+        # Omni-specific fields — only present when the source is itself an
+        # OmniRequestOutput (e.g. a diffusion stage inside a pipeline).
+        if isinstance(source, OmniRequestOutput):
+            for name in _OMNI_CONTENT_ATTRS:
                 setattr(self, name, getattr(source, name))
-        if not self.request_id:
-            self.request_id = getattr(source, "request_id", "") or ""
-        # Dynamic attribute that vLLM code attaches to RequestOutput; it is a
-        # read-only property on this class, so store it in _multimodal_output.
-        if not isinstance(source, OmniRequestOutput) and _has("multimodal_output"):
-            mm = source.multimodal_output
-            if mm is not None:
-                self._multimodal_output = mm
-        # Preserve remaining dynamic attributes (e.g. dynamically annotated
-        # stage outputs) so they stay reachable through `request_output`.
-        if source_vars:
-            known = type(self).__dataclass_fields__.keys()
-            for name, value in source_vars.items():
-                if name.startswith("_") or name in known or name in _COPY_SKIP_ATTRS:
-                    continue
-                setattr(self, name, value)
+
+    @classmethod
+    def from_stage_output(
+        cls, source: RequestOutput, **kwargs: Any
+    ) -> "OmniRequestOutput":
+        """Create an OmniRequestOutput from a stage's raw output.
+
+        Copies generation content (``outputs``, ``prompt``, ``prompt_token_ids``,
+        ``finished``, ``images``, ``latents``, etc.) from *source* onto the
+        returned object.  *source* may be a vLLM ``RequestOutput``, another
+        ``OmniRequestOutput`` (which inherits from ``RequestOutput``).
+
+        This is the **preferred** way to construct an ``OmniRequestOutput``
+        that wraps a stage result.
+
+        Args:
+            source: The stage output whose content is copied onto the new object.
+            **kwargs: Passed through to the dataclass constructor (``request_id``,
+                ``stage_id``, ``final_output_type``, ``metrics``,
+                ``stage_durations``, ``peak_memory_mb``, ``finished``, etc.).
+                Typed as ``Any`` because the exact set of valid keys is the
+                dataclass field list, which is validated by ``cls(**kwargs)``
+                at call time.
+
+        Returns:
+            A new ``OmniRequestOutput`` with the stage's content flattened onto it.
+        """
+        obj = cls(**kwargs)
+        obj._copy_content_from(source)
+        return obj
 
     @classmethod
     def from_error(
@@ -335,44 +342,6 @@ class OmniRequestOutput(RequestOutput):
         """Check if this is a pipeline stage output."""
         return self.stage_id is not None
 
-    def unwrap(self) -> "OmniRequestOutput":
-        """Return the output itself.
-
-        Kept for backward compatibility: outputs used to nest a stage's
-        OmniRequestOutput inside ``request_output``; content is now flattened
-        onto the object itself, so there is nothing to unwrap.
-        """
-        return self
-
-    @staticmethod
-    def unwrap_result(result: Any) -> "OmniRequestOutput":
-        """Extract the final OmniRequestOutput from omni.generate() results.
-
-        Handles:
-        1. Extracting from list if needed
-        2. Type validation
-
-        Args:
-            result: The result from omni.generate() - may be a list or OmniRequestOutput
-
-        Returns:
-            The OmniRequestOutput with actual content
-
-        Raises:
-            ValueError: If result is not an OmniRequestOutput or list containing one
-        """
-        # Handle list wrapper
-        if isinstance(result, list):
-            if not result:
-                raise ValueError("Result list is empty")
-            result = result[0]
-
-        # Validate type
-        if not isinstance(result, OmniRequestOutput):
-            raise ValueError(f"Expected OmniRequestOutput, got {type(result)}")
-
-        return result.unwrap()
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         result = {
@@ -425,43 +394,3 @@ class OmniRequestOutput(RequestOutput):
         return f"OmniRequestOutput({', '.join(parts)})"
 
 
-def _request_output_get(self: OmniRequestOutput) -> RequestOutput | None:
-    """Backward-compat view of the wrapped stage output.
-
-    The omni output now IS the RequestOutput, so pipeline/LLM outputs return
-    ``self``; pure diffusion or error outputs return None (matching the old
-    composition semantics where ``request_output`` was unset for them).
-    """
-    if self.stage_id is not None or self.outputs:
-        return self
-    return None
-
-
-def _request_output_set(self: OmniRequestOutput, value: Any) -> None:
-    if value is not None:
-        self._copy_content_from(value)
-
-
-# `request_output` is attached after class creation, NOT declared as a field
-# or InitVar: msgspec serializes dataclasses natively via __dataclass_fields__
-# (which includes InitVar pseudo-fields), so a request_output entry would be
-# read through the property during encoding — returning `self` and recursing
-# forever. As a plain property it is invisible to both dataclasses and
-# msgspec.
-OmniRequestOutput.request_output = property(  # type: ignore[assignment]
-    _request_output_get, _request_output_set
-)
-
-# Keep `request_output=` working as a constructor keyword for
-# backward compatibility: the wrapped stage output's content is copied onto
-# the new object (see _copy_content_from).
-_dataclass_init = OmniRequestOutput.__init__
-
-
-def _omni_request_output_init(self: OmniRequestOutput, *args: Any, request_output: Any = None, **kwargs: Any) -> None:
-    _dataclass_init(self, *args, **kwargs)
-    if request_output is not None:
-        self._copy_content_from(request_output)
-
-
-OmniRequestOutput.__init__ = _omni_request_output_init  # type: ignore[method-assign]

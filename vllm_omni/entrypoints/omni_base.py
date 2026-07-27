@@ -609,13 +609,13 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         # Generation content (outputs, prompt, images, trajectory_*, ...) is
         # copied from engine_outputs onto the returned object by
-        # OmniRequestOutput.__post_init__.
-        return OmniRequestOutput(
+        # OmniRequestOutput.from_stage_output().
+        return OmniRequestOutput.from_stage_output(
+            engine_outputs,
             request_id=req_id or "",
             finished=finished,
             stage_id=stage_id,
             final_output_type=output_type,
-            request_output=engine_outputs,
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,

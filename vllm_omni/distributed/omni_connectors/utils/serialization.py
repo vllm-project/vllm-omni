@@ -262,7 +262,7 @@ class OmniMsgpackDecoder:
 
         data = dict(obj)
         # Legacy wire format (pre-inheritance): the stage output was nested
-        # under "request_output". Merge its content via the compat setter.
+        # under "request_output". Merge its content into the new object.
         legacy_inner = data.pop("request_output", None)
         field_names = {f.name for f in fields(OmniRequestOutput)}
         known = {k: v for k, v in data.items() if k in field_names}
@@ -273,7 +273,7 @@ class OmniMsgpackDecoder:
             # _is_omni_request_output is correct.
             return obj
         if legacy_inner is not None and not isinstance(legacy_inner, dict):
-            out.request_output = legacy_inner
+            out._copy_content_from(legacy_inner)
         return out
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:

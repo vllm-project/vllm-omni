@@ -125,7 +125,7 @@ def _extract_images(output: OmniRequestOutput) -> list:
         return output.images
     # When the output comes from the orchestrator pipeline, images may be
     # nested inside request_output.
-    inner = getattr(output, "request_output", None)
+    inner = output
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images
     return []

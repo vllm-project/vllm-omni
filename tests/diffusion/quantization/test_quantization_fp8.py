@@ -88,8 +88,8 @@ def _generate_single_stage_image(
         if hasattr(first_output, "images") and first_output.images:
             images = first_output.images
         else:
-            assert hasattr(first_output, "request_output") and first_output.request_output
-            request_output = first_output.request_output
+            assert isinstance(first_output, OmniRequestOutput) and first_output
+            request_output = first_output
             if isinstance(request_output, list):
                 req_out = request_output[0]
             else:
@@ -147,10 +147,10 @@ def _generate_single_stage_video(
 
         first = outputs[0]
 
-        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput.request_output).
+        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput).
         frames: Any = None
-        if hasattr(first, "request_output") and isinstance(first.request_output, list):
-            inner = first.request_output[0]
+        if isinstance(first, OmniRequestOutput) and isinstance(first, list):
+            inner = first[0]
             if isinstance(inner, OmniRequestOutput) and inner.images:
                 frames = inner.images[0]
         if frames is None and hasattr(first, "images") and first.images:
@@ -234,8 +234,8 @@ def _generate_bagel_image(
             if images := getattr(req_output, "images", None):
                 generated_image = images[0]
                 break
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:
@@ -250,8 +250,8 @@ def _generate_bagel_image(
 
         # Check LLM stage output — should have finish_reason=stop (not length)
         for req_output in omni_outputs:
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:

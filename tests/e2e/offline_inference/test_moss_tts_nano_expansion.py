@@ -108,7 +108,7 @@ def _build_request(
 def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     """Run a single request and return (waveform, sample_rate)."""
     for stage_outputs in omni.generate(request, DEFAULT_SAMPLING):
-        req_output = stage_outputs.request_output
+        req_output = stage_outputs
         if req_output is not None:
             mm = req_output.outputs[0].multimodal_output
             assert mm is not None, "Expected multimodal_output to be non-None"
@@ -167,7 +167,7 @@ def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     results = []
     # Single-stage model (num_stages=1): one sampling param for all requests.
     for stage_outputs in omni_runner.omni.generate(requests, [DEFAULT_SAMPLING]):
-        req_output = stage_outputs.request_output
+        req_output = stage_outputs
         if req_output is not None:
             mm = req_output.outputs[0].multimodal_output
             assert mm is not None

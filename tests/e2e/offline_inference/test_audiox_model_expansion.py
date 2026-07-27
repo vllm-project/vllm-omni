@@ -53,9 +53,9 @@ def test_audiox_model(omni_runner: OmniRunner) -> None:
     assert outputs is not None
     first_output = outputs[0]
     assert first_output.final_output_type == "audio"
-    assert hasattr(first_output, "request_output") and first_output.request_output
+    assert isinstance(first_output, OmniRequestOutput) and first_output
 
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output

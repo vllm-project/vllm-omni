@@ -310,7 +310,7 @@ def _generate_image(omni, config: QualityTestConfig):
     first = outputs[0]
     if hasattr(first, "images") and first.images:
         return first.images[0], peak_mem
-    inner = first.request_output
+    inner = first
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images[0], peak_mem
     raise ValueError("Could not extract image from output.")
@@ -342,8 +342,8 @@ def _generate_video(omni, config: QualityTestConfig):
 
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        inner = first.request_output[0]
+    if isinstance(first, OmniRequestOutput) and isinstance(first, list):
+        inner = first[0]
         if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
             frames = inner.images[0] if inner.images else None
         else:
@@ -442,11 +442,11 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
     image = Image.new("RGB", (2, 2))
     inner = OmniRequestOutput.from_diffusion(request_id="req", images=[image])
-    outer = OmniRequestOutput(
+    outer = OmniRequestOutput.from_stage_output(
+        inner,
         request_id="req",
         stage_id=0,
         final_output_type="image",
-        request_output=inner,
         finished=True,
     )
 

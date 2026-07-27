@@ -128,8 +128,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     if model_name == "stabilityai/stable-audio-open-1.0":
-        audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
-        audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
+        audio_offload = output_offload[0]. multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0]. multimodal_output.get("audio")
         # Match the sibling cpu-offload test's tolerance: layerwise offload moves
         # blocks across the PCIe bus on a side stream, which can perturb cuBLAS
         # algorithm selection and produce ~ULP-level drift larger than 1e-3.

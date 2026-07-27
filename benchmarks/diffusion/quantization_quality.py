@@ -207,8 +207,8 @@ def _generate_video(omni, args, prompt, seed):
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        inner = first.request_output[0]
+    if isinstance(first, OmniRequestOutput) and isinstance(first, list):
+        inner = first[0]
         if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
             frames = inner.images[0] if inner.images else None
         else:

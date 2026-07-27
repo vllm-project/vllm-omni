@@ -104,7 +104,7 @@ def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, 
         )
         end = time.perf_counter()
         first_output = outputs[0]
-        req_out = first_output.request_output
+        req_out = first_output
         frames = req_out.images[0]
         if isinstance(frames, torch.Tensor):
             frames = frames.detach().cpu().numpy()

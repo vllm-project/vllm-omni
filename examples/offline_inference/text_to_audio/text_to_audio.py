@@ -388,9 +388,9 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     output = outputs[0]
-    if not hasattr(output, "request_output") or not output.request_output:
+    if not isinstance(output, OmniRequestOutput) or not output:
         raise ValueError("No request_output found in OmniRequestOutput")
-    request_output = output.request_output
+    request_output = output
     if not hasattr(request_output, "multimodal_output"):
         raise ValueError("No multimodal_output found in request_output")
 
