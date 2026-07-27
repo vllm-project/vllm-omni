@@ -297,13 +297,9 @@ def test_joy_hsdp_is_explicitly_unsupported():
 
 def test_joy_tensor_parallelism_is_explicitly_unsupported():
     with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
-        _raise_if_unsupported_tensor_parallel(
-            SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2))
-        )
+        _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2)))
 
-    _raise_if_unsupported_tensor_parallel(
-        SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
-    )
+    _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1)))
     _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace()))
     _raise_if_unsupported_tensor_parallel(SimpleNamespace())
     _raise_if_unsupported_tensor_parallel(None)
@@ -326,9 +322,7 @@ def test_transformer_rejects_tensor_parallelism_before_building_layers():
 def test_pipeline_rejects_tensor_parallelism_before_loading_components():
     with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
         JoyImageEditPipeline(
-            od_config=SimpleNamespace(
-                parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=2)
-            )
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=2))
         )
 
 
@@ -1216,8 +1210,8 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     pipeline._prepare_latents = fake_prepare_latents
     pipeline.diffuse = diffuse
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
-    pipeline.check_cfg_parallel_validity = (
-        lambda scale, has_neg_prompt: cfg_checks.append((scale, has_neg_prompt)) or True
+    pipeline.check_cfg_parallel_validity = lambda scale, has_neg_prompt: (
+        cfg_checks.append((scale, has_neg_prompt)) or True
     )
 
     request = _make_request(
