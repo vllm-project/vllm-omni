@@ -189,6 +189,7 @@ class SimpleQFormerImageRefiner(nn.Module):
     def __init__(
         self,
         hidden_size: int,
+        output_hidden_size: int | None = None,
         num_queries: int = 128,
         num_layers: int = 2,
         num_heads: int | None = None,
@@ -196,6 +197,8 @@ class SimpleQFormerImageRefiner(nn.Module):
         norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
+        input_hidden_size = hidden_size
+        hidden_size = output_hidden_size or hidden_size
         self.hidden_size = hidden_size
         self.num_queries = num_queries
         # ensure num_heads divides hidden_size
@@ -203,8 +206,8 @@ class SimpleQFormerImageRefiner(nn.Module):
             num_heads = max(1, hidden_size // 128)
         self.num_heads = self._choose_valid_num_heads(hidden_size, num_heads)
         self.input_proj = nn.Sequential(
-            Qwen2RMSNorm(hidden_size, eps=norm_eps),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            Qwen2RMSNorm(input_hidden_size, eps=norm_eps),
+            nn.Linear(input_hidden_size, hidden_size, bias=True),
         )
 
         # Learnable query embeddings
@@ -662,11 +665,32 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         batch_size: int,
         height: int,
         width: int,
+        ar_image_hidden_states: torch.Tensor | None = None,
+        ar_image_attention_mask: torch.Tensor | None = None,
     ):
         device = hidden_states.device
         p = self.config.patch_size
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states.dtype)
+        image_embedder = getattr(self.time_caption_embed, "image_embedder", None)
+        if image_embedder is not None and ar_image_hidden_states is not None:
+            if ar_image_attention_mask is None:
+                ar_image_attention_mask = torch.ones(
+                    ar_image_hidden_states.shape[:2],
+                    dtype=torch.bool,
+                    device=ar_image_hidden_states.device,
+                )
+            image_hidden_states = image_embedder(
+                ar_image_hidden_states,
+                ~ar_image_attention_mask.bool(),
+            )
+            image_attention_mask = torch.ones(
+                image_hidden_states.shape[:2],
+                dtype=torch.bool,
+                device=image_hidden_states.device,
+            )
+            text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
+            text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
         img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
         img_tokens = self.x_embedder(img_tokens)
@@ -699,6 +723,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return (
             temb,
             text_hidden_states,
+            text_attention_mask,
             img_tokens,
             img_mask,
             img_len,
@@ -740,6 +765,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+        ar_image_hidden_states: torch.Tensor | None = None,
+        ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor:
         batch_size, height, width = self._validate_inputs(
@@ -749,6 +776,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         (
             temb,
             text_hidden_states,
+            text_attention_mask,
             img_tokens,
             img_mask,
             img_len,
@@ -766,6 +794,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             batch_size,
             height,
             width,
+            ar_image_hidden_states,
+            ar_image_attention_mask,
         )
 
         text_hidden_states, img_tokens = self._apply_refiners(

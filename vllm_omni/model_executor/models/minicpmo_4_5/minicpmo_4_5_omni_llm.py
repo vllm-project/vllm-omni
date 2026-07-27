@@ -4170,6 +4170,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         device = pixel_values[0].device
         dtype = pixel_values[0].dtype
 
+        # VPM batching bounds encoder activations below, while this padding
+        # buffer intentionally remains sized for the full input batch.
         all_pixel_values = torch.zeros((B, 3, P, L), dtype=dtype, device=device)
         for i, pixel_values_item in enumerate(pixel_values):
             L_item = pixel_values_item.shape[-1]
@@ -4183,16 +4185,29 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         for i, num_patches_item in enumerate(num_patches):
             patch_attn_mask[i, :num_patches_item] = True
 
-        vision_embedding = self.vpm(
-            all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
-            tgt_sizes=tgt_sizes,
-        )
+        patch_attn_mask = patch_attn_mask.unsqueeze(1)
 
-        if not isinstance(vision_embedding, torch.Tensor):
-            vision_embedding = vision_embedding.last_hidden_state
+        def encode_vision(start: int, end: int) -> torch.Tensor:
+            chunk_tgt_sizes = tgt_sizes[start:end]
+            vision_embedding = self.vpm(
+                all_pixel_values[start:end],
+                patch_attention_mask=patch_attn_mask[start:end],
+                tgt_sizes=chunk_tgt_sizes,
+            )
 
-        return self.resampler(vision_embedding, tgt_sizes)
+            if not isinstance(vision_embedding, torch.Tensor):
+                vision_embedding = vision_embedding.last_hidden_state
+
+            return vision_embedding
+
+        vision_batch_size = max(1, int(self.config.vision_batch_size))
+        if B <= vision_batch_size:
+            return self.resampler(encode_vision(0, B), tgt_sizes)
+
+        vision_embeddings = [
+            encode_vision(start, min(start + vision_batch_size, B)) for start in range(0, B, vision_batch_size)
+        ]
+        return self.resampler(torch.cat(vision_embeddings, dim=0), tgt_sizes)
 
     def _process_vision_input(
         self,
@@ -4309,9 +4324,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
-        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask, output_hidden_states=True).hidden_states[
-            self.audio_encoder_layer
-        ]
+        selects_final_layer = self.audio_encoder_layer == -1
+        audio_outputs = self.apm(
+            wavforms,
+            attention_mask=audio_attention_mask,
+            output_hidden_states=not selects_final_layer,
+        )
+        if selects_final_layer:
+            audio_states = audio_outputs.last_hidden_state
+        else:
+            # Whisper follows the Hugging Face hidden-state ordering: the
+            # embedding output, followed by each encoder layer output.
+            assert audio_outputs.hidden_states is not None
+            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
         audio_embeds = self.audio_projection_layer(audio_states)
 
         audio_embeds = audio_embeds.transpose(1, 2)

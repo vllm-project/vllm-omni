@@ -1,13 +1,12 @@
-# MammothModa2-Preview
+# MammothModa2
 
-> MammothModa2-Preview generation and understanding through shared offline examples
+> MammothModa2-Preview and MammothModa2-Dev unified understanding and generation
 
 ## Summary
 
 - Vendor: ByteDance Research
-- Model: `bytedance-research/MammothModa2-Preview`
-- Task: Text-to-image generation (AR → DiT two-stage pipeline), plus
-  image-to-text understanding (AR stage)
+- Models: `bytedance-research/MammothModa2-Preview`, `bytedance-research/MammothModa2-Dev`
+- Tasks: Preview and Dev text-to-image (AR → DiT); Dev text/image understanding
 - Mode: Offline inference
 - Maintainer: Community
 
@@ -29,7 +28,9 @@ flags. Image size uses the standard `--height` / `--width` flags.
 
 - Upstream model:
   [`bytedance-research/MammothModa2-Preview`](https://huggingface.co/bytedance-research/MammothModa2-Preview)
-- Related text-to-image example:
+- Dev model:
+  [`bytedance-research/MammothModa2-Dev`](https://huggingface.co/bytedance-research/MammothModa2-Dev)
+- Related offline example:
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 - Related T2T/I2T example:
   [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
@@ -131,46 +132,43 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
-### Image-to-Text (I2T, simplest)
+## MammothModa2-Dev unified inference
 
-For the simplest offline image-understanding run, use a short inline Python
-snippet from the repository root:
+MammothModa2-Dev uses a Qwen3-VL AR backbone, while MammothModa2-Preview uses
+Qwen2.5-VL. vLLM-Omni selects the matching implementation from the nested
+`llm_config.model_type`; no checkpoint edits or `trust_remote_code` flag are
+required.
 
-```python
-from PIL import Image
-from vllm import SamplingParams
-from vllm.multimodal.image import convert_image_mode
-from vllm_omni import Omni
+Text-to-text and image-to-text use the AR-only deploy. Text-to-image loads the
+Qwen3 generation experts (`gen_mlp`), extra visual vocabulary and image head,
+then sends the generated visual tokens and hidden states to the DiT stage.
 
-def main():
-    prompt = (
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-        "Summarize this image.<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
+Download the checkpoint:
 
-    omni = Omni(
-        model="./MammothModa2-Preview",
-        deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
-    )
-    try:
-        outputs = list(
-            omni.generate(
-                [{
-                    "prompt": prompt,
-                    "multi_modal_data": {"image": convert_image_mode(Image.open("./image.png"), "RGB")},
-                    "additional_information": {"omni_task": ["chat"]},
-                }],
-                [SamplingParams(temperature=0.2, top_p=0.9, top_k=-1, max_tokens=512, seed=42)],
-            )
-        )
-    finally:
-        omni.close()
-
-    ro = getattr(outputs[-1], "request_output", outputs[-1])
-    print(ro.outputs[0].text.strip())
-
-if __name__ == "__main__":
-    main()
+```bash
+hf download bytedance-research/MammothModa2-Dev --local-dir ./MammothModa2-Dev
 ```
+
+Run text-to-text through the shared understanding example. It recognizes the
+Dev checkpoint as MammothModa2 and automatically selects
+`mammoth_moda2_ar.yaml`:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Dev \
+  --prompt "Explain multimodal generation in three sentences."
+```
+
+Add an image for image-to-text or image summarization:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ./MammothModa2-Dev \
+  --image ./image.png \
+  --prompt "Please summarize the content of this image."
+```
+
+The Dev checkpoint is approximately 47.55 GiB on disk. In the verified AR-only
+run, loaded model weights used approximately 16.97 GiB of GPU memory before KV
+and encoder caches. Allow additional GPU memory for those caches and the input
+image.

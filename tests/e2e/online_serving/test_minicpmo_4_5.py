@@ -29,6 +29,7 @@ test_params = [
             use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
+                "--no-async-chunk",
             ],
         ),
         id="default",

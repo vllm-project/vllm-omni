@@ -23,10 +23,11 @@ including `librosa`.
 
 The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
-logical device 0 with memory budgets of 65%, 15%, and 15%. For throughput,
-`minicpmo_4_5_batching.yaml` gives the Thinker GPU 0 (90%) and colocates the
-Talker (55%) and Code2Wav (35%) on GPU 1. Each stage admits at most four
-concurrent sequences.
+logical device 0 with memory budgets of 55%, 22%, and 22%. The profile admits
+at most four sequences per stage and bounds startup video profiling to 32
+frames per video. For throughput,`minicpmo_4_5_batching.yaml` gives the Thinker
+GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
+profile admits at most four concurrent sequences per stage.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
@@ -60,7 +61,7 @@ checkpoint path. To start the experimental native duplex backend, use
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code --port 8099 \
-    --stage-overrides '{"0": {"gpu_memory_utilization": 0.65}}'
+    --stage-overrides '{"0": {"gpu_memory_utilization": 0.55}}'
 ```
 
 ## Send multimodal requests

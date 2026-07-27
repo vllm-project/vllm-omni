@@ -22,17 +22,6 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 
-# In full_payload (async_chunk=false) mode the talker emits one per-step delta
-# codec frame per request (a 2-D ``[1, 1]`` tensor, mirroring the async path).
-# The connector full-payload accumulator concatenates these 2-D frames along
-# dim-0 into the complete ``codes.audio`` sequence -- exactly like qwen3_tts --
-# so ``tts2code2wav`` (the sync payload builder) receives the full audio codes
-# at flush time.  We therefore use the default CONCAT semantics (no REPLACE
-# keys).  The async path is unaffected: ``should_accumulate_full_payload_output``
-# returns False when async_chunk=True, so the accumulator is never consulted
-# there and the bridge accumulates deltas via its own ``pending`` buffer.
-_FULL_PAYLOAD_REPLACE_KEYS = frozenset()
-
 
 class _MiniCPMO45MetaStruct(MetaStruct):
     """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
@@ -178,7 +167,7 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
         if routed_id is not None and str(routed_id) != request_id:
             return []
         codes = pooling_output.get("codes")
-        audio = codes.get("audio") if isinstance(codes, Mapping) else None
+        audio = codes.get("audio") if isinstance(codes, Mapping) else pooling_output.get("codes.audio")
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(
         pooling_output,
@@ -270,9 +259,9 @@ def tts2code2wav_async_chunk(
             duplex_info = {}
         state = {
             "internal_id": internal_id,
+            "pending": [],
             "left_context": [],
             "codec_end": 0,
-            "pending": [],
             "ref_audio": codes_info.get("ref"),
             "ref_audio_sr": meta_info.get("ref_audio_sr"),
             "segment_text": meta_info.get("native_duplex_segment_text"),
@@ -352,140 +341,35 @@ def tts2code2wav_async_chunk(
     )
 
 
-def tts2code2wav(
+def tts2code2wav_full_payload(
     transfer_manager: Any,
-    multimodal_output: Any = None,
-    request: Any = None,
-    is_finished: bool = False,
-    pooling_output: Any = None,
-) -> "OmniPayloadStruct | None":
-    """Talker TTS -> Code2Wav connector builder (async_chunk=false path).
-
-    On the NPU runner the stage-1 -> stage-2 hand-off goes through
-    ``ChunkTransferAdapter.save_async`` -> ``_send_single_request``, which
-    invokes this hook **per decode step** with ``multimodal_output=`` (the
-    un-flattened per-step talker output).  The hook therefore behaves exactly
-    like :func:`tts2code2wav_async_chunk`: it buffers the per-step codec deltas
-    in a per-request ``pending`` window, emits fixed-size codec frames (with the
-    silence left-context prepended on the first frame), and marks the final
-    frame with ``last_chunk`` / ``finished`` once the request is done.
-
-    The ``pooling_output=`` keyword is also accepted so the GPU full-payload
-    accumulate-then-flush path (which passes the already-concatenated codec,
-    flat ``codes.audio`` key) can reuse the same logic.
-    """
+    pooling_output: Any,
+    request: Any,
+) -> OmniPayloadStruct:
+    """Build one terminal Code2Wav payload when async chunks are disabled."""
     external_id = getattr(request, "external_req_id", None)
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
-    internal_id = str(internal_id if internal_id is not None else request_id)
+    codes = _extract_codec_delta(pooling_output, request_id)
+    _, left_context_frames = _codec_config(transfer_manager)
+    context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
+    output_codes = [*context, *codes]
 
-    mm = multimodal_output if multimodal_output is not None else pooling_output
+    request_info = getattr(request, "additional_information", None)
+    if not isinstance(request_info, Mapping):
+        request_info = {}
+    codes_info = request_info.get("codes")
+    if not isinstance(codes_info, Mapping):
+        codes_info = {}
+    meta_info = request_info.get("meta")
+    if not isinstance(meta_info, Mapping):
+        meta_info = {}
+    duplex_info = request_info.get("duplex")
+    if not isinstance(duplex_info, Mapping):
+        duplex_info = {}
 
-    request_payload = getattr(transfer_manager, "request_payload", None)
-    if request_payload is None:
-        request_payload = {}
-        transfer_manager.request_payload = request_payload
-    container = request_payload.get(request_id)
-    if not isinstance(container, dict):
-        container = {}
-        request_payload[request_id] = container
-
-    record = container.get(_MINICPMO45_STREAM_RECORD)
-    if not isinstance(record, dict):
-        record = {
-            "internal_id": internal_id,
-            "cache_epoch": 0,
-            "retired_internal_ids": set(),
-        }
-        container[_MINICPMO45_STREAM_RECORD] = record
-    elif internal_id in record["retired_internal_ids"]:
-        return None
-    elif record["internal_id"] != internal_id:
-        record["retired_internal_ids"].add(record["internal_id"])
-        record["internal_id"] = internal_id
-        record["cache_epoch"] = int(record["cache_epoch"]) + 1
-        _drop_codec_state(transfer_manager, request_id)
-
-    if _is_aborted(request):
-        record["retired_internal_ids"].add(internal_id)
-        _drop_codec_state(transfer_manager, request_id)
-        return None
-
-    state = container.get(_MINICPMO45_ASYNC_STATE)
-    if not isinstance(state, dict):
-        request_info = getattr(request, "additional_information", None)
-        if not isinstance(request_info, Mapping):
-            request_info = {}
-        codes_info = request_info.get("codes")
-        if not isinstance(codes_info, Mapping):
-            codes_info = {}
-        meta_info = request_info.get("meta")
-        if not isinstance(meta_info, Mapping):
-            meta_info = {}
-        duplex_info = request_info.get("duplex")
-        if not isinstance(duplex_info, Mapping):
-            duplex_info = {}
-        state = {
-            "internal_id": internal_id,
-            "left_context": [],
-            "codec_end": 0,
-            "pending": [],
-            "ref_audio": codes_info.get("ref"),
-            "ref_audio_sr": meta_info.get("ref_audio_sr"),
-            "segment_text": meta_info.get("native_duplex_segment_text"),
-            "segment_end": bool(meta_info.get("segment_end", False)),
-            "turn_end": bool(meta_info.get("turn_end", False)),
-            "duplex_turn_id": duplex_info.get("model_turn_id", duplex_info.get("turn_id")),
-            "duplex_epoch": duplex_info.get("epoch"),
-        }
-        container[_MINICPMO45_ASYNC_STATE] = state
-
-    # Per-step delta: un-flattened ``codes.audio`` (NPU adapter path) or the
-    # accumulated flat ``codes.audio`` key (GPU full-payload path).
-    if isinstance(mm, Mapping) and "codes.audio" in mm and "codes" not in mm:
-        audio = mm.get("codes.audio")
-        new_codes_step = _codec_scalars(audio) if audio is not None else []
-    else:
-        new_codes_step = _extract_codec_delta(mm, request_id)
-
-    pending = state["pending"]
-    pending.extend(new_codes_step)
-    request_finished = getattr(request, "is_finished", None)
-    finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    if not finished and len(pending) < chunk_frames:
-        return None
-
-    new_token_count = len(pending) if finished else chunk_frames
-    new_codes = pending[:new_token_count]
-    del pending[:new_token_count]
-    codec_start = int(state["codec_end"])
-    codec_end = codec_start + new_token_count
-
-    if new_token_count:
-        if codec_start == 0:
-            context = [_MINICPMO45_SILENCE_CODE] * left_context_frames
-        else:
-            context = list(state["left_context"])
-        output_codes = [*context, *new_codes]
-        history = [*state["left_context"], *new_codes]
-        state["left_context"] = history[-left_context_frames:] if left_context_frames else []
-    elif finished and codec_start > 0 and state["left_context"]:
-        context = list(state["left_context"])
-        output_codes = context
-    else:
-        context = []
-        output_codes = []
-    state["codec_end"] = codec_end
-
-    last_chunk = bool(finished and not pending)
-    if last_chunk:
-        record["retired_internal_ids"].add(internal_id)
-        _drop_codec_state(transfer_manager, request_id)
-
-    chunk_seq = int(getattr(transfer_manager, "put_req_chunk", {}).get(request_id, 0))
-    finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
-    ref_audio = state.get("ref_audio") if codec_start == 0 else None
+    ref_audio = codes_info.get("ref")
+    finished = torch.tensor(True, dtype=torch.bool)
     return OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(output_codes, dtype=torch.long),
@@ -493,28 +377,65 @@ def tts2code2wav(
         ),
         meta=_MiniCPMO45MetaStruct(
             request_id=request_id,
-            chunk_seq=chunk_seq,
-            cache_epoch=int(record["cache_epoch"]),
+            chunk_seq=0,
+            cache_epoch=0,
             code_flat_numel=len(output_codes),
-            codec_chunk_frames=new_token_count,
+            codec_chunk_frames=len(codes),
             codec_left_context_frames=len(context),
             left_context_size=len(context),
-            last_chunk=last_chunk,
-            stream_finished=finished_tensor,
-            finished=finished_tensor,
+            last_chunk=True,
+            stream_finished=finished,
+            finished=finished,
             req_id=[request_id],
-            ref_audio_sr=_coerce_int(state.get("ref_audio_sr")),
+            ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
             native_duplex_segment_text=(
-                str(state["segment_text"]) if isinstance(state.get("segment_text"), str) else None
+                str(meta_info["native_duplex_segment_text"])
+                if isinstance(meta_info.get("native_duplex_segment_text"), str)
+                else None
             ),
-            duplex_turn_id=_coerce_int(state.get("duplex_turn_id")),
-            duplex_epoch=_coerce_int(state.get("duplex_epoch")),
-            segment_end=bool(state.get("segment_end", False)),
-            turn_end=bool(state.get("turn_end", False)),
-            tts_is_last_chunk=last_chunk,
+            duplex_turn_id=_coerce_int(duplex_info.get("model_turn_id", duplex_info.get("turn_id"))),
+            duplex_epoch=_coerce_int(duplex_info.get("epoch")),
+            segment_end=bool(meta_info.get("segment_end", False)),
+            turn_end=bool(meta_info.get("turn_end", False)),
+            tts_is_last_chunk=True,
         ),
         request_id=request_id,
     )
+
+
+def tts2code2wav_token_only(
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Build the sync Code2Wav placeholder; codec data arrives by connector."""
+    code2wav_inputs: list[OmniTokensPrompt] = []
+    for talker_output in source_outputs:
+        if not talker_output.finished:
+            continue
+        output = talker_output.outputs[0]
+        multimodal_output = getattr(output, "multimodal_output", None)
+        codes = multimodal_output.get("codes") if isinstance(multimodal_output, Mapping) else None
+        audio = (
+            codes.get("audio")
+            if isinstance(codes, Mapping)
+            else multimodal_output.get("codes.audio")
+            if isinstance(multimodal_output, Mapping)
+            else None
+        )
+        codec_codes = _codec_scalars(audio)
+        if not codec_codes:
+            continue
+        prompt_len = len(codec_codes) + 3
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0] * prompt_len,
+                additional_information=None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return code2wav_inputs
 
 
 def _special_token_ids_from_mm_output(mm_output):
