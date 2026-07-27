@@ -89,18 +89,6 @@ local = [
     "FlagEmbedding",
 ]
 
-# Optional runtime dependencies for the MiniCPM-o 4.5 talker pipeline.
-# The talker loads MiniCPMTTS via `trust_remote_code` from the model repo,
-# and that module performs `from stepaudio2 import Token2wav` against the
-# MiniCPM-o-flavored Token2wav vocoder (PyPI: `stepaudio2-minicpmo`, NOT
-# upstream `stepfun-ai/Step-Audio2` — the upstream signature rejects
-# `n_timesteps` and crashes at construction). A clean `vllm-omni` install
-# does not pull this in by default to avoid forcing the dep onto users
-# who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
-minicpmo = [
-    "stepaudio2-minicpmo",
-]
-
 # LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
 # separation and loudness normalization.
 longcat-video-avatar = [
