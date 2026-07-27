@@ -3,7 +3,7 @@
 
 """Declarative execution recipes for the LTX model family."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
@@ -158,6 +158,12 @@ LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
     fixed_num_inference_steps=True,
 )
 
+# LTX-2.3 full-distilled uses the same official fixed 8 + 3 sigma schedules
+# and request contract. Its distinct component profile selects the 22B merged
+# distilled Transformer, BWE vocoder, and matching spatial upsampler; no
+# distilled LoRA is loaded for either phase.
+LTX23_DISTILLED_TWO_STAGE_RECIPE = replace(LTX2_DISTILLED_TWO_STAGE_RECIPE)
+
 
 def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipelineRecipe:
     return LTXPipelineRecipe(
@@ -202,6 +208,7 @@ _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("two_stage", "2"): LTX2_TWO_STAGE_RECIPE,
     ("two_stage", "2.3"): LTX23_TWO_STAGE_RECIPE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_TWO_STAGE_RECIPE,
+    ("distilled_two_stage", "2.3"): LTX23_DISTILLED_TWO_STAGE_RECIPE,
     ("dmd2", "2"): LTX_POSITIVE_ONLY_RECIPE,
     ("dmd2", "2.3"): LTX_POSITIVE_ONLY_RECIPE,
 }

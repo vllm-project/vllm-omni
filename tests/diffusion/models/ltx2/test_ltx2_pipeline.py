@@ -25,9 +25,11 @@ from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_DISTILLED_COMPONENT_PROFILE,
     LTX2_TWO_STAGE_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
+    LTX23_DISTILLED_COMPONENT_PROFILE,
     LTX23_TWO_STAGE_COMPONENT_PROFILE,
     _install_connector_attention,
     detect_ltx_model_version,
+    resolve_ltx_component_profile,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import (
@@ -55,10 +57,12 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_ONE_STAGE_RECIPE,
     LTX2_TWO_STAGE_RECIPE,
+    LTX23_DISTILLED_TWO_STAGE_RECIPE,
     LTX23_ONE_STAGE_RECIPE,
     LTX23_TWO_STAGE_RECIPE,
     LTX_DEFAULT_NEGATIVE_PROMPT,
     LTX_POSITIVE_ONLY_RECIPE,
+    resolve_ltx_pipeline_recipe,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_request import (
     LTXRequestInputs,
@@ -183,6 +187,7 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     assert LTX2TwoStagePipeline.pipeline_recipe is LTX2_TWO_STAGE_RECIPE
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
     assert LTX2_DISTILLED_COMPONENT_PROFILE.checkpoint_kind == "distilled"
+    assert LTX23_DISTILLED_COMPONENT_PROFILE.checkpoint_kind == "distilled"
     assert LTX2_TWO_STAGE_COMPONENT_PROFILE.checkpoint_kind == "regular"
     assert LTX23_TWO_STAGE_COMPONENT_PROFILE.checkpoint_kind == "regular"
     assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
@@ -284,6 +289,33 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
     assert pipe.model_version == "2.3"
     assert pipe.component_profile is LTX23_TWO_STAGE_COMPONENT_PROFILE
     assert pipe.pipeline_recipe is LTX23_TWO_STAGE_RECIPE
+
+
+def test_ltx23_checkpoint_selects_full_distilled_profile_and_recipe(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2VocoderWithBWE"]}))
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+
+    pipe = LTX2DistilledPipeline(
+        od_config=SimpleNamespace(
+            model=str(tmp_path),
+            enable_diffusion_pipeline_profiler=False,
+        )
+    )
+
+    assert pipe.model_version == "2.3"
+    assert pipe.component_profile is LTX23_DISTILLED_COMPONENT_PROFILE
+    assert pipe.pipeline_recipe is LTX23_DISTILLED_TWO_STAGE_RECIPE
+    assert pipe._phase_weights is None
+    assert pipe.preserve_sp_padded_audio_duration
+    assert pipe.reports_stage_durations
 
 
 def test_ltx_entries_expose_batch_image_and_distributed_decode_contracts():
@@ -916,6 +948,19 @@ def test_ltx2_distilled_two_stage_recipe_is_fixed_positive_only():
     assert not LTX2_DISTILLED_TWO_STAGE_RECIPE.allow_negative_prompt
     assert LTX2_DISTILLED_TWO_STAGE_RECIPE.fixed_num_inference_steps
     assert (LTX2_DISTILLED_TWO_STAGE_RECIPE.height, LTX2_DISTILLED_TWO_STAGE_RECIPE.width) == (1024, 1536)
+
+
+def test_ltx23_full_distilled_route_uses_merged_weights_without_lora():
+    assert resolve_ltx_component_profile("distilled_two_stage", "2.3") is LTX23_DISTILLED_COMPONENT_PROFILE
+    assert resolve_ltx_pipeline_recipe("distilled_two_stage", "2.3") is LTX23_DISTILLED_TWO_STAGE_RECIPE
+    assert LTX23_DISTILLED_TWO_STAGE_RECIPE == LTX2_DISTILLED_TWO_STAGE_RECIPE
+    assert LTX23_DISTILLED_TWO_STAGE_RECIPE is not LTX2_DISTILLED_TWO_STAGE_RECIPE
+    assert all(phase.adapter_slot is None for phase in LTX23_DISTILLED_TWO_STAGE_RECIPE.phases)
+    assert LTX23_DISTILLED_COMPONENT_PROFILE.distilled_lora_filename is None
+    assert LTX23_DISTILLED_COMPONENT_PROFILE.vocoder_cls is LTX23_COMPONENT_PROFILE.vocoder_cls
+    assert LTX23_DISTILLED_COMPONENT_PROFILE.latent_upsampler_filename == (
+        "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1971,6 +2016,7 @@ class TestPipelineComponents:
 
     def test_distilled_profile_keeps_upsampler_in_managed_resident_components(self):
         assert LTX2_DISTILLED_COMPONENT_PROFILE.resident_modules == ("vocoder", "latent_upsampler")
+        assert LTX23_DISTILLED_COMPONENT_PROFILE.resident_modules == ("vocoder", "latent_upsampler")
 
 
 class TestLTX23DecodeConditioning:

@@ -113,6 +113,16 @@ LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     checkpoint_kind="distilled",
 )
 
+LTX23_DISTILLED_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_distilled",
+    resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    latent_upsampler_cls=LTX2LatentUpsamplerModel,
+    artifact_repo_id="Lightricks/LTX-2.3",
+    latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+    checkpoint_kind="distilled",
+)
+
 LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
     LTX2_COMPONENT_PROFILE,
     name="ltx2_two_stage",
@@ -142,6 +152,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("two_stage", "2"): LTX2_TWO_STAGE_COMPONENT_PROFILE,
     ("two_stage", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2.3"): LTX23_DISTILLED_COMPONENT_PROFILE,
     ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
     ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
 }

@@ -11,6 +11,7 @@
 | LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Ordinary two-stage T2V/I2V | `LTX2TwoStagePipeline` | No |
+| LTX-2.3 distilled | `diffusers/LTX-2.3-Distilled-Diffusers` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
 LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
@@ -22,6 +23,9 @@ the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 or provide one initial image for I2V. As in the official LTX pipelines,
 distilled mode is selected explicitly rather than inferred from the checkpoint
 name or metadata; always pass `--model-class-name LTX2DistilledPipeline`.
+Both stages use the full merged distilled Transformer and never load the
+standalone distilled LoRA. Checkpoint metadata selects the LTX-2 or LTX-2.3
+component profile; LTX-2.3 uses its BWE vocoder and matching x2 upsampler.
 
 `LTX2TwoStagePipeline` runs the regular checkpoint at half resolution, then
 upsamples and refines with the matching distilled LoRA. Omit `image` for T2V
@@ -123,6 +127,15 @@ Start the distilled checkpoint with its two-stage entry:
 
 ```bash
 vllm serve rootonchair/LTX-2-19b-distilled --omni \
+  --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
+```
+
+For LTX-2.3 full-distilled, use the componentized distilled checkpoint. If it
+does not include `latent_upsampler/`, the runtime resolves the official v1.1
+x2 upsampler from `Lightricks/LTX-2.3`:
+
+```bash
+vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
   --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
 ```
 
@@ -366,6 +379,7 @@ bundled offline CLI do not currently expose `sigmas`.
 - <https://huggingface.co/Lightricks/LTX-2>
 - <https://huggingface.co/Lightricks/LTX-2.3>
 - <https://huggingface.co/diffusers/LTX-2.3-Diffusers>
+- <https://huggingface.co/diffusers/LTX-2.3-Distilled-Diffusers>
 - [Online video generation](../../docs/user_guide/examples/online_serving/text_to_video.md)
 - [Request batching](../../docs/user_guide/diffusion/request_batching.md)
 - [T2V offline example](../../examples/offline_inference/text_to_video/text_to_video.md)
