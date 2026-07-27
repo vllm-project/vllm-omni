@@ -8,6 +8,7 @@ from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.routing import Route
 from vllm.entrypoints.serve.utils.error_response import create_error_response
 
 
@@ -22,6 +23,7 @@ class OmniServingCapability(Enum):
     """Serving capabilities that pipelines can shut down."""
 
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
+    CHAT_COMPLETIONS = RouteTarget("/v1/chat/completions", frozenset({"POST"}))
 
     @property
     def path(self) -> str:
@@ -41,7 +43,7 @@ class EndpointRestriction:
 def build_rejection_handler(reason: str):
     """Build a rejection handler for a given endpoint for the provided reason."""
 
-    async def rejection_handler(raw_request: Request):
+    async def rejection_handler(_raw_request: Request):
         error = create_error_response(message=reason)
         return JSONResponse(
             content=error.model_dump(),
@@ -51,19 +53,33 @@ def build_rejection_handler(reason: str):
     return rejection_handler
 
 
+def remove_route_from_app(
+    app: FastAPI,
+    path: str,
+    methods: set[str] | frozenset[str] | None = None,
+) -> None:
+    """Remove matching routes from an initialized FastAPI application."""
+    routes_to_remove: list[Route] = []
+    for route in app.router.routes:
+        if isinstance(route, Route) and route.path == path:
+            if methods is None or (route.methods and route.methods & methods):
+                routes_to_remove.append(route)
+
+    for route in routes_to_remove:
+        app.router.routes.remove(route)
+
+
 def shutdown_unsupported_routes(
     app: FastAPI,
     endpoint_restrictions: tuple[EndpointRestriction, ...],
-):
+) -> None:
     """Given an initialized FastAPI server instance and a set of model specific endpoint
     restrictions, remove the restricted routes and patch a handler that returns 400.
     """
-    from vllm_omni.entrypoints.openai.api_server import _remove_route_from_app
-
     for end_restrict in endpoint_restrictions:
         capability = end_restrict.capability
         # Remove the route from the app
-        _remove_route_from_app(app, capability.path, capability.methods)
+        remove_route_from_app(app, capability.path, capability.methods)
 
         # Patch the bad request error with the model specific
         # reason for shutting down this endpoint

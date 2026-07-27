@@ -8,6 +8,7 @@ import logging
 import os
 import struct
 import wave
+from contextlib import asynccontextmanager
 from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest, SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -413,7 +415,8 @@ def test_completion_route_preserves_handler_http_exception(mocker: MockerFixture
     app.state.engine_client.generate.assert_not_called()
 
 
-def test_speech_only_model_rejects_generate_routes_before_engine(mocker: MockerFixture):
+@pytest.mark.asyncio
+async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture):
     class FakeCompletionHandler:
         def __init__(self):
             self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
@@ -425,51 +428,123 @@ def test_speech_only_model_rejects_generate_routes_before_engine(mocker: MockerF
     class FakeSpeechHandler:
         def __init__(self):
             self.create_speech = mocker.AsyncMock(return_value=JSONResponse({"ok": True}))
+            self.shutdown = mocker.Mock()
 
-    app = FastAPI()
-    app.include_router(api_server_module.router)
-    app.state.openai_serving_models = SimpleNamespace(
-        base_model_paths=[SimpleNamespace(name="cosyvoice3", model_path="/models/Fun-CosyVoice3-0.5B-2512")]
+    class FakeEngine:
+        endpoint_restrictions = COSYVOICE3_PIPELINE.endpoint_restrictions
+        stage_configs = []
+
+        def __init__(self):
+            self.generate = mocker.AsyncMock()
+
+        async def get_supported_tasks(self):
+            return ()
+
+    engine = FakeEngine()
+    completion_handler = FakeCompletionHandler()
+    chat_handler = FakeChatHandler()
+    speech_handler = FakeSpeechHandler()
+    captured_app = None
+    serve_started = asyncio.Event()
+    http_shutdown = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        yield engine
+
+    async def fake_init_app_state(engine_client, state, args):
+        del args
+        state.engine_client = engine_client
+        state.openai_serving_chat = chat_handler
+        state.openai_serving_completion = completion_handler
+        state.openai_serving_speech = speech_handler
+
+    async def fake_serve_http(asgi_app, **kwargs):
+        nonlocal captured_app
+        del kwargs
+        captured_app = asgi_app._inner
+        serve_started.set()
+
+        async def wait_for_shutdown():
+            await http_shutdown.wait()
+
+        return asyncio.create_task(wait_for_shutdown())
+
+    mocker.patch.object(api_server_module, "build_async_omni", fake_build_async_omni)
+    mocker.patch.object(
+        api_server_module,
+        "build_openai_app",
+        side_effect=lambda args, supported_tasks: FastAPI(),
     )
-    app.state.openai_serving_chat = FakeChatHandler()
-    app.state.openai_serving_completion = FakeCompletionHandler()
-    app.state.openai_serving_speech = FakeSpeechHandler()
-    app.state.engine_client = mocker.MagicMock()
-
-    client = TestClient(app)
-
+    mocker.patch.object(api_server_module, "omni_init_app_state", fake_init_app_state)
+    mocker.patch.object(api_server_module, "serve_http", fake_serve_http)
+    mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    mocker.patch.object(api_server_module, "_get_vllm_config", new=mocker.AsyncMock(return_value=None))
+    mocker.patch.object(api_server_module, "get_uvicorn_log_config", return_value=None)
     terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
-    completion_response = client.post(
-        "/v1/completions",
-        json={"model": "cosyvoice3", "prompt": "hello"},
+
+    args = SimpleNamespace(
+        tool_parser_plugin="",
+        reasoning_parser_plugin="",
+        reasoning_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        enable_ssl_refresh=False,
+        host="127.0.0.1",
+        port=0,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=None,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=None,
+        h11_max_header_count=None,
     )
-    assert completion_response.status_code == 404
+    sock = mocker.Mock()
+    worker_task = asyncio.create_task(api_server_module.omni_run_server_worker("127.0.0.1:0", sock, args))
+    await asyncio.wait_for(serve_started.wait(), timeout=2)
+
+    try:
+        assert captured_app is not None
+        with TestClient(captured_app) as client:
+            completion_response = client.post(
+                "/v1/completions",
+                json={"model": "cosyvoice3", "prompt": "hello"},
+            )
+            chat_response = client.post(
+                "/v1/chat/completions",
+                json={"model": "cosyvoice3", "messages": [{"role": "user", "content": "hello"}]},
+            )
+            speech_response = client.post(
+                "/v1/audio/speech",
+                json={"model": "cosyvoice3", "input": "hello", "voice": "alloy"},
+            )
+    finally:
+        http_shutdown.set()
+        await asyncio.wait_for(worker_task, timeout=2)
+
+    assert completion_response.status_code == 400
     completion_body = completion_response.json()
-    assert completion_body["error"]["type"] == "NotFoundError"
-    assert completion_body["error"]["code"] == 404
+    assert completion_body["error"]["type"] == "BadRequestError"
+    assert completion_body["error"]["code"] == 400
     assert "Completions API" in completion_body["error"]["message"]
 
-    chat_response = client.post(
-        "/v1/chat/completions",
-        json={"model": "cosyvoice3", "messages": [{"role": "user", "content": "hello"}]},
-    )
-    assert chat_response.status_code == 404
+    assert chat_response.status_code == 400
     chat_body = chat_response.json()
-    assert chat_body["error"]["type"] == "NotFoundError"
-    assert chat_body["error"]["code"] == 404
+    assert chat_body["error"]["type"] == "BadRequestError"
+    assert chat_body["error"]["code"] == 400
     assert "Chat Completions API" in chat_body["error"]["message"]
 
-    terminate_mock.assert_not_called()
-    app.state.openai_serving_completion.create_completion.assert_not_called()
-    app.state.openai_serving_chat.create_chat_completion.assert_not_called()
-
-    speech_response = client.post(
-        "/v1/audio/speech",
-        json={"model": "cosyvoice3", "input": "hello", "voice": "alloy"},
-    )
     assert speech_response.status_code == 200
-    app.state.openai_serving_speech.create_speech.assert_awaited_once()
-    app.state.engine_client.generate.assert_not_called()
+    terminate_mock.assert_not_called()
+    completion_handler.create_completion.assert_not_awaited()
+    chat_handler.create_chat_completion.assert_not_awaited()
+    speech_handler.create_speech.assert_awaited_once()
+    speech_handler.shutdown.assert_called_once()
+    engine.generate.assert_not_awaited()
+    sock.close.assert_called_once()
 
 
 class TestSpeechAPI:

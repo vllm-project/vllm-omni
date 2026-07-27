@@ -29,7 +29,6 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
-from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
@@ -91,7 +90,10 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
+from vllm_omni.config.endpoint_policy import (
+    remove_route_from_app,
+    shutdown_unsupported_routes,
+)
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
@@ -167,38 +169,6 @@ MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
 profiler_router = APIRouter()
-
-# Some TTS-only models still need the engine's internal "generate" task for
-# speech synthesis, but they must not expose text generation routes publicly.
-# Keep this serving-layer route admission explicit instead of inferring it from
-# supported_tasks, which describes engine capability rather than HTTP API support.
-# This is a narrow compatibility table; long term, model-family serving adapters
-# should declare their public OpenAI route support directly.
-_UNSUPPORTED_OPENAI_ROUTES_BY_MODEL = {
-    "cosyvoice3": {"chat_completions", "completions"},
-}
-
-
-def _model_matches_openai_route_rule(model_name: str | None, route: str) -> bool:
-    if not model_name:
-        return False
-    normalized_model_name = model_name.lower()
-    return any(
-        pattern in normalized_model_name and route in unsupported_routes
-        for pattern, unsupported_routes in _UNSUPPORTED_OPENAI_ROUTES_BY_MODEL.items()
-    )
-
-
-def _is_openai_route_denied(raw_request: Request, requested_model: str | None, route: str) -> bool:
-    candidate_model_names = [requested_model]
-    try:
-        base_model_paths = raw_request.app.state.openai_serving_models.base_model_paths
-    except AttributeError:
-        base_model_paths = []
-    for base_model_path in base_model_paths:
-        candidate_model_names.append(getattr(base_model_path, "name", None))
-        candidate_model_names.append(getattr(base_model_path, "model_path", None))
-    return any(_model_matches_openai_route_rule(model_name, route) for model_name in candidate_model_names)
 
 
 def _load_model_chat_template_json(model: str) -> str | None:
@@ -302,21 +272,6 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     if hasattr(engine_client, "get_vllm_config"):
         return await engine_client.get_vllm_config()
     return getattr(engine_client, "vllm_config", None)
-
-
-def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None):
-    """Remove a route from the app by path and optionally by methods.
-
-    OMNI: used to override upstream /v1/chat/completions with omni behavior.
-    """
-    routes_to_remove = []
-    for route in app.routes:
-        if isinstance(route, Route) and route.path == path:
-            if methods is None or (hasattr(route, "methods") and route.methods & methods):
-                routes_to_remove.append(route)
-
-    for route in routes_to_remove:
-        app.routes.remove(route)
 
 
 def _register_omni_exception_handlers(app) -> None:
@@ -560,10 +515,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Override completion/chat routes so speech-only models return
         # 4xx before unsupported generate requests can dispatch to the engine.
-        _remove_route_from_app(app, "/v1/completions", {"POST"})
-        _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
-        _remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
-        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        remove_route_from_app(app, "/v1/completions", {"POST"})
+        remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
+        remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
@@ -1248,8 +1203,6 @@ def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    if _is_openai_route_denied(raw_request, request.model, "completions"):
-        return _create_unsupported_api_json_response(raw_request, "Completions API")
     handler: Any | None = Omnicompletion(raw_request)
     if handler is None:
         return _create_unsupported_api_json_response(raw_request, "Completions API")
@@ -1288,8 +1241,6 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
-    if _is_openai_route_denied(raw_request, request.model, "chat_completions"):
-        return _create_unsupported_api_json_response(raw_request, "Chat Completions API")
     handler = Omnichat(raw_request)
     if handler is None:
         base_server = getattr(raw_request.app.state, "serving_tokenization", None)
