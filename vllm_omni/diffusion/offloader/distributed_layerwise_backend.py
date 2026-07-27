@@ -17,6 +17,7 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
 
@@ -33,6 +34,58 @@ from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
+
+# Threshold (in MB) for deciding whether a non-block DiT submodule should
+# use layerwise offload (streaming hooks) or be moved to GPU as a resident
+# module.  Submodules larger than this are offloaded to save HBM; smaller
+# ones stay resident for lower latency.
+_ON_DEMAND_THRESHOLD_MB = 1024
+
+
+# ---------------------------------------------------------------------- #
+#  Declarative OffloadPlan                                               #
+# ---------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class OffloadPlan:
+    """Optional declarative metadata for distributed layerwise offload.
+
+    Models declare this as a class attribute ``_offload_plan`` on the
+    pipeline class.  When present, the offloader uses it instead of
+    heuristic block discovery, making it easier to support new models
+    without offload-specific logic in constructor or forward code.
+
+    If not declared, the offloader falls back to:
+    1. ``_layerwise_offload_blocks_attrs`` on each DiT module class.
+    2. Heuristic search for ``layers`` / ``blocks`` / ``h`` attributes.
+
+    Attributes:
+        block_attrs: Maps DiT path → tuple of block-list attribute names.
+            e.g. ``{"transformer": ("gen_layers",),
+                    "transformer.language_model": ("layers",)}``
+            When present, overrides ``_layerwise_offload_blocks_attrs``
+            for the named DiT paths.
+        offload_submodules: Maps child name → block-list attribute name,
+            for large non-DiT submodules within a DiT that should be
+            independently offloaded with their own hooks.
+            e.g. ``{"context_encoder": "layers"}``
+            When present, replaces heuristic search in
+            ``_try_layerwise_offload_submodule``.
+    """
+
+    block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    offload_submodules: dict[str, str] = field(default_factory=dict)
+
+
+def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:
+    """Retrieve the OffloadPlan declared by the pipeline, if any.
+
+    Checks ``pipeline._offload_plan`` (ClassVar on the pipeline class).
+    Returns ``None`` if not declared, signaling the offloader to use
+    fallback discovery.
+    """
+    return getattr(pipeline, "_offload_plan", None)
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
@@ -99,10 +152,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # Marks the first hook in a shared-buffer group.  When multiple DiT
         # groups share the same 2 GPU buffers, another group may have
         # overwritten this group's slot between forwards.  The first block
-        # must always sync-prefetch on entry to ensure it loads the correct
+        # must sync-prefetch on entry to ensure it loads the correct
         # weights, even if is_materialized sees a non-empty tensor left by
         # the other group.
         self._is_group_first: bool = False
+
+        # Group ID for per-slot contamination tracking.  Shared across all
+        # hooks in the same group.  When a hook prefetches into a slot, it
+        # stamps the slot with its group ID.  On group entry, the first
+        # hook checks whether the slot was last written by its own group
+        # (tail hook's async prefetch) — if so, skip the sync-prefetch.
+        self._group_id: int = -1
+        self._shared_slot_group: list[int] | None = None  # [-1, -1], shared
 
         # Parameters/buffers of the current and next blocks
         self.block_parameters: dict[str, nn.Parameter] = {}
@@ -349,6 +410,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.ready_events[slot] = evt
         self._prefetch_done = evt
 
+        # Stamp the slot with this hook's group ID so that group-first
+        # hooks can detect whether another group has overwritten the slot.
+        if self._shared_slot_group is not None:
+            self._shared_slot_group[slot] = self._group_id
+
         # Re-point using cached metadata (avoids per-layer dict lookups).
         for target, dtype, offset, numel, shape in self._cached_repoint[slot]:
             DistributedLayerwiseOffloadHook._set_tensor_storage(
@@ -399,12 +465,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     # ------------------------------------------------------------------ #
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
-        # If this is the first block in a shared-buffer group, always
-        # sync-prefetch — another group may have overwritten our slot.
-        # A non-empty view into the shared buffer does NOT prove the
-        # weights belong to this group.
+        # Group-first hook: check whether the shared buffer slot was
+        # overwritten by another group since our last forward.  If the
+        # slot still contains our own data (from the tail hook's async
+        # prefetch), skip the sync-prefetch and just wait for the event.
         if self._is_group_first and self._prev_hook is not None:
-            self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+            slot_contaminated = True
+            if self._shared_slot_group is not None:
+                slot_contaminated = self._shared_slot_group[self.current_slot] != self._group_id
+            if slot_contaminated:
+                # Another group (or no group) wrote to our slot — re-fetch
+                self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+            # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook.get_weights(self.current_slot)
         elif not self.is_materialized and self._prev_hook is not None:
             # Previous hook was skipped (e.g. by cache-dit), sync-prefetch
@@ -553,6 +625,57 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             return
 
         logger.info("Loading DiT weights via mmap (meta → page cache, no RSS): %d keys", len(weight_map))
+
+        # --- Convert DiT modules to meta device ---
+        # The transformer was created normally (with random weights and
+        # correct non-persistent buffers from __init__).  We convert it
+        # to meta device to release the random weights (they're useless),
+        # then load real weights via mmap.
+        #
+        # Non-persistent buffers (e.g. RoPE inv_freq, timestep freqs) are
+        # NOT in the checkpoint — they are computed from formulas in
+        # __init__.  Save them before meta conversion and restore after
+        # mmap loading, so we don't need model-specific buffer rebuild code.
+        #
+        # Important: when DiT modules are nested (e.g. transformer contains
+        # transformer.language_model), to_empty("meta") on the parent
+        # converts the child's buffers too.  So we must save ALL buffers
+        # from ALL DiT modules BEFORE any to_empty call.
+        saved_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        for dit_module in modules.dits:
+            bufs: dict[str, torch.Tensor] = {}
+            for name, buf in dit_module.named_buffers():
+                # Check if this buffer is non-persistent on its OWNING module
+                owner = dit_module
+                parts = name.split(".")
+                for part in parts[:-1]:
+                    owner = getattr(owner, part)
+                buf_name = parts[-1]
+                is_non_persistent = buf_name in owner._non_persistent_buffers_set
+                # Save if non-persistent OR already meta (shouldn't happen
+                # before to_empty, but be safe)
+                if is_non_persistent:
+                    bufs[name] = buf.detach().clone()
+            saved_buffers[id(dit_module)] = bufs
+
+        # Now convert all DiT modules to meta (after saving all buffers).
+        # Skip modules that are already meta (happens when a parent DiT
+        # module contains a child DiT module — to_empty on the parent
+        # already converted the child).
+        for dit_module in modules.dits:
+            if any(p.is_meta for p in dit_module.parameters()):
+                logger.info(
+                    "%s already on meta device (skipping to_empty, %d buffers saved)",
+                    dit_module.__class__.__name__,
+                    len(saved_buffers.get(id(dit_module), {})),
+                )
+                continue
+            dit_module.to_empty(device="meta")
+            logger.info(
+                "Converted %s to meta device (%d non-persistent buffers saved)",
+                dit_module.__class__.__name__,
+                len(saved_buffers.get(id(dit_module), {})),
+            )
 
         # Build reverse mapping {model_param_name: (ckpt_key, file_path)} using
         # the pipeline's _remap_ckpt_key (if available).  This handles the
@@ -710,6 +833,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             if callable(post_load_weights):
                 post_load_weights()
 
+            # Restore non-persistent buffers that were saved before meta
+            # conversion.  These buffers (e.g. RoPE inv_freq, timestep
+            # freqs) are computed from formulas in __init__ and are not
+            # present in the checkpoint.  By saving and restoring them
+            # generically, we avoid model-specific buffer rebuild code.
+            bufs = saved_buffers.get(id(dit_module), {})
+            for name, buf in bufs.items():
+                parent = dit_module
+                parts = name.split(".")
+                for part in parts[:-1]:
+                    if part.isdigit():
+                        parent = parent[int(part)]
+                    else:
+                        parent = getattr(parent, part)
+                # Place on the same device as the module's parameters
+                # Place on the offloader's target device (not the module's
+                # current device, which may still be meta at this point).
+                parent._buffers[parts[-1]] = buf.to(self.device)
+
     def _load_module_weights_from_mmap(self, module: nn.Module, dit_name: str, child_name: str) -> None:
         """Load a non-block DiT submodule's weights from safetensors via mmap."""
         from safetensors import safe_open
@@ -822,12 +964,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         module.to(self.device)
         logger.info("Moved %s (%s) to GPU (resident)", label, module.__class__.__name__)
 
-    def _try_layerwise_offload_submodule(self, module: nn.Module, name: str) -> bool:
+    def _try_layerwise_offload_submodule(self, module: nn.Module, name: str, plan: OffloadPlan | None = None) -> bool:
         """Try to apply layerwise offload to a large submodule's blocks.
 
-        Searches for common block-list attributes (layers, blocks, h).
-        If found, applies the same layerwise streaming hooks used for the DiT,
-        so only 2 layers reside on GPU at a time instead of the full module.
+        Resolution order:
+        1. OffloadPlan.offload_submodules (declarative, if plan is provided)
+        2. Heuristic search for common block-list attributes
 
         Returns True if layerwise offload was applied, False otherwise.
         """
@@ -835,15 +977,34 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         blocks = None
         blocks_attr = None
-        for attr_name in ("layers", "blocks", "h", "model.layers"):
+
+        # 1. Check OffloadPlan first (declarative — no guessing)
+        if plan is not None and name in plan.offload_submodules:
+            attr_name = plan.offload_submodules[name]
             try:
                 candidate = attrgetter(attr_name)(module)
+                if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
+                    blocks = candidate
+                    blocks_attr = attr_name
             except AttributeError:
-                continue
-            if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
-                blocks = candidate
-                blocks_attr = attr_name
-                break
+                logger.warning(
+                    "OffloadPlan declared block attr '%s' for submodule '%s' "
+                    "but attribute not found — falling back to heuristic",
+                    attr_name,
+                    name,
+                )
+
+        # 2. Fallback: heuristic search
+        if blocks is None:
+            for attr_name in ("layers", "blocks", "h", "model.layers"):
+                try:
+                    candidate = attrgetter(attr_name)(module)
+                except AttributeError:
+                    continue
+                if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
+                    blocks = candidate
+                    blocks_attr = attr_name
+                    break
 
         if blocks is None:
             return False
@@ -899,12 +1060,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Wire backward references + slot alternation
         for i in range(len(sub_hooks)):
             sub_hooks[i]._prev_hook = sub_hooks[i - 1]
+        # Assign slots in list order: sub_hooks = [last_hook, block0, ..., blockN-2]
+        # This ensures last_hook.current_slot != block0_hook.current_slot,
+        # so the circular prefetch (last_hook → block0) writes to a
+        # different slot than block0 reads from.  Correct for ALL N.
         for i, hook in enumerate(sub_hooks):
             hook.current_slot = i % 2
-        # Mark first hook in this group — it must always sync-prefetch on
-        # entry because another group may have overwritten the shared slot.
-        if sub_hooks:
-            sub_hooks[0]._is_group_first = True
+        # Mark block0_hook (index 1) as group-first — it must sync-prefetch
+        # on entry because another group may have overwritten the shared slot.
+        if len(sub_hooks) > 1:
+            sub_hooks[1]._is_group_first = True
 
         # Defer buffer allocation and prefetch to enable() unified allocation
         self._all_hook_groups.append(sub_hooks)
@@ -928,13 +1093,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping distributed layer-wise offloading")
             return
 
-        # If transformer was created on meta device, load weights from
-        # safetensors via mmap views (no RSS — data stays in page cache).
-        # This avoids O(dp_size × model_size) peak RSS during load_model.
-        _has_meta = any(
-            (p.is_meta if hasattr(p, "is_meta") else False) for dit in modules.dits for p in dit.parameters()
-        )
-        if _has_meta:
+        # Retrieve optional declarative OffloadPlan from the pipeline.
+        # When present, replaces heuristic block discovery.
+        plan = get_offload_plan(pipeline)
+
+        # Load weights via mmap for DLO+AllGather.
+        # The offloader converts DiT modules to meta device internally
+        # (via to_empty), so we always call _load_weights_via_mmap when
+        # DLO+AllGather is active — regardless of whether the model was
+        # created on meta or not.
+        if self.config.dlo_use_allgather and self.dp_size > 1:
             self._load_weights_via_mmap(pipeline, modules)
 
         # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
@@ -989,7 +1157,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # Large modules (> 1 GB) use on-demand hooks instead — they are
             # only needed briefly (e.g. language_model for text encoding)
             # and keeping them resident wastes HBM during the DiT loop.
-            _ON_DEMAND_THRESHOLD = 1024  # MB
+            _ON_DEMAND_THRESHOLD = _ON_DEMAND_THRESHOLD_MB  # alias for readability
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
                     _has_meta = any((p.is_meta if hasattr(p, "is_meta") else False) for p in m.parameters())
@@ -1010,7 +1178,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                         # in _dit_modules) — hooks already applied.
                         if id(m) in all_dit_modules:
                             logger.info("Submodule '%s' is already a DiT module, skipping layerwise offload", name)
-                        elif self._try_layerwise_offload_submodule(m, name):
+                        elif self._try_layerwise_offload_submodule(m, name, plan):
                             pass  # layerwise hooks applied
                         else:
                             self._register_on_demand_hook(m, name)
@@ -1103,14 +1271,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for i in range(len(block_hooks)):
                 block_hooks[i]._prev_hook = block_hooks[i - 1]
 
-            # Initialize alternating slots
+            # Assign slots in list order (correct for ALL N, including odd).
+            # block_hooks = [last_hook, block0_hook, ..., blockN-2_hook]
+            # last_hook(0) and block0_hook(1) get different slots →
+            # circular prefetch (last_hook → block0) writes to a
+            # different slot than block0 reads from.
             for i, hook in enumerate(block_hooks):
                 hook.current_slot = i % 2
 
-            # Mark first hook in this group — shared buffers may be
-            # overwritten by other groups between forwards.
-            if block_hooks:
-                block_hooks[0]._is_group_first = True
+            # Mark block0_hook (index 1) as group-first
+            if len(block_hooks) > 1:
+                block_hooks[1]._is_group_first = True
 
             # Defer buffer allocation — collected for unified allocation below
             self._all_hook_groups.append(block_hooks)
@@ -1130,11 +1301,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         unified_shard_buffers = None
         if self.dp_size > 1:
             unified_shard_buffers = self._allocate_shared_shard_buffers(all_hooks)
-        for hook in all_hooks:
-            hook.gpu_buffers = unified_buffers
-            hook._owns_buffers = False
-            if unified_shard_buffers is not None:
-                hook.gpu_shard_buffers = unified_shard_buffers
+
+        # Shared slot-group tracker: _shared_slot_group[slot] = group_id
+        # that last wrote to that slot.  Group-first hooks use this to
+        # skip sync-prefetch when the slot still contains their own data.
+        shared_slot_group = [-1, -1]
+
+        for group_idx, group in enumerate(self._all_hook_groups):
+            for hook in group:
+                hook.gpu_buffers = unified_buffers
+                hook._owns_buffers = False
+                if unified_shard_buffers is not None:
+                    hook.gpu_shard_buffers = unified_shard_buffers
+                hook._group_id = group_idx
+                hook._shared_slot_group = shared_slot_group
 
         # Prefetch first block of the FIRST module group only.
         # Subsequent groups share the same 2 device buffers; prefetching

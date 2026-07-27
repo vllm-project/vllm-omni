@@ -976,19 +976,39 @@ class WorkerProc:
                         self._return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    # On error, always reply (even from non-primary ranks) to
-                    # prevent the executor from hanging waiting for replies
-                    # that never arrive.  Tag with dp_rank for matching.
-                    if self.result_mq is not None:
-                        from vllm_omni.diffusion.distributed.parallel_state import (
-                            get_data_parallel_rank,
+                    # Apply the same reply gate as the success path so
+                    # non-output ranks don't enqueue stale error replies
+                    # that compete with the expected responder's message.
+                    output_rank = msg.get("output_rank")
+                    exec_all_ranks = msg.get("exec_all_ranks", False)
+                    if output_rank is None and exec_all_ranks:
+                        # DP multi-concurrency: primary ranks reply, tagged
+                        from vllm.distributed.parallel_state import (
+                            get_tensor_model_parallel_rank,
                         )
 
-                        try:
-                            dp_rank = get_data_parallel_rank()
-                        except Exception:
-                            dp_rank = self.gpu_id
-                        self._return_result({"status": "error", "error": str(e), "dp_rank": dp_rank})
+                        from vllm_omni.diffusion.distributed.parallel_state import (
+                            get_classifier_free_guidance_rank,
+                            get_data_parallel_rank,
+                            get_pipeline_parallel_rank,
+                            get_sequence_parallel_rank,
+                        )
+
+                        is_primary = (
+                            get_sequence_parallel_rank() == 0
+                            and get_classifier_free_guidance_rank() == 0
+                            and get_tensor_model_parallel_rank() == 0
+                            and get_pipeline_parallel_rank() == 0
+                        )
+                        if is_primary and self.result_mq is not None:
+                            try:
+                                dp_rank = get_data_parallel_rank()
+                            except Exception:
+                                dp_rank = self.gpu_id
+                            self._return_result({"status": "error", "error": str(e), "dp_rank": dp_rank})
+                    elif (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None:
+                        # Normal RPC: only the expected rank replies
+                        self._return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

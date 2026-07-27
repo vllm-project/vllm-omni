@@ -362,22 +362,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # other hangs.  Reject this here.
             #
             # num_inference_steps=None means "pipeline default", which may
-            # resolve differently per request mode.  When ALL are None, we
-            # cannot validate here — the pipeline resolves them later.  This
-            # is safe only if all requests use the same mode (guaranteed by
-            # the scheduler's batch admission).  If any are explicit and any
-            # are None, reject to be safe.
+            # resolve differently per request mode (e.g. Cosmos3 action_mode
+            # resolves to 30 while T2V resolves to 35).  Since
+            # RequestBatchSamplingParamsKey does not include extra_args
+            # (which carries action_mode), the scheduler cannot guarantee
+            # that all-None requests share a mode.  Reject all-None to be
+            # safe — callers must specify num_inference_steps explicitly
+            # when using DP multi-concurrency.
             step_counts = {
                 nr.req.sampling_params.num_inference_steps
                 for nr in new_reqs
                 if nr.req.sampling_params.num_inference_steps is not None
             }
             has_none = any(nr.req.sampling_params.num_inference_steps is None for nr in new_reqs)
-            has_explicit = len(step_counts) > 0
-            if (len(step_counts) > 1) or (has_none and has_explicit):
+            if (len(step_counts) > 1) or has_none:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to have "
-                    f"the same num_inference_steps, got "
+                    "the same explicit num_inference_steps (None is not allowed "
+                    "because it may resolve differently per request mode), got "
                     f"{[nr.req.sampling_params.num_inference_steps for nr in new_reqs]}. "
                     "AllGather is a collective that requires every rank to participate "
                     "at each step."

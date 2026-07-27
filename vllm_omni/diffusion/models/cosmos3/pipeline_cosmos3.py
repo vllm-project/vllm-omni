@@ -901,28 +901,14 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Transformer (weights loaded later via weights_sources) ---
         transformer_cls = resolve_cosmos3_transformer_cls(od_config.tf_model_config)
+        self.transformer = transformer_cls(
+            od_config=od_config,
+            temporal_compression_factor=self.vae_scale_factor_temporal,
+            sound_gen=sound_gen,
+            sound_dim=sound_dim,
+            sound_latent_fps=sound_latent_fps,
+        )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
-
-        _dist_offload = getattr(od_config, "enable_distributed_layerwise_offload", False)
-        _use_ag = getattr(od_config, "dlo_use_allgather", True)
-        if _dist_offload and _use_ag:
-            with torch.device("meta"):
-                self.transformer = transformer_cls(
-                    od_config=od_config,
-                    temporal_compression_factor=self.vae_scale_factor_temporal,
-                    sound_gen=sound_gen,
-                    sound_dim=sound_dim,
-                    sound_latent_fps=sound_latent_fps,
-                )
-            logger.info("Transformer created on meta device (dist_offload + AllGather)")
-        else:
-            self.transformer = transformer_cls(
-                od_config=od_config,
-                temporal_compression_factor=self.vae_scale_factor_temporal,
-                sound_gen=sound_gen,
-                sound_dim=sound_dim,
-                sound_latent_fps=sound_latent_fps,
-            )
 
         # --- Scheduler ---
         # Distilled model differs from regular one only by scheduler,

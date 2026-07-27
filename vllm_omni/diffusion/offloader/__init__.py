@@ -11,7 +11,9 @@ from .base import OffloadBackend, OffloadConfig, OffloadStrategy
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
+    OffloadPlan,
     apply_distributed_block_hook,
+    get_offload_plan,
     remove_distributed_block_hook,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
@@ -26,6 +28,7 @@ logger = init_logger(__name__)
 __all__ = [
     "OffloadBackend",
     "OffloadConfig",
+    "OffloadPlan",
     "OffloadStrategy",
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
@@ -36,6 +39,7 @@ __all__ = [
     "apply_distributed_block_hook",
     "remove_distributed_block_hook",
     "get_offload_backend",
+    "get_offload_plan",
 ]
 
 

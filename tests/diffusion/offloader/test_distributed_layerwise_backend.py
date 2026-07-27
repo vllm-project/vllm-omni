@@ -22,6 +22,8 @@ from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
+    OffloadPlan,
+    get_offload_plan,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -482,9 +484,54 @@ class TestCrossGroupSharedBuffer:
         hook_a.pre_forward(block_a)
         assert not sync_called[0], "Materialized block should not sync-prefetch without _is_group_first"
 
-        # Case 2: _is_group_first=True, materialized → MUST sync-prefetch
+        # Case 2: _is_group_first=True, materialized, slot contaminated
+        # (no _shared_slot_group set → defaults to contaminated) → MUST sync-prefetch
         hook_a._is_group_first = True
         hook_a._prev_hook = hook_a
         sync_called[0] = False
         hook_a.pre_forward(block_a)
-        assert sync_called[0], "_is_group_first must force sync-prefetch even when materialized"
+        assert sync_called[0], "_is_group_first must force sync-prefetch when slot is contaminated"
+
+        # Case 3: _is_group_first=True, slot NOT contaminated (same group owns slot)
+        # → skip sync-prefetch, just wait for async event
+        hook_a._shared_slot_group = [hook_a._group_id, -1]
+        sync_called[0] = False
+        hook_a.pre_forward(block_a)
+        assert not sync_called[0], "Should skip sync-prefetch when slot_group matches (non-contaminated)"
+
+
+class TestOffloadPlan:
+    """Test declarative OffloadPlan metadata."""
+
+    def test_get_offload_plan_returns_none_when_not_declared(self):
+        """Pipelines without _offload_plan should return None."""
+        model = _SingleBlockModel(num_blocks=3)
+        assert get_offload_plan(model) is None
+
+    def test_get_offload_plan_returns_declared_plan(self):
+        """Pipelines with _offload_plan should return it."""
+        plan = OffloadPlan(
+            block_attrs={"transformer": ("gen_layers",)},
+            offload_submodules={"context_encoder": "layers"},
+        )
+
+        class PipelineWithPlan(nn.Module):
+            _offload_plan = plan
+
+        model = PipelineWithPlan()
+        result = get_offload_plan(model)
+        assert result is plan
+        assert result.block_attrs == {"transformer": ("gen_layers",)}
+        assert result.offload_submodules == {"context_encoder": "layers"}
+
+    def test_offload_plan_defaults_to_empty(self):
+        """OffloadPlan with no arguments should have empty dicts."""
+        plan = OffloadPlan()
+        assert plan.block_attrs == {}
+        assert plan.offload_submodules == {}
+
+    def test_offload_plan_is_frozen(self):
+        """OffloadPlan should be immutable (frozen=True)."""
+        plan = OffloadPlan()
+        with pytest.raises(Exception):
+            plan.block_attrs = {"x": ("y",)}  # type: ignore

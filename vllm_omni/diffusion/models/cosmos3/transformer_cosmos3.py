@@ -1846,31 +1846,5 @@ class Cosmos3VFMTransformer(nn.Module):
             return tuple(outputs)
 
     def post_load_weights(self) -> None:
-        """Post-load processing: ensure correct dtypes and rebuild buffers.
-
-        Non-persistent buffers (time_embedder.freqs, rotary_emb.inv_freq) are
-        not stored in the checkpoint and must be rebuilt from their formulas.
-        This is needed when the transformer is created on meta device (DLO)
-        and weights are loaded via mmap — the buffers remain meta until here.
-        """
-        import math
-
-        # Cast time_embedder to FP32 (precision requirement, autocast disabled)
+        """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
-
-        # Rebuild time_embedder.freqs (non-persistent, not in checkpoint)
-        te = self.time_embedder
-        if hasattr(te, "freqs") and te.freqs.is_meta:
-            half = te.frequency_embedding_size // 2
-            max_period = 10000
-            freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half)
-            te.freqs = freqs.to(te.linear_1.weight.device)
-
-        # Rebuild language_model.rotary_emb.inv_freq (non-persistent)
-        rotary = self.language_model.rotary_emb
-        if hasattr(rotary, "inv_freq") and rotary.inv_freq.is_meta:
-            inv_freq = 1.0 / (
-                rotary.rope_theta
-                ** (torch.arange(0, rotary.head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / rotary.head_dim)
-            )
-            rotary.inv_freq = inv_freq.to(rotary.head_dim.device)

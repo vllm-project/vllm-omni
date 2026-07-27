@@ -140,11 +140,19 @@ def pack_diffusion_output_shm(output: object) -> object:
 
     Supports a bare ``DiffusionOutput``, a wrapper object carrying one in
     ``.result`` (for example ``RunnerOutput``), an RPC result envelope carrying
-    the diffusion output in ``["result"]``, or a batch wrapper carrying
-    ``RunnerOutput`` objects in ``.runner_outputs``.
+    the diffusion output in ``["result"]``, a batch wrapper carrying
+    ``RunnerOutput`` objects in ``.runner_outputs``, or a DP-tagged dict
+    ``{"dp_rank": int, "output": DiffusionOutput}`` used by DP multi-concurrency.
     """
     if isinstance(output, DiffusionOutput):
         return _pack_diffusion_fields(output)
+
+    # DP multi-concurrency: {"dp_rank": int, "output": DiffusionOutput}
+    if isinstance(output, dict) and "dp_rank" in output and "output" in output:
+        inner = output["output"]
+        if isinstance(inner, DiffusionOutput):
+            output["output"] = _pack_diffusion_fields(inner)
+        return output
 
     if _is_rpc_result_envelope(output):
         result = output.get("result")
@@ -175,6 +183,13 @@ def unpack_diffusion_output_shm(output: object) -> object:
     """Reconstruct tensors from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
         return _unpack_diffusion_fields(output)
+
+    # DP multi-concurrency: {"dp_rank": int, "output": DiffusionOutput}
+    if isinstance(output, dict) and "dp_rank" in output and "output" in output:
+        inner = output["output"]
+        if isinstance(inner, DiffusionOutput):
+            output["output"] = _unpack_diffusion_fields(inner)
+        return output
 
     if _is_rpc_result_envelope(output):
         result = output.get("result")
