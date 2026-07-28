@@ -29,6 +29,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerContext,
     ARDiffusionPagedLayerInputs,
+    ar_diffusion_paged_attention,
     paged_write_attn,
 )
 
@@ -309,7 +310,43 @@ class LingBotSelfAttention(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
             )
-            output = self.attn(query, visible_key, visible_value)
+            if query.is_cuda and query.shape[0] == 1:
+                # Use the same block-table FlashAttention entry point as the
+                # realtime path so direct replay is a numerical oracle for
+                # paged execution, rather than a comparison between two
+                # different attention kernels.
+                block_size = key.shape[1]
+                key_cache = visible_key[0].unflatten(0, (-1, block_size))
+                value_cache = visible_value[0].unflatten(0, (-1, block_size))
+                block_count = key_cache.shape[0]
+                block_table = torch.arange(
+                    block_count,
+                    dtype=torch.int32,
+                    device=query.device,
+                ).unsqueeze(0)
+                query_start_loc = torch.tensor(
+                    [0, query.shape[1]],
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                seq_lens = torch.tensor(
+                    [visible_key.shape[1]],
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                output = ar_diffusion_paged_attention(
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_table=block_table,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_query_len=query.shape[1],
+                    max_seq_len=visible_key.shape[1],
+                    softmax_scale=self.head_dim**-0.5,
+                )
+            else:
+                output = self.attn(query, visible_key, visible_value)
         return self.o(output.flatten(2, 3))
 
 
