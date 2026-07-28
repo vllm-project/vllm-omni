@@ -1889,12 +1889,15 @@ class AsyncOmniEngine:
         # and lets the destructor/free path handle asleep entries correctly
         # (returns a null handle so the C extension skips unmap/release).
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+            from vllm.device_allocator import get_mem_allocator_instance
+            from vllm.device_allocator.cumem import cumem_available
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
+            from vllm_omni.platforms import current_omni_platform
+
+            if cumem_available or current_omni_platform.is_xpu():
+                allocator = get_mem_allocator_instance()
                 allocator.release_pools()
-                logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
+                logger.debug("[AsyncOmniEngine] Released CuMem/XpuMem memory pool during shutdown")
         except Exception:
             pass
 

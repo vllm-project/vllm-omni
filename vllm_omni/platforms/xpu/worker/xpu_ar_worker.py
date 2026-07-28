@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm.logger import init_logger
-from vllm.v1.worker.xpu_worker import XPUWorker
 
+from vllm_omni.platforms.xpu.worker.base import OmniXPUWorkerBase
 from vllm_omni.platforms.xpu.worker.xpu_ar_model_runner import XPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
 
-class XPUARWorker(OmniWorkerMixin, XPUWorker):
+class XPUARWorker(OmniWorkerMixin, OmniXPUWorkerBase):
     """XPU AR worker for thinker/talker stages in Omni model."""
 
     def init_device(self):
