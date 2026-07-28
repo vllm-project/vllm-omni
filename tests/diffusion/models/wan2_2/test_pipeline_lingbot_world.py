@@ -369,6 +369,7 @@ def _od_config(**overrides):
         },
         "enable_cpu_offload": False,
         "enable_layerwise_offload": False,
+        "enforce_eager": True,
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
             sequence_parallel_size=1,
@@ -425,6 +426,7 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
 
 def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
     module = _load_pipeline_module()
+    module.get_tensor_model_parallel_world_size = lambda: 1
     pipeline = _pipeline(module)
 
     spec = pipeline.ar_diffusion_kv_cache_spec()

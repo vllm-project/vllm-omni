@@ -254,7 +254,10 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
         raise RuntimeError("layer exploded")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", boom)
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="layer exploded"):
         runner.execute_model(request)
@@ -285,7 +288,10 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
     runner.device = torch.device("cuda")
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
         runner.execute_model(request)
