@@ -160,6 +160,29 @@ async def test_do_register_offloads_remote_factory(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing-address", "add-client"])
+async def test_do_register_shuts_down_rejected_client(monkeypatch, failure):
+    shutdown_calls = 0
+
+    class Client:
+        client_addresses = {} if failure == "missing-address" else {"input_address": "tcp://rejected"}
+
+        def shutdown(self):
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+
+    pool = FakePool(stage_id=0)
+    if failure == "add-client":
+        monkeypatch.setattr(pool, "add_client", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("reject")))
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=lambda *_args: Client())
+
+    with pytest.raises(RuntimeError):
+        await controller._do_register(0, 1)
+
+    assert shutdown_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_unregister_then_register_restores_coordinator_replica_slot(monkeypatch):
     class Client:
         def __init__(self, input_addr: str) -> None:

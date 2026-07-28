@@ -207,10 +207,23 @@ class MembershipController:
                     replica_id,
                 )
             return None
-        input_addr = StagePool._client_input_addr(client)
-        if input_addr is None:
-            raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
-        pool.add_client(input_addr, client, replica_id=replica_id)
+        try:
+            input_addr = StagePool._client_input_addr(client)
+            if input_addr is None:
+                raise RuntimeError(
+                    f"remote replica factory for stage {stage_id} produced a client without input address"
+                )
+            pool.add_client(input_addr, client, replica_id=replica_id)
+        except Exception:
+            try:
+                client.shutdown()
+            except Exception:
+                logger.exception(
+                    "[MembershipController] failed to shutdown rejected replica client stage=%d replica=%d",
+                    stage_id,
+                    replica_id,
+                )
+            raise
         logger.info(
             "[MembershipController] attached remote replica stage=%d replica=%d addr=%s",
             stage_id,
