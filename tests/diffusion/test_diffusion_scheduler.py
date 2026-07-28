@@ -236,6 +236,16 @@ class TestGetRequestBatchSamplingParamsKey:
             self._make(seed=1, generator=gen_a)
         ) == get_request_batch_sampling_params_key(self._make(seed=2, generator=gen_b))
 
+    def test_distinguishes_pipeline_extra_args(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
+
+        first = self._make()
+        second = self._make()
+        first.sampling_params.extra_args = {"sample_solver": "unipc"}
+        second.sampling_params.extra_args = {"sample_solver": "euler"}
+
+        assert get_request_batch_sampling_params_key(first) != get_request_batch_sampling_params_key(second)
+
 
 class TestRequestScheduler:
     def setup_method(self) -> None:

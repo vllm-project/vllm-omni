@@ -30,11 +30,15 @@ class AllGatherKVParallelAttention:
     def __init__(
         self,
         sp_group: SequenceParallelGroupCoordinator,
+        *,
+        process_group=None,
+        world_size: int | None = None,
+        rank: int | None = None,
     ) -> None:
         self._sp_group = sp_group
-        self._allgather_group = sp_group.allgather_group
-        self._sp_size = sp_group.allgather_world_size
-        self._sp_rank = sp_group.allgather_rank
+        self._allgather_group = process_group if process_group is not None else sp_group.allgather_group
+        self._sp_size = world_size if world_size is not None else sp_group.allgather_world_size
+        self._sp_rank = rank if rank is not None else sp_group.allgather_rank
 
     @property
     def enabled(self) -> bool:

@@ -267,6 +267,7 @@ class Wan22Pipeline(
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
 ):
+    supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -543,8 +544,8 @@ class Wan22Pipeline(
     def forward(
         self,
         req: DiffusionRequestBatch,
-        prompt: str | None = None,
-        negative_prompt: str | None = None,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
         height: int = 480,
         width: int = 832,
         num_inference_steps: int = 40,
@@ -556,22 +557,21 @@ class Wan22Pipeline(
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
         **kwargs,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         # Get parameters from request or arguments
-        if len(req.prompts) > 1:
-            raise ValueError(
-                """This model only supports a single prompt, not a batched request.""",
-                """Please pass in a single prompt object or string, or a single-item list.""",
-            )
-        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+        if req.prompts:
+            prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts]
+            negative_prompt = [
+                "" if isinstance(item, str) else (item.get("negative_prompt") or "") for item in req.prompts
+            ]
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        height = common_sampling_params.height or height
+        width = common_sampling_params.width or width
+        num_frames = common_sampling_params.num_frames if common_sampling_params.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -579,16 +579,17 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = common_sampling_params.num_inference_steps or num_inference_steps
+        num_videos_per_prompt = common_sampling_params.num_outputs_per_prompt or 1
 
         # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        if common_sampling_params.guidance_scale_provided:
+            guidance_scale = common_sampling_params.guidance_scale
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
+            common_sampling_params.guidance_scale_2
+            if common_sampling_params.guidance_scale_2 is not None
             else (
                 guidance_scale[1]
                 if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
@@ -601,7 +602,23 @@ class Wan22Pipeline(
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+        boundary_ratio = (
+            self.boundary_ratio if self.boundary_ratio is not None else common_sampling_params.boundary_ratio
+        )
+
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        if prompt_embeds is not None:
+            prompt = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
 
         if boundary_ratio is None:
             boundary_ratio = 0.875
@@ -633,11 +650,30 @@ class Wan22Pipeline(
             # Fallback to text_encoder dtype if no transformer loaded
             dtype = self.text_encoder.dtype
 
-        # Seed / generator
+        # Preserve independent per-request RNG streams inside the fused batch.
         if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+            request_generators: list[torch.Generator] = []
+            for sampling in sampling_params_list:
+                current = sampling.generator
+                if isinstance(current, list):
+                    if len(current) != num_videos_per_prompt:
+                        raise ValueError(
+                            "Per-request generator lists must match num_outputs_per_prompt, "
+                            f"got {len(current)} and {num_videos_per_prompt}."
+                        )
+                    request_generators.extend(current)
+                elif current is not None:
+                    request_generators.extend([current] * num_videos_per_prompt)
+                else:
+                    if sampling.seed is None:
+                        raise ValueError("Each batched Wan request must have a seed or generator.")
+                    request_generators.extend(
+                        [
+                            torch.Generator(device=device).manual_seed(sampling.seed + output_idx)
+                            for output_idx in range(num_videos_per_prompt)
+                        ]
+                    )
+            generator = request_generators
 
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
@@ -649,8 +685,8 @@ class Wan22Pipeline(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=common_sampling_params.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
@@ -666,8 +702,8 @@ class Wan22Pipeline(
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
-        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        sample_solver = resolve_wan_sample_solver(req.requests[0], default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(req.requests[0], self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
             self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
             self._sample_solver = sample_solver
@@ -683,6 +719,12 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
+        batched_images = [
+            None if isinstance(item, str) else (item.get("multi_modal_data", {}) or {}).get("image")
+            for item in req.prompts
+        ]
+        if req.num_reqs > 1 and any(item is not None for item in batched_images):
+            raise ValueError("Wan request batching currently supports T2V requests only; batch I2V is not yet supported.")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         if isinstance(raw_image, list):
@@ -729,7 +771,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=req.collate_request_tensors("latents", None),
             )
 
             # Encode image condition
@@ -771,7 +813,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=req.collate_request_tensors("latents", None),
             )
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -848,9 +890,16 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return [
+            DiffusionOutput(
+                output=output[
+                    request_idx * num_videos_per_prompt : (request_idx + 1) * num_videos_per_prompt
+                ],
+                stage_durations=stage_durations,
+            )
+            for request_idx in range(req.num_reqs)
+        ]
 
     def predict_noise(
         self,

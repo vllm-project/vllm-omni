@@ -112,6 +112,9 @@ class RequestBatchSamplingParamsKey:
     # Model-specific batch defaults used by request-mode pipelines.
     layers: int = 4
     use_en_prompt: bool = False
+    # Pipeline-specific controls (for example Wan sample_solver/flow_shift)
+    # are batch-wide unless a pipeline explicitly implements per-item values.
+    extra_args: object = None
 
     # LoRA identity.
     lora_int_id: int | None = None

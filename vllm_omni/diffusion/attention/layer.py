@@ -121,6 +121,8 @@ class Attention(nn.Module):
         self.use_ring = False
         self.ring_pg = None
         self.ring_runner = None
+        self._ring_quality_guard_strategy = None
+        self._ring_quality_guard_steps: set[int] = set()
 
         if config is not None:
             if config.parallel_config.ring_degree > 1:
@@ -132,6 +134,23 @@ class Attention(nn.Module):
                         sp_group,
                         attn_backend_pref=self.backend_pref,
                     )
+                    guard_count = int(
+                        (getattr(config, "additional_config", None) or {}).get(
+                            "ring_quality_guard_steps", 0
+                        )
+                    )
+                    if guard_count > 0 and config.parallel_config.ulysses_degree == 1:
+                        from vllm_omni.diffusion.attention.parallel.allgather_kv import (
+                            AllGatherKVParallelAttention,
+                        )
+
+                        self._ring_quality_guard_steps = set(range(guard_count))
+                        self._ring_quality_guard_strategy = AllGatherKVParallelAttention(
+                            sp_group,
+                            process_group=sp_group.ring_group,
+                            world_size=sp_group.ring_world_size,
+                            rank=sp_group.ring_rank,
+                        )
                 except Exception:
                     self.use_ring = False
                     self.ring_runner = None
@@ -167,6 +186,11 @@ class Attention(nn.Module):
             ctx = get_forward_context()
             if not ctx.sp_active:
                 return self._no_parallel_strategy
+            if (
+                self._ring_quality_guard_strategy is not None
+                and ctx.denoise_step_idx in self._ring_quality_guard_steps
+            ):
+                return self._ring_quality_guard_strategy
         return self.parallel_strategy
 
     def _init_kv_cache_quantization(self, config) -> None:
@@ -271,7 +295,11 @@ class Attention(nn.Module):
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
 
         # 2. Kernel Execution (Computation)
-        if self.use_ring and strategy is not self._no_parallel_strategy:
+        if (
+            self.use_ring
+            and strategy is not self._no_parallel_strategy
+            and strategy is not self._ring_quality_guard_strategy
+        ):
             out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)

@@ -527,6 +527,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         must declare ``supports_request_batch = True``.
         """
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
+        logger.info(
+            "[RequestBatch] executing one fused pipeline forward num_reqs=%d request_ids=%s",
+            len(reqs),
+            [req.request_id for req in reqs],
+        )
         return self._execute_request_list(
             reqs,
             od_config=od_config,
