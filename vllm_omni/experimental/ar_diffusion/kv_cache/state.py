@@ -130,7 +130,7 @@ class ARDiffusionKVState:
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
             for _ in range(n_chunks):
-                ctx.adapter.on_chunk_committed()
+                self.kv_cache.commit_chunk(ctx.adapter)
             self._committed[kv_branch] += ctx.seq_len
             _log.debug(
                 "AR-Diffusion COMMIT [%s] new_tokens=%d chunks=%d resident=%d/%d",

@@ -81,22 +81,21 @@ def test_sliding_replace_keeps_window():
     def skip(n):
         return chunk_window_skipped_tokens(n, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False)
 
-    assert skip(16) == 0
-    assert skip(32) == 16  # make room for the in-flight chunk
-    assert skip(48) == 32
+    assert skip(32) == 0  # nothing past the window yet
+    assert skip(48) == 16  # one chunk fell out of the window
+    assert skip(64) == 32
 
 
 def test_sliding_replace_snaps_to_chunk_boundary():
     # A non-chunk-aligned overflow must snap down so a chunk is never half-evicted.
     skip = chunk_window_skipped_tokens(50, chunk_size=16, sliding_window=32, sink_chunks=0, reset_at_boundary=False)
-    assert skip % 16 == 0 and skip == 32
+    assert skip % 16 == 0 and skip == 16
 
 
 def test_sink_chunks_protected():
     # sink = 1 chunk (16 tokens) is never skipped.
     skip = chunk_window_skipped_tokens(80, chunk_size=16, sliding_window=32, sink_chunks=1, reset_at_boundary=False)
-    # Include the next complete chunk when selecting the recent tail.
-    assert skip == 48
+    assert skip == 32
 
 
 def test_reset_at_boundary_drops_completed_past_sink():

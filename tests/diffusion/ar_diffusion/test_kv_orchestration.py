@@ -54,10 +54,12 @@ def test_full_request_lifecycle_and_eviction():
         used = {int(s) // kv.block_size for s in slots}
         assert kv.null_block_id not in used
         assert used <= set(block_table)
-        # The in-flight chunk is part of the declared resident window.
+        # Allocation may transiently add one in-flight chunk.
+        assert len(kv.window_block_ids(adapter)) <= kv.spec.window_chunks + 1
+        kv.commit_chunk(adapter)
+        # A successful commit immediately prunes physical ownership.
         assert len(kv.window_block_ids(adapter)) <= kv.spec.window_chunks
         free_after.append(kv.manager.block_pool.get_num_free_blocks())
-        kv.commit_chunk(adapter)
 
     # Pool memory plateaus once the window is full (eviction recycles blocks).
     assert free_after[-1] == free_after[kv.spec.window_chunks - 1]

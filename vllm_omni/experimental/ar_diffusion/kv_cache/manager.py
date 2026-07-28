@@ -561,6 +561,11 @@ class ARDiffusionKVCache:
         """
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
+        self.manager.remove_skipped_blocks(
+            adapter.request_id,
+            adapter.num_computed_tokens,
+            num_prompt_tokens=adapter.num_prompt_tokens,
+        )
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access --------------------------------------------

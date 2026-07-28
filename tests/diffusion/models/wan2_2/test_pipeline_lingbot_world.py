@@ -1455,6 +1455,8 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
         "applied_event_ids": [1],
     }
     assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
+    assert pipeline._ar_sessions["world-1"].camera_tail is not None
+    assert pipeline._ar_sessions["world-1"].camera_tail.poses.shape == (1, 4, 4)
     expected_generator = torch.Generator(device="cpu").manual_seed(17)
     expected_first = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)
     expected_second = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)

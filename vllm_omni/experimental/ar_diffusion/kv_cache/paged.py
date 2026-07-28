@@ -163,14 +163,7 @@ def chunk_window_skipped_tokens(
     if reset_at_boundary:
         completed = (num_computed_tokens // chunk_size) * chunk_size
         return max(0, completed - sink)
-    # ``allocate_slots`` asks for the next complete chunk after
-    # ``num_computed_tokens``. Reserve room for that in-flight chunk when
-    # selecting the resident tail; otherwise a steady-state request retains
-    # ``sink + window + current`` instead of the declared ``sink + window``.
-    skipped = max(
-        0,
-        num_computed_tokens + chunk_size - sliding_window - sink,
-    )
+    skipped = max(0, num_computed_tokens - sliding_window - sink)
     return (skipped // chunk_size) * chunk_size
 
 
