@@ -6,7 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -42,6 +42,12 @@ class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
 class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["abort"] = "abort"
     request_ids: list[str]
+
+
+class InteractionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["interaction"] = "interaction"
+    request_id: str
+    interaction: OmniInteractionPrompt
 
 
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
@@ -90,6 +96,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
+    event_id: str | None = None  # for interactions on diffusion generation requests
 
 
 class OutputMessage(EngineQueueMessage, kw_only=True):

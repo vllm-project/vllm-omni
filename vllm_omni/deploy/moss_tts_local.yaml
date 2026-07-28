@@ -9,24 +9,25 @@ connectors:
   shm:
     name: SharedMemoryConnector
     extra:
-      codec_streaming: true
       connector_get_sleep_s: 0.005
       connector_get_max_wait_first_chunk: 1000
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
-      codec_stream_slots: 8
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
+    max_num_seqs: 64
     gpu_memory_utilization: 0.60
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 65536
     max_model_len: 4096
     devices: "0"
+    # profiler_config:
+    #   profiler: torch
+    #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage0/batch_8
     output_connectors:
       to_stage_1: shm
     default_sampling_params:
@@ -38,17 +39,22 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    max_num_seqs: 8
-    gpu_memory_utilization: 0.15
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.30
     enforce_eager: false
     enable_prefix_caching: false
     async_scheduling: true
     compilation_config:
-      cudagraph_capture_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      # Reused by the codec as execution-batch buckets; T is derived from
+      # initial_codec_chunk_frames and codec_chunk_frames.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
       cudagraph_num_of_warmups: 1
+    # profiler_config:
+    #   profiler: torch
+    #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage1/batch_8
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "0"
+    devices: "1"
     input_connectors:
       from_stage_0: shm
     default_sampling_params:

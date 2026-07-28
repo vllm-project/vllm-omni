@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import CacheConfig
-from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
 from vllm_omni.worker.gpu_generation_model_runner import (

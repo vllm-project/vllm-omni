@@ -69,6 +69,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
+        # Segment-local chunk counter: incremented alongside put_req_chunk
+        # but popped at segment boundaries (unlike put_req_chunk which is
+        # request-global for connector key continuity).
+        self.ramp_chunk_count: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
@@ -313,7 +317,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
+                    # Terminal stops no longer count as segment boundaries
+                    # (is_segment_finished is False when the request finishes,
+                    # see #5383), but the processor must still flush its
+                    # accumulated tail on the terminal chunk — otherwise the
+                    # downstream stage receives the finished marker without
+                    # the final payload (#5413).
+                    is_finished=is_segment_finished or is_finished,
                 )
 
             except Exception as e:
@@ -339,6 +349,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
+            self.ramp_chunk_count[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
@@ -360,6 +371,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
             self.requests_num_chunks_sent.pop(external_req_id, None)
+            self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
@@ -412,6 +424,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
+        self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
@@ -536,6 +549,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         self._active_streams[request_id] = request
         return True
+
+    @property
+    def num_running_waiting_for_chunk(self) -> int:
+        """Count running requests temporarily removed while awaiting a chunk."""
+        return len(self.waiting_for_chunk_running_requests)
 
     def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         # Hold non-active running requests in a private deque rather than

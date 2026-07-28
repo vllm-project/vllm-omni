@@ -30,7 +30,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -59,6 +59,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -75,7 +76,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
@@ -154,7 +155,7 @@ class AsyncOmniEngine:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
-        trust_remote_code: bool = False,
+        trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -233,7 +234,11 @@ class AsyncOmniEngine:
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
-        kwargs["trust_remote_code"] = trust_remote_code
+        # Tri-state: None means "not specified" — the deploy yaml's per-stage
+        # trust_remote_code stays in effect. An explicit True/False here is a
+        # global override (precedence: caller > deploy yaml > default False);
+        # the merge rule lives in with_trust_remote_code_override.
+        kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
@@ -789,6 +794,11 @@ class AsyncOmniEngine:
                 supported_tasks=self.supported_tasks,
             )
             request.external_req_id = cid
+            # Companions are stage-0-final: without this worker-visible tag
+            # the AR runner would still emit downstream connector payloads
+            # for them (the orchestrator-side final_stage_id=0 registration
+            # alone does not reach the worker).
+            request = apply_omni_final_stage_metadata(request, 0)
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
@@ -1145,7 +1155,7 @@ class AsyncOmniEngine:
         model: str,
         kwargs: dict[str, Any],
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1706,6 +1716,30 @@ class AsyncOmniEngine:
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
         self.abort(request_ids)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Send an interaction control message to the Orchestrator."""
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+
+        self.request_queue.sync_q.put_nowait(
+            InteractionMessage(
+                request_id=request_id,
+                interaction=interaction,
+            )
+        )
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Async interaction API."""
+        self.submit_interaction(request_id, interaction)
 
     def collective_rpc(
         self,

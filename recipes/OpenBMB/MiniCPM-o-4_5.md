@@ -79,9 +79,9 @@ a fallback because it would duplicate state machines and correctness paths.
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
-`gpu_memory_utilization` budgets are 0.65, 0.15, and 0.15. This layout
-minimizes the GPU count; use a large-memory accelerator and leave the
-remaining 5% for runtime overhead.
+`gpu_memory_utilization` budgets are 0.55, 0.22, and 0.22. All stages admit
+up to four sequences. Startup video profiling is bounded to 32 frames per
+video. Use the two-GPU profile for production throughput.
 
 #### Environment
 
@@ -202,8 +202,8 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: Thinker, Talker, and Code2Wav reserve 0.65, 0.15, and
-  0.15 of GPU 0. The larger Thinker share protects its multimodal KV cache;
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.22, and
+  0.22 of GPU 0. The larger Thinker share protects its multimodal KV cache;
   all three model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
@@ -214,6 +214,9 @@ speech output (TTS)"** checkbox on / off.
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
   exact-shape-compatible chunks and does not fall back to serial decode.
+- `limit_mm_per_prompt.video.num_frames: 32` bounds startup dummy profiling,
+  not runtime media decoding. Use `media_io_kwargs.video.num_frames` when a
+  matching URL/file video sampling limit is required.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1
