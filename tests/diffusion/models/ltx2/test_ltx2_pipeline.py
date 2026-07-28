@@ -1567,11 +1567,25 @@ def test_ltx_phase_adapter_uses_local_tp_lora_slices(
     assert wrapper.adapters["ltx_distilled"][0].lora_a.shape[-1] == expected_local_a_width
 
 
-def test_ltx_resident_lora_rejects_serialized_quantized_checkpoint():
+@pytest.mark.parametrize(
+    "serialized_flag",
+    [
+        "is_checkpoint_quantized",
+        "is_checkpoint_serialized",
+        "is_checkpoint_fp8_serialized",
+        "is_checkpoint_nvfp4_serialized",
+        "is_checkpoint_mxfp4_serialized",
+        "is_checkpoint_mxfp8_serialized",
+        "is_checkpoint_int8_serialized",
+        "is_checkpoint_torchao_serialized",
+        "is_checkpoint_future_serialized",
+    ],
+)
+def test_ltx_resident_lora_rejects_serialized_quantized_checkpoint(serialized_flag):
     pipe = SimpleNamespace(
         transformer=SimpleNamespace(config={}),
         od_config=SimpleNamespace(
-            quantization_config=SimpleNamespace(is_checkpoint_fp8_serialized=True),
+            quantization_config=SimpleNamespace(**{serialized_flag: True}),
         ),
     )
 
