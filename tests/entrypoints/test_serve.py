@@ -377,7 +377,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
@@ -457,7 +457,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
