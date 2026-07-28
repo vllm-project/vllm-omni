@@ -2124,37 +2124,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             waveform = resample_audio(waveform, int(sample_rate), SAMPLE_RATE)
         return waveform
 
-    def _build_ming_prompt_waveform(
+    def _build_ming_reference_waveforms(
         self,
         ref_audio_data: tuple[list[float], int] | list[tuple[list[float], int]] | None,
-    ):
-        if isinstance(ref_audio_data, list):
-            return torch.cat(
-                [self._coerce_ming_prompt_waveform(item[0], item[1]) for item in ref_audio_data],
-                dim=-1,
-            )
-        if ref_audio_data is not None:
-            return self._coerce_ming_prompt_waveform(ref_audio_data[0], ref_audio_data[1])
-        return None
-
-    def _extract_ming_speaker_embeddings_from_ref_audio(
-        self,
-        ref_audio_data_list: list[tuple[list[float], int]],
-    ) -> list[list[float]]:
-        from vllm_omni.model_executor.models.ming_tts.speaker_extractor import MingSpeakerEmbeddingExtractor
-
-        extractor = MingSpeakerEmbeddingExtractor(self.engine_client.model_config.model, target_sr=16000)
-        embeddings = []
-        for wav_samples, sr in ref_audio_data_list:
-            waveform = torch.as_tensor(wav_samples, dtype=torch.float32).reshape(1, -1)
-            embedding = extractor.extract_from_waveform(waveform, int(sr))
-            flat = embedding.detach().reshape(-1).to(torch.float32).cpu()
-            if int(flat.numel()) != SPEAKER_EMBEDDING_DIM:
-                raise ValueError(
-                    f"Ming speaker extractor returned {int(flat.numel())} dims; expected {SPEAKER_EMBEDDING_DIM}"
-                )
-            embeddings.append(flat.tolist())
-        return embeddings
+    ) -> tuple[list[torch.Tensor], list[int]]:
+        if ref_audio_data is None:
+            return [], []
+        items = ref_audio_data if isinstance(ref_audio_data, list) else [ref_audio_data]
+        waveforms = [torch.as_tensor(samples, dtype=torch.float32).reshape(1, -1) for samples, _ in items]
+        sample_rates = [int(sample_rate) for _, sample_rate in items]
+        if any(sample_rate <= 0 for sample_rate in sample_rates):
+            raise ValueError(f"Ming reference audio sample rates must be positive, got {sample_rates}")
+        return waveforms, sample_rates
 
     def _parse_ming_instruction_fields(
         self,
@@ -2197,11 +2178,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         *,
         ref_audio_data: tuple[list[float], int] | list[tuple[list[float], int]] | None = None,
+        voice_name: str | None = None,
+        voice_created_at: int = 0,
     ) -> dict[str, Any]:
         """Build a Ming dense prompt directly from the OpenAI speech request."""
         from transformers import AutoTokenizer
 
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_MAX_DECODE_STEPS
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            KEY_MAX_DECODE_STEPS,
+            KEY_SPEAKER_SAMPLE_RATES,
+            KEY_SPEAKER_WAVEFORM,
+            KEY_SPEAKER_WAVEFORM_LENGTHS,
+        )
         from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 
         if self._tts_tokenizer is None:
@@ -2210,9 +2198,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
         ref_text = request.ref_text
-        prompt_waveform = self._build_ming_prompt_waveform(ref_audio_data) if ref_text is not None else None
+        reference_waveforms, reference_sample_rates = self._build_ming_reference_waveforms(ref_audio_data)
+        reference_waveform = torch.cat(reference_waveforms, dim=-1) if reference_waveforms else None
+        prompt_waveforms = (
+            [
+                self._coerce_ming_prompt_waveform(waveform, sample_rate)
+                for waveform, sample_rate in zip(reference_waveforms, reference_sample_rates, strict=True)
+            ]
+            if ref_text is not None
+            else []
+        )
+        prompt_waveform = torch.cat(prompt_waveforms, dim=-1) if prompt_waveforms else None
         speaker_embedding = request.speaker_embedding
-        use_zero_spk_emb = prompt_waveform is None and speaker_embedding is None
+        pending_speaker_extraction = speaker_embedding is None and reference_waveform is not None
+        use_zero_spk_emb = not pending_speaker_extraction and prompt_waveform is None and speaker_embedding is None
 
         runtime_controls = {}
         if request.max_new_tokens is not None:
@@ -2229,8 +2228,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt_text=ref_text,
             prompt_waveform=prompt_waveform,
             speaker_embedding=speaker_embedding,
+            speaker_count=len(reference_waveforms) if pending_speaker_extraction else None,
             use_zero_spk_emb=use_zero_spk_emb,
         )
+        additional_information = prompt_dict["additional_information"]
+        if pending_speaker_extraction:
+            additional_information[KEY_SPEAKER_WAVEFORM] = reference_waveform
+            additional_information[KEY_SPEAKER_WAVEFORM_LENGTHS] = torch.tensor(
+                [int(waveform.shape[-1]) for waveform in reference_waveforms],
+                dtype=torch.int32,
+            )
+            additional_information[KEY_SPEAKER_SAMPLE_RATES] = torch.tensor(
+                reference_sample_rates,
+                dtype=torch.int32,
+            )
+            if voice_name:
+                additional_information["voice_name"] = voice_name
+                additional_information["voice_created_at"] = int(voice_created_at)
         prompt = tokens_input(prompt_token_ids=prompt_dict["prompt_token_ids"])
         prompt["prompt"] = prompt_dict["prompt"]
         prompt["text"] = prompt_dict["text"]

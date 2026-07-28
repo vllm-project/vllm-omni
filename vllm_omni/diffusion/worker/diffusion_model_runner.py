@@ -205,6 +205,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if load_format == "dummy":
             return
 
+        current_omni_platform.init_diffusion_model_runner_runtime(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+
         load_device = (
             "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
         )
