@@ -109,6 +109,8 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.official_root is None or args.checkpoint is None or args.gemma_root is None:
         raise ValueError("Official backend requires --official-root, --checkpoint, and --gemma-root")
     _insert_official_paths(args.official_root)
+    # vLLM disables cuDNN SDPA during import; mirror the worker's Gemma dispatch.
+    torch.backends.cuda.enable_cudnn_sdp(False)
 
     from ltx_core.components.guiders import MultiModalGuiderParams
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
