@@ -98,8 +98,8 @@ from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
+    choose_output_format,
     encode_image_base64,
-    encode_image_base64_with_compression,
     parse_size,
     validate_layered_layers,
 )
@@ -1773,6 +1773,8 @@ async def generate_images(
     try:
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
+        output_compression = request.output_compression if request.output_compression is not None else 100
+        output_format = choose_output_format(request.output_format or "png", request.background or "auto")
         if len(stage_configs) > 1:
             chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
             if chat_handler is None:
@@ -1788,7 +1790,6 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                parse_size(request.size)
                 width, height = parse_size(request.size)
                 app_state_args = getattr(raw_request.app.state, "args", None)
                 _check_max_generated_image_size(app_state_args, width, height)
@@ -1831,7 +1832,17 @@ async def generate_images(
                     content=generation_result.model_dump(),
                 )
             flat_images, _, _, _ = generation_result
-            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
+            image_data = [
+                ImageData(
+                    b64_json=encode_image_base64(
+                        img,
+                        format=output_format,
+                        output_compression=output_compression,
+                    ),
+                    revised_prompt=None,
+                )
+                for img in flat_images
+            ]
 
             return ImageGenerationResponse(created=int(time.time()), data=image_data)
 
@@ -1920,12 +1931,12 @@ async def generate_images(
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
-        # Determine output format (default to png)
-        output_format = _choose_output_format(request.output_format or "png", None)
-
-        # Encode images to base64 with the specified format
+        # Encode images to base64
         image_data = [
-            ImageData(b64_json=encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
+            ImageData(
+                b64_json=encode_image_base64(img, format=output_format, output_compression=output_compression),
+                revised_prompt=None,
+            )
             for img in images
         ]
 
@@ -2019,7 +2030,7 @@ async def edit_images(
             detail=(f"Model mismatch: request specifies '{model}' but server is running '{model_name}'."),
         )
     # 2. get output format & compression
-    output_format = _choose_output_format(output_format, background)
+    output_format = choose_output_format(output_format, background)
     if response_format != "b64_json":
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2287,9 +2298,7 @@ async def edit_images(
         # Encode images to base64
         image_data = [
             ImageData(
-                b64_json=encode_image_base64_with_compression(
-                    img, format=output_format, output_compression=output_compression
-                ),
+                b64_json=encode_image_base64(img, format=output_format, output_compression=output_compression),
                 revised_prompt=None,
             )
             for img in images
@@ -2625,18 +2634,6 @@ async def _load_input_images(
     # sees the request -- root cause of the "online 3 magnets vs offline 1
     # magnet" systematic semantic mismatch.
     return [img.convert("RGB") for img in images]
-
-
-def _choose_output_format(output_format: str | None, background: str | None) -> str:
-    # Normalize and choose extension
-    fmt = (output_format or "").lower()
-    if fmt in {"jpg", "png", "webp", "jpeg"}:
-        return fmt
-    # If transparency requested, prefer png
-    if (background or "auto").lower() == "transparent":
-        return "png"
-    # Default
-    return "jpeg"
 
 
 def apply_stage_default_sampling_params(

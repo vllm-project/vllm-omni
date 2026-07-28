@@ -68,6 +68,37 @@ response = client.chat.completions.create(
     `ChatCompletionRequest` schema. The fields are still stored internally
     and correctly forwarded to the diffusion pipeline.
 
+## Choosing the image output format
+
+The returned image is embedded as a base64 data URL inside the assistant
+message content (`choices[0].message.content[0].image_url.url`). Pass keys
+under `vllm_xargs` to control how that image is encoded:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `image_format` | string | `"png"` | One of `png`, `jpeg`/`jpg`, `webp`. Unknown values fall back to `png`. |
+| `image_compression` | integer | `100` | Quality (1-100). Out-of-range values are clamped. |
+| `image_background` | string | `"auto"` | Set to `"transparent"` to force PNG when `image_format` is omitted. |
+
+```bash
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "A beautiful landscape painting"}
+    ],
+    "extra_body": {"num_inference_steps": 50, "seed": 42},
+    "vllm_xargs": {
+      "image_format": "webp",
+      "image_compression": 80
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' \
+    | cut -d',' -f2- | base64 -d > out.webp
+```
+
+The data URL's MIME type follows the resolved format (e.g. `data:image/webp;base64,...`).
+`jpg` is canonicalized to `jpeg` so the MIME stays IANA-compliant.
+
 ## Model-Specific Examples
 
 For complete examples with full request/response details, see the model-specific

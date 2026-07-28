@@ -26,9 +26,12 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
+    choose_output_format,
     encode_image_base64,
+    get_vllm_image_params,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.protocol.images import ImageGenerationRequest
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -109,6 +112,125 @@ def test_encode_image_base64():
     # Verify properties
     assert decoded_img.size == (64, 64)
     assert decoded_img.format == "PNG"
+
+
+@pytest.mark.parametrize(
+    "fmt,expected_pil_format",
+    [("png", "PNG"), ("jpeg", "JPEG"), ("jpg", "JPEG"), ("webp", "WEBP")],
+)
+def test_encode_image_base64_format_roundtrip(fmt, expected_pil_format):
+    """Each supported format encodes and decodes back with the right PIL format tag."""
+    img = Image.new("RGB", (64, 64), color="blue")
+    b64_str = encode_image_base64(img, format=fmt)
+
+    decoded = base64.b64decode(b64_str)
+    decoded_img = Image.open(io.BytesIO(decoded))
+    assert decoded_img.format == expected_pil_format
+    assert decoded_img.size == (64, 64)
+
+
+def test_encode_image_base64_compression_changes_size():
+    """Lower JPEG quality should produce smaller payloads than higher quality."""
+    img = Image.new("RGB", (256, 256))
+    # Add some structure so JPEG actually has something to compress
+    for y in range(256):
+        for x in range(256):
+            img.putpixel((x, y), ((x * 7) % 256, (y * 11) % 256, ((x + y) * 13) % 256))
+
+    high = encode_image_base64(img, format="jpeg", output_compression=95)
+    low = encode_image_base64(img, format="jpeg", output_compression=10)
+    assert len(low) < len(high)
+
+
+def test_encode_image_base64_jpeg_flattens_rgba():
+    """RGBA→JPEG should flatten transparency over white instead of crashing."""
+    img = Image.new("RGBA", (32, 32), color=(255, 0, 0, 0))  # fully transparent red
+    b64_str = encode_image_base64(img, format="jpeg")
+    decoded = Image.open(io.BytesIO(base64.b64decode(b64_str)))
+    assert decoded.format == "JPEG"
+    assert decoded.mode == "RGB"
+    # Fully-transparent pixel should be flattened to white background.
+    r, g, b = decoded.getpixel((0, 0))
+    assert r > 240 and g > 240 and b > 240
+
+
+def test_encode_image_base64_rejects_unsupported_format():
+    img = Image.new("RGB", (8, 8))
+    with pytest.raises(ValueError, match="Unsupported output format"):
+        encode_image_base64(img, format="bmp")
+
+
+def test_choose_output_format_passthrough():
+    # "jpg" is canonicalised to "jpeg" so downstream MIME types use the IANA name.
+    expected = {"png": "png", "jpeg": "jpeg", "jpg": "jpeg", "webp": "webp"}
+    for fmt, expect in expected.items():
+        assert choose_output_format(fmt, "auto") == expect
+        assert choose_output_format(fmt.upper(), "auto") == expect
+
+
+def test_choose_output_format_transparent_prefers_png():
+    assert choose_output_format(None, "transparent") == "png"
+    # Unknown format with transparent background still resolves to png.
+    assert choose_output_format("tiff", "transparent") == "png"
+
+
+def test_choose_output_format_default_jpeg():
+    assert choose_output_format(None, "auto") == "jpeg"
+    assert choose_output_format("", None) == "jpeg"
+
+
+def test_get_vllm_image_params_defaults():
+    assert get_vllm_image_params(None) == ("png", 100, "auto")
+    assert get_vllm_image_params({}) == ("png", 100, "auto")
+
+
+def test_get_vllm_image_params_clamps_compression():
+    # Above range clamps to 100, below to 1.
+    _, c_high, _ = get_vllm_image_params({"image_compression": 500})
+    assert c_high == 100
+    _, c_low, _ = get_vllm_image_params({"image_compression": -5})
+    assert c_low == 1
+
+
+def test_get_vllm_image_params_rejects_unknown_format():
+    fmt, _, _ = get_vllm_image_params({"image_format": "tiff"})
+    assert fmt == "png"  # unknown → safe default
+
+
+def test_get_vllm_image_params_normalizes_format_case():
+    fmt, c, bg = get_vllm_image_params(
+        {"image_format": "  WEBP ", "image_compression": 75, "image_background": "transparent"}
+    )
+    assert fmt == "webp"
+    assert c == 75
+    assert bg == "transparent"
+
+
+def test_image_generation_request_validates_output_format():
+    req = ImageGenerationRequest(prompt="hi", output_format="WEBP")
+    assert req.output_format == "webp"
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="hi", output_format="bmp")
+
+
+def test_image_generation_request_validates_compression_range():
+    # Pydantic field bounds reject out-of-range values at the protocol layer.
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="hi", output_compression=0)
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="hi", output_compression=101)
+    ok = ImageGenerationRequest(prompt="hi", output_compression=50)
+    assert ok.output_compression == 50
+
+
+def test_image_generation_request_no_duplicate_output_format():
+    """Guard against the prior bug where output_format was declared twice."""
+    fields = ImageGenerationRequest.model_fields
+    output_format_count = sum(1 for name in fields if name == "output_format")
+    assert output_format_count == 1
+    # Ensure background and output_compression are real fields, not stuck as Form sentinels.
+    assert "background" in fields
+    assert "output_compression" in fields
 
 
 # Integration Tests (with mocking)

@@ -139,6 +139,9 @@ Content-Type: application/json
 | `n` | integer | 1 | Number of images to generate (1-10) |
 | `size` | string | model defaults | Image dimensions in WxH format (e.g., "1024x1024", "512x512") |
 | `response_format` | string | "b64_json" | Response format (`"b64_json"` or `"file"`) |
+| `output_format` | string | "png" | Encoding of the returned image. One of `png`, `jpeg`/`jpg`, `webp`. `jpg` is canonicalized to `jpeg`. |
+| `output_compression` | integer | 100 | Quality (1-100). For `jpeg`/`webp` it is the encoder quality (100 = best). For `png` it maps to PIL's `compress_level` (100 = no compression / largest file). |
+| `background` | string | "auto" | Background handling. Set to `transparent` to force PNG output regardless of `output_format`. |
 | `user` | string | null | User identifier for tracking |
 
 #### vllm-omni Extension Parameters
@@ -196,6 +199,24 @@ response = requests.post(
     }
 )
 ```
+
+### Output Format and Compression
+
+Return WebP at quality 80:
+
+```bash
+curl -X POST http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a glowing teapot in space",
+    "size": "512x512",
+    "seed": 42,
+    "output_format": "webp",
+    "output_compression": 80
+  }' | jq -r '.data[0].b64_json' | base64 -d > out.webp
+```
+
+`output_format=jpg` is treated as `jpeg`. Setting `background=transparent` forces PNG.
 
 ## Parameter Handling
 
