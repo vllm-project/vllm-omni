@@ -141,6 +141,12 @@ class LTXRuntime(
         self.model_version = detect_ltx_model_version(od_config.model)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        if getattr(od_config, "cache_backend", "none") == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support cache_backend='cache_dit'. "
+                "Cache-DiT currently supports only one-stage LTX recipes; multi-stage recipes require "
+                "phase-aware cache enable and refresh."
+            )
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)

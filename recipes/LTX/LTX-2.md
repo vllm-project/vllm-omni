@@ -40,6 +40,55 @@ files from `Lightricks/LTX-2` or `Lightricks/LTX-2.3` respectively:
 The runtime searches the model root, `VLLM_OMNI_LTX_ARTIFACTS_DIR`, then the
 matching Lightricks Hub repository.
 
+## Diffusion Feature Matrix
+
+The table is pipeline-specific. A model-level LTX support mark elsewhere in
+the documentation does not imply that every multi-stage entry supports that
+feature.
+
+| Diffusion feature | `LTX2Pipeline` | `LTX2TwoStagePipeline` | `LTX2DistilledPipeline` |
+|---|:---:|:---:|:---:|
+| T2V / I2V | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+| Request-level batching | ✅ | ❌ | ❌ |
+| Custom sigma schedule | ✅ | ❌ | ❌ |
+| Request video/audio latents | ✅ | ❌ | ❌ |
+| CFG | ✅ | ⚠️ Stage 1 | — positive-only |
+| STG | ✅ | ⚠️ Stage 1 | — positive-only |
+| Cross-modality guidance / rescale | ✅ | ⚠️ Stage 1 | — positive-only |
+| Tensor parallel | ✅ | ✅ | ✅ |
+| Ulysses sequence parallel | ✅ | ✅ | ✅ |
+| Ring sequence parallel | ⚠️ | ⚠️ | ⚠️ |
+| CFG parallel | ⚠️ CFG-only | ⚠️ Stage 1, CFG-only | — |
+| HSDP | ✅ | ✅ | ✅ |
+| Pipeline parallel | ❌ | ❌ | ❌ |
+| Expert parallel | — | — | — |
+| Module-wise CPU offload | ✅ | ✅ | ✅ |
+| Layerwise CPU offload | ✅ | ✅ | ✅ |
+| VAE patch parallel decode | ✅ | ✅ | ✅ |
+| Quantization | ⚠️ | ⚠️ | ⚠️ |
+| Internal distilled LoRA | — | ✅ dynamic/resident | — merged weights |
+| Cache-DiT | ✅ | ❌ | ❌ |
+| TeaCache | ❌ | ❌ | ❌ |
+| Step execution | ❌ | ❌ | ❌ |
+
+Legend: ✅ supported; ⚠️ supported with the restriction shown below; ❌
+explicitly unsupported; — not applicable.
+
+- Ring SP requires the logical audio latent length to be divisible by the SP
+  size because it cannot consume the key-padding mask; otherwise use pure
+  Ulysses.
+- CFG parallel supports only a two-branch CFG plan. Disable STG and modality
+  guidance and set both rescale fields to `0.0`.
+- Quantization support depends on the checkpoint format and LoRA strategy.
+  Dynamic phase LoRA can reuse an online-quantized base. Resident phase LoRA
+  requires an unquantized checkpoint so the adapter can be merged before
+  online quantization; serialized quantized checkpoints are rejected.
+- Cache-DiT is deliberately limited to `LTX2Pipeline`. Multi-stage entries
+  need phase-aware cache enable/refresh across different denoise schedules and,
+  in resident mode, different Transformer instances. They fail at startup when
+  `cache_backend="cache_dit"` is requested instead of silently running an
+  uncached or stale-cache Stage 2.
+
 ## API Migration
 
 Only `req` may be passed positionally to `LTX2Pipeline`; every optional

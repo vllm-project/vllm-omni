@@ -68,6 +68,7 @@ class LTXPipelineRecipe:
     allow_request_latents: bool = True
     allow_negative_prompt: bool = True
     fixed_num_inference_steps: bool = False
+    supports_cache_dit: bool = False
 
     def __post_init__(self) -> None:
         if not self.phases:
@@ -108,13 +109,16 @@ def _official_guidance(stg_block: int) -> LTXGuidanceSpec:
 
 
 LTX2_ONE_STAGE_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     phases=(LTXPhaseRecipe(name="generate", guidance=_official_guidance(29)),),
 )
 LTX23_ONE_STAGE_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     num_inference_steps=30,
     phases=(LTXPhaseRecipe(name="generate", guidance=_official_guidance(28)),),
 )
 LTX_POSITIVE_ONLY_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     phases=(
         LTXPhaseRecipe(
             name="generate",
