@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX23_TWO_STAGE_COMPONENT_PROFILE,
     _install_connector_attention,
     detect_ltx_model_version,
+    resolve_ltx_artifact,
     resolve_ltx_component_profile,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
@@ -203,6 +204,30 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
 
     (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
     assert detect_ltx_model_version(str(tmp_path)) == "2"
+
+
+def test_ltx_artifact_directory_is_an_authoritative_override(tmp_path, monkeypatch):
+    artifacts_dir = tmp_path / "sidecars"
+    artifacts_dir.mkdir()
+    filename = "ltx-sidecar.safetensors"
+    expected = artifacts_dir / filename
+    expected.write_bytes(b"sidecar")
+    monkeypatch.setenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", str(artifacts_dir))
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
+
+    assert resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == str(expected)
+
+    with pytest.raises(FileNotFoundError, match="does not contain required LTX artifact"):
+        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", "missing.safetensors")
+
+
+def test_ltx_artifact_falls_back_to_model_root_without_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", raising=False)
+    filename = "ltx-sidecar.safetensors"
+    expected = tmp_path / filename
+    expected.write_bytes(b"sidecar")
+
+    assert resolve_ltx_artifact(str(tmp_path), "Lightricks/test", filename) == str(expected)
 
 
 @pytest.mark.parametrize(
@@ -1268,7 +1293,6 @@ def _make_phase_weight_factory_pipeline():
         transformer=object(),
         od_config=SimpleNamespace(
             model="unused",
-            model_paths={"distilled_lora": "/models/distilled.safetensors"},
             lora_path=None,
             dtype=torch.float32,
         ),
