@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+# minicpm-challenge branch: skip entire Intel/XPU CI (no pipeline upload => no image build / tests).
+echo "--- Skipping Intel/XPU CI on this branch (including image build)"
+exit 0
+
 source .buildkite/common/scripts/resolve_skip_ci.sh
 
 upload_pipeline() {

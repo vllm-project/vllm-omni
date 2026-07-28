@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# minicpm-challenge branch: skip entire AMD CI (no pipeline upload => no image build / tests).
+echo "--- Skipping AMD CI on this branch (including image build)"
+exit 0
+
 source .buildkite/common/scripts/resolve_skip_ci.sh
 
 if [[ -z "${RUN_ALL:-}" ]]; then
