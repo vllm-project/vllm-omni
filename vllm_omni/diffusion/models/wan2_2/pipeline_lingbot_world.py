@@ -1164,6 +1164,10 @@ class LingBotWorldCausalDMDPipeline(
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
+        # The direct/offline cache is request-local and no longer needed once
+        # all latent blocks have been generated. Release it before VAE decode
+        # so the two large allocations do not overlap.
+        cache = None
         if tick is not None:
             assert session_state is not None
             session_state.prompt = inputs.prompt
