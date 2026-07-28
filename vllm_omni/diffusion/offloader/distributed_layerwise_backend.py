@@ -637,24 +637,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # __init__.  Save them before meta conversion and restore after
         # mmap loading, so we don't need model-specific buffer rebuild code.
         #
-        # Fail closed for unsupported configurations BEFORE to_empty,
-        # because to_empty("meta") may strip the weight_loader attribute.
+        # Fail closed for unsupported configurations BEFORE to_empty.
         # The mmap path bypasses AutoWeightsLoader, which means TP-aware
         # weight_loader callbacks (fused QKV, row-parallel, etc.) are not
-        # invoked.  Detect TP-sharded params by checking for the
-        # `weight_loader` attribute (set by RowParallelLinear / QKVParallelLinear
-        # when TP > 1).  If found, reject to prevent silently incorrect weights.
-        tp_aware_params = [
-            name
-            for name, param in pipeline.named_parameters()
-            if hasattr(param, "weight_loader")
-            and getattr(param.weight_loader, "__name__", "") != "default_weight_loader"
-        ]
-        if tp_aware_params:
+        # invoked.  When TP > 1, these callbacks shard weights across TP
+        # ranks — skipping them produces incorrect weights.
+        # Check the actual TP world size from parallel_state (initialized
+        # before enable()).  Note: params may have custom weight_loader
+        # attributes even at TP=1 (e.g. QKVParallelLinear), so we cannot
+        # reject based on attribute presence alone.
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_world = get_tensor_model_parallel_world_size()
+        except Exception:
+            tp_world = 1
+        if tp_world > 1:
             raise ValueError(
                 "Distributed layerwise offload with mmap loading does not "
-                f"support Tensor Parallel (TP > 1). Found {len(tp_aware_params)} params with "
-                f"TP-aware weight_loader callbacks (first: {tp_aware_params[0]}). Use DP or SP "
+                "support Tensor Parallel (TP > 1). TP-aware weight_loader "
+                "callbacks are bypassed by the mmap path. Use DP or SP "
                 "instead of TP, or disable distributed layerwise offload."
             )
 

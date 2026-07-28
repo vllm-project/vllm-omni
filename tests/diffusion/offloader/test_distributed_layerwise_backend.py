@@ -540,8 +540,8 @@ class TestOffloadPlan:
 class TestMmapValidation:
     """Tests for mmap loader validation: TP rejection, strict check, validate_loaded_weights."""
 
-    def test_tp_aware_params_rejected(self, tmp_path, patched_offload_runtime):
-        """Params with non-default weight_loader should be rejected."""
+    def test_tp_rejected_when_tp_world_size_gt_1(self, tmp_path, patched_offload_runtime, monkeypatch):
+        """DLO+AllGather should reject when TP world size > 1."""
         import json
         from types import SimpleNamespace
 
@@ -549,31 +549,29 @@ class TestMmapValidation:
 
         from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 
-        class TPParam(nn.Parameter):
-            pass
+        # Mock TP world size = 2
+        monkeypatch.setattr(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            lambda: 2,
+        )
 
-        def tp_weight_loader(param, weight):
-            param.data.copy_(weight)
-
-        class ModelWithTP(nn.Module):
+        class SimpleModel(nn.Module):
             _layerwise_offload_blocks_attrs = ["blocks"]
 
             def __init__(self):
                 super().__init__()
-                self.linear = nn.Linear(4, 4, bias=False)
-                self.linear.weight.weight_loader = tp_weight_loader
                 self.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False)])
 
-        class PipelineWithTP(nn.Module):
+        class SimplePipeline(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer = ModelWithTP()
+                self.transformer = SimpleModel()
 
             @staticmethod
             def _remap_ckpt_key(key):
                 return key
 
-        pipeline = PipelineWithTP()
+        pipeline = SimplePipeline()
         weights = {name: torch.ones(p.shape, dtype=p.dtype) for name, p in pipeline.named_parameters() if not p.is_meta}
         save_file(weights, str(tmp_path / "model.safetensors"))
         (tmp_path / "model.safetensors.index.json").write_text(
@@ -582,7 +580,9 @@ class TestMmapValidation:
 
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
-                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False, model_path=str(tmp_path)
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                model_path=str(tmp_path),
             ),
             torch.device("cpu"),
         )
@@ -590,6 +590,64 @@ class TestMmapValidation:
 
         with pytest.raises(ValueError, match="Tensor Parallel"):
             backend._load_weights_via_mmap(pipeline, modules)
+
+    def test_tp_allowed_when_tp_world_size_eq_1(self, tmp_path, patched_offload_runtime, monkeypatch):
+        """DLO+AllGather should work when TP world size = 1, even if params
+        have custom weight_loader attributes (e.g. QKVParallelLinear at TP=1)."""
+        import json
+        from types import SimpleNamespace
+
+        from safetensors.torch import save_file
+
+        from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+
+        # Mock TP world size = 1 (default)
+        monkeypatch.setattr(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+
+        def custom_weight_loader(param, weight):
+            param.data.copy_(weight)
+
+        class ModelWithCustomLoader(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4, bias=False)
+                # Simulate QKVParallelLinear: custom weight_loader even at TP=1
+                self.linear.weight.weight_loader = custom_weight_loader
+                self.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+
+        class PipelineWithLoader(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = ModelWithCustomLoader()
+
+            @staticmethod
+            def _remap_ckpt_key(key):
+                return key
+
+        pipeline = PipelineWithLoader()
+        weights = {name: torch.ones(p.shape, dtype=p.dtype) for name, p in pipeline.named_parameters() if not p.is_meta}
+        save_file(weights, str(tmp_path / "model.safetensors"))
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {k: "model.safetensors" for k in weights}})
+        )
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                model_path=str(tmp_path),
+            ),
+            torch.device("cpu"),
+        )
+        modules = SimpleNamespace(dits=[pipeline.transformer], dit_names=["transformer"])
+
+        # Should NOT raise — TP=1 is allowed even with custom weight_loader
+        backend._load_weights_via_mmap(pipeline, modules)
 
     def test_validate_loaded_weights_called(self, tmp_path, patched_offload_runtime):
         """validate_loaded_weights should be called after mmap loading."""
