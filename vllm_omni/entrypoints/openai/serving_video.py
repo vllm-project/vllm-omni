@@ -60,6 +60,19 @@ class ReferenceAudio:
 
 
 @dataclass
+class ReferenceConditionAnchor:
+    """One decoded anchor for multi-anchor frame conditioning (FLF2V / FMLF).
+
+    Carries the decoded PIL image together with the per-anchor latent ``index``
+    and ``strength`` from the HTTP request, ready for the pipeline to consume.
+    """
+
+    data: Image.Image
+    index: int
+    strength: float
+
+
+@dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
 
@@ -118,6 +131,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        reference_conditions: list[ReferenceConditionAnchor] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -140,6 +154,18 @@ class OmniOpenAIServingVideo:
             target_size = (vp.width, vp.height)
             if input_image.size != target_size:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+        if reference_conditions and vp.width is not None and vp.height is not None:
+            target_size = (vp.width, vp.height)
+            reference_conditions = [
+                ReferenceConditionAnchor(
+                    data=anchor.data.resize(target_size, Image.Resampling.LANCZOS)
+                    if anchor.data.size != target_size
+                    else anchor.data,
+                    index=anchor.index,
+                    strength=anchor.strength,
+                )
+                for anchor in reference_conditions
+            ]
         multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
             multi_modal_data["image"] = input_image
@@ -147,6 +173,8 @@ class OmniOpenAIServingVideo:
             multi_modal_data["video"] = input_video
         if reference_audio is not None:
             multi_modal_data["audio"] = reference_audio.path
+        if reference_conditions:
+            multi_modal_data["conditions"] = reference_conditions
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
@@ -259,6 +287,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        reference_conditions: list[ReferenceConditionAnchor] | None = None,
     ) -> VideoGenerationResponse:
         artifacts = await self._run_and_extract(
             request,
@@ -266,6 +295,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            reference_conditions=reference_conditions,
         )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
@@ -308,6 +338,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        reference_conditions: list[ReferenceConditionAnchor] | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -316,6 +347,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            reference_conditions=reference_conditions,
         )
         if len(artifacts.videos) > 1:
             logger.warning(

@@ -94,6 +94,33 @@ class UrlAudioReference(BaseModel):
 AudioReference = UrlAudioReference
 
 
+class VideoConditionAnchor(BaseModel):
+    """One anchor in a multi-anchor frame conditioning request (FLF2V / FMLF).
+
+    Used by pipelines that accept a list of frames anchored at specific latent
+    indices (e.g. ``LTX2ConditionPipeline``). Mirrors the ``ImageReference``
+    convention: ``image_url`` accepts ``data:`` URLs (base64) and
+    ``http(s)://`` URLs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_url: str = Field(
+        ...,
+        description="Image source for this anchor. Accepts a data: URL (base64) or http(s):// URL.",
+    )
+    index: int = Field(
+        ...,
+        description="Latent frame index for this anchor. Negative values resolve from the end (-1 = last).",
+    )
+    strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Per-anchor conditioning strength (1.0 = hard pin, 0.0 = no-op).",
+    )
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -127,6 +154,17 @@ class VideoGenerationRequest(BaseModel):
     audio_reference: AudioReference | None = Field(
         default=None,
         description="Optional audio reference for speech-to-video. Provide audio_url (http(s) or data URL).",
+    )
+
+    conditions: list[VideoConditionAnchor] | None = Field(
+        default=None,
+        description=(
+            "Multi-anchor frame conditioning (FLF2V / FMLF). Each entry pins the latent at `index` "
+            "to the image at `image_url` with `strength`. Consumed by pipelines that support "
+            "multi-anchor conditioning (e.g., `LTX2ConditionPipeline`). Anchors are resized to the "
+            "output resolution, so keep base64 `data:` images small (or use an http(s) URL) to stay "
+            "under the multipart request size limit."
+        ),
     )
 
     # Video params block for extensibility
