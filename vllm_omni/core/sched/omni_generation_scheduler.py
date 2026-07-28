@@ -47,6 +47,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
@@ -145,12 +146,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Fast path selection and scheduling for one-shot generation requests,
         # independent of pooling_params.
-        while (
-            self.waiting
-            and token_budget > 0
-            and len(self.running) < self.max_num_running_reqs
-            and self._pause_state == PauseState.UNPAUSED
-        ):
+        while self.waiting and token_budget > 0 and self._pause_state == PauseState.UNPAUSED:
+            # Requests waiting for their next chunk are temporarily absent
+            # from `running`, but stateful models still retain their model
+            # runner slot. Mirror vLLM's treatment of
+            # `num_waiting_for_streaming_input` when enforcing max_num_seqs.
+            num_running = len(self.running)
+            if self._retains_state_across_chunks and self.chunk_transfer_adapter is not None:
+                num_running += self.chunk_transfer_adapter.num_running_waiting_for_chunk
+            if num_running >= self.max_num_running_reqs:
+                break
+
             request = self.waiting.peek_request()
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (

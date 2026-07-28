@@ -294,7 +294,6 @@ def talker2codec_raw_async_chunk(
                 meta=MetaStruct(
                     req_id=[req_id],
                     left_context_size=0,
-                    codec_streaming=True,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
                     stream_finished=torch.tensor(True, dtype=torch.bool),
@@ -326,7 +325,6 @@ def talker2codec_raw_async_chunk(
         meta=MetaStruct(
             req_id=[req_id],
             left_context_size=0,
-            codec_streaming=True,
             codec_chunk_frames=int(chunk_codes.shape[0]),
             codec_left_context_frames=0,
             code_flat_numel=int(codec_flat.numel()),

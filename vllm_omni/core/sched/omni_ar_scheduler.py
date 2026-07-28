@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from time import time
 from typing import Any
 
+import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -34,6 +35,51 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+
+class SampledLogprobContractError(RuntimeError):
+    """The model runner returned unusable sampled-token logprobs."""
+
+
+def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: list[int]) -> Any:
+    """Slice and validate the sampled-token logprobs for one AR request."""
+    if logprobs is None:
+        raise SampledLogprobContractError("AR logprobs were requested, but the model runner returned none")
+
+    sliced = logprobs.slice_request(req_index, len(sampled_token_ids))
+    token_rows = np.asarray(sliced.logprob_token_ids)
+    value_rows = np.asarray(sliced.logprobs)
+    expected_rows = len(sampled_token_ids)
+
+    if token_rows.ndim != 2 or value_rows.ndim != 2:
+        raise SampledLogprobContractError(
+            "AR sampled-token logprobs must be rank-2 arrays, "
+            f"got token_ids={token_rows.shape} logprobs={value_rows.shape}"
+        )
+    if token_rows.shape[0] != expected_rows or value_rows.shape[0] != expected_rows:
+        raise SampledLogprobContractError(
+            "AR sampled-token logprob row count does not match generated tokens: "
+            f"tokens={expected_rows} token_id_rows={token_rows.shape[0]} "
+            f"logprob_rows={value_rows.shape[0]}"
+        )
+    if expected_rows == 0:
+        return sliced
+    if token_rows.shape[1] == 0 or value_rows.shape[1] == 0:
+        raise SampledLogprobContractError("AR sampled-token logprob rows are empty")
+
+    sampled = np.asarray(sampled_token_ids)
+    if not np.array_equal(token_rows[:, 0], sampled):
+        mismatch = np.flatnonzero(token_rows[:, 0] != sampled)
+        first = int(mismatch[0])
+        raise SampledLogprobContractError(
+            "AR sampled-token logprobs are misaligned: "
+            f"row={first} generated_token={int(sampled[first])} "
+            f"logprob_token={int(token_rows[first, 0])}"
+        )
+    if not np.isfinite(value_rows[:, 0]).all():
+        bad_rows = np.flatnonzero(~np.isfinite(value_rows[:, 0])).tolist()
+        raise SampledLogprobContractError(f"AR sampled-token logprobs contain non-finite values at rows {bad_rows}")
+    return sliced
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -362,6 +408,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            status_before_stop = request.status
+            new_logprobs = None
+            logprob_validation_failed = False
+
+            # Validate before mutating request token state. A bad runner output
+            # is request-local: terminate only this request and keep processing
+            # the rest of the batch.
+            if (
+                generated_token_ids
+                and request.sampling_params is not None
+                and request.sampling_params.num_logprobs is not None
+            ):
+                try:
+                    new_logprobs = _slice_sampled_logprobs(logprobs, req_index, generated_token_ids)
+                except SampledLogprobContractError as exc:
+                    logger.error("Invalid AR sampled-token logprobs for request %s: %s", req_id, exc)
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.stop_reason = str(exc)
+                    request.resumable = False
+                    generated_token_ids = []
+                    logprob_validation_failed = True
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:
@@ -391,16 +458,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = False
+            stopped = logprob_validation_failed
             is_segment_finished = False
             finished = False
-            new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
-            status_before_stop = request.status
             finish_reason = None
             routed_experts = None
 
@@ -470,10 +535,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_preempted_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
-
-            # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
