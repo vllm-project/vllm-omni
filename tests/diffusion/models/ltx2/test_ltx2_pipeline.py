@@ -1323,9 +1323,7 @@ def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch)
     )
     lora_entries = [
         _LTXLoRAEntry(
-            module_name="proj",
-            target_name="proj",
-            shard_id=None,
+            source_module="proj",
             lora_a=torch.tensor([[1.0, 2.0]]),
             lora_b=torch.tensor([[3.0], [4.0]]),
         )
@@ -1529,9 +1527,7 @@ def test_ltx_resident_lora_requires_every_adapter_target(monkeypatch):
         "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights._load_resident_lora_entries",
         lambda *args: [
             _LTXLoRAEntry(
-                module_name="missing",
-                target_name="missing",
-                shard_id=None,
+                source_module="missing",
                 lora_a=torch.eye(2),
                 lora_b=torch.eye(2),
             )
