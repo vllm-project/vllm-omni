@@ -109,7 +109,7 @@ class OmniPlatform(Platform):
         cls,
         selected_backend: str | None,
         head_size: int,
-        allow_trtllm_default: bool = True,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for this platform.
 
