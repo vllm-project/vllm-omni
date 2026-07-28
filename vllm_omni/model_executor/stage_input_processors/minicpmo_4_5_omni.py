@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
-_MINICPMO45_LEFT_CONTEXT_FRAMES = 3
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -130,7 +129,7 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
-    left_context_frames = int(config.get("codec_left_context_frames", _MINICPMO45_LEFT_CONTEXT_FRAMES))
+    left_context_frames = int(config.get("codec_left_context_frames", 3))
     if chunk_frames <= 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
@@ -167,9 +166,6 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
         routed_id = routed_id or pooling_output.get("request_id")
         if routed_id is not None and str(routed_id) != request_id:
             return []
-        flat_audio = pooling_output.get("codes.audio")
-        if flat_audio is not None:
-            return _codec_scalars(flat_audio)
         codes = pooling_output.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else pooling_output.get("codes.audio")
         return _codec_scalars(audio)
@@ -203,101 +199,6 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
 def _is_aborted(request: Any) -> bool:
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
-
-
-def tts2code2wav_full_payload(
-    transfer_manager: Any,
-    pooling_output: Any,
-    request: Any,
-) -> OmniPayloadStruct:
-    """Pack complete Talker codec output for non-async transfer."""
-    external_id = getattr(request, "external_req_id", None)
-    internal_id = getattr(request, "request_id", None)
-    request_id = str(external_id if external_id is not None else internal_id)
-
-    new_codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
-    context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if new_codes else []
-    output_codes = [*context, *new_codes]
-
-    request_info = getattr(request, "additional_information", None)
-    if not isinstance(request_info, Mapping):
-        request_info = {}
-    codes_info = request_info.get("codes")
-    if not isinstance(codes_info, Mapping):
-        codes_info = {}
-    meta_info = request_info.get("meta")
-    if not isinstance(meta_info, Mapping):
-        meta_info = {}
-    duplex_info = request_info.get("duplex")
-    if not isinstance(duplex_info, Mapping):
-        duplex_info = {}
-
-    ref_audio = codes_info.get("ref")
-    finished = torch.tensor(True, dtype=torch.bool)
-    return OmniPayloadStruct(
-        codes=CodesStruct(
-            audio=torch.tensor(output_codes, dtype=torch.long),
-            ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
-        ),
-        meta=_MiniCPMO45MetaStruct(
-            request_id=request_id,
-            chunk_seq=0,
-            cache_epoch=0,
-            code_flat_numel=len(output_codes),
-            codec_chunk_frames=len(new_codes),
-            codec_left_context_frames=len(context),
-            left_context_size=len(context),
-            last_chunk=True,
-            stream_finished=finished,
-            finished=finished,
-            req_id=[request_id],
-            ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
-            native_duplex_segment_text=(
-                str(meta_info["native_duplex_segment_text"])
-                if isinstance(meta_info.get("native_duplex_segment_text"), str)
-                else None
-            ),
-            duplex_turn_id=_coerce_int(duplex_info.get("model_turn_id", duplex_info.get("turn_id"))),
-            duplex_epoch=_coerce_int(duplex_info.get("epoch")),
-            segment_end=bool(meta_info.get("segment_end", False)),
-            turn_end=bool(meta_info.get("turn_end", False)),
-            tts_is_last_chunk=True,
-        ),
-        request_id=request_id,
-    )
-
-
-def tts2code2wav_token_only(
-    source_outputs: list[Any],
-    _prompt: Any = None,
-    _requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """Build the sync Code2Wav placeholder; codec data arrives by connector."""
-    code2wav_inputs: list[OmniTokensPrompt] = []
-    for talker_output in source_outputs:
-        if not talker_output.finished:
-            continue
-        output = talker_output.outputs[0]
-        multimodal_output = getattr(output, "multimodal_output", None)
-        flat_audio = multimodal_output.get("codes.audio") if isinstance(multimodal_output, Mapping) else None
-        codes = multimodal_output.get("codes") if isinstance(multimodal_output, Mapping) else None
-        audio = flat_audio
-        if audio is None and isinstance(codes, Mapping):
-            audio = codes.get("audio")
-        codec_codes = _codec_scalars(audio)
-        if not codec_codes:
-            continue
-        prompt_len = len(codec_codes) + _MINICPMO45_LEFT_CONTEXT_FRAMES
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0] * prompt_len,
-                additional_information=None,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-    return code2wav_inputs
 
 
 def tts2code2wav_async_chunk(

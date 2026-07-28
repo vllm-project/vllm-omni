@@ -51,51 +51,6 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
-def test_full_payload_packs_all_codes_with_initial_context() -> None:
-    payload = tts2code2wav_full_payload(
-        _manager(),
-        {"codes.audio": torch.arange(7, dtype=torch.long).reshape(-1, 1)},
-        _request("req"),
-    )
-
-    assert _codes(payload) == [4218, 4218, 4218, *range(7)]
-    assert payload.meta.request_id == "req"
-    assert payload.meta.chunk_seq == 0
-    assert payload.meta.code_flat_numel == 10
-    assert payload.meta.codec_chunk_frames == 7
-    assert payload.meta.left_context_size == 3
-    assert payload.meta.last_chunk is True
-    assert payload.meta.finished.item() is True
-
-
-def test_full_payload_forwards_reference_voice_and_duplex_identity() -> None:
-    request = _request("req")
-    request.additional_information = {
-        "codes": {"ref": [0.1, -0.1]},
-        "meta": {
-            "ref_audio_sr": 16000,
-            "native_duplex_segment_text": "hello",
-            "segment_end": True,
-            "turn_end": True,
-        },
-        "duplex": {"epoch": 3, "model_turn_id": 7},
-    }
-
-    payload = tts2code2wav_full_payload(
-        _manager(),
-        {"codes": {"audio": torch.arange(7, dtype=torch.long)}},
-        request,
-    )
-
-    assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
-    assert payload.meta.ref_audio_sr == 16000
-    assert payload.meta.native_duplex_segment_text == "hello"
-    assert payload.meta.duplex_epoch == 3
-    assert payload.meta.duplex_turn_id == 7
-    assert payload.meta.segment_end is True
-    assert payload.meta.turn_end is True
-
-
 def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
 
@@ -104,26 +59,6 @@ def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     assert payload.meta.left_context_size == 0
     assert payload.meta.last_chunk is True
     assert payload.meta.finished.item() is True
-
-
-def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
-    output = SimpleNamespace(
-        finished=True,
-        outputs=[
-            SimpleNamespace(
-                multimodal_output={
-                    "codes.audio": torch.arange(7, dtype=torch.long).reshape(-1, 1),
-                    "meta.finished": torch.tensor(True),
-                }
-            )
-        ],
-    )
-
-    prompts = tts2code2wav_token_only([output])
-
-    assert len(prompts) == 1
-    assert prompts[0]["prompt_token_ids"] == [0] * 10
-    assert prompts[0]["additional_information"] is None
 
 
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])

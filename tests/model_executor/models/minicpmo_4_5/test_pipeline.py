@@ -152,7 +152,6 @@ class TestDeployTopology:
         assert "skip_mm_profiling" not in stages[0].yaml_engine_args
         assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
         assert stages[2].yaml_engine_args["skip_mm_profiling"] is True
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_async_chunk")
         assert stages[1].yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
         assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
