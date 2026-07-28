@@ -41,9 +41,7 @@ class LTXPhaseWeights(Protocol):
 
 @dataclass(frozen=True)
 class _LTXLoRAEntry:
-    module_name: str
-    target_name: str
-    shard_id: str | int | None
+    source_module: str
     lora_a: torch.Tensor
     lora_b: torch.Tensor
 
@@ -90,9 +88,7 @@ def _load_resident_lora_entries(transformer: nn.Module, path: str, dtype: torch.
     manifest = LTXAdapterParser(transformer).parse(path)
     return [
         _LTXLoRAEntry(
-            module_name=target.source_module,
-            target_name=target.module,
-            shard_id=target.slice,
+            source_module=target.source_module,
             lora_a=lora_a.to(dtype=dtype),
             lora_b=lora_b.to(dtype=dtype),
         )
@@ -150,9 +146,9 @@ class LTXResidentLoRAController:
         )
         entries_by_module: dict[str, _LTXLoRAEntry] = {}
         for entry in entries:
-            if entry.module_name in entries_by_module:
-                raise ValueError(f"Official LTX LoRA contains duplicate module {entry.module_name!r}.")
-            entries_by_module[entry.module_name] = entry
+            if entry.source_module in entries_by_module:
+                raise ValueError(f"Official LTX LoRA contains duplicate module {entry.source_module!r}.")
+            entries_by_module[entry.source_module] = entry
 
         fusion_device = torch.device(self.pipeline.device)
         if fusion_device.type == "cuda" and not torch.cuda.is_available():
@@ -174,7 +170,7 @@ class LTXResidentLoRAController:
                         f"{name} {tuple(weight.shape)}."
                     )
                 weight = weight.to(device=fusion_device) + delta
-                merged_modules.add(entry.module_name)
+                merged_modules.add(entry.source_module)
             yield name, weight
 
         missing = set(entries_by_module) - merged_modules
