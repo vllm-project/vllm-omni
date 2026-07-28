@@ -681,24 +681,16 @@ class Orchestrator:
         final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
+            # Streaming updates always follow the first-chunk add_request
+            # through the same ordered submission queue, so an unknown id
+            # here can only mean the request already finished or was
+            # aborted (e.g. the client disconnected). Re-adding it would
+            # resurrect a headless session that keeps cycling through the
+            # stages with nobody consuming its outputs (issue #4271).
             logger.warning(
-                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
-            fallback_msg = StageSubmissionMessage(
-                type="add_request",
-                request_id=msg.request_id,
-                prompt=msg.prompt,
-                original_prompt=msg.original_prompt,
-                output_prompt_text=msg.output_prompt_text,
-                sampling_params_list=msg.sampling_params_list,
-                final_stage_id=msg.final_stage_id,
-                final_output_stage_ids=msg.final_output_stage_ids,
-                preprocess_ms=msg.preprocess_ms,
-                request_timestamp=msg.request_timestamp,
-                enqueue_ts=msg.enqueue_ts,
-            )
-            await self._handle_add_request(fallback_msg)
             return
 
         if msg.sampling_params_list:

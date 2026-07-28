@@ -1813,6 +1813,56 @@ async def test_stage_pool_submit_update_refreshes_output_processor_state() -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
+    """A streaming update for an untracked request must not resurrect it.
+
+    Updates always follow the first-chunk add_request through the same
+    ordered submission queue, so an unknown id can only mean the request
+    already finished or was aborted (e.g. the client disconnected).
+    Falling back to add_request created headless sessions that kept
+    cycling through the stages (issue #4271).
+    """
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        async def submit_update(self, request_id, req_state, request, *, prompt_text=None) -> int:
+            self.calls.append((request_id, prompt_text))
+            return 0
+
+    pool = RecordingPool()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = False
+    orchestrator.request_states = {}
+    orchestrator.stage_pools = [pool]
+    add_request_calls: list[str] = []
+
+    async def record_add_request(msg) -> None:
+        add_request_calls.append(msg.request_id)
+
+    orchestrator._handle_add_request = record_add_request
+
+    await orchestrator._handle_streaming_update(
+        StageSubmissionMessage(
+            type="streaming_update",
+            request_id="req-unknown",
+            prompt=SimpleNamespace(request_id="req-unknown", prompt_token_ids=[1], resumable=True),
+            original_prompt={"prompt": "segment-2"},
+            output_prompt_text="segment-2",
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            preprocess_ms=0.0,
+            request_timestamp=time.time(),
+            enqueue_ts=time.perf_counter(),
+        )
+    )
+
+    assert pool.calls == []
+    assert add_request_calls == []
+    assert "req-unknown" not in orchestrator.request_states
+
+
 async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> None:
     class RecordingPool:
         def __init__(self) -> None:

@@ -252,6 +252,37 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
+    """A terminal stop is not a segment boundary (#5383), but the producer-side
+    processor must still receive the flush signal on the terminal chunk.
+    Passing only ``is_segment_finished`` starved processors of their final
+    accumulated payload once terminal stops stopped setting it (#5413: the
+    downstream stage got ``meta.finished`` with the tail data missing).
+    """
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-terminal")
+
+    seen_flush_flags = []
+
+    def recording_processor(**kwargs):
+        seen_flush_flags.append(kwargs["is_finished"])
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": False}
+    )
+
+    assert seen_flush_flags == [True]
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert bool(sent_payload.meta.finished.item()) is True
+    assert bool(sent_payload.meta.is_segment_finished.item()) is False
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
@@ -780,6 +811,10 @@ def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_ada
 class _HashableRequest(SimpleNamespace):
     """SimpleNamespace that can be added to a set (needed by scheduler internals)."""
 
+    # vLLM 0.26: update_from_output settles this counter for every scheduled
+    # request; real Requests initialise it to 0 (vllm/v1/request.py).
+    num_in_flight_tokens = 0
+
     def __hash__(self):
         return hash(self.request_id)
 
@@ -833,7 +868,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.requests = {"req-s1": request}
 
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
     scheduler.waiting = mocker.MagicMock()
@@ -918,7 +953,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
     scheduler.waiting = mocker.MagicMock()
@@ -1047,7 +1082,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler._pending_finish_reqs = list(pending_finish_reqs)
 
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = list(running)
     scheduler.waiting = mocker.MagicMock()
@@ -1103,7 +1138,7 @@ def test_deferred_finish_emits_finished_output(mocker: MockerFixture):
         running=[request],
         pending_finish_reqs=[request],
     )
-    scheduler._free_request.return_value = {"mock": "kv_params"}
+    scheduler._free_request.return_value = ({"mock": "kv_params"}, None)
 
     result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
 
