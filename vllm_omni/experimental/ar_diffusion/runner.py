@@ -52,6 +52,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     """
 
     _WARMUP_SID = "__ardiffusion_warmup__"
+
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
