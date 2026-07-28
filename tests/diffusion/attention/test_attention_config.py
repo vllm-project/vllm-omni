@@ -255,6 +255,7 @@ class TestMaskedAttentionFallback:
             attention=SimpleNamespace(forward=run("native")),
             sdpa_fallback=SimpleNamespace(forward=run("sdpa")),
             backend_pref=backend_name,
+            _assert_piecewise_compatible=lambda _metadata: None,
         )
         return layer, calls
 
