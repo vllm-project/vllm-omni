@@ -59,11 +59,12 @@ E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
 
 CUDA_NIGHTLY_ONLY = (
-    '(build.pull_request.labels includes "nightly-test") || (build.branch == "main" && build.env("NIGHTLY") == "1")'
+    '(build.pull_request.labels includes "nightly-test") || '
+    '(build.branch == "minicpm-challenge" && build.env("NIGHTLY") == "1")'
 )
 NPU_NIGHTLY_ONLY = (
-    '(build.branch == "main" && build.env("NIGHTLY") == "1") || '
-    '(build.branch != "main" && ('
+    '(build.branch == "minicpm-challenge" && build.env("NIGHTLY") == "1") || '
+    '(build.branch != "minicpm-challenge" && ('
     'build.pull_request.labels includes "nightly-test" || '
     'build.pull_request.labels includes "omni-test" || '
     'build.pull_request.labels includes "tts-test" || '
@@ -103,7 +104,8 @@ def _format_bootstrap_if(expr: str) -> str:
 
 def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     disabled = "false"
-    nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
+    # L4 nightly scheduled push CI runs on minicpm-challenge (not main).
+    nightly_main = 'build.branch == "minicpm-challenge" && build.env("NIGHTLY") == "1"'
     nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
 
     if platform == "npu":
@@ -118,11 +120,12 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         merge_base = disabled
     else:
         ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-        merge_main = 'build.branch == "main" && build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1"'
-        merge_pr = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
+        # L3 merge push CI runs on minicpm-challenge (not main).
+        merge_main = 'build.branch == "minicpm-challenge" && build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1"'
+        merge_pr = 'build.branch != "minicpm-challenge" && build.pull_request.labels includes "merge-test"'
         nightly_label_if = (
-            '(build.branch == "main" && build.env("NIGHTLY") == "1") || '
-            '(build.branch != "main" && ('
+            '(build.branch == "minicpm-challenge" && build.env("NIGHTLY") == "1") || '
+            '(build.branch != "minicpm-challenge" && ('
             'build.pull_request.labels includes "nightly-test" || '
             'build.pull_request.labels includes "omni-test" || '
             'build.pull_request.labels includes "tts-test" || '
@@ -140,8 +143,8 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     weekly_main = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 
     if decision.skip_all:
-        # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4 + L2/L3 (--e2e); WEEKLY=1 still runs L5.
+        # Docs / skip-mark only: no PR-label escape hatch. Scheduled
+        # NIGHTLY=1 (minicpm-challenge) still runs L4 + L2/L3 (--e2e); WEEKLY=1 (main) still runs L5.
         image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
         ready_expr = nightly_main
         merge_expr = nightly_main if platform == "cuda" else disabled

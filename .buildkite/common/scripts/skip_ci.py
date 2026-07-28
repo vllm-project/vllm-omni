@@ -282,7 +282,7 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _resolve_diff_range() -> str | None:
-    """Return a git diff range for PR or main builds, or None when unavailable."""
+    """Return a git diff range for PR or push-branch builds, or None when unavailable."""
     is_pr = os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false" and os.environ.get(
         "BUILDKITE_PULL_REQUEST", ""
     )
@@ -302,13 +302,15 @@ def _resolve_diff_range() -> str | None:
                 return None
         return f"{base_ref}...{commit}"
 
-    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
+    # main: ready/nightly/weekly push CI; minicpm-challenge: merge (L3) push CI
+    branch = os.environ.get("BUILDKITE_BRANCH", "")
+    if branch in ("main", "minicpm-challenge"):
         if _git("rev-parse", "--verify", f"{commit}^").returncode != 0:
-            _log("main commit has no parent; using safe defaults")
+            _log(f"{branch} commit has no parent; using safe defaults")
             return None
         return f"{commit}^..{commit}"
 
-    _log("not PR/main build; using safe defaults")
+    _log("not PR/main/minicpm-challenge build; using safe defaults")
     return None
 
 
