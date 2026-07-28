@@ -17,13 +17,14 @@ import cache_dit
 import pytest
 from cache_dit import ForwardPattern
 
-from vllm_omni.diffusion.cache.cache_dit_backend import (
+from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTAdapterConfig,
     CacheDiTBackend,
+    CacheDiTConfig,
 )
-from vllm_omni.diffusion.cache.magcache.backend import MagCacheBackend
+from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
-from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -31,6 +32,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class TestCacheDiTBackend:
     """Test CacheDiTBackend implementation."""
+
+    def test_config_projection_contains_only_cache_dit_fields(self):
+        shared_config = DiffusionCacheConfig(
+            Fn_compute_blocks=4,
+            max_warmup_steps=8,
+            rel_l1_thresh=0.3,
+        )
+
+        config = CacheDiTConfig.from_diffusion_config(shared_config)
+
+        assert config.Fn_compute_blocks == 4
+        assert config.max_warmup_steps == 8
+        assert not hasattr(config, "rel_l1_thresh")
 
     def test_init_with_dict(self):
         """Test initialization with dictionary config."""
@@ -47,8 +61,8 @@ class TestCacheDiTBackend:
         assert backend.config.Fn_compute_blocks == 4
         assert backend.enabled is False
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_enable_single_transformer(self, mock_cache_dit, mock_block_adapter):
         """Test enabling cache-dit on single-transformer pipeline."""
         # Mock pipeline
@@ -75,10 +89,61 @@ class TestCacheDiTBackend:
         assert backend._refresh_func is not None
         mock_cache_dit.enable_cache.assert_called_once()
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_without_model_adapter_uses_cache_dit_registry(self, mock_cache_dit, mock_logger):
+        """A missing model-declared adapter falls back to Cache-DiT's registry."""
+
+        class BuiltinTransformer:
+            pass
+
+        class BuiltinPipeline:
+            transformer = BuiltinTransformer()
+
+        pipeline = BuiltinPipeline()
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+
+        backend.enable(pipeline)
+
+        assert backend.enabled is True
+        assert backend._refresh_func is not None
+        assert mock_cache_dit.enable_cache.call_args.args[0] is pipeline.transformer
+        mock_logger.info.assert_any_call(
+            "Transformer %s does not declare _cache_dit_adapter_config; "
+            "falling back to Cache-DiT's built-in adapter registry.",
+            "BuiltinTransformer",
+        )
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_without_compatible_adapter_has_contextual_error(self, mock_cache_dit):
+        """An unsupported fallback reports both pipeline and transformer names."""
+
+        class UnsupportedTransformer:
+            pass
+
+        class UnsupportedPipeline:
+            transformer = UnsupportedTransformer()
+
+        pipeline = UnsupportedPipeline()
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        mock_cache_dit.enable_cache.side_effect = ValueError("unsupported")
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Failed to enable Cache-DiT for pipeline UnsupportedPipeline with transformer UnsupportedTransformer"
+            ),
+        ) as exc_info:
+            backend.enable(pipeline)
+
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert backend.enabled is False
+        assert backend._refresh_func is None
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_refresh(self, mock_cache_dit, mock_block_adapter):
-        """Test refreshing cache context with SCM mask policy updates when num_inference_steps changes."""
+        """Test refreshing cache context with SCM mask policy updates."""
         # Mock pipeline
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "DiTPipeline"
@@ -107,8 +172,6 @@ class TestCacheDiTBackend:
 
         # First refresh with 50 steps
         backend.refresh(mock_pipeline, num_inference_steps=50)
-        assert backend._last_num_inference_steps == 50
-
         # Verify steps_mask was called with mask policy (not direct steps mask)
         mock_cache_dit.steps_mask.assert_called_with(mask_policy="fast", total_steps=50)
         assert mock_cache_dit.steps_mask.call_count == 1
@@ -137,10 +200,28 @@ class TestCacheDiTBackend:
         call_args = mock_cache_dit.refresh_context.call_args
         assert call_args[0][0] == mock_transformer
         assert "cache_config" in call_args[1]
-        assert backend._last_num_inference_steps == 100
+        assert mock_cache_dit.refresh_context.call_count == 1
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_refresh_resets_same_step_count(self, mock_cache_dit, mock_block_adapter):
+        """Every generation must reset context, even when the step count is unchanged."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "DiTPipeline"
+        mock_pipeline.transformer = Mock()
+        mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+            block_forward_patterns={"layers": ForwardPattern.Pattern_0}
+        )
+
+        backend = CacheDiTBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+        backend.refresh(mock_pipeline, num_inference_steps=20)
+        backend.refresh(mock_pipeline, num_inference_steps=20)
+
+        assert mock_cache_dit.refresh_context.call_count == 2
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_enable_hunyuan_pipeline_uses_model_transformer(self, mock_cache_dit, mock_block_adapter):
         """Test HunyuanImage3 uses pipeline.transformer for cache enable/refresh.
 
@@ -179,8 +260,8 @@ class TestCacheDiTBackend:
         assert call_args[0][0] is mock_pipeline.model
         assert call_args[1]["num_inference_steps"] == 12
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
         """Test DreamID uses pipeline.transformer for cache enable/refresh.
 
@@ -221,8 +302,8 @@ class TestCacheDiTBackend:
         assert call_args[1]["num_inference_steps"] == 12
 
     @pytest.mark.parametrize("num_inference_steps", [1, 7])
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_refresh_scm_bypassed_for_unsupported_step_counts(
         self, mock_cache_dit, mock_block_adapter, num_inference_steps
     ):
@@ -361,8 +442,6 @@ class TestCacheSelector:
 
 class TestMagCacheBackend:
     """Test MagCacheBackend implementation."""
-
-    from vllm_omni.diffusion.cache.magcache.backend import MagCacheBackend
 
     def test_init(self):
         """Test initialization."""

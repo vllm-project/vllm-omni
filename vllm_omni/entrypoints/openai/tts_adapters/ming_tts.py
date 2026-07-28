@@ -3,13 +3,14 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
+
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-
-from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -33,6 +34,8 @@ class MingTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         server = self.ctx.server
         ref_audio_source = request.ref_audio
+        uploaded_audio_voice = None
+        uploaded_audio_created_at = 0
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
         if ref_audio_source is None and voice_lower in server.uploaded_speakers:
             speaker_info = server.uploaded_speakers[voice_lower]
@@ -47,17 +50,20 @@ class MingTTSAdapter(ARTTSAdapter):
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing")
                 if request.ref_text is None:
                     request.ref_text = speaker_info.get("ref_text")
+                uploaded_audio_voice = voice_lower
+                uploaded_audio_created_at = server._voice_created_at(voice_lower)
         ref_audio_data = None
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
-            if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio(ref_audio_data)
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
             wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
-            if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio([ref_audio_data])[0]
-        prompt = server._build_ming_dense_prompt(request, ref_audio_data=ref_audio_data)
+        prompt = server._build_ming_dense_prompt(
+            request,
+            ref_audio_data=ref_audio_data,
+            voice_name=uploaded_audio_voice,
+            voice_created_at=uploaded_audio_created_at,
+        )
         tts_params = prompt.get("additional_information", {})
         # Ming stop-token / max_tokens sampling stays in the orchestrator tail.
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
@@ -73,11 +79,12 @@ class MingTTSAdapter(ARTTSAdapter):
             if not request.speaker_embedding:
                 return "'speaker_embedding' must be a non-empty list of floats"
             emb_len = len(request.speaker_embedding)
-            if emb_len != 192:
+            if emb_len != SPEAKER_EMBEDDING_DIM:
                 logger.warning(
-                    "speaker_embedding has %d dimensions; Ming dense expects 192. "
+                    "speaker_embedding has %d dimensions; Ming dense expects %d. "
                     "Wrong dimensions will likely fail or degrade output.",
                     emb_len,
+                    SPEAKER_EMBEDDING_DIM,
                 )
 
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
@@ -127,8 +134,10 @@ class MingTTSAdapter(ARTTSAdapter):
                 )
             if embeddings and isinstance(embeddings[0], list):
                 for item in embeddings:
-                    if len(item) != 192:
-                        return "Podcast-style Ming speaker embeddings must each have 192 dimensions"
+                    if len(item) != SPEAKER_EMBEDDING_DIM:
+                        return (
+                            f"Podcast-style Ming speaker embeddings must each have {SPEAKER_EMBEDDING_DIM} dimensions"
+                        )
 
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"

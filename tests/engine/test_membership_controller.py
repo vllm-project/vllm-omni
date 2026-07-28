@@ -11,6 +11,7 @@ import pytest
 
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.engine.membership_controller import MembershipController
+from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -45,10 +46,10 @@ class FakePool:
     def attach_load_balancer(self, lb):
         self.lb = lb
 
-    def add_client(self, input_addr, client):
-        self.added.append((input_addr, client))
+    def add_client(self, input_addr, client, *, replica_id=None):
+        self.added.append((input_addr, client, replica_id))
         self.clients.append(client)
-        return len(self.clients) - 1
+        return len(self.clients) - 1 if replica_id is None else replica_id
 
     def invalidate_addr(self, input_addr):
         self.invalidated.append(input_addr)
@@ -155,4 +156,35 @@ async def test_do_register_offloads_remote_factory(monkeypatch):
 
     assert factory_thread_ids
     assert factory_thread_ids[0] != threading.get_ident()
-    assert pool.added[0][0] == "tcp://stage-0-replica-1"
+    assert pool.added[0] == ("tcp://stage-0-replica-1", pool.clients[0], 1)
+
+
+@pytest.mark.asyncio
+async def test_unregister_then_register_restores_coordinator_replica_slot(monkeypatch):
+    class Client:
+        def __init__(self, input_addr: str) -> None:
+            self.client_addresses = {"input_address": input_addr}
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    old_clients = [Client("tcp://old-0"), Client("tcp://old-1")]
+    replacement = Client("tcp://new-1")
+    pool = StagePool(0, old_clients)
+
+    def factory(stage_id: int, replica_id: int):
+        assert (stage_id, replica_id) == (0, 1)
+        return replacement
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=factory)
+    await controller.handle_unregister(0, "tcp://old-0")
+    await controller.handle_unregister(0, "tcp://old-1")
+
+    await controller.handle_register(0, 1)
+    await controller.drain_tasks(timeout=1)
+
+    assert pool.clients == [None, replacement]
+    assert pool.get_replica_id_by_addr("tcp://new-1") == 1
+    assert pool.get_replica_id_by_addr("tcp://old-1") is None
+    assert pool.available_replica_ids() == [1]

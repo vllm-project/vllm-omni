@@ -149,14 +149,17 @@ def _apply_diffusion_parallel_runtime_overrides(
             continue
         if parallel_config_dict is None:
             parallel_config_dict = {}
-        if key in ("ulysses_degree", "ring_degree"):
+        if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
             degree_overridden = True
         parallel_config_dict[key] = runtime_overrides.pop(key)
 
     if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+        allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = (
+            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+        )
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -220,6 +223,9 @@ class StagePipelineConfig:
     hf_config_name: str | None = None
     engine_output_type: str | None = None
     model_arch: str | None = None
+    # The model keeps per-request execution state while awaiting the next
+    # async chunk, so the parked request continues to consume model capacity.
+    retains_state_across_chunks: bool = False
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -270,6 +276,15 @@ class PipelineConfig:
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    duplex_runtime_extension: str | None = None
+    # Optional model-owned Serving adapter loaded only when the Realtime duplex
+    # endpoint is enabled. Generic OpenAI modules must not select a model.
+    duplex_serving_adapter: str | None = None
+    # Explicitly enable the stable duplex control mechanism. This is separate
+    # from the optional model extension because turn-commit-only deployments
+    # do not require a model planner.
+    duplex_control_enabled: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
@@ -357,6 +372,7 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
@@ -375,6 +391,8 @@ class StageDeployConfig:
     diffusion_attention_config: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
@@ -406,6 +424,38 @@ class StageDeployConfig:
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class DuplexSessionRuntimeConfig:
+    """Server-owned lifecycle and per-session buffering limits."""
+
+    idle_ttl_s: float | None = 300.0
+    disconnect_grace_s: float = 30.0
+    reaper_interval_s: float = 5.0
+    resume_replay_ttl_s: float = 60.0
+    resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
+    max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
+    max_pending_turns_per_session: int = 4
+    max_sessions: int = 1
+    completed_append_cache_size: int = 256
+
+    def __post_init__(self) -> None:
+        positive = {
+            "disconnect_grace_s": self.disconnect_grace_s,
+            "reaper_interval_s": self.reaper_interval_s,
+            "resume_replay_ttl_s": self.resume_replay_ttl_s,
+            "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
+            "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
+            "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_sessions": self.max_sessions,
+            "completed_append_cache_size": self.completed_append_cache_size,
+        }
+        if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
+            raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"duplex_session.{name} must be positive")
+
+
 @dataclass
 class DeployConfig:
     """Loaded from deploy/<model>.yaml — the only config file users edit.
@@ -419,8 +469,10 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    session_mode: str = "turn"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -610,7 +662,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "session_mode": raw_dict.get("session_mode", "turn"),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
+        "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -770,7 +824,8 @@ def _build_engine_args(
     per-stage StageDeployConfig overrides take precedence when present (e.g.
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
-    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
+    engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
@@ -876,6 +931,10 @@ def merge_pipeline_deploy(
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
         input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        # Downstream stages may share a multimodal wrapper class without owning
+        # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
+        if not ps.requires_multimodal_data:
+            engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
             engine_args.get("async_scheduling", True),
@@ -896,6 +955,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
@@ -922,6 +982,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
@@ -984,6 +1045,7 @@ class StageConfig:
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
             "stage_type": StageType(self.stage_type).value,
+            "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
             "engine_input_source": self.input_sources,  # Legacy field name

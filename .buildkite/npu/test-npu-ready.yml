@@ -1,13 +1,13 @@
 steps:
-  - group: ":card_index_dividers: TTS Model Test"
-    key: ready-tts-group
+  - group: ":card_index_dividers: Omni Model Test"
+    key: ready-omni-group
     depends_on: upload-ready-pipeline
     steps:
-      - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
+      - label: ":robot: Omni · MiniCPM-o 4.5 Test"
         agents:
-          queue: "ascend-a2b3"
-          resource_class: "npu-1"
-        image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+          queue: "ascend-a3"
+          resource_class: "npu-2"
+        image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
         plugins:
           - kubernetes:
               podSpecPatch:
@@ -18,4 +18,17 @@ steps:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'
+          - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
+
+  - group: ":card_index_dividers: TTS Model Test"
+    key: ready-tts-group
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
+        mirror_hardwares: a2b3_npu_1
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model and npu' --run-level 'core_model'

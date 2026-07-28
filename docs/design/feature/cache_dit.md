@@ -32,10 +32,13 @@ The library supports three main caching strategies:
 
 vLLM-omni integrates cache-dit through the `CacheDiTBackend` class, which provides a unified interface for managing cache-dit acceleration on diffusion models.
 
+Code outside `vllm_omni/diffusion/cache` must import Cache-DiT symbols from the
+package-level API: `vllm_omni.diffusion.cache.cachedit`.
+
 | Method/Class | Purpose | Behavior |
 |--------------|---------|----------|
-| [`CacheDiTBackend`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/#vllm_omni.diffusion.cache.CacheBackend) | Unified backend interface | Automatically handles enabler selection and cache refresh |
-| [`enable_cache_for_dit()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_dit) | Apply caching to transformer | Configures DBCache on transformer blocks |
+| `CacheDiTBackend` | Unified backend interface | Automatically handles enabler selection and cache refresh |
+| `enable_cache_for_dit()` | Apply caching to transformer | Configures DBCache on transformer blocks |
 
 **Key APIs from Cache-DiT:**
 
@@ -47,7 +50,7 @@ vLLM-omni integrates cache-dit through the `CacheDiTBackend` class, which provid
 | `ForwardPattern` | Defines block forward signature patterns: `Pattern_0`, `Pattern_1`, `Pattern_2` |
 | `ParamsModifier` | Per-transformer or per-block-list cache configuration customization |
 | `DBCacheConfig` | Configuration for DBCache parameters (warmup steps, cached steps, thresholds) |
-| `refresh_context()` | Update cache context | Called when `num_inference_steps` changes |
+| `refresh_context()` | Update cache context | Called at every generation boundary |
 
 ---
 
@@ -179,7 +182,8 @@ cache_dit.enable_cache(
 
 ### Registering Custom Implementations
 
-After writing your custom enabler, register it in `CUSTOM_DIT_ENABLERS` in `vllm_omni/diffusion/cache/cache_dit_backend.py`:
+After writing your custom enabler, register it in `CUSTOM_DIT_ENABLERS` in
+`vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
 CUSTOM_DIT_ENABLERS = {
@@ -266,10 +270,10 @@ Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
 |-------|------|---------|-------|
-| **Standard DiT** | [`cache_dit_backend.py::enable_cache_for_dit`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_dit) | Default enabler | Single transformer, automatic |
-| **Wan2.2** | [`cache_dit_backend.py::enable_cache_for_wan22`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_wan22) | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
-| **LongCat** | [`cache_dit_backend.py::enable_cache_for_longcat_image`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_longcat_image) | Multi-block-list | Two block lists in one transformer |
-| **BAGEL** | [`cache_dit_backend.py::enable_cache_for_bagel`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_bagel) | Omni model | Complex architecture |
+| **Standard DiT** | `cachedit.backend::enable_cache_for_dit` | Default enabler | Single transformer, automatic |
+| **Wan2.2** | `cachedit.model_specific::enable_cache_for_wan22` | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
+| **LongCat** | `cachedit.config::CacheDiTAdapterConfig` | Declarative block adapter | Two block lists in one transformer |
+| **BAGEL** | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter | Complex architecture |
 
 ---
 

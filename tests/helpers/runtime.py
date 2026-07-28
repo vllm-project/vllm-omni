@@ -638,7 +638,10 @@ class OmniServerStageCli(OmniServer):
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            # Must be repo root (not tests/): after Docker deps-cache installs an empty
+            # vllm_omni stub into site-packages, cwd on sys.path[0] is what makes
+            # ``python -m vllm_omni.entrypoints...`` resolve the real package.
+            cwd=_omni_subprocess_cwd(),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
@@ -2333,7 +2336,6 @@ class OmniRunner:
         # production default in AsyncOmniEngine remains 600s; this only
         # affects the test runner wrapper.
         init_timeout: int = 1800,
-        shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,
         **kwargs,
@@ -2353,7 +2355,6 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            shm_threshold_bytes=shm_threshold_bytes,
             stage_configs_path=stage_configs_path,
             **kwargs,
         )
@@ -2423,6 +2424,10 @@ class OmniRunner:
         video_padding_token = "<|VIDEO|>"
         image_padding_token = "<|IMAGE|>"
         audio_padding_token = "<|AUDIO|>"
+        # Default wrapping for Qwen-style models (bos/eos around the placeholder).
+        audio_fmt = "<|audio_bos|>{p}<|audio_eos|>"
+        image_fmt = "<|vision_bos|>{p}<|vision_eos|>"
+        video_fmt = "<|vision_bos|>{p}<|vision_eos|>"
         if "Qwen3-Omni-30B-A3B-Instruct" in self.model_name:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
@@ -2431,6 +2436,15 @@ class OmniRunner:
             video_padding_token = "<VIDEO>"
             image_padding_token = "<IMAGE>"
             audio_padding_token = "<AUDIO>"
+        elif "MiniCPM" in self.model_name:
+            # MiniCPM-o expects the bare placeholder literals (with parens and ./),
+            # not Qwen-style bos/eos wrapping.
+            video_padding_token = "(<video>./</video>)"
+            image_padding_token = "(<image>./</image>)"
+            audio_padding_token = "(<audio>./</audio>)"
+            audio_fmt = "{p}"
+            image_fmt = "{p}"
+            video_fmt = "{p}"
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -2491,28 +2505,28 @@ class OmniRunner:
             if audio is not None:
                 if isinstance(audio, list):
                     for _ in audio:
-                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                        user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
                 else:
-                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
                     for _ in image:
-                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                        user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
                 else:
-                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
             video = videos_list[i]
             if video is not None:
                 if isinstance(video, list):
                     for _ in video:
-                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                        user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
                 else:
-                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
             user_content += prompt_text
 

@@ -97,6 +97,7 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -624,6 +625,9 @@ def main():
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break
+
+    if not images:
+        images = extract_images_from_outputs(outputs)
 
     if not images:
         raise ValueError("No images found in request_output")

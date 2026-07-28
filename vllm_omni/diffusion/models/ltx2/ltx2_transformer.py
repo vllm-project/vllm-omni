@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -57,6 +57,9 @@ _RMSNORM_INIT_PARAMS = inspect.signature(RMSNorm.__init__).parameters
 
 def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) -> nn.Module:
     """Bridge diffusers' RMSNorm API onto vLLM's `has_weight` variant."""
+    if not elementwise_affine:
+        return nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
+
     kwargs: dict[str, Any] = {"eps": eps}
     if "elementwise_affine" in _RMSNORM_INIT_PARAMS:
         kwargs["elementwise_affine"] = elementwise_affine
@@ -79,10 +82,14 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     cos, sin = freqs
+    if cos.dtype != x.dtype:
+        cos = cos.to(dtype=x.dtype)
+    if sin.dtype != x.dtype:
+        sin = sin.to(dtype=x.dtype)
     # Concrete pair count instead of -1 keeps SDPA shape static under torch.compile.
     x_real, x_imag = x.unflatten(2, (x.shape[2] // 2, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+    out = x * cos + x_rotated * sin
     return out
 
 
@@ -94,6 +101,10 @@ def apply_split_rotary_emb(
 ) -> torch.Tensor:
     # `head_dim` is plumbed in (not inferred via `-1`) so SDPA shape stays static under torch.compile.
     cos, sin = freqs
+    if cos.dtype != x.dtype:
+        cos = cos.to(dtype=x.dtype)
+    if sin.dtype != x.dtype:
+        sin = sin.to(dtype=x.dtype)
 
     x_dtype = x.dtype
     needs_reshape = False
@@ -112,7 +123,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()  # Explicitly upcast to float
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -327,6 +338,23 @@ class TensorParallelRMSNorm(nn.Module):
         return out.to(dtype=x_dtype)
 
 
+def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an additive/expanded LTX mask to a 2D padding mask."""
+    if attention_mask.ndim > 2:
+        if attention_mask.is_floating_point():
+            valid = attention_mask >= 0
+        else:
+            valid = attention_mask.to(torch.bool)
+        batch_size = valid.shape[0]
+        key_length = valid.shape[-1]
+        attention_mask = valid.reshape(batch_size, -1, key_length).all(dim=1)
+    if attention_mask.is_floating_point():
+        attention_mask = attention_mask >= 0
+    if attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+    return attention_mask
+
+
 class LTX2AudioVideoAttnProcessor:
     r"""
     Processor for implementing attention (SDPA is used by default if you're using PyTorch 2.0) for the LTX-2.0 model.
@@ -343,24 +371,6 @@ class LTX2AudioVideoAttnProcessor:
                 "LTX attention processors require a minimum PyTorch version of 2.0. "
                 "Please upgrade your PyTorch installation."
             )
-
-    @staticmethod
-    def _to_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-        # Convert additive/expanded masks into a 2D padding mask for flash-attn.
-        if attention_mask.ndim > 2:
-            if attention_mask.is_floating_point():
-                valid = attention_mask >= 0
-            else:
-                valid = attention_mask.to(torch.bool)
-            b = valid.shape[0]
-            key_len = valid.shape[-1]
-            valid = valid.reshape(b, -1, key_len).all(dim=1)
-            attention_mask = valid
-        if attention_mask.is_floating_point():
-            attention_mask = attention_mask >= 0
-        if attention_mask.dtype != torch.bool:
-            attention_mask = attention_mask.to(torch.bool)
-        return attention_mask
 
     @staticmethod
     def _is_sp_enabled() -> bool:
@@ -390,12 +400,12 @@ class LTX2AudioVideoAttnProcessor:
             # For cross-attention, encoder sequence length != query length, so drop the mask.
             if encoder_hidden_states is not None and encoder_hidden_states.shape[1] != hidden_states.shape[1]:
                 return None
-            return self._to_padding_mask(attention_mask)
+            return to_ltx_padding_mask(attention_mask)
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
         if attn.attn.attn_backend.get_name().upper() == "FLASH_ATTN":
-            attention_mask = self._to_padding_mask(attention_mask)
+            attention_mask = to_ltx_padding_mask(attention_mask)
         return attention_mask
 
     @staticmethod
@@ -467,6 +477,7 @@ class LTX2AudioVideoAttnProcessor:
         attention_mask: torch.Tensor | None = None,
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        perturbation_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         is_self_attention = encoder_hidden_states is None
         batch_size, sequence_length, _ = hidden_states.shape if is_self_attention else encoder_hidden_states.shape
@@ -509,17 +520,21 @@ class LTX2AudioVideoAttnProcessor:
             elif attn.rope_type == "split":
                 query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
                 key = apply_split_rotary_emb(
-                    key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb, head_dim=attn.head_dim
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                    head_dim=attn.head_dim,
                 )
 
         query = query.unflatten(2, (attn.heads, attn.head_dim))
         key = key.unflatten(2, (attn.heads, attn.head_dim))
-        value = value.unflatten(2, (attn.heads, attn.head_dim))
+        value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-        hidden_states = attn.attn(query, key, value, attn_metadata)
+        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+        if perturbation_mask is not None:
+            hidden_states = hidden_states * perturbation_mask + value * (1 - perturbation_mask)
 
         # LTX-2.3: per-head gated attention
         if attn.to_gate_logits is not None:
@@ -560,6 +575,7 @@ class LTX2Attention(torch.nn.Module):
         norm_elementwise_affine: bool = True,
         rope_type: str = "interleaved",
         apply_gated_attention: bool = False,
+        pack_qkv: bool = True,
         processor=None,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
@@ -591,7 +607,7 @@ class LTX2Attention(torch.nn.Module):
         self.to_q = None
         self.to_k = None
         self.to_v = None
-        if cross_attention_dim is None:
+        if cross_attention_dim is None and pack_qkv:
             self.to_qkv = QKVParallelLinear(
                 hidden_size=query_dim,
                 head_size=self.head_dim,
@@ -847,6 +863,9 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=audio_gated_attn,
+            # The official checkpoint evaluates audio Q/K/V separately. Fusing
+            # the bf16 GEMMs changes denoise numerics enough to accumulate.
+            pack_qkv=False,
             quant_config=quant_config,
             prefix=f"{prefix}.audio_attn1" if prefix else "audio_attn1",
         )
@@ -992,8 +1011,10 @@ class LTX2VideoTransformerBlock(nn.Module):
         v2a_cross_attention_mask: torch.Tensor | None = None,
         use_a2v_cross_attention: bool = True,
         use_v2a_cross_attention: bool = True,
-        perturbation_mask: torch.Tensor | None = None,
-        all_perturbed: bool | None = None,
+        video_self_attention_perturbation_mask: torch.Tensor | None = None,
+        audio_self_attention_perturbation_mask: torch.Tensor | None = None,
+        a2v_cross_attention_perturbation_mask: torch.Tensor | None = None,
+        v2a_cross_attention_perturbation_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.size(0)
 
@@ -1012,6 +1033,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             encoder_hidden_states=None,
             query_rotary_emb=video_rotary_emb,
             attention_mask=self_attention_mask,
+            perturbation_mask=video_self_attention_perturbation_mask,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
 
@@ -1031,6 +1053,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             encoder_hidden_states=None,
             query_rotary_emb=audio_rotary_emb,
             attention_mask=audio_self_attention_mask,
+            perturbation_mask=audio_self_attention_perturbation_mask,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * audio_gate_msa
 
@@ -1123,6 +1146,8 @@ class LTX2VideoTransformerBlock(nn.Module):
                     key_rotary_emb=ca_audio_rotary_emb,
                     attention_mask=a2v_cross_attention_mask,
                 )
+                if a2v_cross_attention_perturbation_mask is not None:
+                    a2v_attn_hidden_states = a2v_attn_hidden_states * a2v_cross_attention_perturbation_mask
                 hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
             # 3.3. Video-to-Audio Cross Attention: Q: Audio; K,V: Video
@@ -1141,6 +1166,8 @@ class LTX2VideoTransformerBlock(nn.Module):
                     key_rotary_emb=ca_video_rotary_emb,
                     attention_mask=v2a_cross_attention_mask,
                 )
+                if v2a_cross_attention_perturbation_mask is not None:
+                    v2a_attn_hidden_states = v2a_attn_hidden_states * v2a_cross_attention_perturbation_mask
                 audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
 
         # 4. Feedforward
@@ -1345,7 +1372,10 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             return self.prepare_audio_coords(*args, **kwargs)
 
     def forward(
-        self, coords: torch.Tensor, device: str | torch.device | None = None
+        self,
+        coords: torch.Tensor,
+        device: str | torch.device | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = device or coords.device
 
@@ -1421,6 +1451,9 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
 
+        if out_dtype is not None:
+            cos_freqs = cos_freqs.to(out_dtype)
+            sin_freqs = sin_freqs.to(out_dtype)
         return cos_freqs, sin_freqs
 
 
@@ -1488,8 +1521,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 # Shard prompt embeds across sequence
                 "encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
                 "audio_encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Shard video timestep when provided as (B, seq_len)
+                # Keep per-token video/audio timestep embeddings aligned with
+                # their corresponding latent sequence shards. Official LTX
+                # multi-guidance supplies both tensors as (B, seq_len).
                 "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
+                "audio_timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
             },
             "rope": {
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
@@ -1856,6 +1892,12 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # Determine timestep for audio.
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
+        def batch_step(step: torch.Tensor) -> torch.Tensor:
+            return step[:, 0] if step.ndim > 1 else step
+
+        sigma = sigma if sigma is not None else batch_step(timestep)
+        audio_sigma = audio_sigma if audio_sigma is not None else batch_step(audio_timestep)
+
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
@@ -1877,12 +1919,22 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 batch_size, audio_num_frames, audio_hidden_states.device
             )
 
-        video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
-        audio_rotary_emb = self.audio_rope(audio_coords, device=audio_hidden_states.device)
+        video_rotary_emb = self.rope(video_coords, device=hidden_states.device, out_dtype=hidden_states.dtype)
+        audio_rotary_emb = self.audio_rope(
+            audio_coords,
+            device=audio_hidden_states.device,
+            out_dtype=audio_hidden_states.dtype,
+        )
 
-        video_cross_attn_rotary_emb = self.cross_attn_rope(video_coords[:, 0:1, :], device=hidden_states.device)
+        video_cross_attn_rotary_emb = self.cross_attn_rope(
+            video_coords[:, 0:1, :],
+            device=hidden_states.device,
+            out_dtype=hidden_states.dtype,
+        )
         audio_cross_attn_rotary_emb = self.cross_attn_audio_rope(
-            audio_coords[:, 0:1, :], device=audio_hidden_states.device
+            audio_coords[:, 0:1, :],
+            device=audio_hidden_states.device,
+            out_dtype=audio_hidden_states.dtype,
         )
 
         # 2. Patchify input projections
@@ -1920,7 +1972,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             hidden_dtype=hidden_states.dtype,
         )
         video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
-            timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            audio_sigma.flatten() * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
@@ -1935,7 +1987,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             hidden_dtype=audio_hidden_states.dtype,
         )
         audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
-            audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            sigma.flatten() * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=audio_hidden_states.dtype,
         )
@@ -1945,7 +1997,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
 
         # 3.3. LTX-2.3: Compute prompt modulation from sigma
-        audio_sigma = audio_sigma if audio_sigma is not None else sigma
         if self.prompt_modulation and sigma is not None:
             temb_prompt, _ = self.prompt_adaln(sigma.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype)
             temb_prompt_audio, _ = self.audio_prompt_adaln(
@@ -1967,8 +2018,17 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
             audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
+        perturbation_kwargs = (attention_kwargs or {}).get("ltx_perturbation_kwargs", {})
+
+        def perturbation_mask_for(name: str, block_idx: int) -> torch.Tensor | None:
+            mask = perturbation_kwargs.get(f"{name}_mask")
+            blocks = perturbation_kwargs.get(f"{name}_blocks")
+            if mask is None or (blocks is not None and block_idx not in blocks):
+                return None
+            return mask
+
         # 5. Run transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
             block_kwargs = {
                 "temb": temb,
                 "temb_audio": temb_audio,
@@ -1984,6 +2044,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),
+                "audio_self_attention_perturbation_mask": perturbation_mask_for("audio_self_attention", block_idx),
+                "a2v_cross_attention_perturbation_mask": perturbation_mask_for("a2v_cross_attention", block_idx),
+                "v2a_cross_attention_perturbation_mask": perturbation_mask_for("v2a_cross_attention", block_idx),
             }
             # NOTE: We intentionally pass the first 4 args here positionally,
             # because CacheDiT expects the first 2 args to be hidden_states
@@ -2066,7 +2130,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                packed_name = name.replace(weight_name, param_name)
+                if packed_name not in params_dict:
+                    continue
+                name = packed_name
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
