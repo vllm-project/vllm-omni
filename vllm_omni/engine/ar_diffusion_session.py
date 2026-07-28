@@ -135,6 +135,34 @@ class ARDiffusionTickConsumer(Protocol[TickOutputT]):
     def chunk_metadata(self, output: TickOutputT) -> ARDiffusionChunkMetadata: ...
 
 
+@dataclass(frozen=True)
+class ARDiffusionPreparedControls:
+    """One reducer-owned, transactional control snapshot.
+
+    ``private_state`` is opaque to the session layer and becomes durable only
+    after the corresponding model tick succeeds.
+    """
+
+    controls: tuple[ARDiffusionControlInput, ...]
+    private_state: Any = None
+
+
+class ARDiffusionControlReducer(Protocol):
+    """Optional model adapter for stateful controls sampled per AR block."""
+
+    def prepare(
+        self,
+        *,
+        current_controls: Mapping[str, ARDiffusionControlInput],
+        events: Sequence[ARDiffusionSessionEvent],
+        chunk_index: int,
+    ) -> ARDiffusionPreparedControls: ...
+
+    def commit(self, prepared: ARDiffusionPreparedControls) -> None: ...
+
+    def reset(self) -> None: ...
+
+
 class ARDiffusionSessionLifecycle(Protocol):
     """Worker-facing session lifecycle operations."""
 
@@ -228,6 +256,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
         lifecycle: ARDiffusionSessionLifecycle,
         max_pending_events: int,
         request_id_factory: Callable[[str, int], str] | None = None,
+        control_reducer: ARDiffusionControlReducer | None = None,
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string.")
@@ -238,6 +267,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
         self._lifecycle = lifecycle
         self._max_pending_events = max_pending_events
         self._request_id_factory = request_id_factory or _default_request_id
+        self._control_reducer = control_reducer
 
         self._status = ARDiffusionSessionStatus.ACTIVE
         self._pending_events: dict[int, ARDiffusionSessionEvent] = {}
@@ -330,15 +360,35 @@ class ARDiffusionSession(Generic[TickOutputT]):
         ARDiffusionTickRequest,
         str | None,
         dict[str, ARDiffusionControlInput],
+        ARDiffusionPreparedControls | None,
     ]:
         event_ids = tuple(sorted(self._pending_events))
+        events = tuple(self._pending_events[event_id] for event_id in event_ids)
         prompt = self._prompt
-        controls = {track: _copy_control(control) for track, control in self._controls.items()}
-        for event_id in event_ids:
-            event = self._pending_events[event_id]
+        for event in events:
             if event.prompt is not None:
                 prompt = event.prompt
-            for control in event.controls:
+
+        prepared_controls: ARDiffusionPreparedControls | None = None
+        if self._control_reducer is None:
+            controls = {track: _copy_control(control) for track, control in self._controls.items()}
+            for event in events:
+                for control in event.controls:
+                    controls[control.track] = _copy_control(control)
+        else:
+            prepared_controls = self._control_reducer.prepare(
+                current_controls={track: _copy_control(control) for track, control in self._controls.items()},
+                events=events,
+                chunk_index=self._chunk_index,
+            )
+            if not isinstance(prepared_controls, ARDiffusionPreparedControls):
+                raise TypeError("control reducer prepare() must return ARDiffusionPreparedControls.")
+            controls = {}
+            for control in prepared_controls.controls:
+                if not isinstance(control, ARDiffusionControlInput):
+                    raise TypeError("prepared controls must contain ARDiffusionControlInput values.")
+                if control.track in controls:
+                    raise ValueError("prepared controls must contain at most one value per track.")
                 controls[control.track] = _copy_control(control)
 
         chunk_index = self._chunk_index
@@ -352,13 +402,14 @@ class ARDiffusionSession(Generic[TickOutputT]):
             controls=tuple(_copy_control(controls[track]) for track in sorted(controls)),
         )
         self._inflight_event_floor = event_ids[-1] if event_ids else None
-        return tick, prompt, controls
+        return tick, prompt, controls, prepared_controls
 
     async def _commit_tick(
         self,
         tick: ARDiffusionTickRequest,
         prompt: str | None,
         controls: dict[str, ARDiffusionControlInput],
+        prepared_controls: ARDiffusionPreparedControls | None,
     ) -> None:
         async with self._state_lock:
             for event_id in tick.applied_event_ids:
@@ -367,6 +418,9 @@ class ARDiffusionSession(Generic[TickOutputT]):
                 self._event_floor = tick.applied_event_ids[-1]
             self._prompt = prompt
             self._controls = controls
+            if prepared_controls is not None:
+                assert self._control_reducer is not None
+                self._control_reducer.commit(prepared_controls)
             self._chunk_index += 1
             self._inflight_event_floor = None
 
@@ -375,7 +429,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
         async with self._tick_lock:
             async with self._state_lock:
                 self._require_active()
-                tick, prompt, controls = self._build_tick_locked()
+                tick, prompt, controls, prepared_controls = self._build_tick_locked()
 
             expected_metadata = ARDiffusionChunkMetadata.from_tick(tick)
             try:
@@ -403,7 +457,14 @@ class ARDiffusionSession(Generic[TickOutputT]):
                     ) from tick_error
                 raise
 
-            commit_task = asyncio.create_task(self._commit_tick(tick, prompt, controls))
+            commit_task = asyncio.create_task(
+                self._commit_tick(
+                    tick,
+                    prompt,
+                    controls,
+                    prepared_controls,
+                )
+            )
             try:
                 await asyncio.shield(commit_task)
             except asyncio.CancelledError:
@@ -431,6 +492,8 @@ class ARDiffusionSession(Generic[TickOutputT]):
                 self._pending_events.clear()
                 self._prompt = None
                 self._controls.clear()
+                if self._control_reducer is not None:
+                    self._control_reducer.reset()
                 self._inflight_event_floor = None
                 self._chunk_index = 0
                 self._status = ARDiffusionSessionStatus.ACTIVE
@@ -470,12 +533,14 @@ class ARDiffusionSessionManager(Generic[TickOutputT]):
         max_pending_events: int,
         request_id_factory: Callable[[str, int], str] | None = None,
         session_id_factory: Callable[[], str] | None = None,
+        control_reducer_factory: Callable[[], ARDiffusionControlReducer] | None = None,
     ) -> None:
         self._tick_consumer = tick_consumer
         self._lifecycle = lifecycle
         self._max_pending_events = max_pending_events
         self._request_id_factory = request_id_factory
         self._session_id_factory = session_id_factory or (lambda: uuid.uuid4().hex)
+        self._control_reducer_factory = control_reducer_factory
         self._sessions: dict[str, ARDiffusionSession[TickOutputT]] = {}
         self._lock = asyncio.Lock()
 
@@ -490,6 +555,9 @@ class ARDiffusionSessionManager(Generic[TickOutputT]):
                 lifecycle=self._lifecycle,
                 max_pending_events=self._max_pending_events,
                 request_id_factory=self._request_id_factory,
+                control_reducer=(
+                    self._control_reducer_factory() if self._control_reducer_factory is not None else None
+                ),
             )
             self._sessions[resolved_session_id] = session
             return session

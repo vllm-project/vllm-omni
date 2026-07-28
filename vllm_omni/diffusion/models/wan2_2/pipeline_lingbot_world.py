@@ -31,6 +31,12 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_actions import (
+    LINGBOT_CAMERA_ACTION_SCHEMA,
+    LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
+    integrate_lingbot_camera_actions,
+    parse_lingbot_camera_action_frames,
+)
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
     CameraTrajectory,
     build_plucker_embedding,
@@ -72,6 +78,7 @@ _MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
+_PREPROCESSED_CAMERA_ACTIONS_KEY = "_lingbot_camera_actions"
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
@@ -83,7 +90,8 @@ class _LingBotRequestInputs:
 
     prompt: str
     image: PIL.Image.Image | torch.Tensor
-    camera_trajectory: CameraTrajectory
+    camera_trajectory: CameraTrajectory | None
+    camera_actions: tuple[tuple[str, ...], ...] | None
     height: int
     width: int
     num_frames: int
@@ -103,6 +111,7 @@ class _LingBotARSessionState:
     generator_state: torch.Tensor | None = None
     image_condition: torch.Tensor | None = None
     camera_tail: CameraTrajectory | None = None
+    camera_pitch: float = 0.0
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -255,37 +264,48 @@ def get_lingbot_world_pre_process_func(
             request_id=getattr(request, "request_id", "legacy-lingbot-request"),
         )
         if tick is not None:
-            camera_controls = [
-                control
-                for control in tick.controls
-                if control.track == "camera" and control.schema == "lingbot.camera_trajectory.v1"
-            ]
+            camera_controls = [control for control in tick.controls if control.track == "camera"]
             if len(camera_controls) != 1:
+                raise ValueError("LingBot realtime ticks require exactly one camera control.")
+            camera_control = camera_controls[0]
+            if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
+                camera_data = camera_control.data
+                try:
+                    poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
+                    intrinsics = torch.as_tensor(
+                        camera_data["intrinsics"],
+                        dtype=torch.float32,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    raise ValueError(
+                        "lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields."
+                    ) from None
+                if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+                    raise ValueError("camera control poses must have shape [frames, 4, 4].")
+                if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+                    raise ValueError("camera control intrinsics must have shape [frames, 4].")
+                if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
+                    raise ValueError(
+                        "camera control poses and intrinsics must contain the same positive number of frames."
+                    )
+                if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
+                    raise ValueError("camera control values must all be finite.")
+                trajectory = CameraTrajectory(
+                    poses=poses,
+                    intrinsics=intrinsics,
+                )
+                camera_actions = None
+            elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
+                trajectory = None
+                camera_actions = parse_lingbot_camera_action_frames(
+                    camera_control.data,
+                    expected_frames=3,
+                )
+            else:
                 raise ValueError(
-                    "LingBot realtime ticks require exactly one camera control "
-                    "with schema 'lingbot.camera_trajectory.v1'."
+                    "LingBot realtime camera controls require schema "
+                    "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
                 )
-            camera_data = camera_controls[0].data
-            try:
-                poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
-                intrinsics = torch.as_tensor(
-                    camera_data["intrinsics"],
-                    dtype=torch.float32,
-                )
-            except (KeyError, TypeError, ValueError):
-                raise ValueError("lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields.") from None
-            if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-                raise ValueError("camera control poses must have shape [frames, 4, 4].")
-            if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
-                raise ValueError("camera control intrinsics must have shape [frames, 4].")
-            if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
-                raise ValueError("camera control poses and intrinsics must contain the same positive number of frames.")
-            if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
-                raise ValueError("camera control values must all be finite.")
-            trajectory = CameraTrajectory(
-                poses=poses,
-                intrinsics=intrinsics,
-            )
         else:
             action_path = extra_args.get("action_path")
             if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
@@ -305,6 +325,7 @@ def get_lingbot_world_pre_process_func(
                 raise ValueError(
                     "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
                 ) from None
+            camera_actions = None
 
         updated_prompt = dict(prompt)
         updated_multi_modal_data = dict(multi_modal_data)
@@ -314,6 +335,7 @@ def get_lingbot_world_pre_process_func(
         request.sampling_params.extra_args = {
             **extra_args,
             _PREPROCESSED_CAMERA_KEY: trajectory,
+            _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
         }
         return request
 
@@ -587,8 +609,13 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
         camera_trajectory = extra_args.get(_PREPROCESSED_CAMERA_KEY)
-        if not isinstance(camera_trajectory, CameraTrajectory):
+        camera_actions = extra_args.get(_PREPROCESSED_CAMERA_ACTIONS_KEY)
+        if camera_trajectory is not None and not isinstance(camera_trajectory, CameraTrajectory):
             raise ValueError("LingBot camera trajectory must be materialized by the pre-process function.")
+        if camera_actions is not None:
+            camera_actions = tuple(tuple(actions) for actions in camera_actions)
+        if (camera_trajectory is None) == (camera_actions is None):
+            raise ValueError("LingBot pre-processing must materialize exactly one camera input.")
 
         request_flow_shift = (
             extra_args["flow_shift"] if "flow_shift" in extra_args else getattr(self.scheduler.config, "shift", 5.0)
@@ -685,6 +712,7 @@ class LingBotWorldCausalDMDPipeline(
             prompt=prompt.strip(),
             image=image,
             camera_trajectory=camera_trajectory,
+            camera_actions=camera_actions,
             height=height,
             width=width,
             num_frames=num_frames,
@@ -787,17 +815,26 @@ class LingBotWorldCausalDMDPipeline(
         """Convert raw camera frames to a latent-aligned ray tensor."""
 
         trajectory = inputs.camera_trajectory
+        if trajectory is None:
+            raise RuntimeError("LingBot camera trajectory was not prepared before camera embedding.")
         available_frames = int(trajectory.poses.shape[0])
-        if available_frames < inputs.num_frames:
-            raise ValueError(
-                "camera trajectory frames must be at least num_frames; "
-                f"got camera_frames={available_frames}, num_frames={inputs.num_frames}."
+        if inputs.camera_actions is not None:
+            if available_frames != inputs.num_latent_frames:
+                raise ValueError(
+                    "camera actions must produce exactly one pose per latent frame; "
+                    f"got camera_frames={available_frames}, latent_frames={inputs.num_latent_frames}."
+                )
+        else:
+            if available_frames < inputs.num_frames:
+                raise ValueError(
+                    "camera trajectory frames must be at least num_frames; "
+                    f"got camera_frames={available_frames}, num_frames={inputs.num_frames}."
+                )
+            trajectory = CameraTrajectory(
+                poses=trajectory.poses[: inputs.num_frames],
+                intrinsics=trajectory.intrinsics[: inputs.num_frames],
             )
-        trajectory = CameraTrajectory(
-            poses=trajectory.poses[: inputs.num_frames],
-            intrinsics=trajectory.intrinsics[: inputs.num_frames],
-        )
-        trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
+            trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
         embedding_trajectory = trajectory
         if previous is not None:
             embedding_trajectory = CameraTrajectory(
@@ -1104,6 +1141,17 @@ class LingBotWorldCausalDMDPipeline(
                 :,
                 condition_start:condition_stop,
             ]
+        camera_pitch: float | None = None
+        if inputs.camera_actions is not None:
+            assert session_state is not None
+            action_trajectory, camera_pitch = integrate_lingbot_camera_actions(
+                inputs.camera_actions,
+                width=inputs.width,
+                height=inputs.height,
+                initial_pose=(session_state.camera_tail.poses[-1] if session_state.camera_tail is not None else None),
+                initial_pitch=session_state.camera_pitch,
+            )
+            inputs = replace(inputs, camera_trajectory=action_trajectory)
         camera, camera_tail = self._prepare_camera(
             inputs,
             dtype=dtype,
@@ -1173,6 +1221,8 @@ class LingBotWorldCausalDMDPipeline(
             session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
             session_state.camera_tail = camera_tail
+            if camera_pitch is not None:
+                session_state.camera_pitch = camera_pitch
             session_state.next_chunk_index += 1
 
         # Phase 4: either expose model-space latents or invert the checkpoint's
