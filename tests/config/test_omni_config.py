@@ -989,6 +989,19 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
+def test_diffusion_config_preserves_custom_engine_and_runner_routing():
+    engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+    runner_cls = "vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner"
+
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        engine_backend=engine_backend,
+        diffusion_model_runner_cls=runner_cls,
+    )
+
+    assert cfg.engine_backend == engine_backend
+    assert cfg.diffusion_model_runner_cls == runner_cls
+
+
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(

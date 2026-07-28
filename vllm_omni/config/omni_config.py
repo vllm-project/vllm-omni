@@ -537,6 +537,8 @@ class _DiffusionConfigProjection:
     trust_remote_code: bool = False
     revision: str | None = None
     distributed_executor_backend: str = "mp"
+    engine_backend: str | type = "default"
+    diffusion_model_runner_cls: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
