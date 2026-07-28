@@ -10,7 +10,7 @@ Not supported yet:
 This integration currently follows the default upstream text-to-image recipe.
 It does not expose recipe selectors such as `model_type` or `variant`.
 
-Resolved from `config.json::architectures`; no `model_index.json` rewrite is needed.
+The checkpoint is identified by its HiDream-O1 pixel prediction head. This keeps ordinary `Qwen3VLForConditionalGeneration` checkpoints out of the diffusion registry.
 
 ```bash
 python end2end.py --model HiDream-ai/HiDream-O1-Image --output hidream_o1_output.png

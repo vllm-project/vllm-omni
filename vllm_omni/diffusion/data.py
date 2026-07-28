@@ -527,10 +527,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     except Exception:
         model_index = None
     if model_index is not None:
-        model_class_name = model_index.get("_class_name")
-        if model_class_name == "HiDreamO1ImagePipeline":
-            return "Qwen3VLForConditionalGeneration"
-        return model_class_name
+        return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
         return "DiffusersAdapterPipeline"
 
@@ -542,6 +539,11 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
+    if model_type == "qwen3_vl":
+        from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+
+        if _looks_like_hidream_o1(model, cfg):
+            return "HiDreamO1ImagePipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1064,8 +1066,6 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
-                    if self.model_class_name == "HiDreamO1ImagePipeline":
-                        self.model_class_name = "Qwen3VLForConditionalGeneration"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter
@@ -1121,7 +1121,17 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                if model_type == "qwen3_vl":
+                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+
+                    if self.model_class_name != "HiDreamO1ImagePipeline" and not _looks_like_hidream_o1(
+                        self.model, cfg
+                    ):
+                        raise ValueError(f"Qwen3-VL checkpoint {self.model} is not a supported diffusion model")
+                    self.model_class_name = "HiDreamO1ImagePipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()

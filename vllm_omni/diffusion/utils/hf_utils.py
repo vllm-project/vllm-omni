@@ -53,6 +53,22 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
+    """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
+    try:
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        if not isinstance(cfg, Mapping) or cfg.get("model_type") != "qwen3_vl":
+            return False
+
+        index = get_hf_file_to_dict("model.safetensors.index.json", model_name)
+        if not isinstance(index, Mapping):
+            return False
+        weight_map = index.get("weight_map")
+        return isinstance(weight_map, Mapping) and "model.final_layer2.linear.weight" in weight_map
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -98,7 +114,4 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-        # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
-        # but are still diffusion-style models in vllm-omni. Detect them via
-        # config.json.
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)

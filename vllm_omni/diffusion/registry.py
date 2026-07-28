@@ -301,16 +301,6 @@ _DIFFUSION_MODELS = {
         "pipeline_hidream_image",
         "HiDreamImagePipeline",
     ),
-    # HiDream-O1-Image: checkpoint config.json declares
-    # architectures=["Qwen3VLForConditionalGeneration"] (transformers convention,
-    # since upstream inference.py uses Qwen3VLForConditionalGeneration.from_pretrained
-    # directly). Registry key must match architectures[0]. No collision with
-    # internvla_a1 / gr00t (those use custom arch names like "InternVLAA1").
-    "Qwen3VLForConditionalGeneration": (
-        "hidream_o1_image",
-        "pipeline_hidream_o1_image",
-        "HiDreamO1ImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -558,8 +548,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
-    # HiDream-O1-Image: key mirrors _DIFFUSION_MODELS above.
-    "Qwen3VLForConditionalGeneration": "get_hidream_o1_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",

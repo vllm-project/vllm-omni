@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
         default="A cat is sitting next to a sign that says 'HiDream-O1 vLLM-Omni'",
         help="Text prompt.",
     )
-    p.add_argument("--height", type=int, default=1024, help="Image height.")
-    p.add_argument("--width", type=int, default=1024, help="Image width.")
+    p.add_argument("--height", type=int, default=2048, help="Requested image height.")
+    p.add_argument("--width", type=int, default=2048, help="Requested image width.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument(
         "--steps",

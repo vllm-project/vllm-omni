@@ -3,24 +3,31 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import numpy as np
 import torch
 from einops import rearrange
 from PIL import Image
 from torch import nn
+from transformers import AutoProcessor, PreTrainedTokenizerBase, Qwen3VLConfig
+from transformers.processing_utils import ProcessorMixin
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
+    HiDreamO1ImageTransformer,
+)
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -47,6 +54,13 @@ PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
 )
 
 
+class HiDreamO1TextSample(TypedDict):
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    token_types: torch.Tensor
+    vinput_mask: torch.Tensor
+
+
 def find_closest_resolution(width: int, height: int) -> tuple[int, int]:
     img_ratio = width / height
     best_res: tuple[int, int] | None = None
@@ -70,7 +84,7 @@ def get_rope_index_fix_point(
     image_grid_thw: torch.Tensor | None = None,
     video_grid_thw: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
-    skip_vision_start_token: list[int] | None = None,
+    skip_vision_start_token: list[int],
     fix_point: int = 4096,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if video_grid_thw is not None:
@@ -99,7 +113,7 @@ def get_rope_index_fix_point(
             image_nums = (vision_tokens == image_token_id).sum()
             video_nums = (vision_tokens == video_token_id).sum()
             input_tokens = input_ids.tolist()
-            llm_pos_ids_list: list = []
+            llm_pos_ids_list: list[torch.Tensor] = []
             st = 0
             remain_images, remain_videos = image_nums, video_nums
             for _ in range(image_nums + video_nums):
@@ -191,10 +205,10 @@ def build_t2i_text_sample(
     prompt: str,
     height: int,
     width: int,
-    tokenizer,
-    processor,
-    model_config,
-) -> dict:
+    tokenizer: PreTrainedTokenizerBase,
+    processor: ProcessorMixin,
+    model_config: Qwen3VLConfig,
+) -> HiDreamO1TextSample:
     image_token_id = model_config.image_token_id
     video_token_id = model_config.video_token_id
     vision_start_token_id = model_config.vision_start_token_id
@@ -359,7 +373,8 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin):
+    supports_request_batch = False
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -369,6 +384,15 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.model_dir = od_config.model
         self.dtype = od_config.dtype if od_config.dtype is not None else torch.bfloat16
         self.device = get_local_device()
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder=None,
+                revision=od_config.revision,
+                prefix="model.",
+                fall_back_to_pt=True,
+            )
+        ]
 
         self._validate_static_config()
 
@@ -377,9 +401,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
 
-        self.processor = None
-        self.tokenizer = None
-        self.model = None
         self._init_processor_and_model()
         self._validate_tms_token_id()
 
@@ -391,32 +412,23 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             raise NotImplementedError(f"cfg_parallel_size={cfg_parallel_size} not supported")
 
     def _init_processor_and_model(self) -> None:
-        from transformers import AutoProcessor, PreTrainedTokenizerBase
-
-        from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
-            HiDreamO1ImageTransformer,
-        )
-
         logger.info(
-            "HiDreamO1ImagePipeline: loading processor + model from %s (dtype=%s, device=%s)",
+            "HiDreamO1ImagePipeline: loading processor and model config from %s",
             self.model_dir,
-            self.dtype,
-            self.device,
         )
-        self.processor = AutoProcessor.from_pretrained(self.model_dir)
-        self.model = HiDreamO1ImageTransformer.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(
             self.model_dir,
-            torch_dtype=self.dtype,
-            device_map=self.device,
-        ).eval()
+            revision=self.od_config.revision,
+        )
+        model_config = Qwen3VLConfig.from_pretrained(
+            self.model_dir,
+            revision=self.od_config.revision,
+        )
+        self.model = HiDreamO1ImageTransformer(model_config)
 
         self._add_special_tokens(self.processor)
         self.tokenizer = (
             self.processor if isinstance(self.processor, PreTrainedTokenizerBase) else self.processor.tokenizer
-        )
-        logger.info(
-            "HiDreamO1ImagePipeline: ready (num_params=%.1fB)",
-            sum(p.numel() for p in self.model.parameters()) / 1e9,
         )
 
     def _validate_tms_token_id(self) -> None:
@@ -426,9 +438,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             raise RuntimeError(f"tms_token maps to {actual_tms_ids}, model expects [{expected_tms_id}]")
 
     @staticmethod
-    def _add_special_tokens(processor) -> None:
-        from transformers import PreTrainedTokenizerBase
-
+    def _add_special_tokens(processor: ProcessorMixin | PreTrainedTokenizerBase) -> None:
         tok = processor if isinstance(processor, PreTrainedTokenizerBase) else processor.tokenizer
         tok.boi_token = "<|boi_token|>"
         tok.bor_token = "<|bor_token|>"
@@ -438,7 +448,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _resolve_generation_params(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
     ) -> tuple[str, int, int, int, int, float]:
         sp = req.sampling_params
 
@@ -524,7 +534,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _forward_once(
         self,
-        sample: dict,
+        sample: HiDreamO1TextSample,
         z_in: torch.Tensor,
         t_pixeldit: torch.Tensor,
     ) -> torch.Tensor:
@@ -552,7 +562,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         height: int,
         width: int,
         expected_image_len: int,
-    ) -> dict:
+    ) -> HiDreamO1TextSample:
         sample = build_t2i_text_sample(
             prompt=prompt,
             height=height,
@@ -566,10 +576,10 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             raise RuntimeError(
                 f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} for {height}x{width}"
             )
-        return {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in sample.items()}
+        return {key: value.to(self.device) for key, value in sample.items()}
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         prompt, height, width, num_inference_steps, seed, guidance_scale = self._resolve_generation_params(req)
 
         expected_image_len = (height // PATCH_SIZE) * (width // PATCH_SIZE)
@@ -579,7 +589,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             width,
             expected_image_len,
         )
-        samples: list[dict] = [cond_sample]
+        samples: list[HiDreamO1TextSample] = [cond_sample]
         if guidance_scale > 1.0:
             uncond_sample = self._build_and_validate_sample(
                 " ",
@@ -604,50 +614,41 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             device=self.device,
         )
 
-        # TODO(concurrent-serving): process-global RNG mutation, replace with
-        # explicitly plumbed generators before concurrent serving.
-        torch.manual_seed(seed + 1)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed + 1)
+        with self.progress_bar(total=len(sched.timesteps)) as pbar:
+            for step_t in sched.timesteps:
+                step_t_f32 = step_t.float()
+                t_pixeldit = 1.0 - step_t_f32 / 1000.0
+                sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
-        for _step_idx, step_t in enumerate(sched.timesteps):
-            step_t_f32 = step_t.float()
-            t_pixeldit = 1.0 - step_t_f32 / 1000.0
-            sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
+                x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
 
-            x_pred_cond = self._forward_once(samples[0], z.clone(), t_pixeldit)
-            v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
+                if len(samples) > 1:
+                    x_pred_uncond = self._forward_once(
+                        samples[1],
+                        z,
+                        t_pixeldit,
+                    )
+                    v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
+                    v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+                else:
+                    v_guided = v_cond
 
-            if len(samples) > 1:
-                x_pred_uncond = self._forward_once(
-                    samples[1],
-                    z.clone(),
-                    t_pixeldit,
-                )
-                v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
-                v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
-            else:
-                v_guided = v_cond
+                model_output = -v_guided
 
-            model_output = -v_guided
+                z = sched.step(
+                    model_output,
+                    step_t_f32,
+                    z.float(),
+                    return_dict=False,
+                )[0].to(self.dtype)
+                pbar.update()
 
-            z = sched.step(
-                model_output,
-                step_t_f32,
-                z.float(),
-                return_dict=False,
-            )[0].to(self.dtype)
-
-        return DiffusionOutput(output=(z, height, width))
+        return DiffusionOutput(
+            output=(z, height, width),
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        for _ in weights:
-            pass
-        return {name for name, _ in self.named_parameters()}
-
-    def has_real_checkpoint(self) -> bool:
-        if not self.model_dir:
-            return False
-        return os.path.exists(os.path.join(self.model_dir, "model.safetensors")) or os.path.exists(
-            os.path.join(self.model_dir, "model.safetensors.index.json")
-        )
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
