@@ -22,9 +22,10 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -33,15 +34,17 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    get_stage_connector_role,
+    stage_sends_async_output,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -321,7 +324,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
@@ -1841,14 +1847,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        if self._async_chunk:
+        if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            # Non-async-chunk still ships the full payload to the next stage (via
-            # accumulate_full_payload_output and the inter_stage_outputs field); only
-            # client mm keys are split out when async_chunk is enabled. #4527 set this
-            # to (None, pooler_output), which skipped accumulation and starved the
-            # downstream stage (300s connector-input timeout / empty audio). (PR #4792)
+            # Connector-less stages expose the same payload through the
+            # orchestrator bridge; non-async stages preserve legacy behavior.
             pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
@@ -1860,7 +1863,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-            multimodal_outputs = self._build_multimodal_outputs(pooler_client)
+            multimodal_outputs = (
+                inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None

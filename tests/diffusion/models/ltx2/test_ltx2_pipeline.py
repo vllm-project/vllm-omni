@@ -731,7 +731,7 @@ class TestRegistryIntegration:
 
     def test_cache_dit_for_ltx2_does_not_have_custom_enablers_registered(self):
         """Pipeline variants are *not* registered in CUSTOM_DIT_ENABLERS."""
-        from vllm_omni.diffusion.cache.cache_dit_backend import CUSTOM_DIT_ENABLERS
+        from vllm_omni.diffusion.cache.cachedit import CUSTOM_DIT_ENABLERS
 
         # NOTE: We used to have custom enablers for this model, but refactored to handle
         # it more generically. Now we only need to ensure it has git cache adapter config.

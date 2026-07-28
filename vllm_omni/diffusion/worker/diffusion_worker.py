@@ -50,6 +50,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPref
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -315,6 +316,7 @@ class DiffusionWorker:
                 sequence_parallel_size=parallel_config.sequence_parallel_size,
                 ulysses_degree=parallel_config.ulysses_degree,
                 ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
@@ -509,6 +511,15 @@ class DiffusionWorker:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
         return self.lora_manager.add_adapter(lora_request)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Apply a midway interaction to an active stepwise request."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()

@@ -55,6 +55,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -71,7 +72,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
@@ -933,6 +934,7 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            allgather_degree = normalized_kwargs.get("allgather_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
@@ -947,7 +949,7 @@ class AsyncOmniEngine:
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree
+                sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=pipeline_parallel_size,
@@ -957,6 +959,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                allgather_degree=allgather_degree,
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
@@ -997,6 +1000,14 @@ class AsyncOmniEngine:
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
+            "diffusion_compile_granularity": (
+                "regional"
+                if kwargs.get("diffusion_compile_granularity") is None
+                else kwargs["diffusion_compile_granularity"]
+            ),
+            "diffusion_compile_dynamic": (
+                True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
+            ),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1692,6 +1703,30 @@ class AsyncOmniEngine:
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
         self.abort(request_ids)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Send an interaction control message to the Orchestrator."""
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+
+        self.request_queue.sync_q.put_nowait(
+            InteractionMessage(
+                request_id=request_id,
+                interaction=interaction,
+            )
+        )
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Async interaction API."""
+        self.submit_interaction(request_id, interaction)
 
     def collective_rpc(
         self,

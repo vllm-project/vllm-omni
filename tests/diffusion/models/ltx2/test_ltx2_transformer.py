@@ -4,7 +4,7 @@
 import pytest
 from torch import nn
 
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel, _make_rms_norm
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

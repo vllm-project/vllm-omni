@@ -47,6 +47,8 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         # qwen3_tts: Qwen3TTSTalkerForConditionalGeneration (Stage 0)
         # -> Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
         ("Qwen3TTSCode2Wav", "code2wav"),
+        # minicpmo_4_5: Talker (Stage 1) -> Code2Wav (Stage 2).
+        ("MiniCPMO45Code2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
         # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder

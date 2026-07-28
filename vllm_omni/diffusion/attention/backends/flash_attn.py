@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -81,6 +82,28 @@ class FlashAttentionImpl(AttentionImpl):
     @staticmethod
     def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
         return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
+
+    @staticmethod
+    def _flash_varlen_wrapper(q, k, v, *, attn_func, causal, softmax_scale, **kwargs):
+        """Call a varlen-only FlashAttention backend for a dense segment."""
+        del kwargs
+        batch_size, q_len = q.shape[:2]
+        k_len = k.shape[1]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, k_len, dtype=torch.int32, device=q.device)
+        out = attn_func(
+            q=q.flatten(0, 1),
+            k=k.flatten(0, 1),
+            v=v.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=k_len,
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )
+        out = FlashAttentionImpl._unwrap_flash_output(out)
+        return out.reshape(batch_size, q_len, *out.shape[1:])
 
     def _forward_varlen_masked(
         self,
@@ -171,6 +194,7 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
             flash_attn_func,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -186,10 +210,18 @@ class FlashAttentionImpl(AttentionImpl):
         # Try piecewise attention
         if full_attn_spans is not None:
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
-            attn_func = partial(
-                FlashAttentionImpl._flash_wrapper,
-                attn_func=flash_attn_func,
-            )
+            if flash_attn_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_wrapper,
+                    attn_func=flash_attn_func,
+                )
+            elif flash_attn_varlen_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_varlen_wrapper,
+                    attn_func=flash_attn_varlen_func,
+                )
+            else:
+                raise ImportError("Piecewise FlashAttention requires a dense or varlen FlashAttention function")
 
             return piecewise_attn(
                 query,
@@ -198,6 +230,7 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

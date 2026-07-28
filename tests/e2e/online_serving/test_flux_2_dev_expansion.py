@@ -6,6 +6,7 @@ Coverage:
 - Layerwise CPU offload
 - Ulysses sequence parallelism
 - Ring sequence parallelism
+- VAE patch parallel encode/decode
 
 This test verifies that FLUX.2-dev can be launched with CPU offload enabled,
 accepts text-to-image requests through the OpenAI-compatible API, and returns
@@ -88,6 +89,21 @@ def _get_flux_2_dev_feature_cases(model: str):
                 ],
             ),
             id="ring_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--tensor-parallel-size",
+                    "2",
+                    "--vae-patch-parallel-size",
+                    "2",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="vae_patch_parallel_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]

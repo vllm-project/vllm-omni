@@ -29,6 +29,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
@@ -39,6 +40,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
@@ -576,6 +578,8 @@ class Orchestrator:
                 self.duplex_control_plane.dispatch(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
+            elif msg_type == "interaction":
+                await self._handle_interaction(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
@@ -677,24 +681,16 @@ class Orchestrator:
         final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
+            # Streaming updates always follow the first-chunk add_request
+            # through the same ordered submission queue, so an unknown id
+            # here can only mean the request already finished or was
+            # aborted (e.g. the client disconnected). Re-adding it would
+            # resurrect a headless session that keeps cycling through the
+            # stages with nobody consuming its outputs (issue #4271).
             logger.warning(
-                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
-            fallback_msg = StageSubmissionMessage(
-                type="add_request",
-                request_id=msg.request_id,
-                prompt=msg.prompt,
-                original_prompt=msg.original_prompt,
-                output_prompt_text=msg.output_prompt_text,
-                sampling_params_list=msg.sampling_params_list,
-                final_stage_id=msg.final_stage_id,
-                final_output_stage_ids=msg.final_output_stage_ids,
-                preprocess_ms=msg.preprocess_ms,
-                request_timestamp=msg.request_timestamp,
-                enqueue_ts=msg.enqueue_ts,
-            )
-            await self._handle_add_request(fallback_msg)
             return
 
         if msg.sampling_params_list:
@@ -766,6 +762,44 @@ class Orchestrator:
             abort=True,
         )
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    async def _handle_interaction(self, msg: InteractionMessage) -> None:
+        """Handle a midway interaction for an active streaming diffusion request."""
+        stage_id = 0
+        request_id = msg.request_id
+        event_id = msg.interaction.get("event_id")
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"No active request for interaction: {request_id}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
+            return
+
+        try:
+            await self.stage_pools[stage_id].submit_interaction(request_id, msg.interaction)
+        except Exception as exc:
+            logger.info(
+                "[Orchestrator] Failed interaction for req %s: %s",
+                request_id,
+                exc,
+                exc_info=True,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"Failed interaction for request {request_id}: {exc}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
 
     async def _abort_request_ids(self, request_ids: list[str]) -> None:
         """Forward abort requests to all stage pools."""
@@ -1182,7 +1216,11 @@ class Orchestrator:
             return
 
         request_finished = False
-        if finished and self.stage_pools[stage_id].final_output:
+        if (
+            finished
+            and self.stage_pools[stage_id].final_output
+            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
+        ):
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -1243,7 +1281,7 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
+            and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -1290,6 +1328,12 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs."""
+        pool = self.stage_pools[stage_id]
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return stage_receives_chunks(model_config)
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1963,6 +2007,11 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            if not self._stage_receives_async_chunks(next_stage_id):
+                # Outgoing-only stages receive their first real input from the
+                # orchestrator. Pre-submitting a placeholder lets it race and
+                # execute before that conditioning payload arrives.
+                continue
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
