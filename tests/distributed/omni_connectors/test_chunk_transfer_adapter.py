@@ -71,6 +71,30 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
     request.update_block_hashes.assert_called_once_with()
 
 
+def test_streaming_payload_can_append_exact_prompt_length(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        _all_token_ids=[0, 0, 7, 8],
+        _output_token_ids=[7, 8],
+        prompt_token_ids=[0, 0],
+        num_computed_tokens=4,
+        num_prompt_tokens=2,
+        update_block_hashes=mocker.Mock(),
+    )
+    payload = {
+        "ids": {"prompt": [1, 2, 3]},
+        "meta": {"next_stage_prompt_len": 3},
+    }
+
+    construct_next_stage_streaming_input_prompt(payload, request)
+
+    assert request.prompt_token_ids == [0, 0, 7, 8, 0, 0, 0]
+    assert request._all_token_ids == [0, 0, 7, 8, 0, 0, 0]
+    assert request._output_token_ids == []
+    assert request.num_computed_tokens == 4
+    assert request.num_prompt_tokens == 7
+    request.update_block_hashes.assert_called_once_with()
+
+
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
     def _build(
@@ -252,6 +276,37 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
+    """A terminal stop is not a segment boundary (#5383), but the producer-side
+    processor must still receive the flush signal on the terminal chunk.
+    Passing only ``is_segment_finished`` starved processors of their final
+    accumulated payload once terminal stops stopped setting it (#5413: the
+    downstream stage got ``meta.finished`` with the tail data missing).
+    """
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-terminal")
+
+    seen_flush_flags = []
+
+    def recording_processor(**kwargs):
+        seen_flush_flags.append(kwargs["is_finished"])
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": False}
+    )
+
+    assert seen_flush_flags == [True]
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert bool(sent_payload.meta.finished.item()) is True
+    assert bool(sent_payload.meta.is_segment_finished.item()) is False
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
@@ -312,6 +367,23 @@ def test_send_single_request_struct_preserves_segment_finished(build_adapter, mo
     sent_payload = connector.put.call_args.kwargs["data"]
     assert sent_payload.meta.finished.item() is False
     assert sent_payload.meta.is_segment_finished.item() is True
+
+
+def test_send_single_request_respects_processor_receiver_boundary(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(is_segment_finished=torch.tensor(False, dtype=torch.bool))
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.is_segment_finished.item() is False
 
 
 def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
@@ -463,7 +535,7 @@ def test_fifo_promotion(build_adapter):
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-1", "req-2"]
-    assert waiting_queue == reqs[2:]
+    assert waiting_queue == []
     assert reqs[0].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[2].status == RequestStatus.WAITING
@@ -473,12 +545,29 @@ def test_fifo_promotion(build_adapter):
     # (commit c4d95fd9 — otherwise the terminal chunk deadlocks at c=8 K=2).
     # Simulate it here so promotion can pick up the freed slot.
     adapter._evict_finished_active_streams({"req-1"})
+    adapter.restore_queues(waiting_queue, running_queue)
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2", "req-3"]
     # Promotion + chunk processing happen in the same call, so req-3 is
     # already WAITING_FOR_CHUNK by the time we check.
     assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
+
+
+def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, max_num_seqs=2, active_stream_window=1)
+    active = _req("req-active", RequestStatus.WAITING)
+    non_active = _req("req-non-active", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([active, non_active])
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert waiting_queue == []
+    assert active.status == RequestStatus.WAITING_FOR_CHUNK
+    assert non_active.status == RequestStatus.WAITING
+    assert list(adapter._pending_load_reqs) == [active]
+    assert list(adapter.waiting_for_chunk_waiting_requests) == [active, non_active]
 
 
 def test_legacy_k0(build_adapter):
@@ -509,12 +598,13 @@ def test_finished_releases_slot(build_adapter):
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1"]
-    assert waiting_queue == [req_2]
+    assert waiting_queue == []
 
     adapter.finished_requests.add("req-1")
     # Eviction is deferred to postprocess_scheduler_output in the runtime path
     # (commit c4d95fd9). Simulate it so promotion can pick up the freed slot.
     adapter._evict_finished_active_streams({"req-1"})
+    adapter.restore_queues(waiting_queue, running_queue)
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2"]
