@@ -61,6 +61,25 @@ def test_ring_divisibility_is_a_hard_constraint():
     assert "divisible" in decision.rejected[SPStrategy.RING]
 
 
+def test_ring_checks_post_sharding_length_with_auto_pad():
+    model = EmpiricalCostModel(
+        [
+            CalibrationPoint(strategy, Interconnect.NVLINK, 4, 0.125, 14040, float(i + 1))
+            for i, strategy in enumerate(SPStrategy)
+        ]
+    )
+    decision = SPCostSelector(model).select(
+        _workload(
+            seq_len=14040,
+            sp_degree=4,
+            sequence_auto_pad=True,
+        )
+    )
+    assert SPStrategy.RING in decision.rejected
+    assert "local sequence" in decision.rejected[SPStrategy.RING]
+    assert "3510" in decision.rejected[SPStrategy.RING]
+
+
 def test_causal_rejects_allgather_kv():
     decision = SPCostSelector(_model()).select(_workload(causal=True))
     assert SPStrategy.ALLGATHER_KV in decision.rejected

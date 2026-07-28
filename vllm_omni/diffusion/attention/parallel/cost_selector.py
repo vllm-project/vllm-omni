@@ -46,6 +46,7 @@ class SPWorkload:
     dtype_bytes: int = 2
     causal: bool = False
     has_attention_mask: bool = False
+    sequence_auto_pad: bool = False
     ulysses_mode: str = "strict"
 
     def __post_init__(self) -> None:
@@ -272,8 +273,14 @@ class SPCostSelector:
             if workload.causal and not caps.allgather_kv_causal:
                 return "AllGather-KV does not support causal attention"
             return None
-        if workload.seq_len % workload.sp_degree:
-            return "Ring requires global sequence length divisible by SP degree"
+        if workload.seq_len % workload.sp_degree and not workload.sequence_auto_pad:
+            return "Ring requires global sequence length divisible by SP degree when auto-padding is disabled"
+        local_seq_len = math.ceil(workload.seq_len / workload.sp_degree)
+        if local_seq_len % workload.sp_degree:
+            return (
+                "Ring requires the post-sharding local sequence length divisible "
+                f"by Ring degree (local_seq_len={local_seq_len}, degree={workload.sp_degree})"
+            )
         if workload.has_attention_mask and not caps.ring_attention_mask:
             return "Ring does not support attention masks"
         return None
