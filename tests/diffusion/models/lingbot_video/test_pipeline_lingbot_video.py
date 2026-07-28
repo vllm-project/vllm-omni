@@ -566,9 +566,12 @@ def test_forward_marks_unsupported_output_count_as_client_error():
     assert exc_info.value.status_code == 400
 
 
-def test_load_weights_rejects_external_weight_stream():
+def test_load_weights_uses_standard_weight_stream():
     pipeline = _make_pipeline()
+    pipeline.transformer = nn.Linear(1, 1, bias=False)
 
     assert pipeline.load_weights([]) == set()
-    with pytest.raises(RuntimeError, match="components are loaded directly"):
-        pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+    loaded = pipeline.load_weights([("transformer.weight", torch.ones(1, 1))])
+
+    assert loaded == {"transformer.weight"}
+    assert torch.equal(pipeline.transformer.weight, torch.ones(1, 1))

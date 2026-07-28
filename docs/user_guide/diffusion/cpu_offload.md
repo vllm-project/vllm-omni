@@ -50,6 +50,7 @@ higher-priority strategy is selected.
 | Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | — | yes | — | `layers`, customized modules |
+| LingBotVideoPipeline | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | `LingBotVideoTransformer3DModel` | yes | yes | — | `blocks` |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
 
 Model-level support requires discoverable DiT and encoder components.

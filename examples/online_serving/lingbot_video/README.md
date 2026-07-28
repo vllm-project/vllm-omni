@@ -17,6 +17,39 @@ substantially more GPU memory:
 MODEL=robbyant/lingbot-video-moe-30b-a3b bash run_server.sh
 ```
 
+### Memory offload
+
+Use model-level (sequential) CPU offload when the Base checkpoint and shared
+components do not fit on one GPU. The Qwen3-VL text encoder and Base Transformer
+take turns on the GPU; the VAE remains resident by default:
+
+```bash
+MODEL=robbyant/lingbot-video-moe-30b-a3b \
+  bash run_server.sh --enable-cpu-offload --enforce-eager
+```
+
+For the dense checkpoint, layerwise offload instead keeps the Transformer block
+weights in pinned CPU memory and prefetches blocks as they execute. The text
+encoder, VAE, and non-block Transformer modules remain GPU-resident:
+
+```bash
+MODEL=robbyant/lingbot-video-dense-1.3b \
+  bash run_server.sh --enable-layerwise-offload --enforce-eager
+```
+
+The two offload modes are mutually exclusive. Both reduce GPU memory at the
+cost of extra CPU-GPU transfers and startup work; they are capacity features,
+not speedups.
+
+For an additional low-memory T2I/T2V request, include
+`"offload_vae_during_denoise":true` in `extra_params`. LingBot temporarily moves
+the VAE to CPU during denoising and restores it before decode. This option is
+separate from the shared sequential policy, where the VAE normally remains on
+GPU.
+
+These paths load the Base dense or MoE Transformer only. CPU/layerwise offload
+does not enable the optional Refiner.
+
 ## Text to image
 
 The image endpoint selects T2I mode and always generates one frame:
