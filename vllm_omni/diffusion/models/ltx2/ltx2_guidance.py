@@ -391,7 +391,10 @@ class LTXGuidanceExecutor:
             model_sigma: torch.Tensor | None = None,
         ) -> torch.Tensor:
             model_sigma = sigma if model_sigma is None else model_sigma
-            x0 = {name: x0_from_velocity(sample, value, model_sigma) for name, value in splits.items()}
+            # Official guidance reduces contiguous BSC tensors. The fused
+            # transformer output may be channel-major after splitting, which
+            # changes fp32 reduction order and can cross bf16 rounding bounds.
+            x0 = {name: x0_from_velocity(sample, value, model_sigma).contiguous() for name, value in splits.items()}
             guided = combine_guided_x0(
                 cond=x0["cond"],
                 uncond_text=x0.get("uncond", 0.0),
