@@ -9,7 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -21,6 +21,7 @@ import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
@@ -3205,6 +3206,82 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         return prompt, tts_params, qwen3_ref_audio_warmup_artifact_key
+
+    async def _prepare_resumable_speech_generation(
+        self,
+        initial_request: OpenAICreateSpeechRequest,
+        request_stream: AsyncGenerator[OpenAICreateSpeechRequest, None],
+        request_id: str | None = None,
+    ) -> tuple[str, Any, dict[str, Any]]:
+        """Prepare one engine request fed by native resumable input updates."""
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+        if self._tts_model_type != "qwen3_tts":
+            raise ValueError("Resumable speech input is currently supported only for Qwen3-TTS.")
+
+        request_id = request_id or f"speech-{random_uuid()}"
+        sampling_params_list = coerce_param_message_types(
+            list(self.engine_client.default_sampling_params_list),
+            True,
+        )
+        adapter = self._get_tts_adapter()
+        if adapter is None:
+            raise ValueError("No TTS adapter is configured for resumable speech input.")
+
+        async def prepare(request: OpenAICreateSpeechRequest):
+            has_inline_ref_audio = request.ref_audio is not None
+            validation_error = adapter.validate(request)
+            if validation_error:
+                raise ValueError(validation_error)
+            return await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+
+        prepared = await prepare(initial_request)
+
+        if initial_request.max_new_tokens is not None and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = initial_request.max_new_tokens
+        if initial_request.seed is not None and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].seed = initial_request.seed
+            if sampling_params_list[0].extra_args is None:
+                sampling_params_list[0].extra_args = {}
+            sampling_params_list[0].extra_args["tts_local_seed"] = initial_request.seed
+        elif sampling_params_list:
+            default_seed = getattr(sampling_params_list[0], "seed", None)
+            if default_seed is not None:
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+                if sampling_params_list[0].extra_args is None:
+                    sampling_params_list[0].extra_args = {}
+                sampling_params_list[0].extra_args.setdefault("tts_local_seed", int(default_seed))
+
+        async def prompt_stream() -> AsyncGenerator[StreamingInput, None]:
+            yield StreamingInput(prompt=prepared.prompt)
+            async for request in request_stream:
+                update_prompt = tokens_input(prompt_token_ids=[1])
+                update_prompt["additional_information"] = {
+                    "text": [request.input],
+                    "meta": {"qwen3_tts_streaming_update": True},
+                }
+                yield StreamingInput(prompt=update_prompt)
+
+        generator = self.engine_client.generate(
+            prompt=prompt_stream(),
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["audio"],
+        )
+        self._track_ref_audio_artifact_warmup(
+            request_id,
+            prepared.warmup_artifact_key,
+            x_vector_only=self._tts_x_vector_only(prepared.tts_params),
+        )
+        return request_id, generator, prepared.tts_params
 
     async def _prepare_speech_generation(
         self,

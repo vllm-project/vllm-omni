@@ -690,6 +690,40 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         dtype = self._embedding_dtype
         tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
 
+        streaming_update_raw = meta.get("qwen3_tts_streaming_update")
+        if isinstance(streaming_update_raw, list):
+            streaming_update_raw = streaming_update_raw[0] if streaming_update_raw else False
+        if is_prefill and bool(streaming_update_raw):
+            if span_len != 1:
+                raise ValueError(
+                    f"Qwen3-TTS resumable text updates must append exactly one prompt token; received {span_len}."
+                )
+            text_raw = info_dict.get("text")
+            text = text_raw[0] if isinstance(text_raw, list) and text_raw else text_raw
+            if not isinstance(text, str) or not text:
+                raise ValueError("Qwen3-TTS resumable text update is missing text.")
+            continuation_embed, trailing_text = self._prompt_builder.build_streaming_text_update(text)
+            input_ids_out = input_ids.clone()
+            input_ids_out[:] = int(self.talker_config.codec_pad_id)
+            audio_codes = torch.zeros(
+                (span_len, int(self.talker_config.num_code_groups)),
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+            return (
+                input_ids_out,
+                continuation_embed.to(device=input_ids.device, dtype=dtype),
+                {
+                    "codes": {"audio": audio_codes},
+                    "hidden_states": {"trailing_text": trailing_text.detach()},
+                    "meta": {
+                        "qwen3_tts_streaming_update": False,
+                        "talker_text_offset": 0,
+                        "codec_streaming": codec_streaming,
+                    },
+                },
+            )
+
         if is_prefill:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = embed.get("prefill")

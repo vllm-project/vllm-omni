@@ -496,6 +496,22 @@ class BatchSpeechResponse(BaseModel):
     failed: int
 
 
+class StreamingSpeechInputCommit(BaseModel):
+    """Commit buffered text to a persistent streaming speech request."""
+
+    type: Literal["input.commit"]
+    commit_id: str | None = None
+
+
+class StreamingSpeechInputCommitted(BaseModel):
+    """Acknowledgement that a text commit was queued for the resumable request."""
+
+    type: Literal["input.committed"] = "input.committed"
+    commit_id: str | None = None
+    sentence_index: int = Field(ge=0)
+    chars_committed: int = Field(ge=1)
+
+
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
@@ -544,9 +560,30 @@ class StreamingSpeechSessionConfig(BaseModel):
             "frames (existing behavior)."
         ),
     )
+    streaming_mode: Literal["sentence", "token_level", "sentence_commit"] = Field(
+        default="sentence",
+        description=(
+            "Text input streaming mode: 'sentence' (default) buffers input until input.done; "
+            "'token_level' feeds text incrementally to a single TTS request; "
+            "'sentence_commit' buffers input.text messages until input.commit, then appends "
+            "each commit to one persistent TTS request."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.streaming_mode in ("token_level", "sentence_commit"):
+            if self.word_timestamps:
+                raise ValueError(f"word_timestamps is not supported in {self.streaming_mode} mode.")
+            if self.response_format != "pcm":
+                raise ValueError(
+                    f"{self.streaming_mode} streaming requires response_format='pcm'. "
+                    f"Got response_format='{self.response_format}'."
+                )
+            self.stream_audio = True
+            if self.speed is not None and self.speed != 1.0:
+                raise ValueError(f"Speed adjustment is not supported in {self.streaming_mode} mode.")
+            self.speed = 1.0
         if self.stream_audio:
             if self.response_format != "pcm":
                 raise ValueError(

@@ -879,6 +879,40 @@ class Qwen3TTSPromptEmbedsBuilder:
         text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
         return text_embed + codec_embed_sum, tts_pad_embed
 
+    def build_streaming_text_update(self, text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the one-row prefill and decode tail for a resumable text update."""
+        if not text:
+            raise ValueError("Qwen3-TTS streaming text updates cannot be empty.")
+
+        tokenizer = self.get_text_tokenizer()
+        device = self._device()
+        wrapped_ids = tokenizer(
+            build_assistant_text(text),
+            return_tensors="pt",
+            padding=False,
+        )["input_ids"].to(device=device)
+        text_ids = wrapped_ids[:, 3:-5]
+        if text_ids.numel() == 0:
+            raise ValueError("Qwen3-TTS streaming text update produced no text tokens.")
+
+        text_embed = self._text_projection(self._text_embedding(text_ids))
+        eos_id = torch.tensor(
+            [[self._config.tts_eos_token_id]],
+            device=device,
+            dtype=text_ids.dtype,
+        )
+        eos_embed = self._text_projection(self._text_embedding(eos_id))
+        codec_bos = self._codec_embed(
+            torch.tensor(
+                [[self._talker_config.codec_bos_id]],
+                device=device,
+                dtype=torch.long,
+            )
+        )
+        first_row = text_embed[:, :1] + codec_bos
+        trailing_text = torch.cat((text_embed[:, 1:], eos_embed), dim=1)
+        return first_row.squeeze(0), trailing_text.squeeze(0)
+
     # -------------------- main entry point --------------------
 
     def build_prompt_embeds(

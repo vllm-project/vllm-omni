@@ -9,6 +9,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.utils.forced_aligner import WordTimestamp
@@ -52,6 +53,83 @@ def _build_test_app(
     return app, speech_service
 
 
+def _build_resumable_test_app(mocker: MockerFixture, captured_text: list[str]):
+    speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+    speech_service.engine_client = SimpleNamespace(abort=mocker.AsyncMock())
+    speech_service.forced_aligner_config = None
+
+    async def prepare(initial_request, remaining_requests):
+        async def requests():
+            yield initial_request
+            async for request in remaining_requests:
+                yield request
+
+        return "req-resumable", requests(), {}
+
+    async def chunks(generator, _request_id, *, include_sample_rate=False):
+        async for request in generator:
+            captured_text.append(request.input)
+            chunk = request.input.encode()
+            yield (chunk, 24000) if include_sample_rate else chunk
+
+    speech_service._prepare_resumable_speech_generation = prepare
+    speech_service._generate_pcm_chunks = chunks
+    return _build_test_app(speech_service)
+
+
+@pytest.mark.asyncio
+async def test_resumable_preparation_uses_sparse_native_updates(mocker: MockerFixture):
+    service = object.__new__(OmniOpenAIServingSpeech)
+    captured: dict = {}
+
+    def generate(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    service.engine_client = SimpleNamespace(
+        errored=False,
+        default_sampling_params_list=[object()],
+        generate=generate,
+    )
+    service._tts_model_type = "qwen3_tts"
+    prepared = SimpleNamespace(
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        tts_params={"task_type": ["CustomVoice"]},
+        warmup_artifact_key=None,
+    )
+    adapter = SimpleNamespace(
+        validate=lambda _request: None,
+        build=mocker.AsyncMock(return_value=prepared),
+    )
+    service._get_tts_adapter = lambda: adapter
+    service._track_ref_audio_artifact_warmup = lambda *_args, **_kwargs: None
+    service._tts_x_vector_only = lambda _params: False
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+        side_effect=lambda params, _streaming: params,
+    )
+
+    async def updates():
+        yield OpenAICreateSpeechRequest(input="second", voice="Vivian")
+
+    await service._prepare_resumable_speech_generation(
+        OpenAICreateSpeechRequest(input="first", voice="Vivian"),
+        updates(),
+        request_id="req-1",
+    )
+    prompt_stream = captured["prompt"]
+    first = await anext(prompt_stream)
+    second = await anext(prompt_stream)
+
+    assert first.prompt == prepared.prompt
+    assert second.prompt["prompt_token_ids"] == [1]
+    assert second.prompt["additional_information"] == {
+        "text": ["second"],
+        "meta": {"qwen3_tts_streaming_update": True},
+    }
+    assert adapter.build.await_count == 1
+
+
 class TestStreamingSpeechWebSocket:
     def test_non_streaming_single_frame(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
@@ -78,6 +156,103 @@ class TestStreamingSpeechWebSocket:
                 assert session_done == {"type": "session.done", "total_sentences": 1}
 
         assert speech_service._generate_audio_bytes.await_count == 1
+
+    def test_connection_reuse_accepts_second_session(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                for text in ("First session.", "Second session."):
+                    ws.send_json({"type": "session.config", "voice": "Vivian"})
+                    ws.send_json({"type": "input.text", "text": text})
+                    ws.send_json({"type": "input.done"})
+
+                    assert ws.receive_json()["type"] == "audio.start"
+                    assert ws.receive_bytes().startswith(b"RIFF")
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {
+                        "type": "session.done",
+                        "total_sentences": 1,
+                    }
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+
+    def test_token_level_uses_native_resumable_input(self, mocker: MockerFixture):
+        captured_text: list[str] = []
+        app, _ = _build_resumable_test_app(mocker, captured_text)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "streaming_mode": "token_level",
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello "})
+                ws.send_json({"type": "input.text", "text": "world."})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                assert ws.receive_bytes() == b"Hello "
+                assert ws.receive_bytes() == b"world."
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": 12,
+                    "error": False,
+                }
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "total_sentences": 2,
+                }
+
+        assert captured_text == ["Hello ", "world."]
+
+    def test_sentence_commits_use_native_resumable_input(self, mocker: MockerFixture):
+        captured_text: list[str] = []
+        app, _ = _build_resumable_test_app(mocker, captured_text)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "streaming_mode": "sentence_commit",
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence."})
+                ws.send_json({"type": "input.commit", "commit_id": "first"})
+                ws.send_json({"type": "input.text", "text": " Second sentence."})
+                ws.send_json({"type": "input.commit", "commit_id": "second"})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                assert ws.receive_bytes() == b"First sentence."
+                assert ws.receive_json() == {
+                    "type": "input.committed",
+                    "commit_id": "first",
+                    "sentence_index": 0,
+                    "chars_committed": 15,
+                }
+                assert ws.receive_bytes() == b" Second sentence."
+                assert ws.receive_json() == {
+                    "type": "input.committed",
+                    "commit_id": "second",
+                    "sentence_index": 1,
+                    "chars_committed": 17,
+                }
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "total_sentences": 2,
+                }
+
+        assert captured_text == ["First sentence.", " Second sentence."]
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
