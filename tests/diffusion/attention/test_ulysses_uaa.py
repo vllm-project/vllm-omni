@@ -268,7 +268,9 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     batch_size = 2
     head_size = 8
     seq_len = 10
-    num_heads = 3  # head_cnt not divisible by ulysses_degree=2 -> triggers head padding
+    # This is the positive Hybrid case: K/V heads must not require padding,
+    # which is unsupported by advanced_uaa when Ring is also enabled.
+    num_heads = 4
 
     # Ensure ring ranks see equal post-Ulysses seq_len:
     # rank0/1 -> 3+2=5, rank2/3 -> 3+2=5
