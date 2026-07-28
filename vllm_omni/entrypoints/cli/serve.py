@@ -410,7 +410,7 @@ class OmniServeCommand(CLISubcommand):
             dest="model_class_name",
             type=str,
             default=None,
-            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+            help="Override the diffusion pipeline class name (e.g. LTX2Pipeline).",
         )
         omni_config_group.add_argument(
             "--diffusion-load-format",
