@@ -31,6 +31,8 @@ from tests.helpers.mark import hardware_test
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 OFFICIAL_REVISION = "9377758131b1ffde4b7f766804590a6617bf2ab9"
+# Version selected by this revision's uv.lock. Keep it out of Omni's runtime and dev dependencies.
+OFFICIAL_OPENIMAGEIO_VERSION = "3.1.11.0"
 PROMPT = (
     "A space shuttle launches vertically above a desert launch pad. Bright exhaust flames and a dense white "
     "plume billow beneath it while the camera remains fixed."
@@ -185,6 +187,22 @@ def _official_source(artifact_root: Path) -> tuple[Path, str]:
         actual_revision = _git_revision(root)
     assert actual_revision == revision, f"Official source revision mismatch: {actual_revision} != {revision}"
     return root, revision
+
+
+def _official_runner_prefix() -> list[str]:
+    """Run the reference with its missing binary dependency isolated from CI."""
+    uv = shutil.which("uv")
+    assert uv is not None, "uv is required to run the pinned official LTX reference"
+    return [
+        uv,
+        "run",
+        "--no-project",
+        "--with",
+        f"openimageio=={OFFICIAL_OPENIMAGEIO_VERSION}",
+        "--python",
+        sys.executable,
+        "python",
+    ]
 
 
 def _resolve_model(case: LTXAccuracyCase) -> Path:
@@ -349,14 +367,13 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     request_path.write_text(json.dumps(_request(case, image), indent=2) + "\n")
 
     runner = Path(__file__).with_name("run_ltx_reference.py")
-    base_command = [
-        sys.executable,
+    runner_args = [
         str(runner),
         "--request",
         str(request_path),
     ]
     if os.environ.get("VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", "").lower() in {"1", "true", "yes", "on"}:
-        base_command.append("--enable-layerwise-offload")
+        runner_args.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
     repository_root = Path(__file__).resolve().parents[4]
@@ -367,7 +384,8 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
 
     official_output = output_root / "official"
     _run(
-        base_command
+        _official_runner_prefix()
+        + runner_args
         + [
             "--backend",
             "official",
@@ -386,7 +404,8 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
 
     omni_output = output_root / "omni"
     _run(
-        base_command
+        [sys.executable]
+        + runner_args
         + [
             "--backend",
             "omni",
