@@ -1,7 +1,7 @@
 """Tests for MossTTSCUDAGraphCodecWrapper numerical equivalence.
 
 Verifies that CUDA Graph-accelerated decoding produces results equivalent
-to eager mode, with special attention to the two-argument _decode_frame
+to eager mode, with special attention to the two-argument _decode
 interface (codes [NQ, 1, T] + lengths [1]) and the NQ-first input convention.
 """
 
@@ -34,7 +34,7 @@ DOWNSAMPLE_RATE = 4  # synthetic; real checkpoint uses 1920
 class SyntheticCodecModel(nn.Module):
     """Minimal stand-in for MossAudioTokenizerModel.
 
-    Exposes the same two-argument ``_decode_frame(codes, lengths)`` interface
+    Exposes the same two-argument ``_decode(codes, lengths)`` interface
     used by ``MossTTSCUDAGraphCodecWrapper`` and returns a
     MossAudioTokenizerDecoderOutput.
 
@@ -58,7 +58,7 @@ class SyntheticCodecModel(nn.Module):
         self.conv = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
         self.upsample = nn.ConvTranspose1d(hidden, 1, kernel_size=downsample_rate, stride=downsample_rate)
 
-    def _decode_frame(self, codes: torch.Tensor, lengths: torch.Tensor) -> MossAudioTokenizerDecoderOutput:
+    def _decode(self, codes: torch.Tensor, lengths: torch.Tensor) -> MossAudioTokenizerDecoderOutput:
         """codes: [NQ, B, T], lengths: [B] → audio [B, 1, T*upsample]."""
         nq, b, t = codes.shape
         # treat NQ as channel dim → [B, NQ, T] for Conv1d (expects [B, C, T])
@@ -83,7 +83,7 @@ class SyntheticCodecModel(nn.Module):
         for i, c in enumerate(codes_list):
             codes[:nq, i, : c.shape[-1]] = c[:nq]
             lengths[i] = c.shape[-1]
-        return self._decode_frame(codes, lengths)
+        return self._decode(codes, lengths)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ def _eager_decode(model: SyntheticCodecModel, codes_nq_t: torch.Tensor) -> MossA
     codes_nq_1_t = codes_nq_t.unsqueeze(1)  # [NQ, 1, T]
     lengths = torch.tensor([t], dtype=torch.long, device=codes_nq_t.device)
     with torch.no_grad():
-        return model._decode_frame(codes_nq_1_t, lengths)
+        return model._decode(codes_nq_1_t, lengths)
 
 
 # ---------------------------------------------------------------------------

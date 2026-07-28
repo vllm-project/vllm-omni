@@ -388,17 +388,22 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         return out
 
     torch._dynamo.reset()
-    from torch._dynamo.testing import CompileCounter
+    try:
+        from torch._dynamo.testing import CompileCounter
 
-    counter = CompileCounter()
+        counter = CompileCounter()
 
-    def fn(inputs, q, k, v):
-        return paged_write_attn(inputs, q, k, v, None, None, HEAD_DIM**-0.5) * 1.0
+        def fn(inputs, q, k, v):
+            return paged_write_attn(inputs, q, k, v, None, None, HEAD_DIM**-0.5) * 1.0
 
-    compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
 
-    run_one_forward(commit=True)  # history grows between calls ->
-    run_one_forward(commit=True)  # block-table VALUES change, shapes don't
-    run_one_forward(commit=False)
+        run_one_forward(commit=True)  # history grows between calls ->
+        run_one_forward(commit=True)  # block-table VALUES change, shapes don't
+        run_one_forward(commit=False)
 
-    assert counter.frame_count == 1, f"recompiled: frame_count={counter.frame_count}"
+        assert counter.frame_count == 1, f"recompiled: frame_count={counter.frame_count}"
+    finally:
+        # Leave a clean dynamo state for later suites in the same pytest process
+        # (e.g. model_executor transformers models).
+        torch._dynamo.reset()

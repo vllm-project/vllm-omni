@@ -246,6 +246,37 @@ class TestDelayPatternBehavior:
 class TestSamplerMethods:
     """Test the actual sampler and batched delay masking methods."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_apply_top_k_top_p_on_cpu(self, monkeypatch):
+        # File is marked cpu; vLLM's apply_top_k_top_p uses Triton and rejects
+        # CPU tensors. Use a pure-PyTorch fallback that still honors top-k/top-p.
+        def _cpu_apply_top_k_top_p(logits, top_ks, top_ps):
+            out = logits.clone()
+            vocab = out.shape[-1]
+            top_ks = top_ks.reshape(-1)
+            top_ps = top_ps.reshape(-1)
+            for row in range(out.shape[0]):
+                k = int(top_ks[row].item())
+                p = float(top_ps[row].item())
+                if 0 < k < vocab:
+                    threshold = torch.topk(out[row], k).values[-1]
+                    out[row].masked_fill_(out[row] < threshold, float("-inf"))
+                if 0.0 < p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(out[row], descending=True)
+                    probs = torch.softmax(sorted_logits, dim=-1)
+                    cumprobs = torch.cumsum(probs, dim=-1)
+                    # Keep the first token that exceeds p; drop the rest.
+                    to_remove = cumprobs > p
+                    to_remove[1:] = to_remove[:-1].clone()
+                    to_remove[0] = False
+                    out[row, sorted_idx[to_remove]] = float("-inf")
+            return out
+
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker.apply_top_k_top_p",
+            _cpu_apply_top_k_top_p,
+        )
+
     def _make_minimal_talker(self):
         """Create a minimal talker-like object with sampler/masking methods."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod

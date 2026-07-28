@@ -59,6 +59,8 @@ class MockScheduler:
     def __init__(self):
         self._waiting_queue = []
         self._step_id = 0
+        # Match RequestScheduler API used by request-batch admission wait.
+        self.max_num_running_reqs = 5
 
     def add_request(self, request):
         self._waiting_queue.append(request)
@@ -66,6 +68,12 @@ class MockScheduler:
 
     def has_requests(self):
         return len(self._waiting_queue) > 0
+
+    def num_waiting_requests(self) -> int:
+        return len(self._waiting_queue)
+
+    def num_running_requests(self) -> int:
+        return 0
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -623,10 +631,16 @@ async def test_async_add_req_and_stream_response():
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._init_lock = asyncio.Lock()
     engine._closed = False
-    engine.od_config = SimpleNamespace(streaming_output=False)
+    # Enable admission wait so concurrent adds land in one schedule wave;
+    # otherwise the first request can execute alone (~1s) and the rest in a
+    # second wave (~2s), failing the latency-spread assertion.
+    engine.od_config = SimpleNamespace(
+        streaming_output=False,
+        request_batch_max_wait_ms=500.0,
+    )
     engine._loop_started = False
     engine.main_loop = None
-    engine.supports_request_batch = False
+    engine.supports_request_batch = True
     engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
