@@ -5,17 +5,20 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import PIL.Image
 import torch
+import torch.nn.functional as F
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
 from . import ltx2_latents as latent_ops
-from .ltx2_denoise import I2VVideoAudioScheduler
+from .ltx2_guidance import euler_step_from_velocity
 
 if TYPE_CHECKING:
     from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
@@ -42,6 +45,41 @@ def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_outputs: int) ->
     if num_outputs == 1:
         return tensor
     return tensor.repeat_interleave(num_outputs, dim=0)
+
+
+def _preprocess_i2v_pil_images(
+    images: PIL.Image.Image | list[PIL.Image.Image],
+    *,
+    height: int,
+    width: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Match official LTX aspect-preserving resize and center crop."""
+    image_list = images if isinstance(images, list) else [images]
+    processed = []
+    for image in image_list:
+        pixels = (
+            torch.from_numpy(np.array(image.convert("RGB"), copy=True))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=device, dtype=torch.float32)
+        )
+        source_height, source_width = pixels.shape[-2:]
+        scale = max(height / source_height, width / source_width)
+        resized_height = math.ceil(source_height * scale)
+        resized_width = math.ceil(source_width * scale)
+        pixels = F.interpolate(
+            pixels,
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        crop_top = (resized_height - height) // 2
+        crop_left = (resized_width - width) // 2
+        pixels = pixels[:, :, crop_top : crop_top + height, crop_left : crop_left + width]
+        processed.append((pixels / 127.5 - 1.0).to(dtype=dtype))
+    return torch.cat(processed, dim=0)
 
 
 class LTXTextConditioningMixin:
@@ -113,21 +151,64 @@ class LTXTextConditioningMixin:
         batch_size = len(prompt) if prompt is not None else prompt_embeds.shape[0]
         negative_prompt_embeds_provided = negative_prompt_embeds is not None
 
-        if prompt_embeds is None:
-            prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
-                prompt=prompt,
-                num_videos_per_prompt=num_videos_per_prompt,
+        if do_classifier_free_guidance and prompt_embeds is None and negative_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            if prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type as `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            if isinstance(negative_prompt, list) and batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt` has batch size {len(negative_prompt)}, but `prompt` has batch size"
+                    f" {batch_size}."
+                )
+
+            # Official LTX encodes positive and negative prompts in one Gemma batch;
+            # separate bf16 GEMMs produce a different conditioning trajectory.
+            combined_embeds, combined_mask = self._get_gemma_prompt_embeds(
+                prompt=prompt + negative_prompt,
+                num_videos_per_prompt=1,
                 max_sequence_length=max_sequence_length,
                 scale_factor=scale_factor,
                 device=device,
                 dtype=dtype,
             )
-        elif num_videos_per_prompt > 1:
-            prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
-            prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
-                prompt_attention_mask,
-                num_videos_per_prompt,
-            )
+            prompt_embeds = combined_embeds[:batch_size]
+            negative_prompt_embeds = combined_embeds[batch_size:]
+            prompt_attention_mask = combined_mask[:batch_size]
+            negative_prompt_attention_mask = combined_mask[batch_size:]
+            if num_videos_per_prompt > 1:
+                prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+                negative_prompt_embeds = _repeat_prompt_tensor_for_outputs(
+                    negative_prompt_embeds,
+                    num_videos_per_prompt,
+                )
+                prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
+                negative_prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    negative_prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
+        else:
+            if prompt_embeds is None:
+                prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
+                    prompt=prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    scale_factor=scale_factor,
+                    device=device,
+                    dtype=dtype,
+                )
+            elif num_videos_per_prompt > 1:
+                prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+                prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
 
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
@@ -243,9 +324,10 @@ class LTXTextConditioningMixin:
 
 
 class LTXI2VConditioningMixin:
-    """First-frame conditioning behavior common to LTX2 and LTX2.3."""
+    """First-frame conditioning with optional unified T2V/I2V dispatch."""
 
     support_image_input = True
+    unified_text_image_entry = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -253,10 +335,6 @@ class LTXI2VConditioningMixin:
             vae_scale_factor=self.vae_spatial_compression_ratio,
             resample="bilinear",
         )
-
-    def forward(self, req: Any, image: Any | None = None, *args: Any, **kwargs: Any) -> Any:
-        """Preserve the public I2V positional API while sharing the T2V runner."""
-        return super().forward(req, *args, image=image, **kwargs)
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:
@@ -283,11 +361,12 @@ class LTXI2VConditioningMixin:
         image: Any | None,
         request_inputs: LTXRequestInputs,
     ) -> Any | None:
-        if image is not None or not req.prompts:
+        prompts = getattr(req, "prompts", None)
+        if image is not None or not prompts:
             return image
 
         raw_images = []
-        for prompt_item in req.prompts:
+        for prompt_item in prompts:
             if isinstance(prompt_item, str):
                 raw_image = None
             else:
@@ -300,8 +379,12 @@ class LTXI2VConditioningMixin:
                 raw_image = PIL.Image.open(raw_image).convert("RGB")
             raw_images.append(raw_image)
 
+        if all(raw_image is None for raw_image in raw_images) and self.unified_text_image_entry:
+            return None
         if any(raw_image is None for raw_image in raw_images) and request_inputs.latents is None:
-            raise ValueError("Image is required for LTX I2V generation.")
+            if not self.unified_text_image_entry:
+                raise ValueError("Image is required for LTX I2V generation.")
+            raise ValueError("LTX request batches cannot mix text-to-video and image-to-video prompts.")
         if len(raw_images) == 1:
             return raw_images[0]
         return raw_images or image
@@ -311,75 +394,19 @@ class LTXI2VConditioningMixin:
         request_inputs: LTXRequestInputs,
         image: Any | None = None,
     ) -> None:
-        if image is None and request_inputs.latents is None:
+        if not self.unified_text_image_entry and image is None and request_inputs.latents is None:
             raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
         super()._check_forward_inputs(request_inputs, image=image)
 
-    def prepare_latents(
+    def _encode_i2v_image_latents(
         self,
-        image: torch.Tensor | None = None,
-        batch_size: int = 1,
-        num_channels_latents: int = 128,
-        height: int = 512,
-        width: int = 768,
-        num_frames: int = 121,
-        noise_scale: float = 0.0,
-        dtype: torch.dtype | None = None,
-        device: torch.device | None = None,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_frames, height, width = latent_ops.resolve_video_latent_shape(
-            height,
-            width,
-            num_frames,
-            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
-            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
-        )
-        shape = (batch_size, num_channels_latents, num_frames, height, width)
-        mask_shape = (batch_size, 1, num_frames, height, width)
-
-        if latents is not None:
-            if latents.ndim == 5:
-                batch_size, _, num_frames, height, width = latents.shape
-                mask_shape = (batch_size, 1, num_frames, height, width)
-                conditioning_mask = latents.new_zeros(mask_shape)
-                conditioning_mask[:, :, 0] = 1.0
-                latents = latent_ops.normalize_latents(
-                    latents,
-                    self.vae.latents_mean,
-                    self.vae.latents_std,
-                    self.vae.config.scaling_factor,
-                )
-                latents = latent_ops.create_noised_state(
-                    latents,
-                    noise_scale * (1 - conditioning_mask),
-                    generator,
-                )
-                latents = latent_ops.pack_latents(
-                    latents,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                )
-            else:
-                conditioning_mask = latents.new_zeros(mask_shape)
-                conditioning_mask[:, :, 0] = 1.0
-
-            conditioning_mask = latent_ops.pack_latents(
-                conditioning_mask,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            ).squeeze(-1)
-            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
-                raise ValueError(
-                    "Provided `latents` tensor has shape"
-                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
-                )
-            return latents.to(device=device, dtype=dtype), conditioning_mask
-
-        if image is None:
-            raise ValueError("`image` must be provided when `latents` is None.")
-
+        image: torch.Tensor,
+        *,
+        batch_size: int,
+        generator: torch.Generator | list[torch.Generator] | None,
+        dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        """Encode one conditioning frame per prompt into normalized latents."""
         image_batch_size = image.shape[0]
         if image_batch_size == 0:
             raise ValueError("`image` batch is empty.")
@@ -415,38 +442,173 @@ class LTXI2VConditioningMixin:
                 for img in image
             ]
 
-        init_latents = torch.cat(init_latents, dim=0).to(dtype)
+        init_latents = torch.cat(init_latents, dim=0).to(dtype=dtype)
         if num_videos_per_prompt > 1:
             init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
-        init_latents = latent_ops.normalize_latents(
+        return latent_ops.normalize_latents(
             init_latents,
             self.vae.latents_mean,
             self.vae.latents_std,
+        )
+
+    @staticmethod
+    def _replace_first_latent_frame(
+        latents: torch.Tensor,
+        image_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_shape = (latents.shape[0], latents.shape[1], 1, latents.shape[3], latents.shape[4])
+        if tuple(image_latents.shape) != expected_shape:
+            raise ValueError(
+                f"Encoded LTX conditioning image has shape {tuple(image_latents.shape)}, expected {expected_shape}."
+            )
+        latents = latents.clone()
+        latents[:, :, :1] = image_latents
+        return latents
+
+    def prepare_latents(
+        self,
+        image: torch.Tensor | None = None,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 0.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if image is None and self.unified_text_image_entry:
+            return super().prepare_latents(
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                noise_scale=noise_scale,
+                dtype=dtype,
+                device=device,
+                generator=generator,
+                latents=latents,
+            )
+
+        num_frames, height, width = latent_ops.resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
+        mask_shape = (batch_size, 1, num_frames, height, width)
+
+        if latents is not None:
+            unpacked_latents = latents.ndim == 5
+            if latents.ndim == 5:
+                expected_shape = (batch_size, num_channels_latents, num_frames, height, width)
+                if tuple(latents.shape) != expected_shape:
+                    raise ValueError(
+                        f"Provided unpacked `latents` have shape {tuple(latents.shape)}, expected {expected_shape}."
+                    )
+                conditioning_mask = latents.new_zeros(mask_shape)
+                conditioning_mask[:, :, 0] = 1.0
+                latents = latent_ops.normalize_latents(
+                    latents,
+                    self.vae.latents_mean,
+                    self.vae.latents_std,
+                    self.vae.config.scaling_factor,
+                )
+                if image is not None:
+                    image_latents = self._encode_i2v_image_latents(
+                        image,
+                        batch_size=batch_size,
+                        generator=generator,
+                        dtype=dtype,
+                    )
+                    # Official distilled Stage 2 starts from the upsampled Stage 1
+                    # state, then reapplies the source image at final resolution.
+                    latents = self._replace_first_latent_frame(latents, image_latents)
+                latents = latent_ops.pack_latents(
+                    latents,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+            else:
+                conditioning_mask = latents.new_zeros(mask_shape)
+                conditioning_mask[:, :, 0] = 1.0
+
+            conditioning_mask = latent_ops.pack_latents(
+                conditioning_mask,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            ).squeeze(-1)
+            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
+                raise ValueError(
+                    "Provided `latents` tensor has shape"
+                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
+                )
+            if unpacked_latents:
+                # Official LTX patchifies the latent state before drawing noise.
+                # Sampling the packed shape preserves its seed-to-output contract.
+                latents = latent_ops.create_noised_state(
+                    latents,
+                    noise_scale * (1 - conditioning_mask).unsqueeze(-1),
+                    generator,
+                )
+            elif image is not None:
+                image_latents = self._encode_i2v_image_latents(
+                    image,
+                    batch_size=batch_size,
+                    generator=generator,
+                    dtype=dtype,
+                )
+                unpacked = latent_ops.unpack_latents(
+                    latents,
+                    num_frames,
+                    height,
+                    width,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+                unpacked = self._replace_first_latent_frame(unpacked, image_latents)
+                latents = latent_ops.pack_latents(
+                    unpacked,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+            return latents.to(device=device, dtype=dtype), conditioning_mask
+
+        if image is None:
+            raise ValueError("`image` must be provided when `latents` is None.")
+        init_latents = self._encode_i2v_image_latents(
+            image,
+            batch_size=batch_size,
+            generator=generator,
+            dtype=dtype,
         )
         init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
 
         conditioning_mask = torch.zeros(mask_shape, device=device, dtype=dtype)
         conditioning_mask[:, :, 0] = 1.0
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
-
+        init_latents = latent_ops.pack_latents(
+            init_latents,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
         conditioning_mask = latent_ops.pack_latents(
             conditioning_mask,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         ).squeeze(-1)
-        latents = latent_ops.pack_latents(
-            latents,
-            self.transformer_spatial_patch_size,
-            self.transformer_temporal_patch_size,
-        )
+        noise = randn_tensor(init_latents.shape, generator=generator, device=device, dtype=dtype)
+        latents = init_latents * conditioning_mask.unsqueeze(-1) + noise * (1 - conditioning_mask).unsqueeze(-1)
         return latents, conditioning_mask
 
     def _step_video_latents_i2v(
         self,
         noise_pred_video: torch.Tensor,
         latents: torch.Tensor,
-        timestep: torch.Tensor,
+        step_index: int,
         latent_num_frames: int,
         latent_height: int,
         latent_width: int,
@@ -469,12 +631,14 @@ class LTXI2VConditioningMixin:
         )
         noise_pred_video = noise_pred_video[:, :, 1:]
         noise_latents = latents_unpacked[:, :, 1:]
-        pred_latents = self.scheduler.step(
-            noise_pred_video,
-            timestep,
+        # Official LTX advances the unconditioned frames directly on the
+        # sigma trajectory; the first frame remains fixed conditioning.
+        pred_latents = euler_step_from_velocity(
             noise_latents,
-            return_dict=False,
-        )[0]
+            noise_pred_video,
+            self.scheduler.sigmas,
+            step_index,
+        )
         latents_unpacked = torch.cat([latents_unpacked[:, :, :1], pred_latents], dim=2)
         return latent_ops.pack_latents(
             latents_unpacked,
@@ -491,12 +655,31 @@ class LTXI2VConditioningMixin:
         noise_scale: float,
         image: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if request_inputs.latents is None:
+        if image is None and self.unified_text_image_entry:
+            return super()._prepare_video_latents_stage(
+                request_inputs,
+                prompt_context,
+                device=device,
+                noise_scale=noise_scale,
+                image=None,
+            )
+
+        if image is not None:
             if isinstance(image, torch.Tensor):
                 if image.ndim == 3:
                     image = image.unsqueeze(0)
             elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
                 image = torch.stack(image, dim=0)
+            elif isinstance(image, PIL.Image.Image) or (
+                isinstance(image, list) and image and isinstance(image[0], PIL.Image.Image)
+            ):
+                image = _preprocess_i2v_pil_images(
+                    image,
+                    height=request_inputs.height,
+                    width=request_inputs.width,
+                    device=device,
+                    dtype=prompt_context.positive_connector_prompt_embeds.dtype,
+                )
             else:
                 image = self.video_processor.preprocess(
                     image,
@@ -509,32 +692,17 @@ class LTXI2VConditioningMixin:
             )
 
         return self.prepare_latents(
-            image,
-            prompt_context.batch_size * request_inputs.num_videos_per_prompt,
-            self.transformer.config.in_channels,
-            request_inputs.height,
-            request_inputs.width,
-            request_inputs.num_frames,
-            noise_scale,
-            torch.float32,
-            device,
-            request_inputs.generator,
-            request_inputs.latents,
-        )
-
-    def _make_video_audio_scheduler(
-        self,
-        audio_scheduler: Any,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-    ) -> Any:
-        return I2VVideoAudioScheduler(
-            self,
-            audio_scheduler,
-            latent_num_frames,
-            latent_height,
-            latent_width,
+            image=image,
+            batch_size=prompt_context.batch_size * request_inputs.num_videos_per_prompt,
+            num_channels_latents=self.transformer.config.in_channels,
+            height=request_inputs.height,
+            width=request_inputs.width,
+            num_frames=request_inputs.num_frames,
+            noise_scale=noise_scale,
+            dtype=prompt_context.positive_connector_prompt_embeds.dtype,
+            device=device,
+            generator=request_inputs.generator,
+            latents=request_inputs.latents,
         )
 
     def _prepare_denoise_context_for_cfg(
@@ -544,6 +712,8 @@ class LTXI2VConditioningMixin:
     ) -> LTXDenoiseContext:
         denoise_ctx = super()._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
         if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return denoise_ctx
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
 
         mask_batch = denoise_ctx.conditioning_mask.shape[0]
@@ -564,15 +734,46 @@ class LTXI2VConditioningMixin:
         ts: torch.Tensor,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
     ) -> dict[str, torch.Tensor]:
-        kwargs = super()._denoise_timestep_kwargs(ts, forward_ctx, denoise_ctx)
+        if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return super()._denoise_timestep_kwargs(
+                    ts,
+                    forward_ctx,
+                    denoise_ctx,
+                    video_token_count=video_token_count,
+                    audio_token_count=audio_token_count,
+                )
+            raise ValueError("LTX I2V denoising requires a conditioning mask.")
+        kwargs = super()._denoise_timestep_kwargs(
+            ts,
+            forward_ctx,
+            denoise_ctx,
+            video_token_count=video_token_count,
+            audio_token_count=audio_token_count,
+        )
         conditioning_mask = (
             denoise_ctx.conditioning_mask if forward_ctx.cfg_parallel_ready else denoise_ctx.conditioning_mask_for_model
         )
         if conditioning_mask is None:
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
         kwargs.update(
-            timestep=ts.unsqueeze(-1) * (1 - conditioning_mask),
-            audio_timestep=ts,
+            timestep=ts.reshape(-1, 1) * (1 - conditioning_mask),
         )
         return kwargs
+
+    def _video_guidance_model_sigma(
+        self,
+        sigma: torch.Tensor,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> torch.Tensor:
+        if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return super()._video_guidance_model_sigma(sigma, denoise_ctx)
+            raise ValueError("LTX I2V guidance requires a conditioning mask.")
+        # The conditioned tokens are evaluated at timestep zero by the model,
+        # so velocity-to-x0 guidance must use that same per-token sigma.
+        return sigma.reshape(-1, 1, 1) * (1 - denoise_ctx.conditioning_mask).unsqueeze(-1)
