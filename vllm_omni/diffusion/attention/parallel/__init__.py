@@ -12,11 +12,27 @@ Attention module, only adding a new strategy and selecting it in the factory.
 """
 
 from .base import NoParallelAttention, ParallelAttentionContext, ParallelAttentionStrategy
+from .cost_selector import (
+    EmpiricalCostModel,
+    Interconnect,
+    SPCostSelector,
+    SPStrategy,
+    SPWorkload,
+    StrategyCapabilities,
+    StrategyDecision,
+)
 from .factory import build_parallel_attention_strategy
 
 __all__ = [
-    "ParallelAttentionStrategy",
-    "ParallelAttentionContext",
+    "EmpiricalCostModel",
+    "Interconnect",
     "NoParallelAttention",
+    "ParallelAttentionContext",
+    "ParallelAttentionStrategy",
+    "SPCostSelector",
+    "SPStrategy",
+    "SPWorkload",
+    "StrategyCapabilities",
+    "StrategyDecision",
     "build_parallel_attention_strategy",
 ]
