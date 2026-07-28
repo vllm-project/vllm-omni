@@ -41,6 +41,26 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
+def _get_cpu_offload_cases(model: str):
+    return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--default-sampling-params",
+                    DEFAULT_SAMPLING_PARAMS,
+                    "--enable-cpu-offload",
+                    "--enforce-eager",
+                ],
+            ),
+            id="cpu-offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+    ]
+
+
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
@@ -98,4 +118,28 @@ def test_video_generation_modes_001(omni_server: OmniServer, openai_client: Open
         responses[0].videos[0],
         synthetic_image["np_array"],
         max_mean_absolute_error=0.25,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_cpu_offload_cases(MODEL), indirect=True)
+def test_cpu_offload_t2v_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    openai_client.send_video_diffusion_request(
+        {
+            "model": omni_server.model,
+            "form_data": {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "height": 192,
+                "width": 320,
+                "num_frames": 9,
+                "fps": 24,
+                "num_inference_steps": 2,
+                "guidance_scale": 3.0,
+                "flow_shift": 3.0,
+                "seed": 42,
+            },
+        }
     )

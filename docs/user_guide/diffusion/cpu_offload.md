@@ -47,6 +47,7 @@ higher-priority strategy is selected.
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | yes | yes | — | `transformer_blocks` |
 | StableDiffusionXLPipeline | `stabilityai/stable-diffusion-xl-base-1.0` | `SDXLUNet2DConditionModel` | yes | yes | — | `down_blocks`, `up_blocks` |
 | StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | — | yes | — | `transformer_blocks` |
+| LingBotVideoPipeline | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | `LingBotVideoTransformer3DModel` | yes | yes | — | `blocks` |
 | Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
 | SoulXSingerPipeline / SoulXSingerSVCPipeline | `Soul-AILab/SoulX-Singer` | `DiffLlama` | yes | yes | — | `layers` |

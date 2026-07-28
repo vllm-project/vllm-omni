@@ -7,4 +7,5 @@ PORT="${PORT:-8099}"
 
 vllm serve "${MODEL}" --omni \
     --model-class-name LingBotVideoPipeline \
-    --port "${PORT}"
+    --port "${PORT}" \
+    "$@"

@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
+from functools import wraps
 from typing import Any, ClassVar
 
 import numpy as np
@@ -17,9 +18,16 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from vllm.logger import init_logger
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import (
+    from_pretrained_with_prefetch,
+    prefetch_subfolders,
+)
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
@@ -37,8 +45,11 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
+
+logger = init_logger(__name__)
 
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
@@ -112,6 +123,40 @@ def _module_device(module: torch.nn.Module) -> torch.device:
         return next(module.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _restore_vae_device_after_call(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Restore the VAE device after generation, including exceptional exits."""
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        vae = getattr(self, "vae", None)
+        if vae is None:
+            return func(self, *args, **kwargs)
+
+        original_device = _module_device(vae)
+        active_error: BaseException | None = None
+        try:
+            return func(self, *args, **kwargs)
+        except BaseException as exc:
+            active_error = exc
+            raise
+        finally:
+            current_device = _module_device(vae)
+            if current_device != original_device:
+                try:
+                    vae.to(device=original_device)
+                    torch.accelerator.empty_cache()
+                except Exception:
+                    if active_error is None:
+                        raise
+                    logger.exception(
+                        "Failed to restore LingBot VAE to %s while propagating %s",
+                        original_device,
+                        type(active_error).__name__,
+                    )
+
+    return wrapped
 
 
 def _transformer_timestep(timestep: torch.Tensor, transformer_dtype: torch.dtype) -> torch.Tensor:
@@ -325,7 +370,8 @@ class LingBotVideoPipeline(
         super().__init__()
         del prefix
         self.od_config = od_config
-        self.device = get_local_device()
+        self._execution_device = get_local_device()
+        self.device = self._execution_device
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
         self.token_length = TOKEN_LENGTH
@@ -335,7 +381,9 @@ class LingBotVideoPipeline(
         self._crop_start: int | None = None
 
         model = od_config.model
-        local_files_only = os.path.exists(model)
+        revision = od_config.revision
+        local_files_only = os.path.isdir(model)
+        load_device = torch.get_default_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = getattr(od_config, "model_config", None) or {}
         transformer_dtype = _dtype_from_name(model_config.get("transformer_dtype"), dtype)
@@ -348,61 +396,102 @@ class LingBotVideoPipeline(
         vae_subfolder = str(model_config.get("vae_subfolder", "vae"))
         scheduler_subfolder = str(model_config.get("scheduler_subfolder", "scheduler"))
 
-        self.transformer = LingBotVideoTransformer3DModel.from_pretrained(
+        component_subfolders = [
+            transformer_subfolder,
+            text_encoder_subfolder,
+            processor_subfolder,
+            vae_subfolder,
+            scheduler_subfolder,
+        ]
+        prefetch_subfolders(
             model,
-            subfolder=transformer_subfolder,
-            torch_dtype=transformer_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+            subfolders=component_subfolders,
+        )
+
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
+            "revision": revision,
         }
-        self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen3VLForConditionalGeneration.from_pretrained,
             model,
             subfolder=text_encoder_subfolder,
+            prefetch_list=component_subfolders,
             **text_encoder_kwargs,
-        ).to(self.device)
+        ).to(load_device)
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
             subfolder=processor_subfolder,
             local_files_only=local_files_only,
+            revision=revision,
         )
-        self.vae = AutoencoderKLWan.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLWan.from_pretrained,
             model,
             subfolder=vae_subfolder,
+            prefetch_list=component_subfolders,
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+            revision=revision,
+        ).to(load_device)
         self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
             model,
             subfolder=scheduler_subfolder,
             local_files_only=local_files_only,
+            revision=revision,
         )
+
+        transformer_config = LingBotVideoTransformer3DModel.load_config(
+            model,
+            subfolder=transformer_subfolder,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        transformer_kwargs = get_transformer_config_kwargs(
+            TransformerConfig.from_dict(transformer_config),
+            LingBotVideoTransformer3DModel,
+        )
+        self.transformer = LingBotVideoTransformer3DModel(**transformer_kwargs)
+        self.transformer.to(dtype=transformer_dtype)
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder=transformer_subfolder,
+                revision=revision,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
+
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
 
     def to(self, *args, **kwargs):
-        device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
-        super().to(*args, **kwargs)
+        device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
         if device is not None:
-            self.device = torch.device(device)
-            self.transformer.to(device=self.device, non_blocking=non_blocking)
-            self.text_encoder.to(device=self.device, non_blocking=non_blocking)
-            self.vae.to(device=self.device, non_blocking=non_blocking)
+            move_kwargs: dict[str, Any] = {
+                "device": device,
+                "non_blocking": non_blocking,
+            }
+            if memory_format is not None:
+                move_kwargs["memory_format"] = memory_format
+            super().to(**move_kwargs)
+            self._execution_device = torch.device(device)
+            self.device = self._execution_device
+        elif memory_format is not None:
+            super().to(memory_format=memory_format)
+
+        # Keep each component's configured dtype. In particular, the VAE stays
+        # FP32 and the Transformer applies its own BF16-bulk/FP32-islands policy.
         if dtype is not None:
             self.transformer.to(dtype=dtype, non_blocking=non_blocking)
         return self
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        consumed = list(weights)
-        if consumed:
-            raise RuntimeError(
-                f"{self.__class__.__name__}.load_weights received {len(consumed)} weight tensors; "
-                "LingBot components are loaded directly from subfolders during __init__."
-            )
-        return {name for name, _ in self.named_parameters()}
+        return AutoWeightsLoader(self).load_weights(weights)
 
     @staticmethod
     def check_inputs(height: int, width: int, num_frames: int) -> None:
@@ -556,6 +645,7 @@ class LingBotVideoPipeline(
         frames = frames.permute(0, 2, 3, 4, 1).cpu()
         return frames[0]
 
+    @_restore_vae_device_after_call
     @torch.no_grad()
     def _generate(
         self,
