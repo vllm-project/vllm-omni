@@ -257,6 +257,47 @@ def test_ltx23_checkpoint_selects_version_specific_one_stage_profile(tmp_path, m
     assert pipe.reports_stage_durations
 
 
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        LTX2_TWO_STAGE_RECIPE,
+        LTX23_TWO_STAGE_RECIPE,
+        LTX2_DISTILLED_TWO_STAGE_RECIPE,
+        LTX23_DISTILLED_TWO_STAGE_RECIPE,
+    ],
+)
+def test_ltx_multistage_recipes_declare_cache_dit_unsupported(recipe):
+    assert not recipe.supports_cache_dit
+
+
+@pytest.mark.parametrize("recipe", [LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE, LTX_POSITIVE_ONLY_RECIPE])
+def test_ltx_one_stage_recipes_declare_cache_dit_supported(recipe):
+    assert recipe.supports_cache_dit
+
+
+def test_ltx_multistage_rejects_cache_dit_before_component_initialization(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
+    initialized = False
+
+    def stub_components(*_args, **_kwargs):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+
+    with pytest.raises(ValueError, match="only one-stage LTX recipes"):
+        LTX2TwoStagePipeline(
+            od_config=SimpleNamespace(
+                model=str(tmp_path),
+                cache_backend="cache_dit",
+            )
+        )
+
+    assert not initialized
+
+
 def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, monkeypatch):
     from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
