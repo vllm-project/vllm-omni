@@ -63,7 +63,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
     """
@@ -90,7 +90,7 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_sequential_requests_independent(omni_server, openai_client) -> None:
     """
@@ -133,7 +133,7 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
@@ -159,7 +159,7 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """
