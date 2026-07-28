@@ -571,6 +571,34 @@ def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
         OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
 
 
+def test_diffusion_parallel_config_derives_world_size_for_auto_sp():
+    cfg = OmniStageDiffusionParallelConfig(
+        sp_strategy="auto",
+        sp_selector_profile="/tmp/profile.jsonl",
+        sp_selector_workload={
+            "seq_len": 8192,
+            "sp_degree": 4,
+            "num_heads": 32,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "interconnect": "nvlink",
+        },
+    )
+
+    assert cfg.sequence_parallel_size == 4
+    assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_rejects_auto_with_manual_degrees():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        OmniStageDiffusionParallelConfig(
+            ulysses_degree=2,
+            sp_strategy="auto",
+            sp_selector_profile="/tmp/profile.jsonl",
+            sp_selector_workload={"sp_degree": 2},
+        )
+
+
 def test_stage_realizations_use_stage_specific_parallel_config_types():
     qwen_config = VllmOmniConfig.from_registry("qwen3_tts")
     ar_stage = qwen_config.stage_by_id(0)

@@ -15,11 +15,13 @@ from .base import NoParallelAttention, ParallelAttentionContext, ParallelAttenti
 from .cost_selector import (
     EmpiricalCostModel,
     Interconnect,
+    PhysicsInformedCostModel,
     SPCostSelector,
     SPStrategy,
     SPWorkload,
     StrategyCapabilities,
     StrategyDecision,
+    resolve_auto_sp_strategy,
 )
 from .factory import build_parallel_attention_strategy
 
@@ -29,10 +31,12 @@ __all__ = [
     "NoParallelAttention",
     "ParallelAttentionContext",
     "ParallelAttentionStrategy",
+    "PhysicsInformedCostModel",
     "SPCostSelector",
     "SPStrategy",
     "SPWorkload",
     "StrategyCapabilities",
     "StrategyDecision",
     "build_parallel_attention_strategy",
+    "resolve_auto_sp_strategy",
 ]

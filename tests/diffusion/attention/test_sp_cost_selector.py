@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,10 +12,12 @@ from vllm_omni.diffusion.attention.parallel.cost_selector import (
     CalibrationPoint,
     EmpiricalCostModel,
     Interconnect,
+    PhysicsInformedCostModel,
     SPCostSelector,
     SPStrategy,
     SPWorkload,
     StrategyCapabilities,
+    resolve_auto_sp_strategy,
 )
 
 
@@ -96,9 +99,7 @@ def test_strict_ulysses_requires_divisible_kv_heads():
         CalibrationPoint(strategy, Interconnect.NVLINK, 4, 0.125, 2048, float(i + 1))
         for i, strategy in enumerate(SPStrategy)
     ]
-    decision = SPCostSelector(EmpiricalCostModel(points)).select(
-        _workload(sp_degree=4, num_kv_heads=2)
-    )
+    decision = SPCostSelector(EmpiricalCostModel(points)).select(_workload(sp_degree=4, num_kv_heads=2))
     assert SPStrategy.ULYSSES in decision.rejected
 
 
@@ -141,3 +142,100 @@ def test_loads_p1d_jsonl_schema(tmp_path):
     )
     model = EmpiricalCostModel.from_jsonl(path)
     assert model.predict_ms(SPStrategy.RING, _workload()) == 1.25
+
+
+def test_physics_informed_model_pools_sequence_and_kv_ratio_terms():
+    def latency(seq_len: int, kv_ratio: float) -> float:
+        seq = seq_len / 2048
+        return 0.5 + 0.2 * seq + 0.1 * seq * seq + 0.3 * kv_ratio * seq
+
+    points = [
+        CalibrationPoint(
+            SPStrategy.RING,
+            Interconnect.NVLINK,
+            2,
+            ratio,
+            seq_len,
+            latency(seq_len, ratio),
+        )
+        for ratio in (0.125, 0.25, 1.0)
+        for seq_len in (2048, 8192, 32768)
+        if not (ratio == 0.25 and seq_len == 8192)
+    ]
+    model = PhysicsInformedCostModel(points)
+    assert model.predict_ms(
+        SPStrategy.RING,
+        _workload(seq_len=8192, num_kv_heads=8),
+    ) == pytest.approx(latency(8192, 0.25))
+
+
+def test_explicit_pcie_sp2_overlap_regime_can_override_interpolated_cost():
+    points = [
+        CalibrationPoint(strategy, Interconnect.PCIE, 2, 0.125, 8192, latency)
+        for strategy, latency in (
+            (SPStrategy.ULYSSES, 8.0),
+            (SPStrategy.ALLGATHER_KV, 4.0),
+            (SPStrategy.RING, 6.0),
+        )
+    ]
+    decision = SPCostSelector(
+        EmpiricalCostModel(points),
+        pcie_sp2_ring_kv_tokens=1024,
+    ).select(
+        _workload(
+            seq_len=8192,
+            interconnect="pcie",
+        )
+    )
+    assert decision.strategy == SPStrategy.RING
+
+
+def test_resolve_auto_strategy_updates_degrees_before_group_initialization(
+    tmp_path,
+):
+    profile = tmp_path / "profile.jsonl"
+    rows = [
+        {
+            "strategy": strategy,
+            "sp": 2,
+            "f": 0.125,
+            "seq": 2048,
+            "interconnect": "nvlink",
+            "p50_ms": latency,
+        }
+        for strategy, latency in (
+            ("ulysses", 2.0),
+            ("allgather_kv", 1.0),
+            ("ring", 0.5),
+        )
+    ]
+    profile.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(
+        sp_strategy="auto",
+        sp_selector_profile=str(profile),
+        sp_selector_workload={
+            "seq_len": 2048,
+            "sp_degree": 2,
+            "num_heads": 32,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "interconnect": "nvlink",
+        },
+        sp_selector_cost_model="empirical",
+        sp_selector_pcie_sp2_ring_kv_tokens=None,
+        sp_selector_allow_ring=False,
+        sequence_parallel_size=2,
+        ulysses_degree=1,
+        ring_degree=1,
+        allgather_degree=1,
+    )
+    decision = resolve_auto_sp_strategy(config)
+    assert decision is not None
+    assert decision.strategy == SPStrategy.ALLGATHER_KV
+    assert config.ulysses_degree == 1
+    assert config.ring_degree == 1
+    assert config.allgather_degree == 2
+    assert config.sequence_parallel_size == 2

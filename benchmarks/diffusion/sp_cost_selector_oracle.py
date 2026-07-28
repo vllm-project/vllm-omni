@@ -23,6 +23,7 @@ from vllm_omni.diffusion.attention.parallel.cost_selector import (
     CalibrationPoint,
     EmpiricalCostModel,
     Interconnect,
+    PhysicsInformedCostModel,
     SPCostSelector,
     SPStrategy,
     SPWorkload,
@@ -31,11 +32,7 @@ from vllm_omni.diffusion.attention.parallel.cost_selector import (
 
 def _read_rows(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as f:
-        return [
-            json.loads(line)
-            for line in f
-            if line.strip() and json.loads(line).get("status", "ok") == "ok"
-        ]
+        return [json.loads(line) for line in f if line.strip() and json.loads(line).get("status", "ok") == "ok"]
 
 
 def _point(row: dict) -> CalibrationPoint:
@@ -77,6 +74,8 @@ def evaluate(
     evaluation_rows: list[dict],
     *,
     leave_one_seq_out: bool,
+    physics_informed: bool = False,
+    pcie_sp2_ring_kv_tokens: float | None = None,
 ) -> dict:
     cells: dict[tuple, list[dict]] = defaultdict(list)
     for row in evaluation_rows:
@@ -89,7 +88,11 @@ def evaluate(
             training = [_point(row) for row in calibration_rows if _cell_key(row)[3] != workload.seq_len]
         else:
             training = [_point(row) for row in calibration_rows]
-        selector = SPCostSelector(EmpiricalCostModel(training))
+        model_cls = PhysicsInformedCostModel if physics_informed else EmpiricalCostModel
+        selector = SPCostSelector(
+            model_cls(training),
+            pcie_sp2_ring_kv_tokens=pcie_sp2_ring_kv_tokens,
+        )
         decision = selector.select(workload)
         measured = {SPStrategy(row["strategy"]): _point(row).latency_ms for row in rows}
         feasible_measured = {strategy: ms for strategy, ms in measured.items() if strategy in decision.costs_ms}
@@ -129,11 +132,15 @@ def main() -> None:
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--evaluation", type=Path, required=True)
     parser.add_argument("--leave-one-seq-out", action="store_true")
+    parser.add_argument("--physics-informed", action="store_true")
+    parser.add_argument("--pcie-sp2-ring-kv-tokens", type=float)
     args = parser.parse_args()
     result = evaluate(
         _read_rows(args.calibration),
         _read_rows(args.evaluation),
         leave_one_seq_out=args.leave_one_seq_out,
+        physics_informed=args.physics_informed,
+        pcie_sp2_ring_kv_tokens=args.pcie_sp2_ring_kv_tokens,
     )
     print(json.dumps(result, indent=2, default=str))
 

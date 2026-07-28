@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Any, Protocol
+
+import numpy as np
 
 
 class SPStrategy(StrEnum):
@@ -64,14 +67,10 @@ class SPWorkload:
             raise ValueError(f"SP workload dimensions must be positive: {', '.join(invalid)}")
         if self.num_heads % self.num_kv_heads:
             raise ValueError(
-                "num_heads must be divisible by num_kv_heads, got "
-                f"{self.num_heads} and {self.num_kv_heads}"
+                f"num_heads must be divisible by num_kv_heads, got {self.num_heads} and {self.num_kv_heads}"
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
-            raise ValueError(
-                "ulysses_mode must be 'strict' or 'advanced_uaa', got "
-                f"{self.ulysses_mode!r}"
-            )
+            raise ValueError(f"ulysses_mode must be 'strict' or 'advanced_uaa', got {self.ulysses_mode!r}")
         object.__setattr__(self, "interconnect", Interconnect(self.interconnect))
 
     @property
@@ -153,9 +152,7 @@ class EmpiricalCostModel:
                             sp_degree=int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
                             kv_ratio=float(row["kv_ratio"] if "kv_ratio" in row else row["f"]),
                             seq_len=int(row["seq_len"] if "seq_len" in row else row["seq"]),
-                            latency_ms=float(
-                                row["latency_ms"] if "latency_ms" in row else row["p50_ms"]
-                            ),
+                            latency_ms=float(row["latency_ms"] if "latency_ms" in row else row["p50_ms"]),
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -166,9 +163,7 @@ class EmpiricalCostModel:
         matching = [
             p
             for p in self._points
-            if p.strategy == strategy
-            and p.interconnect == workload.interconnect
-            and p.sp_degree == workload.sp_degree
+            if p.strategy == strategy and p.interconnect == workload.interconnect and p.sp_degree == workload.sp_degree
         ]
         if not matching:
             raise LookupError(
@@ -206,13 +201,58 @@ class EmpiricalCostModel:
         if pair is None:
             pair = (curve[0], curve[1]) if seq_len < curve[0].seq_len else (curve[-2], curve[-1])
         left, right = pair
-        weight = (math.log(seq_len) - math.log(left.seq_len)) / (
-            math.log(right.seq_len) - math.log(left.seq_len)
-        )
-        log_ms = math.log(left.latency_ms) + weight * (
-            math.log(right.latency_ms) - math.log(left.latency_ms)
-        )
+        weight = (math.log(seq_len) - math.log(left.seq_len)) / (math.log(right.seq_len) - math.log(left.seq_len))
+        log_ms = math.log(left.latency_ms) + weight * (math.log(right.latency_ms) - math.log(left.latency_ms))
         return math.exp(log_ms)
+
+
+class PhysicsInformedCostModel(EmpiricalCostModel):
+    """Jointly fit compute and communication terms across KV ratios.
+
+    Independent power-law extrapolation is brittle when the held-out sequence
+    tier crosses a strategy boundary. This model pools all KV-ratio points for
+    the same strategy/interconnect/SP tuple and fits
+
+    ``latency = c0 + c1*S + c2*S^2 + c3*f*S``.
+
+    The terms correspond to fixed launch cost, sequence-linear traffic,
+    attention compute, and KV-ratio-dependent traffic. Profiles with too few
+    points fall back to :class:`EmpiricalCostModel`.
+    """
+
+    def predict_ms(self, strategy: SPStrategy, workload: SPWorkload) -> float:
+        matching = [
+            p
+            for p in self._points
+            if p.strategy == strategy and p.interconnect == workload.interconnect and p.sp_degree == workload.sp_degree
+        ]
+        if len(matching) < 4 or len({p.seq_len for p in matching}) < 3:
+            return super().predict_ms(strategy, workload)
+
+        seq_scale = float(np.median([p.seq_len for p in matching]))
+
+        def features(seq_len: int, kv_ratio: float) -> tuple[float, ...]:
+            seq = seq_len / seq_scale
+            return (1.0, seq, seq * seq, kv_ratio * seq)
+
+        design = np.asarray(
+            [features(point.seq_len, point.kv_ratio) for point in matching],
+            dtype=np.float64,
+        )
+        observations = np.asarray(
+            [point.latency_ms for point in matching],
+            dtype=np.float64,
+        )
+        coefficients, *_ = np.linalg.lstsq(design, observations, rcond=None)
+        prediction = float(
+            np.dot(
+                np.asarray(features(workload.seq_len, workload.kv_ratio)),
+                coefficients,
+            )
+        )
+        if not math.isfinite(prediction) or prediction <= 0:
+            return super().predict_ms(strategy, workload)
+        return prediction
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,9 +270,12 @@ class SPCostSelector:
         self,
         cost_model: StrategyCostModel,
         capabilities: StrategyCapabilities | None = None,
+        *,
+        pcie_sp2_ring_kv_tokens: float | None = None,
     ) -> None:
         self._cost_model = cost_model
         self._capabilities = capabilities or StrategyCapabilities()
+        self._pcie_sp2_ring_kv_tokens = pcie_sp2_ring_kv_tokens
 
     def select(self, workload: SPWorkload) -> StrategyDecision:
         costs: dict[SPStrategy, float] = {}
@@ -251,6 +294,18 @@ class SPCostSelector:
             details = "; ".join(f"{strategy}: {reason}" for strategy, reason in rejected.items())
             raise RuntimeError(f"no feasible calibrated SP strategy: {details}")
         selected = min(costs, key=costs.__getitem__)
+        # The #5092 calibration and independent Wan E2E both show a regime
+        # where SP2 Ring hides PCIe traffic once the communicated KV working
+        # set is large enough. Keep this profile-specific threshold explicit
+        # instead of silently baking it into every deployment.
+        if (
+            self._pcie_sp2_ring_kv_tokens is not None
+            and workload.interconnect == Interconnect.PCIE
+            and workload.sp_degree == 2
+            and workload.seq_len * workload.kv_ratio >= self._pcie_sp2_ring_kv_tokens
+            and SPStrategy.RING in costs
+        ):
+            selected = SPStrategy.RING
         return StrategyDecision(
             strategy=selected,
             predicted_ms=costs[selected],
@@ -264,8 +319,7 @@ class SPCostSelector:
             return "implementation is not available in this build"
         if strategy == SPStrategy.ULYSSES:
             if workload.ulysses_mode == "strict" and (
-                workload.num_heads % workload.sp_degree
-                or workload.num_kv_heads % workload.sp_degree
+                workload.num_heads % workload.sp_degree or workload.num_kv_heads % workload.sp_degree
             ):
                 return "strict Ulysses requires Q and KV heads divisible by SP degree"
             return None
@@ -284,3 +338,56 @@ class SPCostSelector:
         if workload.has_attention_mask and not caps.ring_attention_mask:
             return "Ring does not support attention masks"
         return None
+
+
+def resolve_auto_sp_strategy(parallel_config: Any) -> StrategyDecision | None:
+    """Resolve ``sp_strategy='auto'`` before process groups are initialized.
+
+    Auto mode is intentionally a startup/deployment decision: the selected
+    backend determines which mutually-exclusive process groups are created.
+    The workload is therefore declared in config rather than inferred from an
+    individual request after workers have started.
+    """
+
+    mode = str(getattr(parallel_config, "sp_strategy", "manual"))
+    if mode == "manual":
+        return None
+    if mode != "auto":
+        raise ValueError(f"sp_strategy must be 'manual' or 'auto', got {mode!r}")
+
+    profile = getattr(parallel_config, "sp_selector_profile", None)
+    raw_workload = getattr(parallel_config, "sp_selector_workload", None)
+    if not profile or not isinstance(raw_workload, dict):
+        raise ValueError("sp_strategy='auto' requires sp_selector_profile and sp_selector_workload")
+
+    workload_args = dict(raw_workload)
+    workload_args.setdefault(
+        "sp_degree",
+        int(getattr(parallel_config, "sequence_parallel_size", 1)),
+    )
+    workload = SPWorkload(**workload_args)
+    model_name = str(getattr(parallel_config, "sp_selector_cost_model", "physics_informed"))
+    model_cls: type[EmpiricalCostModel]
+    if model_name == "physics_informed":
+        model_cls = PhysicsInformedCostModel
+    elif model_name == "empirical":
+        model_cls = EmpiricalCostModel
+    else:
+        raise ValueError(f"sp_selector_cost_model must be 'physics_informed' or 'empirical', got {model_name!r}")
+
+    decision = SPCostSelector(
+        model_cls.from_jsonl(profile),
+        capabilities=StrategyCapabilities(ring=bool(getattr(parallel_config, "sp_selector_allow_ring", False))),
+        pcie_sp2_ring_kv_tokens=getattr(
+            parallel_config,
+            "sp_selector_pcie_sp2_ring_kv_tokens",
+            None,
+        ),
+    ).select(workload)
+
+    degree = workload.sp_degree
+    parallel_config.ulysses_degree = degree if decision.strategy == SPStrategy.ULYSSES else 1
+    parallel_config.ring_degree = degree if decision.strategy == SPStrategy.RING else 1
+    parallel_config.allgather_degree = degree if decision.strategy == SPStrategy.ALLGATHER_KV else 1
+    parallel_config.sequence_parallel_size = degree
+    return decision
