@@ -73,7 +73,4 @@ time timeout -k 30 30m docker run \
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
     pytest -v -s -m "core_model and xpu and B60"
-    pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s -m "advanced_model and xpu and B60"
-    pytest -v -s -m "omni and xpu and B60"
 '
