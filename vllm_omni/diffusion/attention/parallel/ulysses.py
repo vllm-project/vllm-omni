@@ -34,19 +34,30 @@ def _positive_divisors(n: int) -> list[int]:
 
 
 @torch.compiler.disable
-def _all_gather_int(pg: dist.ProcessGroup, value: int, *, device: torch.device) -> list[int]:
-    """All-gather a scalar int across pg.
+def _all_gather_ints(
+    pg: dist.ProcessGroup,
+    values: tuple[int, ...],
+    *,
+    device: torch.device,
+) -> list[tuple[int, ...]]:
+    """All-gather a fixed-size tuple of ints across pg.
 
     Note: we use a device tensor so this works for NCCL subgroups (e.g. Ulysses/Ring).
     """
     world_size = dist.get_world_size(pg)
     if world_size == 1:
-        return [int(value)]
+        return [tuple(int(value) for value in values)]
 
-    t = torch.tensor([int(value)], dtype=torch.int64, device=device)
+    t = torch.tensor(values, dtype=torch.int64, device=device)
     gathered = [torch.empty_like(t) for _ in range(world_size)]
     dist.all_gather(gathered, t, group=pg)
-    return [int(x.item()) for x in gathered]
+    return [tuple(int(value) for value in x.tolist()) for x in gathered]
+
+
+@torch.compiler.disable
+def _all_gather_int(pg: dist.ProcessGroup, value: int, *, device: torch.device) -> list[int]:
+    """All-gather a scalar int across pg."""
+    return [rank_values[0] for rank_values in _all_gather_ints(pg, (value,), device=device)]
 
 
 def _ulysses_all_to_all_any_qkv(
@@ -158,8 +169,8 @@ class _UlyssesCtx(ParallelAttentionContext):
     joint_strategy: str = "front"
     # UAA (Ulysses Anything Attention) metadata
     use_uaa: bool = False
-    uaa_seq_lens: tuple[int, ...] = ()
-    uaa_local_seq_len: int = 0
+    uaa_query_seq_lens: tuple[int, ...] = ()
+    uaa_query_local_seq_len: int = 0
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
 
@@ -312,28 +323,58 @@ class UlyssesParallelAttention:
                     f"(got scatter_idx={self._scatter_idx}, gather_idx={self._gather_idx})."
                 )
 
-            local_seq_len = int(query.shape[1])
-            seq_lens = _all_gather_int(self._ulysses_pg, local_seq_len, device=query.device)
-            s_global = int(sum(seq_lens))
+            query_local_seq_len = int(query.shape[1])
+            key_local_seq_len = int(key.shape[1])
+            value_local_seq_len = int(value.shape[1])
+            qkv_seq_lens_by_rank = _all_gather_ints(
+                self._ulysses_pg,
+                (query_local_seq_len, key_local_seq_len, value_local_seq_len),
+                device=query.device,
+            )
+            query_seq_lens = [seq_lens[0] for seq_lens in qkv_seq_lens_by_rank]
+            key_seq_lens = [seq_lens[1] for seq_lens in qkv_seq_lens_by_rank]
+            value_seq_lens = [seq_lens[2] for seq_lens in qkv_seq_lens_by_rank]
+            if key_seq_lens != value_seq_lens:
+                raise ValueError(
+                    "Ulysses attention requires matching key/value sequence lengths on every rank, "
+                    f"but got key={key_seq_lens} and value={value_seq_lens}."
+                )
+
+            query_global_seq_len = int(sum(query_seq_lens))
+            key_global_seq_len = int(sum(key_seq_lens))
+            value_global_seq_len = int(sum(value_seq_lens))
 
             # In hybrid Ulysses+Ring, Ring attention uses P2P send/recv with fixed-shape
-            # buffers. This requires all ring ranks to have the same seq_len after the
-            # Ulysses all-to-all (i.e. per-ring-rank S_global must match).
+            # buffers. This requires all ring ranks to have the same Q, K, and V
+            # sequence lengths after the Ulysses all-to-all.
             if self._sp_group.ring_world_size > 1:
-                ring_s_globals = _all_gather_int(self._sp_group.ring_group, s_global, device=query.device)
-                if len(set(ring_s_globals)) != 1:
+                ring_qkv_seq_lens = _all_gather_ints(
+                    self._sp_group.ring_group,
+                    (query_global_seq_len, key_global_seq_len, value_global_seq_len),
+                    device=query.device,
+                )
+                ring_query_seq_lens = [seq_lens[0] for seq_lens in ring_qkv_seq_lens]
+                ring_key_seq_lens = [seq_lens[1] for seq_lens in ring_qkv_seq_lens]
+                ring_value_seq_lens = [seq_lens[2] for seq_lens in ring_qkv_seq_lens]
+                if any(
+                    len(set(seq_lens)) != 1
+                    for seq_lens in (ring_query_seq_lens, ring_key_seq_lens, ring_value_seq_lens)
+                ):
                     raise ValueError(
                         "ulysses_mode='advanced_uaa' with hybrid Ulysses+Ring requires the "
-                        "post-Ulysses seq_len to be equal across ring ranks, but got "
-                        f"{ring_s_globals} (ring_degree={self._sp_group.ring_world_size}). "
+                        "post-Ulysses Q/K/V seq_len to be equal across ring ranks, but got "
+                        f"query={ring_query_seq_lens}, key={ring_key_seq_lens}, "
+                        f"value={ring_value_seq_lens} (ring_degree={self._sp_group.ring_world_size}). "
                         "This typically means the input sequence was not evenly shardable across the ring. "
                         "Try setting ring_degree=1, or choose a sequence length divisible by ring_degree."
                     )
             query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg, query, seq_lens=seq_lens, use_sync=self._use_sync
+                self._ulysses_pg, query, seq_lens=query_seq_lens, use_sync=self._use_sync
             )
-            key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
-            value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
+            key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=key_seq_lens, use_sync=self._use_sync)
+            value, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg, value, seq_lens=value_seq_lens, use_sync=self._use_sync
+            )
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
@@ -350,8 +391,8 @@ class UlyssesParallelAttention:
             query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
             key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
             value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
-            seq_lens = []
-            local_seq_len = 0
+            query_seq_lens = []
+            query_local_seq_len = 0
             orig_head_cnt = 0
 
         if is_joint:
@@ -386,8 +427,8 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
-            uaa_seq_lens=tuple(int(x) for x in seq_lens) if mode == "advanced_uaa" else (),
-            uaa_local_seq_len=int(local_seq_len) if mode == "advanced_uaa" else 0,
+            uaa_query_seq_lens=tuple(int(x) for x in query_seq_lens) if mode == "advanced_uaa" else (),
+            uaa_query_local_seq_len=int(query_local_seq_len) if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
@@ -452,8 +493,8 @@ class UlyssesParallelAttention:
                 output_img = _ulysses_all_to_all_any_o(
                     ctx.ulysses_pg,
                     output_img,
-                    seq_lens=list(ctx.uaa_seq_lens),
-                    local_seq_len=ctx.uaa_local_seq_len,
+                    seq_lens=list(ctx.uaa_query_seq_lens),
+                    local_seq_len=ctx.uaa_query_local_seq_len,
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
@@ -484,8 +525,8 @@ class UlyssesParallelAttention:
             return _ulysses_all_to_all_any_o(
                 ctx.ulysses_pg,
                 attn_output,
-                seq_lens=list(ctx.uaa_seq_lens),
-                local_seq_len=ctx.uaa_local_seq_len,
+                seq_lens=list(ctx.uaa_query_seq_lens),
+                local_seq_len=ctx.uaa_query_local_seq_len,
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
             )

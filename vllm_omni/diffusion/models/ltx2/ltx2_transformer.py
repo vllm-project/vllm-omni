@@ -355,6 +355,23 @@ def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask
 
 
+class _LTX2ParallelAttention(Attention):
+    """Preserve LTX SP collectives while keeping masked cross-attention key-only."""
+
+    def __init__(self, *args, is_cross_attention: bool, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.is_cross_attention = is_cross_attention
+
+    def _run_local_attention(self, query, key, value, attn_metadata):
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if self.is_cross_attention and attention_mask is not None:
+            # A 2D LTX cross-attention mask describes K/V padding only. Flash
+            # varlen applies one mask to Q and K when their lengths happen to
+            # match, so use mask-aware SDPA after the SP redistribution.
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        return super()._run_local_attention(query, key, value, attn_metadata)
+
+
 class LTX2AudioVideoAttnProcessor:
     r"""
     Processor for implementing attention (SDPA is used by default if you're using PyTorch 2.0) for the LTX-2.0 model.
@@ -581,6 +598,7 @@ class LTX2Attention(torch.nn.Module):
         disable_kv_quant: bool = False,
     ):
         super().__init__()
+        is_cross_attention = cross_attention_dim is not None
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
         # map to the same RMSNorm implementation applied across Q/K heads.
         if qk_norm not in ("rms_norm_across_heads", "rms_norm"):
@@ -695,7 +713,7 @@ class LTX2Attention(torch.nn.Module):
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
         )
-        self.attn = Attention(
+        self.attn = _LTX2ParallelAttention(
             num_heads=self.query_num_heads,
             head_size=dim_head,
             num_kv_heads=self.kv_num_heads,
@@ -703,6 +721,7 @@ class LTX2Attention(torch.nn.Module):
             causal=False,
             prefix=prefix,
             disable_kv_quant=disable_kv_quant,
+            is_cross_attention=is_cross_attention,
         )
 
         # LTX-2.3: per-head gated attention

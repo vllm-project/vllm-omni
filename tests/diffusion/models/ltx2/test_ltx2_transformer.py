@@ -7,10 +7,12 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
     LTX2AudioVideoAttnProcessor,
     LTX2VideoTransformer3DModel,
+    _LTX2ParallelAttention,
     _make_rms_norm,
 )
 
@@ -92,3 +94,63 @@ def test_ltx_sp_keeps_cross_attention_key_padding_mask(monkeypatch):
     )
 
     torch.testing.assert_close(actual, key_padding_mask)
+
+
+def _fake_ltx_parallel_attention(*, is_cross_attention: bool):
+    calls = []
+
+    class Backend:
+        @staticmethod
+        def get_name():
+            return "FLASH_ATTN"
+
+        @staticmethod
+        def supports_attention_mask():
+            return True
+
+    def run(name):
+        def forward(query, _key, _value, _metadata):
+            calls.append(name)
+            return torch.zeros_like(query)
+
+        return forward
+
+    layer = object.__new__(_LTX2ParallelAttention)
+    nn.Module.__init__(layer)
+    layer.is_cross_attention = is_cross_attention
+    layer.attn_backend = Backend
+    layer.attention = SimpleNamespace(forward=run("native"))
+    layer.sdpa_fallback = SimpleNamespace(forward=run("sdpa"))
+    layer.backend_pref = "FLASH_ATTN"
+    return layer, calls
+
+
+@pytest.mark.parametrize(("query_length", "key_length"), [(4, 4), (3, 4)])
+def test_ltx_masked_cross_attention_uses_sdpa(query_length, key_length):
+    layer, calls = _fake_ltx_parallel_attention(is_cross_attention=True)
+    query = torch.zeros(1, query_length, 2, 4, dtype=torch.bfloat16)
+    key = value = torch.zeros(1, key_length, 2, 4, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True] * (key_length - 1) + [False]]))
+
+    layer._run_local_attention(query, key, value, metadata)
+
+    assert calls == ["sdpa"]
+
+
+def test_ltx_masked_self_attention_keeps_native_backend():
+    layer, calls = _fake_ltx_parallel_attention(is_cross_attention=False)
+    query = key = value = torch.zeros(1, 4, 2, 4, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, True, False]]))
+
+    layer._run_local_attention(query, key, value, metadata)
+
+    assert calls == ["native"]
+
+
+def test_ltx_unmasked_cross_attention_keeps_native_backend():
+    layer, calls = _fake_ltx_parallel_attention(is_cross_attention=True)
+    query = key = value = torch.zeros(1, 4, 2, 4, dtype=torch.bfloat16)
+
+    layer._run_local_attention(query, key, value, None)
+
+    assert calls == ["native"]
