@@ -218,12 +218,12 @@ def test_dreamzero_like_two_branches_are_independent():
 
 
 def test_lru_eviction_releases_blocks_and_notifies_pipeline():
-    pipeline = CapablePipeline(lingbot_like_spec(capacity=8))
+    pipeline = CapablePipeline(lingbot_like_spec(capacity=2))
     runner = make_runner(pipeline)
     kv = runner.kv_cache
     assert kv is not None
-    assert runner._session_capacity == 1
-    assert kv.session_capacity == 1
+    assert runner._session_capacity == 2
+    assert kv.session_capacity == 2
     free_total = kv.manager.block_pool.get_num_free_blocks()
     old = commit_one_frame(runner, "old", "main")
     k = torch.randn(1, 8, 4, 64)
@@ -231,8 +231,10 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
     assert kv.manager.block_pool.get_num_free_blocks() < free_total
 
     runner._get_or_create_session("new")
+    assert tuple(runner._sessions) == ("old", "new")
+    runner._get_or_create_session("newest")
 
-    assert tuple(runner._sessions) == ("new",)
+    assert tuple(runner._sessions) == ("new", "newest")
     assert pipeline.closes == ["old"]
     assert "old" not in kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total

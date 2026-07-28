@@ -52,8 +52,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     """
 
     _WARMUP_SID = "__ardiffusion_warmup__"
-    _MAX_RESIDENT_SESSIONS = 1
-
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
@@ -124,7 +122,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
-        self._session_capacity = min(spec.session_capacity, self._MAX_RESIDENT_SESSIONS)
+        self._session_capacity = spec.session_capacity
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,

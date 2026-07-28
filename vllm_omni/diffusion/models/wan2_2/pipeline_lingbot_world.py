@@ -512,7 +512,7 @@ class LingBotWorldCausalDMDPipeline(
             window_frames=recent_window_frames,
             sink_frames=sink_frames,
             kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),),
-            session_capacity=1,
+            session_capacity=2,
             cross_attention=(
                 ARDiffusionCrossAttentionKVSpec(
                     self._AR_TEXT_CACHE,
@@ -908,6 +908,8 @@ class LingBotWorldCausalDMDPipeline(
             dtype=torch.float32,
         )
         for step_index, (timestep_value, sigma) in enumerate(schedule):
+            if not self.od_config.enforce_eager:
+                torch.compiler.cudagraph_mark_step_begin()
             set_forward_context_denoise_step_idx(step_index)
             timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
             # Checkpoint channel contract:
@@ -971,6 +973,8 @@ class LingBotWorldCausalDMDPipeline(
             if ar_cross_attention is not None
             else cast(LingBotTransformerCache, cache)
         )
+        if not self.od_config.enforce_eager:
+            torch.compiler.cudagraph_mark_step_begin()
         self.transformer(
             hidden_states=cache_input,
             timestep=torch.zeros(1, device=self.device, dtype=torch.float32),
