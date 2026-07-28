@@ -852,7 +852,9 @@ def run_headless(args: TrackingNamespace) -> None:
         model,
         stage_configs_path,
         args_dict,
-        trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
+        # store_true cannot express an explicit False: absent maps to None
+        # ("not specified") so the deploy yaml's per-stage value applies.
+        trust_remote_code=getattr(args, "trust_remote_code", None) or None,
         deploy_config_path=args_dict.get("deploy_config"),
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),
