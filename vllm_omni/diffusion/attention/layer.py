@@ -175,12 +175,15 @@ class Attention(nn.Module):
                     self.use_ring = False
                     self.ring_runner = None
 
-        self.parallel_strategy = build_parallel_attention_strategy(
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-            use_sync=use_sync,
-            causal=causal,
-        )
+        if skip_sequence_parallel:
+            self.parallel_strategy = NoParallelAttention()
+        else:
+            self.parallel_strategy = build_parallel_attention_strategy(
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+                causal=causal,
+            )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
 
