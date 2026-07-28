@@ -47,7 +47,7 @@ from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
 )
-from tests.model_tests.diffusion.utils import resolve_tiny_model_path
+from tests.model_tests.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -763,6 +763,7 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     prompt_tokens: int | None = None
+    completion_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
     #: HTTP status + error text for the error-handling path (e.g. validator
@@ -898,6 +899,7 @@ class OpenAIClientHandler:
                 # Usage is yielded after the last token
                 if chunk.usage:
                     result.prompt_tokens = chunk.usage.prompt_tokens
+                    result.completion_tokens = chunk.usage.completion_tokens
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
 
@@ -930,6 +932,7 @@ class OpenAIClientHandler:
             usage = getattr(chat_completion, "usage", None)
             if usage:
                 result.prompt_tokens = usage.prompt_tokens
+                result.completion_tokens = usage.completion_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
             if audio_data:

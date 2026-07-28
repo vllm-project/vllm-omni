@@ -2,7 +2,7 @@ from shutil import rmtree
 
 import pytest
 
-from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
+from tests.model_tests.model_settings import MODEL_SETTINGS
 
 
 @pytest.fixture(scope="session")
@@ -22,10 +22,10 @@ def tiny_model_paths(request, run_level):
         if not hasattr(item, "callspec"):
             continue
         model_name = item.callspec.params.get("model_name")
-        if model_name is None or model_name not in DIFFUSION_TEST_SETTINGS:
+        if model_name is None or model_name not in MODEL_SETTINGS:
             continue
         if model_name not in model_paths:
-            settings = DIFFUSION_TEST_SETTINGS[model_name]
+            settings = MODEL_SETTINGS[model_name]
             if run_level == "core_model":
                 print(f"Calling tiny model builder for: {model_name}")
                 path = settings.builder()

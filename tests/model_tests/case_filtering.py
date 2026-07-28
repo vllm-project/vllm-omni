@@ -17,7 +17,13 @@ import itertools
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.model_tests.diffusion.config_types import DiffusionAccs, DiffusionModelTestOpts, get_required_device_count
+from tests.model_tests.config_types import (
+    DiffusionAccs,
+    DiffusionModelTestOpts,
+    ModelTestOpts,
+    OmniModelTestOpts,
+)
+from tests.model_tests.utils import get_required_device_count
 from vllm_omni.platforms import current_omni_platform
 
 # These tests are intended to run on L4 GPUs since they test parallelism (i.e., need GPUs),
@@ -59,12 +65,24 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     return marks
 
 
-def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts, online: bool):
-    """Given a model & its corresponding test options, build the list of pytest params
-    to be run for this model. The base case (no accelerations) is always included. Extra
-    test groups are always appended for offline tests, but are only added to the online
-    tests if online_base_only is overridden to False to avoid redundant testing.
-    """
+def omni_parametrization(model_name: str, test_info: ModelTestOpts, online: bool):
+    # FIXME - This should also expand on accelerations, but it probably makes more
+    # sense to fully unify the test opt classes since we also have models in the
+    # middle like Bagel (multistage diffusion).
+    return [
+        pytest.param(
+            model_name,
+            None,
+            test_info.supported_tasks,
+            test_info.check_multi_output,
+            test_info.check_determinism,
+            id=model_name,
+            marks=test_info.marks if test_info.marks is not None else [],
+        )
+    ]
+
+
+def diffusion_parametrization(model_name: str, test_info: DiffusionModelTestOpts, online: bool):
     test_groups: list[list[DiffusionAccs] | None] = [None]
     if not (online and test_info.online_base_only) and test_info.extra_test_groups:
         test_groups.extend(test_info.extra_test_groups)
@@ -83,12 +101,27 @@ def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts
     ]
 
 
+def get_model_parametrization(model_name: str, test_info: ModelTestOpts, online: bool):
+    """Given a model & its corresponding test options, build the list of pytest params
+    to be run for this model. The base case (no accelerations) is always included. Extra
+    test groups are always appended for offline tests, but are only added to the online
+    tests if online_base_only is overridden to False to avoid redundant testing.
+    """
+    if isinstance(test_info, OmniModelTestOpts):
+        return omni_parametrization(model_name, test_info, online)
+    elif isinstance(test_info, DiffusionModelTestOpts):
+        return diffusion_parametrization(model_name, test_info, online)
+    raise NotImplementedError("Unrecognized model test opt type")
+
+
 def get_parametrized_options(
-    test_settings: dict[str, DiffusionModelTestOpts],
+    test_settings: dict[str, ModelTestOpts],
     online: bool = False,
 ):
-    """Converts all the DiffusionModelTestOpts into an expanded list of parameters
-    based on which accelerations are available.
+    """Converts all the ModelTestOpts into an expanded list of parameters.
+    Currently, this means:
+    - diffusion models are expanded based on what accelerations are available
+    - Omni is WIP :)
 
     When online=True and a model has online_base_only=True, only the base case
     (no accelerations) is included for that model's parametrization to minimize

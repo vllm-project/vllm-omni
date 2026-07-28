@@ -6,7 +6,7 @@ to account for it in DIFFUSION_TEST_SETTINGS
 
 import pytest
 
-from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
+from tests.model_tests.model_settings import DIFFUSION_TEST_SETTINGS
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]

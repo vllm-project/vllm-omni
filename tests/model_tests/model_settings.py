@@ -1,8 +1,9 @@
-from tests.model_tests.diffusion import diff_model_builders
-from tests.model_tests.diffusion.config_types import (
+from tests.model_tests import model_builders
+from tests.model_tests.config_types import (
     DiffusionAccs,
     DiffusionModelTestOpts,
-    DiffusionTasks,
+    ModelTasks,
+    OmniModelTestOpts,
 )
 
 # This object defines the (tiny) model configurations for common tests.
@@ -28,11 +29,11 @@ from tests.model_tests.diffusion.config_types import (
 #
 # $ pytest test_common_offline.py -k test_pipeline_on_supported_tasks[Flux2KleinPipeline
 #   ^ Runs all test groups for Flux2KleinPipeline only
-DIFFUSION_TEST_SETTINGS = {
+DIFFUSION_TEST_SETTINGS: dict[str, DiffusionModelTestOpts] = {
     "Flux2KleinPipeline": DiffusionModelTestOpts(
         model="black-forest-labs/FLUX.2-klein-4B",
-        builder=diff_model_builders.tiny_flux2_klein_builder,
-        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE, DiffusionTasks.IMAGE_TO_IMAGE],
+        builder=model_builders.tiny_flux2_klein_builder,
+        supported_tasks=[ModelTasks.TEXT_TO_IMAGE, ModelTasks.IMAGE_TO_IMAGE],
         extra_test_groups=[
             [DiffusionAccs.HSDP, DiffusionAccs.TEA_CACHE],
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
@@ -41,8 +42,8 @@ DIFFUSION_TEST_SETTINGS = {
     ),
     "LTX2Pipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",
-        builder=diff_model_builders.tiny_ltx2_builder,
-        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        builder=model_builders.tiny_ltx2_builder,
+        supported_tasks=[ModelTasks.TEXT_TO_VIDEO],
         check_determinism=False,
         check_multi_output=False,
         extra_test_groups=[
@@ -52,3 +53,18 @@ DIFFUSION_TEST_SETTINGS = {
         ],
     ),
 }
+
+OMNI_MODEL_SETTINGS: dict[str, OmniModelTestOpts] = {
+    # TODO: Thinker only / resolution needs to be handled cleanly here
+    "qwen3_omni_moe": OmniModelTestOpts(
+        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        builder=model_builders.tiny_qwen3_omni_builder,
+        supported_tasks=[ModelTasks.TEXT_TO_TEXT],  # ModelTasks.TEXT_TO_AUDIO],
+        check_determinism=False,
+        check_multi_output=False,
+    )
+}
+
+# TODO: This is probably silly, as practically these are always disjoint,
+# But it's more convenient to compare against existing registries for now.
+MODEL_SETTINGS = {**DIFFUSION_TEST_SETTINGS, **OMNI_MODEL_SETTINGS}

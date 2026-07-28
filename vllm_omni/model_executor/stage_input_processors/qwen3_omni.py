@@ -48,13 +48,22 @@ _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
-    """Fetch layer tensor with tolerant key lookup (str/int)."""
+    """Fetch layer tensor with tolerant key lookup (str/int).
+
+    Falls back to the highest available integer key when the exact key is absent.
+    This handles models with fewer layers than the full-size reference (e.g. tiny
+    test models where accept_hidden_layer < 24).
+    """
     if not isinstance(layers, dict):
         return None
     key_int = int(key)
     val = layers.get(key_int)
     if val is None:
         val = layers.get(key)
+    if val is None:
+        int_keys = [k for k in layers if isinstance(k, int)]
+        if int_keys:
+            val = layers.get(max(int_keys))
     return val if isinstance(val, torch.Tensor) else None
 
 

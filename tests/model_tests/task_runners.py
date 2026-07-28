@@ -5,17 +5,46 @@ image to image, and so on. These are called by the core test runner.
 
 import base64
 import io
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import TypeAlias
 
 import numpy as np
 from PIL import Image
 
-from tests.helpers.runtime import DiffusionResponse, OmniServer, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    DiffusionResponse,
+    OmniResponse,
+    OmniServer,
+    OpenAIClientHandler,
+    dummy_messages_from_mix_data,
+)
+from tests.model_tests.config_types import ModelTasks
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-PROMPT = "Dummy prompt"
+OMNI_TEXT_PROMPT = "Hello, briefly describe yourself."
+OMNI_SPEECH_PROMPT = "Say: hello world"
+
+_OMNI_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+)
+
+OnlineTaskRunner: TypeAlias = Callable[[OmniServer, OpenAIClientHandler], None]
+OfflineTaskRunner: TypeAlias = Callable[[Omni], None]
+
+
+def _format_omni_chat_prompt(user_text: str) -> str:
+    return (
+        f"<|im_start|>system\n{_OMNI_SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{user_text}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+PROMPT = "A black cat sitting on a bed."
 IMAGE_DIMS = (512, 512)
 HEIGHT, WIDTH = IMAGE_DIMS
 INPUT_IMAGE = Image.new("RGB", IMAGE_DIMS)
@@ -27,7 +56,10 @@ IMAGE_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
     width=WIDTH,
     seed=42,
 )
-
+TEXT_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
+    num_inference_steps=4,
+    seed=42,
+)
 VIDEO_NUM_FRAMES = 9
 VIDEO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
     num_inference_steps=4,
@@ -73,6 +105,26 @@ def _validate_image_gen_determinism(images_a: list[Image.Image], images_b: list[
     assert np.array_equal(np.array(images_a[0]), np.array(images_b[0]))
 
 
+def _get_online_omni_response(responses: list[OmniResponse]) -> OmniResponse:
+    assert len(responses) == 1
+    return responses[0]
+
+
+def _validate_text(response: OmniResponse) -> None:
+    assert response.completion_tokens
+
+
+def _validate_speech(response: OmniResponse) -> None:
+    assert response.audio_bytes
+
+
+def _validate_offline_speech(outputs: list[OmniRequestOutput]) -> None:
+    audio_stage = next((o for o in outputs if getattr(o, "final_output_type", None) == "audio"), None)
+    assert audio_stage is not None
+    assert audio_stage.request_output is not None
+    assert audio_stage.request_output.outputs[0].multimodal_output.get("audio") is not None
+
+
 ### Output extractor utils for offline / online paths respectively
 def _get_offline_images(outputs: list[OmniRequestOutput]) -> list[Image.Image]:
     """Extract the images from an Omni .generate() call."""
@@ -105,6 +157,14 @@ def _validate_video(outputs: list[OmniRequestOutput], expected_n: int = 1):
 
 
 ### Offline helpers
+def _run_offline_t2t(omni: Omni):
+    return omni.generate({"prompt": _format_omni_chat_prompt(OMNI_TEXT_PROMPT), "modalities": ["text"]})
+
+
+def _run_offline_t2s(omni: Omni):
+    return omni.generate({"prompt": _format_omni_chat_prompt(OMNI_SPEECH_PROMPT), "modalities": ["audio"]})
+
+
 def _run_offline_t2i(omni: Omni, params: OmniDiffusionSamplingParams = IMAGE_GEN_SAMPLING_PARAMS):
     return omni.generate({"prompt": PROMPT}, params)
 
@@ -158,6 +218,19 @@ def _run_online_i2i(server: OmniServer, client: OpenAIClientHandler) -> list[Dif
 
 
 ### Offline task runners
+def run_and_validate_text_to_text_request(omni: Omni):
+    """Run and validate a text to text request."""
+    outputs = _run_offline_t2t(omni)
+    assert len(outputs) == 1
+    assert outputs[0].request_output is not None
+    assert outputs[0].request_output.outputs[0].text is not None
+
+
+def run_and_validate_text_to_speech_request(omni: Omni):
+    """Run and validate a text-in, speech-out request."""
+    _validate_offline_speech(_run_offline_t2s(omni))
+
+
 def run_and_validate_text_to_image_request(omni: Omni):
     """Run and validate a text to image request."""
     _validate_images(_get_offline_images(_run_offline_t2i(omni)))
@@ -237,3 +310,63 @@ def run_and_validate_online_text_to_image_multi_output(server: OmniServer, clien
 def run_and_validate_online_text_to_video_request(server: OmniServer, client: OpenAIClientHandler):
     """Run and validate a text to video request through the server."""
     _get_online_videos(_run_online_t2v(server, client))
+
+
+def run_and_validate_online_text_to_text_request(server: OmniServer, client: OpenAIClientHandler) -> None:
+    """Run and validate a text-in, text-out request."""
+    messages = dummy_messages_from_mix_data(content_text=OMNI_TEXT_PROMPT)
+    request_config = {
+        "model": server.model,
+        "messages": messages,
+        "modalities": ["text"],
+    }
+    _validate_text(_get_online_omni_response(client.send_omni_request(request_config)))
+
+
+def run_and_validate_online_text_to_speech_request(server: OmniServer, client: OpenAIClientHandler) -> None:
+    """Run and validate a text-in, speech-out request."""
+    messages = dummy_messages_from_mix_data(content_text=OMNI_SPEECH_PROMPT)
+    request_config = {
+        "model": server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+    }
+    _validate_speech(_get_online_omni_response(client.send_omni_request(request_config)))
+
+
+# TODO: add offline AR task runners (run_and_validate_text_to_text_request,
+# run_and_validate_mm_to_text_request, run_and_validate_text_to_speech_request)
+# once the following are in place:
+#   - OmniModelTestOpts initialization and case-filtering infra (analogous to
+#     build_omni_from_diff_accelerations / get_parametrized_options for diffusion)
+#   - Confirmed API for Omni.generate() with AR prompts and modality params
+
+
+@dataclass
+class TaskRunner:
+    offline_validator: OfflineTaskRunner
+    online_validator: OnlineTaskRunner
+
+
+TASKS_TO_RUNNER_MAP: dict[ModelTasks, TaskRunner] = {
+    ModelTasks.TEXT_TO_TEXT: TaskRunner(
+        run_and_validate_text_to_text_request,
+        run_and_validate_online_text_to_text_request,
+    ),
+    ModelTasks.TEXT_TO_IMAGE: TaskRunner(
+        run_and_validate_text_to_image_request,
+        run_and_validate_online_text_to_image_request,
+    ),
+    ModelTasks.IMAGE_TO_IMAGE: TaskRunner(
+        run_and_validate_image_to_image_request,
+        run_and_validate_online_image_to_image_request,
+    ),
+    ModelTasks.TEXT_TO_VIDEO: TaskRunner(
+        run_and_validate_text_to_video_request,
+        run_and_validate_online_text_to_video_request,
+    ),
+    ModelTasks.TEXT_TO_AUDIO: TaskRunner(
+        run_and_validate_text_to_speech_request,
+        run_and_validate_online_text_to_speech_request,
+    ),
+}
