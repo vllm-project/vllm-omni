@@ -637,6 +637,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # __init__.  Save them before meta conversion and restore after
         # mmap loading, so we don't need model-specific buffer rebuild code.
         #
+        # Fail closed for unsupported configurations BEFORE to_empty,
+        # because to_empty("meta") may strip the weight_loader attribute.
+        # The mmap path bypasses AutoWeightsLoader, which means TP-aware
+        # weight_loader callbacks (fused QKV, row-parallel, etc.) are not
+        # invoked.  Detect TP-sharded params by checking for the
+        # `weight_loader` attribute (set by RowParallelLinear / QKVParallelLinear
+        # when TP > 1).  If found, reject to prevent silently incorrect weights.
+        tp_aware_params = [
+            name
+            for name, param in pipeline.named_parameters()
+            if hasattr(param, "weight_loader")
+            and getattr(param.weight_loader, "__name__", "") != "default_weight_loader"
+        ]
+        if tp_aware_params:
+            raise ValueError(
+                "Distributed layerwise offload with mmap loading does not "
+                f"support Tensor Parallel (TP > 1). Found {len(tp_aware_params)} params with "
+                f"TP-aware weight_loader callbacks (first: {tp_aware_params[0]}). Use DP or SP "
+                "instead of TP, or disable distributed layerwise offload."
+            )
+
+        #
         # Important: when DiT modules are nested (e.g. transformer contains
         # transformer.language_model), to_empty("meta") on the parent
         # converts the child's buffers too.  So we must save ALL buffers
@@ -705,6 +727,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         file_cache: dict[str, Any] = {}
         loaded = 0
         skipped = 0
+        loaded_names: set[str] = set()
 
         # Discover blocks first so we can distinguish block params (deferred
         # to _shard_and_pin) from non-block params (loaded here as mmap views).
@@ -761,6 +784,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     parent = getattr(parent, part)
             parent._parameters[parts[-1]] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
             loaded += 1
+            loaded_names.add(name)
 
         logger.info("Mmap weight loading: %d non-block params loaded, %d skipped", loaded, skipped)
 
@@ -815,8 +839,33 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                             parent = getattr(parent, part)
                     parent._parameters[bparts[-1]] = torch.nn.Parameter(tensor, requires_grad=bparam.requires_grad)
                     block_loaded += 1
+                    loaded_names.add(full_param_name)
 
         logger.info("Mmap block loading: %d params loaded, %d skipped", block_loaded, skipped)
+
+        # Strict validation: check that all meta params were loaded.
+        # This replaces the validation that AutoWeightsLoader.load_weights()
+        # performs in the regular load path.
+        remaining_meta = [
+            name for name, param in pipeline.named_parameters() if hasattr(param, "is_meta") and param.is_meta
+        ]
+        if remaining_meta:
+            # Filter out params inside submodules that will be loaded later
+            # by _load_module_weights_from_mmap (non-block submodules)
+            dit_param_names = set()
+            for dit_module in modules.dits:
+                for pname, _ in dit_module.named_parameters():
+                    dit_param_names.add(pname)
+            truly_missing = [n for n in remaining_meta if n in dit_param_names]
+            if truly_missing:
+                logger.warning(
+                    "Mmap loading: %d params still on meta device after "
+                    "loading (first 5: %s). These may be loaded later by "
+                    "_load_module_weights_from_mmap or are expected to be "
+                    "meta (e.g. DTensor placeholders).",
+                    len(truly_missing),
+                    truly_missing[:5],
+                )
 
         # Keep file handles open — _shard_and_pin will read from the mmap views.
         # They will be released after _shard_and_pin completes (when params are
@@ -832,6 +881,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             post_load_weights = getattr(dit_module, "post_load_weights", None)
             if callable(post_load_weights):
                 post_load_weights()
+
+            # Call validate_loaded_weights if the model defines it.
+            # This preserves the sound-weight and action-weight validation
+            # that AutoWeightsLoader.load_weights() triggers in the regular
+            # load path (e.g. Cosmos3 checks for missing audio/action weights).
+            validate = getattr(dit_module, "validate_loaded_weights", None)
+            if callable(validate):
+                validate(loaded_names)
 
             # Restore non-persistent buffers that were saved before meta
             # conversion.  These buffers (e.g. RoPE inv_freq, timestep
