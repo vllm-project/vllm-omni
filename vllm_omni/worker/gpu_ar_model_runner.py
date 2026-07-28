@@ -1566,20 +1566,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         return True
 
-    def _should_start_early_sampled_token_copy(self, *, use_async_omni_output: bool) -> bool:
-        """Start sampled-token D2H early when hidden payload is omitted.
-
-        Models like GLM-Image skip AR hidden-state D2H; without that accidental
-        sync, begin the required token-id copy before Omni payload construction.
-        """
-        # Omni async-chunk already owns its async copy/event path.
-        if use_async_omni_output:
-            return False
-        # Sync path returns OmniModelRunnerOutput directly; no async wrapper.
-        if not self.use_async_scheduling:
-            return False
-        return not self._model_omni_pooler_payload_include_hidden()
-
     def _build_omni_async_snapshot_payload(
         self,
         *,
@@ -2054,27 +2040,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
-        async_output_kwargs = None
-        early_async_output = None
-        if self.use_async_scheduling:
-            async_output_kwargs = dict(
-                sampled_token_ids=sampler_output.sampled_token_ids,
-                logprobs_tensors=getattr(sampler_output, "logprobs_tensors", None),
-                invalid_req_indices=invalid_req_indices,
-                async_output_copy_stream=self.async_output_copy_stream,
-                vocab_size=self.input_batch.vocab_size,
-            )
-        if async_output_kwargs is not None and self._should_start_early_sampled_token_copy(
-            use_async_omni_output=use_async_omni_output
-        ):
-            # Start sampled-token D2H early for hidden opt-out models (e.g.
-            # GLM-Image), overlapping the required wait with Omni payload work.
-            # Reuse AsyncGPUModelRunnerOutput; attach real Omni output below.
-            with record_function_or_nullcontext("gpu_model_runner: start_async_sampled_token_ids"):
-                early_async_output = AsyncGPUModelRunnerOutput(
-                    model_runner_output=OmniModelRunnerOutput.empty(),
-                    **async_output_kwargs,
-                )
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
@@ -2107,18 +2072,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if not self.use_async_scheduling:
                 return output
         with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
-            assert async_output_kwargs is not None
             async_output_cls = OmniAsyncGPUModelRunnerOutput if use_async_omni_output else AsyncGPUModelRunnerOutput
+            async_output_kwargs = dict(
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
             if use_async_omni_output:
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
                     cuda_device=self.device,
                     **async_output_kwargs,
                 )
-            elif early_async_output is not None:
-                # Replace the empty placeholder now that Omni output is ready.
-                early_async_output._model_runner_output = output
-                async_output = early_async_output
             else:
                 async_output = async_output_cls(
                     model_runner_output=output,

@@ -541,37 +541,6 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
     assert payload["multimodal_outputs"]["codes"]["audio"].tolist() == [[1]]
 
 
-def test_should_start_early_sampled_token_copy_for_non_async_hidden_opt_out():
-    runner = _make_async_output_runner()
-    runner.use_async_scheduling = True
-    runner.model.omni_pooler_payload_include_hidden = False
-
-    # GLM-like path: async scheduling, no Omni async-chunk output, hidden opt-out.
-    assert runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
-    # Omni async-chunk output already starts its own async copy/event.
-    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=True)
-
-    # Without async scheduling, return OmniModelRunnerOutput synchronously.
-    runner.use_async_scheduling = False
-    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
-
-    # Hidden payload kept: keep the existing late AsyncGPUModelRunnerOutput path.
-    runner.use_async_scheduling = True
-    runner.model.omni_pooler_payload_include_hidden = True
-    assert not runner._should_start_early_sampled_token_copy(use_async_omni_output=False)
-
-
-def test_omni_model_runner_output_empty_has_required_base_fields():
-    output = OmniModelRunnerOutput.empty()
-
-    assert output.req_ids == []
-    assert output.req_id_to_index == {}
-    assert output.sampled_token_ids == []
-    assert output.logprobs is None
-    assert output.prompt_logprobs_dict == {}
-    assert output.pooler_output == []
-
-
 def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
     class QueryStartLoc:
         def __init__(self):
