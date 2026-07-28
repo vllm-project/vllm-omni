@@ -121,22 +121,10 @@ CASES = (
 )
 
 
-def _run(command: list[str], *, log_path: Path, env: dict[str, str], timeout: int = 1800) -> None:
+def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
     start = time.perf_counter()
-    with log_path.open("w") as log:
-        result = subprocess.run(
-            command,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    if result.returncode != 0:
-        tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-80:])
-        pytest.fail(f"Command failed with exit code {result.returncode}: {' '.join(command)}\n{tail}")
-    print(f"{' '.join(command[:3])} finished in {time.perf_counter() - start:.1f}s; log={log_path}")
+    subprocess.run(command, env=env, timeout=timeout, check=True)
+    print(f"{' '.join(command[:3])} finished in {time.perf_counter() - start:.1f}s")
 
 
 def _clone_official_source(root: Path, revision: str) -> None:
@@ -376,6 +364,7 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
         runner_args.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
+    env["PYTHONUNBUFFERED"] = "1"
     repository_root = Path(__file__).resolve().parents[4]
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -398,7 +387,6 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
             "--gemma-root",
             str(gemma_root),
         ],
-        log_path=output_root / "official.log",
         env=env,
     )
 
@@ -416,7 +404,6 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
             "--model-class-name",
             case.model_class_name,
         ],
-        log_path=output_root / "omni.log",
         env=env,
     )
 
