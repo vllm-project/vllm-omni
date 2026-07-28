@@ -86,6 +86,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
     ),
+    "LTX2ConditionPipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2ConditionPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -502,6 +507,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2ConditionPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",

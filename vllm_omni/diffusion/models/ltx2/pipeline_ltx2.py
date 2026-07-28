@@ -14,6 +14,7 @@ from .ltx2_components import LTX2_COMPONENT_PROFILE
 from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
+from .ltx2_condition import LTXMultiAnchorConditioningMixin
 from .ltx2_conditioning import LTXI2VConditioningMixin
 from .ltx2_recipes import (
     LTX2_ONE_STAGE_RECIPE,
@@ -34,6 +35,15 @@ class LTX2Pipeline(LTXI2VConditioningMixin, LTXRuntime):
     _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
     _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
     supports_request_batch = True
+
+
+class LTX2ConditionPipeline(LTXMultiAnchorConditioningMixin, LTX2Pipeline):
+    """LTX-2 / LTX-2.3 one-stage multi-anchor frame conditioning entry (FLF2V / FMLF).
+
+    Keyframe interpolation: anchor a set of frames (first-last, first-middle-last,
+    ...) at given indices and strengths. Degrades to pure T2V when no conditions
+    are supplied. See :mod:`.ltx2_condition`.
+    """
 
 
 class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
