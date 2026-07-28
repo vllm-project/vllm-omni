@@ -216,12 +216,10 @@ def build_ltx_phase_weights(pipeline: Any) -> LTXPhaseWeights | None:
         )
 
     mode = _resolve_two_stage_lora_mode()
-    model_paths = getattr(pipeline.od_config, "model_paths", {}) or {}
     adapter_path = resolve_ltx_artifact(
         pipeline.od_config.model,
         profile.artifact_repo_id,
         profile.distilled_lora_filename,
-        explicit_path=model_paths.get("distilled_lora"),
     )
 
     if mode == "resident":

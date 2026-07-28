@@ -37,8 +37,12 @@ files from `Lightricks/LTX-2` or `Lightricks/LTX-2.3` respectively:
 | LTX-2 | `ltx-2-19b-distilled-lora-384.safetensors` | `ltx-2-spatial-upscaler-x2-1.0.safetensors` |
 | LTX-2.3 | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` |
 
-The runtime searches the model root, `VLLM_OMNI_LTX_ARTIFACTS_DIR`, then the
-matching Lightricks Hub repository.
+To use predownloaded sidecars, set `VLLM_OMNI_LTX_ARTIFACTS_DIR` to one
+directory containing the applicable files under the exact names shown above.
+The variable is an authoritative directory override: startup fails if a
+required file is missing. When it is unset, the runtime searches the model
+root and then the matching Lightricks Hub repository. Per-component
+`model_paths` overrides are not used by LTX.
 
 ## Diffusion Feature Matrix
 
