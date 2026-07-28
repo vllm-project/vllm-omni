@@ -64,6 +64,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "MiMoAudioModel",
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
+            "AudexCode2Wav",
+            "AudexXCodec1",
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",

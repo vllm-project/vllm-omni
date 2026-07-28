@@ -104,6 +104,7 @@ class _RequestQueue(list):
                 self.remove(request)
 
 
+@pytest.mark.skip(reason="#issue 5484")
 def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")

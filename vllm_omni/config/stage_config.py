@@ -821,7 +821,7 @@ def _build_engine_args(
     per-stage StageDeployConfig overrides take precedence when present (e.g.
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
-    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
