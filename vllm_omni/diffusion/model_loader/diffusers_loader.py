@@ -378,6 +378,7 @@ class DiffusersPipelineLoader:
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
+        self._apply_skip_softmax_calibration(model)
         return model.eval()
 
     @staticmethod
@@ -390,6 +391,14 @@ class DiffusersPipelineLoader:
             if getattr(quant_method, "uses_meta_device", False):
                 return True
         return False
+
+    def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
+        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            apply_skip_softmax_calibration,
+        )
+
+        cfg = getattr(self.od_config, "diffusion_attention_config", None)
+        apply_skip_softmax_calibration(cfg, model)
 
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.

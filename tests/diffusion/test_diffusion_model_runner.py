@@ -121,6 +121,15 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
+class _CompileTrackingModel:
+    def __init__(self):
+        self.compile_calls = []
+
+    def compile(self, *args, **kwargs):
+        self.compile_calls.append((args, kwargs))
+        return self
+
+
 def _make_request():
     sampling_params = SimpleNamespace(
         generator=None,
@@ -177,10 +186,20 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     return runner
 
 
-def _make_compile_runner(*, use_hsdp: bool):
+def _make_compile_runner(
+    model=None,
+    *,
+    compile_granularity: str = "regional",
+    compile_dynamic: bool = True,
+    use_hsdp: bool = False,
+):
     runner = object.__new__(DiffusionModelRunner)
-    runner.pipeline = SimpleNamespace(transformer=SimpleNamespace())
-    runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
+    runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
+    runner.od_config = SimpleNamespace(
+        diffusion_compile_granularity=compile_granularity,
+        diffusion_compile_dynamic=compile_dynamic,
+        parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+    )
     return runner
 
 
@@ -206,6 +225,65 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
             {"dynamic": True},
         )
     ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_dynamic=False)
+    compiled_model = object()
+    regional_calls = []
+
+    def _regionally_compile(target, **kwargs):
+        regional_calls.append((target, kwargs))
+        return compiled_model
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [(model, {"dynamic": False})]
+    assert model.compile_calls == []
+    assert runner.pipeline.transformer is compiled_model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_full_granularity(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False)
+    regional_calls = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "regionally_compile",
+        lambda *args, **kwargs: regional_calls.append((args, kwargs)),
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False})]
+    assert regional_calls == []
+    assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model)
+
+    def _regionally_compile(*args, **kwargs):
+        raise RuntimeError("compile setup failed")
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert runner.pipeline.transformer is model
+    assert "failed before activation" in caplog.text
+    assert "lazy compilation errors" in caplog.text
 
 
 @pytest.mark.core_model

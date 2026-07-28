@@ -498,7 +498,7 @@ class Attention(nn.Module):
             role_category=role_category,
         )
         self.attn_impl_cls = attn_backend_cls.get_impl_cls()
-        self.attention = self.attn_impl_cls(..., backend_kwargs=spec.extra if spec else None)
+        self.attention = self.attn_impl_cls(..., backend_kwargs=spec.backend_kwargs() if spec else None)
 ```
 
 **Available Backends**:
@@ -540,7 +540,7 @@ def get_attn_backend_for_role(role, head_size, attention_config=None, role_categ
 
 4. **Platform default** — `current_omni_platform.get_diffusion_attn_backend_cls(...)` picks the best-available kernel for the hardware.
 
-`AttentionSpec.extra` is forwarded to the backend constructor as `backend_kwargs`, so backend-specific parameters (e.g. SparseBlock `block_size`) can be set without changing model code.
+A backend that needs configuration exposes it as a typed field on `AttentionSpec`; `AttentionSpec.backend_kwargs()` serializes it into the `backend_kwargs` the impl consumes. Today the only such field is `skip_softmax` (TRTLLM_ATTN), so e.g. `target_sparsity` can be set without changing model code.
 
 For the user-facing CLI surface, see [Diffusion Attention Backends](../../user_guide/diffusion/attention_backends.md). For the role declaration contract on the model side, see [Adding a Diffusion Model](../../contributing/model/adding_diffusion_model.md).
 
@@ -769,7 +769,7 @@ class TeaCacheBackend(CacheBackend):
 
 **2. Cache-DiT Backend**
 
-**Location**: `vllm_omni/diffusion/cache/cache_dit_backend.py`
+**Location**: `vllm_omni/diffusion/cache/cachedit/`
 
 ```python
 class CacheDiTBackend(CacheBackend):

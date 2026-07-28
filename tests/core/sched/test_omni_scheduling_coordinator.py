@@ -119,7 +119,12 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             ("CovoAudioForConditionalGeneration", "code2wav"),
             ("MiMoAudioModel", "code2wav"),
             ("Qwen3TTSCode2Wav", "code2wav"),
+            ("MiniCPMO45Code2Wav", "code2wav"),
             ("CosyVoice3Model", "cosyvoice3_code2wav"),
+            # audex: sync-path TTS decoder (async_chunk: false deploys) and
+            # the TTA XCodec1 stage (always sync full-payload).
+            ("AudexCode2Wav", "audex_code2wav"),
+            ("AudexXCodec1", "audex_xcodec"),
             ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
             ("DyninOmniForConditionalGeneration", "token2image"),
             ("DyninOmniForConditionalGeneration", "token2audio"),

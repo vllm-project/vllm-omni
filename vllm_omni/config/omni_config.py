@@ -14,7 +14,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeAlias, TypedDict, cast
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config.utils import config
@@ -109,6 +109,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     sequence_parallel_size: int
     ulysses_degree: int
     ring_degree: int
+    allgather_degree: int
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
@@ -269,6 +270,11 @@ class OmniStageModelConfig:
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
+    # Per-stage checkpoint/tokenizer subdirectories under the model root
+    # (e.g. Audex stage 0 → checkpoint_folder_audiogen). Mirrors
+    # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
+    model_subdir: str | None = None
+    tokenizer_subdir: str | None = None
 
 
 @config
@@ -360,6 +366,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
+    allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
@@ -370,7 +377,11 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
-        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+        self.sequence_parallel_size = (
+            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        )
+        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
+            raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
@@ -464,6 +475,8 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     pin_cpu_memory: bool = True
+    diffusion_compile_granularity: Literal["regional", "full"] = "regional"
+    diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None
@@ -1109,6 +1122,10 @@ def _build_model_config(
     kwargs = _config_kwargs(engine)
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
+    if "model_subdir" not in kwargs and topology.model_subdir is not None:
+        kwargs["model_subdir"] = topology.model_subdir
+    if "tokenizer_subdir" not in kwargs and topology.tokenizer_subdir is not None:
+        kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
         **kwargs,
