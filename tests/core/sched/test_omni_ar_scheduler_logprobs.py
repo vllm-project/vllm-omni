@@ -76,6 +76,7 @@ class _Request:
         self.status = RequestStatus.RUNNING
         self.sampling_params = SimpleNamespace(num_logprobs=1)
         self.num_computed_tokens = 0
+        self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
         self.has_encoder_inputs = False
         self.pooling_params = None
@@ -104,7 +105,6 @@ class _RequestQueue(list):
                 self.remove(request)
 
 
-@pytest.mark.skip(reason="#issue 5484")
 def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
@@ -138,7 +138,8 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         scheduler.requests.pop(request.request_id, None)
         scheduler.finished_req_ids.add(request.request_id)
         scheduler.finished_req_ids_dict[request.client_index].add(request.request_id)
-        return None
+        # vLLM 0.26 contract: (kv_xfer_params, ec_xfer_params)
+        return None, None
 
     scheduler._update_request_with_output = update_request
     scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
