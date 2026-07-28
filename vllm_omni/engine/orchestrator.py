@@ -36,6 +36,8 @@ from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    CacheResetRequestMessage,
+    CacheResetResultMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
@@ -579,6 +581,8 @@ class Orchestrator:
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
+            elif msg_type == "cache_reset":
+                await self._handle_cache_reset(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
@@ -819,6 +823,28 @@ class Orchestrator:
                 rpc_id=rpc_id,
                 method=method,
                 stage_ids=stage_ids,
+                results=results,
+            )
+        )
+
+    async def _handle_cache_reset(self, msg: CacheResetRequestMessage) -> None:
+        """Reset caches on every live stage replica and retain its identity."""
+        calls = [
+            pool.reset_cache(
+                replica_id,
+                msg.kind,
+                reset_running_requests=msg.reset_running_requests,
+                reset_connector=msg.reset_connector,
+            )
+            for pool in self.stage_pools
+            for replica_id in pool.live_replica_ids()
+        ]
+        results = await asyncio.gather(*calls)
+        results.sort(key=lambda item: (item.stage_id, item.replica_id))
+        await self.rpc_async_queue.put(
+            CacheResetResultMessage(
+                rpc_id=msg.rpc_id,
+                kind=msg.kind,
                 results=results,
             )
         )

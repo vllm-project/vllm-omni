@@ -54,6 +54,18 @@ class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     stage_ids: list[int] | None
 
 
+CacheResetKind = Literal["prefix", "mm", "encoder"]
+CacheResetStatus = Literal["success", "not_applicable", "failed"]
+
+
+class CacheResetRequestMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["cache_reset"] = "cache_reset"
+    rpc_id: str
+    kind: CacheResetKind
+    reset_running_requests: bool = False
+    reset_connector: bool = False
+
+
 class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["shutdown"] = "shutdown"
 
@@ -110,3 +122,23 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:
         return ("collective", self.rpc_id)
+
+
+class CacheResetReplicaResult(msgspec.Struct, kw_only=True):
+    stage_id: int
+    replica_id: int
+    stage_type: str | None
+    status: CacheResetStatus
+    result: bool | None = None
+    error: str | None = None
+
+
+class CacheResetResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["cache_reset_result"] = "cache_reset_result"
+    rpc_id: str
+    kind: CacheResetKind
+    results: list[CacheResetReplicaResult]
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("cache_reset", self.rpc_id)

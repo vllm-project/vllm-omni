@@ -304,6 +304,19 @@ class OmniTensorPrefixCache:
         """Clears the cache hit IDs to prepare for a new engine step."""
         self._new_req_cache_hit_ids.clear()
 
+    def reset(self) -> None:
+        """Fence pending copies and discard all request-scoped cache state.
+
+        Scheduler block validity remains authoritative, so the large cache
+        tensors can stay allocated and do not need an expensive zero-fill.
+        """
+        pending_write = self._pending_write
+        self._pending_write = None
+        if pending_write is not None:
+            pending_write.event.synchronize()
+        self._new_req_cache_hit_ids.clear()
+        self._deferred_mm_outputs.clear()
+
     def has_prefix_cached_new_req_ids(self) -> bool:
         """Return True when this step contains a newly scheduled prefix hit."""
         return bool(self._new_req_cache_hit_ids)

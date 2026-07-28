@@ -19,6 +19,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    CacheResetRequestMessage,
+    CacheResetResultMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     ErrorMessage,
@@ -227,6 +229,35 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         normalized_kwargs = dict(kwargs or {})
         self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
         return self.rpc_result
+
+
+class FakeCacheResetStageClient(FakeStageClient):
+    def __init__(self, *args, prefix_result: bool = True, reset_error: Exception | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.prefix_result = prefix_result
+        self.reset_error = reset_error
+        self.cache_reset_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _maybe_raise(self) -> None:
+        if self.reset_error is not None:
+            raise self.reset_error
+
+    async def reset_prefix_cache_async(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        self.cache_reset_calls.append(("prefix", (reset_running_requests, reset_connector)))
+        self._maybe_raise()
+        return self.prefix_result
+
+    async def reset_mm_cache_async(self) -> None:
+        self.cache_reset_calls.append(("mm", ()))
+        self._maybe_raise()
+
+    async def reset_encoder_cache_async(self) -> None:
+        self.cache_reset_calls.append(("encoder", ()))
+        self._maybe_raise()
 
 
 class FakeOutputProcessor:
@@ -2027,6 +2058,73 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         assert not stage0.collective_rpc_calls
         assert len(stage1.collective_rpc_calls) == 1
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_cache_reset_aggregates_replica_results_and_skips_diffusion(orchestrator_factory) -> None:
+    stage0_r0 = FakeCacheResetStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeCacheResetStageClient(stage_type="llm", final_output=False, prefix_result=False)
+    stage1 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            None,
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CacheResetRequestMessage(
+                rpc_id="cache-1",
+                kind="prefix",
+                reset_running_requests=True,
+                reset_connector=True,
+            )
+        )
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert isinstance(msg, CacheResetResultMessage)
+        assert [(r.stage_id, r.replica_id, r.status, r.result) for r in msg.results] == [
+            (0, 0, "success", True),
+            (0, 1, "success", False),
+            (1, 0, "not_applicable", None),
+        ]
+        assert stage0_r0.cache_reset_calls == [("prefix", (True, True))]
+        assert stage0_r1.cache_reset_calls == [("prefix", (True, True))]
+        assert stage1.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_cache_reset_reports_replica_failure(orchestrator_factory) -> None:
+    stage0 = FakeCacheResetStageClient(
+        stage_type="llm",
+        final_output=True,
+        reset_error=RuntimeError("reset failed"),
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(CacheResetRequestMessage(rpc_id="cache-2", kind="encoder"))
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert isinstance(msg, CacheResetResultMessage)
+        assert len(msg.results) == 1
+        assert msg.results[0].status == "failed"
+        assert msg.results[0].stage_id == 0
+        assert msg.results[0].replica_id == 0
+        assert msg.results[0].error == "reset failed"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

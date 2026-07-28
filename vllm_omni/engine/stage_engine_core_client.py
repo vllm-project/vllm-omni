@@ -432,6 +432,22 @@ class StageEngineCoreClientBase(StageClientBase):
             kwargs=kwargs,
         )
 
+    async def reset_mm_cache_async(self) -> None:
+        await super().reset_mm_cache_async()
+
+    async def reset_encoder_cache_async(self) -> None:
+        await super().reset_encoder_cache_async()
+
+    async def reset_prefix_cache_async(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        return await super().reset_prefix_cache_async(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+
 
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
     """Stage async client backed by vLLM's ``AsyncMPClient``."""

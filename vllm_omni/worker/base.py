@@ -89,6 +89,12 @@ class OmniGPUWorkerBase(GPUWorker):
         else:
             self.profiler.stop()
 
+    def reset_omni_prefix_cache(self) -> None:
+        """Reset Omni state coupled to the scheduler's prefix cache."""
+        cache = getattr(self.model_runner, "omni_prefix_cache", None)
+        if cache is not None:
+            cache.reset()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Process-scoped GPU memory profiling for concurrent stage initialization.
