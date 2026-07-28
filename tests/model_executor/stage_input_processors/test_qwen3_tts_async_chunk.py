@@ -561,7 +561,9 @@ def test_full_payload_emits_placeholder_frame_on_degenerate_take(pooling_output)
     assert payload is not None
     assert payload["meta"]["finished"].item() is True
     audio = payload["codes"]["audio"]
-    assert audio.numel() > 0
+    # Same wire format as the normal path: flat, codebook-major, one frame.
+    assert audio.ndim == 1
+    assert audio.numel() == _NUM_QUANTIZERS_DEFAULT
     # The placeholder must survive the same validity filter real takes go
     # through; a frame the filter would drop re-creates the zero-token request.
     frames = audio.reshape(-1, _NUM_QUANTIZERS_DEFAULT)

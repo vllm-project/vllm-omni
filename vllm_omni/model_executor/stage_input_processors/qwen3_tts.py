@@ -43,13 +43,15 @@ def _qwen3_tts_degenerate_finished_payload():
     which killed the whole stage EngineCore before #5269 and no-ops after it,
     so the request never finishes either way (#5196, #5471).
 
-    One all-ones frame is valid by ``_filter_audio_codes_qwen3_tts``
-    (non-negative, not all-zero, below ``_CODEBOOK_SIZE``), so the request
-    runs the normal one-shot code2wav path and finishes cleanly with a single
-    frame (~80 ms at 12 Hz) of placeholder audio.
+    The placeholder is one all-ones frame, emitted flat (codebook-major, the
+    same wire format the normal path below produces). Its values are valid by
+    ``_filter_audio_codes_qwen3_tts`` (non-negative, not all-zero, below
+    ``_CODEBOOK_SIZE``), so the request runs the normal one-shot code2wav
+    path and finishes cleanly with a single frame (~80 ms at 12 Hz) of
+    placeholder audio.
     """
     return {
-        "codes": {"audio": torch.ones(1, _NUM_QUANTIZERS_DEFAULT, dtype=torch.long)},
+        "codes": {"audio": torch.ones(_NUM_QUANTIZERS_DEFAULT, dtype=torch.long)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
 
