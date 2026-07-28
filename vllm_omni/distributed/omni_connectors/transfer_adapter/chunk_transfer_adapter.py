@@ -317,7 +317,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
+                    # Terminal stops no longer count as segment boundaries
+                    # (is_segment_finished is False when the request finishes,
+                    # see #5383), but the processor must still flush its
+                    # accumulated tail on the terminal chunk — otherwise the
+                    # downstream stage receives the finished marker without
+                    # the final payload (#5413).
+                    is_finished=is_segment_finished or is_finished,
                 )
 
             except Exception as e:
@@ -543,6 +549,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         self._active_streams[request_id] = request
         return True
+
+    @property
+    def num_running_waiting_for_chunk(self) -> int:
+        """Count running requests temporarily removed while awaiting a chunk."""
+        return len(self.waiting_for_chunk_running_requests)
 
     def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         # Hold non-active running requests in a private deque rather than

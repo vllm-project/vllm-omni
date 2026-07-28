@@ -41,12 +41,8 @@ th {
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.2-VACE | `Pyros13/Wan2.2-VACE-Fun-A14B-Diffusers` | ✅︎ |   |   |   |
-| `LTX2Pipeline` | LTX-2-T2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
-| `LTX2ImageToVideoPipeline` | LTX-2-I2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
-| `LTX2TwoStagesPipeline` | LTX-2-T2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
-| `LTX2ImageToVideoTwoStagesPipeline` | LTX-2-I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
-| `LTX23Pipeline` | LTX-2.3-T2V | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
-| `LTX23ImageToVideoPipeline` | LTX-2.3-I2V | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX2Pipeline` | LTX-2 / LTX-2.3 one-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX2DistilledPipeline` | LTX-2 distilled two-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
@@ -61,6 +57,7 @@ th {
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` | ✅︎ | ✅︎ | | |
+| `MammothModa2ForConditionalGeneration` | MammothModa2-Dev (AR-only image understanding) | `bytedance-research/MammothModa2-Dev` | ✅︎ | | | |
 | `Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `FluxKontextPipeline` | FLUX.1-Kontext-dev | `black-forest-labs/FLUX.1-Kontext-dev` | ✅︎ | ✅︎ | | |
 | `FluxPipeline` | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | ✅︎ | ✅︎ | | ✅︎ |

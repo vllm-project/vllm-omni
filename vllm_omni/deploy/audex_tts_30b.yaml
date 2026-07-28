@@ -1,0 +1,76 @@
+# Audex 30B-A3B (nvidia/Nemotron-Labs-Audex-30B-A3B) TTS deploy.
+#
+# Same pipeline/topology/token space as the 2B (audex_tts.yaml); the thinker
+# is the hybrid Mamba+MoE NemotronHForCausalLM (~60 GB bf16), so:
+#   * enable_prefix_caching: false — hybrid Mamba stage.
+#   * Single H100 80GB layout: thinker 0.85 + decoder 0.08 share GPU 0.
+#     If weights + state do not fit (long sequences OOM), set
+#     tensor_parallel_size: 2 on stage 0 and move stage 1 to devices "2".
+#   * CUDA graphs stay ON for stage 0: the hybrid Mamba+MoE thinker
+#     captures cleanly and review benchmarks measured ~7x lower TTS RTF
+#     vs enforce_eager (0.30 vs 2.08 single-stream), on par with the 2B
+#     and NVIDIA's reference demo.
+#   * Classifier-free guidance quality (en-24, self-transcribed ASR CER):
+#     baseline cfg=1.0 -> 0.72%; guided cfg=1.5 at temperature 0.1 -> 0.72%
+#     (gate: guided <= baseline, PASS). Note the 30B's best guided
+#     temperature is 0.1 (the yaml default) — unlike the 2B's 0.05, which
+#     measured 0.79% here. The serving layer currently injects 0.05 for
+#     guided requests on all sizes; acceptable (still within the anchor
+#     +2pp standing gate) but a size-aware refinement is a known follow-up.
+# ALWAYS pass this yaml explicitly (--stage-configs-path): bare serve of the
+# 30B repo auto-detects the shared model_type and lands on the 2B-tuned yaml.
+pipeline: audex_tts
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      initial_codec_chunk_frames: 1
+      codec_token_offset: 131077
+      codec_vocab_size: 65536
+      decoder_emit_chunk_frames: 5
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.85
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    dtype: bfloat16
+    devices: "0"
+    logits_processors:
+      - "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.1
+      top_k: 80
+      max_tokens: 2048
+      seed: 0
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 8192
+      seed: 0

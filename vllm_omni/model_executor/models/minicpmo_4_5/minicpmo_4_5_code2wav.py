@@ -30,6 +30,20 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
+    """Resolve ``model_ref`` to a local directory containing the repo assets.
+
+    ``model_config.model`` is a filesystem path in local deployments but a
+    Hugging Face repo id in hub/CI deployments; the prompt-audio and
+    token2wav asset lookups need a real directory either way.
+    """
+    if Path(model_ref).is_dir():
+        return model_ref
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -118,6 +132,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         del prefix
         self.vllm_config = vllm_config
         self.model_path = str(vllm_config.model_config.model)
+        self._model_revision = getattr(vllm_config.model_config, "revision", None)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
         self._owned_prompt_wavs: dict[str, tuple[str, str]] = {}
@@ -126,12 +141,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
-        self._default_prompt_wav = str(
-            extra.get(
-                "prompt_wav",
-                Path(self.model_path) / "assets" / "HT_ref_audio.wav",
-            )
-        )
+        self._prompt_wav_override = extra.get("prompt_wav")
+
+    @property
+    def _default_prompt_wav(self) -> str:
+        if self._prompt_wav_override is not None:
+            return str(self._prompt_wav_override)
+        return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -600,6 +616,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
+        # Hub repo ids only need to become local directories once the vocoder
+        # assets are actually read; unit tests construct this model with fake
+        # paths and must not trigger a hub download (#5442).
+        self.model_path = _resolve_model_dir(self.model_path, self._model_revision)
         prompt_path = Path(self._default_prompt_wav)
         if not prompt_path.is_file():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")

@@ -529,6 +529,26 @@ def decode_b64_image(b64: str):
     return img
 
 
+def concat_audio(audio_val) -> np.ndarray:
+    """Flatten a multimodal audio payload to mono float32 samples.
+
+    Engines return ``multimodal_output["audio"]`` as a tensor, a list of
+    per-chunk tensors (streaming decoders), or an array-like; concatenate
+    in order and return a 1-D ``np.float32`` array (empty when a list has
+    no tensors).
+    """
+    import torch
+
+    if isinstance(audio_val, list):
+        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
+        if not tensors:
+            return np.zeros((0,), dtype=np.float32)
+        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
+    if isinstance(audio_val, torch.Tensor):
+        return audio_val.detach().cpu().float().reshape(-1).numpy()
+    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
+
+
 def preprocess_text(text):
     import opencc
 
@@ -695,6 +715,7 @@ def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> 
 
 __all__ = [
     "_merge_base64_audio_to_segment",
+    "concat_audio",
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",

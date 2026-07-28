@@ -1245,7 +1245,7 @@ class TestRankAwareKVRouting(unittest.TestCase):
 
 class TestAttachOmniConnectorOutput(unittest.TestCase):
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
-        from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
+        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
         host = MixinHost()
         host.get_omni_connector_output = lambda: OmniConnectorOutput(chunk_ready_req_ids={"req-1"})
