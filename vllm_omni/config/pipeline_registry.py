@@ -33,6 +33,12 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.model_executor.models.audex.pipeline import (
+    AUDEX_S2S_PIPELINE,
+    AUDEX_THINKER_ONLY_PIPELINE,
+    AUDEX_TTA_PIPELINE,
+    AUDEX_TTS_PIPELINE,
+)
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -86,6 +92,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.soulx_singer.pipeline import (
+    SOULXSINGER_SVC_PIPELINE,
+    SOULXSINGER_SVS_PIPELINE,
+)
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -122,6 +132,14 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
+    "audex_tts": AUDEX_TTS_PIPELINE,
+    "audex_tta": AUDEX_TTA_PIPELINE,
+    "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
+    "audex_s2s": AUDEX_S2S_PIPELINE,
+    # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
+    # ``model_type: nemotron_labs_audex``; bare ``vllm-omni serve <repo>``
+    # auto-detects through it and must land on the default (TTS) pipeline.
+    "nemotron_labs_audex": AUDEX_TTS_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming_tts": MING_TTS_PIPELINE,
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
@@ -144,6 +162,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
+    "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
+    "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }
 
 

@@ -637,7 +637,7 @@ Key points:
 
 ## Testing
 
-For general testing conventions, see [tests_style.md](../ci/tests_style.md).
+For general testing conventions, see [Test Writing Guide](../ci/test_writing_guide.md).
 
 Recommended test cases for a new TTS model:
 

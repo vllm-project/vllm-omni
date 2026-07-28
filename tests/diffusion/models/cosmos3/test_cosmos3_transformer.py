@@ -193,7 +193,7 @@ def test_edge_und_and_gen_use_relu2_and_no_und_qk_norm() -> None:
         SimpleNamespace(
             tf_model_config=_tiny_cosmos3_edge_config(
                 num_hidden_layers=1,
-                use_k_norm_und_for_gen=False,
+                use_und_k_norm_for_gen=False,
             ),
             dtype=torch.float32,
         )
@@ -221,14 +221,14 @@ def test_edge_creates_gen_k_norm_when_enabled() -> None:
             tf_model_config=_tiny_cosmos3_edge_config(
                 num_hidden_layers=1,
                 qk_norm_for_diffusion=True,
-                use_k_norm_und_for_gen=True,
+                use_und_k_norm_for_gen=True,
             ),
             dtype=torch.float32,
         )
     )
 
     k_norm = model.language_model.layers[0].self_attn.k_norm_und_for_gen
-    assert model.use_k_norm_und_for_gen is True
+    assert model.use_und_k_norm_for_gen is True
     assert isinstance(k_norm, RMSNorm)
     assert isinstance(model.gen_layers[0].cross_attention.norm_q, RMSNorm)
     assert isinstance(model.gen_layers[0].cross_attention.norm_k, RMSNorm)
@@ -244,7 +244,7 @@ def test_edge_supports_no_gen_qk_norm_variant() -> None:
             tf_model_config=_tiny_cosmos3_edge_config(
                 num_hidden_layers=1,
                 qk_norm_for_diffusion=False,
-                use_k_norm_und_for_gen=False,
+                use_und_k_norm_for_gen=False,
             ),
             dtype=torch.float32,
         )
@@ -266,7 +266,7 @@ def test_edge_validates_required_relu2_weights() -> None:
     nn.Module.__init__(model)
     model.num_hidden_layers = 1
     model.qk_norm_for_diffusion = True
-    model.use_k_norm_und_for_gen = True
+    model.use_und_k_norm_for_gen = True
 
     complete = {
         "transformer.language_model.layers.0.mlp.up_proj.weight",
@@ -288,7 +288,7 @@ def test_edge_validates_required_relu2_weights() -> None:
     with pytest.raises(ValueError, match=r"self_attn\.k_norm_und_for_gen"):
         model.validate_loaded_weights(missing_k_norm)
 
-    model.use_k_norm_und_for_gen = False
+    model.use_und_k_norm_for_gen = False
     model.validate_loaded_weights(missing_k_norm)
 
 

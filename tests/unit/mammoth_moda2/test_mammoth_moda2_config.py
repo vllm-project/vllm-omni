@@ -16,7 +16,11 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import (
     Mammothmoda2Config,
     Mammothmoda2Qwen2_5_VLConfig,
     Mammothmoda2Qwen2_5_VLTextConfig,
+    Mammothmoda2Qwen3VLConfig,
+    Mammothmoda2Qwen3VLTextConfig,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.cpu
@@ -89,3 +93,30 @@ class TestMammothmoda2Qwen2_5_VLConfig:
         assert hasattr(text_config, "vocab_size")
         assert hasattr(text_config, "image_token_id")
         assert hasattr(text_config, "video_token_id")
+
+
+@pytest.mark.cpu
+class TestMammothmoda2Qwen3VLConfig:
+    def test_dev_config_uses_qwen3_vl_subconfigs(self):
+        config = Mammothmoda2Config(
+            llm_config={
+                "model_type": "mammothmoda2_qwen3_vl",
+                "text_config": {
+                    "model_type": "mammothmoda2_qwen3_vl_text",
+                    "vocab_size": 151936,
+                    "gen_vocab_size": 32800,
+                    "gen_vocab_start_index": 152064,
+                },
+                "vision_config": {
+                    "model_type": "mammothmoda2_qwen3_vl_vision",
+                    "deepstack_visual_indexes": [8, 16, 24],
+                },
+            }
+        )
+
+        assert isinstance(config.llm_config, Mammothmoda2Qwen3VLConfig)
+        assert isinstance(config.get_text_config(), Mammothmoda2Qwen3VLTextConfig)
+        # vLLM validates sampling against the complete base + visual vocabulary.
+        assert config.get_text_config().vocab_size == 152064 + 32800
+        assert config.get_text_config().gen_vocab_start_index == 152064
+        assert config.llm_config.vision_config.deepstack_visual_indexes == [8, 16, 24]

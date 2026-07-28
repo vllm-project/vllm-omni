@@ -37,7 +37,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
-from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (

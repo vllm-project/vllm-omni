@@ -23,6 +23,7 @@ from vllm_omni.model_extras.bagel import (
 from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
+from vllm_omni.model_extras.bagel import build_x_to_text_prompt as build_bagel_x_to_text_prompt
 from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
@@ -34,6 +35,9 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -45,6 +49,9 @@ from vllm_omni.model_extras.mammothmodal2_preview import (
 )
 from vllm_omni.model_extras.mammothmodal2_preview import (
     build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_x_to_text_prompt as build_mammothmoda2_x_to_text_prompt,
 )
 from vllm_omni.model_extras.ming_flash_omni import (
     MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
@@ -88,6 +95,50 @@ ImageToVideoPromptBuilder = Callable[
     ],
     dict[str, Any],
 ]
+XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
+
+
+def default_x_to_text_prompt(
+    model: str,
+    prompt: str,
+    has_image: bool,
+) -> tuple[dict[str, Any], list[int] | None]:
+    del model, has_image
+    return {"prompt": prompt, "modalities": ["text"]}, None
+
+
+_X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
+    "bagel": build_bagel_x_to_text_prompt,
+    "hunyuan_image3": build_hunyuan_x_to_text_prompt,
+    "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
+}
+
+
+def get_x_to_text_model_family(model: str) -> str:
+    """Resolve a text-output prompt family from a checkpoint's config.json."""
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    config = get_hf_file_to_dict("config.json", model) or {}
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = {str(value).lower() for value in (config.get("architectures") or [])}
+    if model_type == "bagel" or "bagelforconditionalgeneration" in architectures:
+        return "bagel"
+    if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
+        return "hunyuan_image3"
+    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
+        return "mammoth_moda2"
+    return "generic"
+
+
+def build_x_to_text_prompt(
+    model_family: str,
+    model: str,
+    prompt: str,
+    has_image: bool,
+) -> tuple[dict[str, Any], list[int] | None]:
+    """Build a model-aware T2T/I2T prompt and optional stop-token ids."""
+    builder = _X_TO_TEXT_SPECS.get(model_family, default_x_to_text_prompt)
+    return builder(model, prompt, has_image)
 
 
 def default_text_to_image_prompt(
@@ -170,6 +221,19 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
     },
+    "LingBotVideoPipeline": {
+        "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    **{
+        model_class_name: {
+            "extra_body_params": LTX_EXTRA_BODY_PARAMS,
+            "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+        }
+        for model_class_name in (
+            "LTX2Pipeline",
+            "LTX2DistilledPipeline",
+        )
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
@@ -189,6 +253,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
 }
+
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request adapters.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:

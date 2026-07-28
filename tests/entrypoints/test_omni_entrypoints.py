@@ -108,6 +108,8 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
         self.endpoint_restrictions = ()
+        self.duplex_session_config = None
+        self.duplex_serving_adapter_path = None
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
