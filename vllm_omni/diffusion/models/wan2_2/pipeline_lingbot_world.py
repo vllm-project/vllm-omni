@@ -102,6 +102,7 @@ class _LingBotARSessionState:
     prompt: str | None = None
     generator_state: torch.Tensor | None = None
     image_condition: torch.Tensor | None = None
+    camera_tail: CameraTrajectory | None = None
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -776,7 +777,13 @@ class LingBotWorldCausalDMDPipeline(
             )
         return condition
 
-    def _prepare_camera(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
+    def _prepare_camera(
+        self,
+        inputs: _LingBotRequestInputs,
+        *,
+        dtype: torch.dtype,
+        previous: CameraTrajectory | None = None,
+    ) -> tuple[torch.Tensor, CameraTrajectory]:
         """Convert raw camera frames to a latent-aligned ray tensor."""
 
         trajectory = inputs.camera_trajectory
@@ -791,8 +798,17 @@ class LingBotWorldCausalDMDPipeline(
             intrinsics=trajectory.intrinsics[: inputs.num_frames],
         )
         trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
+        embedding_trajectory = trajectory
+        if previous is not None:
+            embedding_trajectory = CameraTrajectory(
+                poses=torch.cat((previous.poses, trajectory.poses), dim=0),
+                intrinsics=torch.cat(
+                    (previous.intrinsics, trajectory.intrinsics),
+                    dim=0,
+                ),
+            )
         camera_embedding = build_plucker_embedding(
-            trajectory,
+            embedding_trajectory,
             height=inputs.height,
             width=inputs.width,
             target_height=inputs.height,
@@ -800,7 +816,13 @@ class LingBotWorldCausalDMDPipeline(
             device=self.device,
             dtype=dtype,
         )
-        return _fold_camera_embedding(camera_embedding)
+        if previous is not None:
+            camera_embedding = camera_embedding[1:]
+        tail = CameraTrajectory(
+            poses=trajectory.poses[-1:].clone(),
+            intrinsics=trajectory.intrinsics[-1:].clone(),
+        )
+        return _fold_camera_embedding(camera_embedding), tail
 
     def _ar_text_caches(
         self,
@@ -1082,7 +1104,11 @@ class LingBotWorldCausalDMDPipeline(
                 :,
                 condition_start:condition_stop,
             ]
-        camera = self._prepare_camera(inputs, dtype=dtype)
+        camera, camera_tail = self._prepare_camera(
+            inputs,
+            dtype=dtype,
+            previous=session_state.camera_tail if session_state is not None else None,
+        )
         if camera.shape[2:] != condition.shape[2:]:
             raise RuntimeError(
                 "folded camera and image condition must share latent frame/height/width geometry; "
@@ -1142,6 +1168,7 @@ class LingBotWorldCausalDMDPipeline(
             assert session_state is not None
             session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
+            session_state.camera_tail = camera_tail
             session_state.next_chunk_index += 1
 
         # Phase 4: either expose model-space latents or invert the checkpoint's
