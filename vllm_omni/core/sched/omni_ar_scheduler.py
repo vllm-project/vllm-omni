@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
-from time import time
 from typing import Any
 
 import numpy as np
@@ -228,7 +227,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
-        self._before_omni_schedule(model_mode="ar")
+        self._process_pending_omni_inputs(model_mode="ar")
 
         original_waiting = None
         if self._should_defer_waiting_admission():

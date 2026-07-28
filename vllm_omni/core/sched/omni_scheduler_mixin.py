@@ -27,7 +27,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import (
-    OmniInputRecvHandle,
+    OmniChunkRecvHandle,
     OmniNewRequestData,
     OmniSchedulerOutput,
 )
@@ -138,8 +138,8 @@ class OmniSchedulerMixin:
             connector_output.stage_recv_req_ids if connector_output else set(),
         )
 
-    def _before_omni_schedule(self, model_mode: str) -> None:
-        """Apply connector readiness and park requests awaiting stage input."""
+    def _process_pending_omni_inputs(self, model_mode: str) -> None:
+        """Apply pending connector inputs, timeouts, and async chunks."""
         self._consume_pending_connector_output(model_mode)
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
@@ -221,7 +221,7 @@ class OmniSchedulerMixin:
         base: SchedulerOutput,
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
-        pending_input_registrations: list[OmniInputRecvHandle] | None = None,
+        pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 

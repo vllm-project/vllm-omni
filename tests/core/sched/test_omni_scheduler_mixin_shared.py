@@ -5,7 +5,7 @@ import pytest
 from vllm.v1.engine import FinishReason
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniInputRecvHandle
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,7 +34,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         restore_queues=lambda waiting: calls.append(("restore-full", waiting))
     )
 
-    scheduler._before_omni_schedule("ar")
+    scheduler._process_pending_omni_inputs("ar")
     scheduler._restore_omni_wait_queues()
 
     assert calls == [
@@ -71,8 +71,10 @@ def test_finished_request_attachment_keeps_ar_abort_policy_explicit(
     assert scheduler.finished_req_ids_dict == {}
 
 
-def test_input_receive_handle_keeps_compatibility_alias():
-    assert OmniChunkRecvHandle is OmniInputRecvHandle
+def test_chunk_receive_handle_carries_minimal_registration_fields():
+    handle = OmniChunkRecvHandle(request_id="req", external_req_id="external")
+    assert handle.request_id == "req"
+    assert handle.external_req_id == "external"
 
 
 def test_output_helper_preserves_required_nan_counter_default():
