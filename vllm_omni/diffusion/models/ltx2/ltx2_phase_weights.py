@@ -64,15 +64,20 @@ def _uses_serialized_quantization(quant_config: Any) -> bool:
         quant_config = quant_config.resolve("transformer")
     if quant_config is None:
         return False
-    serialized_flags = (
-        "is_checkpoint_quantized",
-        "is_checkpoint_fp8_serialized",
-        "is_checkpoint_nvfp4_serialized",
-        "is_checkpoint_mxfp8_serialized",
-        "is_checkpoint_torchao_serialized",
-    )
-    return getattr(quant_config, "data_type", None) == "mx_fp" or any(
-        bool(getattr(quant_config, name, False)) for name in serialized_flags
+    if getattr(quant_config, "data_type", None) == "mx_fp" or bool(
+        getattr(quant_config, "is_checkpoint_quantized", False)
+    ):
+        return True
+
+    # Quantization backends do not share one serialized-checkpoint flag:
+    # examples include is_checkpoint_int8_serialized,
+    # is_checkpoint_mxfp4_serialized, and is_checkpoint_serialized. Match the
+    # naming contract instead of maintaining a format list that becomes stale
+    # whenever another offline format is added.
+    return any(
+        bool(getattr(quant_config, name))
+        for name in dir(quant_config)
+        if name == "is_checkpoint_serialized" or (name.startswith("is_checkpoint_") and name.endswith("_serialized"))
     )
 
 
