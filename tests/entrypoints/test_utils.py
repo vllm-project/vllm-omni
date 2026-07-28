@@ -390,6 +390,20 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
+    def test_default_diffusion_stage_preserves_custom_engine_routing(self):
+        engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+        runner_cls = "vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner"
+
+        stage = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "engine_backend": engine_backend,
+                "diffusion_model_runner_cls": runner_cls,
+            }
+        )[0]
+
+        assert stage["engine_args"]["engine_backend"] == engine_backend
+        assert stage["engine_args"]["diffusion_model_runner_cls"] == runner_cls
+
     def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
         self, tmp_path, mocker: MockerFixture
     ):
