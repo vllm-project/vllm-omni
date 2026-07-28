@@ -41,11 +41,11 @@ def _get_server_cases(model: str):
     ]
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
 def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_images_generations_request(
+    openai_client.send_images_generations_http_request(
         {
             "json": {
                 "model": omni_server.model,

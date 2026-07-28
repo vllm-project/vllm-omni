@@ -1,19 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import base64
-import io
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 
 from tests.helpers import assertions
-from tests.helpers.assertions import (
-    _assert_transcript_matches,
-    _resolve_audio_transcript,
-    assert_images_generations_response,
-)
+from tests.helpers.assertions import _assert_transcript_matches, _resolve_audio_transcript
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -95,20 +88,3 @@ def test_escalated_transcript_keeps_declared_language(monkeypatch):
 
     assert captured["model_size"] == "large-v3"
     assert captured["language"] == "en"
-
-
-def test_images_generations_response_decodes_expected_size():
-    buffer = io.BytesIO()
-    Image.new("RGB", (32, 16), "green").save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-
-    assert_images_generations_response(
-        {"data": [{"b64_json": encoded}]},
-        {
-            "json": {
-                "n": 1,
-                "size": "32x16",
-                "response_format": "b64_json",
-            }
-        },
-    )

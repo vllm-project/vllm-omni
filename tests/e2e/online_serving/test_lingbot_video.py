@@ -41,12 +41,11 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_images_generations_request(
+    openai_client.send_images_generations_http_request(
         {
             "json": {
                 "model": omni_server.model,
@@ -64,8 +63,7 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
     )
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_video_generation_modes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:

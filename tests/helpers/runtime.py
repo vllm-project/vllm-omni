@@ -1483,20 +1483,12 @@ class OpenAIClientHandler:
             err_code=cfg.get("err_code"),
             err_message=cfg.get("err_message"),
         )
-        return [resp]
-
-    def send_images_generations_request(
-        self,
-        request_config: dict[str, Any],
-    ) -> list[HttpResponse]:
-        """POST and validate a successful ``/v1/images/generations`` request."""
-        responses = self.send_images_generations_http_request(request_config)
-        for response in responses:
-            assert response.success, response.error_message
-            payload = response.json_body
+        if cfg.get("err_code") is None:
+            assert resp.success, resp.error_message
+            payload = resp.json_body
             assert isinstance(payload, dict)
-            assert_images_generations_response(payload, request_config, run_level=self.run_level)
-        return responses
+            assert_images_generations_response(payload, cfg, run_level=self.run_level)
+        return [resp]
 
     def send_images_edits_http_request(
         self,
