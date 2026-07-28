@@ -1,9 +1,9 @@
 """
 E2E Online tests for MiniCPM-o 4.5 model with multimodal input and audio / text output.
 
-MiniCPM-o 4.5 has ``async_chunk: false``, ``max_num_seqs: 1`` on both stages,
-and the vocoder runs in-process inside the talker stage rather than as a separate
-Code2Wav stage.
+The legacy regression fixture explicitly disables async chunking. Dedicated
+streaming cases below run the batching deployment with async chunking enabled
+and validate incremental SSE text and audio output.
 """
 
 import os
@@ -35,6 +35,21 @@ test_params = [
     )
 ]
 
+async_chunk_test_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=[
+                "--trust-remote-code",
+                "--async-chunk",
+            ],
+        ),
+        id="async_chunk",
+    )
+]
+
 
 def get_system_prompt():
     return {
@@ -63,6 +78,26 @@ def get_prompt(prompt_type: str = "text_only") -> str:
 def get_max_batch_size(size_type="few"):
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
     return batch_sizes.get(size_type, 5)
+
+
+def _assert_stream_finished(response) -> None:
+    finish_reasons = response.finish_reasons or []
+    assert finish_reasons, "Stream ended without a finish reason"
+    assert finish_reasons[-1] == "stop", f"Unexpected terminal finish reason: {finish_reasons[-1]}"
+
+
+def _assert_text_stream(response, *, min_chunks: int = 2) -> None:
+    chunks = response.text_chunks or []
+    assert len(chunks) >= min_chunks, f"Expected at least {min_chunks} text chunks, got {len(chunks)}"
+    assert response.text_content == "".join(chunks)
+    _assert_stream_finished(response)
+
+
+def _assert_audio_stream(response) -> None:
+    chunks = response.audio_data or []
+    assert len(chunks) >= 2, f"Expected at least two audio chunks, got {len(chunks)}"
+    assert response.audio_bytes is not None and len(response.audio_bytes) > 44
+    _assert_stream_finished(response)
 
 
 @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
@@ -233,3 +268,71 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", async_chunk_test_params, indirect=True)
+def test_text_to_text_async_chunk_streaming_001(omni_server, openai_client) -> None:
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text"],
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    response = openai_client.send_omni_request(request_config)[0]
+    _assert_text_stream(response)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", async_chunk_test_params, indirect=True)
+def test_text_to_audio_async_chunk_streaming_001(omni_server, openai_client) -> None:
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["audio"],
+        "key_words": {"audio": ["Beijing"]},
+    }
+
+    response = openai_client.send_omni_request(request_config)[0]
+    _assert_audio_stream(response)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", async_chunk_test_params, indirect=True)
+def test_mix_to_text_audio_async_chunk_streaming_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+    }
+
+    response = openai_client.send_omni_request(request_config)[0]
+    _assert_text_stream(response, min_chunks=1)
+    _assert_audio_stream(response)

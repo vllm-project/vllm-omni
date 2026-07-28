@@ -754,6 +754,7 @@ class OmniResponse:
     """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
 
     text_content: str | None = None
+    text_chunks: list[str] | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
     audio_format: str | None = None
@@ -765,6 +766,7 @@ class OmniResponse:
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
+    finish_reasons: list[str] | None = None
     #: HTTP status + error text for the error-handling path (e.g. validator
     #: rejections); populated when the OpenAI client raises an APIError.
     status_code: int | None = None
@@ -886,7 +888,9 @@ class OpenAIClientHandler:
         result = OmniResponse()
         try:
             text_content = ""
+            text_chunks = []
             audio_data = []
+            finish_reasons = []
             for chunk in chat_completion:
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
@@ -894,7 +898,11 @@ class OpenAIClientHandler:
                     if modality == "audio" and content:
                         audio_data.append(content)
                     elif modality == "text" and content:
+                        text_chunks.append(content)
                         text_content += content
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    if finish_reason is not None:
+                        finish_reasons.append(str(finish_reason))
                 # Usage is yielded after the last token
                 if chunk.usage:
                     result.prompt_tokens = chunk.usage.prompt_tokens
@@ -907,7 +915,9 @@ class OpenAIClientHandler:
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
             result.text_content = text_content
+            result.text_chunks = text_chunks
             result.audio_data = audio_data
+            result.finish_reasons = finish_reasons
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
