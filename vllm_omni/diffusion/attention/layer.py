@@ -155,12 +155,23 @@ class Attention(nn.Module):
                     self.use_ring = False
                     self.ring_runner = None
 
-        self.parallel_strategy = build_parallel_attention_strategy(
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-            use_sync=use_sync,
-            causal=causal,
-        )
+        # Some models instantiate a causal attention module for a separate
+        # conditioning/KV-cache path while using sequence-parallel attention
+        # only in their non-causal denoising path (e.g. BAGEL).  Constructing
+        # an AllGather-KV strategy for that unused causal module would fail at
+        # model initialization because AllGather-KV is intentionally
+        # non-causal-only.  ``skip_sequence_parallel`` is already honored at
+        # execution time; honor it here as well so the inactive module does
+        # not need to build an incompatible communication strategy.
+        if skip_sequence_parallel:
+            self.parallel_strategy = NoParallelAttention()
+        else:
+            self.parallel_strategy = build_parallel_attention_strategy(
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+                causal=causal,
+            )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
 

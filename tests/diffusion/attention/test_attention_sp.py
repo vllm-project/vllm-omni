@@ -228,6 +228,25 @@ def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
+def test_skip_sequence_parallel_keeps_causal_cache_attention_local():
+    """BAGEL's causal cache module must not construct an SP strategy.
+
+    BAGEL manually shards only its non-causal VAE denoising path.  The causal
+    text/KV-cache attention is instantiated alongside it, and must remain
+    local so AllGather-KV (which is non-causal-only) can be selected for the
+    denoising module.
+    """
+    attention = Attention(
+        num_heads=4,
+        head_size=8,
+        causal=True,
+        softmax_scale=8**-0.5,
+        num_kv_heads=2,
+        skip_sequence_parallel=True,
+    )
+    assert attention.parallel_strategy.name == "none"
+
+
 def test_allgather_kv_slices_rear_joint_dense_mask():
     rank = 1
     joint_len = 1
@@ -380,12 +399,21 @@ def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
     ("ulysses_degree", "ring_degree", "allgather_degree"),
     [
         pytest.param(2, 2, 1, id="ulysses-ring"),
-        pytest.param(1, 1, 2, id="allgather-kv"),
+        pytest.param(4, 1, 1, id="ulysses"),
+        pytest.param(1, 4, 1, id="ring"),
+        pytest.param(1, 1, 4, id="allgather-kv"),
     ],
 )
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
-@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize(
+    "num_kv_heads",
+    [
+        pytest.param(None, id="mha"),
+        pytest.param(8, id="gqa"),
+    ],
+)
 @pytest.mark.parametrize("head_size", [8])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -405,10 +433,21 @@ def test_sequence_parallel(
     batch_size: int,
     seq_len: int,
     num_heads: int,
+    num_kv_heads: int | None,
     head_size: int,
 ):
     """Compare Ulysses/Ring and AllGather-KV SP against a single-rank run."""
     sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+
+    if (
+        num_kv_heads is not None
+        and ulysses_degree > 1
+        and num_kv_heads % ulysses_degree != 0
+    ):
+        pytest.skip(
+            "Strict Ulysses requires KV heads divisible by ulysses_degree; "
+            "use a smaller Ulysses degree with Ring for this GQA shape"
+        )
 
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
@@ -436,6 +475,7 @@ def test_sequence_parallel(
                 batch_size,
                 seq_len,
                 num_heads,
+                num_kv_heads,
                 head_size,
                 dtype,
                 causal,
@@ -467,6 +507,7 @@ def test_sequence_parallel(
                 batch_size,
                 seq_len,
                 num_heads,
+                num_kv_heads,
                 head_size,
                 dtype,
                 causal,
@@ -563,6 +604,7 @@ def ulysses_attention_on_test_model(
     batch_size: int,
     seq_len: int,
     num_heads: int,
+    num_kv_heads: int | None,
     head_size: int,
     dtype: torch.dtype,
     causal: bool,
@@ -648,7 +690,7 @@ def ulysses_attention_on_test_model(
             "head_size": head_size,
             "hidden_size": hidden_size,
             "causal": causal,
-            "num_kv_heads": None,
+            "num_kv_heads": num_kv_heads,
             "scatter_idx": 2,
             "gather_idx": 1,
             "use_sync": use_sync,

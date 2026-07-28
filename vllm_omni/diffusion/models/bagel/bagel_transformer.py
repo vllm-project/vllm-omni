@@ -484,6 +484,10 @@ class PackedAttentionMoT(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
+            # The causal module is used only for the text/KV-cache update.
+            # SP is applied manually to the non-causal VAE denoising path;
+            # keeping this module local also permits AllGather-KV selection.
+            skip_sequence_parallel=True,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,
