@@ -17,11 +17,12 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.55
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.6
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
+    max_model_len: 32768
     devices: "0"
     limit_mm_per_prompt:
       video:
@@ -37,10 +38,11 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.22
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.1
     enforce_eager: false
     max_num_batched_tokens: 8192
+    max_model_len: 32768
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
@@ -57,8 +59,8 @@ stages:
       detokenize: false
 
   - stage_id: 2
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.22
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.1
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536

@@ -2,6 +2,9 @@
 
 These cover modality combinations, separate Code2Wav behavior, sequential
 request isolation, longer audio output, and Chinese speech.
+
+Like Qwen3-Omni expansion, ``default`` exercises ``--no-async-chunk`` and
+``async_chunk`` exercises ``--async-chunk``.
 """
 
 import os
@@ -18,20 +21,29 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
+# Deploy YAML defaults to ``async_chunk: true``; keep sync and async as
+# separate parametrizations so both handoff paths are exercised.
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
-            server_args=[
-                "--trust-remote-code",
-            ],
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="default",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=["--trust-remote-code", "--async-chunk"],
+        ),
+        id="async_chunk",
+    ),
 ]
 
 
@@ -63,7 +75,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
     """
@@ -90,7 +102,7 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_sequential_requests_independent(omni_server, openai_client) -> None:
     """
@@ -131,7 +143,7 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
@@ -157,7 +169,7 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """

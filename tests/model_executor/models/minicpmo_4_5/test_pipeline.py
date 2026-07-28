@@ -163,11 +163,11 @@ class TestDeployTopology:
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
-                0.55,
-                0.22,
-                0.22,
+                0.6,
+                0.1,
+                0.1,
             ]
             assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"video": {"count": 1, "num_frames": 32}}
         elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:

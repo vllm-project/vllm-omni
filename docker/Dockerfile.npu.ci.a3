@@ -32,6 +32,7 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "pytest-cov>=4.0.0" \
       "pytest-mock>=3.10.0" \
       "openpyxl>=3.0.0" \
+      "opencc==1.4.1" \
       "psutil>=7.2.0" \
       "soundfile>=0.13.1" \
       "pyttsx3>=2.99" \

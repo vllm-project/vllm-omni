@@ -1,6 +1,6 @@
 """E2E online tests for MiniCPM-o 4.5 multimodal input and audio/text output.
 
-The batching deployment uses async chunk transfer across separate Thinker,
+Exercises async chunk streaming (``--async-chunk``) across separate Thinker,
 Talker, and Code2Wav stages.
 """
 
@@ -11,23 +11,28 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = modify_stage_config(
+    get_deploy_config_path("minicpmo_4_5.yaml"),
+    updates={
+        "stages": {0: {"default_sampling_params.max_tokens": 128}, 1: {"default_sampling_params.max_tokens": 512}}
+    },
+)
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
-            server_args=["--trust-remote-code"],
+            use_stage_cli=False,
+            server_args=["--trust-remote-code", "--async-chunk"],
         ),
-        id="default",
-    )
+        id="async_chunk",
+    ),
 ]
 
 
@@ -63,7 +68,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -88,7 +93,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
@@ -113,7 +118,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -142,7 +147,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -170,7 +175,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -199,7 +204,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """

@@ -19,20 +19,6 @@ DEPLOY_CONFIG = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-        "stages": {
-            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
-            1: {"kv_cache_memory_bytes": 512 * 1024 * 1024},
-            2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
-        },
-    },
-)
-CORE_DEPLOY_CONFIG = modify_stage_config(
-    DEPLOY_CONFIG,
-    updates={
-        "stages": {
-            0: {"enforce_eager": True},
-            1: {"enforce_eager": True},
-        }
     },
 )
 ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "minicpmo_4_5"
@@ -47,18 +33,7 @@ SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            use_stage_cli=True,
-            server_args=["--trust-remote-code"],
-        ),
-        id="three-stage-single-gpu",
-    )
-]
-CORE_SERVER_PARAMS = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=CORE_DEPLOY_CONFIG,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
         id="three-stage-single-gpu",
