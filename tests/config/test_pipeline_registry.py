@@ -66,3 +66,17 @@ def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_r
     """Ensure that registering a custom resolver to OMNI_PIPELINES requires an explicit model_type."""
     with pytest.raises(ValueError):
         register_pipeline(custom_resolver)
+
+
+def test_deepseek_janus_pipeline_registered():
+    """Ensure DeepSeek Janus deploy topology is registered."""
+    assert "deepseek_janus_single_stage" in OMNI_PIPELINES
+
+
+def test_deepseek_janus_pipeline_does_not_match_generic_hf_architecture():
+    """Avoid routing every MultiModalityCausalLM checkpoint to Janus by architecture."""
+    pipeline = OMNI_PIPELINES["deepseek_janus_single_stage"]
+
+    assert not callable(pipeline)
+    assert pipeline.hf_architectures == ()
+    assert pipeline.get_stage(0).model_arch == "JanusPipeline"

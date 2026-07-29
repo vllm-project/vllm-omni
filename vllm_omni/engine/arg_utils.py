@@ -67,7 +67,7 @@ def _register_omni_hf_configs() -> None:
     except ImportError:
         _CONFIG_REGISTRY = None
 
-    for model_type, config_cls in [
+    config_classes = [
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
@@ -78,7 +78,17 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
-    ]:
+    ]
+    try:
+        from vllm_omni.diffusion.models.deepseek_janus._janus_hf_vendor.modeling_vlm import (
+            MultiModalityConfig,
+        )
+
+        config_classes.append(("multi_modality", MultiModalityConfig))
+    except Exception as exc:  # pragma: no cover - optional Janus dependency guard
+        logger.debug("Skipping DeepSeek Janus HF config registration: %s", exc)
+
+    for model_type, config_cls in config_classes:
         try:
             AutoConfig.register(model_type, config_cls)
         except ValueError:

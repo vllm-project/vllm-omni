@@ -243,10 +243,13 @@ def resolve_model_config_path(model: str) -> str:
         ValueError: If model_type cannot be determined
         FileNotFoundError: If no stage config file exists for the model type
     """
+    config_dict: dict[str, Any] | None = None
+
     # Try to get config from standard transformers format first
     try:
         hf_config = get_config(model, trust_remote_code=True)
         model_type = hf_config.model_type
+        config_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else None
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
         if file_or_path_exists(model, "model_index.json", revision=None):
@@ -286,6 +289,13 @@ def resolve_model_config_path(model: str) -> str:
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type == "vla" and _looks_like_dreamzero(model):
         model_type = "dreamzero"
+    if model_type == "multi_modality":
+        from vllm_omni.diffusion.data import _looks_like_deepseek_janus
+
+        if config_dict is None:
+            config_dict = get_hf_file_to_dict("config.json", model, revision=None) or {}
+        if _looks_like_deepseek_janus(model, config_dict):
+            model_type = "deepseek_janus_single_stage"
 
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
         normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]

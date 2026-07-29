@@ -161,6 +161,12 @@ class StageConfigFactory:
             trust_remote_code=trust_remote_code,
         )
         if hf_config is not None:
+            if hf_config.model_type == "multi_modality":
+                from vllm_omni.diffusion.data import _looks_like_deepseek_janus
+
+                cfg = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
+                if _looks_like_deepseek_janus(model, cfg):
+                    return "deepseek_janus_single_stage"
             return hf_config.model_type
 
         # Fallback: read config.json directly for custom model types that
@@ -169,6 +175,10 @@ class StageConfigFactory:
             config_dict = get_hf_file_to_dict("config.json", model, revision=None)
             if config_dict:
                 if "model_type" in config_dict:
+                    from vllm_omni.diffusion.data import _looks_like_deepseek_janus
+
+                    if _looks_like_deepseek_janus(model, config_dict):
+                        return "deepseek_janus_single_stage"
                     return config_dict["model_type"]
                 # VoxCPM2-style configs use singular ``architecture`` rather
                 # than HF's standard ``model_type`` / ``architectures``. Accept

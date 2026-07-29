@@ -95,6 +95,12 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Optional runtime dependencies for DeepSeek Janus image generation.
+janus-image = [
+    "addict>=2.4.0",
+    "timm>=0.9.16",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
