@@ -1,0 +1,49 @@
+# Vevo2 deploy: single-stage AR TTS wrapping Amphion's
+# ``Vevo2InferencePipeline`` (Qwen2.5-0.5B AR + 350M flow-matching
+# transformer + 250M Vocos vocoder).
+#
+# Memory budget (measured on CUDA; includes the fp32-everywhere cast): the
+# Vevo2 pipeline itself peaks at ~7.55 GiB allocated / ~8.80 GiB reserved --
+# the Qwen2.5-0.5B AR LM + 350M flow-matching transformer + Vocos vocoder,
+# plus the Whisper-medium encoder used for reference-audio feature extraction.
+# That pipeline is constructed by Amphion OUTSIDE vLLM's allocator, so its
+# footprint stacks on top of whatever ``gpu_memory_utilization`` reserves.
+# We keep ``gpu_memory_utilization`` low (0.4 -> ~9.6 GiB of a 24 GB card)
+# because this MVP wraps Amphion's ``inference_ar_and_fm`` and barely touches
+# the paged KV cache; 0.4 + the ~8.8 GiB pipeline leaves real headroom on a
+# 24 GB card, whereas the previous 0.5 landed near 21/24 GiB (measured) and
+# would not survive anything but an otherwise-idle card.
+#
+# Notable choices:
+#   * enforce_eager=true — Vevo2InferencePipeline's call into ar_model
+#     .generate() / FM Euler solver / Vocos is not wired through CUDA
+#     graphs in this MVP. Phase 5 of the TTS skill (CUDA-graph capture
+#     of the AR loop) is a follow-up.
+#   * max_num_seqs=4 — per-request streaming generators are stored in
+#     ``self._stream_gens`` and keyed by request ID; concurrent requests
+#     are isolated.
+#   * skip_mm_profiling=true — Vevo2 has no multimodal input
+#     preprocessing path; the dummy-MM profile pass is unnecessary.
+#
+# License note: the RMSnow/Vevo2 checkpoint is CC BY-NC-ND 4.0
+# (non-commercial, no-derivatives). Commercial deployment requires
+# contacting the upstream authors.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    skip_mm_profiling: true
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
