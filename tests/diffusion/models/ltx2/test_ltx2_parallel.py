@@ -3,6 +3,7 @@
 
 """Unit tests for LTX guidance and forward-parallel behavior."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -50,7 +51,8 @@ class TestCFGParallelHelpers:
         assert torch.allclose(video_combined, expected_video)
         assert torch.allclose(audio_combined, expected_audio)
 
-    def test_cfg_parallel_rejects_non_cfg_guidance(self):
+    @pytest.mark.parametrize("guidance_world_size", [1, 2, 3, 4])
+    def test_guidance_parallel_accepts_official_guidance(self, guidance_world_size):
         from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
             LTX_GUIDANCE_EXECUTOR,
             LTXGuidancePlan,
@@ -59,25 +61,179 @@ class TestCFGParallelHelpers:
 
         plan = LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.request_guidance)
 
-        with pytest.raises(ValueError, match="CFG-only guidance"):
-            LTX_GUIDANCE_EXECUTOR.validate_cfg_world_size(plan, 2)
+        LTX_GUIDANCE_EXECUTOR.validate_guidance_world_size(plan, guidance_world_size)
 
-    def test_cfg_parallel_dummy_warms_supported_cfg_only_plan(self, monkeypatch):
+    def test_guidance_parallel_dummy_warms_full_guidance_plan(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
         from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        monkeypatch.setattr(ltx2_runtime, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_runtime, "get_guidance_parallel_world_size", lambda: 2)
         pipe = object.__new__(LTX2Pipeline)
         req = SimpleNamespace(is_dummy_run=lambda: True)
         request_inputs = SimpleNamespace(guidance=LTX23_ONE_STAGE_RECIPE.request_guidance)
 
-        cfg_parallel_ready = pipe._setup_forward_runtime(req, request_inputs, attention_kwargs=None)
+        guidance_parallel_ready = pipe._setup_forward_runtime(req, request_inputs, attention_kwargs=None)
 
-        assert cfg_parallel_ready is True
-        assert pipe._guidance_plan.names == ("cond", "uncond")
+        assert guidance_parallel_ready is True
+        assert pipe._guidance_plan.names == ("cond", "uncond", "ptb", "mod")
         assert pipe._guidance_plan.spec.video.cfg_scale == 3.0
         assert pipe._guidance_plan.spec.audio.cfg_scale == 7.0
+
+    def test_guidance_parallel_warns_for_imbalanced_passes(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
+
+        spec = ltx2_guidance.LTXGuidanceSpec(
+            video=ltx2_guidance.LTXModalityGuidance(
+                cfg_scale=3.0,
+                stg_scale=1.0,
+                stg_blocks=(1,),
+            )
+        )
+        plan = ltx2_guidance.LTXGuidancePlan.build(spec)
+        captured = []
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_rank", lambda: 0)
+        monkeypatch.setattr(ltx2_guidance.logger, "warning_once", lambda *args: captured.append(args))
+
+        ltx2_guidance.LTX_GUIDANCE_EXECUTOR.warn_if_imbalanced(plan, 4, "hq_generate")
+
+        assert plan.names == ("cond", "uncond", "ptb")
+        assert len(captured) == 1
+        assert captured[0][1:] == ("hq_generate", 3, 4, 1, 75.0)
+
+    @pytest.mark.parametrize("guidance_rank", [0, 1])
+    def test_default_guidance_is_sharded_and_combined(self, monkeypatch, guidance_rank):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
+        from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseContext
+        from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+        from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
+
+        executor = ltx2_guidance.LTX_GUIDANCE_EXECUTOR
+        plan = ltx2_guidance.LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.request_guidance)
+        video_predictions = {
+            "cond": torch.tensor([[[0.2, -0.3]]]),
+            "uncond": torch.tensor([[[-0.4, 0.1]]]),
+            "ptb": torch.tensor([[[0.5, -0.2]]]),
+            "mod": torch.tensor([[[-0.1, 0.6]]]),
+        }
+        audio_predictions = {
+            "cond": torch.tensor([[[0.7, -0.2]]]),
+            "uncond": torch.tensor([[[0.1, 0.4]]]),
+            "ptb": torch.tensor([[[-0.3, 0.2]]]),
+            "mod": torch.tensor([[[0.4, -0.5]]]),
+        }
+        state = LTXAVState(
+            video=torch.tensor([[[1.0, -2.0]]]),
+            audio=torch.tensor([[[0.5, 3.0]]]),
+        )
+        denoise_ctx = LTXDenoiseContext(
+            latents=state.video,
+            audio_latents=state.audio,
+            video_coords=torch.zeros(1, 1, 3),
+            audio_coords=torch.zeros(1, 1, 1),
+        )
+        executor.prepare_denoise_context(plan, True, 2, denoise_ctx)
+
+        class FakeGuidanceGroup:
+            def __init__(self):
+                self.call_index = 0
+
+            def all_gather(self, tensor, separate_tensors=True):
+                assert separate_tensors
+                gathered = (
+                    [video_predictions["cond"], video_predictions["uncond"]],
+                    [video_predictions["ptb"], video_predictions["mod"]],
+                    [audio_predictions["cond"], audio_predictions["uncond"]],
+                    [audio_predictions["ptb"], audio_predictions["mod"]],
+                )[self.call_index]
+                torch.testing.assert_close(tensor, gathered[guidance_rank])
+                self.call_index += 1
+                return gathered
+
+        group = FakeGuidanceGroup()
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_rank", lambda: guidance_rank)
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_group", lambda: group)
+
+        local_names = ("cond", "ptb") if guidance_rank == 0 else ("uncond", "mod")
+        captured = {}
+
+        class FakeTransformer:
+            def __call__(self, **kwargs):
+                captured.update(kwargs)
+                return (
+                    torch.cat([video_predictions[name] for name in local_names]),
+                    torch.cat([audio_predictions[name] for name in local_names]),
+                )
+
+        video_sigma = torch.tensor(0.25)
+        audio_sigma = torch.tensor(0.5)
+
+        class FakePipeline:
+            scheduler = SimpleNamespace(sigmas=torch.stack([video_sigma]))
+            transformer = FakeTransformer()
+
+            @staticmethod
+            def _transformer_cache_context(name):
+                assert name == "guided"
+                return nullcontext()
+
+            @staticmethod
+            def _build_transformer_kwargs(forward_ctx, denoise_ctx, **kwargs):
+                del forward_ctx, denoise_ctx
+                return kwargs
+
+            @staticmethod
+            def _video_guidance_model_sigma(sigma, denoise_ctx):
+                del denoise_ctx
+                return sigma
+
+        positive_context = torch.ones(1, 1, 1)
+        negative_context = torch.zeros(1, 1, 1)
+        forward_ctx = SimpleNamespace(
+            prompt_context=SimpleNamespace(
+                positive_connector_prompt_embeds=positive_context,
+                positive_connector_audio_prompt_embeds=positive_context,
+                negative_connector_prompt_embeds=negative_context,
+                negative_connector_audio_prompt_embeds=negative_context,
+            ),
+            attention_kwargs=None,
+            audio_scheduler=SimpleNamespace(sigmas=torch.stack([audio_sigma])),
+        )
+
+        actual_video, actual_audio = executor.predict_parallel_guidance(
+            FakePipeline(),
+            plan,
+            index=0,
+            timestep=torch.tensor(1.0),
+            state=state,
+            forward_ctx=forward_ctx,
+            denoise_ctx=denoise_ctx,
+        )
+
+        expected_video = executor._guide_modality(
+            state.video,
+            video_predictions,
+            video_sigma,
+            plan.spec.video,
+        )
+        expected_audio = executor._guide_modality(
+            state.audio,
+            audio_predictions,
+            audio_sigma,
+            plan.spec.audio,
+        )
+        torch.testing.assert_close(actual_video, expected_video)
+        torch.testing.assert_close(actual_audio, expected_audio)
+        assert group.call_index == 4
+        assert captured["hidden_states"].shape[0] == 2
+        perturbations = captured["attention_kwargs"]["ltx_perturbation_kwargs"]
+        if guidance_rank == 0:
+            assert "video_self_attention_mask" in perturbations
+            assert "a2v_cross_attention_mask" not in perturbations
+        else:
+            assert "video_self_attention_mask" not in perturbations
+            assert "a2v_cross_attention_mask" in perturbations
 
 
 class TestCFGParallelForwardPath:
@@ -96,7 +252,7 @@ class TestCFGParallelForwardPath:
         pipe.tokenizer_max_length = 4
         pipe.vae_spatial_compression_ratio = 32
         pipe.vae_temporal_compression_ratio = 8
-        monkeypatch.setattr(ltx2_runtime, "get_classifier_free_guidance_world_size", lambda: 1)
+        monkeypatch.setattr(ltx2_runtime, "get_guidance_parallel_world_size", lambda: 1)
 
         class StopAtEncodePromptError(Exception):
             pass
@@ -238,10 +394,10 @@ class TestCFGParallelForwardPath:
                     return [audio_pos, audio_neg]
                 raise AssertionError(f"Unexpected gathered tensor: {tensor}")
 
-        monkeypatch.setattr(ltx2_runtime, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_rank", lambda: cfg_rank)
-        monkeypatch.setattr(ltx2_guidance, "get_cfg_group", lambda: FakeCfgGroup())
+        monkeypatch.setattr(ltx2_runtime, "get_guidance_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_rank", lambda: cfg_rank)
+        monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_group", lambda: FakeCfgGroup())
 
         def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas=None, mu=None):
             scheduler.sigmas = torch.tensor([0.25, 0.25], device=device)
