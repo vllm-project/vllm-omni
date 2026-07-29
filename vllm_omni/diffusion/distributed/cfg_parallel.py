@@ -223,6 +223,18 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
     # ── N-branch CFG interface (for 3+ branch models) ──
 
+    def _set_teacache_branch_id(self, branch_id: int | None) -> None:
+        """Tag the next forward with its CFG branch id for the TeaCache hook.
+
+        The hook keeps a per-branch cache state but cannot infer the branch
+        itself (branch count varies across steps; a rank may own several
+        branches). The tag is consumed per call. No-op when the pipeline has
+        no ``transformer`` or TeaCache is not enabled.
+        """
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            transformer._teacache_branch_id = branch_id
+
     def predict_noise_with_multi_branch_cfg(
         self,
         do_true_cfg: bool,
@@ -268,7 +280,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             else:
                 # Sequential: run all N branches on single device
                 preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
-                for kw in branches_kwargs:
+                for bid, kw in enumerate(branches_kwargs):
+                    self._set_teacache_branch_id(bid)
                     pred = _wrap(self.predict_noise(**kw))
                     if output_slice is not None:
                         pred = _slice_pred(pred, output_slice)
@@ -276,6 +289,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
         else:
             # No CFG: only compute positive/conditional prediction
+            self._set_teacache_branch_id(0)
             pred = self.predict_noise(**branches_kwargs[0])
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
@@ -307,9 +321,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
         my_branch_ids = assignments[cfg_rank]
         max_per_rank = max(len(a) for a in assignments)
 
-        # Run assigned branches
+        # Run assigned branches. A rank may own several branches (round-robin when
+        # n_branches > cfg_world_size), so tag each forward with its real branch id
+        # rather than the rank, otherwise those branches would share a cache state.
         my_preds: list[tuple[torch.Tensor, ...]] = []
         for bid in my_branch_ids:
+            self._set_teacache_branch_id(bid)
             pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
@@ -317,7 +334,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
         # Idle ranks (cfg_world_size > n_branches) run a forward pass to get the output shape for all_gather.
         # Output shape cannot be inferred from kwargs — may be tuple, sliced, etc.
+        # This result is discarded, so its cache branch does not matter.
         if not my_preds:
+            self._set_teacache_branch_id(0)
             pred = _wrap(self.predict_noise(**branches_kwargs[0]))
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)

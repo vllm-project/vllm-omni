@@ -8,11 +8,15 @@ with and without CFG parallel using fixed random inputs.
 """
 
 import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.cfg_parallel import (
+    CFGParallelMixin,
+    _dispatch_branches,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_classifier_free_guidance_rank,
@@ -773,3 +777,92 @@ def test_multi_branch_without_cfg(dtype: torch.dtype):
     assert noise_pred.shape == (1, 4, 16, 16)
 
     print(f"✓ Test passed: multi_branch predict_noise without CFG (dtype={dtype})")
+
+
+class _TagRecordingPipeline(CFGParallelMixin):
+    """Minimal pipeline that records the TeaCache branch tag seen by each forward.
+
+    Regression harness for #2371: multi-branch CFG dispatch must tag the
+    transformer with the real branch id before every predict_noise call so the
+    TeaCache hook can keep one cache state per branch.
+    """
+
+    def __init__(self):
+        self.transformer = torch.nn.Module()
+        self.transformer._teacache_branch_id = None
+        self.seen_tags: list[int | None] = []
+        self.combined_n_branches: int | None = None
+
+    def predict_noise(self, **kwargs):
+        # The TeaCache hook consumes the tag inside the transformer forward;
+        # mirror that here so a stale tag cannot leak into the next call.
+        self.seen_tags.append(self.transformer._teacache_branch_id)
+        self.transformer._teacache_branch_id = None
+        return torch.ones(2)
+
+    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
+        self.combined_n_branches = len(predictions)
+        return predictions[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parallel
+class TestMultiBranchTeaCacheTagging:
+    """CPU regression tests for per-branch TeaCache tagging in dispatch (#2371)."""
+
+    _CFGP = "vllm_omni.diffusion.distributed.cfg_parallel"
+
+    def test_sequential_dispatch_tags_each_branch(self):
+        pipeline = _TagRecordingPipeline()
+        with patch(f"{self._CFGP}.get_classifier_free_guidance_world_size", return_value=1):
+            pipeline.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=True,
+                true_cfg_scale={"text": 4.0, "image": 2.0},
+                branches_kwargs=[{}, {}, {}],
+            )
+
+        assert pipeline.seen_tags == [0, 1, 2]
+        assert pipeline.combined_n_branches == 3
+        assert pipeline.transformer._teacache_branch_id is None
+
+    def test_no_cfg_dispatch_tags_conditional_branch(self):
+        pipeline = _TagRecordingPipeline()
+        with patch(f"{self._CFGP}.get_classifier_free_guidance_world_size", return_value=1):
+            pipeline.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=False,
+                true_cfg_scale=1.0,
+                branches_kwargs=[{}, {}, {}],
+            )
+
+        assert pipeline.seen_tags == [0]
+
+    @pytest.mark.parametrize(
+        ("cfg_world_size", "cfg_rank", "expected_tags"),
+        [
+            (2, 0, [0, 2]),  # rank owning several branches must tag real ids, not the rank
+            (2, 1, [1]),
+            (3, 2, [2]),
+            (4, 3, [0]),  # idle rank: shape-only forward, result discarded
+        ],
+    )
+    def test_cfg_parallel_dispatch_tags_real_branch_ids(self, cfg_world_size, cfg_rank, expected_tags):
+        assert _dispatch_branches(3, 2) == [[0, 2], [1]]  # guard the round-robin rule
+
+        pipeline = _TagRecordingPipeline()
+        cfg_group = MagicMock()
+        cfg_group.all_gather = lambda t, separate_tensors=True: [t.clone() for _ in range(cfg_world_size)]
+
+        with (
+            patch(f"{self._CFGP}.get_classifier_free_guidance_world_size", return_value=cfg_world_size),
+            patch(f"{self._CFGP}.get_classifier_free_guidance_rank", return_value=cfg_rank),
+            patch(f"{self._CFGP}.get_cfg_group", return_value=cfg_group),
+        ):
+            pipeline.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=True,
+                true_cfg_scale={"text": 4.0, "image": 2.0},
+                branches_kwargs=[{}, {}, {}],
+            )
+
+        assert pipeline.seen_tags == expected_tags
+        assert pipeline.combined_n_branches == 3
