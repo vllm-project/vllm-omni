@@ -115,6 +115,15 @@ class StageConfigFactory:
         Returns:
             the model's config or None.
         """
+        # ``trust_remote_code`` may arrive as ``None`` when the caller never set
+        # it (e.g. AsyncOmniEngine's default when ``--trust-remote-code`` is not
+        # passed on the CLI). vLLM's ``get_config`` does ``trust_remote_code |=
+        # ...`` internally, which raises ``TypeError`` on ``None`` — that used to
+        # be swallowed here, returning ``None`` and silently dropping the
+        # pipeline's ``endpoint_restrictions`` (see issue #5495: /v1/completions
+        # then failed to 400 and crashed stage-1). Coerce to ``False`` so config
+        # resolution stays deterministic regardless of how the flag was plumbed.
+        trust_remote_code = bool(trust_remote_code)
         hf_config = None
         try:
             return get_config(model, trust_remote_code=trust_remote_code)

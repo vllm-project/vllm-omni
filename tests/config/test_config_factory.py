@@ -1785,6 +1785,48 @@ class TestQwen3OmniPipeline:
         assert s.final_output_type == "audio"
         assert s.engine_output_type == "audio"
 
+    def test_endpoint_restrictions_survive_unset_trust_remote_code(self):
+        """Regression test for issue #5495.
+
+        ``AsyncOmniEngine.__init__`` defaults ``trust_remote_code=None`` when
+        ``--trust-remote-code`` is not passed on the CLI (the CI case). vLLM's
+        ``get_config`` does ``trust_remote_code |= ...`` internally, which raises
+        ``TypeError`` on ``None``. That exception used to be swallowed by
+        ``get_hf_config``, returning ``None`` so the pipeline could not be
+        resolved and its ``endpoint_restrictions`` came back empty — which meant
+        ``/v1/completions`` was never shut down, the request reached the stage-1
+        talker, and crashed the EngineCore with an ``islice`` ``ValueError``.
+
+        Assert that a thinker+talker model keeps its COMPLETIONS restriction for
+        an unset (``None``) ``trust_remote_code``, matching the ``False``/``True``
+        behaviour, so the API layer still issues the 400.
+        """
+
+        def fake_get_config(model, trust_remote_code, **kwargs):
+            # Mirror vLLM's real ``get_config``: it OR-assigns into the flag, so
+            # a ``None`` argument raises TypeError before any config is loaded.
+            trust_remote_code |= False
+            return Q3_OMNI_ALL_STAGES_HF_CONFIG
+
+        for trc in (None, False, True):
+            StageConfigFactory.get_hf_config.cache_clear()
+            StageConfigFactory.try_infer_model_type.cache_clear()
+            with patch(
+                "vllm_omni.config.config_factory.get_config",
+                side_effect=fake_get_config,
+            ):
+                pipeline_cfg = StageConfigFactory.get_pipeline_config(
+                    "fake/qwen3-omni",
+                    trust_remote_code=trc,
+                    deploy_config_path=None,
+                )
+            assert pipeline_cfg is not None, f"pipeline unresolved for trust_remote_code={trc!r}"
+            assert pipeline_cfg.model_type == "qwen3_omni_moe"
+            restrictions = pipeline_cfg.endpoint_restrictions
+            assert any(r.capability is OmniServingCapability.COMPLETIONS for r in restrictions), (
+                f"COMPLETIONS restriction dropped for trust_remote_code={trc!r}"
+            )
+
 
 class TestQwen2_5OmniPipeline:
     def test_registered(self):
