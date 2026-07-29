@@ -607,12 +607,15 @@ class HiDreamO1UiTModel(nn.Module):
             attn_metadata: built once by the pipeline via
                 ``utils_hidream_o1.build_packed_attention_metadata`` and
                 passed straight through to every decoder layer.
-            pixel_values / image_grid_thw: reference-image conditioning
-                (Phase 2+; unused for plain text-to-image).
-            precomputed_image_embeds / precomputed_deepstack_image_embeds:
-                Phase 2+ vision-tower embedding cache, reused across
-                denoising steps and CFG branches instead of recomputing the
-                vision tower every call.
+            pixel_values: reference-image pixel patches for conditioning
+                (Phase 2+; ``None`` for plain text-to-image).
+            image_grid_thw: spatial grid ``(T, H, W)`` for each reference
+                image, required when ``pixel_values`` is not ``None``.
+            precomputed_image_embeds: cached vision-tower pooler output,
+                reused across denoising steps and CFG branches to avoid
+                re-running the vision tower every call (Phase 2+).
+            precomputed_deepstack_image_embeds: cached deepstack intermediate
+                features corresponding to ``precomputed_image_embeds``.
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
