@@ -104,6 +104,7 @@ Content-Type: multipart/form-data
 | `num_inference_steps` | integer | model defaults | Number of diffusion steps |
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
+| `infer_align_image_size` | boolean | model default | HunyuanImage3-only img2img alignment flag. When true, condition images are resized instead of center-cropped and eligible outputs are resized back to the input-image ratio at the model base-size area. |
 | `seed` | integer | null | Random seed for reproducibility |
 | `reference_image` | string or array | null | Reference image for inpainting |
 | `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |

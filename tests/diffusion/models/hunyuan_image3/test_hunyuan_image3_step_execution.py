@@ -5,18 +5,23 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
+    _STEP_BATCH_COND_IMAGE_INFO,
     _STEP_CFG_FACTOR,
     _STEP_GENERATOR,
     _STEP_GUIDANCE_SCALE,
+    _STEP_INFER_ALIGN_IMAGE_SIZE,
     _STEP_INPUT_IDS,
     _STEP_MODEL_KWARGS,
     _STEP_PROMPT_KV,
     HunyuanImage3Pipeline,
+    ImageInfo,
+    JointImageInfo,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -74,6 +79,32 @@ def _sampling_params(**extra_args):
         guidance_rescale=0.0,
         generator=None,
     )
+
+
+def _joint_cond_info() -> JointImageInfo:
+    vae = ImageInfo(
+        image_type="vae",
+        image_width=1024,
+        image_height=1024,
+        token_width=64,
+        token_height=64,
+        image_token_length=4096,
+        base_size=1024,
+        ratio_index=0,
+        ori_image_width=1200,
+        ori_image_height=800,
+    )
+    vit = ImageInfo(
+        image_type="siglip2",
+        image_width=1024,
+        image_height=1024,
+        token_width=64,
+        token_height=64,
+        image_token_length=4096,
+        ori_image_width=1200,
+        ori_image_height=800,
+    )
+    return JointImageInfo(vae_image_info=vae, vision_image_info=vit)
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
@@ -144,6 +175,67 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
 
     assert captured["bot_task"] == expected_model_bot_task
     assert captured["system_prompt_bot_task"] == expected_system_bot_task
+
+
+def test_prepare_encode_persists_infer_align_postprocess_metadata(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    monkeypatch.setattr(hy3_module, "retrieve_timesteps", lambda *args, **kwargs: (torch.tensor([1.0, 0.0]), 2))
+
+    cond_info = _joint_cond_info()
+
+    class FakeScheduler:
+        def set_begin_index(self, index):
+            self.begin_index = index
+
+    def fake_prepare_model_inputs(**kwargs):
+        return {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "batch_gen_image_info": [
+                ImageInfo(
+                    image_type="vae",
+                    image_width=1024,
+                    image_height=1024,
+                    token_width=64,
+                    token_height=64,
+                    image_token_length=4096,
+                    add_timestep_token=False,
+                    add_guidance_token=False,
+                )
+            ],
+            "generator": None,
+        }
+
+    pipeline.scheduler = FakeScheduler()
+    pipeline.config = SimpleNamespace(vae={"latent_channels": 4})
+    pipeline.generation_config = SimpleNamespace()
+    pipeline.prepare_model_inputs = fake_prepare_model_inputs
+    pipeline._prepare_attention_mask_for_generation = lambda *args, **kwargs: torch.ones(1, 1, 2, 4, dtype=torch.bool)
+    pipeline._snapshot_injected_ar_kv = lambda: None
+    pipeline._pipeline = SimpleNamespace(
+        _guidance_scale=0.0,
+        _guidance_rescale=0.0,
+        prepare_latents=lambda **kwargs: torch.zeros(1, 4, 8, 8, dtype=torch.bfloat16),
+        _maybe_handle_ar_kv_reuse=lambda input_ids, model_kwargs, **kwargs: (input_ids, 0),
+    )
+    state = DiffusionRequestState(
+        request_id="req-infer-align-step",
+        sampling=_sampling_params(infer_align_image_size="true"),
+        prompts=[
+            {
+                "prompt": "edit",
+                "additional_information": {
+                    "batch_cond_image_info": [cond_info],
+                },
+            }
+        ],
+    )
+
+    pipeline.prepare_encode(state)
+
+    assert state.extra[_STEP_INFER_ALIGN_IMAGE_SIZE] is True
+    assert state.extra[_STEP_BATCH_COND_IMAGE_INFO] == [[cond_info]]
+    assert state.extra[_STEP_MODEL_KWARGS]["num_image_tokens"] == 4096
 
 
 def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
@@ -218,6 +310,48 @@ def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
 
     assert state.latents.dtype == torch.bfloat16
     assert state.step_index == 1
+
+
+def test_post_decode_applies_infer_align_postprocess(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    decoded_image = Image.new("RGB", (1024, 1024), color="white")
+    resized_image = Image.new("RGB", (1254, 836), color="white")
+    cond_info = _joint_cond_info()
+    captured = {}
+
+    class FakeVAE:
+        config = SimpleNamespace(scaling_factor=None, shift_factor=None)
+
+        def decode(self, latents, return_dict=False, generator=None):
+            del return_dict, generator
+            return (torch.zeros(latents.shape[0], 3, 4, 4),)
+
+    def fake_postprocess_outputs(outputs, *, batch_cond_image_info, infer_align_image_size):
+        captured["outputs"] = outputs
+        captured["batch_cond_image_info"] = batch_cond_image_info
+        captured["infer_align_image_size"] = infer_align_image_size
+        return [resized_image]
+
+    pipeline.vae = FakeVAE()
+    pipeline._pipeline = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            postprocess=lambda image, output_type, do_denormalize: [decoded_image],
+        )
+    )
+    pipeline.image_processor = SimpleNamespace(postprocess_outputs=fake_postprocess_outputs)
+    state = _state("req-post-decode", 0)
+    state.latents = torch.zeros(1, 4, 8, 8)
+    state.extra[_STEP_GENERATOR] = None
+    state.extra[_STEP_INFER_ALIGN_IMAGE_SIZE] = True
+    state.extra[_STEP_BATCH_COND_IMAGE_INFO] = [[cond_info]]
+
+    result = pipeline.post_decode(state)
+
+    assert result.output is resized_image
+    assert captured["outputs"] == [decoded_image]
+    assert captured["batch_cond_image_info"] == [[cond_info]]
+    assert captured["infer_align_image_size"] is True
 
 
 def test_later_step_merge_shifts_spans_without_polluting_request_state():

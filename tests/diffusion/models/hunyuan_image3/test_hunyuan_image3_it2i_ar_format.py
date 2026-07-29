@@ -16,7 +16,7 @@ and what the model was actually trained on, this test asserts:
 1. ``build_prompt_tokens`` token-id sequence equals the HF reference produced
    by ``tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)``
    for the same `(system, user_prompt, image)` triple.
-2. The image-tensor produced by the diffusion-side ``_resize_and_crop_center``
+2. The image-tensor produced by the diffusion-side ``_resize_and_crop``
    is byte-identical to the AR-side ``HunyuanImage3Processor._resize_and_crop``
    output (i.e. AR and DiT preprocess the IT2I condition image identically).
 
@@ -128,7 +128,7 @@ def _import_official_snapshot_modules():
     reason=f"{_HUNYUAN_MODEL_ID} not in HF cache",
 )
 def test_dit_condition_image_preprocessing_byte_matches_official_hf():
-    """The diffusion pipeline's ``_resize_and_crop_center`` (used to feed
+    """The diffusion pipeline's ``_resize_and_crop(..., crop_type="center")`` (used to feed
     the VAE encoder for IT2I conditioning) must produce byte-identical
     pixels to the **official** HuggingFace
     ``image_processor.resize_and_crop`` (loaded straight out of the
@@ -146,9 +146,7 @@ def test_dit_condition_image_preprocessing_byte_matches_official_hf():
     import numpy as np
     from PIL import Image
 
-    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
-        _resize_and_crop_center,
-    )
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import _resize_and_crop
 
     _tok_mod, official_module = _import_official_snapshot_modules()
     if official_module is None or not hasattr(official_module, "resize_and_crop"):
@@ -169,7 +167,7 @@ def test_dit_condition_image_preprocessing_byte_matches_official_hf():
                 resample=Image.Resampling.LANCZOS,
                 crop_type="center",
             )
-            dit_out = _resize_and_crop_center(src, tw, th)
+            dit_out = _resize_and_crop(src, tw, th, crop_type="center")
             assert ref_out.size == dit_out.size == (tw, th), (
                 f"size mismatch for src={(src_w, src_h)} target={(tw, th)}: "
                 f"hf_official={ref_out.size} dit={dit_out.size}"

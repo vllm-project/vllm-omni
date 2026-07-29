@@ -137,6 +137,13 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
+    infer_align_image_size: bool | None = Field(
+        default=None,
+        description=(
+            "HunyuanImage3 image-conditioning alignment flag. Plain text-to-image requests have no condition image "
+            "to align, so this does not change T2I output sizing."
+        ),
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,

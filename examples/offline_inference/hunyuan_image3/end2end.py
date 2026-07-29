@@ -63,6 +63,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--height", type=int, default=None, help="Output image height.")
     parser.add_argument("--width", type=int, default=None, help="Output image width.")
+    parser.add_argument(
+        "--infer-align-image-size",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="For img2img, align condition-image preprocessing and output sizing to the input image ratio.",
+    )
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
         "--bot-task",
@@ -221,6 +227,8 @@ def main():
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
             prompt_dict["height"] = input_images[0].height
             prompt_dict["width"] = input_images[0].width
+            if args.infer_align_image_size is not None:
+                prompt_dict["mm_processor_kwargs"] = {"infer_align_image_size": args.infer_align_image_size}
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -259,6 +267,8 @@ def main():
             if args.modality == "text2img":
                 sp.height = args.height
                 sp.width = args.width
+            if args.modality == "img2img" and args.infer_align_image_size is not None:
+                sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
             # When --stream is set, request DELTA output from the AR stage
@@ -288,6 +298,8 @@ def main():
         print(f"  Output size: {args.width}x{args.height}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
+    if args.modality == "img2img" and args.infer_align_image_size is not None:
+        print(f"  Infer-align image size: {args.infer_align_image_size}")
     if additional_config is not None:
         print(f"  Additional config: {additional_config}")
     print(f"  Prompts: {prompts}")

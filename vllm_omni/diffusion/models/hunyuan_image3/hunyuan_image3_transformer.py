@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -640,12 +641,16 @@ class ImageInfo:
         image_token_length: int = None,
         base_size: int = None,
         ratio_index: int = None,
+        ori_image_width: int = None,
+        ori_image_height: int = None,
         **kwargs,
     ):
         self.image_type = image_type
         self.image_tensor = image_tensor
+        self.ori_image_width = ori_image_width
         self.image_width = image_width
         self.w = image_width
+        self.ori_image_height = ori_image_height
         self.image_height = image_height
         self.h = image_height
         self.token_width = token_width
@@ -684,6 +689,7 @@ class ImageInfo:
     def __repr__(self):
         return (
             f"ImageInfo(image_type={self.image_type}, image_tensor={self.image_tensor}, "
+            f"ori_image_width={self.ori_image_width}, ori_image_height={self.ori_image_height}, "
             f"image_width={self.image_width}, image_height={self.image_height}, "
             f"token_width={self.token_width}, token_height={self.token_height}, "
             f"image_token_length={self.image_token_length}, "
@@ -708,6 +714,8 @@ class ImageInfo:
                 # for bc
                 image_height=self.image_height,
                 image_width=self.image_width,
+                ori_image_height=self.ori_image_height,
+                ori_image_width=self.ori_image_width,
             )
         else:
             raise ValueError(f"Unknown image type '{self.image_type}'")
@@ -1513,6 +1521,42 @@ class HunyuanImage3ImageProcessor:
             ratio_index=ratio_idx,
         )
         return image_info
+
+    def postprocess_outputs(
+        self,
+        outputs: list[Image.Image],
+        batch_cond_image_info: list[list[JointImageInfo]] | None,
+        infer_align_image_size: bool = False,
+    ) -> list[Image.Image]:
+        if not infer_align_image_size or not batch_cond_image_info:
+            return outputs
+
+        target_area = self.reso_group.base_size**2
+        for batch_index, (output_image, cond_images) in enumerate(zip(outputs, batch_cond_image_info)):
+            if not cond_images:
+                continue
+
+            output_ratio_index = self.reso_group.get_base_size_and_ratio_index(
+                width=output_image.width,
+                height=output_image.height,
+            )[1]
+
+            for cond_image in cond_images:
+                vae_info = cond_image.vae_image_info
+                ori_width = vae_info.ori_image_width
+                ori_height = vae_info.ori_image_height
+                if output_ratio_index != vae_info.ratio_index or ori_width is None or ori_height is None:
+                    continue
+
+                ratio_diff = abs(ori_height / ori_width - self.reso_group[output_ratio_index].ratio)
+                if ratio_diff >= 0.01:
+                    scale = math.sqrt(target_area / (ori_width * ori_height))
+                    new_w = round(ori_width * scale)
+                    new_h = round(ori_height * scale)
+                    outputs[batch_index] = output_image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+                break
+
+        return outputs
 
 
 class HunYuanMLP(nn.Module):

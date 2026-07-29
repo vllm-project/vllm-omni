@@ -1806,6 +1806,8 @@ async def generate_images(
                 extra_body["flow_shift"] = request.flow_shift
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
+            if request.infer_align_image_size is not None:
+                extra_body["infer_align_image_size"] = request.infer_align_image_size
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
@@ -1857,6 +1859,8 @@ async def generate_images(
             extra_args["bot_task"] = request.bot_task
         if request.flow_shift is not None:
             extra_args["flow_shift"] = request.flow_shift
+        if request.infer_align_image_size is not None:
+            extra_args["infer_align_image_size"] = request.infer_align_image_size
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -2009,6 +2013,7 @@ async def edit_images(
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
+    infer_align_image_size: bool | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
@@ -2187,6 +2192,7 @@ async def edit_images(
             bot_task=bot_task,
             sys_type=sys_type,
             system_prompt=system_prompt,
+            infer_align_image_size=infer_align_image_size,
         )
         extra_args.update(edit_extra_args)
         if extra_args:
@@ -2259,6 +2265,8 @@ async def edit_images(
                 extra_body["system_prompt"] = system_prompt
             if return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = return_stage_metrics
+            if infer_align_image_size is not None:
+                extra_body["infer_align_image_size"] = infer_align_image_size
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -2502,6 +2510,7 @@ def _build_hunyuan_edit_extra_args(
     bot_task: str | None,
     sys_type: str | None,
     system_prompt: str | None,
+    infer_align_image_size: bool | None = None,
 ) -> dict[str, Any]:
     """Map Hunyuan /v1/images/edits form fields to DiT ``extra_args``."""
     extra_args: dict[str, Any] = {}
@@ -2516,6 +2525,8 @@ def _build_hunyuan_edit_extra_args(
         extra_args["system_prompt"] = system_prompt
     if bot_task is not None:
         extra_args["bot_task"] = bot_task
+    if infer_align_image_size is not None:
+        extra_args["infer_align_image_size"] = infer_align_image_size
     return extra_args
 
 

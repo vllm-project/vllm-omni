@@ -1095,6 +1095,27 @@ def test_flow_shift_absent_when_not_requested(test_client):
     assert "flow_shift" not in (captured.extra_args or {})
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_image_generation_forwards_infer_align_image_size_to_extra_args(test_client, value: bool):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024", "infer_align_image_size": value},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["infer_align_image_size"] is value
+
+
+def test_image_generation_omits_infer_align_image_size_by_default(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024"},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert "infer_align_image_size" not in (captured.extra_args or {})
+
+
 def test_invalid_size(test_client):
     """Test with invalid size parameter - rejected by Pydantic"""
     response = test_client.post(
@@ -1227,6 +1248,10 @@ def test_parameter_validation():
     assert req.size is None  # Engine will use model defaults
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
+    assert req.infer_align_image_size is None
+
+    req = ImageGenerationRequest(prompt="test", infer_align_image_size=False)
+    assert req.infer_align_image_size is False
 
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
@@ -1248,6 +1273,19 @@ def test_parameter_validation():
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
+
+
+def test_hunyuan_edit_extra_args_preserve_infer_align_false():
+    from vllm_omni.entrypoints.openai.api_server import _build_hunyuan_edit_extra_args
+
+    extra_args = _build_hunyuan_edit_extra_args(
+        bot_task=None,
+        sys_type=None,
+        system_prompt=None,
+        infer_align_image_size=False,
+    )
+
+    assert extra_args["infer_align_image_size"] is False
 
 
 # Pass-Through Tests
@@ -1749,6 +1787,43 @@ def test_image_edit_parameter_default(async_omni_test_client):
         },
     )
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_image_edit_forwards_infer_align_image_size_to_multistage_extra_args(
+    async_omni_test_client,
+    value: str,
+):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={"prompt": "hello world.", "size": "auto", "infer_align_image_size": value},
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    captured_prompt = engine.captured_prompt
+
+    expected = value == "true"
+    assert captured_sampling_params.extra_args["infer_align_image_size"] is expected
+    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is expected
+
+
+def test_image_edit_omits_infer_align_image_size_by_default(async_omni_test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={"prompt": "hello world.", "size": "auto"},
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    captured_prompt = engine.captured_prompt
+
+    assert "infer_align_image_size" not in (captured_sampling_params.extra_args or {})
+    assert "infer_align_image_size" not in (captured_prompt.get("mm_processor_kwargs") or {})
 
 
 def test_image_edit_parameter_default_single_stage(test_client):

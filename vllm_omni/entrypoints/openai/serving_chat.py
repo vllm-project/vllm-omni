@@ -2870,6 +2870,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         bot_task = extra_body.get("bot_task")
         use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
+        infer_align_image_size = extra_body.get("infer_align_image_size")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2951,6 +2952,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_w"] = width
         if seed is not None and engine_prompt_data is not None:
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
+        if infer_align_image_size is not None:
+            mm_processor_kwargs["infer_align_image_size"] = infer_align_image_size
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
@@ -3002,6 +3005,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_w"] = int(width)
 
             if stage_type == "diffusion":
+                if infer_align_image_size is not None:
+                    extra_args = getattr(default_stage_params, "extra_args", None)
+                    if extra_args is None:
+                        extra_args = {}
+                        default_stage_params.extra_args = extra_args
+                    extra_args["infer_align_image_size"] = infer_align_image_size
                 self._set_if_supported(
                     default_stage_params,
                     height=height,
@@ -3055,6 +3064,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         negative_prompt = extra_body.get("negative_prompt")
         num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
         lora_body = extra_body.get("lora")
+        infer_align_image_size = extra_body.get("infer_align_image_size")
 
         pil_images: list[Image.Image] = []
         for img_b64 in reference_images:
@@ -3093,11 +3103,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
+        if infer_align_image_size is not None:
+            gen_params.extra_args["infer_align_image_size"] = infer_align_image_size
+
         gen_prompt: OmniTextPrompt = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "modalities": ["image"],
         }
+        mm_processor_kwargs: dict[str, Any] = {}
+        if infer_align_image_size is not None:
+            mm_processor_kwargs["infer_align_image_size"] = infer_align_image_size
         if pil_images:
             if len(pil_images) == 1:
                 gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
@@ -3115,6 +3131,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         "and send multiple images in the user message content.",
                         status_code=400,
                     )
+        if mm_processor_kwargs:
+            gen_prompt["mm_processor_kwargs"] = mm_processor_kwargs
 
         return engine, gen_prompt, gen_params, pil_images
 
@@ -3474,6 +3492,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
             apply_declared_extra_args(gen_params, self._get_diffusion_extra_body_params(), extra_body)
+            if extra_body.get("infer_align_image_size") is not None:
+                gen_params.extra_args = {
+                    **(gen_params.extra_args or {}),
+                    "infer_align_image_size": extra_body["infer_align_image_size"],
+                }
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
