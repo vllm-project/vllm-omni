@@ -100,6 +100,16 @@ class LongcatNextAudioDecoder(nn.Module):
         self._vocoder.eval()
         self._weights_loaded = True
 
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        if input_ids.numel() == 0:
+            return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
+        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
+
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
+    ) -> None:
+        return None
+
     def _split_chunks(self, codes: torch.Tensor) -> list[torch.Tensor]:
         """Split [n, 8] codes into per-chunk tensors at level-0 end markers."""
         if codes.shape[0] == 0:

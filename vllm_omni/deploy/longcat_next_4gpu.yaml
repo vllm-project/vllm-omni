@@ -20,12 +20,6 @@ stages:
     devices: "0,1,2,3"
     trust_remote_code: true
     enforce_eager: true
-    # Tuned for 40 GB GPUs: gpu_memory_utilization must leave enough headroom
-    # above the ~33 GB of resident weights + encoders for activations and KV
-    # cache; max_num_batched_tokens caps the multimodal profiling batch size
-    # (must stay >= one image's token budget, 4096); max_model_len caps KV
-    # cache reservation (default 131072 requires far more KV memory than fits
-    # here). Raise gpu_memory_utilization/max_model_len on 80GB-class GPUs.
     gpu_memory_utilization: 0.92
     max_num_batched_tokens: 4608
     max_model_len: 16384

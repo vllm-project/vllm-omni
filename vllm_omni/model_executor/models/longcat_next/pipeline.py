@@ -19,6 +19,19 @@ LONGCAT_NEXT_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
+            # Stays "latent", NOT "audio": OutputModality.AUDIO maps to the
+            # CONCAT_LAST accumulation strategy (waveform-shaped, concat along
+            # the last dim) and MultimodalPayload.from_raw remaps this stage's
+            # routine "hidden" pooler-payload key onto the SAME "audio" name
+            # as our own data -- both wrong for our [1, 8] per-step code rows,
+            # which need CONCAT_DIM0 and a "hidden" key that doesn't collide
+            # with "codes.audio". (Tried "audio" first to satisfy the
+            # single-stage-as-final override below; it did unblock the
+            # payload but corrupted it into a garbled float tensor under a
+            # bare "audio" key -- the "hidden" collision.) The actual fix for
+            # that override lives in gpu_ar_model_runner.py's
+            # _resolve_pooler_payload_req_ids, widened to also accept
+            # "latent", so this field can keep its correct modality tag.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
         ),
@@ -60,8 +73,72 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
+            # Stays "latent", NOT "audio": OutputModality.AUDIO maps to the
+            # CONCAT_LAST accumulation strategy (waveform-shaped, concat along
+            # the last dim) and MultimodalPayload.from_raw remaps this stage's
+            # routine "hidden" pooler-payload key onto the SAME "audio" name
+            # as our own data -- both wrong for our [1, 8] per-step code rows,
+            # which need CONCAT_DIM0 and a "hidden" key that doesn't collide
+            # with "codes.audio". (Tried "audio" first to satisfy the
+            # single-stage-as-final override below; it did unblock the
+            # payload but corrupted it into a garbled float tensor under a
+            # bare "audio" key -- the "hidden" collision.) The actual fix for
+            # that override lives in gpu_ar_model_runner.py's
+            # _resolve_pooler_payload_req_ids, widened to also accept
+            # "latent", so this field can keep its correct modality tag.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+# Thinker + audio decoder only, skipping the image decoder (stage_id=1 in
+# LONGCAT_NEXT_PIPELINE). Unlike PipelineConfig.validate() (which only
+# requires stage_ids to be unique and resolvable via input_sources), the
+# runtime orchestrator requires stage_configs[i].stage_id == i — contiguous,
+# zero-based — since it indexes stage pools by stage_id directly. So the
+# audio decoder here is renumbered to stage_id=1 (not kept at 2, despite
+# matching LONGCAT_NEXT_PIPELINE's numbering) to be the second (index 1)
+# entry in this 2-stage pipeline.
+LONGCAT_NEXT_THINKER_AUDIO_PIPELINE = PipelineConfig(
+    model_type="longcat_next_thinker_audio",
+    model_arch="LongcatNextForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            # Stays "latent", NOT "audio": OutputModality.AUDIO maps to the
+            # CONCAT_LAST accumulation strategy (waveform-shaped, concat along
+            # the last dim) and MultimodalPayload.from_raw remaps this stage's
+            # routine "hidden" pooler-payload key onto the SAME "audio" name
+            # as our own data -- both wrong for our [1, 8] per-step code rows,
+            # which need CONCAT_DIM0 and a "hidden" key that doesn't collide
+            # with "codes.audio". (Tried "audio" first to satisfy the
+            # single-stage-as-final override below; it did unblock the
+            # payload but corrupted it into a garbled float tensor under a
+            # bare "audio" key -- the "hidden" collision.) The actual fix for
+            # that override lives in gpu_ar_model_runner.py's
+            # _resolve_pooler_payload_req_ids, widened to also accept
+            # "latent", so this field can keep its correct modality tag.
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="audio_decoder",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="LongcatNextAudioDecoder",
+            sync_process_input_func=f"{_PROC}.thinker2audio_decoder_token_only",
         ),
     ),
 )

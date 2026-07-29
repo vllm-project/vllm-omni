@@ -17,6 +17,7 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "model_outputs",
         "sr",
         "audio",
+        "codes",
         "image",
         "images",
         "video",

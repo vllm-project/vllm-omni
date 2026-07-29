@@ -57,6 +57,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
 from vllm_omni.model_executor.models.longcat_next.pipeline import (
     LONGCAT_NEXT_PIPELINE,
+    LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
     LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
@@ -140,6 +141,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "longcat_next": LONGCAT_NEXT_PIPELINE,
     "longcat_next_thinker_only": LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
+    "longcat_next_thinker_audio": LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
 }
 
 

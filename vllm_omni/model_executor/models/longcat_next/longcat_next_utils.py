@@ -34,14 +34,30 @@ IMG_START_TOKEN_ID = 131106  # <longcat_img_start>
 IMG_END_TOKEN_ID = 131107  # <longcat_img_end>
 IMG_PAD_TOKEN_ID = 131108  # <longcat_img_pad>
 IMG_NEWLINE_TOKEN_ID = 131109  # <longcat_img_newline>
+AUDIOTEXT_START_TOKEN_ID = 131120  # <longcat_audiotext_start>
+AUDIOTEXT_END_TOKEN_ID = 131121  # <longcat_audiotext_end>
+AUDIOTEXT_PAD_TOKEN_ID = 131122  # <longcat_audiotext_pad>
 AUDIOGEN_START_TOKEN_ID = 131123  # <longcat_audiogen_start>
 AUDIOGEN_END_TOKEN_ID = 131124  # <longcat_audiogen_end>
 
 NUM_CODEBOOKS = 8
-CODEBOOK_SIZE = 16384
+CODEBOOK_SIZE = 16384  # visual codebook only -- every level is 16384-wide.
 
 VISUAL_OFFSET = 150581
 AUDIO_OFFSET = 131125
+
+# Audio codebook sizes are NOT uniform across levels (unlike visual's flat
+# 16384), per config.json's audio_config.vq_config.codebook_sizes.
+AUDIO_CODEBOOK_SIZES = [8192, 4096, 2048, 1024, 1024, 1024, 1024, 1024]
+
+
+def _cumulative_offsets(base: int, codebook_sizes: Sequence[int]) -> list[int]:
+    """cumsum([base] + codebook_sizes[:-1]), mirroring the model's
+    visual_offset_vals/audio_offset_vals buffers (modeling_longcat_next.py)."""
+    offsets = [base]
+    for size in codebook_sizes[:-1]:
+        offsets.append(offsets[-1] + size)
+    return offsets
 
 # Per-level cumulative offsets, mirroring the model's visual/audio_offset_vals
 # buffers (cumsum of [base] + codebook_sizes[:-1]).
