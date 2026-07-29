@@ -1103,14 +1103,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         plan = get_offload_plan(pipeline)
 
         # Load weights via mmap for DLO+AllGather.
-        # The offloader converts DiT modules to meta device internally
-        # (via to_empty), so we always call _load_weights_via_mmap when
-        # DLO+AllGather is active — regardless of whether the model was
-        # created on meta or not.
+        # Gate on _remap_ckpt_key (model supports mmap layout) AND absence
+        # of online quantization (which requires _process_weights_after_loading
+        # that the mmap path bypasses).  This mirrors the gate in
+        # diffusers_loader.py to ensure the same condition is checked in both
+        # the loader path and the enable() path.
         if self.config.dlo_use_allgather and self.dp_size > 1:
             _has_remap = any(callable(getattr(type(m), "_remap_ckpt_key", None)) for m in pipeline.modules())
-            if _has_remap:
+            _has_online_quant = any(
+                getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
+                for module in pipeline.modules()
+            )
+            if _has_remap and not _has_online_quant:
                 self._load_weights_via_mmap(pipeline, modules)
+            elif _has_online_quant:
+                logger.warning(
+                    "Online quantization detected with DLO+AllGather: "
+                    "skipping mmap loading (weights already loaded and "
+                    "quantized via regular loader path)."
+                )
             else:
                 logger.info("Weights already loaded via regular loader — skipping mmap (no _remap_ckpt_key)")
 
