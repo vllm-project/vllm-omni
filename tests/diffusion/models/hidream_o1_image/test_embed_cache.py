@@ -13,7 +13,6 @@ model weights or GPU.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch, call
 import pytest
 import torch
 
@@ -61,9 +60,6 @@ class TestEmbedCacheContract:
         pixel_values = torch.zeros(1, 3, 32, 32)  # placeholder ref image pixels
         vinput_mask = torch.zeros(1, 4, dtype=torch.bool)
         vinput_mask[0, :] = True
-        z = torch.zeros(1, 4, 8)
-        sigma = torch.tensor(0.5)
-
         for step in range(N_STEPS):
             cached_img_emb = embed_storage.get("image_embeds")
             cached_ds = embed_storage.get("deepstack")
@@ -76,9 +72,7 @@ class TestEmbedCacheContract:
             }
             fake_forward_generation(**kwargs)
 
-        assert call_count["n"] == 1, (
-            f"Expected vision tower to be called exactly once, got {call_count['n']}"
-        )
+        assert call_count["n"] == 1, f"Expected vision tower to be called exactly once, got {call_count['n']}"
 
     def test_embed_storage_populated_after_step_zero(self):
         """After the first denoising step, embed_storage must have 'image_embeds'."""

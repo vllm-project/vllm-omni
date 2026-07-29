@@ -13,7 +13,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import einops
 import torch
@@ -141,9 +142,7 @@ def get_rope_index_fix_point(
                 .view(1, 1, -1)
                 .expand(3, input_ids.shape[0], -1)
             )
-            mrope_position_deltas = torch.zeros(
-                [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
-            )
+            mrope_position_deltas = torch.zeros([input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype)
         return position_ids, mrope_position_deltas
 
     total_input_ids = input_ids
@@ -287,26 +286,28 @@ def build_packed_attention_metadata(
 
 # Normalization transform matching the reference repo's ``TENSOR_TRANSFORM``
 # (normalize raw [0,255] pixels to the [-1, 1] range expected by the model).
-_REF_TRANSFORM = T.Compose([
-    T.ToTensor(),                    # [0,255] HWC → [0,1] CHW
-    T.Normalize([0.5], [0.5]),       # [0,1] → [-1,1] per channel
-])
+_REF_TRANSFORM = T.Compose(
+    [
+        T.ToTensor(),  # [0,255] HWC → [0,1] CHW
+        T.Normalize([0.5], [0.5]),  # [0,1] → [-1,1] per channel
+    ]
+)
 
 
-def adaptive_ref_max_size(K: int, output_max: int) -> int:
-    """Return the max side-length for K reference images at the given output resolution.
+def adaptive_ref_max_size(k: int, output_max: int) -> int:
+    """Return the max side-length for k reference images at the given output resolution.
 
     Mirrors the reference repo's pipeline.py adaptive sizing table so that
-    total ref-image token count grows sub-linearly with K, keeping sequence
+    total ref-image token count grows sub-linearly with k, keeping sequence
     length reasonable for personalization with many references.
     """
-    if K == 1:
+    if k == 1:
         return output_max
-    if K == 2:
+    if k == 2:
         return output_max * 48 // 64
-    if K <= 4:
+    if k <= 4:
         return output_max // 2
-    if K <= 8:
+    if k <= 8:
         return output_max * 24 // 64
     return output_max // 4
 
@@ -363,8 +364,16 @@ def preprocess_ref_patches(
 
 MAX_BOX = 5
 DEFAULT_COLORS: list[tuple[int, int, int]] = [
-    (255, 0, 0), (0, 180, 0), (0, 0, 255), (204, 180, 0), (255, 0, 255),
-    (0, 255, 255), (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0),
+    (255, 0, 0),
+    (0, 180, 0),
+    (0, 0, 255),
+    (204, 180, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (128, 0, 0),
+    (0, 128, 0),
+    (0, 0, 128),
+    (128, 128, 0),
 ]
 
 
@@ -454,19 +463,20 @@ def parse_layout_bboxes(
     raw_boxes = _unwrap_boxes(layout_bboxes)
     if not isinstance(raw_boxes, list):
         raise ValueError(
-            "layout_bboxes must be a list, or a dict containing one of: "
-            "layout_bboxes/bboxes/boxes/bbox_list"
+            "layout_bboxes must be a list, or a dict containing one of: layout_bboxes/bboxes/boxes/bbox_list"
         )
     parsed: list[dict[str, Any]] = []
     for idx, item in enumerate(raw_boxes):
         bbox, text = _as_bbox_and_text(item)
-        parsed.append({
-            "bbox": _xxyy_relative_to_absolute_bbox(bbox, width, height),
-            "color": "",
-            "text": text,
-            "image": None,
-            "_orig_idx": idx,
-        })
+        parsed.append(
+            {
+                "bbox": _xxyy_relative_to_absolute_bbox(bbox, width, height),
+                "color": "",
+                "text": text,
+                "image": None,
+                "_orig_idx": idx,
+            }
+        )
     return parsed
 
 

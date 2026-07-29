@@ -7,9 +7,6 @@ entirely on CPU without model weights.
 """
 
 import json
-import math
-import os
-import tempfile
 
 import pytest
 from PIL import Image as PILImage
@@ -33,6 +30,7 @@ _W, _H = 512, 512  # synthetic output resolution for all tests
 # load_layout_bboxes
 # ---------------------------------------------------------------------------
 
+
 class TestLoadLayoutBboxes:
     def test_load_from_json_string(self):
         data = [[0.1, 0.5, 0.1, 0.5]]
@@ -55,6 +53,7 @@ class TestLoadLayoutBboxes:
 # ---------------------------------------------------------------------------
 # parse_layout_bboxes
 # ---------------------------------------------------------------------------
+
 
 class TestParseLayoutBboxes:
     def test_relative_coords_converted_to_absolute(self):
@@ -83,9 +82,7 @@ class TestParseLayoutBboxes:
         assert y2 == round(0.8 * _H)
 
     def test_dict_items_accepted(self):
-        boxes = parse_layout_bboxes(
-            [{"bbox": [0.0, 0.5, 0.0, 0.5], "text": "cat"}], _W, _H
-        )
+        boxes = parse_layout_bboxes([{"bbox": [0.0, 0.5, 0.0, 0.5], "text": "cat"}], _W, _H)
         assert boxes[0]["text"] == "cat"
 
     def test_dict_wrapper_unwrapped(self):
@@ -101,9 +98,7 @@ class TestParseLayoutBboxes:
         assert y1 < y2
 
     def test_orig_idx_preserved(self):
-        boxes = parse_layout_bboxes(
-            [[0.0, 0.3, 0.0, 0.3], [0.5, 0.9, 0.5, 0.9]], _W, _H
-        )
+        boxes = parse_layout_bboxes([[0.0, 0.3, 0.0, 0.3], [0.5, 0.9, 0.5, 0.9]], _W, _H)
         assert boxes[0]["_orig_idx"] == 0
         assert boxes[1]["_orig_idx"] == 1
 
@@ -111,6 +106,7 @@ class TestParseLayoutBboxes:
 # ---------------------------------------------------------------------------
 # draw_bbox_layout
 # ---------------------------------------------------------------------------
+
 
 class TestDrawBboxLayout:
     def _simple_boxes(self, n: int) -> list[dict]:
@@ -159,6 +155,7 @@ class TestDrawBboxLayout:
 # add_outer_border_keep_size
 # ---------------------------------------------------------------------------
 
+
 class TestAddOuterBorderKeepSize:
     def test_output_size_unchanged(self):
         pil = PILImage.new("RGB", (64, 64), (128, 128, 128))
@@ -185,6 +182,7 @@ class TestAddOuterBorderKeepSize:
 # ---------------------------------------------------------------------------
 # create_layout_reference_images
 # ---------------------------------------------------------------------------
+
 
 class TestCreateLayoutReferenceImages:
     def _refs(self, n: int) -> list[PILImage.Image]:
@@ -217,8 +215,7 @@ class TestCreateLayoutReferenceImages:
         refs = self._refs(1)
         result = create_layout_reference_images(refs, self._bboxes(1), _W, _H)
         bordered = result[0]
-        # Border pixels (top-left corner) must not be the original fill color
-        original_color = (0, 0, 0)  # first ref is (0, 0, 0)
+        # Border pixels (top-left corner) must not be the original fill color (0, 0, 0)
         border_pixel = bordered.getpixel((0, 0))
         # The border color comes from DEFAULT_COLORS, so it should be one of them
         assert border_pixel in DEFAULT_COLORS

@@ -181,7 +181,7 @@ class TimestepEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _build_attention_subclasses(quant_config: "QuantizationConfig | None" = None) -> dict[str, type]:
+def _build_attention_subclasses(quant_config: QuantizationConfig | None = None) -> dict[str, type]:
     """Build the attention/decoder-layer/text-model classes that need the
     masking rewire. Deferred into a function (rather than module-level
     classes) because the HF base classes are only available once

@@ -235,18 +235,18 @@ class TestEditSampleTokenTypes:
         """
         total = txt_len + tgt_len + ref_len
         raw = torch.zeros((1, total), dtype=torch.long)
-        raw[0, txt_len - 1] = 3          # tms
-        raw[0, txt_len: txt_len + tgt_len] = 1   # target patches
-        raw[0, txt_len + tgt_len:] = 2           # ref pixel patches
+        raw[0, txt_len - 1] = 3  # tms
+        raw[0, txt_len : txt_len + tgt_len] = 1  # target patches
+        raw[0, txt_len + tgt_len :] = 2  # ref pixel patches
         return raw
 
     def test_vinput_mask_excludes_ref_pixel_patches(self):
         """vinput_mask must be True ONLY for type=1 (target) positions."""
         raw = self._make_edit_token_types(txt_len=5, tgt_len=4, ref_len=3)
         vinput_mask = raw == 1
-        assert vinput_mask[0, :5].sum() == 0     # text: no
-        assert vinput_mask[0, 5:9].sum() == 4    # target: all True
-        assert vinput_mask[0, 9:].sum() == 0     # ref pixel: no
+        assert vinput_mask[0, :5].sum() == 0  # text: no
+        assert vinput_mask[0, 5:9].sum() == 4  # target: all True
+        assert vinput_mask[0, 9:].sum() == 0  # ref pixel: no
 
     def test_single_contiguous_gen_span(self):
         """tms + target + ref_pixel form one contiguous gen span (no multi-span needed)."""
@@ -256,8 +256,8 @@ class TestEditSampleTokenTypes:
         # tms is at position 4, gen ends at position 11 (4+1+4+3=12 total, idx 11 incl.)
         assert len(spans[0]) == 1
         start, end = spans[0][0]
-        assert start == 4   # tms position (txt_len - 1)
-        assert end == 12    # exclusive end (txt_len - 1 + 1 + tgt_len + ref_len = 12)
+        assert start == 4  # tms position (txt_len - 1)
+        assert end == 12  # exclusive end (txt_len - 1 + 1 + tgt_len + ref_len = 12)
 
     def test_ref_pixel_rows_attend_to_everything(self):
         """Gen rows (including ref pixel patches) must be fully True (bidirectional)."""

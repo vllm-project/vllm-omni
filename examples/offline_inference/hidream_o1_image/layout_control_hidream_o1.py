@@ -34,7 +34,6 @@ Usage examples:
 """
 
 import argparse
-import json
 from pathlib import Path
 
 from PIL import Image
@@ -51,14 +50,19 @@ _MODEL_TYPE_PRESETS = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HiDream-O1-Image layout-bbox controlled generation.")
-    p.add_argument("--model", default="HiDream-ai/HiDream-O1-Image-Dev",
-                   help="Model name or local checkpoint path.")
-    p.add_argument("--prompt", default="A person and a dog sitting in a sunny park.",
-                   help="Generation instruction.")
-    p.add_argument("--ref-images", nargs="+", required=True, metavar="PATH",
-                   help="Reference image paths. Each ref corresponds to one bbox entry.")
+    p.add_argument("--model", default="HiDream-ai/HiDream-O1-Image-Dev", help="Model name or local checkpoint path.")
+    p.add_argument("--prompt", default="A person and a dog sitting in a sunny park.", help="Generation instruction.")
     p.add_argument(
-        "--layout-bboxes", required=True, metavar="JSON_OR_PATH",
+        "--ref-images",
+        nargs="+",
+        required=True,
+        metavar="PATH",
+        help="Reference image paths. Each ref corresponds to one bbox entry.",
+    )
+    p.add_argument(
+        "--layout-bboxes",
+        required=True,
+        metavar="JSON_OR_PATH",
         help=(
             "Bounding boxes as a JSON string or a .json file path. "
             "Format: [[x1,x2,y1,y2], ...] in xxyy order, values in [0,1] or [0,100]. "
@@ -86,7 +90,6 @@ def main() -> None:
     shift = args.shift if args.shift is not None else preset["shift"]
 
     ref_images = [Image.open(p).convert("RGB") for p in args.ref_images]
-    n_refs = len(ref_images)
 
     print(f"{'=' * 60}\nHiDream-O1-Image layout-bbox control ({args.model_type})\n{'=' * 60}")
     print(f"  model           : {args.model}")

@@ -90,13 +90,8 @@ def test_image_edit_001(omni_server: OmniServer, openai_client: OpenAIClientHand
 @pytest.mark.parametrize("omni_server", _get_feature_cases(DEV_MODEL), indirect=True)
 def test_multi_ref_personalization_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     """Two-reference personalization smoke for HiDream-O1-Image-Dev (L3)."""
-    image_data_url_list = [
-        f"data:image/jpeg;base64,{generate_synthetic_image(256, 256)['base64']}"
-        for _ in range(2)
-    ]
-    messages = dummy_messages_from_mix_data(
-        image_data_url=image_data_url_list, content_text=PERSONALIZATION_PROMPT
-    )
+    image_data_url_list = [f"data:image/jpeg;base64,{generate_synthetic_image(256, 256)['base64']}" for _ in range(2)]
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url_list, content_text=PERSONALIZATION_PROMPT)
     request_config = {
         "model": omni_server.model,
         "messages": messages,

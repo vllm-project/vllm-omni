@@ -71,8 +71,9 @@ def main() -> None:
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--steps", type=int, default=28)
-    p.add_argument("--guidance-scale", type=float, default=None,
-                   help="Omit for Dev (no CFG). Set to 5.0 for the Full variant.")
+    p.add_argument(
+        "--guidance-scale", type=float, default=None, help="Omit for Dev (no CFG). Set to 5.0 for the Full variant."
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default="hidream_o1_output.png")
     args = p.parse_args()

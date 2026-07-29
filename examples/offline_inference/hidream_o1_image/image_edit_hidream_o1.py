@@ -45,25 +45,29 @@ _MODEL_TYPE_PRESETS = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HiDream-O1-Image editing / personalization.")
-    p.add_argument("--model", default="HiDream-ai/HiDream-O1-Image-Dev",
-                   help="Model name or local checkpoint path.")
-    p.add_argument("--prompt", default="A person is sitting at a café in Paris.",
-                   help="Editing / generation instruction.")
-    p.add_argument("--ref-images", nargs="+", required=True, metavar="PATH",
-                   help="One or more reference image paths. 1 = editing, 2+ = personalization.")
-    p.add_argument("--height", type=int, default=1024,
-                   help="Output image height (snapped to a 32-px grid).")
-    p.add_argument("--width", type=int, default=1024,
-                   help="Output image width (snapped to a 32-px grid).")
-    p.add_argument("--model-type", choices=["full", "dev"], default="dev",
-                   help="full: 50 steps, guidance 5.0, shift 3.0. dev: 28 steps, no CFG, shift 1.0.")
+    p.add_argument("--model", default="HiDream-ai/HiDream-O1-Image-Dev", help="Model name or local checkpoint path.")
+    p.add_argument(
+        "--prompt", default="A person is sitting at a café in Paris.", help="Editing / generation instruction."
+    )
+    p.add_argument(
+        "--ref-images",
+        nargs="+",
+        required=True,
+        metavar="PATH",
+        help="One or more reference image paths. 1 = editing, 2+ = personalization.",
+    )
+    p.add_argument("--height", type=int, default=1024, help="Output image height (snapped to a 32-px grid).")
+    p.add_argument("--width", type=int, default=1024, help="Output image width (snapped to a 32-px grid).")
+    p.add_argument(
+        "--model-type",
+        choices=["full", "dev"],
+        default="dev",
+        help="full: 50 steps, guidance 5.0, shift 3.0. dev: 28 steps, no CFG, shift 1.0.",
+    )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num-inference-steps", type=int, default=None,
-                   help="Override the preset step count.")
-    p.add_argument("--guidance-scale", type=float, default=None,
-                   help="Override the preset guidance scale.")
-    p.add_argument("--shift", type=float, default=None,
-                   help="Override the preset shift value.")
+    p.add_argument("--num-inference-steps", type=int, default=None, help="Override the preset step count.")
+    p.add_argument("--guidance-scale", type=float, default=None, help="Override the preset guidance scale.")
+    p.add_argument("--shift", type=float, default=None, help="Override the preset shift value.")
     p.add_argument("--scheduler", choices=["default", "flow_match"], default="default")
     p.add_argument("--output", default="hidream_o1_edit_output.png")
     p.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")

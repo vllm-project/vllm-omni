@@ -25,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hidream_o1_image.qwen3_vl_uit_transformer import HiDreamO1UiTModel
@@ -45,6 +44,7 @@ from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import (
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -87,7 +87,14 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportImageInput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class HiDreamO1ImagePipeline(
+    nn.Module,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+):
     # SupportImageInput protocol -- enables reference-image conditioning for
     # editing (1 ref) and subject-driven personalization (N refs).
     support_image_input: ClassVar[bool] = True
@@ -199,7 +206,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
             if not name.startswith("model."):
                 logger.warning("Skipping unexpected HiDream-O1-Image weight key %s", name)
                 continue
-            local_name = "transformer." + name[len("model."):]
+            local_name = "transformer." + name[len("model.") :]
 
             # Route checkpoint's split q/k/v and gate/up weights into the
             # fused parallel linear params with appropriate shard ids.
@@ -301,9 +308,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
             "vinput_mask": vinput_mask,
         }
 
-    def _build_edit_sample(
-        self, prompt: str, ref_pils: list[Image.Image], height: int, width: int
-    ) -> dict[str, Any]:
+    def _build_edit_sample(self, prompt: str, ref_pils: list[Image.Image], height: int, width: int) -> dict[str, Any]:
         """Build one branch's packed sequence for editing / personalization.
 
         Ref images condition the model through two independent paths:
@@ -382,9 +387,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         # K VLM-ref spans: skip_vision_start_token=0 (sequential, no fix_point)
         # 1 target span:   skip_vision_start_token=1 (fix_point anchored)
         # K ref-pixel spans: skip_vision_start_token=1 (fix_point anchored)
-        image_grid_thw_tgt = torch.tensor(
-            [[1, h_patches, w_patches]], dtype=torch.int64, device=self.device
-        )
+        image_grid_thw_tgt = torch.tensor([[1, h_patches, w_patches]], dtype=torch.int64, device=self.device)
         ref_pixel_grid_thw_list = []
         for pil, n in zip(ref_pils, ref_image_lens):
             pil_r = resize_pilimage(pil.convert("RGB"), ref_max)
@@ -392,9 +395,11 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
             ref_pixel_grid_thw_list.append([1, rh // PATCH_SIZE, rw // PATCH_SIZE])
         ref_pixel_grid_thw = torch.tensor(ref_pixel_grid_thw_list, dtype=torch.int64, device=self.device)
 
-        image_grid_thw_all = torch.cat(
-            [image_grid_thw_vlm, image_grid_thw_tgt, ref_pixel_grid_thw], dim=0
-        ) if image_grid_thw_vlm is not None else torch.cat([image_grid_thw_tgt, ref_pixel_grid_thw], dim=0)
+        image_grid_thw_all = (
+            torch.cat([image_grid_thw_vlm, image_grid_thw_tgt, ref_pixel_grid_thw], dim=0)
+            if image_grid_thw_vlm is not None
+            else torch.cat([image_grid_thw_tgt, ref_pixel_grid_thw], dim=0)
+        )
 
         skip_flags = [0] * K + [1] + [1] * K
 
@@ -421,7 +426,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         token_types_raw[0, tgt_start:tgt_end] = 1
         ref_start = tgt_end
         for n in ref_image_lens:
-            token_types_raw[0, ref_start: ref_start + n] = 2
+            token_types_raw[0, ref_start : ref_start + n] = 2
             ref_start += n
 
         vinput_mask = token_types_raw == 1  # only target positions
@@ -498,8 +503,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         if _embed_storage is not None and out.cond_image_embeds is not None:
             _embed_storage["image_embeds"] = out.cond_image_embeds.detach()
             _embed_storage["deepstack"] = (
-                [e.detach() for e in out.cond_deepstack_image_embeds]
-                if out.cond_deepstack_image_embeds else []
+                [e.detach() for e in out.cond_deepstack_image_embeds] if out.cond_deepstack_image_embeds else []
             )
 
         # vinput_mask selects only the *target* patch positions (type=1);
