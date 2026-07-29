@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     LTXGuidancePlan,
     LTXGuidanceSpec,
     LTXModalityGuidance,
+    _repeat_batch,
     build_perturbation_kwargs,
     combine_guided_x0,
 )
@@ -580,6 +581,15 @@ def test_ltx_guidance_uses_official_close_to_disabled_semantics():
     )
 
     assert LTXGuidancePlan.build(LTXGuidanceSpec(video=guidance)).names == ("cond",)
+
+
+def test_ltx_positive_only_guidance_preserves_token_major_layout():
+    tensor = torch.arange(24).view(1, 3, 8).transpose(1, 2).contiguous().transpose(1, 2)
+
+    repeated = _repeat_batch(tensor, 1)
+
+    assert repeated is tensor
+    assert repeated.stride() == tensor.stride()
 
 
 def test_ltx_guidance_rescale_is_invariant_to_request_batching():

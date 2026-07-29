@@ -23,7 +23,7 @@ def _make_pipeline(pipeline_cls, sequence_parallel_size: int = 1):
     return pipeline
 
 
-def test_prepare_video_latents_samples_directly_in_packed_token_space():
+def test_prepare_video_latents_matches_official_values_and_token_major_layout():
     pipeline = _make_pipeline(LTX2Pipeline)
     pipeline.vae_spatial_compression_ratio = 8
     pipeline.vae_temporal_compression_ratio = 8
@@ -44,6 +44,7 @@ def test_prepare_video_latents_samples_directly_in_packed_token_space():
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.stride()[1:] == (1, actual.shape[1])
 
 
 def test_prepare_audio_latents_samples_directly_in_packed_token_space():

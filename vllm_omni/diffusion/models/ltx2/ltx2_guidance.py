@@ -188,6 +188,8 @@ def combine_guided_x0(
 
 
 def _repeat_batch(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
+    if repeats == 1:
+        return tensor
     return tensor.repeat((repeats,) + (1,) * (tensor.ndim - 1))
 
 

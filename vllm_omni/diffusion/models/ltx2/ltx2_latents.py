@@ -217,7 +217,12 @@ def prepare_video_latents(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    # Official LTX samples the 5D video latent first and then patchifies it,
+    # leaving token-major storage behind the [B, tokens, channels] view.  The
+    # logical values are unchanged, but preserving that layout is important:
+    # CUDA selects a different bf16 GEMM path for a contiguous token tensor.
+    return latents.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def prepare_audio_latents(
