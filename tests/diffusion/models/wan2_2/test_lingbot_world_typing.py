@@ -12,9 +12,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _ROOT = Path(__file__).parents[4]
 _PRODUCTION_FILES = (
-    _ROOT / "vllm_omni/diffusion/models/wan2_2/lingbot_world_camera.py",
-    _ROOT / "vllm_omni/diffusion/models/wan2_2/lingbot_world_transformer.py",
-    _ROOT / "vllm_omni/diffusion/models/wan2_2/pipeline_lingbot_world.py",
+    _ROOT / "vllm_omni/diffusion/models/wan2_2/lingbot_world/camera.py",
+    _ROOT / "vllm_omni/diffusion/models/wan2_2/lingbot_world/transformer.py",
+    _ROOT / "vllm_omni/diffusion/models/wan2_2/lingbot_world/pipeline.py",
 )
 
 

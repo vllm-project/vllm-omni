@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Camera trajectory loading and geometry for LingBot World conditioning."""
+"""Camera trajectory loading and geometry for LingBot World v2 conditioning."""
 
 from __future__ import annotations
 

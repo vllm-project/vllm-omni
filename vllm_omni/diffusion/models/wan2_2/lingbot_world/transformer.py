@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Checkpoint-compatible causal DiT used by LingBot World v2."""
+"""Checkpoint-compatible causal DiT for the LingBot World v2 model package."""
 
 from __future__ import annotations
 

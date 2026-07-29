@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -31,20 +31,20 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_actions import (
+from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
+from vllm_omni.diffusion.models.wan2_2.lingbot_world.camera import (
     CameraTrajectory,
     build_plucker_embedding,
     interpolate_camera_trajectory,
     load_camera_trajectory,
     resolve_trusted_action_directory,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import (
+from vllm_omni.diffusion.models.wan2_2.lingbot_world.transformer import (
     CausalLingBotWorldTransformer3DModel,
     LingBotAttentionCache,
     LingBotTransformerCache,
@@ -559,7 +559,7 @@ class LingBotWorldCausalDMDPipeline(
         self,
         session_id: str,
         state: ARDiffusionKVState,
-    ):
+    ) -> Iterator[None]:
         if self._ar_diffusion_kv_state is not None:
             raise RuntimeError("LingBot AR-Diffusion state is already bound.")
         if state.session_id != session_id:
@@ -907,7 +907,7 @@ class LingBotWorldCausalDMDPipeline(
         ):
             projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv():
+            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
                     key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(

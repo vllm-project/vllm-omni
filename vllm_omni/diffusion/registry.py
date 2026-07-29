@@ -122,8 +122,8 @@ _DIFFUSION_MODELS = {
         "WanI2VDMD2Pipeline",
     ),
     "LingBotWorldCausalDMDPipeline": (
-        "wan2_2",
-        "pipeline_lingbot_world",
+        "wan2_2.lingbot_world",
+        "pipeline",
         "LingBotWorldCausalDMDPipeline",
     ),
     "LongCatImagePipeline": (

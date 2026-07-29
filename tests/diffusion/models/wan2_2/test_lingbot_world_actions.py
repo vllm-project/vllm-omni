@@ -7,7 +7,7 @@ import asyncio
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_actions import (
+from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     LingBotCameraControlReducer,

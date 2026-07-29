@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib.util
 import math
-import platform
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -17,7 +16,30 @@ from torch import nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world_transformer.py"
+_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world/transformer.py"
+_MODULE_NAME = "_lingbot_world_attention_under_test"
+_STUBBED_MODULE_NAMES = (
+    "vllm",
+    "vllm.distributed",
+    "vllm.model_executor",
+    "vllm.model_executor.layers",
+    "vllm.model_executor.layers.conv",
+    "vllm.model_executor.layers.linear",
+    "vllm.model_executor.model_loader",
+    "vllm.model_executor.model_loader.weight_utils",
+    "vllm.model_executor.utils",
+    "vllm_omni",
+    "vllm_omni.diffusion",
+    "vllm_omni.diffusion.attention",
+    "vllm_omni.diffusion.attention.layer",
+    "vllm_omni.diffusion.layers",
+    "vllm_omni.diffusion.layers.norm",
+    "vllm_omni.diffusion.layers.rope",
+    "vllm_omni.experimental",
+    "vllm_omni.experimental.ar_diffusion",
+    "vllm_omni.experimental.ar_diffusion.kv_cache",
+    "vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -26,40 +48,21 @@ def _inference_context():
         yield
 
 
-def _install_macos_vllm_stubs() -> None:
-    if platform.system() != "Darwin":
-        return
-
-    def ensure_module(name: str) -> ModuleType:
-        module = sys.modules.get(name)
+@pytest.fixture(autouse=True)
+def _restore_stubbed_modules():
+    previous = {name: sys.modules.get(name) for name in _STUBBED_MODULE_NAMES}
+    yield
+    sys.modules.pop(_MODULE_NAME, None)
+    for name, module in previous.items():
         if module is None:
-            module = ModuleType(name)
+            sys.modules.pop(name, None)
+        else:
             sys.modules[name] = module
-        return module
 
-    for name in (
-        "vllm",
-        "vllm.distributed",
-        "vllm.model_executor",
-        "vllm.model_executor.layers",
-        "vllm.model_executor.layers.conv",
-        "vllm.model_executor.layers.linear",
-        "vllm.model_executor.model_loader",
-        "vllm.model_executor.model_loader.weight_utils",
-        "vllm.model_executor.utils",
-        "vllm_omni",
-        "vllm_omni.diffusion",
-        "vllm_omni.diffusion.attention",
-        "vllm_omni.diffusion.attention.layer",
-        "vllm_omni.diffusion.layers",
-        "vllm_omni.diffusion.layers.norm",
-        "vllm_omni.diffusion.layers.rope",
-        "vllm_omni.experimental",
-        "vllm_omni.experimental.ar_diffusion",
-        "vllm_omni.experimental.ar_diffusion.kv_cache",
-        "vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention",
-    ):
-        ensure_module(name)
+
+def _install_vllm_stubs() -> None:
+    for name in _STUBBED_MODULE_NAMES:
+        sys.modules[name] = ModuleType(name)
 
     distributed = sys.modules["vllm.distributed"]
     distributed.get_tensor_model_parallel_rank = lambda: 0
@@ -199,6 +202,9 @@ def _install_macos_vllm_stubs() -> None:
 
     paged_attention.ARDiffusionPagedLayerContext = _PagedLayerContext
     paged_attention.ARDiffusionPagedLayerInputs = _PagedLayerInputs
+    paged_attention.ar_diffusion_paged_attention = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("CUDA paged attention was not expected in this CPU test")
+    )
     paged_attention.paged_write_attn = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("paged path was not expected in this direct-cache test")
     )
@@ -206,8 +212,8 @@ def _install_macos_vllm_stubs() -> None:
 
 def _load_module():
     assert _MODULE_PATH.exists(), "LingBot attention module has not been implemented"
-    _install_macos_vllm_stubs()
-    spec = importlib.util.spec_from_file_location("_lingbot_world_attention_under_test", _MODULE_PATH)
+    _install_vllm_stubs()
+    spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

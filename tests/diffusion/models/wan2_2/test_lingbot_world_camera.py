@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world_camera.py"
+_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world/camera.py"
 _SPEC = importlib.util.spec_from_file_location("_lingbot_world_camera_under_test", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _CAMERA_MODULE = importlib.util.module_from_spec(_SPEC)
