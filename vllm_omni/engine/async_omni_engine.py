@@ -955,7 +955,6 @@ class AsyncOmniEngine:
                 pipeline_parallel_size=pipeline_parallel_size,
                 data_parallel_size=data_parallel_size,
                 tensor_parallel_size=tensor_parallel_size,
-                text_encoder_tensor_parallel_size=normalized_kwargs.get("text_encoder_tensor_parallel_size"),
                 enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
@@ -1031,7 +1030,6 @@ class AsyncOmniEngine:
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
-            "text_encoder_tensor_parallel_size": kwargs.get("text_encoder_tensor_parallel_size", None),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": {

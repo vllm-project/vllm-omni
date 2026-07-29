@@ -183,7 +183,7 @@ class Wan22I2VPipeline(
                 fall_back_to_pt=True,
             ),
         ]
-        if od_config.parallel_config.text_encoder_tensor_parallel_size != 1:
+        if od_config.parallel_config.tensor_parallel_size != 1:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -242,7 +242,7 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
-        if od_config.parallel_config.text_encoder_tensor_parallel_size == 1:
+        if od_config.parallel_config.tensor_parallel_size == 1:
             self.text_encoder = from_pretrained_with_prefetch(
                 UMT5EncoderModel.from_pretrained,
                 model,

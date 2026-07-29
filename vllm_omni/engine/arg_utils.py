@@ -492,7 +492,6 @@ class OrchestratorArgs:
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
     auxiliary_text_encoder: str | None = None
-    text_encoder_tensor_parallel_size: int | None = None
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None

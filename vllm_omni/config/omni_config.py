@@ -454,7 +454,6 @@ class _DiffusionConfigProjection:
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
     cache_strategy: str = "none"
-    text_encoder_tensor_parallel_size: int | None = None
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False

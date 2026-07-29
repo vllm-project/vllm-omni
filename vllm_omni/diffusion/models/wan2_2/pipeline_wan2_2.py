@@ -327,7 +327,7 @@ class Wan22Pipeline(
 
         # Set up weights sources for transformer(s)
         self.weights_sources = []
-        if od_config.parallel_config.text_encoder_tensor_parallel_size != 1:
+        if od_config.parallel_config.tensor_parallel_size != 1:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -384,7 +384,7 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
         )
-        if od_config.parallel_config.text_encoder_tensor_parallel_size == 1:
+        if od_config.parallel_config.tensor_parallel_size == 1:
             self.text_encoder = from_pretrained_with_prefetch(
                 UMT5EncoderModel.from_pretrained,
                 model,
