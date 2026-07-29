@@ -155,7 +155,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
-        """Build a diffusion request and run DiffusionEngine.step()."""
+        """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
@@ -165,8 +165,13 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        results = await self._engine.step(request)
-        result = results[0]
+        # Non-streaming callers share the streaming engine path but only
+        # return the final output.
+        result = None
+        async for results in self._engine.step_streaming(request):
+            result = results[0]
+        if result is None:
+            raise RuntimeError("Diffusion execution finished without output.")
         if not result.request_id:
             result.request_id = request_id
         return result

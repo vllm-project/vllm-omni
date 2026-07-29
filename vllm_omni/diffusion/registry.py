@@ -71,20 +71,10 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
-    "LTX2ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX2ImageToVideoPipeline",
-    ),
-    "LTX2TwoStagesPipeline": (
+    "LTX2DistilledPipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
-        "LTX2TwoStagesPipeline",
-    ),
-    "LTX2ImageToVideoTwoStagesPipeline": (
-        "ltx2",
-        "pipeline_ltx2_two_stage",
-        "LTX2ImageToVideoTwoStagesPipeline",
+        "LTX2DistilledPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
         "ltx2",
@@ -95,16 +85,6 @@ _DIFFUSION_MODELS = {
         "ltx2",
         "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
-    ),
-    "LTX23Pipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23Pipeline",
-    ),
-    "LTX23ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -457,7 +437,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # Some pipelines have recursive
                 # modules that have the transformer
                 module = find_module_with_attr(model, attr)
                 if module is None:
@@ -472,18 +452,25 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # Create SP config
-            sp_config = SequenceParallelConfig(
-                ulysses_degree=od_config.parallel_config.ulysses_degree,
-                ring_degree=od_config.parallel_config.ring_degree,
-            )
+            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
+            allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
+            if allgather_degree > 1:
+                sp_config = SequenceParallelConfig(
+                    allgather_degree=allgather_degree,
+                )
+                mode = "allgather_kv"
+            else:
+                sp_config = SequenceParallelConfig(
+                    ulysses_degree=od_config.parallel_config.ulysses_degree,
+                    ring_degree=od_config.parallel_config.ring_degree,
+                )
+                # Apply hooks according to the plan
+                mode = (
+                    "hybrid"
+                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
+                )
 
-            # Apply hooks according to the plan
-            mode = (
-                "hybrid"
-                if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-            )
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
                 f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
@@ -520,13 +507,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
-    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
-    "LTX23Pipeline": "get_ltx2_post_process_func",
-    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",

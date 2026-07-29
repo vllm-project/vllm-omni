@@ -159,6 +159,7 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -341,6 +342,7 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
@@ -459,12 +461,15 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import fields
 
@@ -12,54 +13,37 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
-    DiffusionRequestState,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    KVPrefetchJob,
     NewRequestData,
     RequestBatchSamplingParamsKey,
-    SamplingParamsKey,
-    SchedulerInterface,
+    SchedulerRequestState,
+    StepBatchSamplingParamsKey,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
+BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
+
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
-_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
-_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(RequestBatchSamplingParamsKey)) - {
+_STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "lora_int_id"
 }
 
 
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey:
-    """Build a batch-compatibility key from the request's sampling params."""
-    sampling = request.sampling_params
-    lora_request = getattr(sampling, "lora_request", None)
-    return SamplingParamsKey(
-        lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _SAMPLING_PARAMS_KEY_FIELD_NAMES},
-    )
-
-
-def get_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-    """Build a request-batch compatibility key from the request's sampling params."""
-    sampling = request.sampling_params
-    lora_request = getattr(sampling, "lora_request", None)
-    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-    return RequestBatchSamplingParamsKey(**key_kwargs)
-
-
-class _BaseScheduler(SchedulerInterface):
+class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers."""
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
-        self._request_states: dict[str, DiffusionRequestState] = {}
+        self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
-        self._running_sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+        self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
@@ -129,13 +113,13 @@ class _BaseScheduler(SchedulerInterface):
         # kv_sender_info (would target the wrong sender under multi-replica) or
         # one already finished/aborted (would consume its sender buffer for
         # nothing).
-        kv_prefetch_jobs: dict | None = None
+        kv_prefetch_job: KVPrefetchJob | None = None
         if self._prefetch_enabled and self._waiting:
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None and not nxt.is_finished():
                 sender_info = getattr(nxt.req, "kv_sender_info", None)
                 if sender_info:
-                    kv_prefetch_jobs = {
+                    kv_prefetch_job = {
                         "request_id": nxt.request_id,
                         "kv_sender_info": sender_info,
                     }
@@ -147,13 +131,17 @@ class _BaseScheduler(SchedulerInterface):
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
-            kv_prefetch_jobs=kv_prefetch_jobs,
+            kv_prefetch_job=kv_prefetch_job,
         )
 
         # update after schedule
         self._step_id += 1
         self._finished_req_ids.clear()
         return scheduler_output
+
+    @abstractmethod
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+        pass
 
     def has_requests(self) -> bool:
         return bool(self._waiting or self._running)
@@ -164,10 +152,10 @@ class _BaseScheduler(SchedulerInterface):
     def num_running_requests(self) -> int:
         return len(self._running)
 
-    def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
+    def get_request_state(self, request_id: str) -> SchedulerRequestState | None:
         return self._request_states.get(request_id)
 
-    def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
+    def pop_request_state(self, request_id: str) -> SchedulerRequestState | None:
         self._pop_extra_request_state(request_id)
         return self._request_states.pop(request_id, None)
 
@@ -262,21 +250,21 @@ class _BaseScheduler(SchedulerInterface):
     def _pop_extra_request_state(self, request_id: str) -> None:
         """Remove subclass-owned per-request state before popping request state."""
 
-    def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> DiffusionRequestState:
-        return DiffusionRequestState(
+    def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> SchedulerRequestState:
+        return SchedulerRequestState(
             request_id=request_id,
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
         )
 
-    def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:
             return True
 
         current_key = self._current_sampling_params_key()
         return current_key is not None and current_key == state.sampling_params_key
 
-    def _current_sampling_params_key(self) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
+    def _current_sampling_params_key(self) -> BatchSamplingParamsKey | None:
         if self._running_sampling_params_key is not None or not self._running:
             return self._running_sampling_params_key
         state = self._request_states.get(self._running[0])
@@ -285,5 +273,30 @@ class _BaseScheduler(SchedulerInterface):
 
     def _build_sampling_params_key(
         self, request: OmniDiffusionRequest
-    ) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
-        return get_sampling_params_key(request)
+    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
+        """Build a step-batch compatibility key from sampling parameters."""
+        sampling = request.sampling_params
+        # LoRA identity is optional on sampling params (and on test stubs).
+        lora_request = getattr(sampling, "lora_request", None)
+        return StepBatchSamplingParamsKey(
+            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+        )
+
+
+class SchedulerInterface(BaseScheduler):
+    """Deprecated compatibility base for custom scheduler injection.
+
+    Prefer subclassing :class:`BaseScheduler` directly. Subclassing this name
+    still works but emits a :class:`DeprecationWarning`.
+    """
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        import warnings
+
+        warnings.warn(
+            "SchedulerInterface is deprecated; subclass BaseScheduler instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init_subclass__(**kwargs)
