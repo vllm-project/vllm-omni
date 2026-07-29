@@ -424,7 +424,11 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             self.model_dir,
             revision=self.od_config.revision,
         )
-        self.model = HiDreamO1ImageTransformer(model_config)
+        self.model = HiDreamO1ImageTransformer(
+            model_config,
+            quant_config=self.od_config.quantization_config,
+            prefix=self.prefix,
+        )
 
         self._add_special_tokens(self.processor)
         self.tokenizer = (
