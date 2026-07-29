@@ -1,0 +1,122 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100",
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "daily-omni",
+        "dataset_path": "liarliar/Daily-Omni",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          1197
+        ],
+        "max_concurrency": [
+          10
+        ],
+        "no_oversample": true,
+        "trust_remote_code": true,
+        "daily_omni_inline_local_video": true,
+        "daily_omni_input_mode": "all",
+        "temperature": 0,
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "request_throughput": [
+            1.6842
+          ],
+          "mean_ttft_ms": [
+            1349.35
+          ],
+          "mean_tpot_ms": [
+            1.0
+          ],
+          "mean_e2el_ms": [
+            5926.09
+          ],
+          "mean_audio_ttfp_ms": [
+            3742.31
+          ],
+          "mean_audio_rtf": [
+            2.4641
+          ]
+        }
+      },
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          1088
+        ],
+        "max_concurrency": [
+          10
+        ],
+        "no_oversample": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "request_throughput": [
+            1.5732
+          ],
+          "mean_ttft_ms": [
+            145.14
+          ],
+          "mean_tpot_ms": [
+            1.0
+          ],
+          "mean_e2el_ms": [
+            6340.87
+          ],
+          "mean_audio_ttfp_ms": [
+            2885.08
+          ],
+          "mean_audio_rtf": [
+            1.4239
+          ]
+        }
+      }
+    ]
+  }
+]
