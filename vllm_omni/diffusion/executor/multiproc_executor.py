@@ -144,9 +144,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
 
             per_q_timeout = max(0.05, chunk_timeout / max(len(mqs), 1))
-            for mq in mqs:
+            start_idx = getattr(self, "_next_queue_idx", 0)
+            for offset in range(len(mqs)):
+                idx = (start_idx + offset) % len(mqs)
                 try:
-                    return mq.dequeue(timeout=per_q_timeout)
+                    result = mqs[idx].dequeue(timeout=per_q_timeout)
+                    self._next_queue_idx = (idx + 1) % len(mqs)
+                    return result
                 except (TimeoutError, zmq.error.Again):
                     continue
 
@@ -385,6 +389,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "at each step."
                 )
 
+            # 2. Validate action_mode: different modes execute different forward schedules
+            action_modes = set()
+            for nr in new_reqs:
+                ea = getattr(nr.req, "extra_args", None)
+                if ea and isinstance(ea, dict):
+                    action_modes.add(ea.get("action_mode"))
+            if len(action_modes) > 1:
+                raise ValueError(
+                    "DP multi-concurrency requires all concurrent requests to "
+                    f"share the same action_mode, got {action_modes}. Different "
+                    "modes execute different forward schedules, causing AllGather "
+                    "deadlock."
+                )
+
         if len(new_reqs) > 1:
             # DP multi-concurrency: send all requests in one broadcast RPC.
             # Each rank picks req[rank % len(reqs)] and computes independently.
@@ -566,17 +584,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 # num_responses replies, then sort by dp_rank tag to match
                 # results to requests.
                 tagged: list[tuple[int, Any]] = []
+                collected_errors: list[str] = []
                 for _ in range(num_responses):
                     response = self._dequeue_one_with_failure_polling(deadline, method)
                     try:
                         unpack_diffusion_output_shm(response)
                     except Exception as e:
                         logger.warning("SHM unpack failed (data may already be inline): %s", e)
-                    response = MultiprocDiffusionExecutor._handle_rpc_response(response)
-                    if isinstance(response, dict) and "dp_rank" in response:
-                        tagged.append((response["dp_rank"], response["output"]))
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        collected_errors.append(str(response.get("error", "unknown")))
                     else:
-                        tagged.append((len(tagged), response))
+                        response = MultiprocDiffusionExecutor._handle_rpc_response(response)
+                        if isinstance(response, dict) and "dp_rank" in response:
+                            tagged.append((response["dp_rank"], response["output"]))
+                        else:
+                            tagged.append((len(tagged), response))
+                if collected_errors:
+                    raise RuntimeError(f"Worker error: {collected_errors[0]}")
                 tagged.sort(key=lambda x: x[0])
                 responses = [r for _, r in tagged]
             else:

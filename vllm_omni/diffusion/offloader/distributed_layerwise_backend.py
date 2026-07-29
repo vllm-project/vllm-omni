@@ -17,21 +17,29 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
 
 import torch
 import torch.distributed
 from torch import nn
-from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
+from .block_discovery import get_blocks_from_dit
 from .module_collector import ModuleDiscovery
+from .offload_plan import OffloadPlan, get_offload_plan
+from .tensor_utils import (
+    dtype_size as _dtype_size,
+)
+from .tensor_utils import (
+    is_materialized_tensor,
+    make_offload_placeholder,
+    set_tensor_storage,
+)
 
 logger = init_logger(__name__)
 
@@ -40,57 +48,6 @@ logger = init_logger(__name__)
 # module.  Submodules larger than this are offloaded to save HBM; smaller
 # ones stay resident for lower latency.
 _ON_DEMAND_THRESHOLD_MB = 1024
-
-
-# ---------------------------------------------------------------------- #
-#  Declarative OffloadPlan                                               #
-# ---------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class OffloadPlan:
-    """Optional declarative metadata for distributed layerwise offload.
-
-    Models declare this as a class attribute ``_offload_plan`` on the
-    pipeline class.  When present, the offloader uses it instead of
-    heuristic block discovery, making it easier to support new models
-    without offload-specific logic in constructor or forward code.
-
-    If not declared, the offloader falls back to:
-    1. ``_layerwise_offload_blocks_attrs`` on each DiT module class.
-    2. Heuristic search for ``layers`` / ``blocks`` / ``h`` attributes.
-
-    Attributes:
-        block_attrs: Maps DiT path → tuple of block-list attribute names.
-            e.g. ``{"transformer": ("gen_layers",),
-                    "transformer.language_model": ("layers",)}``
-            When present, overrides ``_layerwise_offload_blocks_attrs``
-            for the named DiT paths.
-        offload_submodules: Maps child name → block-list attribute name,
-            for large non-DiT submodules within a DiT that should be
-            independently offloaded with their own hooks.
-            e.g. ``{"context_encoder": "layers"}``
-            When present, replaces heuristic search in
-            ``_try_layerwise_offload_submodule``.
-    """
-
-    block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    offload_submodules: dict[str, str] = field(default_factory=dict)
-
-
-def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:
-    """Retrieve the OffloadPlan declared by the pipeline, if any.
-
-    Checks ``pipeline._offload_plan`` (ClassVar on the pipeline class).
-    Returns ``None`` if not declared, signaling the offloader to use
-    fallback discovery.
-    """
-    return getattr(pipeline, "_offload_plan", None)
-
-
-def _dtype_size(dtype: torch.dtype) -> int:
-    """Return element size in bytes for a torch.dtype."""
-    return torch.empty(1, dtype=dtype).element_size()
 
 
 class DistributedLayerwiseOffloadHook(ModelHook):
@@ -143,8 +100,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.cpu_shards: dict[torch.dtype, torch.Tensor] = {}
         self.metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
 
-        # Current slot index (0 or 1)
+        # Current slot index (0 or 1).  Updated dynamically by the previous
+        # hook's prefetch_layer call via _prefetched_slot.  This ensures
+        # correct slot tracking for ALL block counts (including odd N).
         self.current_slot = 0
+        self._prefetched_slot: int | None = None
 
         # Backward link to previous hook for fallback (cache-dit skip)
         self._prev_hook: DistributedLayerwiseOffloadHook | None = None
@@ -183,35 +143,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
     # ------------------------------------------------------------------ #
     #  DTensor helpers (shared with LayerwiseOffloadHook)                 #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _is_dtensor(t: torch.Tensor) -> bool:
-        return isinstance(t, DTensor)
-
-    @staticmethod
-    def _set_tensor_storage(target: torch.Tensor, value: torch.Tensor) -> None:
-        if DistributedLayerwiseOffloadHook._is_dtensor(target):
-            target._local_tensor = value
-        else:
-            target.data = value
-
-    @staticmethod
-    def _make_offload_placeholder(tensor: torch.Tensor) -> torch.Tensor:
-        if DistributedLayerwiseOffloadHook._is_dtensor(tensor):
-            local_shape = tuple(tensor.to_local().shape)
-            return torch.empty(local_shape, device="meta", dtype=tensor.dtype)
-        return torch.empty((0,), device=tensor.device, dtype=tensor.dtype)
-
-    @staticmethod
-    def _is_materialized_tensor(t: torch.Tensor) -> bool:
-        if DistributedLayerwiseOffloadHook._is_dtensor(t):
-            local_t = t.to_local()
-            return not local_t.is_meta
-        return not t.is_meta and t.data.numel() > 0
-
-    # ------------------------------------------------------------------ #
-    #  Lifecycle                                                          #
     # ------------------------------------------------------------------ #
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
@@ -328,9 +259,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     shard[dst_start:dst_end].copy_(local_tensor.flatten()[src_start:src_end])
 
                 # Replace original tensor with placeholder (frees CPU storage)
-                DistributedLayerwiseOffloadHook._set_tensor_storage(
+                set_tensor_storage(
                     original_tensor,
-                    DistributedLayerwiseOffloadHook._make_offload_placeholder(original_tensor),
+                    make_offload_placeholder(original_tensor),
                 )
                 current_offset += numel
 
@@ -359,7 +290,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def is_materialized(self) -> bool:
         """Check whether this block's parameters hold real data on device."""
         for param in self.block_parameters.values():
-            return DistributedLayerwiseOffloadHook._is_materialized_tensor(param)
+            return is_materialized_tensor(param)
         return True
 
     # ------------------------------------------------------------------ #
@@ -409,6 +340,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
+        self._prefetched_slot = slot
 
         # Stamp the slot with this hook's group ID so that group-first
         # hooks can detect whether another group has overwritten the slot.
@@ -417,7 +349,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         # Re-point using cached metadata (avoids per-layer dict lookups).
         for target, dtype, offset, numel, shape in self._cached_repoint[slot]:
-            DistributedLayerwiseOffloadHook._set_tensor_storage(
+            set_tensor_storage(
                 target,
                 gpu_weights[dtype][offset : offset + numel].view(shape),
             )
@@ -452,13 +384,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self._prefetch_done = None
 
         for _, param in self.block_parameters.items():
-            DistributedLayerwiseOffloadHook._set_tensor_storage(
-                param, DistributedLayerwiseOffloadHook._make_offload_placeholder(param)
-            )
+            set_tensor_storage(param, make_offload_placeholder(param))
         for _, buf in self.block_buffers.items():
-            DistributedLayerwiseOffloadHook._set_tensor_storage(
-                buf, DistributedLayerwiseOffloadHook._make_offload_placeholder(buf)
-            )
+            set_tensor_storage(buf, make_offload_placeholder(buf))
 
     # ------------------------------------------------------------------ #
     #  ModelHook interface                                                #
@@ -496,11 +424,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         self.offload_layer()
-        # Do NOT swap current_slot here.  The slot assignment is fixed at
-        # init time (i % 2) so that the circular prefetch (last block →
-        # first block) writes to the correct slot.  Swapping would make
-        # block 0 read slot 1 in step 2 while block 63 prefetched into
-        # slot 0 — causing garbled output.
         return output
 
 
@@ -621,8 +544,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 weight_map[key] = os.path.join(idx_dir, filename)
 
         if not weight_map:
-            logger.warning("No safetensors index found at %s", model_path)
-            return
+            single_files = glob.glob(os.path.join(model_path, "**", "model.safetensors"), recursive=True)
+            for sf in single_files:
+                from safetensors import safe_open as _safe_open
+
+                f = _safe_open(sf, framework="pt", device="cpu")
+                for key in f.keys():
+                    weight_map[key] = sf
+                logger.info("Found single-file safetensors: %s (%d keys)", sf, len(f.keys()))
+
+        if not weight_map:
+            raise RuntimeError(
+                "Distributed layerwise offload could not find safetensors "
+                f"weights at {model_path}. Expected *.safetensors.index.json "
+                "or model.safetensors. Ensure the checkpoint path is correct."
+            )
 
         logger.info("Loading DiT weights via mmap (meta → page cache, no RSS): %d keys", len(weight_map))
 
@@ -737,7 +673,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # to _shard_and_pin) from non-block params (loaded here as mmap views).
         block_module_ids: set[int] = set()
         for dit_module in modules.dits:
-            blocks_attr_names, blocks = self.get_blocks_from_dit(dit_module)
+            blocks_attr_names, blocks = get_blocks_from_dit(dit_module)
             for block in blocks:
                 block_module_ids.update(id(m) for m in block.modules())
 
@@ -798,7 +734,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         block_loaded = 0
         for dit_idx, dit_module in enumerate(modules.dits):
             dit_name = modules.dit_names[dit_idx]
-            blocks_attr_names, blocks = self.get_blocks_from_dit(dit_module)
+            blocks_attr_names, blocks = get_blocks_from_dit(dit_module)
             if not blocks:
                 continue
 
@@ -1123,7 +1059,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             sub_hooks[i]._prev_hook = sub_hooks[i - 1]
         # Assign slots in list order: sub_hooks = [last_hook, block0, ..., blockN-2]
         # This ensures last_hook.current_slot != block0_hook.current_slot,
-        # so the circular prefetch (last_hook → block0) writes to a
+        # so the circular prefetch (last_hook -> block0) writes to a
         # different slot than block0 reads from.  Correct for ALL N.
         for i, hook in enumerate(sub_hooks):
             hook.current_slot = i % 2
@@ -1164,7 +1100,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # DLO+AllGather is active — regardless of whether the model was
         # created on meta or not.
         if self.config.dlo_use_allgather and self.dp_size > 1:
-            self._load_weights_via_mmap(pipeline, modules)
+            _has_remap = any(callable(getattr(type(m), "_remap_ckpt_key", None)) for m in pipeline.modules())
+            if _has_remap:
+                self._load_weights_via_mmap(pipeline, modules)
+            else:
+                logger.info("Weights already loaded via regular loader — skipping mmap (no _remap_ckpt_key)")
 
         # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
         # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
@@ -1193,7 +1133,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             dit_name = modules.dit_names[i]
             logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
 
-            blocks_attr_names, blocks = DistributedLayerwiseOffloadBackend.get_blocks_from_dit(dit_module)
+            blocks_attr_names, blocks = get_blocks_from_dit(dit_module)
 
             if not blocks:
                 logger.warning(
@@ -1332,11 +1272,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for i in range(len(block_hooks)):
                 block_hooks[i]._prev_hook = block_hooks[i - 1]
 
-            # Assign slots in list order (correct for ALL N, including odd).
-            # block_hooks = [last_hook, block0_hook, ..., blockN-2_hook]
-            # last_hook(0) and block0_hook(1) get different slots →
-            # circular prefetch (last_hook → block0) writes to a
-            # different slot than block0 reads from.
+            # Assign slots in list order: block_hooks = [last_hook, block0, ..., blockN-2]
+            # This ensures last_hook.current_slot != block0_hook.current_slot,
+            # so the circular prefetch (last_hook -> block0) writes to a
+            # different slot than block0 reads from.  Correct for ALL N.
             for i, hook in enumerate(block_hooks):
                 hook.current_slot = i % 2
 
@@ -1531,79 +1470,3 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_shard_sizes.items()},
         )
         return shared_shard_buffers
-
-    # ------------------------------------------------------------------ #
-    #  Block discovery (reuses LayerWiseOffloadBackend logic)            #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def get_blocks_attr_names(model: nn.Module) -> list[str]:
-        """Get block attribute names from model class."""
-        attrs: list[str] = getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
-
-        if not attrs:
-            old_attr = getattr(model.__class__, "_layerwise_offload_blocks_attr", None)
-            if old_attr is not None:
-                logger.warning(
-                    "'_layerwise_offload_blocks_attr' is deprecated, "
-                    "please use '_layerwise_offload_blocks_attrs' instead. "
-                    "Example: _layerwise_offload_blocks_attrs = ['blocks']"
-                )
-                attrs = [old_attr] if isinstance(old_attr, str) else list(old_attr)
-
-        return attrs
-
-    @staticmethod
-    def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
-        if not hasattr(model.__class__, "_layerwise_offload_blocks_attrs"):
-            setattr(model.__class__, "_layerwise_offload_blocks_attrs", names)
-
-    @staticmethod
-    def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
-        """Retrieve blocks and attribute names from provided DiT model."""
-        blocks_attr_names = DistributedLayerwiseOffloadBackend.get_blocks_attr_names(model)
-        if not blocks_attr_names:
-            logger.warning(
-                f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
-                "skipping distributed layerwise offloading"
-            )
-            return [], []
-
-        blocks: list[nn.Module] = []
-        for name in blocks_attr_names:
-            attr = getattr(model, name, None)
-            if attr is None:
-                raise AttributeError(
-                    f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
-                    f"does not exist on model {model.__class__.__name__}"
-                )
-            try:
-                attr_iter = iter(attr)
-            except TypeError:
-                if isinstance(attr, nn.Module):
-                    logger.warning(
-                        "Attribute '%s' on %s is not iterable; treating it as one block.",
-                        name,
-                        model.__class__.__name__,
-                    )
-                    blocks.append(attr)
-                    continue
-
-                logger.warning(
-                    "Attribute '%s' on %s is not iterable (got %s); skipping it.",
-                    name,
-                    model.__class__.__name__,
-                    type(attr).__name__,
-                )
-            else:
-                blocks.extend(attr_iter)
-
-        if not blocks:
-            logger.warning(
-                "No blocks found in %s for %s, skipping distributed layerwise offloading",
-                blocks_attr_names,
-                model.__class__.__name__,
-            )
-            return [], []
-
-        return blocks_attr_names, blocks

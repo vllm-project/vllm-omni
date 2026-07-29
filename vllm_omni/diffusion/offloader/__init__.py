@@ -8,19 +8,26 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, OffloadStrategy
+from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
-    OffloadPlan,
     apply_distributed_block_hook,
-    get_offload_plan,
     remove_distributed_block_hook,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
+from .offload_plan import OffloadPlan, get_offload_plan
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
     remove_sequential_offload,
+)
+from .tensor_utils import (
+    dtype_size,
+    is_dtensor,
+    is_materialized_tensor,
+    make_offload_placeholder,
+    set_tensor_storage,
 )
 
 logger = init_logger(__name__)
@@ -40,6 +47,14 @@ __all__ = [
     "remove_distributed_block_hook",
     "get_offload_backend",
     "get_offload_plan",
+    "get_blocks_attr_names",
+    "get_blocks_from_dit",
+    "set_blocks_attr_names",
+    "dtype_size",
+    "is_dtensor",
+    "is_materialized_tensor",
+    "make_offload_placeholder",
+    "set_tensor_storage",
 ]
 
 
