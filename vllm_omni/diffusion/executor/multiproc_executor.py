@@ -389,18 +389,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "at each step."
                 )
 
-            # 2. Validate action_mode: different modes execute different forward schedules
-            action_modes = set()
+            # Validate that all concurrent requests share identical extra_args.
+            # Any difference (action_mode, CFG settings, duration templates, etc.)
+            # can change the number of transformer forwards per denoise step,
+            # causing AllGather deadlock.  Instead of checking individual fields,
+            # require the entire extra_args dict to be the same across all
+            # concurrent requests — a whitelist approach that is robust to
+            # future additions.
+            extra_args_signatures: set = set()
             for nr in new_reqs:
                 ea = getattr(nr.req, "extra_args", None)
                 if ea and isinstance(ea, dict):
-                    action_modes.add(ea.get("action_mode"))
-            if len(action_modes) > 1:
+                    extra_args_signatures.add(tuple(sorted(ea.items())))
+                else:
+                    extra_args_signatures.add(None)
+            if len(extra_args_signatures) > 1:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to "
-                    f"share the same action_mode, got {action_modes}. Different "
-                    "modes execute different forward schedules, causing AllGather "
-                    "deadlock."
+                    "share identical extra_args. Different extra_args "
+                    "(action_mode, CFG, templates, etc.) can change the forward "
+                    "schedule and cause AllGather deadlock. "
+                    f"Got {len(extra_args_signatures)} distinct extra_args."
                 )
 
         if len(new_reqs) > 1:
