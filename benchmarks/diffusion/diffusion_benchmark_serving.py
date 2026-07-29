@@ -1268,6 +1268,8 @@ async def benchmark(args):
 
     print("Loading requests...")
     requests_list = dataset.get_requests()
+    for request in requests_list:
+        request.request_timeout = args.request_timeout
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
@@ -1297,8 +1299,11 @@ async def benchmark(args):
 
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
+    client_timeout = aiohttp.ClientTimeout(
+        total=None if args.request_timeout == 0 else args.request_timeout
+    )
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
         warmup_pairs = await _run_warmups(
             requests_list=requests_list,
             args=args,
@@ -1569,6 +1574,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "Total timeout in seconds for each generation request. "
+            "Set to 0 to disable the timeout. Default: 300."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.request_timeout < 0:
+        parser.error("--request-timeout must be greater than or equal to 0")
     asyncio.run(benchmark(args))

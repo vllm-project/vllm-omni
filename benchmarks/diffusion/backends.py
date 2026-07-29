@@ -26,6 +26,7 @@ class RequestFuncInput:
     fps: int | None = None
     timestamp: float | None = None
     slo_ms: float | None = None
+    request_timeout: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     video_paths: list[str] | None = None
@@ -285,8 +286,27 @@ async def async_request_openai_image_generations(
         "Authorization": "Bearer EMPTY",
     }
 
+    if input.request_timeout is None:
+        request_timeout = session.timeout
+    else:
+        request_timeout = aiohttp.ClientTimeout(
+            total=(
+                None
+                if input.request_timeout == 0
+                else float(input.request_timeout)
+            ),
+            connect=None,
+            sock_connect=None,
+            sock_read=None,
+        )
+
     try:
-        async with session.post(input.api_url, json=payload, headers=headers) as response:
+        async with session.post(
+            input.api_url,
+            json=payload,
+            headers=headers,
+            timeout=request_timeout,
+        ) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
