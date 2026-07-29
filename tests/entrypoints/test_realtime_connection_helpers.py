@@ -48,8 +48,21 @@ def tool_call_conn() -> RealtimeConnection:
     # Tool calling is only supported with async_chunk off, so that is the default
     # here; tests that care about the other mode set it explicitly.
     conn.serving = _FakeServing()
-    # handle_event's session.update branch now also assigns _speaker.
+    # handle_event's session.update branch now also assigns these.
     conn._speaker = None
+    conn._instructions = None
+    return conn
+
+
+@pytest.fixture
+def instructions_conn() -> RealtimeConnection:
+    conn = RealtimeConnection.__new__(RealtimeConnection)
+    conn._instructions = None
+    # ...and the siblings session.update also assigns.
+    conn._tools = None
+    conn._speaker = None
+    # session.update now consults serving.model_config for the async_chunk gate.
+    conn.serving = _FakeServing()
     return conn
 
 
@@ -57,8 +70,9 @@ def tool_call_conn() -> RealtimeConnection:
 def speaker_conn() -> RealtimeConnection:
     conn = RealtimeConnection.__new__(RealtimeConnection)
     conn._speaker = None
-    # ...and _tools, so a session.update event exercises the whole branch.
+    # ...and the siblings, so a session.update event exercises the whole branch.
     conn._tools = None
+    conn._instructions = None
     # session.update now consults serving.model_config for the async_chunk gate.
     conn.serving = _FakeServing()
     return conn
@@ -222,6 +236,43 @@ class TestRealtimeConnectionSpeakerRouting:
         base_handle_event.assert_awaited_once_with(event)
 
 
+class TestRealtimeConnectionInstructionsRouting:
+    """handle_event's instructions (system prompt) addition to session.update."""
+
+    def _patch_base_handle_event(self, mocker):
+        return mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+
+    def test_session_update_captures_instructions(self, instructions_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+        event = {
+            "type": "session.update",
+            "model": "qwen3-omni",
+            "instructions": "Only use tools directly relevant to what the user asked.",
+        }
+
+        asyncio.run(instructions_conn.handle_event(event))
+
+        assert instructions_conn._instructions == "Only use tools directly relevant to what the user asked."
+
+    def test_session_update_without_instructions_leaves_existing_value_untouched(
+        self, instructions_conn, mocker
+    ) -> None:
+        self._patch_base_handle_event(mocker)
+        instructions_conn._instructions = "existing"
+
+        asyncio.run(instructions_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
+
+        assert instructions_conn._instructions == "existing"
+
+    def test_unrelated_event_types_still_delegate_to_base(self, instructions_conn, mocker) -> None:
+        base_handle_event = self._patch_base_handle_event(mocker)
+        event = {"type": "input_audio_buffer.commit", "final": True}
+
+        asyncio.run(instructions_conn.handle_event(event))
+
+        base_handle_event.assert_awaited_once_with(event)
+
+
 class TestRenderTokenPromptReattachesAudio:
     """Regression test for a real bug: the tool-call continuation re-submitted
     the engine's POST-expansion `output.prompt_token_ids` as a bare
@@ -288,8 +339,9 @@ class TestRenderTokenPromptReattachesAudio:
         the continuation has something audio-bearing to splice onto."""
         conn = self._conn(mocker)
         conn._tools = None
-        # _buffer_realtime_audio_with_tools now also reads _speaker.
+        # _buffer_realtime_audio_with_tools now also reads _speaker/_instructions.
         conn._speaker = None
+        conn._instructions = None
         conn._turn_prompt = None
         audio = {"audio": np.zeros(8000, dtype=np.float32)}
         prompt = TokensPrompt(prompt_token_ids=[10, 11], multi_modal_data=audio)

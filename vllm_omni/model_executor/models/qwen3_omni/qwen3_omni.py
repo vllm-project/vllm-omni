@@ -229,6 +229,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         model_config: ModelConfig,
         tools: list[dict[str, Any]] | None = None,
         speaker: str | None = None,
+        instructions: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -243,14 +244,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        if tools:
-            # Render through the model's own chat template with `tools=` so the
-            # thinker gets the <tools>...</tools> system preamble and the
-            # <tool_call></tool_call> output instructions it was trained on
-            # (see chat_template.json) - this is the same tool-calling format
-            # /v1/chat/completions already supports for this checkpoint, just
-            # never previously wired into the realtime audio-in path. When
-            # `tools` is empty this renders byte-identical to the plain
+        if tools or instructions:
+            # Render through the model's own chat template (rather than the
+            # hardcoded f-string below) so the thinker gets the <tools>...</tools>
+            # system preamble and <tool_call></tool_call> output format it was
+            # trained on (see chat_template.json) when tools are present, and/or
+            # an actual system message when instructions are present - this is
+            # the same mechanism /v1/chat/completions already supports for this
+            # checkpoint, just never previously wired into the realtime audio-in
+            # path. When both are empty this renders byte-identical to the plain
             # f-string below, so that path is untouched to keep this change
             # scoped to the new capability.
             #
@@ -274,7 +276,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             prompt_template = safe_apply_chat_template(
                 model_config,
                 tokenizer,
-                [{"role": "user", "content": audio_placeholder}],
+                ([{"role": "system", "content": instructions}] if instructions else [])
+                + [{"role": "user", "content": audio_placeholder}],
                 tools=tools,
                 chat_template=processor.chat_template,
                 add_generation_prompt=True,

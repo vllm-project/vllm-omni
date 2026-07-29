@@ -79,6 +79,10 @@ class RealtimeConnection(VllmRealtimeConnection):
     no way to select a voice at all - every session silently used whichever
     key HF's `talker_config.speaker_id` lists first for the checkpoint.
 
+    Instructions: `session.update` gains an optional `instructions` field
+    (system prompt), mirroring OpenAI's Realtime API. Previously there was
+    no way to set a system prompt at all for /v1/realtime.
+
     Scope and limitations of the tool-calling path:
 
     - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
@@ -116,6 +120,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         # Consecutive tool-call rounds in this turn, bounded by MAX_TOOL_ROUNDS.
         self._tool_rounds = 0
         self._speaker: str | None = None
+        self._instructions: str | None = None
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -142,6 +147,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             speaker = event.get("voice") or event.get("speaker")
             if speaker is not None:
                 self._speaker = speaker
+            instructions = event.get("instructions")
+            if instructions is not None:
+                self._instructions = instructions
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
@@ -227,14 +235,20 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools`/`self._speaker` through to the model's
+        threads `self._tools`/`self._speaker`/`self._instructions` through
+        to the model's
         `buffer_realtime_audio`. The base class's `transcribe_realtime` has a
         fixed (audio_stream, input_stream, model_config) call signature with
         no seam for extra per-connection state like these, so this
         reimplements its (short) body directly rather than patching upstream
         vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, self.serving.model_config, tools=self._tools, speaker=self._speaker
+            audio_stream,
+            input_stream,
+            self.serving.model_config,
+            tools=self._tools,
+            speaker=self._speaker,
+            instructions=self._instructions,
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
