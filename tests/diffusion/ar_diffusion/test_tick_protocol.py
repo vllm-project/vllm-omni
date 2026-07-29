@@ -27,10 +27,7 @@ def test_tick_round_trip_preserves_identity_and_control_snapshot() -> None:
         ),
     )
 
-    restored = ARDiffusionTickRequest.from_extra_args(
-        tick.to_extra_args(),
-        request_id=tick.request_id,
-    )
+    restored = ARDiffusionTickRequest.from_extra_args(tick.to_extra_args())
 
     assert restored == tick
     assert ARDiffusionChunkMetadata.from_tick(tick).to_dict() == {
@@ -68,25 +65,44 @@ def test_tick_rejects_invalid_identity(
         ARDiffusionTickRequest(**values)
 
 
-def test_tick_rejects_request_id_mismatch() -> None:
-    extra_args = ARDiffusionTickRequest(
+def test_tick_snapshot_is_detached_and_deeply_immutable() -> None:
+    payload = {"samples": [{"keys": ["w"]}]}
+    event_ids = [1, 2]
+    controls = [
+        ARDiffusionControlInput(
+            track="camera",
+            schema="example.camera.v1",
+            data=payload,
+        )
+    ]
+    tick = ARDiffusionTickRequest(
         session_id="world-1",
         request_id="request-a",
         chunk_index=0,
-    ).to_extra_args()
+        applied_event_ids=event_ids,  # type: ignore[arg-type]
+        controls=controls,  # type: ignore[arg-type]
+    )
+    serialized = tick.to_extra_args()
 
-    with pytest.raises(ValueError, match="must match"):
-        ARDiffusionTickRequest.from_extra_args(
-            extra_args,
-            request_id="request-b",
-        )
+    payload["samples"][0]["keys"].append("j")
+    event_ids.append(3)
+    controls.clear()
+    serialized["ar_diffusion_tick"]["controls"][0]["data"]["samples"][0]["keys"].append("k")
+
+    assert tick.applied_event_ids == (1, 2)
+    assert isinstance(tick.controls, tuple)
+    assert tick.to_extra_args()["ar_diffusion_tick"]["controls"] == [
+        {
+            "track": "camera",
+            "schema": "example.camera.v1",
+            "data": {"samples": [{"keys": ["w"]}]},
+        }
+    ]
+    with pytest.raises(TypeError):
+        tick.controls[0].data["samples"] = ()  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        tick.controls[0].data["samples"][0]["keys"].append("j")
 
 
 def test_legacy_request_has_no_typed_tick() -> None:
-    assert (
-        ARDiffusionTickRequest.from_extra_args(
-            {"session_id": "legacy"},
-            request_id="request-1",
-        )
-        is None
-    )
+    assert ARDiffusionTickRequest.from_extra_args({"session_id": "legacy"}) is None

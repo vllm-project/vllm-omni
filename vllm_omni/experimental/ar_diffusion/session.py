@@ -56,33 +56,11 @@ class ARDiffusionSessionStatus(str, Enum):
     CLOSED = "closed"
 
 
-def _copy_transport_value(value: Any, *, path: str) -> Any:
-    """Copy JSON-like transport data without retaining tensors or objects."""
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, Mapping):
-        copied: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"{path} mapping keys must be strings.")
-            copied[key] = _copy_transport_value(item, path=f"{path}.{key}")
-        return copied
-    if isinstance(value, list):
-        return [_copy_transport_value(item, path=f"{path}[]") for item in value]
-    if isinstance(value, tuple):
-        return tuple(_copy_transport_value(item, path=f"{path}[]") for item in value)
-    raise ValueError(
-        f"{path} must contain only transport-safe mappings, sequences, and scalar values; got {type(value).__name__}."
-    )
-
-
 def _copy_control(control: ARDiffusionControlInput) -> ARDiffusionControlInput:
-    data = _copy_transport_value(control.data, path=f"control[{control.track!r}].data")
-    assert isinstance(data, dict)
     return ARDiffusionControlInput(
         track=control.track,
         schema=control.schema,
-        data=data,
+        data=control.data,
     )
 
 

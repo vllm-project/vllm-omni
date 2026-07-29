@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 AR_DIFFUSION_TICK_KEY = "ar_diffusion_tick"
@@ -26,6 +27,33 @@ def _non_negative_int(value: object, *, field: str) -> int:
     return value
 
 
+def _freeze_transport_value(value: Any, *, path: str) -> Any:
+    """Copy JSON-like transport data into recursively immutable containers."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} mapping keys must be strings.")
+            frozen[key] = _freeze_transport_value(item, path=f"{path}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_freeze_transport_value(item, path=f"{path}[]") for item in value)
+    raise ValueError(
+        f"{path} must contain only transport-safe mappings, sequences, and scalar values; got {type(value).__name__}."
+    )
+
+
+def _thaw_transport_value(value: Any) -> Any:
+    """Return a detached JSON-serializable copy of an immutable snapshot."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_transport_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_transport_value(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class ARDiffusionControlInput:
     """One model-defined control track in a chunk-boundary snapshot."""
@@ -39,12 +67,17 @@ class ARDiffusionControlInput:
         _non_empty_string(self.schema, field="control.schema")
         if not isinstance(self.data, Mapping):
             raise ValueError("control.data must be a mapping.")
+        object.__setattr__(
+            self,
+            "data",
+            _freeze_transport_value(self.data, path=f"control[{self.track!r}].data"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "track": self.track,
             "schema": self.schema,
-            "data": dict(self.data),
+            "data": _thaw_transport_value(self.data),
         }
 
     @classmethod
@@ -92,8 +125,11 @@ class ARDiffusionTickRequest:
         )
         if event_ids != tuple(sorted(set(event_ids))):
             raise ValueError("applied_event_ids must be unique and strictly increasing.")
-        if any(not isinstance(control, ARDiffusionControlInput) for control in self.controls):
+        controls = tuple(self.controls)
+        if any(not isinstance(control, ARDiffusionControlInput) for control in controls):
             raise ValueError("controls must contain ARDiffusionControlInput values.")
+        object.__setattr__(self, "applied_event_ids", event_ids)
+        object.__setattr__(self, "controls", controls)
 
     def to_extra_args(self) -> dict[str, Any]:
         """Serialize the tick under one namespaced ``extra_args`` key."""
@@ -114,8 +150,6 @@ class ARDiffusionTickRequest:
     def from_extra_args(
         cls,
         extra_args: Mapping[str, Any] | None,
-        *,
-        request_id: str,
     ) -> ARDiffusionTickRequest | None:
         """Parse a typed tick, returning ``None`` for legacy AR requests."""
         if extra_args is None or AR_DIFFUSION_TICK_KEY not in extra_args:
@@ -123,9 +157,6 @@ class ARDiffusionTickRequest:
         value = extra_args[AR_DIFFUSION_TICK_KEY]
         if not isinstance(value, Mapping):
             raise ValueError(f"{AR_DIFFUSION_TICK_KEY} must be a mapping.")
-        embedded_request_id = value.get("request_id", request_id)
-        if embedded_request_id != request_id:
-            raise ValueError("ar_diffusion_tick.request_id must match OmniDiffusionRequest.request_id.")
         raw_event_ids = value.get("applied_event_ids", ())
         raw_controls = value.get("controls", ())
         if not isinstance(raw_event_ids, Sequence) or isinstance(raw_event_ids, (str, bytes)):
@@ -134,7 +165,7 @@ class ARDiffusionTickRequest:
             raise ValueError("controls must be a sequence.")
         return cls(
             session_id=value.get("session_id"),  # type: ignore[arg-type]
-            request_id=request_id,
+            request_id=value.get("request_id"),  # type: ignore[arg-type]
             chunk_index=value.get("chunk_index"),  # type: ignore[arg-type]
             applied_event_ids=tuple(raw_event_ids),
             prompt=value.get("prompt"),  # type: ignore[arg-type]

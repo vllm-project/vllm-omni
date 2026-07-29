@@ -195,8 +195,10 @@ async def test_composite_event_is_isolated_and_queue_admission_is_atomic() -> No
     await session.next_chunk()
     assert consumer.ticks[0].applied_event_ids == (5,)
     assert consumer.ticks[0].prompt == "new prompt"
-    assert consumer.ticks[0].controls[0].data == {"keys": ["left"]}
-    assert consumer.ticks[0].controls[1].data == {"samples": [{"x": 1.0}]}
+    assert consumer.ticks[0].controls[0].data["keys"] == ("left",)
+    assert consumer.ticks[0].controls[1].data["samples"] == ({"x": 1.0},)
+    assert consumer.ticks[0].controls[0].to_dict()["data"] == {"keys": ["left"]}
+    assert consumer.ticks[0].controls[1].to_dict()["data"] == {"samples": [{"x": 1.0}]}
 
 
 def test_event_rejects_duplicate_tracks_and_non_transport_payloads() -> None:
@@ -209,19 +211,12 @@ def test_event_rejects_duplicate_tracks_and_non_transport_payloads() -> None:
             ),
         )
 
-    session, _, _ = make_session()
-    event = ARDiffusionSessionEvent(
-        event_id=1,
-        controls=(
-            ARDiffusionControlInput(
-                track="camera",
-                schema="example.camera.v1",
-                data={"object": object()},
-            ),
-        ),
-    )
     with pytest.raises(ValueError, match="transport-safe"):
-        asyncio.run(session.accept_event(event))
+        ARDiffusionControlInput(
+            track="camera",
+            schema="example.camera.v1",
+            data={"object": object()},
+        )
 
 
 @pytest.mark.asyncio
