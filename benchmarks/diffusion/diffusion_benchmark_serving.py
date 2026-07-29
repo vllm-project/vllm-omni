@@ -1578,9 +1578,7 @@ if __name__ == "__main__":
         "--request-timeout",
         type=float,
         default=300.0,
-        help=(
-            "Total timeout in seconds for each generation request. Set to 0 to disable the timeout. Default: 300."
-        ),
+        help="Total timeout in seconds for each generation request. Set to 0 to disable the timeout. Default: 300.",
     )
 
     args = parser.parse_args()
