@@ -57,12 +57,16 @@ class FakeLifecycle:
     def __init__(self) -> None:
         self.resets: list[str] = []
         self.closes: list[str] = []
+        self.close_failures_remaining = 0
 
     async def reset_session(self, session_id: str) -> None:
         self.resets.append(session_id)
 
     async def close_session(self, session_id: str) -> None:
         self.closes.append(session_id)
+        if self.close_failures_remaining:
+            self.close_failures_remaining -= 1
+            raise RuntimeError("fake close failed")
 
 
 class FailingCommitReducer:
@@ -365,6 +369,59 @@ async def test_reset_close_and_disconnect_reach_lifecycle_boundary() -> None:
     await manager.disconnect("world-disconnect")
     assert disconnected.status is ARDiffusionSessionStatus.CLOSED
     assert lifecycle.closes[-1] == "world-disconnect"
+
+
+@pytest.mark.asyncio
+async def test_failed_close_retains_tombstone_until_cleanup_retry_succeeds() -> None:
+    consumer = FakeTickConsumer()
+    lifecycle = FakeLifecycle()
+    lifecycle.close_failures_remaining = 1
+    manager = ARDiffusionSessionManager(
+        tick_consumer=consumer,
+        lifecycle=lifecycle,
+        max_pending_events=4,
+    )
+    session = await manager.create_session("world-close-retry")
+
+    with pytest.raises(RuntimeError, match="fake close failed"):
+        await manager.close_session("world-close-retry")
+
+    assert session.status is ARDiffusionSessionStatus.CLEANUP_FAILED
+    assert await manager.get_session("world-close-retry") is session
+    with pytest.raises(ARDiffusionSessionStateError, match="already exists"):
+        await manager.create_session("world-close-retry")
+    with pytest.raises(ARDiffusionSessionStateError, match="cleanup_failed"):
+        await manager.reset_session("world-close-retry")
+
+    await manager.close_session("world-close-retry")
+
+    assert lifecycle.closes == ["world-close-retry", "world-close-retry"]
+    assert session.status is ARDiffusionSessionStatus.CLOSED
+    with pytest.raises(ARDiffusionSessionStateError, match="does not exist"):
+        await manager.get_session("world-close-retry")
+    recreated = await manager.create_session("world-close-retry")
+    assert recreated is not session
+
+
+@pytest.mark.asyncio
+async def test_failed_disconnect_retains_session_for_explicit_cleanup_retry() -> None:
+    lifecycle = FakeLifecycle()
+    lifecycle.close_failures_remaining = 1
+    manager = ARDiffusionSessionManager(
+        tick_consumer=FakeTickConsumer(),
+        lifecycle=lifecycle,
+        max_pending_events=4,
+    )
+    session = await manager.create_session("world-disconnect-retry")
+
+    with pytest.raises(RuntimeError, match="fake close failed"):
+        await manager.disconnect("world-disconnect-retry")
+
+    assert session.status is ARDiffusionSessionStatus.CLEANUP_FAILED
+    assert await manager.get_session("world-disconnect-retry") is session
+
+    await manager.close_session("world-disconnect-retry")
+    assert session.status is ARDiffusionSessionStatus.CLOSED
 
 
 class FakeRPCClient:

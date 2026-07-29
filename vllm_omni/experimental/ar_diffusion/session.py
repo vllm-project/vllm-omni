@@ -52,6 +52,7 @@ class ARDiffusionSessionStatus(str, Enum):
     RESETTING = "resetting"
     FAILED = "failed"
     CLOSING = "closing"
+    CLEANUP_FAILED = "cleanup_failed"
     CLOSED = "closed"
 
 
@@ -511,17 +512,19 @@ class ARDiffusionSession(Generic[TickOutputT]):
                 self._status = ARDiffusionSessionStatus.ACTIVE
 
     async def close(self) -> None:
-        """Close worker state. The local session closes even if cleanup fails."""
+        """Close worker state, retaining a tombstone until cleanup succeeds."""
         async with self._tick_lock:
             async with self._state_lock:
                 if self._status is ARDiffusionSessionStatus.CLOSED:
                     return
-                if self._status is ARDiffusionSessionStatus.CLOSING:
-                    return
                 self._status = ARDiffusionSessionStatus.CLOSING
             try:
                 await self._lifecycle.close_session(self.session_id)
-            finally:
+            except BaseException:
+                async with self._state_lock:
+                    self._status = ARDiffusionSessionStatus.CLEANUP_FAILED
+                raise
+            else:
                 async with self._state_lock:
                     self._pending_events.clear()
                     self._prompt = None
@@ -587,12 +590,10 @@ class ARDiffusionSessionManager(Generic[TickOutputT]):
 
     async def close_session(self, session_id: str) -> None:
         session = await self.get_session(session_id)
-        try:
-            await session.close()
-        finally:
-            async with self._lock:
-                if self._sessions.get(session_id) is session:
-                    self._sessions.pop(session_id)
+        await session.close()
+        async with self._lock:
+            if self._sessions.get(session_id) is session:
+                self._sessions.pop(session_id)
 
     async def disconnect(self, session_id: str) -> None:
         """Release the owning worker route when its transport disconnects."""
