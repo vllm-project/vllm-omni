@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -545,7 +546,7 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_async_omni_internal_request_id_reaches_engine_exactly(monkeypatch: pytest.MonkeyPatch):
+async def test_async_omni_engine_request_id_reaches_engine_exactly(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(
         stage_metadata=DIFFUSION_ONLY_META,
         on_add_request=_enqueue_async_diffusion_only_output,
@@ -564,7 +565,7 @@ async def test_async_omni_internal_request_id_reaches_engine_exactly(monkeypatch
             async for output in app.generate(
                 prompt="hello",
                 request_id="tick-request-7",
-                _internal_request_id="tick-request-7",
+                _engine_request_id="tick-request-7",
             )
         ]
     finally:
@@ -574,6 +575,56 @@ async def test_async_omni_internal_request_id_reaches_engine_exactly(monkeypatch
     assert outputs[0].request_id == "tick-request-7"
     assert outputs[0].images == ["tick-request-7-image"]
     assert outputs[0].request_output.payload == "tick-request-7-diffusion-final"
+
+
+@pytest.mark.asyncio
+async def test_async_omni_rejects_concurrent_engine_request_id_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=DIFFUSION_ONLY_META,
+        on_add_request=_enqueue_async_diffusion_only_output,
+    )
+    first_submitted = asyncio.Event()
+    release_first = asyncio.Event()
+    original_add_request_async = engine.add_request_async
+
+    async def blocking_add_request(*args, **kwargs) -> None:
+        await original_add_request_async(*args, **kwargs)
+        first_submitted.set()
+        await release_first.wait()
+
+    monkeypatch.setattr(engine, "add_request_async", blocking_add_request)
+    _patch_engine(monkeypatch, engine)
+
+    async def collect(app: AsyncOmni) -> list[OmniRequestOutput]:
+        return [
+            output
+            async for output in app.generate(
+                prompt="hello",
+                request_id="tick-request-7",
+                _engine_request_id="tick-request-7",
+            )
+        ]
+
+    app = AsyncOmni("dummy-model")
+    first = asyncio.create_task(collect(app))
+    try:
+        await first_submitted.wait()
+        with pytest.raises(ValueError, match="Engine request ID 'tick-request-7' is already active"):
+            await collect(app)
+        assert len(engine.submitted) == 1
+        assert engine.aborted == []
+
+        release_first.set()
+        outputs = await first
+    finally:
+        release_first.set()
+        if not first.done():
+            first.cancel()
+        app.shutdown()
+
+    assert outputs[0].request_id == "tick-request-7"
 
 
 @pytest.mark.asyncio

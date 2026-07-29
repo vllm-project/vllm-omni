@@ -31,7 +31,7 @@ class ARDiffusionGenerateClient(Protocol):
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
-        _internal_request_id: str | None = None,
+        _engine_request_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]: ...
 
 
@@ -145,7 +145,7 @@ class ARDiffusionOmniTickConsumer:
             request_id=tick.request_id,
             sampling_params_list=self._sampling_params_for_tick(tick),
             output_modalities=self._output_modalities,
-            _internal_request_id=tick.request_id,
+            _engine_request_id=tick.request_id,
         ):
             if output.stage_id != self._diffusion_stage_id:
                 continue

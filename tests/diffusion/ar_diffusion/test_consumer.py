@@ -59,7 +59,7 @@ class FakeGenerateClient:
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
-        _internal_request_id: str | None = None,
+        _engine_request_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]:
         self.calls.append(
             {
@@ -67,7 +67,7 @@ class FakeGenerateClient:
                 "request_id": request_id,
                 "sampling_params_list": sampling_params_list,
                 "output_modalities": output_modalities,
-                "_internal_request_id": _internal_request_id,
+                "_engine_request_id": _engine_request_id,
             }
         )
         params = sampling_params_list[0]
@@ -160,7 +160,7 @@ async def test_consumer_submits_exact_typed_tick_and_returns_standard_output() -
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["request_id"] == tick.request_id
-    assert call["_internal_request_id"] == tick.request_id
+    assert call["_engine_request_id"] == tick.request_id
     assert call["output_modalities"] == ["video"]
     assert call["prompt"] == {
         "prompt": "turn left",
@@ -240,4 +240,4 @@ async def test_session_commits_only_after_standard_engine_output_metadata() -> N
     assert output.request_id == "world-1-chunk-0"
     assert session.chunk_index == 1
     assert session.pending_event_count == 0
-    assert client.calls[0]["_internal_request_id"] == "world-1-chunk-0"
+    assert client.calls[0]["_engine_request_id"] == "world-1-chunk-0"
