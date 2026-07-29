@@ -709,6 +709,18 @@ def test_hunyuan_image3_extra_registry_declares_request_and_response_params() ->
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_hunyuan_image3_extra_registry_matches_runtime_model_class_name() -> None:
+    # od_config.model_class_name resolves to "HunyuanImage3ForCausalMM" at
+    # runtime; "HunyuanImage3Pipeline" is kept only as a compatibility alias.
+    assert get_extra_body_params("HunyuanImage3ForCausalMM") == get_extra_body_params("HunyuanImage3Pipeline")
+    assert get_extra_output_params("HunyuanImage3ForCausalMM") == get_extra_output_params("HunyuanImage3Pipeline")
+    assert should_init_extra_args_for_non_diffusion_stages(
+        "HunyuanImage3ForCausalMM"
+    ) == should_init_extra_args_for_non_diffusion_stages("HunyuanImage3Pipeline")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_hunyuan_image3_text_to_image_prompt_builder() -> None:
     # Lightweight payload only: AR token-ids / stop-tokens are sourced in the AR
     # input path, so the builder just selects the image modality and forwards the
@@ -779,6 +791,7 @@ def test_hunyuan_image3_ar_input_builder_registered() -> None:
 
     builder = get_ar_input_builder("HunyuanImage3Pipeline")
     assert builder is not None
+    assert get_ar_input_builder("HunyuanImage3ForCausalMM") is builder
     # Models without the hook return None.
     assert get_ar_input_builder("MammothModa2DiTPipeline") is None
     assert get_ar_input_builder(None) is None
