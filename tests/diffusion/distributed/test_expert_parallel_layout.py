@@ -90,9 +90,8 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_vllm_model_parallel_group", fake_init_vllm_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -224,9 +223,8 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -288,9 +286,8 @@ def test_non_moe_ep_fails_before_vllm_ep_remap(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)

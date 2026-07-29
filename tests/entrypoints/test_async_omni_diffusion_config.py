@@ -76,8 +76,8 @@ def test_default_stage_config_uses_parallel_size_kwargs():
     assert parallel_config.enable_expert_parallel is True
 
 
-def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
-    """Ensure nullified diffusion parallel-size kwargs fall back to defaults."""
+def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
+    """Keep omitted DP unresolved until the runtime WORLD size is known."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
         {
             "pipeline_parallel_size": None,
@@ -92,7 +92,7 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config.pipeline_parallel_size == 1
-    assert parallel_config.data_parallel_size == 1
+    assert parallel_config.data_parallel_size is None
     assert parallel_config.tensor_parallel_size == 1
     assert parallel_config.enable_expert_parallel is False
     assert stage_cfg["engine_args"]["enforce_eager"] is False
