@@ -12,14 +12,11 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/minicpmo_realtime_duplex_scenarios.py"
-MULTI_DEMO_PATH = (
-    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py"
-)
-PAIR_DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
-SOFT_INTERRUPT_DEMO_PATH = (
-    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py"
-)
+DRIVER_DIR = Path(__file__).resolve().parent
+DEMO_PATH = DRIVER_DIR / "minicpmo_realtime_duplex_scenarios.py"
+MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
+PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
+SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"
 
 
 def _load_demo_module():
@@ -338,14 +335,7 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
     assert args.validation_mode == "model-policy"
 
 
-@pytest.mark.parametrize(
-    "extra_args",
-    [
-        ["--expect-second-response-substring", "一加一等于二"],
-        ["--input-sha256", "a" * 64],
-    ],
-)
-def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch, extra_args):
+def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -360,7 +350,6 @@ def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(mo
             "ref.wav",
             "--validation-mode",
             "response-required",
-            *extra_args,
         ],
     )
 
@@ -412,7 +401,6 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
             "_client_received_at_s": 2.6,
         },
         {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
-        {"type": "response.listen", "_client_received_at_s": 3.2},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
         {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
         {
@@ -458,10 +446,11 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is True
+    assert summary["listen_between_responses"] is False
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
     assert summary["response_audio_contract_ok"] is True
@@ -498,7 +487,7 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
         validation_mode="model-policy",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring=None,
+        expect_followup_response_substring=None,
     )
 
     assert summary["ok"] is True
@@ -537,14 +526,14 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
 
 
-def test_realtime_duplex_soft_interrupt_checks_expected_text_in_second_response(tmp_path):
+def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):
     demo = _load_soft_interrupt_demo_module()
     output = tmp_path / "second_response_text"
     output.mkdir()
@@ -611,11 +600,32 @@ def test_realtime_duplex_soft_interrupt_checks_expected_text_in_second_response(
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
-    assert summary["ok"] is False
-    assert summary["second_response_transcript_expectation_ok"] is False
+    assert summary["ok"] is True
+    assert summary["followup_response_transcript_ok"] is True
+    assert summary["followup_response_transcript_expectation_ok"] is False
+
+    events = [
+        event
+        for event in events
+        if event.get("response_id") != second_response_id or event["type"] != "response.audio_transcript.delta"
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    missing_transcript_summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring="一加一等于二",
+    )
+
+    assert missing_transcript_summary["ok"] is False
+    assert missing_transcript_summary["followup_response_transcript_ok"] is False
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():
@@ -1523,7 +1533,7 @@ def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
     assert len(ws.messages) == 10
 
 
-def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_done(monkeypatch):
+def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_first_done(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
     send_calls = 0
@@ -1548,7 +1558,6 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
         del args
         assert not state.response_done("resp-first")
         kwargs["on_model_unit_ready"]()
-        state.add({"type": "input_audio_buffer.speech_started", "turn": 2})
         _add_response_transcript(state, "resp-first", transcript="第一轮完成", audio=False)
         state.add({"type": "response.created", "response": {"id": "resp-second"}})
         _add_response_transcript(state, "resp-second", transcript="第二轮完成", audio=True)
@@ -1568,7 +1577,7 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
             ws,
             state,
             b"\x00\x00",
-            b"\x01\x00",
+            b"\x00\x00",
             transcripts=("first", "second"),
             durations_ms=(None, None),
             chunk_ms=200,

@@ -54,6 +54,18 @@ class _SchedulerStub(OmniGenerationScheduler):
         raise AssertionError("unexpected enqueue for skipped_waiting miss")
 
 
+class _AsyncChunkStopSchedulerStub(OmniGenerationScheduler):
+    def __init__(self) -> None:
+        self.num_waiting_for_streaming_input = 0
+        self.chunk_transfer_adapter = SimpleNamespace(receives_chunks=True)
+        self.enqueued: list[Request] = []
+        self.enqueued_statuses: list[RequestStatus] = []
+
+    def _enqueue_waiting_request(self, session: Request) -> None:
+        self.enqueued.append(session)
+        self.enqueued_statuses.append(session.status)
+
+
 def _make_request(**kwargs) -> Request:
     sp = SamplingParams(max_tokens=8)
     defaults = dict(
@@ -131,6 +143,21 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     output = outputs[session.client_index].outputs[0]
     assert output.finish_reason is not None
     assert output.is_segment_finished is True
+
+
+def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
+    sched = _AsyncChunkStopSchedulerStub()
+    session = _make_request(request_id="req-async-chunk-next-segment")
+    session.status = RequestStatus.FINISHED_STOPPED
+    session.resumable = True
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is False
+    assert sched.enqueued == [session]
+    assert sched.enqueued_statuses == [RequestStatus.WAITING]
+    assert session.status == RequestStatus.WAITING
+    assert sched.num_waiting_for_streaming_input == 0
 
 
 class TestReplaceSessionWithStreamingUpdate:

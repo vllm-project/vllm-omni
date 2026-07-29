@@ -801,9 +801,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        update_info = getattr(update, "additional_information", None)
-        update_meta = update_info.get("meta") if isinstance(update_info, dict) else None
-        if isinstance(update_meta, dict) and update_meta.get("replace_streaming_prompt") is True:
+        update_infos = (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        )
+        replace_streaming_prompt = any(
+            isinstance(info, dict)
+            and isinstance(info.get("meta"), dict)
+            and info["meta"].get("replace_streaming_prompt") is True
+            for info in update_infos
+        )
+        if replace_streaming_prompt:
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)

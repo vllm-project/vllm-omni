@@ -894,7 +894,7 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
+        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's
