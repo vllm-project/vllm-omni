@@ -137,6 +137,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             cross_attention_lengths=spec.cross_attention_lengths,
             frames_per_block=spec.frames_per_block,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
+            model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity

@@ -61,7 +61,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
-from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
+from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import (
+    DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
+    DreamZeroStateAdapter,
+)
 from vllm_omni.experimental.world_models.session_state import (
     SessionStateManager,
     resolve_session_state_config,
@@ -149,6 +152,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),
             max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
+            model_owned_state_bytes_per_session=DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
         )
 
     @contextmanager

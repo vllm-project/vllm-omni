@@ -526,6 +526,15 @@ class LingBotWorldCausalDMDPipeline(
         recent_window_frames = total_window_frames - sink_frames
         if recent_window_frames <= 0:
             raise ValueError("LingBot AR-Diffusion cache needs a positive recent window after reserving sink frames.")
+        horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+        condition_channels = self.vae_scale_factor_temporal + int(self.transformer.config.out_channels)
+        condition_bytes_per_session = (
+            condition_channels
+            * horizon_latent_frames
+            * latent_height
+            * latent_width
+            * torch.empty((), dtype=self.transformer.dtype).element_size()
+        )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
             num_kv_heads=num_local_heads,
@@ -542,6 +551,7 @@ class LingBotWorldCausalDMDPipeline(
                     _MAX_SEQUENCE_LENGTH,
                 ),
             ),
+            model_owned_state_bytes_per_session=condition_bytes_per_session,
         )
 
     @contextmanager

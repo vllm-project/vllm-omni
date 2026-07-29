@@ -56,6 +56,9 @@ _VAE_ENCODER_OUT = "vae_encoder_out"
 # own ``num_frame_per_block``; this is only the fallback for callers that build
 # an adapter directly (tests, other entry points).
 DEFAULT_VAE_ENCODER_WINDOW = 2
+# Shipped DreamZero geometry retains 24 Wan VAE causal-convolution cache
+# entries. This is the measured persistent CUDA upper bound per live session.
+DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
 
 class DreamZeroStateAdapter:

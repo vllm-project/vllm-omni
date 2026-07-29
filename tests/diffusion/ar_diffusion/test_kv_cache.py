@@ -213,14 +213,20 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
 
 
-def _make_tiny_capacity_kv(*, requested_capacity: int, available_bytes: int) -> ARDiffusionKVCache:
+def _make_tiny_capacity_kv(
+    *,
+    requested_capacity: int,
+    available_bytes: int,
+    gpu_memory_fraction: float = 1.0,
+    model_owned_state_bytes_per_session: int = 0,
+) -> ARDiffusionKVCache:
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
             enable=True,
             chunk_size=1,
             window_chunks=3,
             sink_chunks=3,
-            gpu_memory_fraction=1.0,
+            gpu_memory_fraction=gpu_memory_fraction,
         ),
         num_layers=1,
         num_kv_heads=1,
@@ -233,6 +239,7 @@ def _make_tiny_capacity_kv(*, requested_capacity: int, available_bytes: int) -> 
         session_capacity=requested_capacity,
         cross_attention_lengths={"text": 2},
         frames_per_block=3,
+        model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
         device=torch.device("cpu"),
     )
 
@@ -270,8 +277,74 @@ def test_requested_capacity_is_capped_and_cross_reservation_uses_effective_capac
 def test_capacity_rejects_budget_that_cannot_fit_one_session():
     # One session needs 11 managed + 3 scratch blocks and 16 cross bytes:
     # 14 * 8 + 16 = 128 bytes.
-    with pytest.raises(ValueError, match="cannot fit one session.*budget=127 bytes.*required=128 bytes"):
+    with pytest.raises(ValueError, match="cannot fit one session.*available=127 bytes.*required=128 bytes"):
         _make_tiny_capacity_kv(requested_capacity=1, available_bytes=127)
+
+
+def test_fraction_is_soft_floor_when_one_session_fits_actual_memory():
+    kv = _make_tiny_capacity_kv(
+        requested_capacity=2,
+        available_bytes=1280,
+        gpu_memory_fraction=0.05,
+    )
+
+    assert kv.configured_memory_budget_bytes == 64
+    assert kv.memory_budget_bytes == 128
+    assert kv.session_capacity == 1
+
+
+def test_model_owned_state_reduces_effective_session_capacity():
+    kv = _make_tiny_capacity_kv(
+        requested_capacity=2,
+        available_bytes=200,
+        model_owned_state_bytes_per_session=16,
+    )
+
+    assert kv.session_capacity == 1
+    assert kv.model_owned_state_reserved_bytes == 16
+    assert (
+        kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes + kv.model_owned_state_reserved_bytes
+        <= kv.memory_budget_bytes
+    )
+
+
+def _make_shipped_lingbot_geometry(*, gpu_memory_fraction: float) -> ARDiffusionKVCache:
+    return ARDiffusionKVCache(
+        ARDiffusionKVConfig(
+            enable=True,
+            chunk_size=1560,
+            window_chunks=9,
+            sink_chunks=9,
+            gpu_memory_fraction=gpu_memory_fraction,
+        ),
+        num_layers=40,
+        num_kv_heads=40,
+        head_size=128,
+        dtype=torch.bfloat16,
+        block_size=1560,
+        max_model_len=1 << 20,
+        available_bytes=100 * (1 << 30),
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=2,
+        cross_attention_lengths={"text": 512},
+        frames_per_block=3,
+        model_owned_state_bytes_per_session=7_488_000,
+    )
+
+
+def test_shipped_lingbot_geometry_default_fraction_admits_one_session():
+    kv = _make_shipped_lingbot_geometry(gpu_memory_fraction=0.1)
+
+    assert kv.configured_memory_budget_bytes == 10 * (1 << 30)
+    assert kv.memory_budget_bytes == 33_653_670_400
+    assert kv.session_capacity == 1
+
+
+def test_shipped_lingbot_geometry_tuned_fraction_admits_two_sessions():
+    kv = _make_shipped_lingbot_geometry(gpu_memory_fraction=0.6)
+
+    assert kv.memory_budget_bytes == 60 * (1 << 30)
+    assert kv.session_capacity == 2
 
 
 def _make_kv(

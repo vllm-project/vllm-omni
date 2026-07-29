@@ -174,6 +174,7 @@ class ARDiffusionKVCache:
         device: torch.device | None = None,
         frames_per_block: int = 1,
         max_scratch_tokens_per_branch: int = 0,
+        model_owned_state_bytes_per_session: int = 0,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -204,6 +205,10 @@ class ARDiffusionKVCache:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
         if max_scratch_tokens_per_branch < 0:
             raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
+        if model_owned_state_bytes_per_session < 0:
+            raise ValueError(
+                f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
+            )
         self.frames_per_block = int(frames_per_block)
         self.block_size = block_size
         self.num_layers = num_layers
@@ -253,10 +258,12 @@ class ARDiffusionKVCache:
         # past that budget. All resident sessions need a complete sink + window;
         # only one request can be in flight, so frames_per_block is counted once.
         page_size_bytes = self.spec.page_size_bytes * num_layers
-        self.memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
+        self.available_memory_bytes = available_bytes
+        self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
         # Reuse the public helper's validation for the memory fraction/page size.
         compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
         self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
+        self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
 
         def _cross_pool_bytes(length: int) -> int:
             return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
@@ -269,35 +276,48 @@ class ARDiffusionKVCache:
             resident_per_session = config.sink_chunks + config.window_chunks
             return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
 
+        def _required_bytes(capacity: int) -> int:
+            return (
+                self.scratch_reserved_bytes
+                + capacity * self.cross_attention_bytes_per_session
+                + capacity * self.model_owned_state_bytes_per_session
+                + _required_managed_blocks(capacity) * page_size_bytes
+            )
+
+        one_session_bytes = _required_bytes(1)
+        if one_session_bytes > available_bytes:
+            raise ValueError(
+                "AR-Diffusion available device memory cannot fit one session: "
+                f"available={available_bytes} bytes, required={one_session_bytes} bytes "
+                "(managed self-attention + cross-attention + scratch + model-owned state)."
+            )
+        self.memory_budget_bytes = max(self.configured_memory_budget_bytes, one_session_bytes)
+        if self.memory_budget_bytes > self.configured_memory_budget_bytes:
+            _log.warning(
+                "AR-Diffusion raised the configured memory budget from %d to %d bytes "
+                "to admit one session that fits actual free device memory",
+                self.configured_memory_budget_bytes,
+                self.memory_budget_bytes,
+            )
+
         effective_capacity = 0
         required_managed_blocks = 0
         for candidate in range(session_capacity, 0, -1):
             candidate_managed_blocks = _required_managed_blocks(candidate)
-            required_bytes = (
-                self.scratch_reserved_bytes
-                + candidate * self.cross_attention_bytes_per_session
-                + candidate_managed_blocks * page_size_bytes
-            )
-            if required_bytes <= self.memory_budget_bytes:
+            if _required_bytes(candidate) <= self.memory_budget_bytes:
                 effective_capacity = candidate
                 required_managed_blocks = candidate_managed_blocks
                 break
-        if effective_capacity == 0:
-            one_session_bytes = (
-                self.scratch_reserved_bytes
-                + self.cross_attention_bytes_per_session
-                + _required_managed_blocks(1) * page_size_bytes
-            )
-            raise ValueError(
-                "AR-Diffusion KV memory budget cannot fit one session: "
-                f"budget={self.memory_budget_bytes} bytes, required={one_session_bytes} bytes "
-                "(managed self-attention + cross-attention + scratch)."
-            )
+        assert effective_capacity > 0
 
         self.session_capacity = effective_capacity
         self.cross_attention_reserved_bytes = self.cross_attention_bytes_per_session * effective_capacity
+        self.model_owned_state_reserved_bytes = self.model_owned_state_bytes_per_session * effective_capacity
         self_attn_budget_bytes = (
-            self.memory_budget_bytes - self.scratch_reserved_bytes - self.cross_attention_reserved_bytes
+            self.memory_budget_bytes
+            - self.scratch_reserved_bytes
+            - self.cross_attention_reserved_bytes
+            - self.model_owned_state_reserved_bytes
         )
         num_blocks = self_attn_budget_bytes // page_size_bytes
         assert num_blocks >= required_managed_blocks
@@ -313,6 +333,13 @@ class ARDiffusionKVCache:
                 self.cross_attention_bytes_per_session / (1024 * 1024),
                 effective_capacity,
                 self.cross_attention_reserved_bytes / (1024 * 1024),
+            )
+        if self.model_owned_state_reserved_bytes:
+            _log.info(
+                "AR-Diffusion model-owned state reservation: %.1f MiB/session × %d sessions = %.1f MiB",
+                self.model_owned_state_bytes_per_session / (1024 * 1024),
+                effective_capacity,
+                self.model_owned_state_reserved_bytes / (1024 * 1024),
             )
 
         layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]

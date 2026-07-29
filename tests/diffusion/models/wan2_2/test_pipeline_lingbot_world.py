@@ -446,6 +446,7 @@ def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
     assert spec.sink_frames == 3
     assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
     assert spec.cross_attention_lengths == {"text": 512}
+    assert spec.model_owned_state_bytes_per_session == 9_600
 
 
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
