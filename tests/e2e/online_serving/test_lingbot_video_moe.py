@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Single-GPU serving smoke for ``robbyant/lingbot-video-moe-30b-a3b``."""
+"""Serving smoke for ``robbyant/lingbot-video-moe-30b-a3b``.
+
+Default and CPU-offload coverage stays single-GPU. The nightly T2V/TI2V
+function case uses two-GPU HSDP without adding another large-model server job.
+"""
 
 import json
 import os
@@ -21,6 +25,7 @@ NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 SMOKE_DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":2,"guidance_scale":3.0}}'
 
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+HSDP_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_server_cases(model: str):
@@ -61,6 +66,28 @@ def _get_cpu_offload_cases(model: str):
     ]
 
 
+def _get_hsdp_cases(model: str):
+    return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--default-sampling-params",
+                    SMOKE_DEFAULT_SAMPLING_PARAMS,
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                    "--enforce-eager",
+                ],
+            ),
+            id="hsdp-2",
+            marks=HSDP_MARKS,
+        ),
+    ]
+
+
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
@@ -85,7 +112,7 @@ def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientH
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
+@pytest.mark.parametrize("omni_server", _get_hsdp_cases(MODEL), indirect=True)
 def test_video_generation_modes_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
         "model": omni_server.model,

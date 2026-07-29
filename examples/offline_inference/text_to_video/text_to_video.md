@@ -86,6 +86,24 @@ python text_to_video.py \
   --extra-body '{"batch_cfg": true, "output_type": "np"}'
 ```
 
+The MoE checkpoint can shard each complete transformer block across two GPUs
+with HSDP. Grouped expert weights stay inside their owning block and are not
+nested-sharded separately:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+  --model robbyant/lingbot-video-moe-30b-a3b \
+  --use-hsdp --hsdp-shard-size 2 \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --output lingbot_moe_hsdp_t2v.mp4
+```
+
+HSDP reduces per-GPU transformer weight residency but adds per-block
+all-gather communication. It cannot be combined with tensor parallelism.
+Use `--enforce-eager` when comparing HSDP output against a single-GPU
+correctness baseline; compiled single-GPU and HSDP execution use different
+Inductor graphs and are not expected to be bitwise identical.
+
 ### LTX-2
 
 ```bash
