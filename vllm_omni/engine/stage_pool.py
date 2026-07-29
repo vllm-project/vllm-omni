@@ -19,6 +19,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine.messages import CacheResetKind, CacheResetReplicaResult
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -1222,6 +1223,70 @@ class StagePool:
                 "supported": False,
                 "error": str(exc),
             }
+
+    async def reset_cache(
+        self,
+        replica_id: int,
+        kind: CacheResetKind,
+        *,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> CacheResetReplicaResult:
+        """Reset one AR replica's cache through EngineCore utility APIs."""
+        stage_type = self.stage_type
+        if stage_type != "llm":
+            return CacheResetReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="not_applicable",
+            )
+
+        client = self.clients[replica_id]
+        if client is None:
+            return CacheResetReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="failed",
+                error="replica is not attached",
+            )
+
+        llm_client = cast(StagePoolLLMClient, client)
+        try:
+            result: bool | None
+            if kind == "prefix":
+                result = await llm_client.reset_prefix_cache_async(
+                    reset_running_requests=reset_running_requests,
+                    reset_connector=reset_connector,
+                )
+            elif kind == "mm":
+                await llm_client.reset_mm_cache_async()
+                result = None
+            else:
+                await llm_client.reset_encoder_cache_async()
+                result = None
+            return CacheResetReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="success",
+                result=result,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[StagePool] cache reset failed: stage=%s replica=%s kind=%s",
+                self.stage_id,
+                replica_id,
+                kind,
+            )
+            return CacheResetReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="failed",
+                error=str(exc),
+            )
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""

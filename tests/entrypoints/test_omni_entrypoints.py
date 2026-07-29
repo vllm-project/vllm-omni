@@ -4,7 +4,7 @@ import queue
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -13,7 +13,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import CacheResetReplicaResult, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
@@ -419,6 +419,81 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     assert serving_models.input_processor is input_processor
     # vLLM 0.20 keeps io_processor on the engine client instead of copying it.
     assert serving_models.engine_client.io_processor is io_processor
+
+
+@pytest.mark.asyncio
+async def test_reset_prefix_cache_preserves_false_result_across_replicas():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        reset_prefix_cache_async=AsyncMock(
+            return_value=[
+                CacheResetReplicaResult(
+                    stage_id=0,
+                    replica_id=0,
+                    stage_type="llm",
+                    status="success",
+                    result=True,
+                ),
+                CacheResetReplicaResult(
+                    stage_id=0,
+                    replica_id=1,
+                    stage_type="llm",
+                    status="success",
+                    result=False,
+                ),
+            ]
+        )
+    )
+
+    assert await omni.reset_prefix_cache(True, True) is False
+    omni.engine.reset_prefix_cache_async.assert_awaited_once_with(
+        reset_running_requests=True,
+        reset_connector=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_encoder_cache_raises_with_replica_identity():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        reset_encoder_cache_async=AsyncMock(
+            return_value=[
+                CacheResetReplicaResult(
+                    stage_id=2,
+                    replica_id=3,
+                    stage_type="llm",
+                    status="failed",
+                    error="transport closed",
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="stage 2 replica 3: transport closed"):
+        await omni.reset_encoder_cache()
+
+
+@pytest.mark.asyncio
+async def test_reset_mm_cache_clears_renderer_and_rejects_diffusion_only():
+    omni = object.__new__(AsyncOmni)
+    renderer = SimpleNamespace(clear_mm_cache_async=AsyncMock())
+    omni.input_processor = SimpleNamespace(renderer=renderer)
+    omni.engine = SimpleNamespace(
+        reset_mm_cache_async=AsyncMock(
+            return_value=[
+                CacheResetReplicaResult(
+                    stage_id=0,
+                    replica_id=0,
+                    stage_type="diffusion",
+                    status="not_applicable",
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="not applicable"):
+        await omni.reset_mm_cache()
+    renderer.clear_mm_cache_async.assert_awaited_once_with()
 
 
 def test_get_diffusion_od_config_returns_diffusion_stage_config():

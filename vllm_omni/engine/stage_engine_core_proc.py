@@ -61,6 +61,20 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Reset scheduler KV state and its Omni tensor cache together."""
+        reset = super().reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+        if reset:
+            self.model_executor.collective_rpc("reset_omni_prefix_cache")
+        return reset
+
     @staticmethod
     def run_stage_core(
         *args: Any,

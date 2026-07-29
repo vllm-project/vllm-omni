@@ -77,6 +77,16 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
 
     async def get_output_async(self) -> EngineCoreOutputs: ...
 
+    async def reset_mm_cache_async(self) -> None: ...
+
+    async def reset_encoder_cache_async(self) -> None: ...
+
+    async def reset_prefix_cache_async(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool: ...
+
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...
 
     def process_engine_inputs(

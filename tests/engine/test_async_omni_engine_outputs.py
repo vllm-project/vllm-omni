@@ -16,6 +16,8 @@ from pytest_mock import MockerFixture
 from vllm_omni.engine.async_engine_utils import weak_shutdown_async_omni_engine
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
+    CacheResetReplicaResult,
+    CacheResetResultMessage,
     CollectiveRPCResultMessage,
     ErrorMessage,
     OutputMessage,
@@ -499,6 +501,39 @@ def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixtu
             )
         )
         assert pending.result(timeout=1) == ["healthy"]
+
+    engine._correlated_rpc_client.close()
+
+
+def test_cache_reset_uses_typed_correlated_rpc(mocker: MockerFixture):
+    request_q = queue.Queue()
+    rpc_q = queue.Queue()
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = SimpleNamespace(sync_q=request_q)
+    engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="cache-rpc"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            engine._reset_cache,
+            "prefix",
+            reset_running_requests=True,
+            reset_connector=True,
+        )
+        request = request_q.get(timeout=1)
+        assert request.type == "cache_reset"
+        assert request.reset_running_requests is True
+        assert request.reset_connector is True
+        expected = CacheResetReplicaResult(
+            stage_id=0,
+            replica_id=1,
+            stage_type="llm",
+            status="success",
+            result=True,
+        )
+        rpc_q.put(CacheResetResultMessage(rpc_id="cache-rpc", kind="prefix", results=[expected]))
+        assert pending.result(timeout=1) == [expected]
 
     engine._correlated_rpc_client.close()
 

@@ -1,7 +1,12 @@
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DEFAULT_SEQ_LEN = 15
 NUM_BLOCKS = 10
@@ -106,6 +111,30 @@ def test_initialization_with_multimodal():
         assert isinstance(cache_tensor, torch.Tensor)
         assert cache_tensor.shape[-1] == feat_dims[mm_key]
         assert mm_outputs[mm_key].dtype == cache_tensor.dtype
+
+
+def test_reset_discards_pending_and_request_scoped_state_without_reallocating():
+    cache = get_omni_pcache_with_mm_tensors({"foo": 3}, DEFAULT_SEQ_LEN)
+    hidden_states_cache = cache.hidden_states_cache
+    mm_outputs_cache = cache.mm_outputs_cache["foo"]
+    hidden_states_cache.fill_(1)
+    mm_outputs_cache.fill_(2)
+
+    event = Mock()
+    cache._pending_write = SimpleNamespace(event=event)
+    cache.add_prefix_cached_new_req_id("req1")
+    cache._deferred_mm_outputs["req1"] = {"foo": [(0, torch.ones(1, 3))]}
+
+    cache.reset()
+
+    event.synchronize.assert_called_once_with()
+    assert cache._pending_write is None
+    assert not cache.has_prefix_cached_new_req_ids()
+    assert cache._deferred_mm_outputs == {}
+    assert cache.hidden_states_cache is hidden_states_cache
+    assert cache.mm_outputs_cache["foo"] is mm_outputs_cache
+    assert torch.all(hidden_states_cache == 1)
+    assert torch.all(mm_outputs_cache == 2)
 
 
 def test_init_missing_mm_cache_keys_is_idempotent():

@@ -27,7 +27,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import CacheResetReplicaResult, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -1134,30 +1134,44 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+        """Reset frontend and EngineCore multi-modal caches for all AR stages."""
+        renderer = self.renderer
+        clear_renderer_cache = getattr(renderer, "clear_mm_cache_async", None)
+        if clear_renderer_cache is not None:
+            await clear_renderer_cache()
+        results = await self.engine.reset_mm_cache_async()
+        self._validate_cache_reset_results("mm", results)
 
     async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+        """Reset the encoder cache for all AR stages."""
+        results = await self.engine.reset_encoder_cache_async()
+        self._validate_cache_reset_results("encoder", results)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
     ) -> bool:
-        """Reset the prefix cache for all stages.
+        """Reset the prefix cache for all AR stages."""
+        results = await self.engine.reset_prefix_cache_async(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+        self._validate_cache_reset_results("prefix", results)
+        return all(result.result is not False for result in results if result.status == "success")
 
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
-        return True
+    @staticmethod
+    def _validate_cache_reset_results(kind: str, results: list[CacheResetReplicaResult]) -> None:
+        applicable = [result for result in results if result.status != "not_applicable"]
+        if not applicable:
+            raise NotImplementedError(f"{kind} cache reset is not applicable to any live AR stage replica")
+        failures = [result for result in applicable if result.status == "failed"]
+        if failures:
+            details = "; ".join(
+                f"stage {result.stage_id} replica {result.replica_id}: {result.error or 'unknown error'}"
+                for result in failures
+            )
+            raise RuntimeError(f"{kind} cache reset failed: {details}")
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"

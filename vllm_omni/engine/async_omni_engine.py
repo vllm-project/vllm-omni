@@ -51,6 +51,10 @@ from vllm_omni.engine.async_engine_utils import (
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    CacheResetKind,
+    CacheResetReplicaResult,
+    CacheResetRequestMessage,
+    CacheResetResultMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
@@ -1793,6 +1797,69 @@ class AsyncOmniEngine:
                 kwargs=kwargs,
                 stage_ids=stage_ids,
             ),
+        )
+
+    def _reset_cache(
+        self,
+        kind: CacheResetKind,
+        *,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> list[CacheResetReplicaResult]:
+        """Reset a cache through each stage's typed control-plane API."""
+        rpc_id = uuid.uuid4().hex
+        msg = CacheResetRequestMessage(
+            rpc_id=rpc_id,
+            kind=kind,
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+        result_msg = transport.execute(
+            ("cache_reset", rpc_id),
+            msg,
+            timeout=None,
+            timeout_message=f"{kind} cache reset timed out",
+            block_on_submit=True,
+        )
+        if not isinstance(result_msg, CacheResetResultMessage):
+            raise RuntimeError(f"unexpected cache reset result type: {type(result_msg).__name__}")
+        return list(result_msg.results)
+
+    async def _reset_cache_async(
+        self,
+        kind: CacheResetKind,
+        *,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> list[CacheResetReplicaResult]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._reset_cache(
+                kind,
+                reset_running_requests=reset_running_requests,
+                reset_connector=reset_connector,
+            ),
+        )
+
+    async def reset_mm_cache_async(self) -> list[CacheResetReplicaResult]:
+        return await self._reset_cache_async("mm")
+
+    async def reset_encoder_cache_async(self) -> list[CacheResetReplicaResult]:
+        return await self._reset_cache_async("encoder")
+
+    async def reset_prefix_cache_async(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> list[CacheResetReplicaResult]:
+        return await self._reset_cache_async(
+            "prefix",
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
         )
 
     def is_alive(self) -> bool:
