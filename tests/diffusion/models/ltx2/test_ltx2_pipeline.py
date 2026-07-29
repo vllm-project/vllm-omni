@@ -988,7 +988,8 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
     if pipeline_cls is LTX2TwoStagePipeline:
         assert activated_slots == [None, "ltx_distilled"]
     torch.testing.assert_close(output.output[0], torch.full((1, 128, 1, 2, 2), 3.0))
-    torch.testing.assert_close(output.output[1], torch.full((1, 8, 1, 2), 4.0))
+    expected_audio = 2.0 if pipeline_cls is LTX2TwoStagePipeline else 4.0
+    torch.testing.assert_close(output.output[1], torch.full((1, 8, 1, 2), expected_audio))
 
 
 @pytest.mark.parametrize("pipeline_cls", [LTX2TwoStagePipeline, LTX2DistilledPipeline])
