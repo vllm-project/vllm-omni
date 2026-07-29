@@ -7,12 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.entrypoints.openai.realtime_tool_calls import (
-    ToolCallStreamState,
-    extract_complete_tool_calls,
-    extract_deltas,
-    strip_tool_calls,
-)
+from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallStreamState, extract_deltas
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -118,45 +113,3 @@ class TestExtractDeltasToolCallLifecycle:
                 args_by_index[d.index] += d.arguments_delta
         assert args_by_index[0] == '{"city": "Boston"}'
         assert args_by_index[1] == '{"tz": "EST"}'
-
-
-class TestExtractCompleteToolCalls:
-    def test_single_complete_call(self) -> None:
-        text = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Boston"}}\n</tool_call>'
-        calls = extract_complete_tool_calls(text)
-        assert calls == [{"name": "get_weather", "arguments": {"city": "Boston"}}]
-
-    def test_no_tool_call_returns_empty(self) -> None:
-        assert extract_complete_tool_calls("just some regular text") == []
-
-    def test_incomplete_block_ignored(self) -> None:
-        text = '<tool_call>\n{"name": "get_weather", "arguments": {'
-        assert extract_complete_tool_calls(text) == []
-
-    def test_malformed_json_skipped_not_raised(self) -> None:
-        text = "<tool_call>\nnot json at all\n</tool_call>"
-        assert extract_complete_tool_calls(text) == []
-
-    def test_multiple_calls_all_parsed(self) -> None:
-        text = (
-            '<tool_call>\n{"name": "a", "arguments": {}}\n</tool_call>'
-            '<tool_call>\n{"name": "b", "arguments": {"x": 1}}\n</tool_call>'
-        )
-        calls = extract_complete_tool_calls(text)
-        assert [c["name"] for c in calls] == ["a", "b"]
-
-
-class TestStripToolCalls:
-    def test_removes_tool_call_block(self) -> None:
-        text = 'Sure.<tool_call>\n{"name": "get_weather", "arguments": {}}\n</tool_call>'
-        assert strip_tool_calls(text) == "Sure."
-
-    def test_no_tool_call_returns_stripped_text(self) -> None:
-        assert strip_tool_calls("  plain text  ") == "plain text"
-
-    def test_multiple_tool_calls_all_removed(self) -> None:
-        text = (
-            'Before<tool_call>\n{"name": "a", "arguments": {}}\n</tool_call>'
-            'Middle<tool_call>\n{"name": "b", "arguments": {}}\n</tool_call>After'
-        )
-        assert strip_tool_calls(text) == "BeforeMiddleAfter"

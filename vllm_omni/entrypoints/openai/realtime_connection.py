@@ -12,7 +12,7 @@ from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
-from vllm.inputs import TokensPrompt
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.renderers.hf import safe_apply_chat_template
 from vllm.renderers.inputs.preprocess import parse_model_prompt
@@ -88,6 +88,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         streaming_input_gen = self._buffer_realtime_audio_with_tools(audio_stream, input_stream)
         self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
 
+    async def _render_prompt(self, prompt: PromptType) -> StreamingInput:
+        model_config = self.serving.model_config
+        parsed_prompt = parse_model_prompt(model_config, prompt)
+        (engine_input,) = await self.serving.renderer.render_cmpl_async([parsed_prompt])
+        return StreamingInput(prompt=engine_input)
+
     async def _buffer_realtime_audio_with_tools(
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
@@ -99,22 +105,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         (audio_stream, input_stream, model_config) call signature with no
         seam for extra per-connection state like tools, so this reimplements
         its (short) body directly rather than patching upstream vLLM."""
-        model_config = self.serving.model_config
-        renderer = self.serving.renderer
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, model_config, tools=self._tools
+            audio_stream, input_stream, self.serving.model_config, tools=self._tools
         )
         async for prompt in stream_input_iter:
-            parsed_prompt = parse_model_prompt(model_config, prompt)
-            (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
-            yield StreamingInput(prompt=engine_input)
+            yield await self._render_prompt(prompt)
 
     async def _render_token_prompt(self, prompt_token_ids: list[int]) -> AsyncGenerator[StreamingInput, None]:
-        model_config = self.serving.model_config
-        renderer = self.serving.renderer
-        parsed_prompt = parse_model_prompt(model_config, TokensPrompt(prompt_token_ids=prompt_token_ids))
-        (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
-        yield StreamingInput(prompt=engine_input)
+        yield await self._render_prompt(TokensPrompt(prompt_token_ids=prompt_token_ids))
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:

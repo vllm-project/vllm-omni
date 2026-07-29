@@ -29,7 +29,6 @@ tool-parser internals that may change across versions.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 
@@ -172,36 +171,3 @@ def extract_deltas(current_text: str, state: ToolCallStreamState) -> tuple[str, 
             state.streamed_args[i] = args_str
 
     return content_delta, tool_deltas
-
-
-def extract_complete_tool_calls(text: str) -> list[dict]:
-    """Non-streaming: parse all complete <tool_call> blocks out of finished
-    text, returning [{"name": ..., "arguments": {...}}, ...]. Malformed
-    blocks are skipped rather than raising."""
-    calls: list[dict] = []
-    pos = 0
-    while True:
-        start = text.find(_TOOL_CALL_START, pos)
-        if start == -1:
-            break
-        end = text.find(_TOOL_CALL_END, start)
-        if end == -1:
-            break
-        body = text[start + len(_TOOL_CALL_START) : end].strip()
-        try:
-            calls.append(json.loads(body))
-        except json.JSONDecodeError:
-            pass
-        pos = end + len(_TOOL_CALL_END)
-    return calls
-
-
-def strip_tool_calls(text: str) -> str:
-    """Remove <tool_call>...</tool_call> blocks, returning whatever plain
-    spoken content (if any) surrounds them."""
-    return re.sub(
-        re.escape(_TOOL_CALL_START) + r".*?" + re.escape(_TOOL_CALL_END),
-        "",
-        text,
-        flags=re.DOTALL,
-    ).strip()
