@@ -30,7 +30,7 @@ test_params = [
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="default",
@@ -39,7 +39,7 @@ test_params = [
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code", "--async-chunk"],
         ),
         id="async_chunk",
