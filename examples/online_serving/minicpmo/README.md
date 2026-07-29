@@ -89,17 +89,18 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     --prompt "Briefly introduce yourself."
 ```
 
-Streaming text + audio:
+Streaming text + audio (use `--stream`):
 
 ```bash
-python streaming_chat_completion.py \
-    --base-url http://localhost:8099/v1 \
-    --output minicpmo_stream.wav
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Briefly introduce yourself." \
+    --port 8099 \
+    --stream
 ```
 
-The example prints text deltas immediately and joins the independently encoded
-24 kHz WAV audio deltas into one valid WAV file. Add `--text-only` to skip
-Talker and Code2Wav.
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
 
 Shared helpers also work if you pass MiniCPM defaults yourself:
 

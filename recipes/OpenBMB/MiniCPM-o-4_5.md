@@ -175,16 +175,18 @@ in another choice's `message.audio.data` (24 kHz mono, see Notes). With
 `modalities: ["text", "audio"]` you typically get two `choices` entries
 (one text, one audio).
 
-**Streaming text + speech**:
+**Streaming text + speech** (use `--stream`):
 
 ```bash
-python examples/online_serving/minicpmo/streaming_chat_completion.py \
-    --base-url http://localhost:8099/v1 \
-    --output minicpmo_stream.wav
+python examples/online_serving/minicpmo/openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Say hello, then introduce vLLM in one sentence." \
+    --port 8099 \
+    --stream
 ```
 
-The client prints text deltas as they arrive and reconstructs one valid WAV
-from the independently encoded audio deltas.
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
 
 **Gradio demo (text + image + audio + video UI)**:
 
