@@ -1,9 +1,7 @@
-"""
-E2E Online tests for MiniCPM-o 4.5 model with multimodal input and audio / text output.
+"""E2E online tests for MiniCPM-o 4.5 multimodal input and audio/text output.
 
-MiniCPM-o 4.5 has ``async_chunk: false``, ``max_num_seqs: 1`` on both stages,
-and the vocoder runs in-process inside the talker stage rather than as a separate
-Code2Wav stage.
+The batching deployment uses async chunk transfer across separate Thinker,
+Talker, and Code2Wav stages.
 """
 
 import os
@@ -26,10 +24,7 @@ test_params = [
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
-            server_args=[
-                "--trust-remote-code",
-                "--no-async-chunk",
-            ],
+            server_args=["--trust-remote-code"],
         ),
         id="default",
     )
@@ -99,7 +94,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text + audio output via OpenAI API.
-    This exercises the talker TTS region detection and in-process token2wav vocoder.
+    This exercises Talker TTS region detection and the Code2Wav stage.
     Deploy Setting: default 2GPU
     Input Modal: text
     Output Modal: text + audio
@@ -133,13 +128,14 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         audio_data_url=audio_data_url,
-        content_text=get_prompt("mix"),
+        content_text=get_prompt(),
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "key_words": {"text": ["Beijing"]},
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())

@@ -190,6 +190,10 @@ class ImageGenerationResponse(BaseModel):
         description="Chain-of-thought text output from the AR stage. "
         "Only present for image editing (IT2I) with CoT-enabled models.",
     )
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request generation metrics.",
+    )
 
     def stream_response(self) -> StreamingResponse:
         if not self.data or not self.data[0].b64_json:

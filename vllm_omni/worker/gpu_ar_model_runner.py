@@ -22,9 +22,10 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -33,9 +34,7 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -322,13 +321,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
+            "NemotronDenseForCausalLM",
+            "NemotronHForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if (
-            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
-            or get_stage_connector_role(self.model_config) is not None
-        ):
+        # The stage-level ``model_arch`` override may be blank so the class
+        # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
+        # TTA/TTS thinker stages, which bind dense on the 2B and NemotronH on
+        # the 30B-A3B). Gate on the RESOLVED architectures, not only the raw
+        # override — otherwise a blank-override producer stage never creates
+        # its worker connector and the sync full-payload flush silently never
+        # runs (downstream stage starves on connector input).
+        stage_archs = set(getattr(self.model_config, "architectures", None) or ())
+        model_arch_override = getattr(self.model_config, "model_arch", None)
+        if model_arch_override:
+            stage_archs.add(model_arch_override)
+        if stage_archs & _OMNI_CONNECTOR_INIT_ARCHS or get_stage_connector_role(self.model_config) is not None:
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,

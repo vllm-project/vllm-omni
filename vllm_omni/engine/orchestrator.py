@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -218,11 +218,18 @@ class _OrchestratorDuplexStagePort:
         request_states: dict[str, OrchestratorRequestState],
         running_counter: OmniRequestCounter | None,
         cleanup_request_ids: Callable[..., Any],
+        async_chunk: bool,
+        prewarm_async_chunk_stages: Callable[
+            [str, Any, OrchestratorRequestState],
+            Awaitable[None],
+        ],
     ) -> None:
         self._stage_pools = stage_pools
         self._request_states = request_states
         self._running_counter = running_counter
         self._cleanup_request_ids = cleanup_request_ids
+        self._async_chunk = async_chunk
+        self._prewarm_async_chunk_stages = prewarm_async_chunk_stages
 
     @property
     def stage_count(self) -> int:
@@ -299,6 +306,12 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
+            if self._async_chunk and context.stage_id == 0:
+                await self._prewarm_async_chunk_stages(
+                    context.request_id,
+                    request,
+                    request_state,
+                )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
@@ -388,6 +401,8 @@ class Orchestrator:
                     request_states=self.request_states,
                     running_counter=self._running_counter,
                     cleanup_request_ids=self._cleanup_request_ids,
+                    async_chunk=self.async_chunk,
+                    prewarm_async_chunk_stages=self._prewarm_async_chunk_stages,
                 ),
                 result_sink=self.rpc_async_queue,
                 lifecycle_sink=self.output_async_queue,
@@ -681,24 +696,16 @@ class Orchestrator:
         final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
+            # Streaming updates always follow the first-chunk add_request
+            # through the same ordered submission queue, so an unknown id
+            # here can only mean the request already finished or was
+            # aborted (e.g. the client disconnected). Re-adding it would
+            # resurrect a headless session that keeps cycling through the
+            # stages with nobody consuming its outputs (issue #4271).
             logger.warning(
-                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
-            fallback_msg = StageSubmissionMessage(
-                type="add_request",
-                request_id=msg.request_id,
-                prompt=msg.prompt,
-                original_prompt=msg.original_prompt,
-                output_prompt_text=msg.output_prompt_text,
-                sampling_params_list=msg.sampling_params_list,
-                final_stage_id=msg.final_stage_id,
-                final_output_stage_ids=msg.final_output_stage_ids,
-                preprocess_ms=msg.preprocess_ms,
-                request_timestamp=msg.request_timestamp,
-                enqueue_ts=msg.enqueue_ts,
-            )
-            await self._handle_add_request(fallback_msg)
             return
 
         if msg.sampling_params_list:
@@ -2025,7 +2032,7 @@ class Orchestrator:
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
                     req_state.prompt,
@@ -2064,12 +2071,18 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
                     request,
                     prompt_text=None,
                 )
+            self._record_duplex_stage_submission(
+                next_stage_id,
+                request_id,
+                replica_id,
+                req_state,
+            )
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in

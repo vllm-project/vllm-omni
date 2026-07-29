@@ -69,6 +69,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        # vLLM 0.26: one entry per KV cache group; max_model_len=8 with
+        # block_sizes=[1] means one group of 8 blocks.
+        max_num_blocks_per_req=[8],
     )
     input_batch.add_request(
         CachedRequestState(

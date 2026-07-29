@@ -30,7 +30,10 @@ from vllm.v1.engine.utils import (
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.engine.stage_init_utils import (
+    maybe_apply_audex_cfg_patches,
+    set_death_signal,
+)
 
 logger = init_logger(__name__)
 
@@ -130,6 +133,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # Audex CFG scheduler patches must land before EngineCore builds
+            # its Scheduler; gated on the stage's logits_processors config.
+            maybe_apply_audex_cfg_patches(kwargs.get("vllm_config"))
 
             engine_core = StageEngineCoreProc(
                 *args,

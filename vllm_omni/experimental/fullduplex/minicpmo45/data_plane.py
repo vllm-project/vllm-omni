@@ -65,12 +65,11 @@ class MiniCPMO45DataPlaneSession:
     def begin_request(self, request_id: str) -> None:
         state = self._requests.setdefault(request_id, _RequestState())
         state.terminal = False
-        # Preserve turn-scoped cursors for resumable requests. The legacy path
-        # only reset request-scoped terminal markers on append.
-        request_turn = state.turns.get(None)
-        if request_turn is not None:
-            request_turn.tts_eos_done = False
-            request_turn.turn_eos_done = False
+        # A resumable append starts a new Talker segment, even when it
+        # continues the same model turn. Re-arm only the segment boundary;
+        # turn EOS remains deduplicated until the model advances the turn.
+        for turn_state in state.turns.values():
+            turn_state.tts_eos_done = False
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:

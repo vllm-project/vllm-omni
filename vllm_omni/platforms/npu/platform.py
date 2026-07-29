@@ -123,7 +123,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = True,
     ) -> str:
+        # NPU has no TRTLLM backend; accepted for signature parity, ignored.
         from importlib.util import find_spec
 
         if selected_backend is not None:

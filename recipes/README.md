@@ -46,8 +46,7 @@ recipes/
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB |
-| [`LTX/LTX-2.md`](./LTX/LTX-2.md) | Text-to-video and image-to-video serving | 1x H200 141GB |
-| [`LTX/LTX-2.3.md`](./LTX/LTX-2.3.md) | Text-to-video with audio generation (22B) | 1x GPU (96GB VRAM) |
+| [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
@@ -57,6 +56,7 @@ recipes/
 | [`OpenBMB/MiniCPM-o-4_5.md`](./OpenBMB/MiniCPM-o-4_5.md) | Online serving for omni multimodal chat (text / image / audio / video → text + 24 kHz speech) | 2x A100/H100 80GB / 3x mid-tier GPU / 8x RTX 4090 24GB |
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
+| [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4 | 1x A100 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
