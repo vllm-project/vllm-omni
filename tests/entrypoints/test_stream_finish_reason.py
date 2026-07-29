@@ -16,20 +16,10 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
-import enum
 import json
 from unittest.mock import MagicMock
 
 import pytest
-
-# Python 3.10 compat: StrEnum was added in 3.11
-if not hasattr(enum, "StrEnum"):
-
-    class _StrEnum(str, enum.Enum):
-        """Minimal StrEnum backport for Python 3.10."""
-
-    enum.StrEnum = _StrEnum  # type: ignore[attr-defined]
-
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
