@@ -871,6 +871,7 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
+        wave_id = rpc_request.get("wave_id")
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
@@ -939,6 +940,7 @@ class WorkerProc:
                         "method": method,
                         "result": result,
                         "rank_statuses": rank_statuses,
+                        "wave_id": wave_id,
                     },
                     True,
                 )
@@ -946,6 +948,8 @@ class WorkerProc:
 
         if rpc_exception is not None:
             raise rpc_exception
+        if isinstance(result, dict) and wave_id is not None:
+            result["wave_id"] = wave_id
         return result, should_reply
 
     def _worker_busy_loop(self) -> None:
@@ -991,6 +995,7 @@ class WorkerProc:
                     # that compete with the expected responder's message.
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
+                    wave_id = msg.get("wave_id")
                     if output_rank is None and exec_all_ranks:
                         # DP multi-concurrency: primary ranks reply, tagged
                         from vllm.distributed.parallel_state import (
@@ -1015,10 +1020,12 @@ class WorkerProc:
                                 dp_rank = get_data_parallel_rank()
                             except Exception:
                                 dp_rank = self.gpu_id
-                            self._return_result({"status": "error", "error": str(e), "dp_rank": dp_rank})
+                            self._return_result(
+                                {"status": "error", "error": str(e), "dp_rank": dp_rank, "wave_id": wave_id}
+                            )
                     elif (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None:
                         # Normal RPC: only the expected rank replies
-                        self._return_result({"status": "error", "error": str(e)})
+                        self._return_result({"status": "error", "error": str(e), "wave_id": wave_id})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

@@ -70,6 +70,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
         self._result_mq: MessageQueue | None = None
+        self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
         self.wake_events = [mp.Event() for _ in range(num_workers)]
@@ -208,6 +209,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # failures. Preserve the pre-envelope error handling for that case.
         MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
         return response
+
+    def _validate_wave_id(self, response: Any, expected_wave_id: int, deadline, method: str) -> Any:
+        """Discard stale RPC responses from a previous wave.
+
+        If a response carries a wave_id that doesn't match the current RPC,
+        it is from a failed/aborted previous wave.  Log and dequeue the next
+        message until we get one with the correct wave_id (or no wave_id
+        for backward-compatible workers).
+        """
+        while True:
+            if not isinstance(response, dict):
+                return response
+            resp_wave_id = response.get("wave_id")
+            if resp_wave_id is None or resp_wave_id == expected_wave_id:
+                return response
+            logger.warning(
+                "Discarding stale RPC response (wave_id=%s, expected=%s, method=%s)",
+                resp_wave_id,
+                expected_wave_id,
+                method,
+            )
+            response = self._dequeue_one_with_failure_polling(deadline, method)
 
     def _launch_workers(
         self,
@@ -559,6 +582,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         else:
             output_rank_for_rpc = unique_reply_rank if unique_reply_rank is not None else 0
             collect_rank_status = unique_reply_rank is None
+        self._rpc_wave_id += 1
+        wave_id = self._rpc_wave_id
         rpc_request = {
             "type": "rpc",
             "method": method,
@@ -567,6 +592,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "output_rank": output_rank_for_rpc,
             "exec_all_ranks": execute_all_ranks,
             "collect_rank_status": collect_rank_status,
+            "wave_id": wave_id,
         }
 
         try:
@@ -596,6 +622,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 collected_errors: list[str] = []
                 for _ in range(num_responses):
                     response = self._dequeue_one_with_failure_polling(deadline, method)
+                    # Discard stale messages from a previous RPC wave.
+                    response = self._validate_wave_id(response, wave_id, deadline, method)
                     try:
                         unpack_diffusion_output_shm(response)
                     except Exception as e:
@@ -615,6 +643,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             else:
                 for _ in range(num_responses):
                     response = self._dequeue_one_with_failure_polling(deadline, method)
+                    response = self._validate_wave_id(response, wave_id, deadline, method)
 
                     try:
                         unpack_diffusion_output_shm(response)
