@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HTTP + WebSocket validation for Qwen3-TTS Base and Higgs Audio V3 ``/v1/audio/speech`` (and related routes)."""
+"""HTTP + WebSocket validation for Qwen3-TTS Base, Higgs Audio V3 and Audex TTA ``/v1/audio/speech`` (and related routes)."""
 
 from __future__ import annotations
 
@@ -66,6 +66,19 @@ _HIGGS_AUDIO_V3_SPEECH = [
             env_dict={"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"},
         ),
         id="higgs_audio_v3",
+        marks=_L4_SPEECH_HW,
+    ),
+]
+
+_AUDEX_TTA_CAPTION = "Heavy rain falling on a tin roof."
+_AUDEX_TTA_SPEECH = [
+    pytest.param(
+        OmniServerParams(
+            model="nvidia/Nemotron-Labs-Audex-2B",
+            stage_config_path=get_deploy_config_path("audex_tta.yaml"),
+            server_args=_SPEECH_SERVER_ARGS,
+        ),
+        id="audex_tta",
         marks=_L4_SPEECH_HW,
     ),
 ]
@@ -320,6 +333,37 @@ def test_speech_higgs_invalid_field_values(
     err_message: str | tuple[str, ...],
 ) -> None:
     body = {"model": omni_server.model, **extra_json}
+    openai_client.send_audio_speech_http_request(
+        {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
+    )
+
+
+# Audex TTA (``audex_tta`` deployment): the serving layer builds the caption
+# prompt and injects the RVQ phase contract + default guidance server-side, so
+# guidance knobs and speech-only fields must be rejected before generation.
+@pytest.mark.parametrize(
+    "overrides, err_message",
+    [
+        pytest.param({"extra_params": {"cfg_scale": 99}}, "cfg_scale", id="cfg_scale_out_of_range"),
+        pytest.param({"extra_params": {"cfg_scale": "big"}}, "cfg_scale", id="cfg_scale_wrong_type"),
+        pytest.param({"extra_params": {"tta_rvq": {}}}, "tta_rvq", id="tta_rvq_not_overridable"),
+        pytest.param({"input": "   "}, "caption", id="caption_whitespace_only"),
+        pytest.param({"voice": "alloy"}, "voice", id="voice_not_supported"),
+        pytest.param(
+            {"ref_audio": "https://example.com/ref.wav"},
+            "reference audio",
+            id="ref_audio_not_supported",
+        ),
+    ],
+)
+@pytest.mark.parametrize("omni_server", _AUDEX_TTA_SPEECH, indirect=True)
+def test_speech_audex_tta_invalid_field_values(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+    overrides: dict[str, object],
+    err_message: str | tuple[str, ...],
+) -> None:
+    body = {"model": omni_server.model, "input": _AUDEX_TTA_CAPTION, **overrides}
     openai_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )

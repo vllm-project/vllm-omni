@@ -628,6 +628,13 @@ class AsyncOmni(EngineClient, OmniBase):
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
+            # The input pump can outlive a normally-completed generation
+            # (e.g. a realtime client that keeps streaming after the final
+            # output); a live pump keeps issuing streaming updates for a
+            # request the orchestrator no longer tracks.
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
+
             self._log_summary_and_cleanup(request_id)
 
         except (asyncio.CancelledError, GeneratorExit):
@@ -1059,7 +1066,10 @@ class AsyncOmni(EngineClient, OmniBase):
         """Submit request IDs to be aborted to the engine."""
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
-            self.request_states.pop(rid, None)
+            state = self.request_states.pop(rid, None)
+            input_stream_task = getattr(state, "input_stream_task", None)
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

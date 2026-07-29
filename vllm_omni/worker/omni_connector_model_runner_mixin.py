@@ -1575,7 +1575,7 @@ class OmniConnectorModelRunnerMixin:
 
         from copy import copy
 
-        from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
+        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
         wrapped = copy(result if result is not None else EMPTY_MODEL_RUNNER_OUTPUT)
         wrapped.omni_connector_output = omni_output

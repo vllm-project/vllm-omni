@@ -11,6 +11,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "duplex_epoch",
         "duplex_turn_id",
         "llm_output_text_utf8",
+        "segment_end",
         "tts_is_last_chunk",
         "turn_end",
     }
