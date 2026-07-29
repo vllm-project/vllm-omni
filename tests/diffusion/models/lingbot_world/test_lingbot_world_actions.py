@@ -7,7 +7,7 @@ import asyncio
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
+from vllm_omni.diffusion.models.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     LingBotCameraControlReducer,
@@ -35,7 +35,7 @@ def _action_control(mode: str, **data) -> ARDiffusionControlInput:
     )
 
 
-def _prepared_frames(prepared) -> list[list[str]]:
+def _prepared_frames(prepared) -> tuple[tuple[str, ...], ...]:
     assert len(prepared.controls) == 1
     return prepared.controls[0].data["frames"]
 
@@ -57,7 +57,8 @@ def test_state_controls_hold_release_and_preserve_short_pulse() -> None:
         ),
         chunk_index=0,
     )
-    assert _prepared_frames(pressed) == [["w"], ["w"], ["w"]]
+    assert _prepared_frames(pressed) == (("w",), ("w",), ("w",))
+    assert pressed.controls[0].to_dict()["data"]["frames"] == [["w"], ["w"], ["w"]]
     reducer.commit(pressed)
 
     held = reducer.prepare(
@@ -65,7 +66,7 @@ def test_state_controls_hold_release_and_preserve_short_pulse() -> None:
         events=(),
         chunk_index=1,
     )
-    assert _prepared_frames(held) == [["w"], ["w"], ["w"]]
+    assert _prepared_frames(held) == (("w",), ("w",), ("w",))
     reducer.commit(held)
 
     pulse = reducer.prepare(
@@ -86,7 +87,7 @@ def test_state_controls_hold_release_and_preserve_short_pulse() -> None:
         ),
         chunk_index=2,
     )
-    assert _prepared_frames(pulse) == [["j"], [], []]
+    assert _prepared_frames(pulse) == (("j",), (), ())
     reducer.commit(pulse)
 
     released = reducer.prepare(
@@ -94,7 +95,7 @@ def test_state_controls_hold_release_and_preserve_short_pulse() -> None:
         events=(),
         chunk_index=3,
     )
-    assert _prepared_frames(released) == [[], [], []]
+    assert _prepared_frames(released) == ((), (), ())
 
 
 def test_script_is_transactional_consumed_once_and_neutral_padded() -> None:
@@ -113,7 +114,7 @@ def test_script_is_transactional_consumed_once_and_neutral_padded() -> None:
         events=(event,),
         chunk_index=0,
     )
-    assert _prepared_frames(first_attempt) == [["w"], ["d"], ["l"]]
+    assert _prepared_frames(first_attempt) == (("w",), ("d",), ("l",))
 
     # An uncommitted failed attempt must not consume the reducer's script.
     second_attempt = reducer.prepare(
@@ -121,7 +122,7 @@ def test_script_is_transactional_consumed_once_and_neutral_padded() -> None:
         events=(event,),
         chunk_index=0,
     )
-    assert _prepared_frames(second_attempt) == [["w"], ["d"], ["l"]]
+    assert _prepared_frames(second_attempt) == (("w",), ("d",), ("l",))
     reducer.commit(second_attempt)
 
     tail = reducer.prepare(
@@ -129,14 +130,14 @@ def test_script_is_transactional_consumed_once_and_neutral_padded() -> None:
         events=(),
         chunk_index=1,
     )
-    assert _prepared_frames(tail) == [["i"], [], []]
+    assert _prepared_frames(tail) == (("i",), (), ())
     reducer.commit(tail)
     exhausted = reducer.prepare(
         current_controls={"camera": tail.controls[0]},
         events=(),
         chunk_index=2,
     )
-    assert _prepared_frames(exhausted) == [[], [], []]
+    assert _prepared_frames(exhausted) == ((), (), ())
 
 
 def test_trajectory_control_remains_an_expert_override() -> None:
@@ -272,7 +273,7 @@ def test_session_reducer_keeps_prompt_and_actions_atomic_and_resets() -> None:
         tick = consumer.ticks[0]
         assert tick.prompt == "turn toward the window"
         assert tick.applied_event_ids == (1,)
-        assert tick.controls[0].data["frames"] == [["d"], ["d"], ["d"]]
+        assert tick.controls[0].data["frames"] == (("d",), ("d",), ("d",))
 
         await session.reset()
         await session.accept_event(
@@ -288,6 +289,6 @@ def test_session_reducer_keeps_prompt_and_actions_atomic_and_resets() -> None:
         )
         await session.next_chunk()
         assert consumer.ticks[1].chunk_index == 0
-        assert consumer.ticks[1].controls[0].data["frames"] == [[], [], []]
+        assert consumer.ticks[1].controls[0].data["frames"] == ((), (), ())
 
     asyncio.run(exercise())

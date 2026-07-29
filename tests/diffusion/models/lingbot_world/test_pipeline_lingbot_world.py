@@ -15,13 +15,13 @@ from diffusers.utils.torch_utils import randn_tensor as _diffusers_randn_tensor
 from PIL import Image
 from torch import nn
 
-import vllm_omni.diffusion.models.wan2_2.lingbot_world.pipeline as lingbot_pipeline
+import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
+from vllm_omni.diffusion.models.lingbot_world.actions import (
     integrate_lingbot_camera_actions,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.camera import CameraTrajectory as _CameraTrajectory
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.camera import (
+from vllm_omni.diffusion.models.lingbot_world.camera import CameraTrajectory as _CameraTrajectory
+from vllm_omni.diffusion.models.lingbot_world.camera import (
     build_plucker_embedding as _real_build_plucker_embedding,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
@@ -32,7 +32,7 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _ROOT = Path(__file__).parents[4]
-_WAN_INIT_PATH = _ROOT / "vllm_omni/diffusion/models/wan2_2/__init__.py"
+_LINGBOT_INIT_PATH = _ROOT / "vllm_omni/diffusion/models/lingbot_world/__init__.py"
 _MODEL_INDEX_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_model_index.json.fixture"
 _SCHEDULER_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_scheduler_config.json.fixture"
 
@@ -667,7 +667,7 @@ def test_official_model_index_discovers_only_declared_components() -> None:
 
     assert model_index["_class_name"] == "LingBotWorldCausalDMDPipeline"
     assert resolved is module.LingBotWorldCausalDMDPipeline
-    assert entry == ("wan2_2.lingbot_world", "pipeline", "LingBotWorldCausalDMDPipeline")
+    assert entry == ("lingbot_world", "pipeline", "LingBotWorldCausalDMDPipeline")
     assert cache_acceleration_disabled
     assert preprocess_name == "get_lingbot_world_pre_process_func"
     assert callable(preprocess)
@@ -1712,13 +1712,13 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
     assert not hasattr(pipeline, "transformer_cache")
 
 
-def test_registry_and_wan_exports_resolve_official_pipeline_class_name() -> None:
+def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> None:
     module = _load_pipeline_module()
     resolved, entry, cache_acceleration_disabled, preprocess_name, preprocess = _resolve_pipeline_through_real_registry(
         module
     )
 
-    assert entry == ("wan2_2.lingbot_world", "pipeline", "LingBotWorldCausalDMDPipeline")
+    assert entry == ("lingbot_world", "pipeline", "LingBotWorldCausalDMDPipeline")
     assert resolved is module.LingBotWorldCausalDMDPipeline
     assert cache_acceleration_disabled
     assert preprocess_name == "get_lingbot_world_pre_process_func"
@@ -1726,7 +1726,7 @@ def test_registry_and_wan_exports_resolve_official_pipeline_class_name() -> None
     assert preprocess(request) is request
     assert isinstance(request.sampling_params.extra_args["_lingbot_camera_trajectory"], _CameraTrajectory)
     assert module.LingBotWorldCausalDMDPipeline.__name__ == "LingBotWorldCausalDMDPipeline"
-    wan_init = _WAN_INIT_PATH.read_text()
-    assert "from .lingbot_world import" in wan_init
-    assert '"LingBotWorldCausalDMDPipeline"' in wan_init
-    assert '"CausalLingBotWorldTransformer3DModel"' in wan_init
+    lingbot_init = _LINGBOT_INIT_PATH.read_text()
+    assert "from .pipeline import" in lingbot_init
+    assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
+    assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init

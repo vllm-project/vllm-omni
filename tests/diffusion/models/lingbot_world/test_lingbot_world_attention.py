@@ -16,7 +16,7 @@ from torch import nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world/transformer.py"
+_MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/lingbot_world/transformer.py"
 _MODULE_NAME = "_lingbot_world_attention_under_test"
 _STUBBED_MODULE_NAMES = (
     "vllm",

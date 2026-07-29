@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.diffusion.models.wan2_2 import test_lingbot_world_attention as attention_tests
+from tests.diffusion.models.lingbot_world import test_lingbot_world_attention as attention_tests
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

@@ -28,20 +28,20 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
+from vllm_omni.diffusion.models.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.camera import (
+from vllm_omni.diffusion.models.lingbot_world.camera import (
     CameraTrajectory,
     build_plucker_embedding,
     interpolate_camera_trajectory,
     load_camera_trajectory,
     resolve_trusted_action_directory,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.transformer import (
+from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CausalLingBotWorldTransformer3DModel,
     LingBotAttentionCache,
     LingBotTransformerCache,

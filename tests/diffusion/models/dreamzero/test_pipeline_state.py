@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
-from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
-from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import (
+from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
     DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
+    DreamZeroPipeline,
 )
+from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

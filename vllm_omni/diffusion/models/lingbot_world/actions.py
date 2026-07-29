@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.models.wan2_2.lingbot_world.camera import (
+from vllm_omni.diffusion.models.lingbot_world.camera import (
     CameraTrajectory,
 )
 from vllm_omni.experimental.ar_diffusion.session import (
