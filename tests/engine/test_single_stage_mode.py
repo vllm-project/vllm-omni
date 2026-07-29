@@ -477,6 +477,76 @@ class TestSingleStageModeDetection:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint-restriction resolution vs. tri-state trust_remote_code (#5495)
+# ---------------------------------------------------------------------------
+
+
+class TestEndpointRestrictionsTrustRemoteCode:
+    """Regression tests for issue #5495.
+
+    ``AsyncOmniEngine.__init__`` takes ``trust_remote_code: bool | None`` where
+    ``None`` means "not specified" (the CLI default, since ``--trust-remote-code``
+    is ``store_true`` and its absence is mapped to ``None``). Endpoint-restriction
+    resolution eagerly loads the HF config via vLLM's ``get_config``, which does
+    ``trust_remote_code |= ...`` internally and raises ``TypeError`` on ``None``.
+    That used to be swallowed, leaving ``endpoint_restrictions`` empty so
+    ``/v1/completions`` was never shut down and the request crashed stage-1.
+
+    ``__init__`` must collapse the ``None`` "not specified" case to ``False`` at
+    the ``get_pipeline_config`` call site so the restriction is still computed.
+    """
+
+    def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
+        mocker.patch.object(
+            AsyncOmniEngine,
+            "_resolve_stage_configs",
+            return_value=("/fake/path", [_make_stage_cfg(0)]),
+        )
+        mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
+        mocker.patch("threading.Thread")
+        mocker.patch("concurrent.futures.Future")
+        return AsyncOmniEngine(model="fake-model", **kwargs)
+
+    @staticmethod
+    def _install_qwen3_omni_config(mocker: MockerFixture) -> None:
+        """Patch get_config to a thinker+talker config, mirroring vLLM's
+        ``trust_remote_code |= ...`` (raises TypeError on None)."""
+        from transformers import Qwen3OmniMoeConfig
+
+        def fake_get_config(model, trust_remote_code, **_):
+            trust_remote_code |= False  # TypeError if None reaches here
+            return Qwen3OmniMoeConfig(enable_audio_output=True)
+
+        from vllm_omni.config.config_factory import StageConfigFactory
+
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+        mocker.patch("vllm_omni.config.config_factory.get_config", side_effect=fake_get_config)
+
+    @pytest.mark.parametrize("trc_kwargs", [{}, {"trust_remote_code": False}, {"trust_remote_code": True}])
+    def test_completions_restriction_survives(self, mocker: MockerFixture, trc_kwargs: dict):
+        """COMPLETIONS restriction is computed regardless of how (or whether)
+        trust_remote_code is passed — including the unset case that resolves to
+        the engine's ``None`` default."""
+        from vllm_omni.config.endpoint_policy import OmniServingCapability
+
+        self._install_qwen3_omni_config(mocker)
+        engine = self._make_engine_no_thread(mocker, **trc_kwargs)
+        assert any(r.capability is OmniServingCapability.COMPLETIONS for r in engine.endpoint_restrictions), (
+            f"COMPLETIONS restriction dropped for {trc_kwargs or 'unset (None default)'}"
+        )
+
+    def test_unset_trust_remote_code_defaults_to_none(self, mocker: MockerFixture):
+        """Guard the tri-state premise: the engine keeps ``None`` (not ``False``)
+        when trust_remote_code is not passed, so the call-site coercion is what
+        prevents the crash."""
+        import inspect
+
+        default = inspect.signature(AsyncOmniEngine.__init__).parameters["trust_remote_code"].default
+        assert default is None
+
+
+# ---------------------------------------------------------------------------
 # AsyncOmniEngine single-stage initialization paths
 # ---------------------------------------------------------------------------
 

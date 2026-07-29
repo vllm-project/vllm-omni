@@ -213,6 +213,12 @@ class AsyncOmniEngine:
         # beforehand. The stage CLI exposes the same deploy YAML through
         # stage_configs_path.
         deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
+        # specified" so stage-config resolution can defer to the deploy yaml's
+        # per-stage value (see ``with_trust_remote_code_override``). The
+        # restriction path below loads the top-level HF config via vLLM's
+        # ``get_config``, which needs a real bool, so collapse ``None`` to the
+        # default ``False`` here (#5495).
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
             trust_remote_code=bool(trust_remote_code),
