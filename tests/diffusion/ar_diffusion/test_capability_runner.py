@@ -57,6 +57,21 @@ def dreamzero_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
     )
 
 
+def tiny_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
+    return ARDiffusionKVCacheSpec(
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=1,
+        tokens_per_frame=1,
+        frames_per_block=3,
+        window_frames=3,
+        sink_frames=3,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=capacity,
+        cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 2),),
+    )
+
+
 class CapablePipeline:
     def __init__(self, spec: ARDiffusionKVCacheSpec) -> None:
         self.spec = spec
@@ -104,6 +119,7 @@ def make_runner(
     *,
     available_bytes: int = 1 << 28,
     step_execution: bool = False,
+    gpu_memory_fraction: float = 0.1,
 ) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(
@@ -114,7 +130,10 @@ def make_runner(
     )
     runner.device = torch.device("cpu")
     runner.pipeline = pipeline
-    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(enable=True)
+    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(
+        enable=True,
+        gpu_memory_fraction=gpu_memory_fraction,
+    )
     runner.kv_cache = None
     runner._ar_diffusion_capability = None
     runner._ar_diffusion_kv_cache_spec = None
@@ -238,6 +257,47 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
     assert pipeline.closes == ["old"]
     assert "old" not in kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_budget_reduced_capacity_drives_runner_lru():
+    pipeline = CapablePipeline(tiny_spec(capacity=2))
+    # One tiny LingBot-like session requires 128 bytes; two require 192.
+    runner = make_runner(
+        pipeline,
+        available_bytes=128,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 2
+    assert kv.session_capacity == 1
+    assert runner._session_capacity == 1
+
+    runner._get_or_create_session("old")
+    runner._get_or_create_session("new")
+
+    assert tuple(runner._sessions) == ("new",)
+    assert pipeline.closes == ["old"]
+
+
+def test_dreamzero_like_requested_capacity_is_capped_by_budget():
+    spec = dreamzero_like_spec(capacity=64)
+    # Per all-layer self-KV page: 65,536 bytes. Two resident sessions need:
+    # managed=(2 * (2 * 6 + 4) + 2)=34 pages, scratch=8 pages,
+    # cross-attention=1 page/session, for 44 pages total.
+    page_bytes = 65_536
+    pipeline = CapablePipeline(spec)
+    runner = make_runner(
+        pipeline,
+        available_bytes=44 * page_bytes,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 64
+    assert kv.session_capacity == 2
+    assert runner._session_capacity == 2
+    assert kv.cross_attention_reserved_bytes == 2 * page_bytes
 
 
 def test_forward_exception_releases_pending_allocation_and_model_state(monkeypatch):

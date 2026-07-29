@@ -15,7 +15,7 @@ import torch
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
     CameraTrajectory,
 )
-from vllm_omni.engine.ar_diffusion_session import (
+from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionPreparedControls,
     ARDiffusionSessionEvent,
 )

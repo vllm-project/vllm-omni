@@ -14,7 +14,7 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world_actions import (
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
 )
-from vllm_omni.engine.ar_diffusion_session import (
+from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
     ARDiffusionSessionEvent,
 )

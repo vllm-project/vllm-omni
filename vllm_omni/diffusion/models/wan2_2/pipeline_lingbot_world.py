@@ -836,6 +836,7 @@ class LingBotWorldCausalDMDPipeline(
             )
             trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
         embedding_trajectory = trajectory
+        drop_anchor = False
         if previous is not None:
             embedding_trajectory = CameraTrajectory(
                 poses=torch.cat((previous.poses, trajectory.poses), dim=0),
@@ -844,6 +845,24 @@ class LingBotWorldCausalDMDPipeline(
                     dim=0,
                 ),
             )
+            drop_anchor = True
+        elif inputs.camera_actions is not None:
+            # The action integrator returns post-action poses. Keep the first
+            # action visible to framewise-delta conditioning by prepending its
+            # known pre-action state (identity for a new realtime session).
+            identity = torch.eye(
+                4,
+                device=trajectory.poses.device,
+                dtype=trajectory.poses.dtype,
+            ).unsqueeze(0)
+            embedding_trajectory = CameraTrajectory(
+                poses=torch.cat((identity, trajectory.poses), dim=0),
+                intrinsics=torch.cat(
+                    (trajectory.intrinsics[:1], trajectory.intrinsics),
+                    dim=0,
+                ),
+            )
+            drop_anchor = True
         camera_embedding = build_plucker_embedding(
             embedding_trajectory,
             height=inputs.height,
@@ -853,7 +872,7 @@ class LingBotWorldCausalDMDPipeline(
             device=self.device,
             dtype=dtype,
         )
-        if previous is not None:
+        if drop_anchor:
             camera_embedding = camera_embedding[1:]
         tail = CameraTrajectory(
             poses=trajectory.poses[-1:].clone(),

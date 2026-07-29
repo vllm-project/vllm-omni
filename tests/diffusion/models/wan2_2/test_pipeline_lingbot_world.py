@@ -17,7 +17,13 @@ from torch import nn
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_lingbot_world as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_actions import (
+    integrate_lingbot_camera_actions,
+)
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import CameraTrajectory as _CameraTrajectory
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
+    build_plucker_embedding as _real_build_plucker_embedding,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
@@ -1547,6 +1553,69 @@ def test_typed_action_ticks_integrate_camera_across_chunks(
     assert state.camera_tail is not None
     torch.testing.assert_close(state.camera_tail.poses[0, 2, 3], first_tail[0, 2, 3])
     assert state.camera_tail.poses[0, 0, 3] > first_tail[0, 0, 3]
+
+
+def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    monkeypatch.setattr(
+        module,
+        "build_plucker_embedding",
+        _real_build_plucker_embedding,
+    )
+    action_trajectory, _ = integrate_lingbot_camera_actions(
+        [["j"], [], []],
+        width=16,
+        height=16,
+    )
+    neutral_trajectory, _ = integrate_lingbot_camera_actions(
+        [[], [], []],
+        width=16,
+        height=16,
+    )
+
+    def inputs(trajectory, actions):
+        return SimpleNamespace(
+            camera_trajectory=trajectory,
+            camera_actions=actions,
+            num_latent_frames=3,
+            num_frames=9,
+            height=16,
+            width=16,
+        )
+
+    action_embedding, tail = pipeline._prepare_camera(
+        inputs(action_trajectory, (("j",), (), ())),
+        dtype=torch.float32,
+    )
+    neutral_embedding, _ = pipeline._prepare_camera(
+        inputs(neutral_trajectory, ((), (), ())),
+        dtype=torch.float32,
+    )
+
+    identity_anchor = torch.eye(4, dtype=action_trajectory.poses.dtype).unsqueeze(0)
+    explicit_trajectory = _CameraTrajectory(
+        poses=torch.cat((identity_anchor, action_trajectory.poses), dim=0),
+        intrinsics=torch.cat(
+            (action_trajectory.intrinsics[:1], action_trajectory.intrinsics),
+            dim=0,
+        ),
+    )
+    explicit = _real_build_plucker_embedding(
+        explicit_trajectory,
+        height=16,
+        width=16,
+        target_height=16,
+        target_width=16,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )[1:]
+
+    assert not torch.equal(action_embedding, neutral_embedding)
+    torch.testing.assert_close(action_embedding, module._fold_camera_embedding(explicit))
+    torch.testing.assert_close(tail.poses, action_trajectory.poses[-1:])
 
 
 def test_typed_tick_rejects_non_contiguous_chunk_index(

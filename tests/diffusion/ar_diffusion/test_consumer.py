@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from vllm_omni.engine.ar_diffusion_consumer import ARDiffusionOmniTickConsumer
-from vllm_omni.engine.ar_diffusion_session import (
+from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
+from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
     ARDiffusionSessionEvent,
 )
@@ -27,6 +27,16 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class FakeStagePool:
+    def __init__(self, num_replicas: int = 1) -> None:
+        self.num_replicas = num_replicas
+
+
+class FakeEngine:
+    def __init__(self, num_replicas: int = 1) -> None:
+        self.stage_pools = [FakeStagePool(num_replicas)]
+
+
 class FakeGenerateClient:
     def __init__(
         self,
@@ -34,7 +44,9 @@ class FakeGenerateClient:
         include_metadata: bool = True,
         applied_event_ids: list[int] | None = None,
         output_error: str | None = None,
+        num_replicas: int = 1,
     ) -> None:
+        self.engine = FakeEngine(num_replicas)
         self.include_metadata = include_metadata
         self.applied_event_ids = applied_event_ids
         self.output_error = output_error
@@ -103,6 +115,23 @@ def make_tick() -> ARDiffusionTickRequest:
             ),
         ),
     )
+
+
+def test_consumer_rejects_replicated_ar_diffusion_stage() -> None:
+    client = FakeGenerateClient(num_replicas=2)
+
+    with pytest.raises(
+        ValueError,
+        match=r"require exactly one replica.*num_replicas=2",
+    ):
+        ARDiffusionOmniTickConsumer(
+            client,
+            prompt_provider=lambda tick: tick.prompt or "",
+            sampling_params_list=[OmniDiffusionSamplingParams()],
+            diffusion_stage_id=0,
+        )
+
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

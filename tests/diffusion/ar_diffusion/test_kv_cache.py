@@ -30,6 +30,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 BLOCK = 16
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
@@ -200,12 +202,76 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
         kv_branches=(ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0)),
         session_capacity=1,
         cross_attention_lengths={"text": L},
-        device=torch.device("cpu"),
     )
     cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
-    expected = compute_num_blocks(avail - cross_bytes, 0.5, kv.spec.page_size_bytes * 2)
+    page_bytes = kv.spec.page_size_bytes * 2
+    scratch_bytes = kv.scratch_num_blocks * page_bytes
+    expected = (int(avail * 0.5) - cross_bytes - scratch_bytes) // page_bytes
     assert kv.num_blocks == expected
-    assert expected > 1 * (2 + 1) + 2  # above the local-slot floor, so the cross deduction is what's tested
+    assert kv.cross_attention_reserved_bytes == cross_bytes
+    assert (kv.num_blocks_total * page_bytes) + cross_bytes <= int(avail * 0.5)
+    assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
+
+
+def _make_tiny_capacity_kv(*, requested_capacity: int, available_bytes: int) -> ARDiffusionKVCache:
+    return ARDiffusionKVCache(
+        ARDiffusionKVConfig(
+            enable=True,
+            chunk_size=1,
+            window_chunks=3,
+            sink_chunks=3,
+            gpu_memory_fraction=1.0,
+        ),
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        block_size=1,
+        max_model_len=128,
+        available_bytes=available_bytes,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=requested_capacity,
+        cross_attention_lengths={"text": 2},
+        frames_per_block=3,
+        device=torch.device("cpu"),
+    )
+
+
+def test_capacity_two_retains_both_windows_and_allocates_next_block():
+    # LingBot-like single-branch geometry: page=8 bytes; capacity=2 requires
+    # 17 managed + 3 scratch blocks, plus two 16-byte cross-attention
+    # reservations: 192 bytes exactly.
+    kv = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192)
+    assert kv.requested_session_capacity == 2
+    assert kv.session_capacity == 2
+    assert kv.managed_num_blocks == 17
+
+    adapters = [kv.begin_request(session_id) for session_id in ("first", "second")]
+    for adapter in adapters:
+        for _ in range(6):  # three sink + three window blocks
+            kv.allocate_token_slots(adapter, 1)
+            kv.commit_chunk(adapter)
+        assert len(kv.window_block_ids(adapter)) == 6
+
+    # Only one request is in flight, so its three-frame block is counted once.
+    kv.allocate_token_slots(adapters[0], 3)
+
+
+def test_requested_capacity_is_capped_and_cross_reservation_uses_effective_capacity():
+    kv = _make_tiny_capacity_kv(requested_capacity=64, available_bytes=192)
+
+    assert kv.requested_session_capacity == 64
+    assert kv.session_capacity == 2
+    assert kv.cross_attention_bytes_per_session == 16
+    assert kv.cross_attention_reserved_bytes == 32
+    assert kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes == kv.memory_budget_bytes
+
+
+def test_capacity_rejects_budget_that_cannot_fit_one_session():
+    # One session needs 11 managed + 3 scratch blocks and 16 cross bytes:
+    # 14 * 8 + 16 = 128 bytes.
+    with pytest.raises(ValueError, match="cannot fit one session.*budget=127 bytes.*required=128 bytes"):
+        _make_tiny_capacity_kv(requested_capacity=1, available_bytes=127)
 
 
 def _make_kv(
@@ -220,15 +286,24 @@ def _make_kv(
         if local_branches == 1
         else (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1))
     )
+    page_bytes = 2 * BLOCK * 4 * 64 * torch.float32.itemsize
+    declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
+    scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
+    managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
     return ARDiffusionKVCache(
-        ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks),
+        ARDiffusionKVConfig(
+            enable=True,
+            chunk_size=BLOCK,
+            window_chunks=window_chunks,
+            gpu_memory_fraction=1.0,
+        ),
         num_layers=1,
         num_kv_heads=4,
         head_size=64,
         dtype=torch.float32,
         block_size=BLOCK,
         max_model_len=4096,
-        available_bytes=1 << 16,  # tiny -> the floor binds
+        available_bytes=(managed_blocks + scratch_blocks) * page_bytes,
         device=torch.device("cpu"),
         kv_branches=kv_branches,
         session_capacity=1,

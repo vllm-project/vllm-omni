@@ -103,6 +103,21 @@ class ARDiffusionOmniTickConsumer:
             raise ValueError("diffusion_stage_id must index sampling_params_list.")
         if not isinstance(templates[diffusion_stage_id], OmniDiffusionSamplingParams):
             raise TypeError("The selected diffusion stage must use OmniDiffusionSamplingParams.")
+        stage_pools = getattr(getattr(engine_client, "engine", None), "stage_pools", None)
+        if stage_pools is None or not 0 <= diffusion_stage_id < len(stage_pools):
+            raise ValueError(
+                "AR-Diffusion realtime execution requires an initialized AsyncOmni "
+                "engine with a matching diffusion stage pool."
+            )
+        replica_count = getattr(stage_pools[diffusion_stage_id], "num_replicas", None)
+        if isinstance(replica_count, bool) or not isinstance(replica_count, int) or replica_count < 1:
+            raise ValueError("The selected AR-Diffusion stage must expose a positive num_replicas.")
+        if replica_count != 1:
+            raise ValueError(
+                "AR-Diffusion realtime sessions currently require exactly one "
+                "replica for the selected diffusion stage; session-affine "
+                f"routing is not implemented (got num_replicas={replica_count})."
+            )
         self._engine_client = engine_client
         self._prompt_provider = prompt_provider
         self._sampling_params_templates = templates

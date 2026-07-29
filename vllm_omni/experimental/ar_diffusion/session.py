@@ -412,17 +412,36 @@ class ARDiffusionSession(Generic[TickOutputT]):
         prepared_controls: ARDiffusionPreparedControls | None,
     ) -> None:
         async with self._state_lock:
+            # Reducer state and the session snapshot form one logical commit.
+            # Run the only fallible operation before mutating session fields so
+            # a reducer failure cannot acknowledge events or advance the chunk.
+            if prepared_controls is not None:
+                assert self._control_reducer is not None
+                self._control_reducer.commit(prepared_controls)
             for event_id in tick.applied_event_ids:
                 self._pending_events.pop(event_id, None)
             if tick.applied_event_ids:
                 self._event_floor = tick.applied_event_ids[-1]
             self._prompt = prompt
             self._controls = controls
-            if prepared_controls is not None:
-                assert self._control_reducer is not None
-                self._control_reducer.commit(prepared_controls)
             self._chunk_index += 1
             self._inflight_event_floor = None
+
+    async def _fail_tick(self, tick_error: BaseException) -> None:
+        async with self._state_lock:
+            self._inflight_event_floor = None
+            self._status = ARDiffusionSessionStatus.FAILED
+        try:
+            # A model forward may already have released its state. This
+            # idempotent close also covers successful forwards whose metadata
+            # or local reducer commit could not be accepted.
+            await self._lifecycle.close_session(self.session_id)
+        except Exception as cleanup_error:
+            raise ARDiffusionSessionError(
+                "AR-Diffusion tick failed "
+                f"({type(tick_error).__name__}: {tick_error}) and worker "
+                f"session cleanup also failed: {cleanup_error}"
+            ) from tick_error
 
     async def next_chunk(self) -> TickOutputT:
         """Execute and atomically commit one chunk-boundary snapshot."""
@@ -440,21 +459,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
                         "Tick consumer metadata does not match the submitted AR-Diffusion tick."
                     )
             except BaseException as tick_error:
-                async with self._state_lock:
-                    self._inflight_event_floor = None
-                    self._status = ARDiffusionSessionStatus.FAILED
-                try:
-                    # A model forward may already have released its state. This
-                    # idempotent close also covers successful-but-mismatched
-                    # output metadata, where worker state has advanced but the
-                    # control-plane snapshot must not commit.
-                    await self._lifecycle.close_session(self.session_id)
-                except Exception as cleanup_error:
-                    raise ARDiffusionSessionError(
-                        "AR-Diffusion tick failed "
-                        f"({type(tick_error).__name__}: {tick_error}) and worker "
-                        f"session cleanup also failed: {cleanup_error}"
-                    ) from tick_error
+                await self._fail_tick(tick_error)
                 raise
 
             commit_task = asyncio.create_task(
@@ -470,7 +475,14 @@ class ARDiffusionSession(Generic[TickOutputT]):
             except asyncio.CancelledError:
                 # Once a consumer reports success, the local chunk/event state
                 # must commit even if the transport task is being cancelled.
-                await commit_task
+                try:
+                    await commit_task
+                except BaseException as commit_error:
+                    await self._fail_tick(commit_error)
+                    raise
+                raise
+            except BaseException as commit_error:
+                await self._fail_tick(commit_error)
                 raise
             return output
 

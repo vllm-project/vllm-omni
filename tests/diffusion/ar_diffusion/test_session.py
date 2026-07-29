@@ -7,10 +7,11 @@ from typing import Any
 
 import pytest
 
-from vllm_omni.engine.ar_diffusion_session import (
+from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionChunkMetadataError,
     ARDiffusionEventAcceptanceStatus,
     ARDiffusionEventQueueFullError,
+    ARDiffusionPreparedControls,
     ARDiffusionSession,
     ARDiffusionSessionError,
     ARDiffusionSessionEvent,
@@ -62,6 +63,30 @@ class FakeLifecycle:
 
     async def close_session(self, session_id: str) -> None:
         self.closes.append(session_id)
+
+
+class FailingCommitReducer:
+    def __init__(self) -> None:
+        self.commit_calls = 0
+        self.reset_calls = 0
+
+    def prepare(
+        self,
+        *,
+        current_controls: dict[str, ARDiffusionControlInput],
+        events: tuple[ARDiffusionSessionEvent, ...],
+        chunk_index: int,
+    ) -> ARDiffusionPreparedControls:
+        del current_controls, events, chunk_index
+        return ARDiffusionPreparedControls(controls=())
+
+    def commit(self, prepared: ARDiffusionPreparedControls) -> None:
+        del prepared
+        self.commit_calls += 1
+        raise RuntimeError("fake reducer commit failed")
+
+    def reset(self) -> None:
+        self.reset_calls += 1
 
 
 def make_session(
@@ -269,6 +294,39 @@ async def test_metadata_mismatch_does_not_commit_snapshot() -> None:
     assert session.pending_event_count == 1
     assert session.status is ARDiffusionSessionStatus.FAILED
     assert lifecycle.closes == ["world-1"]
+
+
+@pytest.mark.asyncio
+async def test_reducer_commit_failure_is_fail_closed_without_partial_session_commit() -> None:
+    consumer = FakeTickConsumer()
+    lifecycle = FakeLifecycle()
+    reducer = FailingCommitReducer()
+    session = ARDiffusionSession(
+        "world-1",
+        tick_consumer=consumer,
+        lifecycle=lifecycle,
+        max_pending_events=4,
+        request_id_factory=lambda session_id, chunk_index: f"{session_id}-request-{chunk_index}",
+        control_reducer=reducer,
+    )
+    await session.accept_event(ARDiffusionSessionEvent(event_id=1, prompt="pending"))
+
+    with pytest.raises(RuntimeError, match="fake reducer commit failed"):
+        await session.next_chunk()
+
+    assert reducer.commit_calls == 1
+    assert session.status is ARDiffusionSessionStatus.FAILED
+    assert session.chunk_index == 0
+    assert session.pending_event_count == 1
+    assert lifecycle.closes == ["world-1"]
+    with pytest.raises(ARDiffusionSessionStateError, match="failed"):
+        await session.next_chunk()
+
+    await session.reset()
+    assert reducer.reset_calls == 1
+    assert session.status is ARDiffusionSessionStatus.ACTIVE
+    assert session.chunk_index == 0
+    assert session.pending_event_count == 0
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,13 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
 )
+from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
+from vllm_omni.experimental.ar_diffusion.session import (
+    ARDiffusionSession,
+    ARDiffusionSessionManager,
+    ARDiffusionWorkerLifecycle,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     AR_DIFFUSION_TICK_KEY,
     ARDiffusionChunkMetadata,
@@ -25,6 +31,10 @@ __all__ = [
     "ARDiffusionKVBranchSpec",
     "ARDiffusionCrossAttentionKVSpec",
     "ARDiffusionEngine",
+    "ARDiffusionOmniTickConsumer",
+    "ARDiffusionSession",
+    "ARDiffusionSessionManager",
+    "ARDiffusionWorkerLifecycle",
     "AR_DIFFUSION_TICK_KEY",
     "ARDiffusionChunkMetadata",
     "ARDiffusionControlInput",
