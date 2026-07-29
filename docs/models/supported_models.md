@@ -108,7 +108,7 @@ support metadata until their recipe is audited.
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
 
-See the [LingBot-World 2.0 recipe](../../recipes/Robbyant/LingBot-World-2.0.md)
+See the [LingBot-World 2.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-World-2.0.md)
 for offline and experimental realtime usage, supported controls, validation,
 and current limitations.
 

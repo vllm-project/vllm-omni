@@ -110,6 +110,7 @@ nav:
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
+        - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
       - Communication:
         - OmniConnector Implementations:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md
