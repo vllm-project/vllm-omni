@@ -59,6 +59,10 @@ def _make_state(output_kind: RequestOutputKind):
     return OmniRequestState(**_DEFAULT_STATE_KWARGS, output_kind=output_kind)
 
 
+def test_output_modality_name_uses_string_value():
+    assert str(OutputModalityNames.AUDIO) == "audio"
+
+
 def test_init_empty_dict():
     """Ensure mm_accumulated is initially empty."""
     assert _make_state(RequestOutputKind.CUMULATIVE).mm_accumulated == {}
