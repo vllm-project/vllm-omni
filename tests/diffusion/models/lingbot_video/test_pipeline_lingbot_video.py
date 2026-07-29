@@ -80,6 +80,47 @@ def test_extra_body_params_include_video_flow_shift_alias():
     assert "batch_cfg" in params
 
 
+def test_execution_options_normalize_base_names_and_legacy_aliases():
+    from vllm_omni.diffusion.models.lingbot_video import normalize_lingbot_execution_options
+
+    options = normalize_lingbot_execution_options(
+        {
+            "batch_cfg": True,
+            "offload_vae_during_denoise": True,
+            "base_low_noise_threshold": 0.3,
+            "base_sigma_tail_steps": 4,
+        }
+    )
+
+    assert options.batch_cfg is True
+    assert options.offload_vae_during_denoise is True
+    assert options.base_low_noise_threshold == pytest.approx(0.3)
+    assert options.base_sigma_tail_steps == 4
+
+    legacy = normalize_lingbot_execution_options(
+        {"t_thresh": 0.25, "refiner_sigma_tail_steps": 3}
+    )
+    assert legacy.base_low_noise_threshold == pytest.approx(0.25)
+    assert legacy.base_sigma_tail_steps == 3
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        ({"batch_cfg": "false"}, "must be a boolean"),
+        ({"base_low_noise_threshold": 0.0}, "must lie in"),
+        ({"base_sigma_tail_steps": -1}, "non-negative integer"),
+        ({"base_low_noise_threshold": 0.3, "t_thresh": 0.2}, "conflict"),
+        ({"base_sigma_tail_steps": 4, "refiner_sigma_tail_steps": 2}, "conflict"),
+    ],
+)
+def test_execution_options_reject_invalid_or_conflicting_values(extra_args, message):
+    from vllm_omni.diffusion.models.lingbot_video import normalize_lingbot_execution_options
+
+    with pytest.raises(ValueError, match=message):
+        normalize_lingbot_execution_options(extra_args)
+
+
 def test_preprocess_preserves_geometry_and_converts_rgb(tmp_path):
     from vllm_omni.diffusion.models.lingbot_video import (
         get_lingbot_video_pre_process_func,
@@ -240,7 +281,7 @@ def test_forward_resolves_t2v_sampling_and_flow_shift_alias():
     assert call["num_inference_steps"] == 2
     assert call["guidance_scale"] == 3.0
     assert call["shift"] == 4.0
-    assert call["batch_cfg"] is True
+    assert call["execution_options"].batch_cfg is True
     assert call["output_type"] == "pt"
 
 
@@ -432,6 +473,7 @@ def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
     expected_transformer_calls,
 ):
     from vllm_omni.diffusion.models.lingbot_video import (
+        LingBotExecutionOptions,
         LingBotGenerationMode,
         LingBotImageCondition,
     )
@@ -468,7 +510,7 @@ def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
         guidance_scale=guidance_scale,
         shift=3.0,
         output_type="latent",
-        batch_cfg=batch_cfg,
+        execution_options=LingBotExecutionOptions(batch_cfg=batch_cfg),
     )
 
     assert [call[0] for call in encode_calls] == expected_prompts
@@ -493,7 +535,7 @@ def test_t2i_decodes_and_returns_the_unique_frame():
         torch.ones(1, 2, 4),
         torch.ones(1, 2, dtype=torch.long),
     )
-    pipeline._decode_latents = lambda latents: torch.ones(1, 16, 16, 3)
+    pipeline._decode_latents_internal = lambda latents: torch.ones(1, 3, 1, 16, 16)
 
     image = pipeline._generate(
         prompt="a still robot",
@@ -508,6 +550,64 @@ def test_t2i_decodes_and_returns_the_unique_frame():
     )
 
     assert image.shape == (16, 16, 3)
+
+
+def test_canonical_output_formatter_preserves_video_and_image_contracts():
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode, LingBotVideoPipeline
+
+    canonical_video = torch.arange(1 * 3 * 2 * 4 * 5).reshape(1, 3, 2, 4, 5)
+    video = LingBotVideoPipeline._format_output(canonical_video, LingBotGenerationMode.T2V)
+
+    assert video.shape == (2, 4, 5, 3)
+    assert torch.equal(video, canonical_video.permute(0, 2, 3, 4, 1)[0])
+
+    canonical_image = canonical_video[:, :, :1]
+    image = LingBotVideoPipeline._format_output(canonical_image, LingBotGenerationMode.T2I)
+    assert image.shape == (4, 5, 3)
+    assert torch.equal(image, canonical_image.permute(0, 2, 3, 4, 1)[0, 0])
+
+
+def test_pipeline_profiler_records_condition_diffuse_and_decode_stages():
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (
+        LingBotStageCondition,
+    )
+
+    pipeline = _make_pipeline()
+    pipeline.vae = nn.Linear(1, 1, bias=False)
+    condition = LingBotStageCondition(
+        prompt_embeds=None,
+        prompt_mask=None,
+        negative_prompt_embeds=None,
+        negative_prompt_mask=None,
+        image_condition=None,
+        cfg_parallel_group=None,
+        cfg_parallel_rank=0,
+    )
+    pipeline._prepare_base_condition = lambda **kwargs: condition
+    pipeline.diffuse = lambda **kwargs: torch.zeros(1, 1, 1, 2, 2)
+    pipeline._decode_latents_internal = lambda latents: torch.ones(1, 3, 1, 16, 16)
+    pipeline.setup_diffusion_pipeline_profiler(
+        profiler_targets=list(pipeline._PROFILER_TARGETS),
+        enable_diffusion_pipeline_profiler=True,
+    )
+
+    image = pipeline._generate(
+        prompt="a still robot",
+        mode=LingBotGenerationMode.T2I,
+        height=16,
+        width=16,
+        num_frames=1,
+        num_inference_steps=1,
+        guidance_scale=1.0,
+    )
+
+    assert image.shape == (16, 16, 3)
+    assert set(pipeline.stage_durations) == {
+        "LingBotVideoPipeline._prepare_base_condition",
+        "LingBotVideoPipeline.diffuse",
+        "LingBotVideoPipeline._decode_latents_internal",
+    }
 
 
 def test_forward_rejects_multi_request_batches():

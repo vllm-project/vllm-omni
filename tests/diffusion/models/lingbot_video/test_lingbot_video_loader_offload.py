@@ -263,7 +263,10 @@ def _build_generation_pipeline(transformer: nn.Module):
 
 
 def _generation_kwargs(*, output_type: str = "pt") -> dict:
-    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+    from vllm_omni.diffusion.models.lingbot_video import (
+        LingBotExecutionOptions,
+        LingBotGenerationMode,
+    )
 
     return {
         "prompt": "a robot",
@@ -275,7 +278,7 @@ def _generation_kwargs(*, output_type: str = "pt") -> dict:
         "guidance_scale": 1.0,
         "shift": 3.0,
         "output_type": output_type,
-        "offload_vae_during_denoise": True,
+        "execution_options": LingBotExecutionOptions(offload_vae_during_denoise=True),
     }
 
 
@@ -296,8 +299,8 @@ def test_vae_is_restored_before_normal_decode(mocker):
 
     pipeline = _build_generation_pipeline(_PassingTransformer())
     decode_devices: list[torch.device] = []
-    pipeline._decode_latents = lambda latents: (
-        decode_devices.append(pipeline.vae.current_device) or torch.zeros(1, 1, 1, 1)
+    pipeline._decode_latents_internal = lambda latents: (
+        decode_devices.append(pipeline.vae.current_device) or torch.zeros(1, 1, 1, 1, 1)
     )
     _patch_tracked_vae_device(mocker, module)
 

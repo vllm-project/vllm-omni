@@ -121,6 +121,8 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 def test_lingbot_extra_registry_declares_request_params() -> None:
     assert get_extra_body_params("LingBotVideoPipeline") == frozenset(
         {
+            "base_low_noise_threshold",
+            "base_sigma_tail_steps",
             "batch_cfg",
             "duration",
             "flow_shift",
