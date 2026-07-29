@@ -793,18 +793,30 @@ class MossTTSCodecDecoder(nn.Module):
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
 
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
-        try:
-            codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
-            codec = MossAudioTokenizerV2Model(codec_cfg)
-            logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
-            return codec_cfg, codec
-        except Exception:
-            logger.exception(
-                "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
-            )
+        import json
+        import os
+        config_file = os.path.join(codec_path, "config.json")
+        is_v1 = True
+        if os.path.exists(config_file):
+            with open(config_file) as f:
+                raw_cfg = json.load(f)
+            if raw_cfg.get("number_channels", 1) >= 2:
+                is_v1 = False
+
+        if not is_v1:
+            try:
+                codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+                codec = MossAudioTokenizerV2Model(codec_cfg)
+                logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
+                return codec_cfg, codec
+            except Exception:
+                logger.exception(
+                    "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
+                )
 
         codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
         codec = MossAudioTokenizerModel(codec_cfg)
+        logger.info("Using vendored MOSS Audio Tokenizer v1 classes from %s", codec_path)
         return codec_cfg, codec
 
     def _configure_decoder_cudagraph(self, device: torch.device) -> None:
