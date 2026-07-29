@@ -484,7 +484,6 @@ class RingKVCache:
             return
         slots = state_slot_ids.to(device=self.end_offset.device, dtype=torch.long)
         self.end_offset.index_fill_(0, slots, 0)
-        self.cache.index_fill_(1, slots, 0)
 
     def complete(
         self,
@@ -1607,6 +1606,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._streaming_modules: list[StreamingModule] = []
         self._streaming_exec_mask: torch.Tensor | None = None
         self._decoder_state_capacity = 0
+        self._decoder_slot_offsets: torch.Tensor | None = None
         self.post_init()
 
     def _start_streaming(self, batch_size: int, *, decoder_only: bool = False) -> None:
@@ -1634,6 +1634,49 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         root.apply(_start)
         self._streaming_modules = streaming_modules
         self._streaming_exec_mask = shared_exec_mask
+        if decoder_only:
+            self._centralize_decoder_slot_offsets(batch_size)
+
+    def _centralize_decoder_slot_offsets(self, state_capacity: int) -> None:
+        """Pack per-module slot offsets so reset needs one CUDA kernel."""
+        state_tensors: list[tuple[StreamingState, list[tuple[object, str]]]] = []
+        for module in self._streaming_modules:
+            state = module._streaming_state
+            fields: list[tuple[object, str]] = []
+            if isinstance(state, MHAState):
+                fields.append((state, "offset"))
+                if state.kv_cache is not None:
+                    fields.append((state.kv_cache, "end_offset"))
+            elif isinstance(state, TransformerState):
+                fields.append((state, "offsets"))
+            else:
+                continue
+
+            if not all(
+                isinstance(getattr(owner, name), torch.Tensor)
+                and getattr(owner, name).shape == (state_capacity,)
+                and getattr(owner, name).dtype == torch.long
+                for owner, name in fields
+            ):
+                raise RuntimeError(
+                    "Dynamic decoder state slots require every per-slot offset to use the full decoder state capacity."
+                )
+            state_tensors.append((state, fields))
+
+        num_offsets = sum(len(fields) for _, fields in state_tensors)
+        if num_offsets == 0:
+            raise RuntimeError("Dynamic decoder state pool has no per-slot offsets.")
+        storage = torch.zeros(
+            (num_offsets, state_capacity),
+            dtype=torch.long,
+            device=next(self.parameters()).device,
+        )
+        row = 0
+        for state, fields in state_tensors:
+            for owner, name in fields:
+                setattr(owner, name, storage[row])
+                row += 1
+        self._decoder_slot_offsets = storage
 
     def _stop_streaming(self) -> None:
         """Stop streaming mode for all modules."""
@@ -1642,6 +1685,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._streaming_modules = []
         self._streaming_exec_mask = None
         self._decoder_state_capacity = 0
+        self._decoder_slot_offsets = None
 
     def initialize_decoder_state_pool(self, state_capacity: int, scratch_capacity: int = 0) -> None:
         """Allocate persistent decoder state independently of execution B."""
@@ -1658,18 +1702,16 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             raise RuntimeError("MOSS Audio Tokenizer decoder state pool is not initialized.")
         if state_slot_ids.numel() == 0:
             return
-        slots = state_slot_ids.to(device=next(self.parameters()).device, dtype=torch.long)
-        if not torch.cuda.is_current_stream_capturing():
-            slots_cpu = slots.detach().to("cpu")
-            if int(slots_cpu.min()) < 0 or int(slots_cpu.max()) >= self._decoder_state_capacity:
+        slot_offsets = self._decoder_slot_offsets
+        if slot_offsets is None:
+            raise RuntimeError("MOSS Audio Tokenizer decoder slot offsets are not initialized.")
+        if state_slot_ids.device.type == "cpu":
+            if int(state_slot_ids.min()) < 0 or int(state_slot_ids.max()) >= self._decoder_state_capacity:
                 raise ValueError(
-                    f"Decoder state slots must be in [0, {self._decoder_state_capacity}), got {slots_cpu.tolist()}"
+                    f"Decoder state slots must be in [0, {self._decoder_state_capacity}), got {state_slot_ids.tolist()}"
                 )
-        for module in self._streaming_modules:
-            state = module._streaming_state
-            reset_slots = getattr(state, "reset_slots", None)
-            if callable(reset_slots):
-                reset_slots(slots)
+        slots = state_slot_ids.to(device=slot_offsets.device, dtype=torch.long)
+        slot_offsets.index_fill_(1, slots, 0)
 
     def decode_streaming_batch(
         self,
@@ -1686,7 +1728,27 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             state_capacity=self._decoder_state_capacity,
             device=codes.device,
         )
-        return self._decode_frame(codes, codes_lengths, execution_context=execution_context)
+        audio, audio_lengths = self.decode_streaming_tensors(
+            codes,
+            codes_lengths,
+            state_slot_ids,
+            valid_rows,
+        )
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
+
+    def decode_streaming_tensors(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tensor-only streaming decode boundary for vLLM compilation."""
+        execution_context = StreamingExecutionContext(
+            state_slot_ids=state_slot_ids,
+            valid_rows=valid_rows,
+        )
+        return self._decode_frame_tensors(codes, codes_lengths, execution_context=execution_context)
 
     def _set_streaming_exec_mask(self, exec_mask: torch.Tensor) -> None:
         """Update the shared active-slot mask with one device copy."""
@@ -1925,13 +1987,13 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         )
 
     @torch.no_grad()
-    def _decode_frame(
+    def _decode_frame_tensors(
         self,
         codes: torch.Tensor,
         codes_lengths: torch.Tensor | None = None,
         execution_context: StreamingExecutionContext | None = None,
-    ) -> MossAudioTokenizerDecoderOutput:
-        """Detokenize discrete tokens into audio waveform."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Detokenize codes and return tensors without Python output wrappers."""
         nq, B, T = codes.shape
         device = codes.device
 
@@ -1955,7 +2017,22 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                     d, d_lengths = decoder_module(d, d_lengths)
 
         d, d_lengths = self._restore_channels_from_codec(d, d_lengths)
-        return MossAudioTokenizerDecoderOutput(audio=d, audio_lengths=d_lengths)
+        return d, d_lengths
+
+    @torch.no_grad()
+    def _decode_frame(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor | None = None,
+        execution_context: StreamingExecutionContext | None = None,
+    ) -> MossAudioTokenizerDecoderOutput:
+        """Compatibility wrapper around the tensor-only decoder."""
+        audio, audio_lengths = self._decode_frame_tensors(
+            codes,
+            codes_lengths,
+            execution_context=execution_context,
+        )
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
 
     def encode(  # type: ignore[override]
         self,

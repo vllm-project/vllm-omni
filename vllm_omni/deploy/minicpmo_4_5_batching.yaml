@@ -84,5 +84,6 @@ platforms:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
         max_num_batched_tokens: 8192
+        gpu_memory_utilization: 0.4
         compilation_config:
           cudagraph_mode: PIECEWISE

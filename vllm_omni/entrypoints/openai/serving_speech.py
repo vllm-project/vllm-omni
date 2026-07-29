@@ -1764,7 +1764,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # headline improvement is multilingual synthesis when the language is
         # given (build_user_message(..., language=...)); 1.0 ignores it
         # gracefully. Sound-effect output is non-verbal, so skip it there.
-        if v in ("tts", "ttsd", "voice_generator") and getattr(request, "language", None):
+        if v in ("tts", "local", "ttsd", "voice_generator") and getattr(request, "language", None):
             user_kwargs["language"] = request.language
 
         # Build the unified-codes prompt: (L, 1+n_vq) where col 0 is text/special
