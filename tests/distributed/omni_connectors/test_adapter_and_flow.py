@@ -218,7 +218,8 @@ def test_get_connectors_for_stage():
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
 
 
-def test_outgoing_only_async_stage_uses_sender_connector_spec():
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_outgoing_stage_uses_sender_connector_spec(async_chunk: bool):
     config = OmniTransferConfig(
         connectors={
             ("1", "2"): ConnectorSpec(
@@ -228,10 +229,26 @@ def test_outgoing_only_async_stage_uses_sender_connector_spec():
         }
     )
 
-    spec = get_stage_connector_spec(config, stage_id=1, async_chunk=True)
+    spec = get_stage_connector_spec(config, stage_id=1, async_chunk=async_chunk)
 
     assert spec["name"] == "SharedMemoryConnector"
     assert spec["extra"] == {"codec_chunk_frames": 25, "role": "sender"}
+
+
+def test_full_payload_consumer_uses_receiver_connector_spec():
+    config = OmniTransferConfig(
+        connectors={
+            ("1", "2"): ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra={"codec_chunk_frames": 25},
+            )
+        }
+    )
+
+    spec = get_stage_connector_spec(config, stage_id=2, async_chunk=False)
+
+    assert spec["name"] == "SharedMemoryConnector"
+    assert spec["extra"] == {"codec_chunk_frames": 25, "role": "receiver"}
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

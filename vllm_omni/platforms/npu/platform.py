@@ -33,6 +33,8 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
+        from vllm_ascend.utils import adapt_patch
+
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
@@ -41,6 +43,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             apply_qwen3_tts_tokenizer_v2_patch,
         )
 
+        adapt_patch(is_global_patch=True)
         apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
@@ -74,25 +77,39 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         init_ascend_config(vllm_config)
 
     @classmethod
+    def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
+        from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
+
+        set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
+        set_mc2_mask(vllm_config, device)
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/deploy"
 
     @classmethod
-    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
-        if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanFusedMoE"
-        return super().get_diffusion_model_impl_qualname(op_name)
-
-    @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
-        if op_name != "hunyuan_fused_moe":
+        if op_name != "fused_moe":
             return
 
-        from vllm_omni.platforms.npu.models.hunyuan_fused_moe import (
-            prepare_hunyuan_fused_moe_runtime,
+        from vllm_omni.platforms.npu.layers.fused_moe import prepare_fused_moe_runtime
+
+        prepare_fused_moe_runtime()
+
+    @classmethod
+    def register_additional_diffusion_fused_moe_hooks(cls, moe_runner: Any) -> None:
+        from vllm_omni.platforms.npu.layers.fused_moe import fused_moe_forward_context_pre_hook
+
+        moe_runner.register_forward_pre_hook(
+            fused_moe_forward_context_pre_hook,
+            with_kwargs=True,
         )
 
-        prepare_hunyuan_fused_moe_runtime()
+    @classmethod
+    def reset_diffusion_fused_moe_forward_context(cls) -> None:
+        from vllm_omni.platforms.npu.layers.fused_moe import reset_fused_moe_forward_context
+
+        reset_fused_moe_forward_context()
 
     @classmethod
     def get_diffusion_packed_modules_mapping(
@@ -106,7 +123,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = True,
     ) -> str:
+        # NPU has no TRTLLM backend; accepted for signature parity, ignored.
         from importlib.util import find_spec
 
         if selected_backend is not None:

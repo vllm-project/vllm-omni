@@ -8,7 +8,7 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+from enum import Enum, Flag, auto
 
 _MODALITY_ALIASES: dict[str, str] = {
     "speech": "audio",
@@ -23,12 +23,16 @@ _MODALITY_ALIASES: dict[str, str] = {
 }
 
 
-class OutputModalityNames(StrEnum):
+class OutputModalityNames(str, Enum):
     """Keys for output modalities.
 
     TODO: (Alex) Integrate this with the big-flag enum below + throughout the code
     for better type safety (currently only used for output processor).
     """
+
+    # Keep the string conversion provided by ``enum.StrEnum`` while using the
+    # Python 3.10-compatible ``str, Enum`` form.
+    __str__ = str.__str__
 
     TEXT = "text"
     IMAGE = "image"

@@ -112,6 +112,7 @@ def _write_deploy_config(path: Path) -> None:
         f"the number of devices ({num_devices}): {parallel_config}"
     )
 
+    parallel_config["sequence_parallel_size"] = sequence_parallel_size
     config_text = yaml.dump(config, default_flow_style=False, sort_keys=False)
     path.write_text(config_text)
     logger.info(

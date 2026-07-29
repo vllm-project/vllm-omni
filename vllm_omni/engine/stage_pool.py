@@ -24,7 +24,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
     count_image_pixels,
@@ -937,10 +937,9 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
-        # Convert plain vllm SamplingParams for single-stage diffusion models
-        # that receive sampling params from the user/caller directly.
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        # Direct engine callers may provide plain vLLM SamplingParams.
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1003,8 +1002,8 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
@@ -1046,6 +1045,24 @@ class StagePool:
                             rollback_error,
                         )
                 raise
+        return replica_id
+
+    async def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> int:
+        """Submit a midway interaction to an active diffusion (typically video generation) request."""
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            replica_id = await self._pick_or_select(request_id)
+
+        client = self._diffusion_client(replica_id)
+        result = await client.submit_interaction_async(request_id, interaction)
+        # Interaction may raise error if underlying check against ODConfig fails.
+        if isinstance(result, dict) and result.get("error"):
+            reason = result.get("reason") or "Unknown interaction RPC error"
+            raise ValueError(str(reason))
         return replica_id
 
     async def _pick_or_select(
