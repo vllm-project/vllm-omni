@@ -1283,6 +1283,8 @@ def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, step
     assert stage2.guidance == LTXGuidanceSpec.positive_only()
     assert stage2.num_inference_steps == 3
     assert stage2.sigmas == (0.909375, 0.725, 0.421875, 0.0)
+    # Official Stage 2 refines video only; its audio result is discarded.
+    assert (recipe.video_output_phase, recipe.audio_output_phase) == (1, 0)
 
 
 def test_ltx_two_stage_entries_select_the_official_adapter_slots():
