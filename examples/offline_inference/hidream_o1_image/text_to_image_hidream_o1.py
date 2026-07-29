@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         "--model-type",
         choices=["full", "dev"],
         default="full",
-        help="full: 50 steps, guidance 5.0, shift 3.0. dev: 28 steps, guidance 0.0 (no CFG), shift 1.0.",
+        help="full: 50 steps, guidance 5.0, shift 3.0. dev: 28 steps, guidance 1.0 (no CFG), shift 1.0.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
