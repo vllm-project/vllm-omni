@@ -1579,8 +1579,7 @@ if __name__ == "__main__":
         type=float,
         default=300.0,
         help=(
-            "Total timeout in seconds for each generation request. "
-            "Set to 0 to disable the timeout. Default: 300."
+            "Total timeout in seconds for each generation request. Set to 0 to disable the timeout. Default: 300."
         ),
     )
 
