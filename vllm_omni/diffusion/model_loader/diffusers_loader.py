@@ -12,7 +12,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -81,7 +80,6 @@ def _natural_sort_key(filepath: str) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
 
 
-MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
@@ -326,15 +324,6 @@ class DiffusersPipelineLoader:
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(
-            model_name_or_path=model_config.model,
-            subfolder=None,
-            revision=model_config.revision,
-            fall_back_to_pt=True,
-            allow_patterns_overrides=None,
-        )
-
     def load_model(
         self,
         load_device: str,
@@ -389,6 +378,7 @@ class DiffusersPipelineLoader:
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
+        self._apply_skip_softmax_calibration(model)
         return model.eval()
 
     @staticmethod
@@ -401,6 +391,14 @@ class DiffusersPipelineLoader:
             if getattr(quant_method, "uses_meta_device", False):
                 return True
         return False
+
+    def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
+        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            apply_skip_softmax_calibration,
+        )
+
+        cfg = getattr(self.od_config, "diffusion_attention_config", None)
+        apply_skip_softmax_calibration(cfg, model)
 
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.
@@ -636,7 +634,7 @@ class DiffusersPipelineLoader:
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
         # when available and falls back to well-known attribute names.
-        # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
+        # This supports nested pipelines (e.g. LTX2DistilledPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
 

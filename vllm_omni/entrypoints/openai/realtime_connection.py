@@ -138,6 +138,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             is_streaming=True,
         )
 
+        result_gen = None
         try:
             result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
@@ -196,6 +197,16 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
         finally:
+            # Close the generator explicitly so AsyncOmni.generate's cleanup
+            # (input-pump cancellation and engine-side abort) runs now rather
+            # than whenever the event loop garbage-collects the async
+            # generator; the delay window is where a disconnected session
+            # keeps cycling through the stages (issue #4271).
+            if result_gen is not None:
+                try:
+                    await result_gen.aclose()
+                except Exception:
+                    logger.exception("Failed to close realtime result generator")
             # Always send terminal event so clients don't hang forever.
             if self._is_connected and not audio_done_sent:
                 try:
@@ -206,4 +217,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                 self.audio_queue.get_nowait()
 
     async def send_json(self, payload: dict):
-        await self.websocket.send_text(json.dumps(payload))
+        try:
+            await self.websocket.send_text(json.dumps(payload))
+        except Exception:
+            # A failed send means the client is gone; flag it so the
+            # generation loop stops instead of retrying into a dead socket.
+            self._is_connected = False
+            raise

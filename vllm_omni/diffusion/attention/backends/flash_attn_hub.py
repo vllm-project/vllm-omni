@@ -12,9 +12,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
-    piecewise_attn,
-)
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 
 logger = init_logger(__name__)
 
@@ -78,6 +76,7 @@ def _run_varlen_dense(
 
 class FlashAttentionHubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -214,6 +213,7 @@ class FlashAttentionHubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -243,6 +243,7 @@ class FlashAttentionHubImpl(AttentionImpl):
 
 class FlashAttention3HubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -379,6 +380,7 @@ class FlashAttention3HubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

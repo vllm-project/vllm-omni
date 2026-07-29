@@ -1,0 +1,239 @@
+# Uploader-only hardware presets for CUDA / NPU test YAML.
+# Referenced as ``mirror_hardwares: l4_1`` on a step; ``upload_pipeline.py`` expands to
+# ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins``, then strips
+# ``mirror_hardwares`` before Buildkite upload.
+#
+# CUDA naming: {chip}_{count}
+#   l4_1, l4_4, h100_1 … h100_4
+# NPU naming: {queue}_{resource_class}
+#   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
+#   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
+#   a3_npu_2    — ascend-a3, resource_class npu-2 (A3 CI image tag …:$BUILDKITE_COMMIT-a3)
+
+x-npu-k8s-plugins: &npu_k8s_plugins
+  - kubernetes:
+      podSpecPatch:
+        imagePullSecrets:
+          - name: swr-secret
+
+
+mirror_hardwares:
+  l4_1:
+    agents:
+      queue: gpu_1_queue
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - HF_HOME=/fsx/hf_cache
+            - HF_TOKEN
+          volumes:
+            - /fsx/hf_cache:/fsx/hf_cache
+
+  l4_4:
+    agents:
+      queue: gpu_4_queue
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - HF_HOME=/fsx/hf_cache
+            - HF_TOKEN
+          volumes:
+            - /fsx/hf_cache:/fsx/hf_cache
+
+  h100_1:
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  h100_2:
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  h100_3:
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 3
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  h100_4:
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  a2b3_npu_1:
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-1"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    plugins: *npu_k8s_plugins
+
+  a2b3_npu_4:
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-4"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    plugins: *npu_k8s_plugins
+
+
+  a2b3_npu_8:
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-8"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    plugins: *npu_k8s_plugins
+
+  a3_npu_2:
+    agents:
+      queue: "ascend-a3"
+      resource_class: "npu-2"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    plugins: *npu_k8s_plugins
+
+  a3_npu_4:
+    agents:
+      queue: "ascend-a3"
+      resource_class: "npu-4"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    plugins: *npu_k8s_plugins
+
+  a3_npu_8:
+    agents:
+      queue: "ascend-a3"
+      resource_class: "npu-8"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    plugins: *npu_k8s_plugins
+
+  a3_npu_16:
+    agents:
+      queue: "ascend-a3"
+      resource_class: "npu-16"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    plugins: *npu_k8s_plugins

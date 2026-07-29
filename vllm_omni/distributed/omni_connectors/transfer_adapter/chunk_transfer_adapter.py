@@ -13,7 +13,7 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec
+from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -56,6 +56,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._active_window,
             )
         self.connector = self.create_connector(model_config)
+        self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -68,6 +69,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
+        # Segment-local chunk counter: incremented alongside put_req_chunk
+        # but popped at segment boundaries (unlike put_req_chunk which is
+        # request-global for connector key continuity).
+        self.ramp_chunk_count: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
@@ -135,7 +140,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         stage_id = self.connector.stage_id
 
-        if stage_id == 0:
+        if stage_id == 0 or not self.receives_chunks:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
@@ -224,7 +229,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
                 request.additional_information = payload_data
-                if chunk_id > 0 and request.resumable:
+                replace_prompt = meta.get("replace_streaming_prompt") is True
+                if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
@@ -277,7 +283,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 # Empty chunk with more data expected: keep polling.
                 has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
-                if not has_new_ids and not payload_finished:
+                if not has_new_ids and payload_segment_finished:
+                    # Preserve an explicit scheduler boundary even when it
+                    # contains no new codec frames.
+                    request.prompt_token_ids = [0]
+                if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the
@@ -311,7 +321,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
+                    # Terminal stops no longer count as segment boundaries
+                    # (is_segment_finished is False when the request finishes,
+                    # see #5383), but the processor must still flush its
+                    # accumulated tail on the terminal chunk — otherwise the
+                    # downstream stage receives the finished marker without
+                    # the final payload (#5413).
+                    is_finished=is_segment_finished or is_finished,
                 )
 
             except Exception as e:
@@ -326,7 +342,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        if payload_data.meta.is_segment_finished is None:
+            payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -337,6 +354,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
+            self.ramp_chunk_count[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
@@ -358,6 +376,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
             self.requests_num_chunks_sent.pop(external_req_id, None)
+            self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
@@ -410,6 +429,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
+        self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
@@ -464,6 +484,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         callers that don't track aborts may omit it to keep the prior
         (unguarded) behaviour.
         """
+        if not self.receives_chunks:
+            return
         if self.connector.stage_id == 0:
             return
 
@@ -532,6 +554,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         self._active_streams[request_id] = request
         return True
+
+    @property
+    def num_running_waiting_for_chunk(self) -> int:
+        """Count running requests temporarily removed while awaiting a chunk."""
+        return len(self.waiting_for_chunk_running_requests)
 
     def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         # Hold non-active running requests in a private deque rather than
@@ -628,6 +655,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         every parked request is restored unconditionally (the
         pre-purge behavior).
         """
+        if not self.receives_chunks:
+            return
         if scheduler_requests is not None:
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
@@ -659,6 +688,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Add additional info for cached requests and
         clean up ready chunks from scheduler output.
         """
+        if not self.receives_chunks:
+            return
         stage_id = self.connector.stage_id
 
         if stage_id == 0:
@@ -710,6 +741,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         queue_snapshot = list(queue)
         for request in queue_snapshot:
             if not self._ensure_active_stream(request):
+                if target_status == RequestStatus.WAITING:
+                    # A non-active placeholder must not remain visible to the
+                    # scheduler: it has no connector payload yet, so running
+                    # it would execute the downstream model with empty
+                    # additional_information. Park it until restore_queues()
+                    # and retry admission on the next scheduler tick.
+                    queue.remove(request)
+                    waiting_for_chunk_list.append(request)
                 continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
@@ -771,8 +810,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests = deque(
             request for request in self.waiting_for_chunk_running_requests if request.request_id not in request_ids
         )
+        self._held_non_active = deque(
+            request for request in self._held_non_active if request.request_id not in request_ids
+        )
 
         for req_id in request_ids:
+            self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)

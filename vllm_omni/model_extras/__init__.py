@@ -5,9 +5,11 @@ from vllm_omni.model_extras.registry import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
     build_text_to_image_prompt,
+    build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
     get_model_class_name,
+    get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
 
@@ -15,8 +17,10 @@ __all__ = [
     "build_image_to_image_prompt",
     "build_image_to_video_prompt",
     "build_text_to_image_prompt",
+    "build_x_to_text_prompt",
     "get_extra_body_params",
     "get_extra_output_params",
     "get_model_class_name",
+    "get_x_to_text_model_family",
     "should_init_extra_args_for_non_diffusion_stages",
 ]
