@@ -1279,6 +1279,7 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1337,6 +1338,37 @@ class DiffusionOutput:
             error_status_code=status_code,
             error_type=error_type,
         )
+
+
+class AsyncOutputKind(Enum):
+    """Message kind for ``AsyncDiffusionOutput`` — routes async results.
+
+    * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
+    * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
+    * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
+      is available via ``async_output_id``
+    """
+
+    RPC_RESULT = "rpc_result"
+    COMPUTE_DONE = "compute_done"
+    OUTPUT_READY = "output_ready"
+
+
+@dataclass
+class AsyncDiffusionOutput:
+    """Async protocol envelope for ``result_mq`` messages.
+
+    In request-mode (``step_execution=False``), all ``result_mq``
+    messages use this envelope.  The ``kind`` field routes the message
+    to the correct consumer.
+    """
+
+    kind: AsyncOutputKind
+    rpc_id: str | None = None
+    async_output_id: str | None = None
+    result: Any | None = None
+    output: DiffusionOutput | None = None
+    error: str | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

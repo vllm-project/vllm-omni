@@ -153,6 +153,16 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         torch.musa.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.musa.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record MUSA device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.musa.mem_get_info(device)
         return free
