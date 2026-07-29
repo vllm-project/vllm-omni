@@ -4,14 +4,19 @@
 
 ## Pipelines
 
-| Model | Checkpoint | Task | `--model-class-name` | Batching |
-|---|---|---|---|---|
-| LTX-2 | `Lightricks/LTX-2` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
-| LTX-2 | `Lightricks/LTX-2` | Ordinary two-stage T2V/I2V | `LTX2TwoStagePipeline` | No |
-| LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Ordinary two-stage T2V/I2V | `LTX2TwoStagePipeline` | No |
-| LTX-2.3 distilled | `diffusers/LTX-2.3-Distilled-Diffusers` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
+| `--model-class-name` | Task | Required checkpoint repositories |
+|---|---|---|
+| `LTX2Pipeline` | LTX-2 one-stage T2V/I2V | `Lightricks/LTX-2` |
+| `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
+| `LTX2DistilledPipeline` | LTX-2 full-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
+| `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
+| `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
+| `LTX2DistilledPipeline` | LTX-2.3 full-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
+
+The table lists repositories as download units. Each full pipeline repository
+supplies the Transformer, text encoder, connectors, video/audio VAEs, vocoder,
+scheduler, and tokenizer. Where a second repository is listed, it supplies the
+matching LoRA and/or spatial upsampler sidecars.
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
 LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
@@ -29,13 +34,8 @@ component profile; LTX-2.3 uses its BWE vocoder and matching x2 upsampler.
 
 `LTX2TwoStagePipeline` runs the regular checkpoint at half resolution, then
 upsamples and refines with the matching distilled LoRA. Omit `image` for T2V
-or provide one initial image for I2V. It needs these sidecar
-files from `Lightricks/LTX-2` or `Lightricks/LTX-2.3` respectively:
-
-| Model | Distilled LoRA | Spatial upsampler |
-|---|---|---|
-| LTX-2 | `ltx-2-19b-distilled-lora-384.safetensors` | `ltx-2-spatial-upscaler-x2-1.0.safetensors` |
-| LTX-2.3 | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` |
+or provide one initial image for I2V. All required sidecars and their source
+repositories are listed in the table above.
 
 To use predownloaded sidecars, set `VLLM_OMNI_LTX_ARTIFACTS_DIR` to one
 directory containing the applicable files under the exact names shown above.
