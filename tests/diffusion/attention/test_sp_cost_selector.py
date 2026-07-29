@@ -17,6 +17,8 @@ from vllm_omni.diffusion.attention.parallel.cost_selector import (
     StrategyCapabilities,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _model(*, ring_ms: float = 3.0) -> EmpiricalCostModel:
     points = []
@@ -77,9 +79,7 @@ def test_strict_ulysses_requires_divisible_kv_heads():
         CalibrationPoint(strategy, Interconnect.NVLINK, 4, 0.125, 2048, float(i + 1))
         for i, strategy in enumerate(SPStrategy)
     ]
-    decision = SPCostSelector(EmpiricalCostModel(points)).select(
-        _workload(sp_degree=4, num_kv_heads=2)
-    )
+    decision = SPCostSelector(EmpiricalCostModel(points)).select(_workload(sp_degree=4, num_kv_heads=2))
     assert SPStrategy.ULYSSES in decision.rejected
 
 

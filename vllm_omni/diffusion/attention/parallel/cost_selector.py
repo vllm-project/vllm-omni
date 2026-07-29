@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Protocol
 
 
 class SPStrategy(StrEnum):
@@ -63,14 +64,10 @@ class SPWorkload:
             raise ValueError(f"SP workload dimensions must be positive: {', '.join(invalid)}")
         if self.num_heads % self.num_kv_heads:
             raise ValueError(
-                "num_heads must be divisible by num_kv_heads, got "
-                f"{self.num_heads} and {self.num_kv_heads}"
+                f"num_heads must be divisible by num_kv_heads, got {self.num_heads} and {self.num_kv_heads}"
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
-            raise ValueError(
-                "ulysses_mode must be 'strict' or 'advanced_uaa', got "
-                f"{self.ulysses_mode!r}"
-            )
+            raise ValueError(f"ulysses_mode must be 'strict' or 'advanced_uaa', got {self.ulysses_mode!r}")
         object.__setattr__(self, "interconnect", Interconnect(self.interconnect))
 
     @property
@@ -152,9 +149,7 @@ class EmpiricalCostModel:
                             sp_degree=int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
                             kv_ratio=float(row["kv_ratio"] if "kv_ratio" in row else row["f"]),
                             seq_len=int(row["seq_len"] if "seq_len" in row else row["seq"]),
-                            latency_ms=float(
-                                row["latency_ms"] if "latency_ms" in row else row["p50_ms"]
-                            ),
+                            latency_ms=float(row["latency_ms"] if "latency_ms" in row else row["p50_ms"]),
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -165,9 +160,7 @@ class EmpiricalCostModel:
         matching = [
             p
             for p in self._points
-            if p.strategy == strategy
-            and p.interconnect == workload.interconnect
-            and p.sp_degree == workload.sp_degree
+            if p.strategy == strategy and p.interconnect == workload.interconnect and p.sp_degree == workload.sp_degree
         ]
         if not matching:
             raise LookupError(
@@ -205,12 +198,8 @@ class EmpiricalCostModel:
         if pair is None:
             pair = (curve[0], curve[1]) if seq_len < curve[0].seq_len else (curve[-2], curve[-1])
         left, right = pair
-        weight = (math.log(seq_len) - math.log(left.seq_len)) / (
-            math.log(right.seq_len) - math.log(left.seq_len)
-        )
-        log_ms = math.log(left.latency_ms) + weight * (
-            math.log(right.latency_ms) - math.log(left.latency_ms)
-        )
+        weight = (math.log(seq_len) - math.log(left.seq_len)) / (math.log(right.seq_len) - math.log(left.seq_len))
+        log_ms = math.log(left.latency_ms) + weight * (math.log(right.latency_ms) - math.log(left.latency_ms))
         return math.exp(log_ms)
 
 
@@ -263,8 +252,7 @@ class SPCostSelector:
             return "implementation is not available in this build"
         if strategy == SPStrategy.ULYSSES:
             if workload.ulysses_mode == "strict" and (
-                workload.num_heads % workload.sp_degree
-                or workload.num_kv_heads % workload.sp_degree
+                workload.num_heads % workload.sp_degree or workload.num_kv_heads % workload.sp_degree
             ):
                 return "strict Ulysses requires Q and KV heads divisible by SP degree"
             return None

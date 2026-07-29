@@ -31,11 +31,7 @@ from vllm_omni.diffusion.attention.parallel.cost_selector import (
 
 def _read_rows(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as f:
-        return [
-            json.loads(line)
-            for line in f
-            if line.strip() and json.loads(line).get("status", "ok") == "ok"
-        ]
+        return [json.loads(line) for line in f if line.strip() and json.loads(line).get("status", "ok") == "ok"]
 
 
 def _point(row: dict) -> CalibrationPoint:
