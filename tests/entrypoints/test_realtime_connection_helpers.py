@@ -48,6 +48,19 @@ def tool_call_conn() -> RealtimeConnection:
     # Tool calling is only supported with async_chunk off, so that is the default
     # here; tests that care about the other mode set it explicitly.
     conn.serving = _FakeServing()
+    # handle_event's session.update branch now also assigns _speaker.
+    conn._speaker = None
+    return conn
+
+
+@pytest.fixture
+def speaker_conn() -> RealtimeConnection:
+    conn = RealtimeConnection.__new__(RealtimeConnection)
+    conn._speaker = None
+    # ...and _tools, so a session.update event exercises the whole branch.
+    conn._tools = None
+    # session.update now consults serving.model_config for the async_chunk gate.
+    conn.serving = _FakeServing()
     return conn
 
 
@@ -166,6 +179,49 @@ class TestRealtimeConnectionToolCallEventRouting:
         base_handle_event.assert_awaited_once_with(event)
 
 
+class TestRealtimeConnectionSpeakerRouting:
+    """handle_event's voice/speaker-selection addition to session.update -
+    threaded into buffer_realtime_audio's own `speaker` param (see
+    Qwen3OmniMoeForConditionalGeneration.buffer_realtime_audio), the same
+    `additional_information={"speaker": [...]}` shape /v1/chat/completions
+    already uses (serving_chat.py)."""
+
+    def _patch_base_handle_event(self, mocker):
+        return mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+
+    def test_session_update_captures_voice_field(self, speaker_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+
+        asyncio.run(speaker_conn.handle_event({"type": "session.update", "model": "qwen3-omni", "voice": "aiden"}))
+
+        assert speaker_conn._speaker == "aiden"
+
+    def test_session_update_captures_speaker_field(self, speaker_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+
+        asyncio.run(speaker_conn.handle_event({"type": "session.update", "model": "qwen3-omni", "speaker": "ethan"}))
+
+        assert speaker_conn._speaker == "ethan"
+
+    def test_session_update_without_voice_or_speaker_leaves_existing_value_untouched(
+        self, speaker_conn, mocker
+    ) -> None:
+        self._patch_base_handle_event(mocker)
+        speaker_conn._speaker = "aiden"
+
+        asyncio.run(speaker_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
+
+        assert speaker_conn._speaker == "aiden"
+
+    def test_unrelated_event_types_still_delegate_to_base(self, speaker_conn, mocker) -> None:
+        base_handle_event = self._patch_base_handle_event(mocker)
+        event = {"type": "input_audio_buffer.commit", "final": True}
+
+        asyncio.run(speaker_conn.handle_event(event))
+
+        base_handle_event.assert_awaited_once_with(event)
+
+
 class TestRenderTokenPromptReattachesAudio:
     """Regression test for a real bug: the tool-call continuation re-submitted
     the engine's POST-expansion `output.prompt_token_ids` as a bare
@@ -182,6 +238,7 @@ class TestRenderTokenPromptReattachesAudio:
         conn.serving = mocker.Mock()
         conn.serving.model_config.is_encoder_decoder = False
         conn.serving.renderer.render_cmpl_async = mocker.AsyncMock(side_effect=lambda prompts: [dict(prompts[0])])
+        conn._speaker = None
         return conn
 
     @staticmethod
@@ -199,6 +256,26 @@ class TestRenderTokenPromptReattachesAudio:
 
         assert result.prompt["multi_modal_data"] is audio
 
+    def test_continuation_keeps_the_selected_voice(self, mocker) -> None:
+        """Without this the voice audibly changes mid-turn: the continuation is
+        built as its own TokensPrompt, bypassing buffer_realtime_audio where the
+        speaker is normally attached, so the spoken reply after a tool call fell
+        back to the checkpoint default."""
+        conn = self._conn(mocker)
+        conn._speaker = "aiden"
+
+        result = self._first(conn._render_token_prompt([1, 2, 3]))
+
+        assert result.prompt["additional_information"] == {"speaker": ["aiden"]}
+
+    def test_continuation_without_a_selected_voice_is_a_noop(self, mocker) -> None:
+        conn = self._conn(mocker)
+        conn._speaker = None
+
+        result = self._first(conn._render_token_prompt([1, 2, 3]))
+
+        assert "additional_information" not in result.prompt
+
     def test_no_multi_modal_data_is_a_noop(self, mocker) -> None:
         conn = self._conn(mocker)
 
@@ -211,6 +288,8 @@ class TestRenderTokenPromptReattachesAudio:
         the continuation has something audio-bearing to splice onto."""
         conn = self._conn(mocker)
         conn._tools = None
+        # _buffer_realtime_audio_with_tools now also reads _speaker.
+        conn._speaker = None
         conn._turn_prompt = None
         audio = {"audio": np.zeros(8000, dtype=np.float32)}
         prompt = TokensPrompt(prompt_token_ids=[10, 11], multi_modal_data=audio)
@@ -502,3 +581,42 @@ class TestToolsRejectedUnderAsyncChunk:
         send_error, _ = self._session_update(tool_call_conn, mocker, async_chunk=False)
         send_error.assert_not_awaited()
         assert tool_call_conn._tools == [{"type": "function", "function": {"name": "get_weather"}}]
+
+
+class TestRenderPromptPropagatesAdditionalInformation:
+    """Regression test for a real bug: BaseRenderer.render_cmpl_async's
+    internal pipeline (process_for_engine_async) only carries over fields
+    it explicitly knows about, so `additional_information` set on the
+    pre-render prompt (buffer_realtime_audio's `speaker`) was silently
+    dropped and never reached the engine - the voice selection feature
+    looked correct in isolation but produced no audible effect. Fixed by
+    reapplying it to the rendered engine_input, mirroring how
+    serving_chat.py._preprocess_chat does it for /v1/chat/completions."""
+
+    def _conn_with_fake_renderer(self, mocker, rendered_engine_input: dict):
+        conn = RealtimeConnection.__new__(RealtimeConnection)
+        conn.serving = mocker.Mock()
+        conn.serving.model_config.is_encoder_decoder = False
+        conn.serving.renderer.render_cmpl_async = mocker.AsyncMock(return_value=[rendered_engine_input])
+        return conn
+
+    def test_additional_information_survives_render(self, mocker) -> None:
+        # render_cmpl_async's fake return simulates the real pipeline: it never
+        # echoes back fields it doesn't recognize, so additional_information
+        # must NOT be in here even though the input prompt has it.
+        rendered = {"prompt_token_ids": [1, 2, 3]}
+        conn = self._conn_with_fake_renderer(mocker, rendered)
+        prompt = TokensPrompt(prompt_token_ids=[1, 2, 3], additional_information={"speaker": ["aiden"]})
+
+        result = asyncio.run(conn._render_prompt(prompt))
+
+        assert result.prompt["additional_information"] == {"speaker": ["aiden"]}
+
+    def test_no_additional_information_is_a_noop(self, mocker) -> None:
+        rendered = {"prompt_token_ids": [1, 2, 3]}
+        conn = self._conn_with_fake_renderer(mocker, rendered)
+        prompt = TokensPrompt(prompt_token_ids=[1, 2, 3])
+
+        result = asyncio.run(conn._render_prompt(prompt))
+
+        assert "additional_information" not in result.prompt

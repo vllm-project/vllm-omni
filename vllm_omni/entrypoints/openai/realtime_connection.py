@@ -44,7 +44,8 @@ class _PendingToolCall:
 
 class RealtimeConnection(VllmRealtimeConnection):
     """Omni realtime connection with audio-only server events, plus
-    OpenAI-Realtime-shaped tool/function calling.
+    OpenAI-Realtime-shaped tool/function calling and voice (TTS speaker)
+    selection.
 
     Reuses upstream vLLM websocket/session lifecycle and customizes
     generation output handling to emit audio deltas and tool-call events.
@@ -73,6 +74,11 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     A chain of tool calls is bounded by MAX_TOOL_ROUNDS.
 
+    Voice selection: `session.update` gains an optional `voice` (or
+    `speaker`) field, mirroring OpenAI's Realtime API. Previously there was
+    no way to select a voice at all - every session silently used whichever
+    key HF's `talker_config.speaker_id` lists first for the checkpoint.
+
     Scope and limitations of the tool-calling path:
 
     - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
@@ -81,6 +87,7 @@ class RealtimeConnection(VllmRealtimeConnection):
     - **Requires `async_chunk` disabled.** `session.update` with `tools` is
       rejected when the server runs in async-chunk mode; see
       `_async_chunk_enabled` for why aggregating instead would not be enough.
+      Voice selection is unaffected and works in either mode.
     - **Waits on client liveness.** Once the model has requested a tool, the turn
       blocks until a `function_call_output` arrives for every pending call. There
       is deliberately no deadline, because a slow tool is indistinguishable from
@@ -108,6 +115,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         # Consecutive tool-call rounds in this turn, bounded by MAX_TOOL_ROUNDS.
         self._tool_rounds = 0
+        self._speaker: str | None = None
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -130,6 +138,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                 else:
                     self._tools = tools
+            # Voice selection is independent of the async_chunk gate above.
+            speaker = event.get("voice") or event.get("speaker")
+            if speaker is not None:
+                self._speaker = speaker
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
@@ -197,6 +209,16 @@ class RealtimeConnection(VllmRealtimeConnection):
         model_config = self.serving.model_config
         parsed_prompt = parse_model_prompt(model_config, prompt)
         (engine_input,) = await self.serving.renderer.render_cmpl_async([parsed_prompt])
+        # render_cmpl_async's internal pipeline (BaseRenderer.process_for_engine_async)
+        # only carries over fields it explicitly knows about - additional_information
+        # set on the pre-render prompt (buffer_realtime_audio's `speaker`) is silently
+        # dropped unless reapplied to the *rendered* engine_input, exactly like
+        # serving_chat.py._preprocess_chat does for /v1/chat/completions.
+        additional_information = (
+            parsed_prompt.get("additional_information") if isinstance(parsed_prompt, dict) else None
+        )
+        if additional_information:
+            engine_input["additional_information"] = additional_information
         return StreamingInput(prompt=engine_input)
 
     async def _buffer_realtime_audio_with_tools(
@@ -205,13 +227,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools` through to the model's `buffer_realtime_audio`.
-        The base class's `transcribe_realtime` has a fixed
-        (audio_stream, input_stream, model_config) call signature with no
-        seam for extra per-connection state like tools, so this reimplements
-        its (short) body directly rather than patching upstream vLLM."""
+        threads `self._tools`/`self._speaker` through to the model's
+        `buffer_realtime_audio`. The base class's `transcribe_realtime` has a
+        fixed (audio_stream, input_stream, model_config) call signature with
+        no seam for extra per-connection state like these, so this
+        reimplements its (short) body directly rather than patching upstream
+        vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, self.serving.model_config, tools=self._tools
+            audio_stream, input_stream, self.serving.model_config, tools=self._tools, speaker=self._speaker
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
@@ -232,6 +255,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         # and free-associates unrelated tool calls instead of answering.
         if multi_modal_data:
             token_prompt["multi_modal_data"] = multi_modal_data
+        # Keep the selected voice for the model's actual spoken reply too, not just
+        # the pre-tool-call turn. This path builds its own TokensPrompt rather than
+        # going through buffer_realtime_audio, so without this the continuation
+        # carries no `speaker` and silently falls back to the checkpoint default -
+        # the voice audibly changes halfway through a tool-calling turn.
+        if self._speaker:
+            token_prompt["additional_information"] = {"speaker": [self._speaker]}
         yield await self._render_prompt(token_prompt)
 
     @staticmethod

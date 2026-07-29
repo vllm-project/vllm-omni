@@ -228,6 +228,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
         tools: list[dict[str, Any]] | None = None,
+        speaker: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -283,6 +284,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+        # Same shape /v1/chat/completions uses (serving_chat.py): a one-element
+        # list under "speaker" in additional_information, read back out by
+        # talker_preprocess_prefill via payload.get("speaker").
+        additional_information = {"speaker": [speaker]} if speaker else None
+        extra_prompt_kwargs = {"additional_information": additional_information} if additional_information else {}
 
         # In non-async-chunk (full-payload) mode the engine treats each
         # streaming TokensPrompt as a fresh decode, so mid-stream segment
@@ -299,6 +305,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         multi_modal_data={"audio": segment},
+                        **extra_prompt_kwargs,
                     )
 
         remaining = buffer.flush()
@@ -306,6 +313,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
                 multi_modal_data={"audio": remaining},
+                **extra_prompt_kwargs,
             )
 
     # ==================== Device utilities ====================
