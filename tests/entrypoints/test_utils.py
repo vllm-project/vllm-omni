@@ -21,6 +21,7 @@ from vllm_omni.entrypoints.utils import (
     filter_stages,
     load_and_resolve_stage_configs,
     load_stage_configs_from_yaml,
+    resolve_deploy_config_path,
     resolve_model_config_path,
 )
 
@@ -413,6 +414,66 @@ class TestLoadAndResolveStageConfigs:
         assert filtered[0].runtime.requires_multimodal_data is True
         assert filtered[0].final_output is False
         assert filtered[0].final_output_type is None
+
+
+class TestResolveDeployConfigPath:
+    """``--stage-configs-path`` and ``--deploy-config`` must resolve alike.
+
+    ``load_and_resolve_stage_configs`` promotes a new-format YAML given via
+    ``--stage-configs-path`` to ``deploy_config_path`` (see
+    ``test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas``).
+    Callers that read the deploy YAML before stage resolution runs must apply
+    the same promotion, or everything they read from it silently defaults.
+    """
+
+    NEW_FORMAT = 'stages:\n  - stage_id: 0\n    devices: "0"\n'
+    LEGACY_FORMAT = "stage_args:\n  - stage_id: 0\n"
+
+    def _write(self, tmp_path, name, text):
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_promotes_new_format_stage_configs_path(self, tmp_path):
+        path = self._write(tmp_path, "deploy.yaml", self.NEW_FORMAT)
+        assert resolve_deploy_config_path(None, path) == path
+
+    def test_legacy_stage_args_yaml_is_not_a_deploy_config(self, tmp_path):
+        path = self._write(tmp_path, "legacy.yaml", self.LEGACY_FORMAT)
+        assert resolve_deploy_config_path(None, path) is None
+
+    def test_explicit_deploy_config_wins(self, tmp_path):
+        deploy = self._write(tmp_path, "deploy.yaml", self.NEW_FORMAT)
+        legacy = self._write(tmp_path, "legacy.yaml", self.LEGACY_FORMAT)
+        assert resolve_deploy_config_path(deploy, legacy) == deploy
+
+    @pytest.mark.parametrize("stage_configs_path", [None, "/nonexistent/deploy.yaml"])
+    def test_missing_input_yields_none_without_raising(self, stage_configs_path):
+        # load_and_resolve_stage_configs re-reads the file and owns the error;
+        # resolving a pipeline must not pre-empt its diagnostics.
+        assert resolve_deploy_config_path(None, stage_configs_path) is None
+
+    def test_unreadable_yaml_yields_none_without_raising(self, tmp_path):
+        path = self._write(tmp_path, "broken.yaml", "stages: [unclosed\n")
+        assert resolve_deploy_config_path(None, path) is None
+
+    def test_agrees_with_the_promotion_load_and_resolve_performs(self, tmp_path, mocker: MockerFixture):
+        """Pin the two call sites together so they cannot drift apart again."""
+        path = self._write(tmp_path, "deploy.yaml", self.NEW_FORMAT)
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=([create_config({"stage_id": 0, "engine_args": {"model": "dummy"}})], None),
+        )
+
+        config_path, _, _ = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=path,
+            kwargs={},
+            trust_remote_code=False,
+        )
+
+        assert config_path == path
+        assert resolve_deploy_config_path(None, path) == config_path
 
 
 class TestLoadStageConfigsFromYaml:
