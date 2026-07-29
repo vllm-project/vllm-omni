@@ -59,7 +59,7 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
   #     - label: ":full_moon: Omni · Perf Test · No Async Chunk"
   #       key: nightly-omni-performance-no-async-chunk
@@ -124,7 +124,7 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
   #     - label: ":full_moon: Omni · Multi-Replica Startup Test with 4x H100"
   #       timeout_in_minutes: 45

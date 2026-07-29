@@ -18,7 +18,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
+_DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
 _RESULT_DIR = Path(__file__).resolve().parent / "results"
 _MIN_DAILY_OMNI_ACCURACY = 0.64
 _MAX_SEED_TTS_MEAN_WER = 0.05
@@ -63,7 +63,7 @@ def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -89,7 +89,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
