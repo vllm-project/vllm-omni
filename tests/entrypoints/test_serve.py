@@ -222,6 +222,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    stage_cfg.engine_args["async_chunk"] = True
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
@@ -241,7 +242,10 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mock_connector_spec = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_spec",
+        return_value={},
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
@@ -277,6 +281,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["omni_stage_config"] is stage_cfg
     assert kwargs["replica_id"] is None
     assert "socket_ownership" not in kwargs
+    assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs

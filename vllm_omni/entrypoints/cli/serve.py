@@ -410,7 +410,7 @@ class OmniServeCommand(CLISubcommand):
             dest="model_class_name",
             type=str,
             default=None,
-            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+            help="Override the diffusion pipeline class name (e.g. LTX2Pipeline).",
         )
         omni_config_group.add_argument(
             "--diffusion-load-format",
@@ -894,7 +894,7 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
+        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's

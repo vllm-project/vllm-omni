@@ -380,5 +380,30 @@ class OmniDiffusionSamplingParams:
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
 
+    @classmethod
+    def from_params(cls, params: Any) -> "OmniDiffusionSamplingParams":
+        """Normalize caller params for diffusion stages.
+
+        Existing Omni params are returned unchanged. Plain vLLM SamplingParams
+        copy seed and matching extra_args fields; remaining extra_args stay nested.
+        Unsupported types raise TypeError.
+        """
+        if isinstance(params, cls):
+            return params
+        if isinstance(params, SamplingParams):
+            extra = dict(getattr(params, "extra_args", None) or {})
+            known = set(cls.__dataclass_fields__)
+            mapped = {k: extra.pop(k) for k in list(extra) if k in known}
+            if extra:
+                mapped["extra_args"] = extra
+            seed = getattr(params, "seed", None)
+            if seed is not None:
+                mapped.setdefault("seed", seed)
+            return cls(**mapped)
+        raise TypeError(
+            "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
+            f"got {type(params).__name__!r}."
+        )
+
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams

@@ -83,7 +83,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
-    """Test processing text, generating audio output through the talker token2wav path."""
+    """Test processing text and generating audio through Talker and Code2Wav."""
     request_config = {"prompts": get_question("text"), "modalities": ["audio"]}
     omni_runner_handler.send_omni_request(request_config)
 

@@ -1174,10 +1174,13 @@ async def _send_listen_only_overlap_pair(
     before_second_listen = state.model_listen_count
     overlap_started_while_active = not state.response_done(first_response_id)
     model_unit_ready_while_active = False
+    second_unit_event_index: int | None = None
 
     def record_model_unit_ready() -> None:
-        nonlocal model_unit_ready_while_active
+        nonlocal model_unit_ready_while_active, second_unit_event_index
         model_unit_ready_while_active = not state.response_done(first_response_id)
+        if model_unit_ready_while_active:
+            second_unit_event_index = len(state.events)
 
     await _send_pcm16(
         ws,
@@ -1239,14 +1242,13 @@ async def _send_listen_only_overlap_pair(
             label=transcripts[1],
         )
 
-    second_speech_index = _nth_event_index(state, "input_audio_buffer.speech_started", 2)
     first_done_index = _event_index_for_response(state, "response.done", first_response_id)
     overlap_ok = (
         overlap_started_while_active
         and model_unit_ready_while_active
-        and second_speech_index is not None
+        and second_unit_event_index is not None
         and first_done_index is not None
-        and second_speech_index < first_done_index
+        and second_unit_event_index < first_done_index
     )
     return [first_response_id, second_response_id], ["speak", second_outcome], overlap_ok
 
@@ -1380,6 +1382,17 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             await ws.send(json.dumps({"type": "session.close"}))
             await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
         finally:
+            if state.count("session.created") > 0 and state.count("session.closed") == 0:
+                try:
+                    await ws.send(json.dumps({"type": "session.close"}))
+                    await _wait_for(
+                        state,
+                        lambda: state.count("session.closed") > 0,
+                        timeout_s=min(args.timeout_s, 5),
+                        label="session.closed during cleanup",
+                    )
+                except (ConnectionClosed, TimeoutError):
+                    pass
             stop.set()
             reader.cancel()
             try:

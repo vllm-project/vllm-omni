@@ -231,18 +231,18 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     ids = payload_data.get("ids", {})
     meta = payload_data.get("meta", {})
     replace_prompt = isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True
-    condition_len = meta.get("next_stage_prompt_len") if replace_prompt else None
-    if isinstance(condition_len, int) and condition_len > 0:
+    next_stage_prompt_len = meta.get("next_stage_prompt_len") if isinstance(meta, dict) else None
+    if replace_prompt and isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer
         # declares that transport behavior explicitly in payload metadata.
-        new_prompt = [0] * condition_len
+        new_prompt = [0] * next_stage_prompt_len
         request._output_token_ids.clear()
         request._all_token_ids.clear()
         request._all_token_ids.extend(new_prompt)
         request.prompt_token_ids = new_prompt
         request.num_computed_tokens = 0
-        request.num_prompt_tokens = condition_len
+        request.num_prompt_tokens = next_stage_prompt_len
         request.update_block_hashes()
         return
     prompt_token_ids = ids.get("prompt", None)
@@ -255,7 +255,10 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     assert request.prompt_token_ids is not None
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
-    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+    if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+        next_prompt_len = next_stage_prompt_len
+    else:
+        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
     new_prompt = [0] * next_prompt_len
     request._all_token_ids.extend(new_prompt or ())
     request.prompt_token_ids.extend(new_prompt or ())

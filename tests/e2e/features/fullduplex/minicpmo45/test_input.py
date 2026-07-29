@@ -43,6 +43,54 @@ def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
     assert buffer.pending_byte_count == 16_000 * 4
 
 
+def test_speech_marker_does_not_leak_across_irregular_chunk_boundaries():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    assert buffer.append(pcm_payload(15_000), chunk_period_ms=1_000) is None
+    speech_unit = buffer.append(pcm_payload(2_000, speech=False), chunk_period_ms=1_000)
+    silence_unit = buffer.append(pcm_payload(15_000, speech=False), chunk_period_ms=1_000)
+
+    assert speech_unit is not None
+    assert speech_unit["is_speech"] is True
+    assert silence_unit is not None
+    assert silence_unit["is_speech"] is False
+
+
+def test_force_listen_marker_does_not_leak_across_irregular_chunk_boundaries():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    forced = pcm_payload(15_000, speech=False)
+    forced["force_listen"] = True
+
+    assert buffer.append(forced, chunk_period_ms=1_000) is None
+    forced_unit = buffer.append(pcm_payload(2_000, speech=False), chunk_period_ms=1_000)
+    unforced_unit = buffer.append(pcm_payload(15_000, speech=False), chunk_period_ms=1_000)
+
+    assert forced_unit is not None
+    assert forced_unit["force_listen"] is True
+    assert unforced_unit is not None
+    assert unforced_unit["force_listen"] is False
+
+
+def test_pcm_append_rollback_restores_per_span_speech_markers():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    assert buffer.append(pcm_payload(15_000), chunk_period_ms=1_000) is None
+    reservation = buffer.prepare_append(
+        pcm_payload(2_000, speech=False),
+        operation_id="mixed-unit",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation is not None
+    reservation.rollback()
+    first = buffer.append(pcm_payload(15_000, speech=False), chunk_period_ms=1_000)
+    second = buffer.flush(chunk_period_ms=1_000)
+
+    assert first is not None
+    assert first["is_speech"] is True
+    assert second is not None
+    assert second["is_speech"] is False
+
+
 def test_commit_without_speech_does_not_synthesize_terminal_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     buffer.append(pcm_payload(8_000, speech=False), chunk_period_ms=1_000)
