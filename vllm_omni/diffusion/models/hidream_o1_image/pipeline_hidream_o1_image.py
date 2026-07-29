@@ -385,14 +385,6 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         image_grid_thw_tgt = torch.tensor(
             [[1, h_patches, w_patches]], dtype=torch.int64, device=self.device
         )
-        ref_pixel_grid_thw = torch.tensor(
-            [[1, pil.size[1] // PATCH_SIZE, pil.size[0] // PATCH_SIZE]
-             for pil, n in zip(ref_pils, ref_image_lens)
-             for _ in [resize_pilimage(pil, ref_max)]],
-            dtype=torch.int64,
-            device=self.device,
-        )
-        # Build per-ref pixel grid from actual resized dimensions.
         ref_pixel_grid_thw_list = []
         for pil, n in zip(ref_pils, ref_image_lens):
             pil_r = resize_pilimage(pil.convert("RGB"), ref_max)
