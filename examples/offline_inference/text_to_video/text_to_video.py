@@ -402,8 +402,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=1,
-        help="Number of GPUs to shard weights across for HSDP.",
+        default=-1,
+        help="Number of GPUs to shard weights across for HSDP (-1: infer from the parallel world size).",
     )
     parser.add_argument(
         "--hsdp-replicate-size",
@@ -488,6 +488,9 @@ def main():
         vae_patch_parallel_size=args.vae_patch_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,

@@ -117,6 +117,38 @@ def test_transformer_to_keeps_sensitive_modules_in_fp32():
     assert model.norm_out_modulation[1].weight.dtype == torch.float32
 
 
+def test_transformer_exposes_block_level_hsdp_contract_for_dense_and_moe():
+    dense_model = _tiny_transformer(depth=2)
+    moe_model = _tiny_transformer(
+        depth=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        n_shared_experts=1,
+    )
+
+    for model in (dense_model, moe_model):
+        model.to(dtype=torch.bfloat16)
+        matched = [
+            name
+            for name, module in model.named_modules()
+            if any(condition(name, module) for condition in model._hsdp_shard_conditions)
+        ]
+
+        assert matched == ["blocks.0", "blocks.1"]
+        assert model._hsdp_preserve_param_dtype is True
+        assert model.blocks[0].attn.to_q.weight.dtype == torch.bfloat16
+        assert model.blocks[0].norm1.weight.dtype == torch.float32
+
+    assert moe_model.blocks[0].ffn.router.weight.dtype == torch.float32
+
+    assert "blocks.0.ffn.experts" in dict(moe_model.named_modules())
+    assert not any(
+        condition("blocks.0.ffn.experts", moe_model.blocks[0].ffn.experts)
+        for condition in moe_model._hsdp_shard_conditions
+    )
+
+
 def test_router_group_limited_topk_uses_bias_corrected_choice():
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 

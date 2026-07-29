@@ -30,6 +30,24 @@ def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
     }
 
 
+def _resolve_hsdp_param_dtype(
+    model: nn.Module,
+    configured_dtype: torch.dtype,
+) -> torch.dtype | None:
+    """Resolve whether FSDP should cast parameters during all-gather.
+
+    Most diffusion transformers use one storage dtype and benefit from the
+    configured mixed-precision policy. Models with intentional mixed-dtype
+    parameters can opt out so FSDP preserves each parameter's loaded dtype.
+    FP8 models require the same behavior for their GEMM kernels.
+    """
+    preserve_param_dtype = bool(getattr(model, "_hsdp_preserve_param_dtype", False))
+    has_fp8_params = any(
+        p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters()
+    )
+    return None if preserve_param_dtype or has_fp8_params else configured_dtype
+
+
 @dataclass
 class HSDPInferenceConfig:
     """Configuration for HSDP inference.
@@ -134,13 +152,10 @@ def apply_hsdp_to_model(
         rank,
     )
 
-    # When the model contains FP8 parameters (online quantization), let FSDP
-    # keep the original storage dtype on all-gather instead of casting to
-    # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
-    # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
-    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    # Preserve heterogeneous loaded dtypes for opt-in mixed-dtype models and
+    # FP8 models; otherwise use the configured inference dtype during all-gather.
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=None if has_fp8_params else hsdp_config.param_dtype,
+        param_dtype=_resolve_hsdp_param_dtype(model, hsdp_config.param_dtype),
         reduce_dtype=hsdp_config.reduce_dtype,
         output_dtype=hsdp_config.output_dtype,
         cast_forward_inputs=False,

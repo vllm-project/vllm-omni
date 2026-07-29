@@ -15,6 +15,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
+    _resolve_hsdp_param_dtype,
     _unshardable_parameters,
     shard_model,
 )
@@ -90,6 +91,36 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert model.block.input_global_scale is input_global_scale
     assert not isinstance(model.block.packed_weight, DTensor)
     assert not isinstance(model.block.input_global_scale, DTensor)
+
+
+def test_hsdp_param_dtype_uses_configured_dtype_by_default():
+    model = nn.Linear(2, 2)
+
+    assert _resolve_hsdp_param_dtype(model, torch.bfloat16) == torch.bfloat16
+
+
+def test_hsdp_param_dtype_preserves_opt_in_model_dtypes():
+    class _MixedDtypeModel(nn.Module):
+        _hsdp_preserve_param_dtype = True
+
+        def __init__(self):
+            super().__init__()
+            self.bulk = nn.Linear(2, 2, dtype=torch.bfloat16)
+            self.sensitive = nn.LayerNorm(2, dtype=torch.float32)
+
+    model = _MixedDtypeModel()
+
+    assert _resolve_hsdp_param_dtype(model, torch.bfloat16) is None
+
+
+def test_hsdp_param_dtype_preserves_fp8_storage():
+    model = nn.Module()
+    model.register_parameter(
+        "weight",
+        nn.Parameter(torch.ones(2, 2, dtype=torch.float8_e4m3fn), requires_grad=False),
+    )
+
+    assert _resolve_hsdp_param_dtype(model, torch.bfloat16) is None
 
 
 class TestHSDPInferenceConfig:

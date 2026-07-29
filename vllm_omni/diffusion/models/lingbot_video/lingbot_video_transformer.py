@@ -703,6 +703,20 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
 
+    @staticmethod
+    def _is_transformer_block(name: str, module: nn.Module) -> bool:
+        return (
+            isinstance(module, LingBotVideoBlock)
+            and name.startswith("blocks.")
+            and name.removeprefix("blocks.").isdigit()
+        )
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+    # AdaLN, normalization, and MoE router parameters intentionally remain
+    # FP32 while the bulk weights are BF16. Preserve those loaded dtypes when
+    # FSDP all-gathers each block instead of applying one dtype to all params.
+    _hsdp_preserve_param_dtype = True
+
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         if dtype is None or dtype == torch.float32:
