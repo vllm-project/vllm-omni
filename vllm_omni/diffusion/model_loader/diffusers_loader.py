@@ -564,14 +564,14 @@ class DiffusersPipelineLoader:
             # internally. If we construct them under `with target_device:` (CUDA),
             # safetensors takes a direct-to-GPU fast path that calls `cudaMalloc`
             # via the driver API and BYPASSES PyTorch's caching allocator.
-            # That makes those bytes invisible to CuMemAllocator, so `sleep()`
+            # That makes those bytes invisible to the memory allocator, so `sleep()`
             # cannot offload/unmap them and GPU memory stays pinned.
             #
             # Fix: build the custom pipeline on CPU first (no default device
             # context), then explicitly move it to the target device. The
             # subsequent `.to(target_device)` issues `torch.empty(..., device=cuda)`
             # + `copy_`, which goes through the caching allocator and is fully
-            # tracked by CuMemAllocator.
+            # tracked by the memory allocator.
             model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
             with set_current_diffusion_config(self.od_config):
                 model = model_cls(od_config=self.od_config)

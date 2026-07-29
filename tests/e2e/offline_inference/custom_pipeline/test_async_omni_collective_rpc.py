@@ -159,18 +159,18 @@ async def test_generate_after_list_loras_inline_mode():
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_sleep_memory_reclaimed_custom_pipeline():
-    """sleep(level=1) must physically reclaim CuMemAllocator-tracked memory for
+    """sleep(level=1) must physically reclaim allocator-tracked memory for
     custom_pipeline.
 
     Regression test for: custom pipelines constructed under ``with target_device:``
     (CUDA default-device context) caused safetensors >=0.20.0 to use a
     direct-to-GPU fast path (cudaMalloc via the driver API) that bypasses
-    CuMemAllocator, leaving weights invisible to sleep() and pinned in GPU
+    the memory allocator, leaving weights invisible to sleep() and pinned in GPU
     memory after the call.
 
     The fix moves custom_pipeline init outside the CUDA context so all weights
     go through the caching allocator and are therefore fully reclaimed by
-    sleep(level=1).  A non-zero ``CuMemAllocator.get_current_usage()`` after
+    sleep(level=1).  A non-zero ``get_current_usage()`` after
     sleep is the direct signal that the bypass is still occurring.
     """
     with ExitStack() as after:
@@ -191,15 +191,15 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         free_before, total = torch.cuda.mem_get_info()
         used_before_gib = (total - free_before) / 1024**3
 
-        # Measure CuMemAllocator-tracked usage before sleep.  In inline mode
+        # Measure allocator-tracked usage before sleep.  In inline mode
         # the worker runs in a thread pool inside this process, so the allocator
         # singleton is shared and can be read directly.
         allocator = None
         tracked_before = 0
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             tracked_before = allocator.get_current_usage()
         except Exception:
             pass
@@ -215,16 +215,16 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         drop_gib = used_before_gib - used_after_gib
 
         # --- Primary assertion: allocator reports zero tracked memory. ---
-        # If this fails it means weights were allocated outside the CuMem pool
+        # If this fails it means weights were allocated outside the memory pool
         # (safetensors direct-to-GPU bypass) — the exact regression this test
         # is designed to catch.
         if allocator is not None:
             tracked_after = allocator.get_current_usage()
             assert tracked_after == 0, (
-                f"CuMemAllocator still tracks {tracked_after / 1024**3:.3f} GiB "
+                f"Memory allocator still tracks {tracked_after / 1024**3:.3f} GiB "
                 f"after sleep(level=1) on custom_pipeline path "
                 f"(was {tracked_before / 1024**3:.3f} GiB before sleep). "
-                "Weights were allocated outside the CuMem pool via the "
+                "Weights were allocated outside the memory pool via the "
                 "safetensors direct-to-GPU fast path — loader-context fix "
                 "may not be applied."
             )
@@ -240,7 +240,7 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         assert freed_gib > 0 or drop_gib > 0, (
             f"Expected GPU memory to be reclaimed after sleep(level=1) on "
             f"custom_pipeline + enable_sleep_mode=True. "
-            f"CuMemAllocator tracked before={tracked_before / 1024**3:.3f} GiB, "
+            f"Allocator tracked before={tracked_before / 1024**3:.3f} GiB, "
             f"ACK freed={freed_gib:.3f} GiB, global VRAM drop={drop_gib:.3f} GiB."
         )
 

@@ -1865,9 +1865,9 @@ class AsyncOmniEngine:
                 name="omni-stage-runtime-shutdown",
             ).start()
 
-        # ── Release CuMem allocator memory pool ──────────────────────────────
-        # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory
-        # Management) allocator holds model weights in a singleton memory pool
+        # ── Release memory allocator pool ────────────────────────────────────
+        # When enable_sleep_mode is in use, the memory allocator holds model
+        # weights in a singleton memory pool
         # that lives in the parent process.  Killing the engine-core subprocess
         # does NOT release this pool — the weights stay resident on the GPU
         # and can cause CUDA OOM for subsequent engine instances (especially
@@ -1880,12 +1880,11 @@ class AsyncOmniEngine:
         # and lets the destructor/free path handle asleep entries correctly
         # (returns a null handle so the C extension skips unmap/release).
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
-                allocator.release_pools()
-                logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
+            allocator = get_mem_allocator_instance()
+            allocator.release_pools()
+            logger.debug("[AsyncOmniEngine] Released memory pool during shutdown")
         except Exception:
             pass
 

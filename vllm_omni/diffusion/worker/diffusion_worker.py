@@ -166,12 +166,6 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         return vllm_config
 
 
-def _get_cumem_allocator_class() -> type:
-    from vllm.device_allocator.cumem import CuMemAllocator
-
-    return CuMemAllocator
-
-
 def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
     ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
     ir_op_priority_func = get_diffusion_ir_op_priority_func(od_config)
@@ -534,8 +528,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        from vllm.device_allocator import get_mem_allocator_instance
+
+        allocator = get_mem_allocator_instance()
 
         usage_before = allocator.get_current_usage()
 
@@ -586,8 +581,9 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        from vllm.device_allocator import get_mem_allocator_instance
+
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         if len(self._sleep_saved_buffers) and self.model_runner is not None:
@@ -708,11 +704,12 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            CuMemAllocator = _get_cumem_allocator_class()
-            allocator = CuMemAllocator.get_instance()
+            from vllm.device_allocator import get_mem_allocator_instance
+
+            allocator = get_mem_allocator_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
-            logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
+            logger.info(f"[Worker {self.rank}] Activating diffusion memory pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
 
@@ -1075,7 +1072,7 @@ class WorkerWrapperBase:
         # Create the actual worker instance
         # When custom_pipeline_args is provided, skip initial model loading
         # since re_init_pipeline will handle it. This avoids allocating memory
-        # through CuMemAllocator twice, which causes assertion failures in
+        # through the memory allocator twice, which causes assertion failures in
         # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
