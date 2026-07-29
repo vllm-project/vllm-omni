@@ -209,13 +209,13 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get the pipeline endpoint
-        # restriction beforehand. TODO (Alex) make this cleaner and refactor
-        # stage config resolution to remove kwargs hacks.
-        deploy_config_path = kwargs.get("deploy_config")
+        # Stage resolution pops deploy_config, so get pipeline-wide settings
+        # beforehand. The stage CLI exposes the same deploy YAML through
+        # stage_configs_path.
+        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()

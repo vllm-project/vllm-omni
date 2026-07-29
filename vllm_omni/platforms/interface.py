@@ -109,6 +109,7 @@ class OmniPlatform(Platform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for this platform.
 
@@ -119,6 +120,7 @@ class OmniPlatform(Platform):
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
                 "TORCH_SDPA", "SAGE_ATTN"). If None, uses platform default.
             head_size: Attention head size.
+            allow_trtllm_default: Whether TRTLLM may be chosen as the default.
 
         Returns:
             Fully qualified class path of the selected backend.
