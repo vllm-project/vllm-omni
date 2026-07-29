@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HiDream-O1-Image pipeline — Phase 3 (text-to-image + image editing +
-multi-reference personalization + layout-bbox conditioning, single GPU,
-no Cache-DiT / TP / SP yet).
+"""HiDream-O1-Image pipeline — text-to-image, image editing,
+multi-reference personalization, and layout-bbox conditioning.
 
-Phase 1 added text-to-image. Phase 2 added reference-image conditioning
-(dual-pathway: Qwen3-VL vision tower + pixel patches). Phase 3 adds
-layout-bbox conditioning: bounding boxes are rendered as a synthetic layout
-image and appended to the ref-image list, reusing the Phase 2 path unchanged.
+Supports Cache-DiT acceleration, Tensor Parallelism, Sequence Parallelism
+(Ulysses), CFG-Parallel, HSDP, and CPU offload (model-level and layerwise).
 """
 
 from __future__ import annotations
