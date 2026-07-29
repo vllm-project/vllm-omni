@@ -39,6 +39,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import load_layout_bboxes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -113,14 +114,17 @@ def main() -> None:
     )
     sampling_params.extra_args.update({"shift": shift, "scheduler_name": args.scheduler})
 
-    # layout_bboxes is passed via multi_modal_data alongside the ref images.
-    # The pipeline's forward() calls create_layout_reference_images() to
-    # augment ref_pils before passing them to _build_edit_sample().
+    # Pre-load layout bboxes here (operator-controlled script) so the pipeline
+    # receives a parsed list/dict, not a raw string.  The pipeline only accepts
+    # inline JSON in multi_modal_data to prevent file-system access from
+    # user-supplied data in online serving.
+    layout_data = load_layout_bboxes(args.layout_bboxes)
+
     prompt_dict = {
         "prompt": args.prompt,
         "multi_modal_data": {
             "image": ref_images,
-            "layout_bboxes": args.layout_bboxes,  # JSON string or file path
+            "layout_bboxes": layout_data,
         },
     }
 

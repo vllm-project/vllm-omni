@@ -9,6 +9,7 @@ Supports Cache-DiT acceleration, Tensor Parallelism, Sequence Parallelism
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable
 from typing import Any, ClassVar
@@ -37,7 +38,6 @@ from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import (
     depatchify,
     find_closest_resolution,
     get_rope_index_fix_point,
-    load_layout_bboxes,
     patchify,
     preprocess_ref_patches,
     resize_pilimage,
@@ -654,7 +654,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         # augmented list is then handled identically to regular multi-ref input.
         raw_layout = mm_data.get("layout_bboxes")
         if raw_layout is not None and ref_pils is not None:
-            layout_data = load_layout_bboxes(raw_layout) if isinstance(raw_layout, str) else raw_layout
+            layout_data = json.loads(raw_layout) if isinstance(raw_layout, str) else raw_layout
             ref_pils = create_layout_reference_images(ref_pils, layout_data, width, height)
 
         latents = self.diffuse(
