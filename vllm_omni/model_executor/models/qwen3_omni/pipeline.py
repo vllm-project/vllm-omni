@@ -23,6 +23,23 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
     default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
+    # Experimental full-duplex integration. Scope: client-signalled barge-in
+    # over a persistent session. Qwen3-Omni has no learned listen/speak
+    # control token, so there is no model-owned turn policy here (unlike
+    # MiniCPM-o 4.5).
+    #
+    # duplex_control_enabled stays False: the worker-side stage-0 audio
+    # embedding path is not implemented (see
+    # vllm_omni/experimental/fullduplex/qwen3omni/stage0.py), so arming the
+    # duplex endpoint would surface a NotImplementedError at the first
+    # append rather than a clean startup failure. The extension and adapter
+    # paths below are declared so the wiring is reviewable and testable, and
+    # so enabling the feature later is a one-line change.
+    duplex_runtime_extension=("vllm_omni.experimental.fullduplex.qwen3omni.runtime.Qwen3OmniDuplexRuntimeExtension"),
+    duplex_serving_adapter=(
+        "vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter.Qwen3OmniServingRuntimeAdapter"
+    ),
+    duplex_control_enabled=False,
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,
