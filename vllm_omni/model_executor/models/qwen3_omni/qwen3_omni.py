@@ -227,6 +227,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -241,7 +242,45 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
+        if tools:
+            # Render through the model's own chat template with `tools=` so the
+            # thinker gets the <tools>...</tools> system preamble and the
+            # <tool_call></tool_call> output instructions it was trained on
+            # (see chat_template.json) - this is the same tool-calling format
+            # /v1/chat/completions already supports for this checkpoint, just
+            # never previously wired into the realtime audio-in path. When
+            # `tools` is empty this renders byte-identical to the plain
+            # f-string below, so that path is untouched to keep this change
+            # scoped to the new capability.
+            #
+            # tokenizer.apply_chat_template() alone raises here: the tokenizer
+            # object itself has no .chat_template set. safe_apply_chat_template
+            # is the same helper vLLM's own /v1/chat/completions path uses to
+            # resolve the template from model_config before calling
+            # apply_chat_template - but its own auto-resolution
+            # (resolve_chat_template in vllm/renderers/hf.py) explicitly skips
+            # the AutoProcessor-based lookup whenever `tools` is given (its
+            # 2nd-priority path is gated on `tools is None`), and for this
+            # multimodal checkpoint the chat_template genuinely lives on the
+            # processor, not the raw tokenizer - so with tools set it falls
+            # through silently to vLLM's generic (non-tool-aware) fallback
+            # template instead of erroring. Passing the processor's own
+            # chat_template explicitly bypasses that broken auto-resolution
+            # (resolve_chat_template's 1st priority: an explicit template
+            # always wins and still respects `tools` when applying it).
+            from vllm.renderers.hf import safe_apply_chat_template
+
+            prompt_template = safe_apply_chat_template(
+                model_config,
+                tokenizer,
+                [{"role": "user", "content": audio_placeholder}],
+                tools=tools,
+                chat_template=processor.chat_template,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        else:
+            prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 

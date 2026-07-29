@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import numpy as np
 import pytest
 import torch
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -20,6 +22,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def realtime_conn() -> RealtimeConnection:
     return RealtimeConnection.__new__(RealtimeConnection)
+
+
+@pytest.fixture
+def tool_call_conn() -> RealtimeConnection:
+    conn = RealtimeConnection.__new__(RealtimeConnection)
+    conn._tools = None
+    conn._tool_result_queue = asyncio.Queue()
+    conn._pending_tool_calls = {}
+    return conn
 
 
 class TestRealtimeConnectionTensorAndPcm:
@@ -84,3 +95,54 @@ class TestAsyncOmniStreamingParamsValidation:
         p = SamplingParams(n=1, stop=["\n"], output_kind=RequestOutputKind.DELTA)
         with pytest.raises(ValueError, match="Input streaming"):
             AsyncOmni._validate_streaming_input_sampling_params(p)
+
+
+class TestRealtimeConnectionToolCallEventRouting:
+    """handle_event's tool-calling additions (session.update.tools capture,
+    conversation.item.create routing) - see realtime_tool_calls.py for the
+    <tool_call> text parser these events feed."""
+
+    def _patch_base_handle_event(self, mocker):
+        return mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+
+    def test_session_update_captures_tools_and_delegates_to_base(self, tool_call_conn, mocker) -> None:
+        base_handle_event = self._patch_base_handle_event(mocker)
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        event = {"type": "session.update", "model": "qwen3-omni", "tools": tools}
+
+        asyncio.run(tool_call_conn.handle_event(event))
+
+        assert tool_call_conn._tools == tools
+        base_handle_event.assert_awaited_once_with(event)
+
+    def test_session_update_without_tools_leaves_existing_tools_untouched(self, tool_call_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+        tool_call_conn._tools = [{"type": "function", "function": {"name": "existing"}}]
+
+        asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
+
+        assert tool_call_conn._tools == [{"type": "function", "function": {"name": "existing"}}]
+
+    def test_conversation_item_create_function_call_output_is_queued(self, tool_call_conn) -> None:
+        item = {"type": "function_call_output", "call_id": "call_1", "output": "sunny and 72"}
+
+        asyncio.run(tool_call_conn.handle_event({"type": "conversation.item.create", "item": item}))
+
+        assert tool_call_conn._tool_result_queue.qsize() == 1
+        assert tool_call_conn._tool_result_queue.get_nowait() == item
+
+    def test_conversation_item_create_unsupported_item_type_sends_error(self, tool_call_conn, mocker) -> None:
+        send_error = mocker.patch.object(tool_call_conn, "send_error", new_callable=mocker.AsyncMock)
+
+        asyncio.run(tool_call_conn.handle_event({"type": "conversation.item.create", "item": {"type": "not_a_thing"}}))
+
+        send_error.assert_awaited_once()
+        assert tool_call_conn._tool_result_queue.empty()
+
+    def test_unrelated_event_types_still_delegate_to_base(self, tool_call_conn, mocker) -> None:
+        base_handle_event = self._patch_base_handle_event(mocker)
+        event = {"type": "input_audio_buffer.commit", "final": True}
+
+        asyncio.run(tool_call_conn.handle_event(event))
+
+        base_handle_event.assert_awaited_once_with(event)

@@ -189,6 +189,130 @@ def _synthetic_pcm16_input() -> bytes:
     return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
 
 
+# Distinct cache entry from REALTIME_SYNTH_PHRASE_TEXT above - must actually ask
+# something the weather tool below plausibly answers, so the model has a real
+# reason to call it (not just prompted to via `tools=`).
+TOOL_CALLING_PHRASE_TEXT = "What is the weather like in Boston right now?"
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def _tool_calling_pcm16_input() -> bytes:
+    syn = generate_synthetic_audio(
+        10,
+        1,
+        sample_rate=16000,
+        phrase_text=TOOL_CALLING_PHRASE_TEXT,
+    )
+    wav_bytes = base64.b64decode(syn["base64"])
+    return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+
+
+async def _run_realtime_tool_call_roundtrip(
+    host: str,
+    port: int,
+    model: str,
+    pcm16: bytes,
+    *,
+    chunk_ms: int = 200,
+) -> dict:
+    """Drive one full tool-calling exchange: model calls a tool, test client
+    answers it, generation resumes and speaks the final reply."""
+    uri = f"ws://{host}:{port}/v1/realtime"
+    bytes_per_ms = 16000 * 2 // 1000
+    chunk_bytes = max(bytes_per_ms * chunk_ms, 2)
+
+    tool_call_name: str | None = None
+    tool_call_args = ""
+    final_text_chunks: list[str] = []
+    final_text = ""
+    saw_final_audio_delta = False
+
+    async with websockets.connect(uri, max_size=64 * 1024 * 1024) as ws:
+        await ws.send(json.dumps({"type": "session.update", "model": model, "tools": [WEATHER_TOOL]}))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
+        for i in range(0, len(pcm16), chunk_bytes):
+            chunk = pcm16[i : i + chunk_bytes]
+            await ws.send(
+                json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(chunk).decode("utf-8")})
+            )
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=600)
+            if isinstance(message, bytes):
+                continue
+            event = json.loads(message)
+            event_type = event.get("type")
+
+            if event_type in ("session.created", "transcription.delta"):
+                continue
+            if event_type == "response.output_item.added":
+                tool_call_name = event["item"]["name"]
+                continue
+            if event_type == "response.function_call_arguments.delta":
+                tool_call_args += event["delta"]
+                continue
+            if event_type == "response.function_call_arguments.done":
+                # Answer the tool call so generation resumes with a real result.
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": event["call_id"],
+                                "output": "sunny and 72 degrees",
+                            },
+                        }
+                    )
+                )
+                continue
+            if event_type == "response.audio.delta":
+                saw_final_audio_delta = True
+                continue
+            if event_type == "transcription.done":
+                final_text_chunks.append(event.get("text", ""))
+                final_text = event.get("text", "") or "".join(final_text_chunks)
+                continue
+            if event_type == "response.audio.done":
+                break
+            if event_type == "error":
+                raise AssertionError(f"WebSocket error: {event}")
+            raise AssertionError(f"Unexpected WebSocket event: {event}")
+
+    return {
+        "tool_call_name": tool_call_name,
+        "tool_call_arguments": tool_call_args,
+        "final_text": final_text,
+        "saw_final_audio_delta": saw_final_audio_delta,
+    }
+
+
+def _assert_tool_call_roundtrip(result: dict) -> None:
+    assert result["tool_call_name"] == "get_weather", (
+        f"Expected the model to call get_weather, got {result['tool_call_name']!r} "
+        f"(final_text={result['final_text']!r})"
+    )
+    parsed_args = json.loads(result["tool_call_arguments"])  # must be valid JSON, not e.g. '{"city": "Boston"}}\\n'
+    assert "city" in parsed_args
+    assert "boston" in parsed_args["city"].lower()
+    assert result["final_text"], "Expected a spoken final reply after the tool result was submitted"
+    assert "72" in result["final_text"], f"Expected the mocked tool result to reach the final reply: {result}"
+    assert result["saw_final_audio_delta"], "Expected audio for the final (non-tool-call) reply leg"
+
+
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
     assert result["delta_events"] >= 1
@@ -281,3 +405,30 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_sync_server_params, indirect=True)
+    def test_tool_calling_round_trip(self, omni_server) -> None:
+        """Merge CI: session.update.tools -> model calls get_weather -> test
+        client submits a function_call_output -> generation resumes and
+        speaks a final reply that incorporates the (mocked) tool result.
+
+        Requires async_chunk off (same server config as the non-async_chunk
+        streaming test above) - the realtime endpoint's generation loop only
+        sees one complete thinker turn to scan for a <tool_call> block when
+        async_chunk is disabled.
+        """
+        pcm16 = _tool_calling_pcm16_input()
+
+        result = asyncio.run(
+            _run_realtime_tool_call_roundtrip(
+                omni_server.host,
+                omni_server.port,
+                omni_server.model,
+                pcm16,
+            )
+        )
+
+        _assert_tool_call_roundtrip(result)
