@@ -1481,6 +1481,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["max_new_frames"] = [request.max_new_tokens]
         return params
 
+    def _validate_vevo2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Vevo2 request.
+
+        Every request must include ``ref_audio`` -- upstream's
+        ``inference_ar_and_fm`` asserts ``timbre_ref_wav_path is not
+        None``. ``ref_text`` is the transcription of the style-reference
+        audio and is recommended (it conditions the AR LM's prosody) but
+        not strictly required by upstream. The ``voice`` OpenAI field is
+        accepted for the uploaded-speakers flow and ignored otherwise --
+        Vevo2 has no built-in speaker presets.
+        """
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.ref_audio is None:
+            return (
+                "Vevo2 requires 'ref_audio' (reference audio for timbre "
+                "and style); upstream's inference_ar_and_fm asserts "
+                "timbre_ref_wav_path is not None."
+            )
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        return None
+
+    async def _build_vevo2_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build ``additional_information`` for Vevo2.
+
+        ``ref_audio`` is resolved via :meth:`_resolve_ref_audio` and
+        passed as a ``(wav_list, sample_rate)`` tuple under
+        ``prompt_audio_array`` so the model owns temp-file lifecycle
+        (matches MOSS-TTS-Nano). ``ref_text`` is forwarded as the style
+        reference text. The model's MVP flow is zero-shot text-to-speech
+        with optional voice cloning; SVS / conversion / editing modes
+        are deferred to follow-up PRs.
+        """
+        params: dict[str, Any] = {"text": [request.input]}
+        if request.ref_text is not None:
+            params["ref_text"] = [request.ref_text]
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        params["prompt_audio_array"] = [[wav_list, sr]]
+        return params
+
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
         """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
 
@@ -2964,11 +3006,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         artifact_ready = False
 
         try:
-            # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
+            # MOSS-TTS-Nano and Vevo2 emit delta chunks per yield (single-stage,
             # async_chunk=false). The engine surfaces each yield as its own
             # RequestOutput, so we need to accumulate across the async-for loop —
             # final_output alone only carries the last (often empty) sentinel.
-            is_moss = self._tts_model_type == "moss_tts_nano"
+            is_moss = self._tts_model_type in ("moss_tts_nano", "vevo2")
             moss_chunks: list[Any] = []
             moss_sample_rate: int | None = None
 

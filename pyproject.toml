@@ -346,11 +346,14 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# CC BY-NC-ND is the Creative Commons "NoDerivatives" license code; ND is
+# its standard abbreviation, not a typo for AND. Used by the Vevo2 weight
+# license and could appear for other CC-licensed checkpoints in the future.
+ND = "ND"
 # Step-Audio reasoning parser streams `</think>` tokens split across chunks
 # (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
 # parser logic and tests and is not a typo of "the"/"this".
 thi = "thi"
-ND = "ND"
 byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.

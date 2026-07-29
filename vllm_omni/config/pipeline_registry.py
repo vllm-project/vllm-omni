@@ -103,6 +103,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
 )
+from vllm_omni.model_executor.models.vevo2.pipeline import VEVO2_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
@@ -163,6 +164,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
+    "vevo2": VEVO2_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,

@@ -25,6 +25,7 @@ For the full list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
+| Vevo2 | `RMSnow/Vevo2` | ✓ (`ref_audio` required) | — (batch only in MVP) | — | — |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
@@ -714,3 +715,33 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+## Vevo2
+
+[Vevo2](https://github.com/open-mmlab/Amphion/tree/main/models/svc/vevo2) is a unified controllable AR + flow-matching model from CUHK-Shenzhen / Amphion. Online serving exposes the **MVP zero-shot TTS path**; SVS / voice conversion / editing / streaming are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)).
+
+> **License**: the `RMSnow/Vevo2` checkpoint is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives). See the [offline README's Vevo2 section](../../offline_inference/text_to_speech/README.md#vevo2) for the full prerequisites (Amphion clone + checkpoint download + one-time `init_vevo2_checkpoint.py` setup).
+
+> **`ref_audio` is required.** Vevo2 has no built-in speakers; every request must include a reference clip.
+
+### Launch
+```bash
+./vevo2/run_server.sh
+# or:
+vllm serve ./ckpts/Vevo2 --omni --port 8092
+```
+Deploy config at `vllm_omni/deploy/vevo2.yaml` auto-loads.
+
+### Client example
+```bash
+python vevo2/openai_speech_client.py \
+    --text "Hello, this is Vevo2." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Transcript of the reference clip."
+```
+
+The `voice` field in the OpenAI schema is required for compatibility but ignored by Vevo2 unless it matches an uploaded speaker.
+
+### Notes
+- `--response-format` supports `wav` (default), `mp3`, `flac`, `pcm`.
+- No streaming yet; the full waveform is returned in one response (single-shot batch mode).
+- For a Gradio UI, see the offline example as a starting point — a Vevo2-specific demo is a follow-up.
