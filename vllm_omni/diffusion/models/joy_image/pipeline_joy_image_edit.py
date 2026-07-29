@@ -153,6 +153,14 @@ def _should_defer_component_device_placement(
     )
 
 
+def _uses_model_level_cpu_offload(
+    od_config: OmniDiffusionConfig,
+) -> bool:
+    return bool(
+        getattr(od_config, "enable_cpu_offload", False) and not getattr(od_config, "enable_layerwise_offload", False)
+    )
+
+
 def _raise_if_unsupported_hsdp(od_config: OmniDiffusionConfig) -> None:
     parallel_config = getattr(od_config, "parallel_config", None)
     if getattr(parallel_config, "use_hsdp", False):
@@ -738,9 +746,9 @@ class JoyImageEditPipeline(
                 )
         return torch.cat([image_latents, noise_latents], dim=1), image_latents
 
-    def _offload_transformer_if_deferred(self) -> None:
+    def _offload_transformer_if_model_level(self) -> None:
         od_config = getattr(self, "od_config", None)
-        if od_config is None or not _should_defer_component_device_placement(od_config):
+        if od_config is None or not _uses_model_level_cpu_offload(od_config):
             return
 
         transformer = getattr(self, "transformer", None)
@@ -759,7 +767,7 @@ class JoyImageEditPipeline(
         if od_config is None or not _should_defer_component_device_placement(od_config):
             return
 
-        self._offload_transformer_if_deferred()
+        self._offload_transformer_if_model_level()
         SequentialOffloadHook._move_params(self.vae, self.device, non_blocking=False)
         current_omni_platform.synchronize()
 
@@ -882,7 +890,7 @@ class JoyImageEditPipeline(
             cfg_normalize=True,
         )
         if output_type == "latent" or req.is_dummy_run():
-            self._offload_transformer_if_deferred()
+            self._offload_transformer_if_model_level()
             return DiffusionOutput(output=latents[:, -1].detach().cpu())
         # Step 6: decode only the target latent back to image space.
         images = self._decode_latents(latents)

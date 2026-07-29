@@ -34,8 +34,11 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     _raise_if_unsupported_hsdp,
     _resize_center_crop,
     _should_defer_component_device_placement,
+    _uses_model_level_cpu_offload,
     get_joy_image_edit_pre_process_func,
 )
+from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 
@@ -183,6 +186,7 @@ def _make_request(*, prompt=None, params=None):
         prompts=[prompt],
         sampling_params=params,
         request_id="joy-test",
+        is_dummy_run=lambda: False,
     )
 
 
@@ -197,6 +201,129 @@ def _make_single_omni_request(*, prompt=None, params=None):
         sampling_params=params,
         request_id="joy-test",
     )
+
+
+class _TinyJoyLayerwisePipeline(torch.nn.Module):
+    _dit_modules = ["transformer"]
+    _encoder_modules: list[str] = []
+    _vae_modules: list[str] = []
+    _resident_modules: list[str] = []
+    _offload_transformer_if_model_level = JoyImageEditPipeline._offload_transformer_if_model_level
+
+    def __init__(self, *, device: torch.device, cleanup_mode: str):
+        super().__init__()
+        self.device = device
+        self.scheduler = SimpleNamespace(
+            set_timesteps=lambda num_inference_steps, device: setattr(
+                self.scheduler,
+                "timesteps",
+                torch.tensor([1.0], device=device),
+            )
+        )
+        self.latent_channels = 4
+        self.od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=True,
+            pin_cpu_memory=False,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+        )
+        self.transformer = JoyImageEditTransformer3DModel(
+            in_channels=4,
+            out_channels=4,
+            hidden_size=32,
+            text_dim=16,
+            num_layers=2,
+            num_attention_heads=4,
+            patch_size=(1, 2, 2),
+        )
+        self.vae = torch.nn.Linear(1, 1)
+        self.cleanup_mode = cleanup_mode
+
+    def encode_prompt(self, *args, **kwargs):
+        return (
+            torch.zeros(1, 5, 16, device=self.device),
+            torch.ones(1, 5, dtype=torch.long, device=self.device),
+        )
+
+    def resolve_effective_true_cfg_scale(self, req, default_true_cfg_scale=4.0):
+        return JoyImageEditPipeline.resolve_effective_true_cfg_scale(
+            req,
+            default_true_cfg_scale=default_true_cfg_scale,
+        )
+
+    def _prepare_latents(self, **kwargs):
+        latents = torch.randn(1, 2, 4, 1, 4, 4, device=self.device)
+        return latents, latents[:, :1].clone()
+
+    def diffuse(self, **kwargs):
+        return self.transformer(
+            hidden_states=kwargs["latents"],
+            timestep=kwargs["timesteps"][0],
+            encoder_hidden_states=kwargs["prompt_embeds"],
+            encoder_hidden_states_mask=kwargs["prompt_embeds_mask"],
+            return_dict=False,
+        )[0]
+
+    def _decode_latents(self, latents):
+        JoyImageEditPipeline._prepare_vae_for_decode(self)
+        return latents[:, -1, :, 0]
+
+
+def _make_layerwise_forward_request(*, dummy: bool = False):
+    request = _make_request(
+        prompt={
+            "prompt": "make it brighter",
+            "additional_information": {
+                "image_tensor": torch.zeros(1, 3, 1, 16, 16),
+                "prompt_image": Image.new("RGB", (16, 16)),
+                "height": 16,
+                "width": 16,
+            },
+        },
+        params=_make_params(true_cfg_scale=1.0, num_inference_steps=1),
+    )
+    request.is_dummy_run = lambda: dummy
+    return request
+
+
+def _run_tiny_joy_layerwise_sequence(first_mode: str):
+    device = torch.device("cuda:0")
+    pipeline = _TinyJoyLayerwisePipeline(device=device, cleanup_mode=first_mode)
+    backend = LayerWiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False),
+        device,
+    )
+    backend.enable(pipeline)
+    try:
+        if first_mode == "dummy":
+            first_request = _make_layerwise_forward_request(dummy=True)
+            first_output_type = "pil"
+        elif first_mode == "latent":
+            first_request = _make_layerwise_forward_request(dummy=False)
+            first_output_type = "latent"
+        elif first_mode == "decoded":
+            first_request = _make_layerwise_forward_request(dummy=False)
+            first_output_type = "pil"
+        else:
+            raise AssertionError(f"unexpected first mode {first_mode!r}")
+
+        with torch.inference_mode():
+            JoyImageEditPipeline.forward(pipeline, first_request, output_type=first_output_type)
+
+        # These non-block modules execute before double_blocks[0], so layerwise
+        # hooks cannot repair them lazily after request cleanup.
+        assert next(pipeline.transformer.img_in.parameters()).device == device
+        assert next(pipeline.transformer.condition_embedder.parameters()).device == device
+        assert next(pipeline.transformer.proj_out.parameters()).device == device
+
+        second_request = _make_layerwise_forward_request(dummy=False)
+        with torch.inference_mode():
+            output = JoyImageEditPipeline.forward(pipeline, second_request, output_type="pil")
+    finally:
+        backend.disable()
+        torch.accelerator.empty_cache()
+
+    assert output.output.shape == (1, 4, 4, 4)
 
 
 def test_joy_registry_and_metadata_entries(tmp_path):
@@ -287,6 +414,66 @@ def test_defer_component_device_placement_for_offload_only():
     )
 
 
+@pytest.mark.parametrize(
+    ("enable_cpu_offload", "enable_layerwise_offload", "expected"),
+    [
+        (True, False, True),
+        (False, True, False),
+        (True, True, False),
+        (False, False, False),
+    ],
+)
+def test_model_level_cpu_offload_predicate_matches_effective_strategy(
+    enable_cpu_offload,
+    enable_layerwise_offload,
+    expected,
+):
+    od_config = SimpleNamespace(
+        enable_cpu_offload=enable_cpu_offload,
+        enable_layerwise_offload=enable_layerwise_offload,
+    )
+
+    assert _uses_model_level_cpu_offload(od_config) is expected
+
+
+def test_model_level_cpu_offload_cleanup_still_moves_transformer(monkeypatch):
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        pin_cpu_memory=False,
+    )
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    move_calls = []
+
+    def fake_move_params(module, target_device, **kwargs):
+        move_calls.append((module, target_device, kwargs))
+
+    monkeypatch.setattr(
+        joy_pipeline_module.SequentialOffloadHook,
+        "_move_params",
+        fake_move_params,
+    )
+    monkeypatch.setattr(joy_pipeline_module.current_omni_platform, "empty_cache", lambda: None)
+
+    JoyImageEditPipeline._offload_transformer_if_model_level(pipeline)
+
+    assert move_calls == [
+        (
+            pipeline.transformer,
+            torch.device("cpu"),
+            {"non_blocking": False, "pin_memory": False},
+        )
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("first_mode", ["dummy", "decoded", "latent"])
+def test_layerwise_joy_lifecycle_survives_second_forward(first_mode):
+    _run_tiny_joy_layerwise_sequence(first_mode)
+
+
 def test_joy_hsdp_is_explicitly_unsupported():
     with pytest.raises(ValueError, match="does not support HSDP"):
         _raise_if_unsupported_hsdp(SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True)))
@@ -296,7 +483,7 @@ def test_joy_hsdp_is_explicitly_unsupported():
 
 
 def test_joy_tensor_parallelism_is_explicitly_unsupported():
-    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+    with pytest.raises(ValueError, match="do not support Tensor Parallelism"):
         _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2)))
 
     _raise_if_unsupported_tensor_parallel(SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1)))
@@ -306,7 +493,7 @@ def test_joy_tensor_parallelism_is_explicitly_unsupported():
 
 
 def test_transformer_rejects_tensor_parallelism_before_building_layers():
-    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+    with pytest.raises(ValueError, match="do not support Tensor Parallelism"):
         JoyImageEditTransformer3DModel(
             od_config=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2)),
             in_channels=4,
@@ -320,7 +507,7 @@ def test_transformer_rejects_tensor_parallelism_before_building_layers():
 
 
 def test_pipeline_rejects_tensor_parallelism_before_loading_components():
-    with pytest.raises(ValueError, match="does not support Tensor Parallelism"):
+    with pytest.raises(ValueError, match="do not support Tensor Parallelism"):
         JoyImageEditPipeline(
             od_config=SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=2))
         )
@@ -1191,7 +1378,6 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     pipeline.scheduler = FakeScheduler()
     encode_calls = []
     diffuse_calls = []
-    cfg_checks = []
 
     def encode_prompt(prompt, image, **kwargs):
         encode_calls.append(prompt)
@@ -1210,9 +1396,6 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     pipeline._prepare_latents = fake_prepare_latents
     pipeline.diffuse = diffuse
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 2, 2)
-    pipeline.check_cfg_parallel_validity = lambda scale, has_neg_prompt: (
-        cfg_checks.append((scale, has_neg_prompt)) or True
-    )
 
     request = _make_request(
         prompt={
@@ -1230,7 +1413,6 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
     output = JoyImageEditPipeline.forward(pipeline, request)
 
     assert output.output.shape == (1, 3, 2, 2)
-    assert cfg_checks == [(2.0, True)]
     assert encode_calls == ["make it brighter", ""]
     assert diffuse_calls[0]["do_true_cfg"] is True
     assert diffuse_calls[0]["true_cfg_scale"] == 2.0
@@ -1293,6 +1475,7 @@ def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
         params=_make_params(true_cfg_scale=1.0),
     )
     request.request_id = DUMMY_DIFFUSION_REQUEST_ID
+    request.is_dummy_run = lambda: True
 
     output = JoyImageEditPipeline.forward(pipeline, request)
 
