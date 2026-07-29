@@ -78,7 +78,7 @@ import multiprocessing
 import time
 import traceback
 from collections.abc import Iterable, Sequence
-from enum import StrEnum, auto
+from enum import Enum
 from typing import Any, NamedTuple
 
 import pytest
@@ -124,15 +124,15 @@ class SamplingCase(NamedTuple):
     lora: dict | None = None
 
 
-class SamplingKind(StrEnum):
-    IMAGE_NONE = auto()
-    IMAGE_DIFFUSION_SINGLE = auto()
-    UNDERSTANDING_NONE = auto()
-    UNDERSTANDING_AR_LIST = auto()
-    TTS_NONE = auto()
-    TTS_DIFFUSION_SINGLE = auto()
-    VIDEO_NONE = auto()
-    VIDEO_DIFFUSION_SINGLE = auto()
+class SamplingKind(str, Enum):
+    IMAGE_NONE = "image_none"
+    IMAGE_DIFFUSION_SINGLE = "image_diffusion_single"
+    UNDERSTANDING_NONE = "understanding_none"
+    UNDERSTANDING_AR_LIST = "understanding_ar_list"
+    TTS_NONE = "tts_none"
+    TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
+    VIDEO_NONE = "video_none"
+    VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
 
 
 # Pre-defined arguments to be used in function calls during the tests
