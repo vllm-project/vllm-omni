@@ -4,6 +4,7 @@
 import argparse
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -454,6 +455,17 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
 
 
+def _unwrap_first(output: Any) -> Any:
+    return output[0] if isinstance(output, list) and output else output
+
+
+def _extract_stage_durations(output: Any) -> dict[str, float]:
+    durations = getattr(_unwrap_first(output), "stage_durations", None)
+    if not isinstance(durations, Mapping):
+        return {}
+    return {str(name): float(duration) for name, duration in durations.items()}
+
+
 def main():
     args = parse_args()
     model_class_name = args.model_class_name
@@ -613,6 +625,15 @@ def main():
     peak_mb = _extract_peak_memory_mb(frames)
     if peak_mb:
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+
+    stage_durations = _extract_stage_durations(frames)
+    if stage_durations:
+        print("Pipeline stage durations:")
+        for name, duration in sorted(stage_durations.items()):
+            if name.endswith("_ms"):
+                print(f"  {name}: {duration:.2f} ms")
+            else:
+                print(f"  {name}: {duration:.6f} seconds ({duration * 1000:.2f} ms)")
 
     audio = None
     audio_sample_rate = args.audio_sample_rate

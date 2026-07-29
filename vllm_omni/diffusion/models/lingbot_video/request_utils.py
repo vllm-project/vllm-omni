@@ -98,6 +98,117 @@ class LingBotRequestConfig:
     input_image: Image.Image | None
 
 
+@dataclass(frozen=True)
+class LingBotExecutionOptions:
+    """Validated options that affect LingBot's Base execution path."""
+
+    batch_cfg: bool = False
+    null_cond_clone_zero: bool = False
+    offload_vae_during_denoise: bool = False
+    base_low_noise_threshold: float | None = None
+    base_sigma_tail_steps: int = 2
+
+
+def _boolean_option(extra_args: Mapping[str, Any], name: str) -> bool:
+    value = extra_args.get(name, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"LingBot `{name}` must be a boolean, got {value!r}.")
+    return value
+
+
+def _optional_float_option(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"LingBot `{name}` must be numeric, got {value!r}.")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"LingBot `{name}` must be numeric, got {value!r}.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"LingBot `{name}` must be finite, got {value!r}.")
+    return parsed
+
+
+def _non_negative_int_option(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"LingBot `{name}` must be a non-negative integer, got {value!r}.")
+    try:
+        parsed = int(value)
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"LingBot `{name}` must be a non-negative integer, got {value!r}.") from exc
+    if not math.isfinite(numeric) or numeric != parsed or parsed < 0:
+        raise ValueError(f"LingBot `{name}` must be a non-negative integer, got {value!r}.")
+    return parsed
+
+
+def normalize_lingbot_execution_options(
+    extra_args: Mapping[str, Any] | None,
+    *,
+    default_base_sigma_tail_steps: int = 2,
+) -> LingBotExecutionOptions:
+    """Normalize Base runtime options before any model work is performed.
+
+    ``t_thresh`` and ``refiner_sigma_tail_steps`` are legacy aliases for the
+    Base low-noise schedule. They remain accepted for one migration cycle, but
+    the internal execution path only uses the unambiguous ``base_*`` names.
+    """
+
+    extra_args = extra_args or {}
+    new_threshold = _optional_float_option(
+        extra_args.get("base_low_noise_threshold"),
+        "base_low_noise_threshold",
+    )
+    legacy_threshold = _optional_float_option(extra_args.get("t_thresh"), "t_thresh")
+    if new_threshold is not None and legacy_threshold is not None and new_threshold != legacy_threshold:
+        raise ValueError(
+            "LingBot `base_low_noise_threshold` and legacy `t_thresh` conflict: "
+            f"{new_threshold!r} != {legacy_threshold!r}."
+        )
+    threshold = new_threshold if new_threshold is not None else legacy_threshold
+    if threshold is not None and not (0.0 < threshold <= 1.0):
+        raise ValueError(f"LingBot `base_low_noise_threshold` must lie in (0, 1], got {threshold!r}.")
+
+    new_tail = extra_args.get("base_sigma_tail_steps")
+    legacy_tail = extra_args.get("refiner_sigma_tail_steps")
+    parsed_new_tail = (
+        _non_negative_int_option(new_tail, "base_sigma_tail_steps") if new_tail is not None else None
+    )
+    parsed_legacy_tail = (
+        _non_negative_int_option(legacy_tail, "refiner_sigma_tail_steps") if legacy_tail is not None else None
+    )
+    if parsed_new_tail is not None and parsed_legacy_tail is not None and parsed_new_tail != parsed_legacy_tail:
+        raise ValueError(
+            "LingBot `base_sigma_tail_steps` and legacy `refiner_sigma_tail_steps` conflict: "
+            f"{parsed_new_tail!r} != {parsed_legacy_tail!r}."
+        )
+    tail_steps = parsed_new_tail if parsed_new_tail is not None else parsed_legacy_tail
+    if tail_steps is None:
+        tail_steps = _non_negative_int_option(
+            default_base_sigma_tail_steps,
+            "base_sigma_tail_steps",
+        )
+
+    if legacy_threshold is not None:
+        logger.warning_once(
+            "LingBot `t_thresh` is deprecated; use `base_low_noise_threshold` for the Base schedule."
+        )
+    if parsed_legacy_tail is not None:
+        logger.warning_once(
+            "LingBot `refiner_sigma_tail_steps` currently aliases the Base schedule and is deprecated; "
+            "use `base_sigma_tail_steps`."
+        )
+
+    return LingBotExecutionOptions(
+        batch_cfg=_boolean_option(extra_args, "batch_cfg"),
+        null_cond_clone_zero=_boolean_option(extra_args, "null_cond_clone_zero"),
+        offload_vae_during_denoise=_boolean_option(extra_args, "offload_vae_during_denoise"),
+        base_low_noise_threshold=threshold,
+        base_sigma_tail_steps=tail_steps,
+    )
+
+
 def _json_caption(value: Any) -> str:
     try:
         caption = json.dumps(value, ensure_ascii=False, separators=(",", ":"))

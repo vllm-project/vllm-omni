@@ -5,6 +5,8 @@ from __future__ import annotations
 
 LINGBOT_VIDEO_EXTRA_BODY_PARAMS = frozenset(
     {
+        "base_low_noise_threshold",
+        "base_sigma_tail_steps",
         "batch_cfg",
         "duration",
         "flow_shift",

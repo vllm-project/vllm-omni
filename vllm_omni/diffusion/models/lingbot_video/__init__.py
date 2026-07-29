@@ -16,9 +16,11 @@ from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (
     get_lingbot_video_pre_process_func,
 )
 from vllm_omni.diffusion.models.lingbot_video.request_utils import (
+    LingBotExecutionOptions,
     LingBotGenerationMode,
     LingBotRequestConfig,
     caption_from_lingbot_prompt,
+    normalize_lingbot_execution_options,
     normalize_lingbot_num_frames,
     normalize_lingbot_request,
     resolve_lingbot_num_frames,
@@ -27,6 +29,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
 )
 
 __all__ = [
+    "LingBotExecutionOptions",
     "LingBotGenerationMode",
     "LingBotImageCondition",
     "LingBotRequestConfig",
@@ -37,6 +40,7 @@ __all__ = [
     "geometry_align_image",
     "get_lingbot_video_pre_process_func",
     "get_lingbot_video_post_process_func",
+    "normalize_lingbot_execution_options",
     "normalize_lingbot_num_frames",
     "normalize_lingbot_request",
     "prepare_ti2v_image_condition",
