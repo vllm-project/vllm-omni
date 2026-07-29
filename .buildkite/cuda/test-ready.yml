@@ -18,14 +18,14 @@ steps:
           - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
-      - label: "Simple · Entrypoints Test"
+      - label: "Simple · Engine&Entrypoints Test"
         commands:
-          - "timeout 20m pytest -sv tests/entrypoints -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
         commands:
-          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
