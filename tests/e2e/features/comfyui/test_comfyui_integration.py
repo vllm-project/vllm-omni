@@ -8,77 +8,12 @@ It ensures that
 
 from __future__ import annotations
 
-import os
-import sys
-from types import ModuleType, SimpleNamespace
-from typing import BinaryIO, TypedDict
-
-
-def _setup_comfyui_test_environment() -> None:
-    """Add the ComfyUI plugin to sys.path and mock comfy_api/comfy_extras before imports."""
-    comfyui_plugin_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "apps", "ComfyUI-vLLM-Omni")
-    )
-    if not os.path.isdir(comfyui_plugin_path):
-        raise FileNotFoundError(
-            f"ComfyUI plugin not found at {comfyui_plugin_path}. "
-            "If it is moved elsewhere, please update the path in this test module."
-        )
-    if comfyui_plugin_path not in sys.path:
-        sys.path.insert(0, comfyui_plugin_path)
-
-    import torch
-
-    class AudioInput(TypedDict):
-        waveform: torch.Tensor
-        sample_rate: int
-
-    class VideoInput:
-        def __init__(self, data: bytes = b"mock_video_data"):
-            self._data = data
-
-        def save_to(self, file: str | BinaryIO):
-            if isinstance(file, str):
-                print("Called VideoInput.save_to with file path. Saving to a path is no-op in tests.")
-            else:
-                file.write(self._data)
-
-    mock_comfy_api = ModuleType("comfy_api")
-    mock_comfy_api_input = ModuleType("comfy_api.input")
-    mock_comfy_api_input.AudioInput = AudioInput
-    mock_comfy_api_input.VideoInput = VideoInput
-    mock_comfy_api.input = mock_comfy_api_input
-    mock_comfy_api_latest = ModuleType("comfy_api.latest")
-    mock_comfy_api_latest.Types = SimpleNamespace(VideoComponents=lambda **kwargs: kwargs)
-    mock_comfy_api_latest.InputImpl = SimpleNamespace(
-        VideoFromComponents=lambda _: VideoInput(b"mock_video_from_components")
-    )
-    mock_comfy_api.latest = mock_comfy_api_latest
-
-    def mock_load(_: str | BinaryIO):
-        waveform = torch.zeros((1, 24000), dtype=torch.float32)
-        return waveform, 24000
-
-    mock_comfy_extras = ModuleType("comfy_extras")
-    mock_nodes_audio = ModuleType("comfy_extras.nodes_audio")
-    mock_nodes_audio.load = mock_load
-    mock_comfy_extras.nodes_audio = mock_nodes_audio
-
-    sys.modules["comfy_api"] = mock_comfy_api
-    sys.modules["comfy_api.input"] = mock_comfy_api_input
-    sys.modules["comfy_api.latest"] = mock_comfy_api_latest
-    sys.modules["comfy_extras"] = mock_comfy_extras
-    sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio
-
-
-_setup_comfyui_test_environment()
-
-# ruff: noqa: E402
 import multiprocessing
 import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import pytest
