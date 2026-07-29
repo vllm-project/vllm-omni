@@ -5,11 +5,25 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_velocity_from_x0_uses_official_host_scalar_sigma():
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import velocity_from_x0
+
+    sigma = MagicMock()
+    sigma.to.return_value.item.return_value = 0.5
+
+    actual = velocity_from_x0(torch.tensor([1.0]), torch.tensor([0.0]), sigma)
+
+    sigma.to.assert_called_once_with(torch.float32)
+    sigma.to.return_value.item.assert_called_once_with()
+    torch.testing.assert_close(actual, torch.tensor([2.0]))
 
 
 class TestCFGParallelHelpers:
