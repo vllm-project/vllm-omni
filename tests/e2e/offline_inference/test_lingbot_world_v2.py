@@ -26,6 +26,7 @@ from tests.helpers.mark import hardware_test
 
 _ROOT = Path(__file__).parents[3]
 _EXAMPLE_PATH = _ROOT / "examples/offline_inference/diffusion/lingbot_world_v2.py"
+_REALTIME_EXAMPLE_PATH = _ROOT / "examples/offline_inference/diffusion/lingbot_world_v2_realtime.py"
 _RUN_E2E_ENV = "VLLM_OMNI_RUN_LINGBOT_WORLD_V2_E2E"
 _MODEL_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH"
 _IMAGE_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH"
@@ -36,6 +37,18 @@ _ALTERNATE_ACTION_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_ALTERNATE_ACTION_DIR"
 def _load_example():
     assert _EXAMPLE_PATH.exists(), "LingBot-World v2 offline example has not been implemented"
     spec = importlib.util.spec_from_file_location("_lingbot_world_v2_example_under_test", _EXAMPLE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_realtime_example():
+    assert _REALTIME_EXAMPLE_PATH.exists(), "LingBot-World v2 realtime example has not been implemented"
+    spec = importlib.util.spec_from_file_location(
+        "_lingbot_world_v2_realtime_example_under_test", _REALTIME_EXAMPLE_PATH
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -101,6 +114,32 @@ def test_parse_args_exposes_lingbot_generation_controls() -> None:
         "tensor_parallel_size": 2,
         "width": 96,
     }
+
+
+def test_realtime_example_loads_prompt_and_action_events(tmp_path: Path) -> None:
+    module = _load_realtime_example()
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        '{"event_id":1,"frames":[["j"],[],[]]}\n{"event_id":2,"prompt":"snowy valley","frames":[["w"],["w"],["w"]]}\n'
+    )
+
+    assert module._load_events(events) == [
+        {"event_id": 1, "prompt": None, "frames": [["j"], [], []]},
+        {
+            "event_id": 2,
+            "prompt": "snowy valley",
+            "frames": [["w"], ["w"], ["w"]],
+        },
+    ]
+
+
+def test_realtime_example_rejects_non_monotonic_event_ids(tmp_path: Path) -> None:
+    module = _load_realtime_example()
+    events = tmp_path / "events.jsonl"
+    events.write_text('{"event_id":2,"prompt":"a"}\n{"event_id":1,"prompt":"b"}\n')
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        module._load_events(events)
 
 
 def test_resolve_paths_builds_a_canonical_trusted_action_root(tmp_path: Path) -> None:

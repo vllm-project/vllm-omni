@@ -108,25 +108,9 @@ support metadata until their recipe is audited.
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
 
-LingBot-World 2.0 v1 is limited to the 14B causal-fast checkpoint, one first-frame image plus a
-camera directory, 9–117 raw frames in `9 + 12k` increments, fixed four-step DMD sampling, and
-request-local history. Its DiT path and local RMSNorm are TP-aware, but real-checkpoint TP=1 and
-TP>1 CUDA runs are still pending. v1 does not support SP/USP, pipeline or CFG parallelism, HSDP,
-VAE parallelism, quantization, Cache-DiT/TeaCache, cross-request or streaming session state,
-runtime events, causal-pretrain, or the 1.3B checkpoint.
-Camera directories consume only `poses.npy` and `intrinsics.npy`; any `wasd_action.npy` or
-`ijkl_action.npy` files are ignored rather than converted to runtime action events.
-The repository includes an opt-in H100-class CUDA E2E matrix (also used on H200): a compiled
-default-resolution TP=1 one-block run, an eager TP=2 one-block sharding run, 21-frame determinism and camera-action sensitivity,
-and an 81-frame run that crosses the checkpoint's 18-latent-frame sliding window. The camera comparison
-expects primary and alternate action directories to be siblings under one trusted root. The table
-remains experimental until those real-checkpoint runs and a qualitative reference-video comparison
-are recorded; neither is claimed by the local CPU/stub suite. No AMD GPU, Ascend NPU, or Intel GPU
-support is claimed.
-
-The [LingBot-World checkpoint](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers)
-is separately licensed under CC BY-NC-SA and restricted to non-commercial use. The vLLM-Omni
-integration code is licensed under Apache-2.0.
+See the [LingBot-World 2.0 recipe](../../recipes/Robbyant/LingBot-World-2.0.md)
+for offline and experimental realtime usage, supported controls, validation,
+and current limitations.
 
 <sup>H3</sup> MiniMax H3 AMD GPU support is validated on gfx942 (MI300X) and
 gfx950 (MI350) in BF16, using the AITER `FLASH_ATTN` diffusion attention backend.

@@ -23,13 +23,13 @@ Four identifiers have distinct lifetimes:
 | `session_id` | One persistent world | Session manager | Selects runner KV and model-owned state. |
 | `event_id` | One control/prompt update | Transport adapter | Unique and monotonically increasing within a session, including across reset. |
 | `chunk_index` | One committed AR block position | Session | Contiguous from zero; reset starts again at zero. |
-| `request_id` | One chunk execution | Session | Exact engine routing key for one in-flight tick. |
+| `request_id` | One chunk execution | Session | Correlates the tick with its returned metadata. |
 
-`AsyncOmni.generate(..., _engine_request_id=request_id)` preserves the tick
-request ID without adding a UUID. This private value is a routing key, not a
-display label: it must be unique among active requests. `AsyncOmni` rejects a
-collision before submitting the second request and never replaces the original
-`ClientRequestState`.
+`AsyncOmni` keeps its normal UUID-suffixed engine routing ID. The tick
+`request_id` remains inside the immutable AR-Diffusion snapshot and the
+standard output metadata, while caller-visible `OmniRequestOutput.request_id`
+continues to use AsyncOmni's existing external-ID contract. Protocol identity
+therefore does not require a private entrypoint override.
 
 ## Request lifecycle
 
@@ -43,7 +43,7 @@ collision before submitting the second request and never replaces the original
    parameters, stores the typed tick in
    `sampling_params.extra_args["ar_diffusion_tick"]`, constructs the normal Omni
    prompt through its `prompt_provider`, and invokes `AsyncOmni.generate()`.
-4. `AsyncOmni` reserves the exact engine request ID and submits one normal
+4. `AsyncOmni` allocates its normal unique engine routing ID and submits one
    `OmniDiffusionRequest` through the orchestrator.
 5. `ARDiffusionModelRunner._request_session()` parses the typed tick.
    `_get_or_create_session()` obtains runner-owned paged KV, and
@@ -172,17 +172,19 @@ intrinsics, and other model-specific conventions out of the session protocol.
 
 For LingBot World v2:
 
-- `actions.py` parses key-state and trajectory controls;
-- `camera.py` loads or constructs camera trajectories and Plücker embeddings;
-- `transformer.py` implements checkpoint-compatible causal attention; and
-- `pipeline.py` constructs conditioning, owns small non-KV session state, and
+- `lingbot_world/actions.py` parses key-state and trajectory controls;
+- `lingbot_world/camera.py` loads or constructs camera trajectories and Plücker embeddings;
+- `lingbot_world/transformer.py` implements checkpoint-compatible causal attention; and
+- `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
   produces one block plus the standard metadata envelope.
 
 ## Non-goals
 
 This contract does not currently provide:
 
-- a public HTTP or WebSocket request schema;
+- a public HTTP or WebSocket request schema (the structured-interaction
+  frontend is tracked separately in
+  [#5527](https://github.com/vllm-project/vllm-omni/pull/5527));
 - camera/action semantics shared by every world model;
 - session migration or replication across workers;
 - retry of an ambiguous partially executed chunk;
@@ -196,7 +198,7 @@ or lifecycle fields to the generic runtime.
 
 CPU contract tests cover:
 
-- exact engine request IDs and concurrent collision rejection;
+- separation of tick correlation IDs from internal engine routing IDs;
 - event ordering, metadata equality, and reducer fail-closed commit;
 - close/disconnect failure tombstones and cleanup retry;
 - capacity one under the default fraction for shipped LingBot geometry;
