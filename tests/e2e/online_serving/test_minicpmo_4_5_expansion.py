@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 # Deploy YAML defaults to ``async_chunk: true``; keep sync and async as
 # separate parametrizations so both handoff paths are exercised.
