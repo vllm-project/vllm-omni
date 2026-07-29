@@ -305,7 +305,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         allocating fresh tensors every layer.  This enforces the fixed
         double-buffer memory bound (exactly 2 blocks on device).
         """
-<<<<<<< Updated upstream
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
         evt = current_omni_platform.Event()
@@ -318,56 +317,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     gw = gpu_weights[dtype]
                     gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=non_blocking)
                 evt.record(self.copy_stream)
-=======
-        _set_stream = self._set_stream
-        _current = self._current_stream_fn
-        _empty = self._empty_fn
-        _device = self.device
-        _nb = non_blocking
-
-        self.copy_stream.wait_stream(_current())
-        prev = _current()
-        evt = self._evt_pool[slot]
-
-        if self._single_dtype:
-            # ── Fast path: no dtype loop ──
-            dtype = self._sd_dtype
-            cpu_shard = self._sd_cpu_shard
-            _set_ts = self._set_ts
-            _shard_n = cpu_shard.numel()
-            _ag_n = self._sd_ag_size
-
-            if self._use_allgather:
-                _ag = self._all_gather_fn
-                _grp = self.dp_group
-                _cs = self.copy_stream
-                _ms = self.comm_stream
-                # Use pre-allocated shard buffer, torch.empty for AG output
-                _shard_buf = self.gpu_shard_buffers[slot][dtype]
-
-                _set_stream(_cs)
-                _shard_buf[:_shard_n].copy_(cpu_shard, non_blocking=_nb)
-
-                _ms.wait_stream(_cs)
-                _set_stream(_ms)
-                gw = _empty(_ag_n, dtype=dtype, device=_device)
-                _ag(gw, _shard_buf[:_shard_n], group=_grp)
-                evt.record(_ms)
-                _set_stream(prev)
-            else:
-                _cs = self.copy_stream
-                _set_stream(_cs)
-                gw = _empty(cpu_shard.shape, dtype=dtype, device=_device)
-                gw.copy_(cpu_shard, non_blocking=_nb)
-                evt.record(_cs)
-                _set_stream(prev)
-
-            self.ready_events[slot] = evt
-            self._prefetch_done = evt
-
-            for target, offset, numel, shape in self._sd_repoint[slot]:
-                _set_ts(target, gw[offset : offset + numel].view(shape))
->>>>>>> Stashed changes
         else:
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
@@ -444,6 +393,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     # ------------------------------------------------------------------ #
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
+        # Dynamic slot tracking: read current_slot from the previous hook's
+        # _prefetched_slot (the slot where this block's data was actually
+        # loaded).  This corrects the initial i%2 assignment for odd block
+        # counts, where the circular tail→head prefetch would otherwise
+        # collide with the head's read slot.
+        if self._prev_hook is not None and self._prev_hook._prefetched_slot is not None:
+            self.current_slot = self._prev_hook._prefetched_slot
+
         # Group-first hook: check whether the shared buffer slot was
         # overwritten by another group since our last forward.  If the
         # slot still contains our own data (from the tail hook's async
