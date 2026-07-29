@@ -1299,9 +1299,7 @@ async def benchmark(args):
 
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
-    client_timeout = aiohttp.ClientTimeout(
-        total=None if args.request_timeout == 0 else args.request_timeout
-    )
+    client_timeout = aiohttp.ClientTimeout(total=None if args.request_timeout == 0 else args.request_timeout)
 
     async with aiohttp.ClientSession(timeout=client_timeout) as session:
         warmup_pairs = await _run_warmups(

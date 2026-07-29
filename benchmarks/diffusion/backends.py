@@ -290,11 +290,7 @@ async def async_request_openai_image_generations(
         request_timeout = session.timeout
     else:
         request_timeout = aiohttp.ClientTimeout(
-            total=(
-                None
-                if input.request_timeout == 0
-                else float(input.request_timeout)
-            ),
+            total=(None if input.request_timeout == 0 else float(input.request_timeout)),
             connect=None,
             sock_connect=None,
             sock_read=None,
