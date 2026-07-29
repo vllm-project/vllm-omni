@@ -54,7 +54,7 @@ stages:
     #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage1/batch_8
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "1"
+    devices: "0"
     input_connectors:
       from_stage_0: shm
     default_sampling_params:
