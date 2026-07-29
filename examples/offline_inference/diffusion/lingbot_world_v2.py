@@ -34,6 +34,7 @@ _NUM_INFERENCE_STEPS = 4
 _MAX_SEQUENCE_LENGTH = 512
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_RAW_FRAMES = 117
+_MAX_SOURCE_CAMERA_FRAMES = 4096
 _TEMPORAL_COMPRESSION = 4
 _LATENT_FRAMES_PER_BLOCK = 3
 _SPATIAL_ALIGNMENT = 16
@@ -63,8 +64,8 @@ def _validate_camera_arrays(action_dir: Path) -> int:
         raise ValueError("intrinsics.npy must have shape [frames, 4].")
     if poses.shape[0] != intrinsics.shape[0]:
         raise ValueError("poses.npy and intrinsics.npy must contain the same frame count.")
-    if not 1 <= poses.shape[0] <= _MAX_RAW_FRAMES:
-        raise ValueError("Camera arrays must contain between 1 and 117 frames.")
+    if not 1 <= poses.shape[0] <= _MAX_SOURCE_CAMERA_FRAMES:
+        raise ValueError("Camera arrays must contain between 1 and 4096 source frames.")
     if poses.dtype.kind not in "fiu" or intrinsics.dtype.kind not in "fiu":
         raise ValueError("Camera arrays must contain real numeric values.")
     if not np.isfinite(poses).all() or not np.isfinite(intrinsics).all():

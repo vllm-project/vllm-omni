@@ -20,6 +20,7 @@ import torch
 _REFERENCE_HEIGHT = 480
 _REFERENCE_WIDTH = 832
 _MAX_ACTION_FRAMES = 117
+_MAX_SOURCE_ACTION_FRAMES = 4096
 _MAX_NPY_HEADER_BYTES = 10_000
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -169,7 +170,7 @@ def _load_bounded_npy(
     trailing_shape: tuple[int, ...],
 ) -> np.ndarray:
     with _open_camera_file(action_fd, filename) as (file_handle, file_stat):
-        max_payload_bytes = _MAX_ACTION_FRAMES * math.prod(trailing_shape) * 8
+        max_payload_bytes = _MAX_SOURCE_ACTION_FRAMES * math.prod(trailing_shape) * 8
         max_file_bytes = _MAX_NPY_HEADER_BYTES + max_payload_bytes + 32
         if file_stat.st_size > max_file_bytes:
             raise ValueError(f"{filename} byte size exceeds the bounded camera-array limit.")
@@ -192,8 +193,8 @@ def _load_bounded_npy(
             expected = ", ".join(str(value) for value in trailing_shape)
             raise ValueError(f"{filename} must have shape [frames, {expected}], got {shape}.")
         frames = shape[0]
-        if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= _MAX_ACTION_FRAMES:
-            raise ValueError(f"{filename} must contain between 1 and {_MAX_ACTION_FRAMES} frames.")
+        if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= _MAX_SOURCE_ACTION_FRAMES:
+            raise ValueError(f"{filename} must contain between 1 and {_MAX_SOURCE_ACTION_FRAMES} source frames.")
         if dtype.kind not in "fiu" or dtype.hasobject or dtype.itemsize > 8:
             raise ValueError(f"{filename} must contain real numeric values with at most 8 bytes per element.")
 
@@ -206,7 +207,9 @@ def _load_bounded_npy(
             array = np.load(snapshot_file, allow_pickle=False)
         except (EOFError, TypeError, ValueError):
             raise ValueError(f"{filename} does not contain a valid numeric NPY array.") from None
-    result: np.ndarray = np.asarray(array, dtype=np.float32)
+    # Official LingBot trajectories may be longer than one request. Only
+    # materialize the bounded prefix that any supported request can consume.
+    result: np.ndarray = np.asarray(array[:_MAX_ACTION_FRAMES], dtype=np.float32)
     return result
 
 

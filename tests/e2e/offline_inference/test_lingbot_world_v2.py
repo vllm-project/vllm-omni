@@ -168,6 +168,31 @@ def test_resolve_paths_builds_a_canonical_trusted_action_root(tmp_path: Path) ->
     assert paths.output == (tmp_path / "outputs/clip.mp4").resolve()
 
 
+def test_resolve_paths_accepts_official_trajectory_longer_than_one_request(tmp_path: Path) -> None:
+    module = _load_example()
+    image, action_dir = _make_assets(tmp_path)
+    np.save(action_dir / "poses.npy", np.repeat(np.eye(4, dtype=np.float32)[None], 269, axis=0))
+    np.save(action_dir / "intrinsics.npy", np.ones((269, 4), dtype=np.float32))
+    args = module.parse_args(
+        [
+            "--prompt",
+            "move forward",
+            "--image",
+            str(image),
+            "--action-dir",
+            str(action_dir),
+            "--num-frames",
+            "81",
+        ]
+    )
+
+    paths = module.resolve_cli_paths(args)
+    _prompt, sampling_kwargs = module.build_request(args, paths)
+
+    assert paths.camera_frames == 269
+    assert sampling_kwargs["num_frames"] == 81
+
+
 def test_resolve_paths_requires_both_camera_arrays(tmp_path: Path) -> None:
     module = _load_example()
     image, action_dir = _make_assets(tmp_path)

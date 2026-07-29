@@ -30,7 +30,9 @@ python examples/offline_inference/diffusion/lingbot_world_v2.py \
 ```
 
 The current causal-fast checkpoint uses four DMD sampling steps. Raw frame
-counts must be `9 + 12k`, up to 117 frames.
+counts must be `9 + 12k`, up to 117 frames. Camera files may contain a
+longer bounded source trajectory (the official example contains 269 frames);
+the runtime consumes only the prefix needed by the request.
 
 ## Realtime in-process generation
 

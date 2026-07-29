@@ -70,7 +70,7 @@ def test_load_camera_trajectory_rejects_missing_files(tmp_path: Path, present_fi
     [
         (np.zeros((2, 3, 4)), np.zeros((2, 4)), "poses.npy"),
         (_identity_poses(2), np.zeros((2, 3)), "intrinsics.npy"),
-        (_identity_poses(0), np.zeros((0, 4)), "1 and 117"),
+        (_identity_poses(0), np.zeros((0, 4)), "1 and 4096 source frames"),
         (_identity_poses(2), np.zeros((1, 4)), "same number of frames"),
     ],
 )
@@ -138,14 +138,31 @@ def test_load_camera_trajectory_rejects_object_dtype_before_materializing(tmp_pa
         load_camera_trajectory(_trusted(tmp_path))
 
 
-def test_load_camera_trajectory_rejects_frame_count_above_request_limit(tmp_path: Path) -> None:
+def test_load_camera_trajectory_accepts_official_length_and_materializes_request_prefix(tmp_path: Path) -> None:
     _write_trajectory(
         tmp_path,
-        _identity_poses(118),
-        np.ones((118, 4), dtype=np.float32),
+        _identity_poses(269),
+        np.arange(269 * 4, dtype=np.float32).reshape(269, 4),
     )
 
-    with pytest.raises(ValueError, match="poses.npy.*1 and 117 frames"):
+    trajectory = load_camera_trajectory(_trusted(tmp_path))
+
+    assert trajectory.poses.shape == (117, 4, 4)
+    assert trajectory.intrinsics.shape == (117, 4)
+    np.testing.assert_array_equal(
+        trajectory.intrinsics.numpy(),
+        np.arange(269 * 4, dtype=np.float32).reshape(269, 4)[:117],
+    )
+
+
+def test_load_camera_trajectory_rejects_unbounded_source_frame_count(tmp_path: Path) -> None:
+    _write_trajectory(
+        tmp_path,
+        _identity_poses(4097),
+        np.ones((4097, 4), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="poses.npy.*bounded camera-array limit|4096 source frames"):
         load_camera_trajectory(_trusted(tmp_path))
 
 
