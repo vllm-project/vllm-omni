@@ -22,7 +22,7 @@ AR_DIFFUSION_OUTPUT_METADATA_KEY = "ar_diffusion"
 
 
 class ARDiffusionGenerateClient(Protocol):
-    """Internal subset of AsyncOmni used to execute one exact-ID tick."""
+    """Internal subset of AsyncOmni used to execute one tick."""
 
     def generate(
         self,
@@ -31,7 +31,6 @@ class ARDiffusionGenerateClient(Protocol):
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
-        _engine_request_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]: ...
 
 
@@ -76,7 +75,7 @@ def _parse_chunk_metadata(output: OmniRequestOutput) -> ARDiffusionChunkMetadata
 
 
 class ARDiffusionOmniTickConsumer:
-    """Converts a typed tick into one exact-ID AsyncOmni diffusion request.
+    """Converts a typed tick into one AsyncOmni diffusion request.
 
     ``prompt_provider`` packages session initialization data such as an initial
     image into the normal Omni prompt. Control ``track/schema/data`` remains in
@@ -128,7 +127,7 @@ class ARDiffusionOmniTickConsumer:
         self,
         tick: ARDiffusionTickRequest,
     ) -> list[OmniSamplingParams]:
-        params = [copy.deepcopy(template) for template in self._sampling_params_templates]
+        params = [copy.copy(template) for template in self._sampling_params_templates]
         diffusion_params = params[self._diffusion_stage_id]
         assert isinstance(diffusion_params, OmniDiffusionSamplingParams)
         diffusion_params.extra_args = {
@@ -145,7 +144,6 @@ class ARDiffusionOmniTickConsumer:
             request_id=tick.request_id,
             sampling_params_list=self._sampling_params_for_tick(tick),
             output_modalities=self._output_modalities,
-            _engine_request_id=tick.request_id,
         ):
             if output.stage_id != self._diffusion_stage_id:
                 continue

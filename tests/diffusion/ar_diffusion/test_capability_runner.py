@@ -179,6 +179,24 @@ def test_runner_uses_typed_tick_as_authoritative_session_contract():
     assert parsed == tick
 
 
+def test_runner_keeps_engine_request_id_separate_from_tick_correlation_id():
+    tick = ARDiffusionTickRequest(
+        session_id="world-7",
+        request_id="client-request-3",
+        chunk_index=3,
+    )
+    req = SimpleNamespace(
+        request_id="engine-request-uuid",
+        sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()),
+    )
+
+    session_id, _, parsed = ARDiffusionModelRunner._request_session(req)
+
+    assert session_id == "world-7"
+    assert req.request_id == "engine-request-uuid"
+    assert parsed.request_id == "client-request-3"
+
+
 def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     pipeline = CapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline)

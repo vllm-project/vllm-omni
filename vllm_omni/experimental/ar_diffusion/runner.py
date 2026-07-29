@@ -235,10 +235,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         req: OmniDiffusionRequest,
     ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
         extra_args = req.sampling_params.extra_args or {}
-        tick = ARDiffusionTickRequest.from_extra_args(
-            extra_args,
-            request_id=req.request_id,
-        )
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
         if tick is not None:
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None

@@ -451,13 +451,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Generate Method ====================
 
-    def _reserve_request_state(self, state: ClientRequestState) -> None:
-        """Reserve an engine routing ID without replacing an active request."""
-        request_id = state.request_id
-        if request_id in self.request_states:
-            raise ValueError(f"Engine request ID {request_id!r} is already active.")
-        self.request_states[request_id] = state
-
     async def generate(
         self,
         prompt: OmniPromptType | AsyncGenerator[StreamingInput, None] | list[OmniPromptType],
@@ -475,7 +468,6 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
-        _engine_request_id: str | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -499,9 +491,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
-            _engine_request_id: Internal-only engine routing key. It must be
-                unique among active requests and is preserved exactly across
-                request state, orchestration, stage output, and cleanup.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -510,18 +499,11 @@ class AsyncOmni(EngineClient, OmniBase):
             ValueError: If sampling_params_list has incorrect length, or
                 if a list prompt is submitted to a diffusion stage.
         """
+        # Append a random UUID suffix to the request_id to ensure it is unique
+        # and non-empty, similar to vLLM's input processor. The suffix is used
+        # only for internal tracking throughout the request's life.
         external_request_id = request_id
-        if _engine_request_id is None:
-            # Append a random UUID suffix to ensure the engine-facing ID is
-            # unique and non-empty, similar to vLLM's input processor.
-            request_id = self._get_unique_request_id(external_request_id)
-        else:
-            if not isinstance(_engine_request_id, str) or not _engine_request_id.strip():
-                raise ValueError("_engine_request_id must be a non-empty string.")
-            if external_request_id and external_request_id != _engine_request_id:
-                raise ValueError("request_id must match _engine_request_id when both are provided.")
-            request_id = _engine_request_id
-            external_request_id = external_request_id or _engine_request_id
+        request_id = self._get_unique_request_id(external_request_id)
 
         # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:
@@ -547,7 +529,6 @@ class AsyncOmni(EngineClient, OmniBase):
             )
 
         input_stream_task: asyncio.Task | None = None
-        request_state_reserved = False
         try:
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
@@ -599,8 +580,7 @@ class AsyncOmni(EngineClient, OmniBase):
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
-            self._reserve_request_state(req_state)
-            request_state_reserved = True
+            self.request_states[request_id] = req_state
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
@@ -662,15 +642,13 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
-            if request_state_reserved:
-                self._fire_failure_counter_if_alive(request_id)
-                await self._abort_internal_requests(request_id)
+            self._fire_failure_counter_if_alive(request_id)
+            await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
-            if request_state_reserved:
-                self._fire_failure_counter_if_alive(request_id)
-                await self._abort_internal_requests(request_id)
+            self._fire_failure_counter_if_alive(request_id)
+            await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
 

@@ -59,7 +59,6 @@ class FakeGenerateClient:
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
-        _engine_request_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]:
         self.calls.append(
             {
@@ -67,15 +66,11 @@ class FakeGenerateClient:
                 "request_id": request_id,
                 "sampling_params_list": sampling_params_list,
                 "output_modalities": output_modalities,
-                "_engine_request_id": _engine_request_id,
             }
         )
         params = sampling_params_list[0]
         assert isinstance(params, OmniDiffusionSamplingParams)
-        tick = ARDiffusionTickRequest.from_extra_args(
-            params.extra_args,
-            request_id=request_id,
-        )
+        tick = ARDiffusionTickRequest.from_extra_args(params.extra_args)
         assert tick is not None
         chunk_metadata = ARDiffusionChunkMetadata.from_tick(tick).to_dict()
         if self.applied_event_ids is not None:
@@ -135,7 +130,7 @@ def test_consumer_rejects_replicated_ar_diffusion_stage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consumer_submits_exact_typed_tick_and_returns_standard_output() -> None:
+async def test_consumer_submits_typed_tick_and_returns_standard_output() -> None:
     client = FakeGenerateClient()
     template = OmniDiffusionSamplingParams(
         output_type="latent",
@@ -160,7 +155,6 @@ async def test_consumer_submits_exact_typed_tick_and_returns_standard_output() -
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["request_id"] == tick.request_id
-    assert call["_engine_request_id"] == tick.request_id
     assert call["output_modalities"] == ["video"]
     assert call["prompt"] == {
         "prompt": "turn left",
@@ -168,13 +162,7 @@ async def test_consumer_submits_exact_typed_tick_and_returns_standard_output() -
     }
     submitted_params = call["sampling_params_list"][0]
     assert submitted_params.extra_args["deployment_option"] == "kept"
-    assert (
-        ARDiffusionTickRequest.from_extra_args(
-            submitted_params.extra_args,
-            request_id=tick.request_id,
-        )
-        == tick
-    )
+    assert ARDiffusionTickRequest.from_extra_args(submitted_params.extra_args) == tick
     assert "ar_diffusion_tick" not in template.extra_args
 
 
@@ -240,4 +228,4 @@ async def test_session_commits_only_after_standard_engine_output_metadata() -> N
     assert output.request_id == "world-1-chunk-0"
     assert session.chunk_index == 1
     assert session.pending_event_count == 0
-    assert client.calls[0]["_engine_request_id"] == "world-1-chunk-0"
+    assert client.calls[0]["request_id"] == "world-1-chunk-0"

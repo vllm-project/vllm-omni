@@ -28,9 +28,6 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
@@ -49,6 +46,9 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world.transformer import (
     LingBotAttentionCache,
     LingBotTransformerCache,
 )
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -259,10 +259,7 @@ def get_lingbot_world_pre_process_func(
         extra_args = getattr(request.sampling_params, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
-        tick = ARDiffusionTickRequest.from_extra_args(
-            extra_args,
-            request_id=getattr(request, "request_id", "legacy-lingbot-request"),
-        )
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
         if tick is not None:
             camera_controls = [control for control in tick.controls if control.track == "camera"]
             if len(camera_controls) != 1:
@@ -1103,10 +1100,7 @@ class LingBotWorldCausalDMDPipeline(
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
-        tick = ARDiffusionTickRequest.from_extra_args(
-            req.sampling_params.extra_args,
-            request_id=getattr(req, "request_id", "legacy-lingbot-request"),
-        )
+        tick = ARDiffusionTickRequest.from_extra_args(req.sampling_params.extra_args)
         if tick is not None and self._ar_diffusion_kv_state is None:
             raise RuntimeError("LingBot typed ticks require ARDiffusionEngine session binding.")
         if tick is None and self._ar_diffusion_kv_state is not None:
