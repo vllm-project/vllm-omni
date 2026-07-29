@@ -56,6 +56,18 @@ def env_to_apply_ftfy_mock_in_subproc(env: dict[str, str] | None = None) -> dict
     return env_dict
 
 
+def reset_artifact_dir(path: Path) -> Path:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def infer_model_label(model: str) -> str:
+    label = Path(model.rstrip("/\\")).name or "model"
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
+
+
 def model_output_dir(parent_dir: Path, model: str) -> Path:
     safe_model_name = model.split("/")[-1].replace(".", "_")
     path = parent_dir / safe_model_name

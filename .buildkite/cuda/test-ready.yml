@@ -15,7 +15,7 @@ steps:
 
       - label: "Simple · Other Test"
         commands:
-          - "timeout 20m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
