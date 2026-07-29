@@ -126,7 +126,10 @@ def x0_from_velocity(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.
 
 def velocity_from_x0(sample: torch.Tensor, x0: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Convert x0 back to velocity using the official fp32 arithmetic order."""
-    sigma = sigma.to(torch.float32)
+    # Official LTX converts the scalar scheduler sigma to a host value before
+    # division. A CUDA scalar tensor selects different kernel arithmetic and
+    # can cross bf16 rounding boundaries late in the denoise trajectory.
+    sigma = sigma.to(torch.float32).item()
     return ((sample.to(torch.float32) - x0.to(torch.float32)) / sigma).to(sample.dtype)
 
 
