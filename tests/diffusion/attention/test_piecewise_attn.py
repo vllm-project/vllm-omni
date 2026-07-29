@@ -27,6 +27,9 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 DEVICE = torch.device("cpu")
 
 
