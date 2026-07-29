@@ -861,3 +861,173 @@ class TestConfigValidation:
         should_reject = (len(step_counts) > 1) or has_none
         assert should_reject, "Different steps should trigger rejection"
         assert len(step_counts) == 2
+
+
+class TestDynamicSlotTracking:
+    """Tests for dynamic slot tracking with odd and even block counts.
+
+    With i%2 initialization alone, odd block counts cause the circular
+    tail→head prefetch to collide with the head's read slot (both map
+    to slot 0).  Dynamic slot tracking via _prefetched_slot corrects
+    this by reading the actual slot from the previous hook's prefetch.
+    """
+
+    @staticmethod
+    def _trace_slots(num_blocks: int, num_iterations: int = 1):
+        """Trace slot assignments through forward passes (pure logic, no hooks).
+
+        Returns a list of (read_slot, write_slot) per block per iteration.
+        """
+        # Initial i%2 assignment (same as enable())
+        current_slots = [i % 2 for i in range(num_blocks)]
+        prefetched_slots: list[int | None] = [None] * num_blocks
+
+        # Sync-prefetch: tail hook prefetches into slot 0
+        prefetched_slots[-1] = 0
+
+        results = []
+        for _ in range(num_iterations):
+            for i in range(num_blocks):
+                prev_idx = (i - 1) % num_blocks
+
+                # Dynamic slot tracking: read from prev's prefetched slot
+                if prefetched_slots[prev_idx] is not None:
+                    current_slots[i] = prefetched_slots[prev_idx]
+
+                read_slot = current_slots[i]
+
+                # Prefetch into other slot
+                next_slot = 1 - read_slot
+                current_slots[i] = next_slot
+                prefetched_slots[i] = next_slot
+
+                results.append((read_slot, next_slot))
+
+        return results
+
+    def test_odd_block_count_no_collision(self):
+        """3 blocks (odd): no read/write slot collision."""
+        results = self._trace_slots(3)
+        for i, (read, write) in enumerate(results):
+            assert read != write, f"Block {i % 3} (step {i}): read={read} == write={write}"
+
+    def test_even_block_count_no_collision(self):
+        """4 blocks (even): no read/write slot collision."""
+        results = self._trace_slots(4)
+        for i, (read, write) in enumerate(results):
+            assert read != write, f"Block {i % 4} (step {i}): read={read} == write={write}"
+
+    def test_large_odd_block_count(self):
+        """7 blocks (odd): no collision across all blocks."""
+        results = self._trace_slots(7)
+        for i, (read, write) in enumerate(results):
+            assert read != write, f"Block {i % 7} (step {i}): read={read} == write={write}"
+
+    def test_5_blocks_two_iterations(self):
+        """5 blocks (odd), 2 iterations: no collision in either pass."""
+        results = self._trace_slots(5, num_iterations=2)
+        n = 5
+        for iteration in range(2):
+            for i in range(n):
+                idx = iteration * n + i
+                read, write = results[idx]
+                assert read != write, (
+                    f"Iter {iteration} block {i}: read={read} == write={write}"
+                )
+
+    def test_3_blocks_three_iterations(self):
+        """3 blocks (odd), 3 iterations: no collision across all passes."""
+        results = self._trace_slots(3, num_iterations=3)
+        n = 3
+        for iteration in range(3):
+            for i in range(n):
+                idx = iteration * n + i
+                read, write = results[idx]
+                assert read != write, (
+                    f"Iter {iteration} block {i}: read={read} == write={write}"
+                )
+
+    def test_72_blocks_cosmos3(self):
+        """72 blocks (Cosmos3, even): no collision."""
+        results = self._trace_slots(72)
+        for i, (read, write) in enumerate(results):
+            assert read != write, f"Block {i % 72} (step {i}): read={read} == write={write}"
+
+    def test_slots_alternate_within_iteration(self):
+        """Within one iteration, consecutive blocks should use alternating slots."""
+        results = self._trace_slots(6)
+        for i in range(6):
+            read, write = results[i]
+            # Each block reads from one slot and writes to the other
+            assert {read, write} == {0, 1}, f"Block {i}: slots {read},{write} don't cover both"
+
+    def test_prefetched_slot_set_after_prefetch(self, dist_group, patched_offload_runtime):
+        """prefetch_layer should set _prefetched_slot to the slot argument."""
+        block = TinyBlock(_make_values(1.0))
+        next_block = TinyBlock(_make_values(2.0))
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        hook.initialize_hook(block)
+
+        assert hook._prefetched_slot is None  # initially None
+
+        hook.prefetch_layer(slot=0, non_blocking=False)
+        assert hook._prefetched_slot == 0
+
+        hook.prefetch_layer(slot=1, non_blocking=False)
+        assert hook._prefetched_slot == 1
+
+    def test_dynamic_slot_overrides_initial_assignment(self, dist_group, patched_offload_runtime):
+        """When _prev_hook._prefetched_slot is set, pre_forward should use
+        that value instead of the initial i%2 assignment."""
+        block_a = TinyBlock(_make_values(1.0))
+        block_b = TinyBlock(_make_values(2.0))
+
+        hook_a = DistributedLayerwiseOffloadHook(
+            next_block=block_b,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        hook_a.initialize_hook(block_a)
+
+        hook_b = DistributedLayerwiseOffloadHook(
+            next_block=block_a,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        hook_b.initialize_hook(block_b)
+
+        # Wire: hook_b._prev_hook = hook_a
+        hook_b._prev_hook = hook_a
+
+        # hook_a prefetched into slot 1
+        hook_a.prefetch_layer(slot=1, non_blocking=False)
+        assert hook_a._prefetched_slot == 1
+
+        # hook_b's initial slot is 0 (from i%2)
+        hook_b.current_slot = 0
+
+        # pre_forward should override to slot 1
+        hook_b.pre_forward(block_b)
+        assert hook_b.current_slot == 1, (
+            "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
+        )
