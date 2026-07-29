@@ -22,10 +22,7 @@ _MINICPMO_SERVER = [
             model="openbmb/MiniCPM-o-4_5",
             stage_config_path=_MINICPMO_DEPLOY,
             use_stage_cli=True,
-            server_args=[
-                "--trust-remote-code",
-                "--no-async-chunk",
-            ],
+            server_args=["--trust-remote-code"],
         ),
         id="minicpmo_4_5",
     )

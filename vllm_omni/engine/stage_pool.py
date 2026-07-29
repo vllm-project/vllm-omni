@@ -937,10 +937,9 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
-        # Convert plain vllm SamplingParams for single-stage diffusion models
-        # that receive sampling params from the user/caller directly.
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        # Direct engine callers may provide plain vLLM SamplingParams.
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1003,8 +1002,8 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)

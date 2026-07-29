@@ -51,6 +51,12 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("MiniCPMO45Code2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # audex TTS sync path: thinker (Stage 0) -> streaming decoder (Stage 1).
+        # The default deploy is async_chunk; this covers async_chunk: false.
+        ("AudexCode2Wav", "audex_code2wav"),
+        # audex TTA: tta thinker (Stage 0) -> XCodec1 (Stage 1, always sync
+        # full-payload — CNN codec decoded over the full sequence).
+        ("AudexXCodec1", "audex_xcodec"),
         # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
         # (Stage 1). Stage 1 consumes the complete mel/latent payload.
         ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),

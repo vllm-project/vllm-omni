@@ -65,11 +65,42 @@ _MODEL_PRESETS = {
         "fps": 16,
         "output": "helios_output.mp4",
     },
+    "ltx2": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 40,
+        "fps": 24,
+        "output": "ltx2_output.mp4",
+    },
+    "ltx2_distilled": {
+        "height": 1024,
+        "width": 1536,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "fps": 24,
+        "output": "ltx2_distilled_output.mp4",
+    },
+    "ltx23": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 30,
+        "fps": 24,
+        "output": "ltx23_output.mp4",
+    },
 }
 
 
-def _detect_preset(model: str) -> dict:
+def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
+    class_lower = (model_class_name or "").lower()
+    if "distilled" in class_lower or "distilled" in model_lower:
+        return _MODEL_PRESETS["ltx2_distilled"]
+    if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
+        return _MODEL_PRESETS["ltx23"]
+    if "ltx2" in class_lower or "ltx-2" in model_lower or "ltx_2" in model_lower:
+        return _MODEL_PRESETS["ltx2"]
     if "vace" in model_lower:
         return _MODEL_PRESETS["vace"]
     if "cosmos" in model_lower:
@@ -122,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+        help="Override model class name (e.g., LTX2Pipeline).",
     )
     parser.add_argument(
         "--deploy-config",
@@ -130,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument(
         "--extra-body",
         type=parse_extra_body,
@@ -331,7 +362,7 @@ def main():
     args = parse_args()
     model_class_name = args.model_class_name
 
-    preset = _detect_preset(args.model)
+    preset = _detect_preset(args.model, model_class_name)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
@@ -422,8 +453,11 @@ def main():
     print(f"{'=' * 60}\n")
 
     prompt_dict = {"prompt": args.prompt}
-    if args.negative_prompt:
+    if args.negative_prompt is not None:
         prompt_dict["negative_prompt"] = args.negative_prompt
+    elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        prompt_dict["negative_prompt"] = ""
 
     sampling_kwargs = dict(
         height=args.height,

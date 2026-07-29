@@ -45,6 +45,26 @@ logger = init_logger(__name__)
 _DEFAULT_PARALLEL_DEGREE = 1
 
 
+def with_trust_remote_code_override(
+    overrides: Mapping[str, Any],
+    trust_remote_code: bool | None,
+) -> dict[str, Any]:
+    """Merge the tri-state ``trust_remote_code`` into an override mapping.
+
+    Single home for the precedence rule (explicit caller value > deploy
+    yaml per-stage value > vLLM default False): a non-None value becomes an
+    explicit override; ``None`` means "not specified" and leaves the deploy
+    yaml's per-stage setting in effect. The serve ``--trust-remote-code``
+    flag is store_true — its absent-False must be mapped to ``None`` at the
+    CLI boundary before reaching here, since it cannot express an explicit
+    False.
+    """
+    merged = dict(overrides)
+    if trust_remote_code is not None:
+        merged["trust_remote_code"] = trust_remote_code
+    return merged
+
+
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -293,7 +313,7 @@ class StageConfigFactory:
         cls,
         model: str,
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
     ) -> VllmOmniConfig | None:
@@ -301,18 +321,19 @@ class StageConfigFactory:
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            # HF config resolution needs a real bool: transformers treats
+            # None as "prompt for consent", which blocks non-interactively.
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
         )
         if pipeline_cfg is None:
             return None
 
-        registry_cli_overrides = {
-            **cli_overrides,
-            "trust_remote_code": trust_remote_code,
-            "model": model,
-        }
+        registry_cli_overrides = with_trust_remote_code_override(
+            {**cli_overrides, "model": model},
+            trust_remote_code,
+        )
         return VllmOmniConfig.from_pipeline_config(
             pipeline_cfg,
             user_deploy_config=user_deploy_config,
@@ -325,7 +346,7 @@ class StageConfigFactory:
         cls,
         model: str,
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
         strategy_specs: Mapping[Any, Any] | None = None,
@@ -339,17 +360,15 @@ class StageConfigFactory:
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            # See create_from_model: HF resolution needs a real bool.
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
         )
         if pipeline_cfg is None:
             return None, None
 
-        legacy_cli_overrides = {
-            **cli_overrides,
-            "trust_remote_code": trust_remote_code,
-        }
+        legacy_cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
         return cls._create_legacy_from_registry(
             pipeline_cfg,
             legacy_cli_overrides,
