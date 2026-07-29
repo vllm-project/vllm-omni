@@ -307,9 +307,24 @@ def resolve_model_config_path(model: str) -> str:
 
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
-    if not os.path.exists(stage_config_path):
-        return None
-    return str(stage_config_path)
+    if os.path.exists(stage_config_path):
+        return str(stage_config_path)
+
+    # A checkpoint's HF ``model_type`` is not always the registered Omni
+    # pipeline key. MiniCPM-o 4.5, for example, reports ``minicpmo`` while its
+    # predicate-selected pipeline is ``minicpmo_4_5``. Stage construction
+    # already loads that pipeline's default deploy config, so return the same
+    # path here to keep runtime connector discovery in sync with the stages.
+    pipeline_config = StageConfigFactory.get_pipeline_config(
+        model=model,
+        trust_remote_code=True,
+    )
+    if pipeline_config is not None and pipeline_config.default_deploy_config_name is not None:
+        default_deploy_path = PROJECT_ROOT / "vllm_omni" / "deploy" / pipeline_config.default_deploy_config_name
+        if default_deploy_path.is_file():
+            return str(default_deploy_path)
+
+    return None
 
 
 def load_stage_configs_from_model(
