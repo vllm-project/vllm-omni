@@ -931,9 +931,7 @@ class TestDynamicSlotTracking:
             for i in range(n):
                 idx = iteration * n + i
                 read, write = results[idx]
-                assert read != write, (
-                    f"Iter {iteration} block {i}: read={read} == write={write}"
-                )
+                assert read != write, f"Iter {iteration} block {i}: read={read} == write={write}"
 
     def test_3_blocks_three_iterations(self):
         """3 blocks (odd), 3 iterations: no collision across all passes."""
@@ -943,9 +941,7 @@ class TestDynamicSlotTracking:
             for i in range(n):
                 idx = iteration * n + i
                 read, write = results[idx]
-                assert read != write, (
-                    f"Iter {iteration} block {i}: read={read} == write={write}"
-                )
+                assert read != write, f"Iter {iteration} block {i}: read={read} == write={write}"
 
     def test_72_blocks_cosmos3(self):
         """72 blocks (Cosmos3, even): no collision."""
@@ -1028,6 +1024,4 @@ class TestDynamicSlotTracking:
 
         # pre_forward should override to slot 1
         hook_b.pre_forward(block_b)
-        assert hook_b.current_slot == 1, (
-            "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
-        )
+        assert hook_b.current_slot == 1, "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
