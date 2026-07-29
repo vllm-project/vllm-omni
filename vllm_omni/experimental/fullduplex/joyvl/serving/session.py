@@ -25,6 +25,7 @@ class StepResult:
     action: ParsedAction
     chunk_index: int
     frame_index: int
+    turn_index: int
     inference_skipped: bool
     latency_ms: float
     long_term_memory: str
@@ -68,14 +69,22 @@ class InteractionSession:
         self._system_prompt = prompt
         return True
 
-    async def step(self, frames: list[str], query: str | None = None, t: float | None = None) -> StepResult:
+    async def step(
+        self, frames: list[str], query: str | None = None, time_ranges: list[str] | None = None
+    ) -> StepResult:
         self.last_access = time.monotonic()
         started = time.perf_counter()
         policy = self._policy
         brain = policy.brain
 
-        base = t if t is not None else brain.frame_index * self.config.frame_seconds
-        time_ranges = [f"{base + i * self.config.frame_seconds:.1f} seconds" for i in range(len(frames))]
+        # Client-supplied per-frame times (the JD webui sends turn-based ones) win;
+        # otherwise fall back to the local 1 fps frame clock.
+        incoming = list(time_ranges or [])
+        base = brain.frame_index * self.config.frame_seconds
+        time_ranges = [
+            incoming[i] if i < len(incoming) and incoming[i] else f"{base + i * self.config.frame_seconds:.1f} seconds"
+            for i in range(len(frames))
+        ]
 
         delegation_info = await policy.fold_delegations()
 
@@ -83,7 +92,8 @@ class InteractionSession:
             self._spawn_consolidation(policy.close_chunk(), policy.take_working_frames())
             self.chunk = WorkingChunk()
 
-        query_is_fresh = policy.set_query(query)
+        policy.tick_turn()
+        query_is_fresh = policy.set_query(query, at=time_ranges[0] if time_ranges else None)
 
         for tr, url in zip(time_ranges, frames):
             policy.observe(tr, url)
@@ -105,6 +115,7 @@ class InteractionSession:
             action=action,
             chunk_index=brain.chunk_index,
             frame_index=brain.frame_index,
+            turn_index=brain.turn_index,
             inference_skipped=skipped,
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             long_term_memory=brain.memory.long_term_memory,
@@ -174,7 +185,10 @@ class InteractionSession:
         query = self._policy.brain.current_query
         if include_query and query:
             content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{query.strip()}"})
-        for tr, url in zip(time_ranges, frames):
-            content.append({"type": "text", "text": f"<{tr}>"})
+        # One time marker per turn, before all of the turn's frames (reference fix 9d07596b).
+        marker = next((tr for tr in time_ranges if tr), None)
+        if marker:
+            content.append({"type": "text", "text": f"<{marker}>"})
+        for url in frames:
             content.append({"type": "image_url", "image_url": {"url": url}, "max_pixels": self.config.max_pixels})
         return {"role": "user", "content": content}

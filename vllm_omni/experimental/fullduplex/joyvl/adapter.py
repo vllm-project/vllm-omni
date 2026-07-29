@@ -58,6 +58,7 @@ class JoyVLDuplexAdapter(DuplexAdapter):
 
         parts = [{"type": "image_url", "image_url": {"url": f}} for f in sample_frames(self._frames, policy.num_frames)]
         messages, _ = policy.build_messages(parts)
+        policy.tick_turn()
         action = policy.commit(await self._generate(messages))
 
         frames = [(str(i), f) for i, f in enumerate(self._frames)]

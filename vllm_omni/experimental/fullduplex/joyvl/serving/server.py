@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import math
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -114,14 +116,16 @@ class SessionManager:
             self._locks[session_id] = asyncio.Lock()
         return session
 
-    async def step(self, session_id: str, frames: list[str], query: str | None) -> StepResult:
+    async def step(
+        self, session_id: str, frames: list[str], query: str | None, time_ranges: list[str] | None = None
+    ) -> StepResult:
         await self._evict_expired()
         # capture session + lock together (no await between) so a concurrent reset cannot
         # swap them out from under us; the lock then serializes step against reset.
         session = self._get(session_id)
         lock = self._locks[session_id]
         async with lock:
-            return await session.step(frames, query)
+            return await session.step(frames, query, time_ranges=time_ranges)
 
     async def reset(self, session_id: str) -> None:
         # Acquire the per-session lock so reset waits for any in-flight step() to finish
@@ -170,10 +174,38 @@ class SessionManager:
             await self._delegation.aclose()
 
 
-def _extract_frames_and_query(payload: dict[str, Any]) -> tuple[list[str], str | None]:
+# Time markers as embedded by the JD reference clients: <3.0 seconds>, <3s>,
+# or a range with "-" / "~" between two values.
+_TIME_VALUE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(?:seconds?|s)$")
+_TIME_MARKER_RE = re.compile(r"^<\d+(?:\.\d+)?\s*(?:seconds?|s)(?:\s*[~-]\s*\d+(?:\.\d+)?\s*(?:seconds?|s))?>$")
+
+
+def _format_seconds_words(value: float) -> str:
+    return f"{math.floor(value * 10 + 0.5) / 10:.1f} seconds"
+
+
+def _normalize_time_range(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    match = _TIME_VALUE_RE.fullmatch(text)
+    if match:
+        return _format_seconds_words(float(match.group(1)))
+    parts = re.split(r"\s*([~-])\s*", text, maxsplit=1)
+    if len(parts) == 3:
+        start = _TIME_VALUE_RE.fullmatch(parts[0].strip())
+        end = _TIME_VALUE_RE.fullmatch(parts[2].strip())
+        if start and end:
+            sep = " ~ " if parts[1] == "~" else "-"
+            return f"{_format_seconds_words(float(start.group(1)))}{sep}{_format_seconds_words(float(end.group(1)))}"
+    return None
+
+
+def _extract_frames_and_query(payload: dict[str, Any]) -> tuple[list[str], str | None, list[str]]:
     messages = payload.get("messages") or []
     frames: list[str] = []
     texts: list[str] = []
+    markers: list[str] = []
     for message in messages:
         if message.get("role") != "user":
             continue
@@ -189,8 +221,38 @@ def _extract_frames_and_query(payload: dict[str, Any]) -> tuple[list[str], str |
                     frames.append(url)
             elif ptype == "text" and part.get("text"):
                 texts.append(part["text"])
-    query = "\n".join(t.strip() for t in texts if t.strip()) or None
-    return frames, query
+    # Pull <time> marker lines out of the text: they are frame timestamps,
+    # not part of the standing instruction.
+    query_lines: list[str] = []
+    for text in texts:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if _TIME_MARKER_RE.fullmatch(stripped):
+                normalized = _normalize_time_range(stripped)
+                if normalized:
+                    markers.append(normalized)
+            elif stripped:
+                query_lines.append(stripped)
+    query = "\n".join(query_lines) or None
+    return frames, query, markers
+
+
+def _incoming_time_ranges(request: Request, payload: dict[str, Any], markers: list[str]) -> list[str]:
+    ranges = payload.get("frame_time_ranges")
+    if isinstance(ranges, list):
+        parsed = [normalized for normalized in (_normalize_time_range(r) for r in ranges) if normalized]
+        if parsed:
+            return parsed
+    for candidate in (
+        request.headers.get("x-frame-time-range"),
+        request.headers.get("x-streaming-time-range"),
+        payload.get("frame_time_range"),
+        payload.get("x_frame_time_range"),
+    ):
+        normalized = _normalize_time_range(candidate)
+        if normalized:
+            return [normalized]
+    return markers
 
 
 def _session_id(request: Request, payload: dict[str, Any]) -> str:
@@ -227,6 +289,7 @@ def _completion_response(model: str, result: StepResult) -> dict[str, Any]:
             "delegation": result.delegation,
             "chunk_index": result.chunk_index,
             "frame_index": result.frame_index,
+            "turn_index": result.turn_index,
             "inference_skipped": result.inference_skipped,
             "latency_ms": result.latency_ms,
             "memory": memory,
@@ -258,10 +321,11 @@ def create_app(config: InteractionConfig) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> JSONResponse:
         payload = await request.json()
-        frames, query = _extract_frames_and_query(payload)
+        frames, query, markers = _extract_frames_and_query(payload)
         if not frames:
             return JSONResponse({"error": "interaction server requires at least one image_url frame"}, status_code=400)
-        result = await manager.step(_session_id(request, payload), frames, query)
+        time_ranges = _incoming_time_ranges(request, payload, markers)
+        result = await manager.step(_session_id(request, payload), frames, query, time_ranges)
         return JSONResponse(_completion_response(config.main_model, result))
 
     @app.post("/reset")

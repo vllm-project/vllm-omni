@@ -65,6 +65,8 @@ async def test_flush_archives_qa_and_summarizes():
     b = InteractionBrain(summarizer=summ, chunk_frames=3, long_term_every_n_chunks=2, frame_seconds=1.0)
     b.update_query("watch the room")
     b.tick(3)
+    for _ in range(3):
+        b.tick_turn()
     assert b.should_flush() is True
     b.record_response("a person enters")
     await b.flush([("0.0s", "u0"), ("2.0s", "u2")])
@@ -73,6 +75,19 @@ async def test_flush_archives_qa_and_summarizes():
     assert b.should_flush() is False
     assert b.memory.qa_history[-1].responses == [("2.0 seconds", "a person enters")]
     assert len(b.memory.mid_term_summaries) == 1
+
+
+def test_chunk_window_counts_turns_not_frames():
+    # A batch turn carrying several frames advances the chunk window by one
+    # (reference fix 9d07596b), so multi-frame requests don't burn the window early.
+    b = InteractionBrain(chunk_frames=2, frame_seconds=1.0)
+    b.tick(3)  # 3 frames arrive in one turn
+    b.tick_turn()
+    assert b.should_flush() is False
+    b.tick_turn()
+    assert b.should_flush() is True
+    b.close_chunk()
+    assert b.should_flush() is False
 
 
 @pytest.mark.asyncio

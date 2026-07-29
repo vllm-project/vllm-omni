@@ -51,8 +51,9 @@ class InteractionBrain:
         self.query_time: str | None = None
         self.query_in_current_chunk = False
         self.frame_index = 0
+        self.turn_index = 0
         self.chunk_index = 1
-        self._chunk_frame_count = 0
+        self._chunk_turn_count = 0
         self.working_frames: list[tuple[str, str]] = []
         self.last_response_text = ""
         self.response_records: list[tuple[str, str]] = []
@@ -67,7 +68,10 @@ class InteractionBrain:
 
     def tick(self, n: int = 1) -> None:
         self.frame_index += n
-        self._chunk_frame_count += n
+
+    def tick_turn(self) -> None:
+        self.turn_index += 1
+        self._chunk_turn_count += 1
 
     def observe(self, time_range: str, data_url: str) -> None:
         self.tick()
@@ -79,16 +83,18 @@ class InteractionBrain:
         return frames
 
     def should_flush(self) -> bool:
-        return self._chunk_frames > 0 and self._chunk_frame_count >= self._chunk_frames
+        # The chunk window counts inference turns, not frames (reference fix 9d07596b);
+        # at 1 fps with one frame per turn the two are identical.
+        return self._chunk_frames > 0 and self._chunk_turn_count >= self._chunk_frames
 
-    def update_query(self, query: str | None) -> bool:
+    def update_query(self, query: str | None, at: str | None = None) -> bool:
         q = (query or "").strip()
         if not q or q == self.current_query:
             return False
         if self.current_query is not None:
             self.archive_query()
         self.current_query = q
-        self.query_time = self.now()
+        self.query_time = at or self.now()
         self.query_in_current_chunk = True
         return True
 
@@ -121,7 +127,7 @@ class InteractionBrain:
         self.archive_query()
         closed = self.chunk_index
         self.chunk_index += 1
-        self._chunk_frame_count = 0
+        self._chunk_turn_count = 0
         self.query_in_current_chunk = False
         return closed
 
