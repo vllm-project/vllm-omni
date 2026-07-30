@@ -409,6 +409,21 @@ class _DriftedTokenizer:
         return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
 
 
+class _BaseCheckpointTokenizer:
+    """Simulates tencent/HunyuanImage-3.0 (base): reports the same
+    model_class_name as -Instruct, but its vocab doesn't include the
+    Instruct-only <img_ratio_33>-<img_ratio_36> tokens -- convert_tokens_to_ids
+    falls back to unk_token_id for those, like a real HF tokenizer would."""
+
+    unk_token_id = 0
+    _INSTRUCT_ONLY = {"<img_ratio_33>", "<img_ratio_36>"}
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        if tok in self._INSTRUCT_ONLY:
+            return self.unk_token_id
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
 def test_validate_special_token_ids_passes_for_matching_tokenizer():
     validate_special_token_ids(_MatchingTokenizer())  # must not raise
 
@@ -416,3 +431,11 @@ def test_validate_special_token_ids_passes_for_matching_tokenizer():
 def test_validate_special_token_ids_raises_on_drift():
     with pytest.raises(ValueError, match="<think>.*expected 128023.*got 999999"):
         validate_special_token_ids(_DriftedTokenizer())
+
+
+def test_validate_special_token_ids_tolerates_base_checkpoint_missing_tokens():
+    """The base checkpoint's tokenizer not recognizing Instruct-only ratio
+    tokens (unk_token_id, not a real drifted id) must not be flagged as a
+    mismatch -- both checkpoints share model_class_name, so this hook fires
+    for either one."""
+    validate_special_token_ids(_BaseCheckpointTokenizer())  # must not raise

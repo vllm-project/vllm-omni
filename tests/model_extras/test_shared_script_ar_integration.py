@@ -229,10 +229,17 @@ def test_apply_ar_stage_inputs_runs_declared_tokenizer_validator(
 
 
 @pytest.mark.parametrize(
-    "module_name,relpath",
+    "module_name,relpath,required_argv",
     [
-        ("_shared_text_to_image_cli", "examples/offline_inference/text_to_image/text_to_image.py"),
-        ("_shared_image_edit_cli", "examples/offline_inference/image_to_image/image_edit.py"),
+        ("_shared_text_to_image_cli", "examples/offline_inference/text_to_image/text_to_image.py", []),
+        # image_edit.py's parser declares --image/--prompt as required (no defaults);
+        # omitting them makes parse_args() raise SystemExit(2) before the assertion
+        # below is ever reached.
+        (
+            "_shared_image_edit_cli",
+            "examples/offline_inference/image_to_image/image_edit.py",
+            ["--image", "dummy.png", "--prompt", "x"],
+        ),
     ],
 )
 @pytest.mark.parametrize("argv,expected", [([], False), (["--trust-remote-code"], True)])
@@ -240,6 +247,7 @@ def test_trust_remote_code_flag_parses_from_real_cli(
     monkeypatch: pytest.MonkeyPatch,
     module_name: str,
     relpath: str,
+    required_argv: list[str],
     argv: list[str],
     expected: bool,
 ) -> None:
@@ -250,7 +258,7 @@ def test_trust_remote_code_flag_parses_from_real_cli(
     the (expensive, one-model-load-per-invocation) full CLI subprocess a
     stricter GPU e2e test would need."""
     module = _load_module(module_name, relpath)
-    monkeypatch.setattr(sys, "argv", ["prog", *argv])
+    monkeypatch.setattr(sys, "argv", ["prog", *required_argv, *argv])
     args = module.parse_args()
     assert args.trust_remote_code is expected
 

@@ -73,12 +73,25 @@ def validate_special_token_ids(tokenizer: Any) -> None:
     wrong stop tokens. Not wired into ``build_prompt_tokens`` itself: callers
     that intentionally pass a stand-in tokenizer with different ids (e.g.
     this module's own unit tests) must not be forced through this check.
+
+    Both ``tencent/HunyuanImage-3.0`` (base) and ``-Instruct`` report the
+    same ``model_class_name`` (``HunyuanImage3ForCausalMM``), so this hook
+    fires for either checkpoint -- but the base tokenizer's vocab doesn't
+    include the Instruct-only ``<img_ratio_33>``-``<img_ratio_36>`` tokens
+    (added for it2i's second aspect-ratio range). A token the tokenizer
+    doesn't recognize at all (``convert_tokens_to_ids`` returning
+    ``unk_token_id``, or ``None`` for tokenizers without an unk concept) is
+    "not part of this checkpoint's vocab," not "drifted"; only an id that
+    resolves to something *else* indicates the hardcoded table is stale.
     """
-    mismatches = {
-        tok: (expected_id, actual_id)
-        for tok, expected_id in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.items()
-        if (actual_id := tokenizer.convert_tokens_to_ids(tok)) != expected_id
-    }
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    mismatches: dict[str, tuple[int, int]] = {}
+    for tok, expected_id in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.items():
+        actual_id = tokenizer.convert_tokens_to_ids(tok)
+        if actual_id is None or (unk_id is not None and actual_id == unk_id):
+            continue  # not in this checkpoint's vocab -- nothing to compare
+        if actual_id != expected_id:
+            mismatches[tok] = (expected_id, actual_id)
     if mismatches:
         details = ", ".join(f"{tok!r}: expected {exp}, got {act}" for tok, (exp, act) in mismatches.items())
         raise ValueError(
@@ -374,12 +387,23 @@ def build_ar_prompt_inputs(
 ) -> ARPromptInputs:
     """Build the complete AR-stage inputs for a HunyuanImage3 request.
 
-    This is the single seam shared by the offline task examples and the
-    OpenAI server: it wraps :func:`build_prompt_tokens` (byte-for-byte HF
-    parity when ``tokenizer`` is given), the :func:`build_prompt` string
-    fallback (when no tokenizer is available), and
-    :func:`resolve_stop_token_ids`, so no caller re-derives the AR
-    prefill/stop-token logic. ``image_size`` follows the same convention as
+    Wraps :func:`build_prompt_tokens` (byte-for-byte HF parity when
+    ``tokenizer`` is given), the :func:`build_prompt` string fallback (when
+    no tokenizer is available), and :func:`resolve_stop_token_ids` behind
+    one call, so a caller doesn't have to re-derive the AR prefill/stop-token
+    logic -- and, critically, doesn't have to independently resolve
+    ``bot_task`` for the prompt-building call vs. the stop-token call, which
+    can silently diverge if a caller passes the same nominal ``bot_task``
+    value to both but resolves "omitted" vs. "explicit None" differently for
+    each (this seam always forwards the identical resolved value to both).
+
+    Used by the offline shared task examples (``text_to_image.py`` /
+    ``image_edit.py`` via ``model_extras.hunyuan_image3.build_ar_stage_inputs``).
+    The OpenAI server's ``serving_chat.py`` does not currently call this
+    seam -- it still independently calls ``build_prompt``/``build_prompt_tokens``/
+    ``resolve_stop_token_ids``, and can hit exactly the divergence described
+    above when ``bot_task`` is omitted from ``extra_body`` (pre-existing,
+    unrelated to this module). ``image_size`` follows the same convention as
     :func:`resolve_stop_token_ids` (``None``/``"auto"`` lets the AR predict
     the aspect ratio; an explicit ``"{w}x{h}"`` makes it stop at the
     terminator).

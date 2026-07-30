@@ -15,7 +15,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras import get_ar_input_builder, get_model_class_name
+from vllm_omni.model_extras import get_ar_input_builder, get_ar_tokenizer_validator, get_model_class_name
 from vllm_omni.platforms import current_omni_platform
 
 PROMPT = "A brown and white dog is running on the grass"
@@ -423,16 +423,32 @@ def test_shared_script_ar_path_reaches_generation(
         prompt_dict=prompt_dict,
         sampling_params_list=sampling_params_list,
         trust_remote_code=True,
-        # Not wiring get_ar_tokenizer_validator here: HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS
-        # is documented as sourced from the -Instruct tokenizer.json, but this file's
-        # MODEL_NAME is the base "tencent/HunyuanImage-3.0" -- if the two tokenizers
-        # differ even slightly, validating here would fail for a reason unrelated to
-        # what this test checks. The validator has its own dedicated coverage in
-        # test_prompt_utils.py / test_shared_script_ar_integration.py.
-        validate_tokenizer=None,
+        # validate_special_token_ids now tolerates tokens the loaded tokenizer
+        # doesn't recognize at all (unk_token_id) instead of requiring every
+        # entry in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS to be present, so this is
+        # safe against MODEL_NAME's base checkpoint missing the Instruct-only
+        # <img_ratio_33>/<img_ratio_36> tokens. Wiring it here exercises the
+        # real production path (get_ar_tokenizer_validator via the registry),
+        # not just the isolated fake-tokenizer coverage in test_prompt_utils.py
+        # / test_shared_script_ar_integration.py.
+        validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
     )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
     generated_image = _extract_generated_image(outputs)
     score = compare_semantic(SYSTEM_EN_RECAPTION, generated_image, clip_model, clip_processor)
     print(f"shared-script AR path (en_recaption): CLIP cosine similarity = {score:.6f}")
+    # test_system_prompt_scores exercises this same (seed=1234, en_recaption)
+    # case through the hand-constructed extra_args path but only prints its
+    # score, so there's no in-repo reference value for this exact comparison
+    # to calibrate against. MIN_SEMANTIC_SIMILARITY is deliberately loose --
+    # a floor for "this is recognizably the same generation," not a quality
+    # bar -- so it catches a gross migration regression (wrong/blank/garbage
+    # image) without being flaky on run-to-run sampling noise. Tighten once
+    # a live run gives us a real score to calibrate against.
+    MIN_SEMANTIC_SIMILARITY = 0.5
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"shared-script AR path (en_recaption) CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} -- the migrated get_ar_input_builder path may have "
+        "diverged from the reference HunyuanImage-3.0 output for this prompt/system-prompt."
+    )
