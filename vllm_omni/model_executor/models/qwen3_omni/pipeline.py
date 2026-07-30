@@ -29,6 +29,9 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             "Qwen3-Omni requires chat template structure for thinker-talker handoff. Use /v1/chat/completions instead.",
         ),
     ),
+    duplex_runtime_extension="vllm_omni.experimental.fullduplex.qwen3omni.runtime.Qwen3OmniDuplexRuntimeExtension",
+    duplex_serving_adapter="vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter.Qwen3OmniServingRuntimeAdapter",
+    duplex_control_enabled=True,
     stages=(
         StagePipelineConfig(
             stage_id=0,

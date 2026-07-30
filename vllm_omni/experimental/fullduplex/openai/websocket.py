@@ -73,7 +73,6 @@ DOMAIN_TERMINAL_EVENTS = frozenset(
     {
         "response.done",
         "response.listen",
-        "audio.cancelled",
         "input.cancelled",
         "session.closed",
     }

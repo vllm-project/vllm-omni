@@ -83,6 +83,7 @@ class DuplexRuntimeExtension(Protocol):
         payload: object,
         final: bool,
         sampling_params: object,
+        tokenizer: object = None,
     ) -> DuplexAppendPlan: ...
 
     def decide_output(
@@ -164,6 +165,8 @@ class DuplexStagePort(Protocol):
     def stage_count(self) -> int: ...
 
     def sampling_defaults(self) -> tuple[object, ...]: ...
+
+    def get_tokenizer(self, stage_id: int) -> object | None: ...
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None: ...
 

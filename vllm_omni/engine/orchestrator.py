@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -214,6 +215,7 @@ class _OrchestratorDuplexStagePort:
     def __init__(
         self,
         *,
+        orchestrator: Orchestrator,
         stage_pools: list[StagePool],
         request_states: dict[str, OrchestratorRequestState],
         running_counter: OmniRequestCounter | None,
@@ -224,12 +226,14 @@ class _OrchestratorDuplexStagePort:
             Awaitable[None],
         ],
     ) -> None:
+        self._orchestrator = orchestrator
         self._stage_pools = stage_pools
         self._request_states = request_states
         self._running_counter = running_counter
         self._cleanup_request_ids = cleanup_request_ids
         self._async_chunk = async_chunk
         self._prewarm_async_chunk_stages = prewarm_async_chunk_stages
+        self._tokenizers: dict[int, Any] = {}
 
     @property
     def stage_count(self) -> int:
@@ -237,6 +241,17 @@ class _OrchestratorDuplexStagePort:
 
     def sampling_defaults(self) -> tuple[object, ...]:
         return tuple(pool.stage_client.default_sampling_params for pool in self._stage_pools)
+
+    def get_tokenizer(self, stage_id: int) -> Any | None:
+        if stage_id in self._tokenizers:
+            return self._tokenizers[stage_id]
+        try:
+            model_config = self._stage_pools[stage_id].stage_vllm_config.model_config
+            tokenizer = cached_tokenizer_from_config(model_config)
+            self._tokenizers[stage_id] = tokenizer
+            return tokenizer
+        except Exception:
+            return None
 
     @staticmethod
     def _sync_bridge_state(
@@ -306,12 +321,12 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
-            if self._async_chunk and context.stage_id == 0:
-                await self._prewarm_async_chunk_stages(
-                    context.request_id,
-                    request,
-                    request_state,
-                )
+        if self._async_chunk and context.stage_id == 0 and request_state.final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(
+                context.request_id,
+                request,
+                request_state,
+            )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
@@ -398,6 +413,7 @@ class Orchestrator:
             self.duplex_control_plane = DuplexControlPlane(
                 extension=duplex_runtime_extension,
                 stage_port=_OrchestratorDuplexStagePort(
+                    orchestrator=self,
                     stage_pools=self.stage_pools,
                     request_states=self.request_states,
                     running_counter=self._running_counter,
@@ -2089,6 +2105,8 @@ class Orchestrator:
             return
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
+            if next_stage_id in req_state.stage_submit_ts:
+                continue
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
             if not self._stage_receives_async_chunks(next_stage_id):

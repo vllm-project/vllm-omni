@@ -1544,6 +1544,7 @@ class AsyncOmniEngine:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        conversation_history: list[dict[str, object]] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Signal an engine-level duplex turn."""
@@ -1554,6 +1555,7 @@ class AsyncOmniEngine:
             next_fence=next_fence,
             session_config=session_config,
             runtime_config=runtime_config,
+            conversation_history=conversation_history,
             timeout=timeout,
         )
 
@@ -1566,6 +1568,7 @@ class AsyncOmniEngine:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        conversation_history: list[dict[str, object]] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for signaling a duplex turn."""
@@ -1579,6 +1582,7 @@ class AsyncOmniEngine:
                 next_fence=next_fence,
                 session_config=session_config,
                 runtime_config=runtime_config,
+                conversation_history=conversation_history,
                 timeout=timeout,
             ),
         )

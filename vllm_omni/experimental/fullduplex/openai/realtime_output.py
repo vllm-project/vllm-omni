@@ -136,7 +136,7 @@ class RealtimeOutputProjector:
                     text = ""
                 payloads.append(
                     {
-                        "type": "response.audio_transcript.delta",
+                        "type": "response.output_audio_transcript.delta",
                         "response_id": response_id,
                         "item_id": self._response_item_id(response_id),
                         "output_index": 0,
@@ -230,62 +230,6 @@ class RealtimeOutputProjector:
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
             return [{"type": "input_audio_buffer.cleared"}]
-        if event_type == "audio.cancelled":
-            response_id = event.get("response_id")
-            payloads: list[dict[str, object]] = []
-            if event.get("reason") == "output_audio_buffer_clear":
-                if not isinstance(response_id, str) or not response_id:
-                    response_id = self._active_response_id or self._last_response_id
-                payloads.append(
-                    {
-                        "type": "output_audio_buffer.cleared",
-                        "response_id": response_id,
-                    }
-                )
-                if not isinstance(response_id, str) or not response_id:
-                    return payloads
-            elif not isinstance(response_id, str) or not response_id:
-                response_id = self._active_response_id
-            if not isinstance(response_id, str) or not response_id:
-                return payloads
-            if self._response_is_done(response_id):
-                return payloads
-            committed_ms = event.get("committed_ms")
-            if isinstance(committed_ms, int | float):
-                item_id = self._response_item_id(response_id)
-                committed_audio_ms = max(0, int(committed_ms))
-                self._item_truncation_cursors[item_id] = (0, committed_audio_ms)
-                item = self._conversation_items.get(item_id)
-                if item is not None:
-                    self._truncate_realtime_item_content(
-                        item,
-                        content_index=0,
-                        audio_end_ms=committed_audio_ms,
-                    )
-                payloads.append(
-                    {
-                        "type": "conversation.item.truncated",
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
-            payloads.extend(self._realtime_audio_done_events(event, response_id))
-            payloads.extend(
-                self._realtime_response_terminal_events(
-                    event,
-                    response_id,
-                    status="cancelled",
-                    status_details={
-                        "type": "cancelled",
-                        "reason": event.get("reason") or "client_cancelled",
-                    },
-                )
-            )
-            if isinstance(response_id, str) and response_id == self._active_response_id:
-                self._active_response_id = None
-            return payloads
         if event_type == "playback.acknowledged":
             return [{"type": "playback.acknowledged", "event": event}]
         if event_type == "conversation.item.created":
@@ -739,7 +683,7 @@ class RealtimeOutputProjector:
             )
         payloads.append(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": response_id,
                 "item_id": item_id,
                 "output_index": 0,
@@ -772,7 +716,7 @@ class RealtimeOutputProjector:
                 state.audio_done_emitted = True
             payloads.append(
                 {
-                    "type": "response.audio.done",
+                    "type": "response.output_audio.done",
                     "response_id": response_id,
                     "item_id": item_id,
                     "output_index": 0,
@@ -782,7 +726,7 @@ class RealtimeOutputProjector:
             if transcript:
                 payloads.append(
                     {
-                        "type": "response.audio_transcript.done",
+                        "type": "response.output_audio_transcript.done",
                         "response_id": response_id,
                         "item_id": item_id,
                         "output_index": 0,

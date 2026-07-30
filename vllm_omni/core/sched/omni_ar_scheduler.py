@@ -248,7 +248,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
+        for queue in (self.waiting, self.running, self.skipped_waiting):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
@@ -734,6 +734,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         # TODO(yrr): chunk transfer adapter & input_coordinator unified to one
         if self.chunk_transfer_adapter:
+            # Snapshot streaming-input requests before the chunk adapter
+            # restores ``requests_origin_status``, which overwrites
+            # WAITING_FOR_STREAMING_REQ with the pre-chunk-park status
+            # (typically WAITING). Without this, the upstream
+            # ``finish_requests`` never decrements
+            # ``num_waiting_for_streaming_input`` and all subsequent
+            # requests become invisible to the engine step loop.
+            if isinstance(request_ids, str):
+                _ids: list[str] | tuple[str, ...] = (request_ids,)
+            elif request_ids is None:
+                _ids = list(self.requests.keys())
+            else:
+                _ids = list(request_ids)
+            for rid in _ids:
+                req = self.requests.get(rid)
+                if req is not None and not req.is_finished() and req.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    self.num_waiting_for_streaming_input -= 1
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         # Realign stale ``request.status`` (chunk-transfer-adapter's

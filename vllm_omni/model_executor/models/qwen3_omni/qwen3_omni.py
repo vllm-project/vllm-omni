@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -131,6 +132,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "thinker":
+            self.has_preprocess = True
             self.use_async_omni_output = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
@@ -151,6 +153,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                 device=self._module_device(self.thinker),
                 dtype=torch.long,
             )
+            self.set_custom_preprocess(self.thinker_preprocess)
+            self.talker_mtp = None  # type: ignore[assignment]
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
@@ -185,6 +189,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             # suppress tokens by setting their probability to ~1e-9 (finite very small)
             self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
+            self._talker_dump_dir = "/tmp/talker_forward_inputs"
+            os.makedirs(self._talker_dump_dir, exist_ok=True)
+            self._talker_dump_counter = 0
             # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
             self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
                 ("hidden_states", "last"),
@@ -268,6 +275,149 @@ class Qwen3OmniMoeForConditionalGeneration(
                 prompt_token_ids=prompt_token_ids,
                 multi_modal_data={"audio": remaining},
             )
+
+    # ==================== Duplex data plane ====================
+
+    def thinker_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+        duplex = kwargs.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {}
+
+        prompt_len_meta = kwargs.get("duplex_prompt_len")
+        token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        if (
+            isinstance(prompt_len_meta, int)
+            and isinstance(token_offset_meta, int)
+            and token_offset_meta >= prompt_len_meta
+        ):
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {}
+
+        helper = self._qwen3omni_duplex_helper()
+        session_id = str(duplex.get("session_id") or "")
+        try:
+            incarnation = int(duplex.get("incarnation", 0))
+        except (TypeError, ValueError):
+            incarnation = 0
+        payload = duplex.get("payload")
+        if not session_id or not isinstance(payload, dict):
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
+
+        session_key = (session_id, incarnation)
+        state = helper.sessions.get(session_key)
+        if state is None:
+            from vllm_omni.experimental.fullduplex.qwen3omni.stage0 import (
+                _Qwen3OmniStage0SessionState,
+            )
+
+            state = _Qwen3OmniStage0SessionState(session_id=session_id)
+            helper.sessions[session_key] = state
+            session_config = duplex.get("session_config")
+            session_config = dict(session_config) if isinstance(session_config, dict) else {}
+            helper._prepare_session_context(state, session_config)
+
+        audio_waveform = helper._decode_audio_payload(payload)
+        seq = duplex.get("seq")
+        try:
+            seq = int(seq) if seq is not None else None
+        except (TypeError, ValueError):
+            seq = None
+        epoch = duplex.get("epoch")
+        try:
+            epoch = int(epoch) if epoch is not None else None
+        except (TypeError, ValueError):
+            epoch = None
+
+        duplex_session_config = duplex.get("session_config")
+        duplex_session_config = dict(duplex_session_config) if isinstance(duplex_session_config, dict) else {}
+        result = helper.stage_prefill_embeddings(
+            state,
+            audio_waveform,
+            epoch=epoch,
+            seq=seq,
+            final=bool(duplex.get("final")),
+            session_config=duplex_session_config,
+        )
+
+        update_result = dict(result)
+        update_result.pop("inputs_embeds", None)
+        if result.get("success") is not True:
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {"duplex": update_result}
+
+        target_dtype = input_embeds.dtype if input_embeds is not None else self.embed_input_ids(input_ids[:1]).dtype
+        full_req_embeds = result["inputs_embeds"].to(device=input_ids.device, dtype=target_dtype)
+        full_input_token_ids = list(result.get("input_token_ids") or [])
+
+        prompt_len = kwargs.get("duplex_prompt_len")
+        try:
+            prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
+        except (TypeError, ValueError):
+            prompt_len = int(full_req_embeds.shape[0])
+
+        span_len = int(input_ids.shape[0])
+        token_offset = kwargs.get("duplex_token_offset", 0)
+        try:
+            token_offset = max(0, int(token_offset))
+        except (TypeError, ValueError):
+            token_offset = 0
+
+        req_embeds = full_req_embeds[token_offset : token_offset + span_len]
+
+        input_token_ids = full_input_token_ids[token_offset : token_offset + span_len]
+        if input_token_ids:
+            req_input_ids = torch.tensor(input_token_ids, dtype=input_ids.dtype, device=input_ids.device)
+            update_result["duplex_prompt_token_ids"] = full_input_token_ids
+        else:
+            req_input_ids = input_ids
+
+        return req_input_ids, req_embeds, {"duplex": update_result}
+
+    def _qwen3omni_duplex_helper(self):
+        helper = getattr(self, "_qwen3omni_duplex_data_plane_helper", None)
+        if helper is not None:
+            return helper
+        from vllm_omni.experimental.fullduplex.qwen3omni.stage0 import Qwen3OmniStage0DuplexRuntime
+
+        model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
+        device = str(self._module_device(self.thinker if self.thinker is not None else self))
+        helper = Qwen3OmniStage0DuplexRuntime(self, model_path=model_path, device=device)
+        self._qwen3omni_duplex_data_plane_helper = helper
+        return helper
+
+    def prepare_duplex_sampling(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        rows: tuple,
+    ) -> None:
+        del sampling_metadata
+        request_sessions = getattr(self, "_qwen3omni_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._qwen3omni_duplex_request_sessions = request_sessions
+        request_sessions.update(
+            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
+        )
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        request_sessions = getattr(self, "_qwen3omni_duplex_request_sessions", None)
+        helper = getattr(self, "_qwen3omni_duplex_data_plane_helper", None)
+        sessions = getattr(helper, "sessions", None) if helper is not None else None
+        if isinstance(request_sessions, dict):
+            for request_id in finished_req_ids:
+                session_key = request_sessions.pop(request_id, None)
+                if session_key is not None and isinstance(sessions, dict):
+                    sessions.pop(session_key, None)
+        if hasattr(self.model, "on_requests_finished"):
+            self.model.on_requests_finished(finished_req_ids)
 
     # ==================== Device utilities ====================
 
@@ -412,6 +562,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
+
+            # Serialize talker forward() inputs to disk
+            dump_path = os.path.join(self._talker_dump_dir, f"{self._talker_dump_counter:06d}.pt")
+            torch.save(
+                {
+                    "input_ids": input_ids.detach().cpu(),
+                    "positions": positions.detach().cpu(),
+                    "inputs_embeds": inputs_embeds.detach().cpu(),
+                },
+                dump_path,
+            )
+            logger.debug("[talker] saved forward inputs to %s", dump_path)
+            self._talker_dump_counter += 1
 
             # Run talker forward
             with torch.inference_mode():
@@ -788,11 +951,30 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.tts_pad_embed = _proj_from_thinker(tts_pad_thinker)
         return self.tts_bos_embed, self.tts_eos_embed, self.tts_pad_embed
 
+    def _get_thinker_tokenizer(self):
+        if not hasattr(self, "_thinker_tokenizer"):
+            self._thinker_tokenizer = cached_tokenizer_from_config(self.vllm_config.model_config)
+        return self._thinker_tokenizer
+
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, payload: OmniPayload):
         hs: HiddenStates = payload.get("hidden_states", {})
         embed: Embeddings = payload.get("embed", {})
         ids: Ids = payload.get("ids", {})
         meta: OmniPayloadMeta = payload.get("meta", {})
+
+        all_ids = ids.get("all")
+        prompt_ids = ids.get("prompt")
+        if all_ids is not None and prompt_ids is not None:
+            all_list = all_ids.tolist() if isinstance(all_ids, torch.Tensor) else list(all_ids)
+            prompt_len = len(prompt_ids.tolist() if isinstance(prompt_ids, torch.Tensor) else list(prompt_ids))
+            generated_ids = all_list[prompt_len:]
+            if generated_ids:
+                try:
+                    tokenizer = self._get_thinker_tokenizer()
+                    thinker_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    logger.info("[thinker] generated text: %s", thinker_text)
+                except Exception:
+                    logger.warning("[thinker] failed to decode generated token ids")
 
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: OmniPayload = {}
@@ -968,11 +1150,28 @@ class Qwen3OmniMoeForConditionalGeneration(
         talker_input_embeds = []  # [1 t d]
         talker_input_ids = []
         trailing_text_hidden_all: torch.Tensor | None = None
+        logger.info(
+            "[t2t_prefill] im_start_indexes=%s input_ids[0][:20]=%s target_len=%d",
+            im_start_indexes.tolist(),
+            input_ids[0][:20].tolist(),
+            target_len,
+        )
         # For every chatml parts
         for i in range(len(im_start_indexes) - 1):
             im_start_index = im_start_indexes[i].item()
             segment_end_index = im_start_indexes[i + 1].item()
             role_token = input_ids[0][im_start_index + 1]
+            logger.info(
+                "[t2t_prefill] segment %d/%d: im_start=%d end=%d role_token=%d (system=%d user=%d assistant=%d)",
+                i,
+                len(im_start_indexes) - 2,
+                im_start_index,
+                segment_end_index,
+                role_token.item(),
+                self.config.system_token_id,
+                self.config.user_token_id,
+                self.config.assistant_token_id,
+            )
             # Talker should ignore thinker system prompt
             if (role_token == self.config.system_token_id).item():
                 continue

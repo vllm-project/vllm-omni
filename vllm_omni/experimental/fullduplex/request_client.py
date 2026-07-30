@@ -201,6 +201,7 @@ class DuplexRequestClient:
         next_fence: DuplexFence | None,
         session_config: dict[str, object] | None,
         runtime_config: dict[str, object] | None,
+        conversation_history: list[dict[str, object]] | None = None,
         timeout: float | None,
     ) -> dict[str, object]:
         kwargs: dict[str, object] = {"event": event, "fence": fence, "timeout": timeout}
@@ -210,6 +211,8 @@ class DuplexRequestClient:
             kwargs["session_config"] = session_config
         if runtime_config is not None:
             kwargs["runtime_config"] = runtime_config
+        if conversation_history is not None:
+            kwargs["conversation_history"] = conversation_history
         result = await self.engine.signal_duplex_turn_async(session_id, **kwargs)
         if event in {"barge_in", "input.cancel", "response.cancel"}:
             self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)

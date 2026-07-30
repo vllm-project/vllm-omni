@@ -78,17 +78,6 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            turn_detection_error = self._validate_realtime_turn_detection(session_payload)
-            if turn_detection_error is not None:
-                await self._send_realtime_payload(
-                    self._realtime_error_payload(
-                        "unsupported_turn_detection",
-                        turn_detection_error,
-                        event_id=event.get("event_id"),
-                        param="turn_detection",
-                    )
-                )
-                return None
             self._apply_realtime_session_defaults(session_payload)
             session_payload.update(self._realtime_overlap_fields(session_payload))
             if not self._opened:
@@ -672,6 +661,13 @@ class RealtimeInputTranslator:
             extra_body["realtime_audio"] = dict(session_payload["audio"])
         if isinstance(session_payload.get("tracing"), str | dict):
             extra_body["realtime_tracing"] = session_payload["tracing"]
+        td_specified = "turn_detection" in session_payload
+        td_value = session_payload.get("turn_detection")
+        if not td_specified and isinstance(audio_input, dict) and "turn_detection" in audio_input:
+            td_specified = True
+            td_value = audio_input["turn_detection"]
+        if td_specified:
+            extra_body["realtime_turn_detection"] = td_value
         response_format = self._duplex_response_format(self._output_audio_format)
         extra_body.setdefault("realtime_output_audio_format", self._output_audio_format)
         overlap_fields = self._realtime_overlap_fields(session_payload)
@@ -989,26 +985,6 @@ class RealtimeInputTranslator:
                 return "video_frames entries must be valid base64"
             if not (header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG")):
                 return "video_frames entries must be JPEG or PNG images"
-        return None
-
-    @staticmethod
-    def _validate_realtime_turn_detection(session_payload: dict[str, object]) -> str | None:
-        configured_values: list[tuple[str, object]] = []
-        if "turn_detection" in session_payload:
-            configured_values.append(("turn_detection", session_payload["turn_detection"]))
-        audio_config = session_payload.get("audio")
-        if isinstance(audio_config, dict):
-            audio_input = audio_config.get("input")
-            if isinstance(audio_input, dict) and "turn_detection" in audio_input:
-                configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
-        for field_path, turn_detection in configured_values:
-            if turn_detection is None:
-                continue
-            turn_detection_type = turn_detection.get("type") if isinstance(turn_detection, dict) else turn_detection
-            return (
-                f"{field_path}={turn_detection_type!r} is not implemented by the duplex Realtime adapter; "
-                "set turn_detection to null and commit input explicitly, or use the model-owned duplex policy"
-            )
         return None
 
     @staticmethod

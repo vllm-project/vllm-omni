@@ -35,7 +35,9 @@ class ChatFallbackProjectorMixin:
             request = self._build_chat_request(session, request_id)
             result = await self._chat_service.create_chat_completion(request, raw_request=None)
             if isinstance(result, ErrorResponse):
-                await send_json({"type": "error", "error": result.message, "code": result.type or "chat_error"})
+                await send_json(
+                    {"type": "error", "error": result.error.message, "code": result.error.type or "chat_error"}
+                )
                 session.end_response(commit_text=False)
                 return
             if hasattr(result, "__aiter__"):
@@ -101,10 +103,10 @@ class ChatFallbackProjectorMixin:
         ):
             model_extra.pop(protocol_key, None)
         kwargs.update(model_extra)
-        if isinstance(tools, list):
+        if isinstance(tools, list) and tools:
             kwargs["tools"] = tools
-        if isinstance(tool_choice, str | dict):
-            kwargs["tool_choice"] = tool_choice
+            if isinstance(tool_choice, str | dict):
+                kwargs["tool_choice"] = tool_choice
 
         request = ChatCompletionRequest(**kwargs)
         object.__setattr__(request, "modalities", response_config.modalities)

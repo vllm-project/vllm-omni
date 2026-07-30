@@ -54,6 +54,7 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     next_fence: DuplexFence | None = None
     session_config: dict[str, object] | None = None
     runtime_config: dict[str, object] | None = None
+    conversation_history: list[dict[str, object]] | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):

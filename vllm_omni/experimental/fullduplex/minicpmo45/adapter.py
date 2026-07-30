@@ -5,8 +5,13 @@ from copy import deepcopy
 from typing import Any
 
 import numpy as np
-from vllm.multimodal.media import MediaConnector
 
+from vllm_omni.experimental.fullduplex.base.audio_utils import (
+    convert_token_to_id,
+    load_native_tokenizer,
+    normalize_ref_audio,
+    resolve_ref_audio,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
@@ -113,9 +118,9 @@ class MiniCPMO45NativeDuplexServingAdapter:
             config.extra_body = extra_body
             return runtime_config
         else:
-            wav_np, sr = await cls.resolve_ref_audio(ref_audio, model_config=model_config)
+            wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
 
-        wav_np = cls.normalize_ref_audio(wav_np, int(sr), target_sr=16000)
+        wav_np = normalize_ref_audio(wav_np, int(sr), target_sr=16000)
         # Trim to a whole number of pooled audio embeddings (100 ms frames) so
         # the first-append scheduler reserve can count them exactly.
         usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
@@ -180,7 +185,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         """
         if "duplex_first_append_context_tokens" in runtime_config:
             return
-        tokenizer = cls._load_native_tokenizer(model_config)
+        tokenizer = load_native_tokenizer(model_config)
         if tokenizer is None:
             return
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
@@ -197,7 +202,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
 
     @staticmethod
     def _native_stage0_stop_token_ids(model_config: Any) -> list[int]:
-        tokenizer = MiniCPMO45NativeDuplexServingAdapter._load_native_tokenizer(model_config)
+        tokenizer = load_native_tokenizer(model_config)
         if tokenizer is None:
             return []
         out: list[int] = []
@@ -209,14 +214,14 @@ class MiniCPMO45NativeDuplexServingAdapter:
         )
         for field in stop_token_fields:
             token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
-            token_id = MiniCPMO45NativeDuplexServingAdapter._convert_token_to_id(tokenizer, token)
+            token_id = convert_token_to_id(tokenizer, token)
             if token_id is not None and token_id not in out:
                 out.append(token_id)
         return out
 
     @staticmethod
     def _native_scheduler_token_id(model_config: Any) -> int | None:
-        tokenizer = MiniCPMO45NativeDuplexServingAdapter._load_native_tokenizer(model_config)
+        tokenizer = load_native_tokenizer(model_config)
         if tokenizer is None:
             return None
         scheduler_tokens = (
@@ -224,7 +229,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS["audio_placeholder_token_id"],
         )
         for token in scheduler_tokens:
-            token_id = MiniCPMO45NativeDuplexServingAdapter._convert_token_to_id(tokenizer, token)
+            token_id = convert_token_to_id(tokenizer, token)
             if token_id is not None:
                 return token_id
         eos_id = getattr(tokenizer, "eos_token_id", None)
@@ -232,73 +237,3 @@ class MiniCPMO45NativeDuplexServingAdapter:
             return int(eos_id)
         except (TypeError, ValueError):
             return None
-
-    @staticmethod
-    def _load_native_tokenizer(model_config: Any) -> Any | None:
-        model_path = getattr(model_config, "model", None)
-        if not isinstance(model_path, str) or not model_path:
-            return None
-        try:
-            from transformers import AutoTokenizer
-
-            return AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-        except Exception:
-            return None
-
-    @staticmethod
-    def _convert_token_to_id(tokenizer: Any, token: str) -> int | None:
-        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-        value = None
-        if callable(convert):
-            value = convert(token)
-            if isinstance(value, list):
-                value = value[0] if len(value) == 1 else None
-        try:
-            token_id = int(value)
-        except (TypeError, ValueError):
-            token_id = -1
-        unk_token_id = getattr(tokenizer, "unk_token_id", None)
-        if token_id >= 0 and token_id != unk_token_id:
-            return token_id
-        encode = getattr(tokenizer, "encode", None)
-        if callable(encode):
-            try:
-                ids = list(encode(token, add_special_tokens=False))
-            except TypeError:
-                ids = list(encode(token))
-            if len(ids) == 1:
-                try:
-                    token_id = int(ids[0])
-                except (TypeError, ValueError):
-                    token_id = -1
-                if token_id >= 0 and token_id != unk_token_id:
-                    return token_id
-        return None
-
-    @staticmethod
-    async def resolve_ref_audio(ref_audio: str, *, model_config: Any) -> tuple[np.ndarray, int]:
-        connector = MediaConnector(
-            allowed_local_media_path=getattr(model_config, "allowed_local_media_path", None),
-            allowed_media_domains=getattr(model_config, "allowed_media_domains", None),
-        )
-        wav_np, sr = await connector.fetch_audio_async(ref_audio)
-        return np.asarray(wav_np, dtype=np.float32), int(sr)
-
-    @staticmethod
-    def normalize_ref_audio(wav_np: np.ndarray, sample_rate: int, *, target_sr: int) -> np.ndarray:
-        wav_np = np.asarray(wav_np, dtype=np.float32)
-        if wav_np.ndim > 1:
-            wav_np = wav_np.mean(axis=-1)
-        wav_np = wav_np.reshape(-1)
-        if sample_rate <= 0 or sample_rate == target_sr or wav_np.size == 0:
-            return wav_np.astype(np.float32, copy=False)
-        import torch
-        import torchaudio
-
-        audio = torch.from_numpy(wav_np).to(dtype=torch.float32).unsqueeze(0)
-        resampled = torchaudio.functional.resample(audio, int(sample_rate), int(target_sr))
-        return resampled.squeeze(0).cpu().numpy().astype(np.float32, copy=False)

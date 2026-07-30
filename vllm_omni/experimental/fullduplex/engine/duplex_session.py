@@ -83,6 +83,8 @@ class DuplexSessionRuntimeState:
     capabilities: DuplexRuntimeCapabilities = field(default_factory=_default_capabilities)
     session_config: dict[str, Any] = field(default_factory=dict)
     runtime_config: dict[str, Any] = field(default_factory=dict)
+    conversation_history: list[dict[str, Any]] = field(default_factory=list)
+    current_assistant_text: str = ""
     config_generation: int = 0
     stage_bindings: dict[int, DuplexStageBinding] = field(default_factory=dict)
     request_resources: dict[tuple[int, str], DuplexRequestResource] = field(default_factory=dict)

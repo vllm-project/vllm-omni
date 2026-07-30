@@ -406,6 +406,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
 
         if self.chunk_transfer_adapter:
+            if isinstance(request_ids, str):
+                _ids: list[str] | tuple[str, ...] = (request_ids,)
+            elif request_ids is None:
+                _ids = list(self.requests.keys())
+            else:
+                _ids = list(request_ids)
+            for rid in _ids:
+                req = self.requests.get(rid)
+                if req is not None and not req.is_finished() and req.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    self.num_waiting_for_streaming_input -= 1
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         # See ``OmniSchedulerMixin._realign_request_status_to_queues`` --

@@ -364,7 +364,9 @@ class OmniDuplexSessionHandler(
                 native.speech_since_commit = False
                 if had_pending_overlap_audio and realtime_protocol is not None:
                     await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
-                if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
+                if payload_type in {"input.cancelled", "session.closed"} or (
+                    payload_type == "response.done" and payload.get("status") == "cancelled"
+                ):
                     session.release_input_bytes(native.clear_committed_audio())
 
         session.reset_overlap_speech()
@@ -378,6 +380,9 @@ class OmniDuplexSessionHandler(
     @staticmethod
     def _advance_barge_in_epoch(session: DuplexSession) -> tuple[int, dict[str, int]]:
         old_playback = session.playback.as_dict()
+        assistant_text = "".join(session.assistant_text_buffer).strip()
+        if assistant_text:
+            session.force_commit_assistant_text(assistant_text)
         new_epoch = session.barge_in()
         session.clear_playback_cursor()
         return new_epoch, old_playback
@@ -917,6 +922,10 @@ class OmniDuplexSessionHandler(
                 )
             )
             session.replace_runtime_config(runtime_config)
+        td_error = self._resolve_turn_detection(session)
+        if td_error is not None:
+            await send_json(td_error)
+            return None
         return _DuplexSessionHandshake(session=session)
 
     async def _resume_session_handshake(
@@ -1156,6 +1165,8 @@ class OmniDuplexSessionHandler(
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
             return None
+        if not session.capabilities.requires_ref_audio:
+            return None
         if not self._config_requests_audio_output(candidate_config):
             return None
         if "ref_audio_data" in session.runtime_config:
@@ -1164,7 +1175,7 @@ class OmniDuplexSessionHandler(
             "type": "error",
             "session_id": session.session_id,
             "code": "ref_audio_required",
-            "error": "MiniCPM-o native duplex audio output requires ref_audio",
+            "error": "native duplex audio output requires ref_audio",
         }
 
     @staticmethod
@@ -1191,19 +1202,104 @@ class OmniDuplexSessionHandler(
 
     @staticmethod
     def _session_auto_responds(session: DuplexSession) -> bool:
-        """Full-duplex / model-driven mode.
+        """Model-driven turn detection (server_vad).
 
-        When set, the server runs per-chunk speak-generation continuously (like
-        the official MiniCPM-o ``duplex_generate`` loop) instead of waiting for an
-        explicit ``response.create``: each ~chunk_period of appended audio is
-        emitted and fed to the stage0 stream so the model itself decides to speak
-        or listen. Signaled by the client via ``extra_body.auto_response`` (or
-        ``extra_body.full_duplex``).
+        When set, the server runs per-chunk speak-generation continuously
+        instead of waiting for an explicit ``response.create``: each
+        ~chunk_period of appended audio is fed to the stage0 stream so the
+        model itself decides to speak or listen.  Resolved from the spec's
+        ``turn_detection`` configuration by ``_resolve_turn_detection``.
         """
         extra = getattr(session.config, "extra_body", None)
         if not isinstance(extra, dict):
             return False
-        return extra.get("auto_response") is True or extra.get("full_duplex") is True
+        return extra.get("auto_response") is True
+
+    # TODO(vraiti) This can likely be simplified by aligning internal configurations with OpenAI spec conventions
+    @staticmethod
+    def _resolve_turn_detection(session: DuplexSession) -> dict[str, object] | None:
+        """Resolve turn_detection config into the internal auto_response flag.
+
+        Called after session capabilities are set.  Returns an error event
+        dict if the requested turn_detection is incompatible with the model,
+        or ``None`` on success.
+        """
+        extra = session.config.extra_body
+        td_specified = "realtime_turn_detection" in extra
+        td_raw = extra.get("realtime_turn_detection")
+
+        if not td_specified:
+            if session.capabilities.supports_model_native_turn_policy:
+                extra["realtime_turn_detection"] = {
+                    "type": "server_vad",
+                    "create_response": True,
+                    "interrupt_response": True,
+                }
+                extra["auto_response"] = True
+            else:
+                extra["realtime_turn_detection"] = None
+                extra["auto_response"] = False
+            return None
+
+        if td_raw is None:
+            extra["auto_response"] = False
+            return None
+
+        if not isinstance(td_raw, dict):
+            return {
+                "type": "error",
+                "session_id": session.session_id,
+                "code": "invalid_turn_detection",
+                "error": {
+                    "type": "invalid_turn_detection",
+                    "message": (f"turn_detection must be null or an object, got {type(td_raw).__name__}"),
+                },
+            }
+
+        td_type = td_raw.get("type")
+        if td_type == "server_vad":
+            if not session.capabilities.supports_model_native_turn_policy:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "unsupported_turn_detection",
+                    "error": {
+                        "type": "unsupported_turn_detection",
+                        "message": (
+                            "turn_detection.type='server_vad' is not supported "
+                            "by this model; set turn_detection to null and "
+                            "commit input explicitly via "
+                            "input_audio_buffer.commit + response.create"
+                        ),
+                    },
+                }
+            create_response = td_raw.get("create_response", True)
+            td_config: dict[str, object] = {
+                "type": "server_vad",
+                "create_response": bool(create_response),
+                "interrupt_response": bool(td_raw.get("interrupt_response", True)),
+            }
+            for key in (
+                "threshold",
+                "prefix_padding_ms",
+                "silence_duration_ms",
+                "idle_timeout_ms",
+            ):
+                if td_raw.get(key) is not None:
+                    td_config[key] = td_raw[key]
+            extra["realtime_turn_detection"] = td_config
+            extra["auto_response"] = bool(create_response)
+            return None
+
+        return {
+            "type": "error",
+            "session_id": session.session_id,
+            "code": "unsupported_turn_detection",
+            "error": {
+                "type": "unsupported_turn_detection",
+                "message": (f"turn_detection.type={td_type!r} is not supported; use 'server_vad' or null"),
+            },
+        }
 
     async def _receive_text(
         self,
@@ -1430,6 +1526,15 @@ class OmniDuplexSessionHandler(
         session.config.extra_body["realtime_session_payload"] = (
             NativeRealtimeSessionProtocol._json_safe_realtime_payload(payload)
         )
+        td_specified = "turn_detection" in payload
+        if not td_specified and isinstance(audio_input, dict) and "turn_detection" in audio_input:
+            td_specified = True
+        if td_specified:
+            td_value = payload.get("turn_detection")
+            if td_value is None and isinstance(audio_input, dict):
+                td_value = audio_input.get("turn_detection")
+            session.config.extra_body["realtime_turn_detection"] = td_value
+            return OmniDuplexSessionHandler._resolve_turn_detection(session)
         return None
 
     def _apply_response_create_options(
@@ -1686,7 +1791,6 @@ class OmniDuplexSessionHandler(
         if not has_running_task and session.active_request_id is None and session.active_response_id is None:
             return False
 
-        old_epoch = session.epoch
         old_request_id = session.active_request_id
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
@@ -1700,7 +1804,7 @@ class OmniDuplexSessionHandler(
                 session.register_history_item(item_id, committed_message)
             elif committed_ms > 0:
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
-        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+        self._advance_barge_in_epoch(session)
         if old_request_id is not None:
             await self._abort_request_background(
                 session,
@@ -1717,14 +1821,10 @@ class OmniDuplexSessionHandler(
         if notify:
             await send_json(
                 {
-                    "type": "audio.cancelled",
-                    "session_id": session.session_id,
+                    "type": "response.done",
                     "response_id": old_response_id,
-                    "reason": reason,
-                    "cancelled_epoch": old_epoch,
-                    "epoch": new_epoch,
-                    "committed_ms": committed_ms,
-                    "playback": old_playback,
+                    "status": "cancelled",
+                    "status_details": {"type": "cancelled", "reason": reason},
                 }
             )
         return True

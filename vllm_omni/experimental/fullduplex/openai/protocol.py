@@ -88,6 +88,7 @@ class DuplexCapabilities:
     supports_audio_truncate: bool = False
     requires_model_runner_kv: bool = False
     requires_native_stage_role: bool = False
+    requires_ref_audio: bool = False
     implementation_level: str = "serving_session_adapter"
     adapter_patterns: list[str] = field(default_factory=lambda: ["chunk_group_append"])
     input_modes: list[str] = field(default_factory=lambda: ["turn_commit_only", "reencode_context"])
@@ -123,10 +124,47 @@ class DuplexCapabilities:
             supports_audio_truncate=True,
             requires_model_runner_kv=True,
             requires_native_stage_role=True,
+            requires_ref_audio=True,
             implementation_level="model_native_duplex",
             adapter_patterns=["scheduler_data_plane"],
             input_modes=["append_audio_chunk"],
             signal_sources=["model_native", "client_event", "server_policy"],
+            stage_handoff_transport="scheduler_data_plane",
+            chunk_period_ms=1000,
+            target_barge_in_latency_ms=None,
+        )
+
+    @classmethod
+    def qwen3omni_native(cls, *, max_sessions: int = 1) -> DuplexCapabilities:
+        supports_multi_session = max_sessions > 1
+        return cls(
+            supports_model_native_turn_policy=False,
+            supports_barge_in=False,
+            supports_input_append=True,
+            supports_replace_latest_chunk=False,
+            supports_reencode_context=False,
+            supports_turn_commit_only=False,
+            supports_kv_lease=False,
+            supports_core_kv_lease=False,
+            supports_model_internal_state=True,
+            supports_stage_resumption=True,
+            supports_scheduler_native_append=False,
+            supports_core_resumable_request=True,
+            supports_stage_connector_handoff=True,
+            supports_independent_io_streams=True,
+            supports_realtime_endpoint=True,
+            supports_multi_session=supports_multi_session,
+            supports_multi_session_same_replica=supports_multi_session,
+            supports_session_lease=True,
+            supports_session_resume=True,
+            session_admission_mode="engine_managed",
+            supports_audio_truncate=True,
+            requires_model_runner_kv=True,
+            requires_native_stage_role=True,
+            implementation_level="model_native_duplex",
+            adapter_patterns=["scheduler_data_plane"],
+            input_modes=["append_audio_chunk"],
+            signal_sources=["client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
             target_barge_in_latency_ms=None,
@@ -941,6 +979,11 @@ class DuplexSession:
         self._restore_response_config()
         return message
 
+    def force_commit_assistant_text(self, text: str) -> None:
+        """Commit assistant text to conversation history without playback truncation."""
+        if text:
+            self._conversation.messages.append({"role": "assistant", "content": text})
+
     def register_history_item(self, item_id: str | None, message: dict[str, object] | None) -> None:
         if not item_id:
             return
@@ -1256,6 +1299,8 @@ class DuplexSession:
             payload["audio"] = dict(self.config.extra_body["realtime_audio"])
         if isinstance(self.config.extra_body.get("realtime_tracing"), str | dict):
             payload["tracing"] = self.config.extra_body["realtime_tracing"]
+        if "realtime_turn_detection" in self.config.extra_body:
+            payload["turn_detection"] = self.config.extra_body["realtime_turn_detection"]
         raw_realtime_session = self.config.extra_body.get("realtime_session_payload")
         if isinstance(raw_realtime_session, dict):
             for key, value in raw_realtime_session.items():

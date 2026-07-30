@@ -1628,14 +1628,14 @@ async def streaming_video_output(websocket: WebSocket):
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    async_chunk = engine_client is not None and getattr(engine_client, "async_chunk", False)
     duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = (
-        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
-    )
-    if use_duplex_realtime and duplex_handler is not None:
+    duplex_explicit = isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    use_duplex_realtime = duplex_handler is not None and (duplex_explicit or async_chunk)
+    if use_duplex_realtime:
         await duplex_handler.handle_realtime_session(websocket)
         return
-
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()

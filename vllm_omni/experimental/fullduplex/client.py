@@ -155,7 +155,7 @@ class RealtimeEventCollector:
         event_type = stored_event.get("type")
         if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
-        if event_type == "response.audio.delta":
+        if event_type == "response.output_audio.delta":
             delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
@@ -225,7 +225,7 @@ class RealtimeEventCollector:
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
 
-            if event.get("type") != "response.audio.delta" or (
+            if event.get("type") != "response.output_audio.delta" or (
                 response_id is not None and event_response_id != response_id
             ):
                 continue
@@ -340,11 +340,10 @@ class RealtimeDuplexClient:
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
-            "turn_detection": None,
+            "turn_detection": {"type": "server_vad"},
             "overlap_policy": "listen_only",
             "playback_commit_policy": "ack_only",
             "extra_body": {
-                "auto_response": True,
                 "minicpmo45_native_duplex": True,
                 "force_listen_count": 0,
             },

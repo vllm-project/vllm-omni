@@ -335,6 +335,7 @@ class AsyncOmni(EngineClient, OmniBase):
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        conversation_history: list[dict[str, object]] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
@@ -345,6 +346,7 @@ class AsyncOmni(EngineClient, OmniBase):
             next_fence=next_fence,
             session_config=session_config,
             runtime_config=runtime_config,
+            conversation_history=conversation_history,
             timeout=timeout,
         )
 

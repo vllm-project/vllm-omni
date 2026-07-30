@@ -452,10 +452,14 @@ class DuplexControlPlane:
         )
         if request_context is None:
             raise RuntimeError("duplex_data_plane_has_no_stage")
+        plan_session_config = dict(request_context.session_config)
+        if session.conversation_history:
+            plan_session_config["conversation_history"] = list(session.conversation_history)
+        stage_tokenizer = self._stage_port.get_tokenizer(stage_id)
         append_plan = self._extension.plan_append(
             request_id=request_id,
             fence=message.fence,
-            session_config=dict(request_context.session_config),
+            session_config=plan_session_config,
             runtime_config=dict(request_context.runtime_config),
             seq=reservation.update.seq,
             turn_seq=reservation.update.turn_seq,
@@ -463,6 +467,7 @@ class DuplexControlPlane:
             payload=message.payload,
             final=message.final,
             sampling_params=request_context.stage_sampling_params,
+            tokenizer=stage_tokenizer,
         )
         if not isinstance(append_plan, DuplexAppendPlan):
             raise TypeError("duplex runtime extension plan_append() must return DuplexAppendPlan")
@@ -542,6 +547,12 @@ class DuplexControlPlane:
                 session_config=message.session_config,
                 runtime_config=message.runtime_config,
             )
+            if message.conversation_history is not None and message.conversation_history:
+                session.conversation_history = list(message.conversation_history)
+            if message.event in cancel_events and session.current_assistant_text:
+                session.conversation_history.append({"role": "user", "content": "[audio]"})
+                session.conversation_history.append({"role": "assistant", "content": session.current_assistant_text})
+                session.current_assistant_text = ""
             session.touch(session.fence, DuplexLeaseActivity.SIGNAL)
             await self.put_result(
                 message.control_id,
@@ -985,6 +996,10 @@ class DuplexControlPlane:
             session.touch(context.identity.fence, DuplexLeaseActivity.MODEL_OUTPUT)
         except RuntimeError:
             return None
+        if stage_id == 0 and context.final_stage_id > 0:
+            text = self._extract_stage0_text(output)
+            if text and text != session.current_assistant_text:
+                session.current_assistant_text = text
         decision = self._extension.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,
@@ -996,6 +1011,13 @@ class DuplexControlPlane:
         if decision is not None and not isinstance(decision, DuplexOutputDecision):
             raise TypeError("duplex runtime extension decide_output() must return DuplexOutputDecision or None")
         return decision
+
+    @staticmethod
+    def _extract_stage0_text(output: object) -> str:
+        outputs = getattr(output, "outputs", None)
+        if not isinstance(outputs, (list, tuple)) or not outputs:
+            return ""
+        return getattr(outputs[0], "text", "") or ""
 
     def session_for_identity(self, identity: DuplexRequestIdentity | None) -> DuplexSessionRuntimeState | None:
         if identity is None:

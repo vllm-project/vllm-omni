@@ -936,81 +936,62 @@ class DuplexSessionRunnerMixin:
                     )
                     had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
                     if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
-                        old_epoch = session.epoch
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                        self._advance_barge_in_epoch(session)
                         await emit_event(
                             {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
+                                "type": "response.done",
                                 "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
+                                "status": "cancelled",
+                                "status_details": {"type": "cancelled", "reason": cancel_reason},
                             }
                         )
                         cancelled = True
                     if not cancelled and playback_was_active:
-                        old_epoch = session.epoch
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, session.last_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                        self._advance_barge_in_epoch(session)
                         await emit_event(
                             {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
+                                "type": "response.done",
                                 "response_id": session.last_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
+                                "status": "cancelled",
+                                "status_details": {"type": "cancelled", "reason": cancel_reason},
                             }
                         )
                         cancelled = True
                     if not cancelled and event_type == "response.cancel":
-                        old_epoch = session.epoch
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                        self._advance_barge_in_epoch(session)
                         await emit_event(
                             {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
+                                "type": "response.done",
                                 "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
+                                "status": "cancelled",
+                                "status_details": {"type": "cancelled", "reason": cancel_reason},
                             }
                         )
                         cancelled = True
                     if not cancelled and event_type == "output_audio_buffer.clear":
-                        old_playback = session.playback.as_dict()
                         committed_ms = session.playback.committed_ms
                         session.clear_playback_cursor()
                         await emit_event(
                             {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
+                                "type": "response.done",
                                 "response_id": session.active_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": session.epoch,
-                                "epoch": session.epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
+                                "status": "cancelled",
+                                "status_details": {"type": "cancelled", "reason": cancel_reason},
                             }
                         )
                         actor.active_response_task = None
                         continue
                     if not cancelled:
                         await self._cancel_pending_input(session, emit_event, reason="barge_in")
+                    history_for_signal = self._history_as_text_messages(session)
                     if not await self._signal_runtime_session(
                         session,
                         "barge_in",
@@ -1026,6 +1007,7 @@ class DuplexSessionRunnerMixin:
                             if session.epoch > cancelled_fence.epoch
                             else None
                         ),
+                        conversation_history=history_for_signal,
                     ):
                         continue
                     actor.active_response_task = None
@@ -1300,41 +1282,31 @@ class DuplexSessionRunnerMixin:
                                     await self._cancel_native_data_plane_stream(session) or had_native_stream
                                 )
                                 if not cancelled and had_native_stream:
-                                    old_epoch = session.epoch
                                     old_response_id = session.active_response_id
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(session, old_response_id, committed_ms)
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                                    self._advance_barge_in_epoch(session)
                                     await emit_event(
                                         {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
+                                            "type": "response.done",
                                             "response_id": old_response_id,
-                                            "reason": "barge_in",
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
+                                            "status": "cancelled",
+                                            "status_details": {"type": "cancelled", "reason": "barge_in"},
                                         }
                                     )
                                     cancelled = True
                                 if not cancelled and playback_was_active:
-                                    old_epoch = session.epoch
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(
                                         session, session.last_response_id, committed_ms
                                     )
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                                    self._advance_barge_in_epoch(session)
                                     await emit_event(
                                         {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
+                                            "type": "response.done",
                                             "response_id": session.last_response_id,
-                                            "reason": "barge_in",
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
+                                            "status": "cancelled",
+                                            "status_details": {"type": "cancelled", "reason": "barge_in"},
                                         }
                                     )
                                     cancelled = True
@@ -1350,6 +1322,7 @@ class DuplexSessionRunnerMixin:
                                             turn_id=session.turn_id,
                                             incarnation=session.incarnation,
                                         ),
+                                        conversation_history=self._history_as_text_messages(session),
                                     ):
                                         continue
                                 actor.active_response_task = None

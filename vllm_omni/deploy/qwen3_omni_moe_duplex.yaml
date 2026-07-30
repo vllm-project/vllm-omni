@@ -1,0 +1,38 @@
+# Qwen3-Omni-MoE native duplex deployment.
+#
+# The registered qwen3_omni_moe pipeline owns the 3-stage topology
+# (thinker -> talker -> code2wav). This overlay enables duplex session
+# management and adjusts sequence capacity for concurrent duplex sessions.
+base_config: qwen3_omni_moe.yaml
+pipeline: qwen3_omni_moe
+session_mode: duplex
+async_chunk: true
+active_stream_window: 1
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 2
+  completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 2
+    async_scheduling: false
+
+  - stage_id: 1
+    max_num_seqs: 2
+    async_scheduling: false
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+    default_sampling_params:
+      max_tokens: 8192
+      stop_token_ids: [2150]
+
+  - stage_id: 2
+    max_num_seqs: 2
+    async_scheduling: false

@@ -196,6 +196,31 @@ class NativeRuntimeBridgeMixin:
             return True
         return any(param.kind == inspect.Parameter.VAR_KEYWORD or param.name == name for param in params)
 
+    @staticmethod
+    def _history_as_text_messages(session: DuplexSession) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        for msg in session.history:
+            role = msg.get("role", "")
+            if role == "assistant":
+                text = msg.get("content", "")
+                if isinstance(text, str) and text.strip():
+                    result.append({"role": "assistant", "content": text})
+            elif role == "user":
+                content = msg.get("content")
+                transcript = msg.get("transcript")
+                if isinstance(transcript, str) and transcript.strip():
+                    result.append({"role": "user", "content": transcript})
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            part_transcript = part.get("transcript")
+                            if isinstance(part_transcript, str) and part_transcript.strip():
+                                result.append({"role": "user", "content": part_transcript})
+                                break
+                elif isinstance(content, str) and content.strip():
+                    result.append({"role": "user", "content": content})
+        return result
+
     def _native_runtime_contract_error(self, session: DuplexSession) -> str | None:
         if session.capabilities.implementation_level != "model_native_duplex":
             return None
@@ -453,6 +478,7 @@ class NativeRuntimeBridgeMixin:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        conversation_history: list[dict[str, object]] | None = None,
     ) -> bool:
         signal_turn = getattr(self._chat_service.engine_client, "signal_duplex_turn_async", None)
         if not callable(signal_turn):
@@ -475,6 +501,8 @@ class NativeRuntimeBridgeMixin:
                 signal_kwargs["session_config"] = session_config
             if runtime_config is not None and self._callable_accepts_keyword(signal_turn, "runtime_config"):
                 signal_kwargs["runtime_config"] = runtime_config
+            if conversation_history is not None and self._callable_accepts_keyword(signal_turn, "conversation_history"):
+                signal_kwargs["conversation_history"] = conversation_history
             result = await signal_turn(session.session_id, **signal_kwargs)
         except Exception as exc:
             logger.exception("Failed to signal duplex runtime session: %s", exc)
@@ -1115,6 +1143,14 @@ class NativeRuntimeBridgeMixin:
                 session.complete_model_turn(model_turn_id)
             if should_commit:
                 session.register_history_item(f"item_{response_id}", committed_message)
+            text_history = self._history_as_text_messages(session)
+            if text_history:
+                await self._signal_runtime_session(
+                    session,
+                    "session.update",
+                    send_json,
+                    conversation_history=text_history,
+                )
             await send_json(
                 {
                     "type": "response.done",

@@ -56,8 +56,9 @@ class _Extension:
         payload,
         final,
         sampling_params,
+        tokenizer=None,
     ):
-        del request_id, fence, session_config, runtime_config, seq, turn_seq, mode, payload, final
+        del request_id, fence, session_config, runtime_config, seq, turn_seq, mode, payload, final, tokenizer
         assert sampling_params == "configured-0"
         return DuplexAppendPlan(prompt={"prompt_token_ids": [1, 2, 3]})
 
@@ -76,6 +77,9 @@ class _TypedStagePort:
 
     def sampling_defaults(self) -> tuple[object, ...]:
         return ("default-0", "default-1")
+
+    def get_tokenizer(self, stage_id: int) -> object | None:
+        return None
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         self.ensure_calls.append(context)
