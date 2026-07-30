@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="600" viewBox="0 0 1024 600" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3-Omni async output decode step gap before and after</title>
+  <desc id="desc">Before async output, decode steps are separated by ~2.8 ms idle gaps while the connector payload is built synchronously; after async output, steps pack back-to-back and a zoom inset shows the inter-step gap is only ~41 us.</desc>
+  <defs>
+    <marker id="dim" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="dimr-sm" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c"/>
+    </marker>
+    <marker id="dimrstart-sm" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 10 0 L 0 5 L 10 10 z" fill="#b91c1c"/>
+    </marker>
+    <style>
+      .card { fill: #ffffff; stroke: #e5e7eb; }
+      .title { font: 700 22px system-ui, -apple-system, Segoe UI, sans-serif; fill: #111827; }
+      .subtitle { font: 500 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
+      .phase { font: 700 16px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1f2937; }
+      .phase-sub { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
+      .row-label { font: 600 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #374151; }
+      .axis { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #9ca3af; }
+      .dimtext { font: 700 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
+      .zoom-cap { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
+      .zoom-gap { font: 700 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
+      .zoom-step { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .gpu { fill: #22c55e; }
+      .before-box { fill: #eaf1fb; stroke: #c7dbf6; }
+      .after-box { fill: #eafaf0; stroke: #bfe7cf; }
+      .dim { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#dim); }
+      .dimred-sm { stroke: #b91c1c; stroke-width: 1.5; }
+      .guide { stroke: #e5e7eb; stroke-width: 1; }
+      .guide-red { stroke: #f0a8a8; stroke-width: 1; stroke-dasharray: 4 3; }
+      .lead { stroke: #b91c1c; stroke-width: 1.3; stroke-dasharray: 4 3; fill: none; }
+      .zoom-box { fill: #fdf6f6; stroke: #f0c9c9; }
+      .stat-blue { fill: #eef4ff; stroke: #c7dbf6; }
+      .stat-green { fill: #eafaf0; stroke: #bfe7cf; }
+      .stat-gray { fill: #f4f5f7; stroke: #e2e5ea; }
+      .stat-cap { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
+      .stat-big { font: 800 17px system-ui, -apple-system, Segoe UI, sans-serif; fill: #111827; }
+      .stat-sub { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
+    </style>
+  </defs>
+
+  <rect x="14" y="14" width="996" height="572" rx="14" class="card"/>
+
+  <text x="44" y="52" class="title">Async output: decode step gap before and after</text>
+  <text x="44" y="74" class="subtitle">Torch profiler trace &#183; consecutive Talker decode steps in a fixed window</text>
+
+  <!-- ===================== BEFORE ===================== -->
+  <rect x="44" y="94" width="158" height="88" rx="10" class="before-box"/>
+  <text x="60" y="120" class="phase">Before</text>
+  <text x="60" y="138" class="phase-sub">sync payload</text>
+  <text x="60" y="154" class="phase-sub">construction</text>
+
+  <text x="224" y="120" class="row-label">GPU kernels</text>
+
+  <line x1="330" y1="88" x2="330" y2="200" class="guide"/>
+
+  <g class="gpu">
+    <rect x="330" y="116" width="135" height="28" rx="3"/>
+    <rect x="510" y="116" width="135" height="28" rx="3"/>
+    <rect x="666" y="116" width="135" height="28" rx="3"/>
+  </g>
+
+  <line x1="465" y1="116" x2="465" y2="144" class="guide-red"/>
+  <line x1="510" y1="116" x2="510" y2="144" class="guide-red"/>
+  <line x1="465" y1="154" x2="510" y2="154" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
+  <text x="488" y="176" text-anchor="middle" class="dimtext">~2.8 ms idle</text>
+
+  <!-- ===================== AFTER ===================== -->
+  <rect x="44" y="204" width="158" height="88" rx="10" class="after-box"/>
+  <text x="60" y="230" class="phase">After</text>
+  <text x="60" y="248" class="phase-sub">async output</text>
+  <text x="60" y="264" class="phase-sub">(off decode path)</text>
+
+  <text x="224" y="230" class="row-label">GPU kernels</text>
+
+  <line x1="330" y1="198" x2="330" y2="308" class="guide"/>
+
+  <g class="gpu">
+    <rect x="330" y="226" width="135" height="28" rx="2"/>
+    <rect x="469" y="226" width="135" height="28" rx="2"/>
+    <rect x="608" y="226" width="135" height="28" rx="2"/>
+  </g>
+
+  <line x1="330" y1="290" x2="760" y2="290" class="dim"/>
+  <text x="752" y="306" text-anchor="end" class="axis">time</text>
+
+  <!-- leads: left vertical, right diagonal into widened zoom gap -->
+  <line x1="465" y1="254" x2="465" y2="402" class="lead"/>
+  <line x1="469" y1="254" x2="513" y2="322" class="lead"/>
+  <line x1="513" y1="322" x2="513" y2="402" class="lead"/>
+
+  <!-- ===================== ZOOM: 41 µs gap (magnified) ===================== -->
+  <rect x="310" y="322" width="358" height="112" rx="10" class="zoom-box"/>
+  <text x="326" y="340" class="zoom-cap">Zoom &#183; one inter-step gap (GPU kernels)</text>
+
+  <rect x="330" y="354" width="135" height="32" rx="4" class="gpu"/>
+  <rect x="513" y="354" width="135" height="32" rx="4" class="gpu"/>
+  <text x="398" y="375" text-anchor="middle" class="zoom-step">step N</text>
+  <text x="581" y="375" text-anchor="middle" class="zoom-step">step N+1</text>
+
+  <line x1="465" y1="400" x2="513" y2="400" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
+  <text x="489" y="416" text-anchor="middle" class="zoom-gap">~41 &#181;s</text>
+
+  <!-- ===================== STAT CARDS ===================== -->
+  <rect x="44" y="452" width="296" height="76" rx="9" class="stat-blue"/>
+  <text x="60" y="472" class="stat-cap">Step-to-step gap</text>
+  <text x="60" y="496" class="stat-big">2.8 ms &#8594; 41 &#181;s</text>
+  <text x="60" y="514" class="stat-sub">~68&#215; tighter</text>
+
+  <rect x="356" y="452" width="296" height="76" rx="9" class="stat-green"/>
+  <text x="372" y="472" class="stat-cap">GPU idle between steps</text>
+  <text x="372" y="496" class="stat-big">eliminated</text>
+  <text x="372" y="514" class="stat-sub">decode workers stay busy</text>
+
+  <rect x="668" y="452" width="312" height="76" rx="9" class="stat-gray"/>
+  <text x="684" y="472" class="stat-cap">Mechanism</text>
+  <text x="684" y="496" class="stat-big">async output</text>
+  <text x="684" y="514" class="stat-sub">payload build off decode path</text>
+</svg>
