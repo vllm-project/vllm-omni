@@ -765,4 +765,25 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+
+        trt_stepper = None
+        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        if use_trt:
+            if current_omni_platform.is_npu():
+                raise ValueError("token2wav_trt requires CUDA; TensorRT is unavailable on NPU")
+            from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
+
+            dtype_name = str(
+                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
+            ).lower()
+            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            max_batch = int(extra.get("token2wav_trt_max_batch", 16))
+            device = next(token2wav.flow.parameters()).device
+            trt_stepper = build_dit_trt_stepper(
+                token2wav.flow.decoder.estimator,
+                device=device,
+                dtype=trt_dtype,
+                max_batch=max_batch,
+            )
+            logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
+        self.backend = BatchedToken2Wav(token2wav, trt_stepper=trt_stepper)
