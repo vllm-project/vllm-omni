@@ -65,6 +65,10 @@ class _ExecutorShutdownCleaner:
 class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
 
+    # Class-level defaults so tests using object.__new__ (without _init_executor)
+    # don't hit AttributeError when collective_rpc accesses these.
+    _rpc_wave_id: int = 0
+
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
