@@ -94,6 +94,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -793,6 +794,7 @@ async def omni_init_app_state(
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
+        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -1112,6 +1114,18 @@ async def omni_init_app_state(
         if state.openai_serving_chat is not None
         else None
     )
+    state.openai_serving_duplex = None
+    if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
+        state.stage_configs,
+        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+    ):
+        from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
+
+        state.openai_serving_duplex = OmniDuplexSessionHandler(
+            chat_service=state.openai_serving_chat,
+            duplex_session_config=getattr(engine_client, "duplex_session_config", None),
+            serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
+        )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -1558,8 +1572,9 @@ async def delete_voice(name: str, raw_request: Request):
 async def streaming_speech(websocket: WebSocket):
     """WebSocket endpoint for streaming text input TTS.
 
-    Accepts text incrementally, splits at sentence boundaries, and
-    returns audio per sentence. See serving_speech_stream.py for protocol.
+    Accepts text incrementally and returns audio for the buffered text on
+    input.done, which flushes without closing the connection. See
+    serving_speech_stream.py for protocol.
     """
     handler = getattr(websocket.app.state, "openai_streaming_speech", None)
     if handler is None:
@@ -1612,6 +1627,15 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    duplex_query = websocket.query_params.get("duplex")
+    use_duplex_realtime = (
+        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    )
+    if use_duplex_realtime and duplex_handler is not None:
+        await duplex_handler.handle_realtime_session(websocket)
+        return
+
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1637,6 +1661,18 @@ async def realtime_robot_openpi(websocket: WebSocket):
         return
     connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
+
+@router.websocket("/v1/duplex")
+async def duplex_websocket(websocket: WebSocket):
+    """WebSocket endpoint for vLLM-Omni duplex session control."""
+    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode
@@ -1795,10 +1831,17 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, _, _, _ = generation_result
+            flat_images, stage_durations, peak_memory_mb, _ = generation_result
             image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
 
-            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+            return ImageGenerationResponse(
+                created=int(time.time()),
+                data=image_data,
+                metrics={
+                    "stage_durations": stage_durations or None,
+                    "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
+                },
+            )
 
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
@@ -1864,7 +1907,7 @@ async def generate_images(
 
         logger.debug(f"Generating {request.n} image(s) {size_str}")
 
-        # Generate images using AsyncOmni (multi-stage mode)
+        # Generate images using AsyncOmni.
         result = await _generate_with_async_omni(
             engine_client=engine_client,
             gen_params=gen_params,
@@ -1894,10 +1937,16 @@ async def generate_images(
             for img in images
         ]
 
+        stage_durations = getattr(result, "stage_durations", None)
+        peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_kwargs = {
             "created": int(time.time()),
             "data": image_data,
             "output_format": output_format,
+            "metrics": {
+                "stage_durations": stage_durations or None,
+                "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
+            },
         }
         if request.size:
             response_kwargs["size"] = size_str
@@ -1955,6 +2004,7 @@ async def edit_images(
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
+    guidance_scale_2: float | None = Form(None),
     strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
@@ -2120,6 +2170,7 @@ async def edit_images(
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
+        _update_if_not_none(gen_params, "guidance_scale_2", guidance_scale_2)
         _update_if_not_none(gen_params, "strength", strength)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
         # If seed is not provided, generate a random one to ensure
@@ -2185,6 +2236,8 @@ async def edit_images(
                 extra_body["num_inference_steps"] = num_inference_steps
             if guidance_scale is not None:
                 extra_body["guidance_scale"] = guidance_scale
+            if guidance_scale_2 is not None:
+                extra_body["guidance_scale_2"] = guidance_scale_2
             if strength is not None:
                 extra_body["strength"] = strength
             if true_cfg_scale is not None:

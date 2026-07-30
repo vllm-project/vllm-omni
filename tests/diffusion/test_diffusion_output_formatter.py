@@ -11,7 +11,6 @@ import torch
 from vllm_omni.diffusion import output_formatter
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.output_formatter import (
-    DiffusionStepTimings,
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
     normalize_diffusion_postprocess_output,
@@ -40,15 +39,6 @@ def _request(
 
 def _config(model_class_name: str = "mock_model") -> SimpleNamespace:
     return SimpleNamespace(model_class_name=model_class_name)
-
-
-def _timings() -> DiffusionStepTimings:
-    return DiffusionStepTimings(
-        preprocess_time_s=0.01,
-        exec_time_s=0.02,
-        postprocess_time_s=0.03,
-        total_time_ms=60.0,
-    )
 
 
 def test_formatter_preserves_single_video_audio_actions_and_metadata(
@@ -80,7 +70,6 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         ),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert len(results) == 1
@@ -102,12 +91,10 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
     assert result.stage_durations == {"execute": 1.25}
     assert result.peak_memory_mb == 321.0
     assert result.metrics == {
-        "preprocess_time_ms": 10.0,
-        "diffusion_engine_exec_time_ms": 20.0,
-        "diffusion_engine_total_time_ms": 60.0,
         "image_num": 1,
         "resolution": 512,
-        "postprocess_time_ms": 30.0,
+        "width": None,
+        "height": None,
     }
 
 
@@ -160,7 +147,6 @@ def test_formatter_normalizes_payload_metadata_envelope(
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.multimodal_output == {
@@ -196,7 +182,6 @@ def test_formatter_maps_trajectory_payload_to_request_output(
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == ["image-0"]
@@ -229,7 +214,6 @@ def test_formatter_preserves_text_envelope_metadata(monkeypatch: pytest.MonkeyPa
         diffusion_output=DiffusionOutput(output=None),
         output_data={"payload": {"text": "caption"}},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == []
@@ -239,6 +223,40 @@ def test_formatter_preserves_text_envelope_metadata(monkeypatch: pytest.MonkeyPa
         "metadata": {"text": {"text_output": "caption"}},
         "text": "caption",
     }
+
+
+@pytest.mark.parametrize(
+    "text_metadata",
+    [
+        pytest.param({"think_text": "reasoning"}, id="sensenova-bagel-thinking"),
+        pytest.param({"ar_generated_text": "reasoning"}, id="hunyuan-image3-cot"),
+    ],
+)
+def test_formatter_preserves_image_with_reasoning_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    text_metadata: dict[str, str],
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    metadata = {"text": text_metadata}
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"image": "image-0"},
+            "metadata": metadata,
+        }
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("generate an image"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data=None,
+        postprocess_output=postprocess_output,
+    )
+
+    assert postprocess_output.primary_key == "image"
+    assert result.images == ["image-0"]
+    assert result.final_output_type == "image"
+    assert result.multimodal_output == {"metadata": metadata}
 
 
 def test_formatter_preserves_audio_output_with_model_sample_rate_fallback(
@@ -261,7 +279,6 @@ def test_formatter_preserves_audio_output_with_model_sample_rate_fallback(
         diffusion_output=DiffusionOutput(output=["waveform"]),
         output_data=["waveform"],
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == []
@@ -293,7 +310,6 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == ["frame-0"]
@@ -328,7 +344,6 @@ def test_formatter_preserves_audio_only_postprocess_dict(
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == []
@@ -360,7 +375,6 @@ def test_formatter_preserves_single_prompt_multiple_audio_outputs(
         diffusion_output=DiffusionOutput(output=["waveform-0", "waveform-1"]),
         output_data=["waveform-0", "waveform-1"],
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert result.images == []
@@ -388,7 +402,6 @@ def test_formatter_preserves_single_prompt_audio_and_action_payloads(
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
         postprocess_output=postprocess_output,
-        timings=_timings(),
     )
 
     assert len(results) == 1

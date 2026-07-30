@@ -1,0 +1,346 @@
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_USE_FLASHINFER_MOE_FP16: 0
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
+steps:
+  - group: ":card_index_dividers: Simple Test"
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: "Simple · Model Executor Test"
+        commands:
+          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Diffusion Test"
+        commands:
+          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Engine&Entrypoints Test"
+        commands:
+          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Other Test"
+        commands:
+          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+  - group: ":card_index_dividers: Diffusion Test"
+    depends_on: upload-ready-pipeline
+    steps:
+
+      - label: "Diffusion · Offloader Test"
+        commands:
+          - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Cache Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Batch Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Distributed Test"
+        source_file_dependencies:
+          - tests/diffusion/distributed/
+          - vllm_omni/diffusion/distributed/
+          - vllm_omni/diffusion/attention/parallel/
+          - vllm_omni/diffusion/data.py
+          - vllm_omni/diffusion/models/
+        commands:
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_4
+
+      - label: "Diffusion · Model Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Other Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/*.py -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+  - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
+    depends_on: upload-ready-pipeline
+    steps:
+
+      - label: "Tiny Model Tests · Diffusion (base)"
+        commands:
+          - timeout 15m pytest -sv tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+  - label: "Engine&Model Executor Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 15m bash -c "
+                  pytest -sv tests/engine/ tests/model_executor/ -m 'core_model and cuda' --run-level 'core_model'
+        "
+    mirror_hardwares: l4_1
+
+  - label: "Distributed Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 20m bash -c "
+          pytest -sv tests/distributed/ -m 'core_model and cuda and L4' --run-level 'core_model'
+        "
+    mirror_hardwares: l4_1
+
+  - label: "Entrypoints Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 30m bash -c "
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model'
+        "
+    mirror_hardwares: l4_1
+
+  - group: ":card_index_dividers: E2E Test"
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: "Custom Pipeline Test"
+        source_file_dependencies:
+          - tests/e2e/features/custom_pipeline/
+          - tests/e2e/features/helpers/custom_pipeline.py
+          - vllm_omni/diffusion/
+          - vllm_omni/engine/
+          - vllm_omni/entrypoints/
+          - vllm_omni/inputs/
+          - vllm_omni/outputs/
+        commands:
+          - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: "RLHF · VeRL-Omni E2E Test"
+        source_file_dependencies:
+          - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+          - tests/e2e/features/helpers/verl_omni_server.py
+          - tests/e2e/features/helpers/custom_pipeline.py
+          - vllm_omni/diffusion/
+          - vllm_omni/engine/
+          - vllm_omni/entrypoints/
+          - vllm_omni/inputs/
+          - vllm_omni/outputs/
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+            "
+        mirror_hardwares: l4_1
+
+      - label: "Omni · Qwen3-Omni Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_omni.py
+          - vllm_omni/model_executor/models/qwen3_omni/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
+          - vllm_omni/deploy/qwen3_omni_moe.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
+      - label: "Omni · MiniCPM-o 4.5 Offline Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_minicpmo_4_5.py
+          - vllm_omni/deploy/minicpmo_4_5.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
+      - label: "Omni · MiniCPM-o 4.5 Online Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_minicpmo_4_5.py
+          - vllm_omni/deploy/minicpmo_4_5.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
+      - label: "Omni · MiniCPM-o 4.5 Duplex Test"
+        source_file_dependencies:
+          - tests/assets/minicpmo_4_5/response_required_16k.wav
+          - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
+          - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
+          - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+          - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
+          - tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+          - tests/helpers/minicpmo_4_5_duplex.py
+          - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+          - vllm_omni/experimental/fullduplex/
+          - vllm_omni/model_executor/models/minicpmo_4_5/
+          - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
+          - vllm_omni/core/sched/
+          - vllm_omni/outputs/multimodal_accumulation.py
+          - vllm_omni/engine/stage_init_utils.py
+          - vllm_omni/engine/async_omni_engine.py
+          - vllm_omni/entrypoints/cli/serve.py
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py -m 'core_model and cuda' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
+      - label: "TTS · VoxCPM2 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_voxcpm2_tts.py
+          - vllm_omni/model_executor/models/voxcpm2/
+          - vllm_omni/deploy/voxcpm2.yaml
+        timeout_in_minutes: 30
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/online_serving/test_voxcpm2_tts.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Qwen3-TTS CustomVoice Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Qwen3-TTS Base Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_base.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+              export VLLM_OMNI_USE_V2_RUNNER=1
+              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Higgs-Audio-V3 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_higgs_audio_v3.py
+          - vllm_omni/model_executor/models/higgs_audio_v3/
+          - vllm_omni/model_executor/stage_input_processors/higgs_audio_v3.py
+          - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              export VLLM_USE_DEEP_GEMM=0
+              export VLLM_MOE_USE_DEEP_GEMM=0
+              pytest -s -v tests/e2e/online_serving/test_higgs_audio_v3.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Qwen Image Edit Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image_edit.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_qwen_image_edit.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Bagel Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_bagel.py
+          - vllm_omni/model_executor/models/bagel/
+          - vllm_omni/diffusion/models/bagel/
+          - vllm_omni/model_executor/stage_input_processors/bagel.py
+          - vllm_omni/deploy/bagel.yaml
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_bagel.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Wan22 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_wan22_t2v.py
+          - vllm_omni/diffusion/models/wan2_2/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Cosmos3 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_cosmos3.py
+          - vllm_omni/diffusion/models/cosmos3/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_cosmos3.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Qwen Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Qwen Image Layered Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image_layered.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1

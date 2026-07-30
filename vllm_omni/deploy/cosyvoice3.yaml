@@ -24,8 +24,6 @@
 #   first. Raising connector_get_sleep_s also relaxes the consumer's polling
 #   cadence, but trades against TTFP — keep it as a last resort.
 async_chunk: true
-dtype: float32
-
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector

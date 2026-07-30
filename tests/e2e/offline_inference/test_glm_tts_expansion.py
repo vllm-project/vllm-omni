@@ -98,6 +98,7 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
         MODEL,
         stage_configs_path=_get_deploy_config(async_chunk=async_chunk),
         stage_init_timeout=600,
+        trust_remote_code=True,
     ) as omni_runner:
         outputs = omni_runner.omni.generate(
             [
