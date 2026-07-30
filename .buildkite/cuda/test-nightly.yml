@@ -458,7 +458,7 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
     steps:
-      - group: ":full_moon: Diffusion · Distributed Test"
+      - label: ":full_moon: Diffusion · Distributed Test"
         timeout_in_minutes: 30
         commands:
           - timeout 30m pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda' --run-level "full_model"
