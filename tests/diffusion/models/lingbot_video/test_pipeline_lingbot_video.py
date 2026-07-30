@@ -80,7 +80,7 @@ def test_extra_body_params_include_video_flow_shift_alias():
     assert "batch_cfg" in params
 
 
-def test_execution_options_normalize_base_names_and_legacy_aliases():
+def test_execution_options_separates_base_aliases_from_refiner_fields():
     from vllm_omni.diffusion.models.lingbot_video import normalize_lingbot_execution_options
 
     options = normalize_lingbot_execution_options(
@@ -97,11 +97,12 @@ def test_execution_options_normalize_base_names_and_legacy_aliases():
     assert options.base_low_noise_threshold == pytest.approx(0.3)
     assert options.base_sigma_tail_steps == 4
 
-    legacy = normalize_lingbot_execution_options(
+    separated = normalize_lingbot_execution_options(
         {"t_thresh": 0.25, "refiner_sigma_tail_steps": 3}
     )
-    assert legacy.base_low_noise_threshold == pytest.approx(0.25)
-    assert legacy.base_sigma_tail_steps == 3
+    assert separated.base_low_noise_threshold == pytest.approx(0.25)
+    assert separated.base_sigma_tail_steps == 2
+    assert separated.refiner.sigma_tail_steps == 3
 
 
 @pytest.mark.parametrize(
@@ -111,7 +112,7 @@ def test_execution_options_normalize_base_names_and_legacy_aliases():
         ({"base_low_noise_threshold": 0.0}, "must lie in"),
         ({"base_sigma_tail_steps": -1}, "non-negative integer"),
         ({"base_low_noise_threshold": 0.3, "t_thresh": 0.2}, "conflict"),
-        ({"base_sigma_tail_steps": 4, "refiner_sigma_tail_steps": 2}, "conflict"),
+        ({"refiner_sigma_tail_steps": -1}, "non-negative integer"),
     ],
 )
 def test_execution_options_reject_invalid_or_conflicting_values(extra_args, message):

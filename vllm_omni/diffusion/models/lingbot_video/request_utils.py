@@ -6,12 +6,16 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from PIL import Image
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.lingbot_video.refiner_utils import (
+    LingBotRefinerConfig,
+)
 
 logger = init_logger(__name__)
 
@@ -99,18 +103,39 @@ class LingBotRequestConfig:
 
 
 @dataclass(frozen=True)
+class LingBotRefinerOptions:
+    """Validated request options for an already-loaded Refiner."""
+
+    run: bool = False
+    explicitly_requested: bool = False
+    height: int = 1088
+    width: int = 1920
+    num_inference_steps: int = 8
+    guidance_scale: float = 3.0
+    shift: float = 3.0
+    t_thresh: float = 0.85
+    sigma_tail_steps: int = 2
+    sample_fps: int = 24
+    output_fps: int = 24
+    max_video_frames: int | None = None
+    batch_cfg: bool = False
+    null_cond_clone_zero: bool = True
+
+
+@dataclass(frozen=True)
 class LingBotExecutionOptions:
-    """Validated options that affect LingBot's Base execution path."""
+    """Validated options for LingBot's Base and optional Refiner stages."""
 
     batch_cfg: bool = False
     null_cond_clone_zero: bool = False
     offload_vae_during_denoise: bool = False
     base_low_noise_threshold: float | None = None
     base_sigma_tail_steps: int = 2
+    refiner: LingBotRefinerOptions = field(default_factory=LingBotRefinerOptions)
 
 
-def _boolean_option(extra_args: Mapping[str, Any], name: str) -> bool:
-    value = extra_args.get(name, False)
+def _boolean_option(extra_args: Mapping[str, Any], name: str, *, default: bool = False) -> bool:
+    value = extra_args.get(name, default)
     if not isinstance(value, bool):
         raise ValueError(f"LingBot `{name}` must be a boolean, got {value!r}.")
     return value
@@ -143,19 +168,35 @@ def _non_negative_int_option(value: Any, name: str) -> int:
     return parsed
 
 
+def _positive_int_option(value: Any, name: str) -> int:
+    parsed = _non_negative_int_option(value, name)
+    if parsed <= 0:
+        raise ValueError(f"LingBot `{name}` must be a positive integer, got {value!r}.")
+    return parsed
+
+
+def _positive_float_option(value: Any, name: str) -> float:
+    parsed = _optional_float_option(value, name)
+    if parsed is None or parsed <= 0.0:
+        raise ValueError(f"LingBot `{name}` must be positive, got {value!r}.")
+    return parsed
+
+
 def normalize_lingbot_execution_options(
     extra_args: Mapping[str, Any] | None,
     *,
     default_base_sigma_tail_steps: int = 2,
+    refiner_config: LingBotRefinerConfig | None = None,
+    mode: LingBotGenerationMode | None = None,
 ) -> LingBotExecutionOptions:
-    """Normalize Base runtime options before any model work is performed.
+    """Normalize Base and Refiner options before any model work is performed.
 
-    ``t_thresh`` and ``refiner_sigma_tail_steps`` are legacy aliases for the
-    Base low-noise schedule. They remain accepted for one migration cycle, but
-    the internal execution path only uses the unambiguous ``base_*`` names.
+    ``t_thresh`` remains a temporary alias for the Base low-noise threshold.
+    Every ``refiner_*`` field exclusively configures the optional second stage.
     """
 
     extra_args = extra_args or {}
+    refiner_config = refiner_config or LingBotRefinerConfig()
     new_threshold = _optional_float_option(
         extra_args.get("base_low_noise_threshold"),
         "base_low_noise_threshold",
@@ -170,34 +211,74 @@ def normalize_lingbot_execution_options(
     if threshold is not None and not (0.0 < threshold <= 1.0):
         raise ValueError(f"LingBot `base_low_noise_threshold` must lie in (0, 1], got {threshold!r}.")
 
-    new_tail = extra_args.get("base_sigma_tail_steps")
-    legacy_tail = extra_args.get("refiner_sigma_tail_steps")
-    parsed_new_tail = (
-        _non_negative_int_option(new_tail, "base_sigma_tail_steps") if new_tail is not None else None
+    raw_base_tail = extra_args.get("base_sigma_tail_steps")
+    tail_steps = (
+        _non_negative_int_option(raw_base_tail, "base_sigma_tail_steps")
+        if raw_base_tail is not None
+        else _non_negative_int_option(default_base_sigma_tail_steps, "base_sigma_tail_steps")
     )
-    parsed_legacy_tail = (
-        _non_negative_int_option(legacy_tail, "refiner_sigma_tail_steps") if legacy_tail is not None else None
-    )
-    if parsed_new_tail is not None and parsed_legacy_tail is not None and parsed_new_tail != parsed_legacy_tail:
-        raise ValueError(
-            "LingBot `base_sigma_tail_steps` and legacy `refiner_sigma_tail_steps` conflict: "
-            f"{parsed_new_tail!r} != {parsed_legacy_tail!r}."
-        )
-    tail_steps = parsed_new_tail if parsed_new_tail is not None else parsed_legacy_tail
-    if tail_steps is None:
-        tail_steps = _non_negative_int_option(
-            default_base_sigma_tail_steps,
-            "base_sigma_tail_steps",
-        )
-
     if legacy_threshold is not None:
         logger.warning_once(
             "LingBot `t_thresh` is deprecated; use `base_low_noise_threshold` for the Base schedule."
         )
-    if parsed_legacy_tail is not None:
-        logger.warning_once(
-            "LingBot `refiner_sigma_tail_steps` currently aliases the Base schedule and is deprecated; "
-            "use `base_sigma_tail_steps`."
+
+    run_explicit = "run_refiner" in extra_args
+    run_refiner = (
+        _boolean_option(extra_args, "run_refiner")
+        if run_explicit
+        else bool(refiner_config.enabled and refiner_config.default_run)
+    )
+    if run_refiner and not refiner_config.enabled:
+        raise ValueError(
+            "LingBot `run_refiner=true` requires startup configuration "
+            "`model_config.lingbot_refiner.enabled=true`."
+        )
+    if mode is LingBotGenerationMode.T2I:
+        if run_explicit and run_refiner:
+            raise ValueError("LingBot Refiner is only supported for video modes; T2I cannot set `run_refiner=true`.")
+        run_refiner = False
+
+    refiner_height = _positive_int_option(extra_args.get("refiner_height", 1088), "refiner_height")
+    refiner_width = _positive_int_option(extra_args.get("refiner_width", 1920), "refiner_width")
+    if refiner_height % 16 != 0 or refiner_width % 16 != 0:
+        raise ValueError(
+            "LingBot Refiner height and width must be multiples of 16, "
+            f"got {refiner_height}x{refiner_width}."
+        )
+    refiner_steps = _positive_int_option(extra_args.get("refiner_steps", 8), "refiner_steps")
+    refiner_guidance = _positive_float_option(
+        extra_args.get("refiner_guidance_scale", 3.0),
+        "refiner_guidance_scale",
+    )
+    refiner_shift = _positive_float_option(extra_args.get("refiner_shift", 3.0), "refiner_shift")
+    refiner_t_thresh = _positive_float_option(
+        extra_args.get("refiner_t_thresh", 0.85),
+        "refiner_t_thresh",
+    )
+    if refiner_t_thresh > 1.0:
+        raise ValueError(f"LingBot `refiner_t_thresh` must lie in (0, 1], got {refiner_t_thresh!r}.")
+    refiner_tail = _non_negative_int_option(
+        extra_args.get("refiner_sigma_tail_steps", 2),
+        "refiner_sigma_tail_steps",
+    )
+    refiner_sample_fps = _positive_int_option(
+        extra_args.get("refiner_sample_fps", 24),
+        "refiner_sample_fps",
+    )
+    refiner_output_fps = _positive_int_option(
+        extra_args.get("refiner_output_fps", 24),
+        "refiner_output_fps",
+    )
+    raw_max_frames = extra_args.get("refiner_max_video_frames")
+    refiner_max_frames = (
+        None
+        if raw_max_frames is None
+        else _positive_int_option(raw_max_frames, "refiner_max_video_frames")
+    )
+    if refiner_max_frames is not None and refiner_max_frames != 1 and (refiner_max_frames - 1) % 4 != 0:
+        raise ValueError(
+            "LingBot `refiner_max_video_frames` must be 1 or 4n+1, "
+            f"got {refiner_max_frames}."
         )
 
     return LingBotExecutionOptions(
@@ -206,6 +287,26 @@ def normalize_lingbot_execution_options(
         offload_vae_during_denoise=_boolean_option(extra_args, "offload_vae_during_denoise"),
         base_low_noise_threshold=threshold,
         base_sigma_tail_steps=tail_steps,
+        refiner=LingBotRefinerOptions(
+            run=run_refiner,
+            explicitly_requested=run_explicit,
+            height=refiner_height,
+            width=refiner_width,
+            num_inference_steps=refiner_steps,
+            guidance_scale=refiner_guidance,
+            shift=refiner_shift,
+            t_thresh=refiner_t_thresh,
+            sigma_tail_steps=refiner_tail,
+            sample_fps=refiner_sample_fps,
+            output_fps=refiner_output_fps,
+            max_video_frames=refiner_max_frames,
+            batch_cfg=_boolean_option(extra_args, "refiner_batch_cfg"),
+            null_cond_clone_zero=_boolean_option(
+                extra_args,
+                "refiner_null_cond_clone_zero",
+                default=True,
+            ),
+        ),
     )
 
 

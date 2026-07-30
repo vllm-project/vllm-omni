@@ -86,12 +86,35 @@ python text_to_video.py \
   --extra-body '{"batch_cfg": true, "output_type": "np"}'
 ```
 
+The official MoE package also contains an optional second 30B-A3B Transformer
+under `refiner/`. Enable it through `--model-config`, then opt into it for a
+request through `--extra-body`. For a single-GPU capacity smoke,
+use sequential CPU offload and move the shared VAE out during both denoise
+stages:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model robbyant/lingbot-video-moe-30b-a3b \
+  --model-config '{"lingbot_refiner":{"enabled":true,"default_run":false,"offload_vae_during_denoise":true}}' \
+  --extra-body '{"run_refiner":true,"offload_vae_during_denoise":true,"refiner_height":192,"refiner_width":320,"refiner_steps":2}' \
+  --enable-cpu-offload \
+  --enforce-eager \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --output lingbot_moe_refined_t2v.mp4
+```
+
+Base and Refiner use independent schedulers and random generators while
+sharing one text encoder, processor, and VAE. The small Refiner dimensions in
+this command are for functional validation; the official high-resolution
+default is `1920x1088`. CPU offload is a capacity feature and adds large
+host-to-device transfers between the two DiTs.
+
 The MoE checkpoint can shard each complete transformer block across two GPUs
 with HSDP. Grouped expert weights stay inside their owning block and are not
 nested-sharded separately:
 
 ```bash
-python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+python examples/offline_inference/text_to_video/text_to_video.py \
   --model robbyant/lingbot-video-moe-30b-a3b \
   --use-hsdp --hsdp-shard-size 2 \
   --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
@@ -102,7 +125,10 @@ HSDP reduces per-GPU transformer weight residency but adds per-block
 all-gather communication. It cannot be combined with tensor parallelism.
 Use `--enforce-eager` when comparing HSDP output against a single-GPU
 correctness baseline; compiled single-GPU and HSDP execution use different
-Inductor graphs and are not expected to be bitwise identical.
+Inductor graphs and are not expected to be bitwise identical. Enabling the
+Refiner through `--model-config` makes the same HSDP topology shard both
+outermost DiTs; it does not create a separate Refiner-specific sharding
+implementation.
 
 ### LTX-2
 

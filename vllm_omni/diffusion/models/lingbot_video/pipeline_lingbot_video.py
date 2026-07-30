@@ -42,8 +42,20 @@ from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import L
 from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     LingBotExecutionOptions,
     LingBotGenerationMode,
+    LingBotRefinerOptions,
     normalize_lingbot_execution_options,
     normalize_lingbot_request,
+)
+from vllm_omni.diffusion.models.lingbot_video.refiner_utils import (
+    LingBotRefinerConfig,
+    LingBotRefinerInputs,
+    align_refiner_first_frame,
+    compute_refiner_frame_budget,
+    compute_refiner_frame_indices,
+    compute_refiner_sigmas,
+    normalize_lingbot_refiner_config,
+    prepare_refiner_latent,
+    resize_refiner_video,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -245,6 +257,7 @@ class LingBotStageCondition:
     image_condition: LingBotImageCondition | None
     cfg_parallel_group: Any | None
     cfg_parallel_rank: int
+    clean_prefix: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -346,9 +359,26 @@ def get_lingbot_video_pre_process_func(od_config: OmniDiffusionConfig):
 def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
-    def post_process_func(frames: torch.Tensor | dict[str, torch.Tensor], sampling_params=None):
+    def post_process_func(frames: torch.Tensor | dict[str, Any], sampling_params=None):
         output_key = None
-        if isinstance(frames, dict):
+        envelope = False
+        metadata: dict[str, Any] = {}
+        payload: dict[str, Any] | None = None
+        if isinstance(frames, dict) and isinstance(frames.get("payload"), Mapping):
+            envelope = True
+            payload = dict(frames["payload"])
+            raw_metadata = frames.get("metadata")
+            if isinstance(raw_metadata, Mapping):
+                metadata = dict(raw_metadata)
+            output_keys = [key for key in ("image", "video") if key in payload]
+            if len(output_keys) != 1:
+                raise ValueError(
+                    "LingBot output payload must contain exactly one of 'image' or 'video', "
+                    f"got {sorted(payload)!r}."
+                )
+            output_key = output_keys[0]
+            frames = payload[output_key]
+        elif isinstance(frames, dict):
             output_keys = [key for key in ("image", "video") if key in frames]
             if len(output_keys) != 1:
                 raise ValueError(
@@ -366,6 +396,10 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
             and (output_type == "np" or output_key == "image")
         ):
             frames = frames.float().cpu().numpy()
+        if envelope:
+            assert payload is not None and output_key is not None
+            payload[output_key] = frames
+            return {"payload": payload, "metadata": metadata}
         return {output_key: frames} if output_key is not None else frames
 
     return post_process_func
@@ -380,10 +414,9 @@ class LingBotVideoPipeline(
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
-    The in-tree transformer supports both dense MLP blocks and routed MoE blocks.
-    Fused expert kernels and the optional ``refiner/`` transformer are not loaded
-    or executed. ``base_low_noise_threshold`` only selects a low-noise sigma
-    schedule for the primary transformer; it does not enable Refiner orchestration.
+    The Base transformer is always loaded through the native weight stream. The
+    optional official Refiner is startup-configured as a second native DiT while
+    sharing the text encoder, processor, and VAE with the Base stage.
     """
 
     supports_step_execution: ClassVar[bool] = False
@@ -391,7 +424,14 @@ class LingBotVideoPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
-    _PROFILER_TARGETS: ClassVar[list[str]] = ["_prepare_base_condition", "diffuse", "_decode_latents_internal"]
+    _PROFILER_TARGETS: ClassVar[list[str]] = [
+        "_prepare_base_condition",
+        "diffuse",
+        "_decode_latents_internal",
+        "_prepare_refiner_inputs",
+        "_prepare_refiner_condition",
+        "_diffuse_refiner",
+    ]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -413,6 +453,14 @@ class LingBotVideoPipeline(
         load_device = torch.get_default_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = getattr(od_config, "model_config", None) or {}
+        self.refiner_config = normalize_lingbot_refiner_config(
+            model_config,
+            base_model=model,
+            base_revision=revision,
+        )
+        self.refiner_transformer: LingBotVideoTransformer3DModel | None = None
+        self.refiner_scheduler: FlowUniPCMultistepScheduler | None = None
+        self._dit_modules = ["transformer"]
         transformer_dtype = _dtype_from_name(model_config.get("transformer_dtype"), dtype)
         text_encoder_dtype = _dtype_from_name(model_config.get("text_encoder_dtype"), dtype)
         vae_dtype = _dtype_from_name(model_config.get("vae_dtype"), torch.float32)
@@ -430,11 +478,30 @@ class LingBotVideoPipeline(
             vae_subfolder,
             scheduler_subfolder,
         ]
+        refiner_model = self.refiner_config.model_dir
+        refiner_revision = self.refiner_config.revision
+        refiner_subfolder = self.refiner_config.transformer_subfolder
+        refiner_local_files_only = bool(refiner_model and os.path.isdir(refiner_model))
+        refiner_shares_source = bool(
+            self.refiner_config.enabled
+            and refiner_model == model
+            and refiner_revision == revision
+        )
+        if refiner_shares_source:
+            component_subfolders.append(refiner_subfolder)
         prefetch_subfolders(
             model,
             local_files_only=local_files_only,
             subfolders=component_subfolders,
         )
+        if self.refiner_config.enabled and not refiner_shares_source:
+            if refiner_model is None:
+                raise RuntimeError("LingBot Refiner is enabled without a resolved model root.")
+            prefetch_subfolders(
+                refiner_model,
+                local_files_only=refiner_local_files_only,
+                subfolders=[refiner_subfolder, scheduler_subfolder],
+            )
 
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
@@ -492,6 +559,47 @@ class LingBotVideoPipeline(
             )
         ]
 
+        if self.refiner_config.enabled:
+            if refiner_model is None:
+                raise RuntimeError("LingBot Refiner is enabled without a resolved model root.")
+            try:
+                refiner_transformer_config = LingBotVideoTransformer3DModel.load_config(
+                    refiner_model,
+                    subfolder=refiner_subfolder,
+                    revision=refiner_revision,
+                    local_files_only=refiner_local_files_only,
+                )
+                refiner_transformer_kwargs = get_transformer_config_kwargs(
+                    TransformerConfig.from_dict(refiner_transformer_config),
+                    LingBotVideoTransformer3DModel,
+                )
+                self.refiner_transformer = LingBotVideoTransformer3DModel(
+                    **refiner_transformer_kwargs
+                )
+                self.refiner_transformer.to(dtype=transformer_dtype)
+                self.refiner_scheduler = FlowUniPCMultistepScheduler.from_pretrained(
+                    refiner_model,
+                    subfolder=scheduler_subfolder,
+                    local_files_only=refiner_local_files_only,
+                    revision=refiner_revision,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to initialize LingBot Refiner from "
+                    f"model={refiner_model!r}, subfolder={refiner_subfolder!r}, "
+                    f"revision={refiner_revision!r}: {exc}"
+                ) from exc
+            self._dit_modules = ["transformer", "refiner_transformer"]
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=refiner_model,
+                    subfolder=refiner_subfolder,
+                    revision=refiner_revision,
+                    prefix="refiner_transformer.",
+                    fall_back_to_pt=True,
+                )
+            )
+
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
@@ -519,6 +627,8 @@ class LingBotVideoPipeline(
         # FP32 and the Transformer applies its own BF16-bulk/FP32-islands policy.
         if dtype is not None:
             self.transformer.to(dtype=dtype, non_blocking=non_blocking)
+            if self.refiner_transformer is not None:
+                self.refiner_transformer.to(dtype=dtype, non_blocking=non_blocking)
         return self
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -657,6 +767,38 @@ class LingBotVideoPipeline(
         mean = mean.view(1, -1, 1, 1, 1)
         std_inv = std_inv.view(1, -1, 1, 1, 1)
         return latents.float() / std_inv + mean
+
+    def _vae_latent_to_dit(self, latents: torch.Tensor) -> torch.Tensor:
+        mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=torch.float32)
+        std_inv = 1.0 / torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=torch.float32)
+        mean = mean.view(1, -1, 1, 1, 1)
+        std_inv = std_inv.view(1, -1, 1, 1, 1)
+        return (latents.float() - mean) * std_inv
+
+    @torch.no_grad()
+    def _encode_video_latent(
+        self,
+        video: torch.Tensor,
+        *,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        if video.ndim != 5:
+            raise ValueError(
+                f"LingBot VAE encode expects [B,C,T,H,W], got {tuple(video.shape)}."
+            )
+        vae_device = _module_device(self.vae)
+        normalized = (video.to(device=vae_device, dtype=torch.float32) - 0.5) / 0.5
+        with torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16,
+            enabled=vae_device.type == "cuda",
+        ):
+            encoded = self.vae.encode(normalized)
+        if hasattr(encoded, "latent_dist"):
+            latents = encoded.latent_dist.sample(generator)
+        else:
+            latents = encoded[0] if isinstance(encoded, tuple) else encoded
+        return self._vae_latent_to_dit(latents).to(latents)
 
     @torch.no_grad()
     def _decode_latents_internal(self, latents: torch.Tensor) -> torch.Tensor:
@@ -813,6 +955,9 @@ class LingBotVideoPipeline(
             image_condition=image_condition,
             cfg_parallel_group=cfg_parallel_group,
             cfg_parallel_rank=cfg_parallel_rank,
+            clean_prefix=(
+                image_condition.clean_latent if image_condition is not None else None
+            ),
         )
 
     @torch.no_grad()
@@ -829,8 +974,8 @@ class LingBotVideoPipeline(
     ) -> torch.Tensor:
         device = self.device
         latents = self.prepare_latents(num_frames, height, width, generator, latents, device)
-        if condition.image_condition is not None:
-            latents = apply_clean_prefix(latents, condition.image_condition.clean_latent)
+        if condition.clean_prefix is not None:
+            latents = apply_clean_prefix(latents, condition.clean_prefix)
 
         sigmas = _compute_low_noise_sigmas(
             sigma_max=float(self.scheduler.sigma_max),
@@ -966,12 +1111,210 @@ class LingBotVideoPipeline(
                 return_dict=False,
                 generator=generator,
             )[0]
-            if condition.image_condition is not None:
-                latents = apply_clean_prefix(latents, condition.image_condition.clean_latent)
+            if condition.clean_prefix is not None:
+                latents = apply_clean_prefix(latents, condition.clean_prefix)
 
         if cfg_parallel:
+            dist.broadcast(
+                latents,
+                src=cfg_latent_src,
+                group=condition.cfg_parallel_group,
+            )
             dist.barrier(group=condition.cfg_parallel_group)
         return latents
+
+    @torch.no_grad()
+    def _prepare_refiner_inputs(
+        self,
+        *,
+        base_video: torch.Tensor,
+        source_fps: float,
+        source_height: int,
+        source_width: int,
+        input_image: Image.Image | None,
+        generator: torch.Generator | None,
+        options: LingBotRefinerOptions,
+    ) -> LingBotRefinerInputs:
+        sample_frames = compute_refiner_frame_budget(
+            int(base_video.shape[2]),
+            source_fps,
+            sample_fps=options.sample_fps,
+            vae_temporal_factor=self.vae_scale_factor_temporal,
+            max_frames=options.max_video_frames,
+        )
+        indices = compute_refiner_frame_indices(
+            int(base_video.shape[2]),
+            sample_frames,
+            device=base_video.device,
+        )
+        sampled = base_video.index_select(2, indices)
+        resized = resize_refiner_video(
+            sampled,
+            height=options.height,
+            width=options.width,
+        )
+
+        # Random-consumption parity with the official runner is intentional:
+        # handoff encode -> optional TI2V clean-frame encode -> Refiner noise.
+        x_up = self._encode_video_latent(resized, generator=generator)
+        clean_prefix = None
+        if input_image is not None:
+            clean_frame = align_refiner_first_frame(
+                input_image,
+                target_height=options.height,
+                target_width=options.width,
+                source_height=source_height,
+                source_width=source_width,
+            )
+            clean_x0 = self._encode_video_latent(clean_frame, generator=generator)
+            clean_prefix = clean_x0[:, :, :1].contiguous()
+            x_up = apply_clean_prefix(x_up, clean_prefix)
+
+        noise = randn_tensor(
+            x_up.shape,
+            generator=generator,
+            device=x_up.device,
+            dtype=x_up.dtype,
+        )
+        initial_latents = prepare_refiner_latent(
+            x_up,
+            noise,
+            options.t_thresh,
+        ).to(device=self.device, dtype=torch.float32)
+        if clean_prefix is not None:
+            clean_prefix = clean_prefix.to(device=self.device, dtype=torch.float32)
+            initial_latents = apply_clean_prefix(initial_latents, clean_prefix)
+        return LingBotRefinerInputs(
+            latents=initial_latents,
+            clean_prefix=clean_prefix,
+            num_frames=sample_frames,
+            source_fps=float(source_fps),
+            sample_fps=options.sample_fps,
+        )
+
+    @torch.no_grad()
+    def _prepare_refiner_condition(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        mode: LingBotGenerationMode,
+        base_condition: LingBotStageCondition,
+        guidance_scale: float,
+        cfg_parallel_group: Any | None,
+        options: LingBotRefinerOptions,
+        clean_prefix: torch.Tensor | None,
+    ) -> LingBotStageCondition:
+        device = self.device
+        do_cfg = guidance_scale > 1.0
+        cfg_parallel = cfg_parallel_group is not None
+        cfg_parallel_rank = 0
+        if cfg_parallel:
+            if not dist.is_available() or not dist.is_initialized():
+                raise ValueError("`cfg_parallel_group` requires an initialized process group.")
+            if options.batch_cfg:
+                raise ValueError("`cfg_parallel_group` and `refiner_batch_cfg` are mutually exclusive.")
+            if not do_cfg:
+                raise ValueError("Refiner CFG parallel requires `refiner_guidance_scale > 1.0`.")
+            cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
+            if dist.get_world_size(cfg_parallel_group) != 2:
+                raise ValueError("Refiner CFG parallel currently requires exactly 2 ranks.")
+
+        prompt_embeds = None
+        prompt_mask = None
+        negative_embeds = None
+        negative_mask = None
+
+        can_reuse_positive = (
+            mode is LingBotGenerationMode.T2V
+            and base_condition.prompt_embeds is not None
+            and base_condition.prompt_mask is not None
+        )
+        if cfg_parallel and cfg_parallel_rank == 1:
+            if options.null_cond_clone_zero:
+                positive, positive_mask = self.encode_prompt(prompt, images=None, device=device)
+                negative_embeds = torch.zeros_like(positive)
+                negative_mask = positive_mask.clone()
+            else:
+                negative_embeds, negative_mask = self.encode_prompt(
+                    negative_prompt,
+                    images=None,
+                    device=device,
+                )
+        else:
+            if can_reuse_positive:
+                prompt_embeds = base_condition.prompt_embeds
+                prompt_mask = base_condition.prompt_mask
+            else:
+                prompt_embeds, prompt_mask = self.encode_prompt(
+                    prompt,
+                    images=None,
+                    device=device,
+                )
+            if do_cfg and not cfg_parallel:
+                if options.null_cond_clone_zero:
+                    negative_embeds = torch.zeros_like(prompt_embeds)
+                    negative_mask = prompt_mask.clone()
+                else:
+                    negative_embeds, negative_mask = self.encode_prompt(
+                        negative_prompt,
+                        images=None,
+                        device=device,
+                    )
+
+        return LingBotStageCondition(
+            prompt_embeds=prompt_embeds,
+            prompt_mask=prompt_mask,
+            negative_prompt_embeds=negative_embeds,
+            negative_prompt_mask=negative_mask,
+            image_condition=None,
+            cfg_parallel_group=cfg_parallel_group,
+            cfg_parallel_rank=cfg_parallel_rank,
+            clean_prefix=clean_prefix,
+        )
+
+    @torch.no_grad()
+    def _diffuse_refiner(
+        self,
+        *,
+        inputs: LingBotRefinerInputs,
+        condition: LingBotStageCondition,
+        generator: torch.Generator | None,
+        options: LingBotRefinerOptions,
+    ) -> torch.Tensor:
+        if self.refiner_transformer is None or self.refiner_scheduler is None:
+            raise RuntimeError("LingBot Refiner was requested but was not initialized.")
+
+        sigmas = compute_refiner_sigmas(
+            sigma_max=float(self.refiner_scheduler.sigma_max),
+            sigma_min=float(self.refiner_scheduler.sigma_min),
+            num_inference_steps=options.num_inference_steps,
+            shift=options.shift,
+            t_thresh=options.t_thresh,
+            tail_steps=options.sigma_tail_steps,
+        )
+        self.refiner_scheduler.set_timesteps(
+            int(sigmas.shape[0]),
+            device=self.device,
+            sigmas=sigmas,
+            shift=1.0,
+        )
+        settings = LingBotStageSettings(
+            num_inference_steps=options.num_inference_steps,
+            guidance_scale=options.guidance_scale,
+            shift=options.shift,
+            batch_cfg=options.batch_cfg,
+            base_low_noise_threshold=options.t_thresh,
+            base_sigma_tail_steps=options.sigma_tail_steps,
+        )
+        return self._run_denoise_stage(
+            transformer=self.refiner_transformer,
+            scheduler=self.refiner_scheduler,
+            generator=generator,
+            latents=inputs.latents,
+            condition=condition,
+            settings=settings,
+        )
 
     @_restore_vae_device_after_call
     @torch.no_grad()
@@ -985,10 +1328,12 @@ class LingBotVideoPipeline(
         height: int = 480,
         width: int = 480,
         num_frames: int = 81,
+        fps: float = 24.0,
         num_inference_steps: int = 40,
         guidance_scale: float = 6.0,
         shift: float = 3.0,
         generator: torch.Generator | None = None,
+        refiner_generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         prompt_mask: torch.Tensor | None = None,
@@ -1002,6 +1347,26 @@ class LingBotVideoPipeline(
         if output_type not in {"pt", "np", "latent"}:
             raise ValueError(f"Unsupported output_type: {output_type}")
         options = execution_options or LingBotExecutionOptions()
+        run_refiner = options.refiner.run
+        if run_refiner and mode is LingBotGenerationMode.T2I:
+            raise ValueError("LingBot Refiner is only supported for video modes.")
+        if run_refiner and (
+            self.refiner_transformer is None or self.refiner_scheduler is None
+        ):
+            raise RuntimeError("LingBot Refiner was requested but is not initialized.")
+
+        # Capture the initial seed before Base condition/latent generation consume
+        # its generator. Refiner stochastic work must use an independent stream.
+        if run_refiner and refiner_generator is None:
+            refiner_seed = (
+                generator.initial_seed()
+                if generator is not None
+                else int(torch.seed())
+            )
+            refiner_generator = torch.Generator(device=self.device).manual_seed(
+                refiner_seed
+            )
+
         settings = LingBotStageSettings(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
@@ -1030,7 +1395,7 @@ class LingBotVideoPipeline(
 
         vae_restore_device = self._offload_vae_for_denoise(
             enabled=options.offload_vae_during_denoise,
-            output_type=output_type,
+            output_type="pt" if run_refiner else output_type,
         )
         latents = self.diffuse(
             num_frames=num_frames,
@@ -1042,14 +1407,55 @@ class LingBotVideoPipeline(
             settings=settings,
         )
 
-        if condition.cfg_parallel_group is not None and condition.cfg_parallel_rank != 0:
+        if not run_refiner:
+            if condition.cfg_parallel_group is not None and condition.cfg_parallel_rank != 0:
+                return latents if output_type == "latent" else []
+            if output_type == "latent":
+                return latents
+            self._restore_vae_for_decode(vae_restore_device)
+            decoded = self._decode_latents_internal(latents)
+            return self._format_output(decoded, mode)
+
+        self._restore_vae_for_decode(vae_restore_device)
+        base_video = self._decode_latents_internal(latents)
+        refiner_inputs = self._prepare_refiner_inputs(
+            base_video=base_video,
+            source_fps=fps,
+            source_height=height,
+            source_width=width,
+            input_image=input_image if mode is LingBotGenerationMode.TI2V else None,
+            generator=refiner_generator,
+            options=options.refiner,
+        )
+        refiner_vae_restore_device = self._offload_vae_for_denoise(
+            enabled=self.refiner_config.offload_vae_during_denoise,
+            output_type="pt",
+        )
+        refiner_condition = self._prepare_refiner_condition(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            mode=mode,
+            base_condition=condition,
+            guidance_scale=options.refiner.guidance_scale,
+            cfg_parallel_group=cfg_parallel_group,
+            options=options.refiner,
+            clean_prefix=refiner_inputs.clean_prefix,
+        )
+        latents = self._diffuse_refiner(
+            inputs=refiner_inputs,
+            condition=refiner_condition,
+            generator=refiner_generator,
+            options=options.refiner,
+        )
+
+        if refiner_condition.cfg_parallel_group is not None and refiner_condition.cfg_parallel_rank != 0:
             return latents if output_type == "latent" else []
         if output_type == "latent":
             return latents
 
-        self._restore_vae_for_decode(vae_restore_device)
+        self._restore_vae_for_decode(refiner_vae_restore_device)
         decoded = self._decode_latents_internal(latents)
-        return self._format_output(decoded, mode)
+        return self._format_output(decoded, LingBotGenerationMode.T2V)
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -1078,6 +1484,12 @@ class LingBotVideoPipeline(
             execution_options = normalize_lingbot_execution_options(
                 extra_args,
                 default_base_sigma_tail_steps=LOW_NOISE_TAIL_V1_DEFAULT_STEPS,
+                refiner_config=getattr(
+                    self,
+                    "refiner_config",
+                    LingBotRefinerConfig(),
+                ),
+                mode=request_config.mode,
             )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc
@@ -1085,8 +1497,9 @@ class LingBotVideoPipeline(
         generator = sampling.generator
         if isinstance(generator, list):
             generator = generator[0] if generator else None
-        if generator is None and sampling.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(int(sampling.seed))
+        if generator is None:
+            seed = int(sampling.seed) if sampling.seed is not None else int(torch.seed())
+            generator = torch.Generator(device=self.device).manual_seed(seed)
 
         sampling.height = request_config.height
         sampling.width = request_config.width
@@ -1105,6 +1518,7 @@ class LingBotVideoPipeline(
             height=request_config.height,
             width=request_config.width,
             num_frames=request_config.num_frames,
+            fps=float(request_config.fps),
             num_inference_steps=request_config.num_inference_steps,
             guidance_scale=request_config.guidance_scale,
             shift=request_config.shift,
@@ -1114,8 +1528,34 @@ class LingBotVideoPipeline(
             execution_options=execution_options,
         )
         output_key = "image" if request_config.mode is LingBotGenerationMode.T2I else "video"
+        output: dict[str, Any] = {output_key: frames}
+        if execution_options.refiner.run:
+            sample_frames = compute_refiner_frame_budget(
+                request_config.num_frames,
+                float(request_config.fps),
+                sample_fps=execution_options.refiner.sample_fps,
+                vae_temporal_factor=self.vae_scale_factor_temporal,
+                max_frames=execution_options.refiner.max_video_frames,
+            )
+            sampling.height = execution_options.refiner.height
+            sampling.width = execution_options.refiner.width
+            sampling.num_frames = sample_frames
+            sampling.fps = execution_options.refiner.output_fps
+            sampling.frame_rate = float(execution_options.refiner.output_fps)
+            output = {
+                "payload": {"video": frames},
+                "metadata": {
+                    "video": {
+                        "fps": execution_options.refiner.output_fps,
+                        "refined": True,
+                        "source_fps": float(request_config.fps),
+                        "sample_fps": execution_options.refiner.sample_fps,
+                        "sample_frames": sample_frames,
+                    }
+                },
+            }
         stage_durations = self.stage_durations if getattr(self, "enable_diffusion_pipeline_profiler", False) else {}
         return DiffusionOutput(
-            output={output_key: frames},
+            output=output,
             stage_durations=stage_durations,
         )

@@ -34,7 +34,7 @@ def _tiny_transformer_config() -> dict:
     }
 
 
-def _build_pipeline(mocker):
+def _build_pipeline(mocker, *, refiner_enabled: bool = False):
     from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
 
     model = "test-org/lingbot-video"
@@ -46,6 +46,11 @@ def _build_pipeline(mocker):
         "vae_subfolder": "custom_vae",
         "scheduler_subfolder": "custom_scheduler",
     }
+    if refiner_enabled:
+        subfolders["lingbot_refiner"] = {
+            "enabled": True,
+            "transformer_subfolder": "custom_refiner",
+        }
     od_config = SimpleNamespace(
         model=model,
         revision=revision,
@@ -85,7 +90,10 @@ def _build_pipeline(mocker):
     scheduler_load = mocker.patch.object(
         module.FlowUniPCMultistepScheduler,
         "from_pretrained",
-        return_value=SimpleNamespace(),
+        side_effect=lambda *args, **kwargs: SimpleNamespace(
+            model=args[0],
+            subfolder=kwargs["subfolder"],
+        ),
     )
 
     with torch.device("cpu"):
@@ -335,3 +343,69 @@ def test_vae_is_restored_when_denoise_raises(mocker):
 
     assert pipeline.vae.moves == [torch.device("cpu"), torch.device("cuda:0")]
     assert pipeline.vae.current_device == torch.device("cuda:0")
+
+
+def test_constructor_builds_independent_native_refiner_source_and_scheduler(mocker):
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    pipeline, calls = _build_pipeline(mocker, refiner_enabled=True)
+
+    assert pipeline._dit_modules == ["transformer", "refiner_transformer"]
+    assert pipeline.refiner_transformer is not None
+    assert pipeline.refiner_scheduler is not None
+    assert pipeline.scheduler is not pipeline.refiner_scheduler
+    assert calls.prefetch.call_args_list == [
+        mocker.call(
+            calls.model,
+            local_files_only=False,
+            subfolders=[
+                "custom_transformer",
+                "custom_text_encoder",
+                "custom_processor",
+                "custom_vae",
+                "custom_scheduler",
+                "custom_refiner",
+            ],
+        )
+    ]
+    assert calls.load_config.call_args_list == [
+        mocker.call(
+            calls.model,
+            subfolder="custom_transformer",
+            revision=calls.revision,
+            local_files_only=False,
+        ),
+        mocker.call(
+            calls.model,
+            subfolder="custom_refiner",
+            revision=calls.revision,
+            local_files_only=False,
+        ),
+    ]
+    assert calls.scheduler_load.call_count == 2
+
+    assert [(source.subfolder, source.prefix) for source in pipeline.weights_sources] == [
+        ("custom_transformer", "transformer."),
+        ("custom_refiner", "refiner_transformer."),
+    ]
+    discovered = ModuleDiscovery.discover(pipeline)
+    assert discovered.dit_names == ["transformer", "refiner_transformer"]
+    assert discovered.outermost_dits()[0] == ["transformer", "refiner_transformer"]
+
+
+def test_native_weight_stream_strictly_loads_base_and_refiner_prefixes(mocker):
+    from vllm.config.load import LoadConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+    pipeline, calls = _build_pipeline(mocker, refiner_enabled=True)
+    checkpoint = {
+        name: torch.arange(parameter.numel(), dtype=torch.float32).reshape(parameter.shape)
+        for name, parameter in pipeline.named_parameters()
+        if name.startswith(("transformer.", "refiner_transformer."))
+    }
+
+    loaded = pipeline.load_weights(checkpoint.items())
+
+    assert loaded == set(checkpoint)
+    loader = DiffusersPipelineLoader(LoadConfig(), calls.od_config)
+    assert loader._get_expected_parameter_names(pipeline) == set(checkpoint)

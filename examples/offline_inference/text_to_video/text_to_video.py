@@ -186,14 +186,23 @@ def _normalize_float_tensor(tensor: torch.Tensor, source_range: str) -> torch.Te
     raise ValueError(f"Unsupported floating-point tensor range: {source_range!r}")
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def _parse_json_object(value: str, option: str) -> dict[str, Any]:
     try:
-        config = json.loads(value)
+        parsed = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
-    if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
-    return config
+        raise argparse.ArgumentTypeError(f"{option} must be valid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(f"{option} must be a JSON object")
+    return parsed
+
+
+def parse_model_config(value: str) -> dict[str, Any]:
+    """Parse engine-level, model-specific configuration."""
+    return _parse_json_object(value, "--model-config")
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    return _parse_json_object(value, "--profiler-config")
 
 
 def parse_extra_body(value: str) -> dict[str, Any]:
@@ -203,13 +212,7 @@ def parse_extra_body(value: str) -> dict[str, Any]:
     OmniDiffusionSamplingParams.extra_args, so a single generic example can
     drive model-specific behaviour without bespoke per-model flags.
     """
-    try:
-        body = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
-    if not isinstance(body, dict):
-        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
-    return body
+    return _parse_json_object(value, "--extra-body")
 
 
 def parse_args() -> argparse.Namespace:
@@ -233,6 +236,12 @@ def parse_args() -> argparse.Namespace:
         "--deploy-config",
         default=None,
         help="Optional deploy config YAML to use for pipeline-backed runs.",
+    )
+    parser.add_argument(
+        "--model-config",
+        type=parse_model_config,
+        default=None,
+        help="Optional JSON object of engine-level, model-specific configuration.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
@@ -537,10 +546,13 @@ def main():
         omni_kwargs["lora_path"] = lora_path
         omni_kwargs["lora_backend"] = args.lora_backend
 
+    model_config = dict(args.model_config or {})
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
-        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+        model_config["guardrails"] = bool(args.extra_body["guardrails"])
+    if model_config:
+        omni_kwargs["model_config"] = model_config
 
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name

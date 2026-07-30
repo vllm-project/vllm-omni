@@ -47,8 +47,39 @@ the VAE to CPU during denoising and restores it before decode. This option is
 separate from the shared sequential policy, where the VAE normally remains on
 GPU.
 
-These paths load the Base dense or MoE Transformer only. CPU/layerwise offload
-does not enable the optional Refiner.
+CPU/layerwise offload does not load the optional Refiner by itself. Refiner
+loading is an explicit startup choice.
+
+### Optional Refiner
+
+The official MoE package stores a second 30B-A3B Transformer under `refiner/`.
+Enable it at server startup through the diffusion stage's `model_config`.
+Sequential CPU offload keeps only the active Base or Refiner DiT on the GPU:
+
+```bash
+MODEL=robbyant/lingbot-video-moe-30b-a3b \
+  bash run_server.sh \
+  --enable-cpu-offload --enforce-eager \
+  --stage-overrides '{"0":{"model_config":{"lingbot_refiner":{"enabled":true,"default_run":false,"offload_vae_during_denoise":true}}}}'
+```
+
+`default_run=false` keeps ordinary video requests on the Base path. Set
+`RUN_REFINER=true` in the video client to opt into the already-loaded Refiner:
+
+```bash
+RUN_REFINER=true bash run_curl_text_image_to_video.sh
+```
+
+The same command supports TI2V when `INPUT_IMAGE` is set. T2I bypasses the
+Refiner by default and rejects an explicit `run_refiner=true`. Base and Refiner
+share one text encoder, processor, and VAE, but use independent native weight
+sources, schedulers, generators, and denoise schedules.
+
+The client defaults to a small `320x192`, 9-frame Refiner validation workload.
+Production deployments can override `REFINER_HEIGHT`, `REFINER_WIDTH`,
+`REFINER_STEPS`, and `REFINER_MAX_VIDEO_FRAMES`; the official high-resolution
+default is `1920x1088`. Both CPU offload and HSDP are capacity strategies and
+may increase latency.
 
 ## Text to image
 
@@ -103,5 +134,6 @@ one output per prompt; image requests with `n>1` are also rejected with HTTP
 400.
 
 LingBot TI2V accepts exactly one image reference. Image editing, video
-references, audio references, batching, and Refiner execution are not supported
-by this pipeline mode.
+references, audio references, and batching are not supported by this pipeline
+mode. When the Refiner is loaded, TI2V rebuilds text-only Refiner conditioning
+and reinjects the geometry-aligned clean first-frame latent after every step.

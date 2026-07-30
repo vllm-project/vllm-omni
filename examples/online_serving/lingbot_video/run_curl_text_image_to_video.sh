@@ -9,6 +9,22 @@ fi
 
 BASE_URL="${BASE_URL:-http://localhost:8099}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
+RUN_REFINER="${RUN_REFINER:-false}"
+REFINER_HEIGHT="${REFINER_HEIGHT:-192}"
+REFINER_WIDTH="${REFINER_WIDTH:-320}"
+REFINER_STEPS="${REFINER_STEPS:-2}"
+REFINER_GUIDANCE_SCALE="${REFINER_GUIDANCE_SCALE:-3.0}"
+REFINER_SHIFT="${REFINER_SHIFT:-3.0}"
+REFINER_T_THRESH="${REFINER_T_THRESH:-0.85}"
+REFINER_SIGMA_TAIL_STEPS="${REFINER_SIGMA_TAIL_STEPS:-2}"
+REFINER_SAMPLE_FPS="${REFINER_SAMPLE_FPS:-24}"
+REFINER_OUTPUT_FPS="${REFINER_OUTPUT_FPS:-24}"
+REFINER_MAX_VIDEO_FRAMES="${REFINER_MAX_VIDEO_FRAMES:-9}"
+
+refiner_extra=""
+if [ "${RUN_REFINER}" = "true" ]; then
+    refiner_extra="\"run_refiner\":true,\"refiner_height\":${REFINER_HEIGHT},\"refiner_width\":${REFINER_WIDTH},\"refiner_steps\":${REFINER_STEPS},\"refiner_guidance_scale\":${REFINER_GUIDANCE_SCALE},\"refiner_shift\":${REFINER_SHIFT},\"refiner_t_thresh\":${REFINER_T_THRESH},\"refiner_sigma_tail_steps\":${REFINER_SIGMA_TAIL_STEPS},\"refiner_sample_fps\":${REFINER_SAMPLE_FPS},\"refiner_output_fps\":${REFINER_OUTPUT_FPS},\"refiner_max_video_frames\":${REFINER_MAX_VIDEO_FRAMES}"
+fi
 
 if [ -n "${INPUT_IMAGE:-}" ]; then
     default_output="lingbot_ti2v.mp4"
@@ -29,12 +45,19 @@ curl_args=(
     -F "seed=42"
 )
 if [ -n "${INPUT_IMAGE:-}" ]; then
+    extra_params='{"size":"320x192"}'
+    if [ "${RUN_REFINER}" = "true" ]; then
+        extra_params="{\"size\":\"320x192\",${refiner_extra}}"
+    fi
     curl_args+=(
         -F "input_reference=@${INPUT_IMAGE}"
-        -F 'extra_params={"size":"320x192"}'
+        -F "extra_params=${extra_params}"
     )
 else
     curl_args+=(-F "width=320" -F "height=192")
+    if [ "${RUN_REFINER}" = "true" ]; then
+        curl_args+=(-F "extra_params={${refiner_extra}}")
+    fi
 fi
 
 create_response="$(curl "${curl_args[@]}")"
