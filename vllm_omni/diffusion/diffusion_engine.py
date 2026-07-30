@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+
 __all__ = [
     "DiffusionEngine",
     "DiffusionExecutionMode",
@@ -154,6 +156,10 @@ class DiffusionEngine:
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
 
+    # Class-level default so tests using object.__new__ (without __init__)
+    # don't hit AttributeError when _busy_loop accesses self.dp_concurrent.
+    dp_concurrent: bool = False
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -222,6 +228,29 @@ class DiffusionEngine:
         self.scheduler.initialize(od_config)
 
     def _init_runtime_state(self) -> None:
+        # DP multi-concurrency: allow batching dp_size requests so each
+        # worker processes a different request in parallel.  Only enabled
+        # for distributed layerwise offload (which shards weights and
+        # needs all ranks active simultaneously).  Ordinary DP with a
+        # non-batch pipeline should not schedule multiple requests.
+        dp_size = 1
+        if getattr(self.od_config, "parallel_config", None) is not None:
+            dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
+        dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        if dp_size > 1 and dist_offload:
+            self.scheduler.max_num_running_reqs = dp_size
+            self.dp_concurrent = True
+            # Set batch admission wait so concurrent requests accumulate
+            # before scheduling.  The scheduler reads this from od_config.
+            if getattr(self.od_config, "request_batch_max_wait_ms", 0) == 0:
+                self.od_config.request_batch_max_wait_ms = 500.0
+            logger.info(
+                "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
+                dp_size,
+                self.od_config.request_batch_max_wait_ms,
+            )
+        else:
+            self.dp_concurrent = False
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -288,6 +317,10 @@ class DiffusionEngine:
         generator = self.async_add_req_and_stream_response(request)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            # Async mode: wait for background D2H/SHM to complete.
+            if output.async_output_id:
+                fut = self.executor.wait_output_ready(output.async_output_id)
+                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time
@@ -396,7 +429,7 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
+                if self.supports_request_batch or self.dp_concurrent:
                     self._wait_for_request_batch_admission_locked()
 
                 sched_output = self.scheduler.schedule()
@@ -436,7 +469,7 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
-        if self.step_execution or not self.supports_request_batch:
+        if self.step_execution or (not self.supports_request_batch and not self.dp_concurrent):
             return
 
         max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
@@ -454,9 +487,12 @@ class DiffusionEngine:
         deadline = start + max_wait_s
         last_waiting = -1
         stable_since = start
-        # Require a short idle period with no queue growth so bursty HTTP
-        # ingress can land before the first schedule() of a wave.
-        stable_window_s = min(0.05, max_wait_s / 5.0)
+        # For dp_concurrent, use a longer stable window so all dp_size
+        # HTTP requests have time to land before scheduling.
+        if self.dp_concurrent:
+            stable_window_s = min(0.3, max_wait_s / 2.0)
+        else:
+            stable_window_s = min(0.05, max_wait_s / 5.0)
 
         while not self.stop_event.is_set():
             waiting = self.scheduler.num_waiting_requests()
@@ -744,11 +780,15 @@ class DiffusionEngine:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
                     req_output = runner_output.get_request_output(target_request_id)
-                    return self._finalize_finished_request(
+                    output = self._finalize_finished_request(
                         target_request_id,
                         runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
+                    if output.async_output_id:
+                        fut = self.executor.wait_output_ready(output.async_output_id)
+                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                    return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.
@@ -773,6 +813,27 @@ class DiffusionEngine:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
 
     def run_startup_warmup(self) -> None:
+        dlo_use_allgather = getattr(self.od_config, "dlo_use_allgather", True)
+        # Skip dummy run when AllGather is used with more than 1 rank,
+        # because the dummy run sends only 1 request but AllGather requires
+        # all ranks to participate simultaneously.  This covers both DP > 1
+        # and SP > 1 (where dp_size is derived from sp_size in OffloadConfig).
+        pc = getattr(self.od_config, "parallel_config", None)
+        dp_size = getattr(pc, "data_parallel_size", 1) if pc else 1
+        sp_size = getattr(pc, "sequence_parallel_size", 1) if pc else 1
+        effective_shard_size = max(dp_size, sp_size)
+        skip_dummy = (
+            getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            and dlo_use_allgather
+            and effective_shard_size > 1
+        )
+        if skip_dummy:
+            logger.info(
+                "Skipping dummy run (dist_offload with AllGather, dp_size=%d, sp_size=%d)",
+                dp_size,
+                sp_size,
+            )
+            return
         try:
             self._dummy_run()
         except Exception as e:
@@ -1035,5 +1096,8 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.result is not None:
             return runner_output.result
+
+        if runner_output is not None and runner_output.async_output_id is not None:
+            return DiffusionOutput(async_output_id=runner_output.async_output_id)
 
         return DiffusionOutput(error=missing_result_error)

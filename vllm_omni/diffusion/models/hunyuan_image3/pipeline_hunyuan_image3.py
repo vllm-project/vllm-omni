@@ -71,6 +71,8 @@ _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 
+_HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
+
 
 def default(val, d):
     return val if val is not None else d
@@ -331,6 +333,41 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         return request
 
     return pre_process_func
+
+
+def get_hunyuan_image3_post_process_func(od_config: OmniDiffusionConfig):
+    """GPU tensor → PIL, runs outside pipeline_forward to overlap with next request."""
+    from diffusers.image_processor import VaeImageProcessor
+
+    image_processor = VaeImageProcessor()
+
+    def post_process_func(images: torch.Tensor | dict):
+        # Handle dict envelope format (upstream): {"payload": {"image": ...}, "metadata": ...}
+        if isinstance(images, dict) and "payload" in images:
+            tensor = images["payload"].get("image")
+            if tensor is None:
+                return images
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0)
+            do_denormalize = [True] * tensor.shape[0]
+            images["payload"]["image"] = image_processor.postprocess(
+                tensor,
+                output_type=_HUNYUAN_DEFAULT_OUTPUT_TYPE,
+                do_denormalize=do_denormalize,
+            )
+            return images
+
+        # Legacy raw tensor format
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        do_denormalize = [True] * images.shape[0]
+        return image_processor.postprocess(
+            images,
+            output_type=_HUNYUAN_DEFAULT_OUTPUT_TYPE,
+            do_denormalize=do_denormalize,
+        )
+
+    return post_process_func
 
 
 class HunyuanImage3Pipeline(
@@ -2224,11 +2261,7 @@ class HunyuanImage3Pipeline(
         if hasattr(self.vae, "ffactor_temporal"):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
             image = image.squeeze(2)
-        image = self.pipeline.image_processor.postprocess(
-            image,
-            output_type=output_type,
-            do_denormalize=[True] * image.shape[0],
-        )
+        # Postprocess deferred to engine post_process_func for overlap with next request.
 
         cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
         metadata = {}
