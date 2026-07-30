@@ -117,7 +117,6 @@ class Qwen3OmniNativeDuplexServingAdapter:
                 "1": _DEFAULT_TALKER_MAX_TOKENS,
             },
             "duplex_chunk_period_ms": Qwen3OmniDuplexPolicy.CHUNK_PERIOD_MS,
-            "duplex_samples_per_audio_token": Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN,
         }
         if instructions:
             runtime_config["instructions"] = instructions

@@ -59,20 +59,17 @@ def duplex_scheduler_token_budget(payload: object, runtime_config: dict[str, Any
     """Scheduler token slots to reserve for one appended audio chunk.
 
     The worker must produce exactly this many thinker embeddings for the
-    chunk. If the two disagree the runner truncates or pads silently, so the
-    arithmetic here and the arithmetic in ``stage0.py`` must be derived from
-    the same constants.
+    chunk. If the two disagree the runner truncates or pads silently, so this
+    and ``Qwen3OmniStage0DuplexRuntime.expected_embedding_count`` both defer
+    to ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
     """
-    samples_per_token = (
-        _coerce_int(runtime_config.get("duplex_samples_per_audio_token"))
-        or Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-    )
+    del runtime_config  # token geometry is a checkpoint property, not tunable
     num_samples = 0
     if isinstance(payload, dict):
         num_samples = _coerce_int(payload.get("num_samples")) or 0
     if num_samples <= 0:
-        return Qwen3OmniDuplexPolicy.tokens_per_chunk(samples_per_token=samples_per_token)
-    return max(1, -(-num_samples // samples_per_token))
+        return Qwen3OmniDuplexPolicy.tokens_per_chunk()
+    return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
 
 
 def build_duplex_data_plane_prompt(

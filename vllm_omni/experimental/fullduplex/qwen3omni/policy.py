@@ -22,6 +22,18 @@ class Qwen3OmniDuplexPolicy:
 
     #: Input chunk cadence for a duplex append, in milliseconds.
     #:
+    #: 1000 ms is not arbitrary: the thinker's audio tower splits its conv
+    #: input into ``n_window * 2 == 100`` mel-frame chunks
+    #: (``qwen3_omni_moe_thinker.py``, ``Qwen3OmniMoeAudioEncoder.forward``),
+    #: and at ``hop_length=160`` / 16 kHz that is exactly 16000 samples =
+    #: 1.0 s. A 1 s duplex chunk therefore lands on the model's own conv
+    #: chunk boundary, so per-chunk encoding introduces no convolutional
+    #: boundary error. (The tower's ATTENTION still spans up to
+    #: ``n_window_infer // (n_window * 2) == 8`` such chunks, so streaming
+    #: one chunk at a time remains an approximation at the attention level,
+    #: just not at the conv level.) Changing this value away from a multiple
+    #: of 1 s reintroduces conv boundary error.
+    #:
     #: NOTE this is deliberately far shorter than the 5000 ms segment used by
     #: the half-duplex ``/v1/realtime`` path
     #: (``Qwen3OmniMoeForConditionalGeneration.buffer_realtime_audio``). That
@@ -35,15 +47,10 @@ class Qwen3OmniDuplexPolicy:
     #: Samples consumed per emitted chunk.
     CHUNK_SAMPLES = SAMPLE_RATE_HZ * CHUNK_PERIOD_MS // 1000
 
-    #: Audio samples represented by one thinker embedding slot.
-    #:
-    #: !! UNVERIFIED — MUST be confirmed against the checkpoint before this
-    #: path can work. It determines how many scheduler token slots each
-    #: append reserves; if it is wrong the reservation and the produced
-    #: embedding count disagree and the worker will truncate or pad silently.
-    #: Derive it from the audio tower's mel hop length, conv stride, and any
-    #: pooling ratio rather than trusting this default.
-    SAMPLES_PER_AUDIO_TOKEN = 1600
+    #: Mel-spectrogram hop length. ``WhisperFeatureExtractor`` with
+    #: ``hop_length=160`` at 16 kHz => one mel frame per 10 ms. Verified
+    #: against Qwen3-Omni-30B-A3B-Instruct ``preprocessor_config.json``.
+    MEL_HOP_LENGTH = 160
 
     #: Wire format accepted from the Realtime client. The serving layer
     #: normalizes to this before anything reaches the worker.
@@ -58,17 +65,40 @@ class Qwen3OmniDuplexPolicy:
             "duplex_scheduler_token_id",
             "duplex_scheduler_token_budget",
             "duplex_chunk_period_ms",
-            "duplex_samples_per_audio_token",
         }
     )
 
     #: Client opt-in flag on ``extra_body``.
     ENABLE_FLAG = "qwen3_omni_native_duplex"
 
+    @staticmethod
+    def audio_tokens_for_mel_frames(mel_frames: int) -> int:
+        """Thinker audio tokens produced by ``mel_frames`` mel frames.
+
+        Mirrors ``_get_feat_extract_output_lengths`` in vLLM's
+        ``qwen3_omni_moe_thinker.py`` exactly -- the conv stack's own length
+        arithmetic. Kept as an integer reimplementation rather than an import
+        so the serving layer does not pull in torch, but it MUST stay in sync
+        with that function; ``test_contracts.py`` pins the shared cases.
+
+        Note this is not a linear samples-per-token ratio: the ``// 100 * 13``
+        term makes it 13 tokens per whole second plus a sub-second remainder.
+        A linear approximation is wrong by ~30% (10 vs 13 tokens/s) and would
+        under-reserve scheduler slots, which the model runner absorbs
+        silently by truncating embeddings.
+        """
+        if mel_frames <= 0:
+            return 0
+        leave = mel_frames % 100
+        feat_lengths = (leave - 1) // 2 + 1
+        return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (mel_frames // 100) * 13
+
     @classmethod
-    def tokens_per_chunk(cls, *, samples_per_token: int | None = None) -> int:
-        """Scheduler token slots to reserve for one appended audio chunk."""
-        per_token = samples_per_token or cls.SAMPLES_PER_AUDIO_TOKEN
-        if per_token <= 0:
-            raise ValueError("samples_per_audio_token must be positive")
-        return max(1, -(-cls.CHUNK_SAMPLES // per_token))
+    def audio_tokens_for_samples(cls, num_samples: int) -> int:
+        """Thinker audio tokens produced by ``num_samples`` PCM samples."""
+        return cls.audio_tokens_for_mel_frames(num_samples // cls.MEL_HOP_LENGTH)
+
+    @classmethod
+    def tokens_per_chunk(cls) -> int:
+        """Scheduler token slots to reserve for one whole appended chunk."""
+        return max(1, cls.audio_tokens_for_samples(cls.CHUNK_SAMPLES))

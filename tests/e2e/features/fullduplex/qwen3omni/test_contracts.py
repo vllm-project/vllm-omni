@@ -202,11 +202,39 @@ def test_token_budget_matches_worker_expected_embedding_count() -> None:
     A mismatch is absorbed silently by the model runner (truncate/pad), so
     pin the two calculations together.
     """
-    for num_samples in (1600, 16000, 24000):
+    for num_samples in (1600, 8000, 16000, 24000, 80000):
         payload = _pcm_payload(num_samples)
         assert duplex_scheduler_token_budget(payload, {}) == Qwen3OmniStage0DuplexRuntime.expected_embedding_count(
             num_samples
         )
+
+
+def test_audio_token_geometry_matches_vllm_thinker_formula() -> None:
+    """Pin our integer reimplementation to vLLM's own conv length arithmetic.
+
+    Mirrors ``_get_feat_extract_output_lengths`` in vLLM's
+    ``qwen3_omni_moe_thinker.py``. If that function changes upstream this
+    test must fail -- the serving layer reserves scheduler slots from it, and
+    under-reserving truncates embeddings with no error.
+
+    Derived from Qwen3-Omni-30B-A3B-Instruct: WhisperFeatureExtractor,
+    hop_length=160 @ 16 kHz => 100 mel frames per second => 13 tokens/second.
+    A linear samples-per-token approximation gives 10 and is wrong.
+    """
+
+    def reference(mel_frames: int) -> int:
+        leave = mel_frames % 100
+        feat_lengths = (leave - 1) // 2 + 1
+        return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (mel_frames // 100) * 13
+
+    for mel_frames in range(1, 1001):
+        assert Qwen3OmniDuplexPolicy.audio_tokens_for_mel_frames(mel_frames) == reference(mel_frames)
+
+    # Anchor the headline cases so a silent drift is obvious in the diff.
+    assert Qwen3OmniDuplexPolicy.audio_tokens_for_samples(16000) == 13
+    assert Qwen3OmniDuplexPolicy.audio_tokens_for_samples(8000) == 7
+    assert Qwen3OmniDuplexPolicy.audio_tokens_for_samples(80000) == 65
+    assert Qwen3OmniDuplexPolicy.tokens_per_chunk() == 13
 
 
 # --- sampling params -------------------------------------------------------
@@ -341,7 +369,7 @@ def test_capabilities_do_not_claim_model_native_turn_policy() -> None:
 def test_runtime_config_update_preserves_server_owned_state() -> None:
     adapter = Qwen3OmniServingRuntimeAdapter(lambda *_args: "")
     current = {
-        "duplex_samples_per_audio_token": 1600,
+        "duplex_chunk_period_ms": 1000,
         "duplex_stage_max_tokens": {"0": 64, "1": 8192},
     }
 
@@ -351,7 +379,7 @@ def test_runtime_config_update_preserves_server_owned_state() -> None:
         temperature = None
 
     updated = adapter.runtime_config_for_update(_Config(), current)
-    assert updated["duplex_samples_per_audio_token"] == 1600
+    assert updated["duplex_chunk_period_ms"] == 1000
     assert updated["duplex_stage_max_tokens"]["0"] == 99
     assert updated["duplex_stage_max_tokens"]["1"] == 8192
     assert updated["instructions"] == "be brief"

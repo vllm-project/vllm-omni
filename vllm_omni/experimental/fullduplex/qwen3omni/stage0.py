@@ -59,10 +59,12 @@ Two blockers, both real
 Reservation invariant
 ---------------------
 ``duplex_scheduler_token_budget`` in ``runtime.py`` reserves scheduler slots
-from ``Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN``. This module MUST
-produce exactly that many embeddings per chunk. If the counts disagree the
-model runner truncates or pads without raising, so the two calculations must
-be derived from the same constant and asserted against each other.
+via ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``, which reimplements
+vLLM's ``_get_feat_extract_output_lengths`` (13 tokens per whole second plus
+a sub-second remainder, derived from the checkpoint's Whisper feature
+extractor at ``hop_length=160``). This module MUST produce exactly that many
+embeddings per chunk. If the counts disagree the model runner truncates or
+pads without raising, so both sides call the same helper.
 """
 
 from __future__ import annotations
@@ -141,10 +143,11 @@ class Qwen3OmniStage0DuplexRuntime:
         5. Return embeddings positioned at ``token_offset`` within the
            request's prompt.
 
-        Deriving the frames-per-embedding ratio in step 2 from the
-        checkpoint's audio config -- not from
-        ``Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN``, which is currently
-        an unverified placeholder -- is the first thing to do.
+        The embedding count for step 4 is already settled:
+        ``expected_embedding_count`` implements the checkpoint's own conv
+        length arithmetic. What remains unknown is the receptive-field width
+        needed for ``left_context`` in step 3, which must come from the
+        audio tower's conv stack.
         """
         raise NotImplementedError(
             "Qwen3-Omni stage-0 duplex audio embedding is not implemented. "
@@ -157,12 +160,10 @@ class Qwen3OmniStage0DuplexRuntime:
         )
 
     @staticmethod
-    def expected_embedding_count(num_samples: int, *, samples_per_token: int | None = None) -> int:
+    def expected_embedding_count(num_samples: int) -> int:
         """Embeddings a chunk of ``num_samples`` must produce.
 
-        Must agree with ``runtime.duplex_scheduler_token_budget``.
+        Must agree with ``runtime.duplex_scheduler_token_budget``; both defer
+        to the same checkpoint-derived formula.
         """
-        per_token = samples_per_token or Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-        if per_token <= 0:
-            raise ValueError("samples_per_audio_token must be positive")
-        return max(1, -(-num_samples // per_token))
+        return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
