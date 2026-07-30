@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -888,3 +889,92 @@ def test_hunyuan_image3_build_ar_stage_inputs_comprehension_text_output() -> Non
     )
     assert ar_i2t.modalities == ["text"]
     assert ar_i2t.prompt_token_ids.count(_FakeHunyuanTokenizer.SPECIAL["<img>"]) == 1
+
+
+class _RealIdHunyuanTokenizer:
+    """Mirrors HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS exactly, so validate_ar_tokenizer
+    accepts it -- unlike _FakeHunyuanTokenizer above, whose ids are deliberately
+    wrong to exercise the drift-detection failure path."""
+
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+        )
+
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.get(tok, self.unk_token_id)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return [900 + len(text)]
+
+
+def _patch_hunyuan_autotokenizer(monkeypatch: pytest.MonkeyPatch, tokenizer: object) -> list[str]:
+    """Patch the ``AutoTokenizer`` that ``hunyuan_image3.build_x_to_text_prompt``
+    imports locally, recording the models it was asked to load."""
+    calls: list[str] = []
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str, trust_remote_code: bool = False) -> object:
+            calls.append(model)
+            assert trust_remote_code is True
+            return tokenizer
+
+    fake_transformers = type(sys)("transformers")
+    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    return calls
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_t2t(monkeypatch: pytest.MonkeyPatch) -> None:
+    """t2t (no image) routes through build_ar_stage_inputs and stops on <answer>."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    calls = _patch_hunyuan_autotokenizer(monkeypatch, _RealIdHunyuanTokenizer())
+    prompt_dict, stop_token_ids = hunyuan_build_x_to_text_prompt(
+        "tencent/HunyuanImage-3.0-Instruct", "What is the capital of France?", has_image=False
+    )
+
+    assert calls == ["tencent/HunyuanImage-3.0-Instruct"]
+    assert prompt_dict["modalities"] == ["text"]
+    assert prompt_dict["prompt_token_ids"] is not None
+    assert prompt_dict["prompt_token_ids"].count(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"]) == 0
+    assert stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_i2t(monkeypatch: pytest.MonkeyPatch) -> None:
+    """i2t (image) inserts exactly one <img> placeholder and still stops on <answer>."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    _patch_hunyuan_autotokenizer(monkeypatch, _RealIdHunyuanTokenizer())
+    prompt_dict, stop_token_ids = hunyuan_build_x_to_text_prompt(
+        "tencent/HunyuanImage-3.0-Instruct", "Describe this image.", has_image=True
+    )
+
+    assert prompt_dict["modalities"] == ["text"]
+    assert prompt_dict["prompt_token_ids"].count(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"]) == 1
+    assert stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_validates_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tokenizer whose special-token ids have drifted must be rejected here too --
+    x_to_text.py (unlike text_to_image.py/image_edit.py) has no registry-driven
+    ar_tokenizer_validator wiring of its own, so this seam must self-validate."""
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    _patch_hunyuan_autotokenizer(monkeypatch, _FakeHunyuanTokenizer())
+    with pytest.raises(ValueError, match="no longer match"):
+        hunyuan_build_x_to_text_prompt("tencent/HunyuanImage-3.0-Instruct", "Hello.", has_image=False)

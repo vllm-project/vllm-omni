@@ -19,11 +19,16 @@ def build_x_to_text_prompt(
 
     Routes through :func:`build_ar_stage_inputs`, the same declarative seam
     the shared text_to_image / image_edit examples use, instead of
-    re-deriving the AR prefill and stop-token logic here.
+    re-deriving the AR prefill and stop-token logic here. Unlike those
+    examples -- generic scripts that reach ``validate_ar_tokenizer`` only
+    indirectly via ``get_ar_tokenizer_validator`` -- this function is already
+    HunyuanImage3-specific, so it calls the validator directly rather than
+    requiring the (model-agnostic) ``x_to_text.py`` caller to know about it.
     """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    validate_ar_tokenizer(tokenizer)
     ar_inputs = build_ar_stage_inputs(
         prompt=prompt,
         tokenizer=tokenizer,
