@@ -56,6 +56,7 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+parse_cache_config = functools.partial(parse_json_object, flag_name="--cache-config")
 
 
 def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -165,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-config",
-        type=json.loads,
+        type=parse_cache_config,
         default=None,
         help=(
             "JSON object of cache configuration values that override the example defaults. "
@@ -438,8 +439,6 @@ def main():
         }
 
     if args.cache_config is not None:
-        if not isinstance(args.cache_config, dict):
-            raise ValueError("--cache-config must be a JSON object.")
         cache_config = {**(cache_config or {}), **args.cache_config}
 
     profiler_enabled = args.profiler_config is not None

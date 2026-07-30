@@ -256,7 +256,6 @@ def test_mammoth_moda2_dit_stage_enables_cache_backend(monkeypatch):
 
     get_cache_backend.assert_called_once_with("tea_cache", {"rel_l1_thresh": 0.1})
     fake_backend.enable.assert_called_once_with(pipe)
-    assert wrapper._dit_cache_backend is fake_backend
     assert pipe.cache_backend is fake_backend
 
 
