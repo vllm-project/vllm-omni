@@ -60,6 +60,34 @@ HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "<img_ratio_36>": 130106,
 }
 
+
+def validate_special_token_ids(tokenizer: Any) -> None:
+    """Fail fast if a real tokenizer's ids drift from the hardcoded table.
+
+    ``HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS`` exists so stop-token / trigger-tag
+    resolution doesn't need a tokenizer round-trip, but that only holds as
+    long as the ids match ``tokenizer.json`` for whatever model repo/revision
+    is actually loaded. Call this once a real tokenizer is available (the
+    example scripts do, right after loading it) to catch drift immediately
+    instead of silently producing a request that runs to completion with the
+    wrong stop tokens. Not wired into ``build_prompt_tokens`` itself: callers
+    that intentionally pass a stand-in tokenizer with different ids (e.g.
+    this module's own unit tests) must not be forced through this check.
+    """
+    mismatches = {
+        tok: (expected_id, actual_id)
+        for tok, expected_id in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.items()
+        if (actual_id := tokenizer.convert_tokens_to_ids(tok)) != expected_id
+    }
+    if mismatches:
+        details = ", ".join(f"{tok!r}: expected {exp}, got {act}" for tok, (exp, act) in mismatches.items())
+        raise ValueError(
+            "HunyuanImage-3.0 tokenizer special-token ids no longer match "
+            f"HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS ({details}). The loaded "
+            "tokenizer/model revision has likely changed; update the hardcoded "
+            "table in prompt_utils.py to match."
+        )
+
 # bot_task -> (sys_type, trigger_tag).
 # ``vanilla`` is special-cased downstream: it bypasses the chat template
 # (no ``User:`` / ``Assistant:`` framing) and is only valid with
@@ -398,6 +426,7 @@ def build_ar_prompt_inputs(
 
 __all__ = [
     "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
+    "validate_special_token_ids",
     "MAX_IMAGES_PER_REQUEST",
     "_TASK_PRESETS",
     "ARPromptInputs",

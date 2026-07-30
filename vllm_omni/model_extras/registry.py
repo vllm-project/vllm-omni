@@ -47,6 +47,9 @@ from vllm_omni.model_extras.hunyuan_image3 import (
     build_text_to_image_prompt as build_hunyuan_image3_text_to_image_prompt,
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.hunyuan_image3 import (
+    validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
@@ -261,6 +264,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_hunyuan_image3_text_to_image_prompt,
         "image_to_image_prompt_builder": build_hunyuan_image3_image_to_image_prompt,
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
+        "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
@@ -382,6 +386,20 @@ def get_ar_input_builder(model_class_name: str | None) -> Callable[..., Any] | N
     """
     spec = _get_spec(model_class_name)
     return spec.get("ar_input_builder") if spec is not None else None
+
+
+def get_ar_tokenizer_validator(model_class_name: str | None) -> Callable[[Any], None] | None:
+    """Return a model's AR-tokenizer validator, or ``None`` if undeclared.
+
+    Models whose AR prompt/stop-token logic depends on hardcoded special
+    token ids (e.g. HunyuanImage3) declare an ``ar_tokenizer_validator`` to
+    check those ids against whatever tokenizer actually loads at runtime.
+    The shared task examples call it generically, right after loading a real
+    tokenizer, so model/tokenizer revision drift fails loudly instead of
+    silently producing a request with the wrong stop tokens.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_tokenizer_validator") if spec is not None else None
 
 
 def build_text_to_image_prompt(

@@ -17,6 +17,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt,
     build_prompt_tokens,
     resolve_stop_token_ids,
+    validate_special_token_ids,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -387,3 +388,31 @@ def test_build_ar_prompt_inputs_comprehension_stops_on_answer():
     """Text-output tasks (t2t / i2t) stop on <answer>."""
     ar = build_ar_prompt_inputs("hi", task="t2t")
     assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+class _MatchingTokenizer:
+    """Reports exactly HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS -- a "real" tokenizer
+    that hasn't drifted from the hardcoded table."""
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
+class _DriftedTokenizer:
+    """Reports a different id for one token -- simulates a model/tokenizer
+    revision bump shifting special-token ids out from under the hardcoded
+    table."""
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        if tok == "<think>":
+            return 999999
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
+def test_validate_special_token_ids_passes_for_matching_tokenizer():
+    validate_special_token_ids(_MatchingTokenizer())  # must not raise
+
+
+def test_validate_special_token_ids_raises_on_drift():
+    with pytest.raises(ValueError, match="<think>.*expected 128023.*got 999999"):
+        validate_special_token_ids(_DriftedTokenizer())

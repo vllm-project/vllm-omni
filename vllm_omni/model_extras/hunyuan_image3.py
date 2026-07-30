@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from PIL import Image
@@ -96,6 +96,15 @@ class ARStageInputs:
     picks the AR output type (``["image"]`` for generation, ``["text"]`` for
     comprehension). ``use_system_prompt`` feeds the DiT system-prompt prefix
     and ``stop_token_ids`` terminate the AR decode.
+
+    ``stage_indices`` names which stage(s) in the request's
+    ``sampling_params_list`` these ``stop_token_ids`` belong to -- the shared
+    scripts apply them by explicit index, not by scanning for "whichever
+    stage isn't a diffusion stage." HunyuanImage-3.0's topology always puts
+    its single AR stage at index 0 (see
+    ``vllm_omni.model_executor.models.hunyuan_image3.pipeline``); a future
+    model with multiple AR/understanding stages would declare its own
+    indices here instead of relying on type-based inference.
     """
 
     prompt: str | None
@@ -103,6 +112,7 @@ class ARStageInputs:
     modalities: list[str]
     use_system_prompt: str
     stop_token_ids: list[int]
+    stage_indices: list[int] = field(default_factory=lambda: [0])
 
 
 def build_ar_stage_inputs(
@@ -162,7 +172,25 @@ def build_ar_stage_inputs(
         modalities=["text"] if text_output else ["image"],
         use_system_prompt=resolved.system_prompt_type,
         stop_token_ids=resolved.stop_token_ids,
+        # HunyuanImage-3.0's AR stage is always stage 0 (see pipeline.py's
+        # HUNYUAN_IMAGE3_PIPELINE / _AR_PIPELINE topologies).
+        stage_indices=[0],
     )
+
+
+def validate_ar_tokenizer(tokenizer: Any) -> None:
+    """Registry-declared ``ar_tokenizer_validator`` hook for HunyuanImage3.
+
+    Called by the shared task examples right after they load a *real*
+    tokenizer for the AR stage, so a model/tokenizer revision bump that
+    silently shifts special-token ids fails loudly instead of producing a
+    request that completes with the wrong stop tokens.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        validate_special_token_ids,
+    )
+
+    validate_special_token_ids(tokenizer)
 
 
 # Per-request, model-specific knobs (non-standard sampling-param fields).

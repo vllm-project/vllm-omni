@@ -25,6 +25,7 @@ from vllm_omni.model_extras import (
 )
 from vllm_omni.model_extras import (
     get_ar_input_builder,
+    get_ar_tokenizer_validator,
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
@@ -399,6 +400,8 @@ def _apply_ar_stage_inputs(
     prompt_dict: dict[str, Any],
     sampling_params_list: list[Any],
     text_output: bool = False,
+    trust_remote_code: bool = False,
+    validate_tokenizer: Any | None = None,
 ) -> None:
     """Apply a model's declared AR-stage inputs to the request in place.
 
@@ -407,14 +410,28 @@ def _apply_ar_stage_inputs(
     ``ar_input_builder`` for the AR prefill + stop tokens, then writes them onto
     ``prompt_dict`` and the non-diffusion (AR) stage sampling params. Kept
     model-agnostic: the example only knows the declared-hook contract.
+
+    ``trust_remote_code`` must be threaded in from the caller's own resolved
+    ``--trust-remote-code`` flag -- this is a separate tokenizer load outside
+    the main engine, so it needs the same explicit user opt-in rather than
+    defaulting to trusting whatever ``--model`` was passed.
+
+    ``validate_tokenizer``, when the model declares one via
+    ``get_ar_tokenizer_validator``, is called on a successfully-loaded real
+    tokenizer -- outside the load's try/except, so a validation failure (a
+    model/tokenizer revision drifting from hardcoded special-token ids)
+    raises instead of being swallowed into the string-prompt fallback.
     """
     try:
         from transformers import AutoTokenizer
 
-        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
     except Exception as exc:  # noqa: BLE001 - tokenizer is optional; fall back to string prompt
         logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
         ar_tokenizer = None
+
+    if ar_tokenizer is not None and validate_tokenizer is not None:
+        validate_tokenizer(ar_tokenizer)
 
     ar_inputs = ar_input_builder(
         prompt=prompt_text,
@@ -434,9 +451,15 @@ def _apply_ar_stage_inputs(
         prompt_dict["use_system_prompt"] = ar_inputs.use_system_prompt
     prompt_dict["modalities"] = ar_inputs.modalities
 
-    for params in sampling_params_list:
-        if not isinstance(params, OmniDiffusionSamplingParams) and hasattr(params, "stop_token_ids"):
-            params.stop_token_ids = ar_inputs.stop_token_ids
+    # Apply stop_token_ids to exactly the stage(s) the builder names -- not
+    # "whichever stage isn't a diffusion stage," which would misfire on any
+    # future topology with more than one non-diffusion stage.
+    for stage_index in ar_inputs.stage_indices:
+        if stage_index >= len(sampling_params_list):
+            continue
+        stage_params = sampling_params_list[stage_index]
+        if not isinstance(stage_params, OmniDiffusionSamplingParams) and hasattr(stage_params, "stop_token_ids"):
+            stage_params.stop_token_ids = ar_inputs.stop_token_ids
 
 
 def main():
@@ -689,6 +712,8 @@ def main():
             width=args.width,
             prompt_dict=prompt_dict,
             sampling_params_list=sampling_params_list,
+            trust_remote_code=args.trust_remote_code,
+            validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
         )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)

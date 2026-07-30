@@ -799,6 +799,19 @@ def test_hunyuan_image3_ar_input_builder_registered() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_hunyuan_image3_ar_tokenizer_validator_registered() -> None:
+    from vllm_omni.model_extras import get_ar_tokenizer_validator
+
+    validator = get_ar_tokenizer_validator("HunyuanImage3Pipeline")
+    assert validator is not None
+    assert get_ar_tokenizer_validator("HunyuanImage3ForCausalMM") is validator
+    # Models without the hook return None.
+    assert get_ar_tokenizer_validator("MammothModa2DiTPipeline") is None
+    assert get_ar_tokenizer_validator(None) is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_hunyuan_image3_build_ar_stage_inputs_t2i_string_fallback() -> None:
     from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
 
@@ -817,6 +830,9 @@ def test_hunyuan_image3_build_ar_stage_inputs_t2i_string_fallback() -> None:
     assert ar.modalities == ["image"]
     assert ar.use_system_prompt
     assert len(ar.stop_token_ids) == 1
+    # stop_token_ids belong to stage 0 (HunyuanImage3's single AR stage) --
+    # declared explicitly, not inferred by the caller from stage type.
+    assert ar.stage_indices == [0]
 
 
 @pytest.mark.core_model
