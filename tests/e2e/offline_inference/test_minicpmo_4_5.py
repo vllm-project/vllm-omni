@@ -14,7 +14,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 models = ["openbmb/MiniCPM-o-4_5"]
 
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 
 test_params = [(model, None, {"deploy_config": _CI_DEPLOY, "trust_remote_code": True}) for model in models]
@@ -31,11 +31,10 @@ def get_question(prompt_type: str = "text") -> str:
     return prompts.get(prompt_type, prompts["text"])
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing text, generating text output."""
@@ -45,7 +44,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing audio, generating text output."""
@@ -58,7 +57,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing image, generating text output."""
@@ -69,7 +68,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating text output."""
@@ -80,19 +79,18 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
-    """Test processing text, generating audio output through the talker token2wav path."""
+    """Test processing text and generating audio through Talker and Code2Wav."""
     request_config = {"prompts": get_question("text"), "modalities": ["audio"]}
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing mixed modalities (image + audio), generating audio output."""
@@ -111,7 +109,7 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating audio output."""

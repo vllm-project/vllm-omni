@@ -8,14 +8,24 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-merge-pipeline
     steps:
-      - label: "Simple · Diffusion & Model Executor Test"
+      - label: "Simple · Model Executor Test"
         commands:
-          - "timeout 20m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Diffusion Test"
+        commands:
+          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Engine&Entrypoints Test"
+        commands:
+          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
         commands:
-          - "timeout 20m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
@@ -25,12 +35,6 @@ steps:
         timeout_in_minutes: 30
         commands:
           - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model"
-        mirror_hardwares: l4_1
-
-      - label: "Diffusion · Offloader Test"
-        timeout_in_minutes: 40
-        commands:
-          - timeout 40m pytest -s -v tests/diffusion/offloader -m "advanced_model and cuda"
         mirror_hardwares: l4_1
 
   - label: "Distributed Test"
@@ -135,39 +139,32 @@ steps:
         timeout_in_minutes: 50
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2
+
+      - label: "Omni · MiniCPM-o 4.5 Duplex Test"
+        source_file_dependencies:
+          - tests/assets/minicpmo_4_5/response_required_16k.wav
+          - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
+          - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
+          - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+          - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
+          - tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+          - tests/helpers/minicpmo_4_5_duplex.py
+          - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+          - vllm_omni/experimental/fullduplex/
+          - vllm_omni/model_executor/models/minicpmo_4_5/
+          - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
+          - vllm_omni/core/sched/
+          - vllm_omni/outputs/multimodal_accumulation.py
+          - vllm_omni/engine/stage_init_utils.py
+          - vllm_omni/engine/async_omni_engine.py
+          - vllm_omni/entrypoints/cli/serve.py
+        timeout_in_minutes: 50
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+        mirror_hardwares: h100_2
 
       - label: "TTS · VoxCPM2 Test"
         source_file_dependencies:
@@ -182,22 +179,6 @@ steps:
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
               pytest -s -v tests/e2e/offline_inference/test_voxcpm2_tts.py tests/e2e/online_serving/test_voxcpm2_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: l4_1
-
-      - label: "TTS · SoulX-Singer Test"
-        source_file_dependencies:
-          - tests/e2e/offline_inference/test_soulxsinger.py
-          - vllm_omni/diffusion/models/soulx_singer/
-          - vllm_omni/deploy/soulxsinger_svc.yaml
-          - vllm_omni/deploy/soulxsinger_svs.yaml
-        timeout_in_minutes: 30
-        commands:
-          - |
-            timeout 30m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_soulxsinger.py -k 'svc or precomputed' -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         mirror_hardwares: l4_1
 

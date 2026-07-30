@@ -270,6 +270,11 @@ class OmniStageModelConfig:
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
+    # Per-stage checkpoint/tokenizer subdirectories under the model root
+    # (e.g. Audex stage 0 → checkpoint_folder_audiogen). Mirrors
+    # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
+    model_subdir: str | None = None
+    tokenizer_subdir: str | None = None
 
 
 @config
@@ -363,7 +368,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    cfg_parallel_size: int = Field(default=1, ge=1, le=3)
+    cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
@@ -469,6 +474,8 @@ class _DiffusionConfigProjection:
     output_type: str = "pil"
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -1117,6 +1124,10 @@ def _build_model_config(
     kwargs = _config_kwargs(engine)
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
+    if "model_subdir" not in kwargs and topology.model_subdir is not None:
+        kwargs["model_subdir"] = topology.model_subdir
+    if "tokenizer_subdir" not in kwargs and topology.tokenizer_subdir is not None:
+        kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
         **kwargs,

@@ -767,11 +767,53 @@ def build_engine_args_dict(
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
+    pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    audex_stage = str(engine_args_dict.get("model_stage") or "")
+    if audex_stage == "audex_xcodec":
+        # TTA stage 1 decodes with the external XCodec1 checkpoint, not a
+        # subfolder of the Audex repo: the source comes from XCODEC1_PATH,
+        # the stage yaml's own ``model`` entry, or the default HF repo — the
+        # pipeline-level model (the Audex root) is never a valid source.
+        from vllm_omni.model_executor.models.audex.checkpoint import (
+            ensure_audex_snapshot,
+            ensure_xcodec1_snapshot,
+        )
+
+        stage_model = None if model == pipeline_model_root else model
+        model = ensure_xcodec1_snapshot(os.environ.get("XCODEC1_PATH") or stage_model)
+        if not stage_defines_tokenizer:
+            # XCodec1 ships no tokenizer files; borrow the thinker's (same
+            # workaround as the TTS decoder stage).
+            audex_root = ensure_audex_snapshot(pipeline_model_root, profile="tta")
+            engine_args_dict["tokenizer"] = os.path.join(audex_root, "checkpoint_folder_audiogen")
+            stage_defines_tokenizer = True
+    elif audex_stage.startswith("audex"):
+        # Audex users pass the HF repo ROOT; make sure the required snapshot
+        # subset exists locally BEFORE subdir resolution, otherwise the
+        # subdirs get joined onto the raw repo id on a fresh cache. The
+        # profile keeps TTS-only deployments from pulling the full-checkpoint
+        # extras.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+        if audex_stage == "audex_omni":
+            audex_profile = "full"
+        elif audex_stage == "audex_tta_thinker":
+            audex_profile = "tta"
+        else:
+            audex_profile = "tts"
+        model = ensure_audex_snapshot(model, profile=audex_profile)
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
+    if engine_args_dict.get("model_stage") in ("audex_thinker", "audex_tta_thinker"):
+        # Audex ships its thinker weights deduplicated into a sibling folder;
+        # replicate the official prepare-script symlink on first use. The TTA
+        # thinker loads the same checkpoint_folder_audiogen checkpoint.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audiogen_weights
+
+        ensure_audiogen_weights(model)
     apply_cli_tokenizer(
         engine_args_dict,
         cli_tokenizer=cli_tokenizer,
@@ -1197,3 +1239,26 @@ def initialize_diffusion_stage(
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+
+
+def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
+    """Install the Audex CFG scheduler patches for CFG-configured engines.
+
+    Must run in the engine-core process BEFORE ``Scheduler`` is constructed:
+    the patch wraps ``Scheduler.__init__`` to add the pair registry, so a
+    scheduler built earlier would never become pair-aware. Gated on the
+    engine's ``logits_processors`` so non-CFG stages stay untouched.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    processors = getattr(model_config, "logits_processors", None) or []
+    if not any("AudexCFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+        return
+
+    from vllm_omni.model_executor.models.audex.cfg import apply_cfg_patches
+
+    apply_cfg_patches()
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if not getattr(Scheduler.schedule, "_audex_cfg_patched", False):
+        raise RuntimeError("Audex CFG scheduler patches failed to install before Scheduler construction")

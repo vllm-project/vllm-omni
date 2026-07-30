@@ -37,6 +37,7 @@ from vllm_omni.model_extras.helios import (
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -222,6 +223,16 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "LingBotVideoPipeline": {
         "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    **{
+        model_class_name: {
+            "extra_body_params": LTX_EXTRA_BODY_PARAMS,
+            "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+        }
+        for model_class_name in (
+            "LTX2Pipeline",
+            "LTX2DistilledPipeline",
+        )
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
