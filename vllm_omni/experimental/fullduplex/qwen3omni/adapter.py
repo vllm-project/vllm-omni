@@ -23,6 +23,10 @@ from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPo
 #: chunk-terminating control token, so this budget is the only stop
 #: condition for a segment.
 _DEFAULT_STAGE0_MAX_TOKENS = 256
+
+#: Used when the client sets no `instructions`. The thinker needs a system
+#: turn for the chat template to be well-formed.
+_DEFAULT_INSTRUCTIONS = "You are a helpful voice assistant. Reply naturally and concisely."
 _DEFAULT_TALKER_MAX_TOKENS = 8192
 
 
@@ -97,10 +101,41 @@ class Qwen3OmniNativeDuplexServingAdapter:
             target_barge_in_latency_ms=None,
         )
 
+    @staticmethod
+    def _scaffolding_token_ids(instructions: object, *, model_config: Any) -> dict[str, object]:
+        """Pre-tokenize the conversation scaffolding for the worker.
+
+        The thinker needs chat-template framing around the audio embeddings;
+        without it there is nothing instructing the model to reply and it
+        emits EOS on the first token.
+
+        Tokenizing here rather than in the worker means the engine's slot
+        reservation and the worker's produced-embedding count are derived
+        from the same token ids, which is the invariant the model runner
+        silently violates on mismatch.
+        """
+        try:
+            from vllm.tokenizers import cached_tokenizer_from_config
+
+            tokenizer = cached_tokenizer_from_config(model_config)
+        except Exception:  # noqa: BLE001 - no tokenizer, fall back to no scaffolding
+            return {}
+
+        def encode(text: str) -> list[int]:
+            return [int(token_id) for token_id in tokenizer.encode(text)]
+
+        session_prefix = Qwen3OmniDuplexPolicy.SESSION_PREFIX_TEMPLATE.format(
+            instructions=instructions if isinstance(instructions, str) and instructions else _DEFAULT_INSTRUCTIONS
+        )
+        return {
+            Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY: encode(session_prefix),
+            Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY: encode(Qwen3OmniDuplexPolicy.TURN_PREFIX),
+            Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY: encode(Qwen3OmniDuplexPolicy.TURN_SUFFIX),
+        }
+
     @classmethod
     async def prepare_runtime_config(cls, config: object, *, model_config: Any) -> dict[str, object]:
         """Build the server-owned runtime config shipped to the engine."""
-        del model_config  # no client media to resolve on this path
         cls.validate_client_extra_body(getattr(config, "extra_body", None))
 
         max_tokens = _positive_int(getattr(config, "max_tokens", None)) or _DEFAULT_STAGE0_MAX_TOKENS
@@ -118,6 +153,7 @@ class Qwen3OmniNativeDuplexServingAdapter:
             },
             "duplex_chunk_period_ms": Qwen3OmniDuplexPolicy.CHUNK_PERIOD_MS,
         }
+        runtime_config.update(cls._scaffolding_token_ids(instructions, model_config=model_config))
         if instructions:
             runtime_config["instructions"] = instructions
         if stage0_sampling:

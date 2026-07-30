@@ -55,21 +55,67 @@ def _stage_config_value(runtime_config: dict[str, Any], key: str, stage_id: int)
     return None
 
 
-def duplex_scheduler_token_budget(payload: object, runtime_config: dict[str, Any]) -> int:
-    """Scheduler token slots to reserve for one appended audio chunk.
+def duplex_audio_token_count(payload: object) -> int:
+    """Thinker embeddings the appended audio will produce.
 
-    The worker must produce exactly this many thinker embeddings for the
-    chunk. If the two disagree the runner truncates or pads silently, so this
-    and ``Qwen3OmniStage0DuplexRuntime.expected_embedding_count`` both defer
-    to ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
+    The worker must produce exactly this many. If the two disagree the runner
+    truncates or pads silently, so this and
+    ``Qwen3OmniStage0DuplexRuntime.expected_embedding_count`` both defer to
+    ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
     """
-    del runtime_config  # token geometry is a checkpoint property, not tunable
     num_samples = 0
     if isinstance(payload, dict):
         num_samples = _coerce_int(payload.get("num_samples")) or 0
     if num_samples <= 0:
         return Qwen3OmniDuplexPolicy.tokens_per_chunk()
     return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
+
+
+def _token_ids(runtime_config: dict[str, Any], key: str) -> list[int]:
+    raw = runtime_config.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [int(token_id) for token_id in raw]
+
+
+def build_duplex_prompt_token_ids(
+    *,
+    runtime_config: dict[str, Any],
+    payload: object,
+    seq: int,
+    turn_seq: int,
+    final: bool,
+) -> tuple[list[int], int, int]:
+    """Assemble the stage-0 prompt for one append.
+
+    Returns ``(prompt_token_ids, audio_offset, audio_token_count)``.
+
+    Layout, so the thinker sees a well-formed chat turn rather than a bare
+    blob of audio embeddings:
+
+    * first append of the session -- system block, then the user turn opener
+    * first append of any later turn -- the user turn opener
+    * every append -- ``<|audio_pad|>`` placeholders that stage 0 overwrites
+      with audio embeddings
+    * final append of a turn -- close the user turn and open the assistant's,
+      which is what actually prompts a reply
+
+    Real token ids are used for the scaffolding (not filler), so the worker
+    can embed those positions through the ordinary embedding lookup and only
+    needs to replace the audio span. ``audio_offset`` tells it where that
+    span begins.
+    """
+    prefix: list[int] = []
+    if seq <= 1:
+        prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY)
+    if turn_seq <= 1:
+        prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
+
+    audio_tokens = duplex_audio_token_count(payload)
+    suffix = _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY) if final else []
+
+    prompt_token_ids = prefix + [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens + suffix
+    return prompt_token_ids, len(prefix), audio_tokens
 
 
 def build_duplex_data_plane_prompt(
@@ -104,10 +150,15 @@ def build_duplex_data_plane_prompt(
     (``gpu_model_runner.py:2035-2042``), so a conditionally-omitted key would
     leave the previous append's value in place rather than clearing it.
     """
-    token_budget = duplex_scheduler_token_budget(payload, runtime_config)
-    token_id = max(0, _coerce_int(runtime_config.get("duplex_scheduler_token_id")) or 0)
+    prompt_token_ids, audio_offset, audio_tokens = build_duplex_prompt_token_ids(
+        runtime_config=runtime_config,
+        payload=payload,
+        seq=seq,
+        turn_seq=turn_seq,
+        final=final,
+    )
     return {
-        "prompt_token_ids": [token_id] * token_budget,
+        "prompt_token_ids": prompt_token_ids,
         "model_intermediate_buffer": {
             "request_id": request_id,
             # Session-scoped id used for cross-stage chunk routing
@@ -129,8 +180,12 @@ def build_duplex_data_plane_prompt(
                 "final": final,
                 "session_config": dict(session_config),
                 "runtime_config": dict(runtime_config),
-                "scheduler_token_budget": token_budget,
-                "scheduler_token_id": token_id,
+                "scheduler_token_budget": len(prompt_token_ids),
+                # Where stage 0 must splice the audio embeddings, and how
+                # many. Everything outside this span is real scaffolding
+                # tokens that embed through the ordinary lookup.
+                "audio_offset": audio_offset,
+                "audio_tokens": audio_tokens,
             },
         },
     }

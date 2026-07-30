@@ -763,6 +763,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             # come up empty and pad-fill over generated tokens.
             return input_ids, self._thinker_input_embeds(input_ids, input_embeds), {}
 
+        # Scaffolding positions (system block, turn openers, the assistant
+        # generation prompt) hold real token ids, so the ordinary embedding
+        # lookup is already correct for them. Only the `<|audio_pad|>` span
+        # needs replacing.
         base_embeds = self._thinker_input_embeds(input_ids, input_embeds)
         audio_embeds = self._duplex_stage0_runtime().build_append_embeddings(
             duplex=duplex,
@@ -774,16 +778,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             return input_ids, base_embeds, {}
 
         offset = int(token_offset) if isinstance(token_offset, int) else 0
+        audio_start = int(duplex.get("audio_offset") or 0)
         span = base_embeds.shape[0]
-        window = audio_embeds[offset : offset + span].to(
-            device=base_embeds.device,
-            dtype=base_embeds.dtype,
-        )
-        if window.shape[0] == 0:
+
+        # Intersect the audio span with the slice of the prompt this call
+        # covers; the runner may split a prompt across several calls.
+        start = max(audio_start - offset, 0)
+        take_from = max(offset - audio_start, 0)
+        window = audio_embeds[take_from : take_from + max(span - start, 0)]
+        if start >= span or window.shape[0] == 0:
             return input_ids, base_embeds, {}
 
         req_embeds = base_embeds.clone()
-        req_embeds[: window.shape[0]] = window
+        req_embeds[start : start + window.shape[0]] = window.to(
+            device=base_embeds.device,
+            dtype=base_embeds.dtype,
+        )
         return (
             input_ids,
             req_embeds,

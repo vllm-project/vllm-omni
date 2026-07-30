@@ -56,6 +56,34 @@ class Qwen3OmniDuplexPolicy:
     #: normalizes to this before anything reaches the worker.
     PCM_FORMAT = "pcm_f32le"
 
+    #: ``<|audio_pad|>``. Occupies the prompt positions that stage 0 overwrites
+    #: with audio embeddings, so the token ids stay meaningful rather than
+    #: being filler. Matches ``qwen3_omni.py:AUDIO_PAD_TOKEN_ID``.
+    AUDIO_PAD_TOKEN_ID = 151675
+
+    #: Conversation scaffolding.
+    #:
+    #: Without this the thinker receives bare audio embeddings with no
+    #: instruction to reply and emits EOS immediately. These mirror the
+    #: framing the half-duplex path already uses in
+    #: ``Qwen3OmniMoeForConditionalGeneration.buffer_realtime_audio``, so
+    #: duplex and half-duplex present the model with the same shape.
+    #:
+    #: Emitted once per session, ahead of the first user turn.
+    SESSION_PREFIX_TEMPLATE = "<|im_start|>system\n{instructions}<|im_end|>\n"
+    #: Opens each user turn.
+    TURN_PREFIX = "<|im_start|>user\n"
+    #: Closes the user turn and hands the floor to the assistant.
+    TURN_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+
+    #: Runtime-config keys carrying the pre-tokenized scaffolding. Tokenizing
+    #: happens once in the serving layer, where the tokenizer lives; the
+    #: worker only embeds the ids. This keeps the engine's slot reservation
+    #: and the worker's produced-embedding count derived from one source.
+    SESSION_PREFIX_IDS_KEY = "duplex_session_prefix_token_ids"
+    TURN_PREFIX_IDS_KEY = "duplex_turn_prefix_token_ids"
+    TURN_SUFFIX_IDS_KEY = "duplex_turn_suffix_token_ids"
+
     #: Server-owned runtime-config keys. A client that sets any of these in
     #: ``extra_body`` is rejected rather than silently overridden.
     PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
@@ -65,6 +93,9 @@ class Qwen3OmniDuplexPolicy:
             "duplex_scheduler_token_id",
             "duplex_scheduler_token_budget",
             "duplex_chunk_period_ms",
+            "duplex_session_prefix_token_ids",
+            "duplex_turn_prefix_token_ids",
+            "duplex_turn_suffix_token_ids",
         }
     )
 

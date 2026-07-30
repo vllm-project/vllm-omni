@@ -33,7 +33,8 @@ from vllm_omni.experimental.fullduplex.qwen3omni.input import Qwen3OmniPcmAppend
 from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPolicy
 from vllm_omni.experimental.fullduplex.qwen3omni.runtime import (
     Qwen3OmniDuplexRuntimeExtension,
-    duplex_scheduler_token_budget,
+    build_duplex_prompt_token_ids,
+    duplex_audio_token_count,
 )
 from vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter import (
     Qwen3OmniServingRuntimeAdapter,
@@ -204,9 +205,7 @@ def test_token_budget_matches_worker_expected_embedding_count() -> None:
     """
     for num_samples in (1600, 8000, 16000, 24000, 80000):
         payload = _pcm_payload(num_samples)
-        assert duplex_scheduler_token_budget(payload, {}) == Qwen3OmniStage0DuplexRuntime.expected_embedding_count(
-            num_samples
-        )
+        assert duplex_audio_token_count(payload) == Qwen3OmniStage0DuplexRuntime.expected_embedding_count(num_samples)
 
 
 def test_audio_token_geometry_matches_vllm_thinker_formula() -> None:
@@ -399,11 +398,93 @@ def test_session_state_satisfies_committed_audio_contract() -> None:
     assert adapter.session_state("sess-1") is not state
 
 
-# --- the unimplemented boundary -------------------------------------------
+# --- stage-0 boundary ------------------------------------------------------
 
 
-def test_stage0_audio_embedding_is_explicitly_unimplemented() -> None:
-    """Fails loudly rather than silently producing wrong embeddings."""
+def test_stage0_fails_loudly_without_a_usable_thinker_stage() -> None:
+    """Never silently no-ops: a bad stage raises rather than dropping audio."""
     runtime = Qwen3OmniStage0DuplexRuntime(object())
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        runtime.build_append_embeddings(duplex={}, token_offset=0, prompt_len=10)
+    with pytest.raises(RuntimeError, match="Qwen3-Omni duplex stage 0"):
+        runtime.build_append_embeddings(
+            duplex={"session_id": "s", "incarnation": 0, "payload": _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES)},
+            token_offset=0,
+            prompt_len=13,
+        )
+
+
+# --- conversation scaffolding ----------------------------------------------
+
+_SCAFFOLD = {
+    Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY: [1, 2, 3],
+    Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY: [4, 5],
+    Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY: [6, 7, 8],
+}
+_PAD = Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID
+
+
+def _prompt(*, seq: int, turn_seq: int, final: bool, samples: int = Qwen3OmniDuplexPolicy.CHUNK_SAMPLES):
+    return build_duplex_prompt_token_ids(
+        runtime_config=dict(_SCAFFOLD),
+        payload=_pcm_payload(samples),
+        seq=seq,
+        turn_seq=turn_seq,
+        final=final,
+    )
+
+
+def test_session_opener_carries_system_block_and_user_turn() -> None:
+    ids, audio_offset, audio_tokens = _prompt(seq=1, turn_seq=1, final=False)
+    assert ids[:5] == [1, 2, 3, 4, 5], "session prefix then turn prefix"
+    assert audio_offset == 5
+    assert audio_tokens == 13
+    assert ids[5:] == [_PAD] * 13
+
+
+def test_mid_turn_append_has_no_scaffolding() -> None:
+    """Only audio: the turn is already open and not yet closed."""
+    ids, audio_offset, audio_tokens = _prompt(seq=2, turn_seq=2, final=False)
+    assert audio_offset == 0
+    assert ids == [_PAD] * audio_tokens
+
+
+def test_later_turn_reopens_user_without_repeating_system_block() -> None:
+    ids, audio_offset, _ = _prompt(seq=9, turn_seq=1, final=False)
+    assert ids[:2] == [4, 5]
+    assert audio_offset == 2, "system block belongs to the session, not each turn"
+
+
+def test_final_append_closes_user_and_opens_assistant() -> None:
+    """This suffix is what actually prompts a reply."""
+    ids, _, audio_tokens = _prompt(seq=3, turn_seq=3, final=True)
+    assert ids[-3:] == [6, 7, 8]
+    assert ids == [_PAD] * audio_tokens + [6, 7, 8]
+
+
+def test_prompt_length_equals_reservation() -> None:
+    """Budget must equal produced embeddings; the runner truncates silently."""
+    for seq, turn_seq, final in ((1, 1, False), (2, 2, False), (3, 3, True), (9, 1, True)):
+        ids, audio_offset, audio_tokens = _prompt(seq=seq, turn_seq=turn_seq, final=final)
+        scaffold = len(ids) - audio_tokens
+        assert audio_offset + audio_tokens <= len(ids)
+        assert ids.count(_PAD) == audio_tokens, "audio span is exactly the pad tokens"
+        assert scaffold == audio_offset + (3 if final else 0)
+
+
+def test_audio_span_is_contiguous_and_located_by_audio_offset() -> None:
+    ids, audio_offset, audio_tokens = _prompt(seq=1, turn_seq=1, final=True)
+    assert ids[audio_offset : audio_offset + audio_tokens] == [_PAD] * audio_tokens
+    assert _PAD not in ids[:audio_offset]
+    assert _PAD not in ids[audio_offset + audio_tokens :]
+
+
+def test_missing_scaffolding_degrades_to_audio_only() -> None:
+    """No tokenizer at config time must not crash the append path."""
+    ids, audio_offset, audio_tokens = build_duplex_prompt_token_ids(
+        runtime_config={},
+        payload=_pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
+        seq=1,
+        turn_seq=1,
+        final=True,
+    )
+    assert audio_offset == 0
+    assert ids == [_PAD] * audio_tokens
