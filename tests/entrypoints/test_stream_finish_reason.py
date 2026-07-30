@@ -16,10 +16,22 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
+import base64
+import enum
 import json
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+
+# Python 3.10 compat: StrEnum was added in 3.11
+if not hasattr(enum, "StrEnum"):
+
+    class _StrEnum(str, enum.Enum):
+        """Minimal StrEnum backport for Python 3.10."""
+
+    enum.StrEnum = _StrEnum  # type: ignore[attr-defined]
+
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
@@ -140,7 +152,7 @@ def _build_serving_chat():
         chat_template_content_format="auto",
     )
     instance._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
+        side_effect=lambda omni_res, role, request, stream=False, first_chunk=True: _mock_audio_choices(
             index=omni_res.request_output.outputs[0].index,
             role=role,
         )
@@ -399,6 +411,70 @@ async def test_declared_modality_not_produced_text_finish_suppressed():
 
 
 @pytest.mark.asyncio
+async def test_streaming_wav_header_is_only_in_first_chunk():
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["audio"])
+    request.audio = {"format": "wav", "voice": "alloy"}
+
+    empty_audio = _make_audio_omni_output()
+    empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
+    first_audio = _make_audio_omni_output()
+    first_audio.request_output.outputs[0].multimodal_output = {
+        "audio": torch.linspace(-0.5, 0.5, 100),
+        "sr": 16000,
+    }
+    second_audio = _make_audio_omni_output()
+    second_audio.request_output.outputs[0].multimodal_output = {
+        "audio": torch.linspace(-0.5, 0.5, 100),
+        "sr": 16000,
+    }
+
+    def create_audio_choice(omni_res, role, request, stream=False, first_chunk=True):
+        return OmniOpenAIServingChat._create_audio_choice(
+            serving_chat,
+            omni_res,
+            role,
+            request,
+            stream=stream,
+            first_chunk=first_chunk,
+        )
+
+    serving_chat._create_audio_choice = create_audio_choice
+
+    async def result_generator():
+        yield empty_audio
+        yield first_audio
+        yield second_audio
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    chunks = _parse_sse_chunks(raw_lines)
+    audio_chunks = [
+        base64.b64decode(choice["delta"]["content"])
+        for chunk in chunks
+        if chunk.get("modality") == "audio"
+        for choice in chunk["choices"]
+        if choice.get("delta", {}).get("content")
+    ]
+
+    assert len(audio_chunks) == 2
+    assert audio_chunks[0][:4] == b"RIFF"
+    assert int.from_bytes(audio_chunks[0][24:28], "little") == 16000
+    assert audio_chunks[1][:4] != b"RIFF"
+    assert audio_chunks[0][44:] == audio_chunks[1]
+
+
+@pytest.mark.asyncio
 async def test_audio_chunk_without_waveform_keeps_stream_alive():
     """An audio message with no PCM must not break the stream.
 
@@ -413,8 +489,15 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     empty_audio = _make_audio_omni_output()
     empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
 
-    def create_audio_choice(omni_res, role, request, stream=False):
-        return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
+    def create_audio_choice(omni_res, role, request, stream=False, first_chunk=True):
+        return OmniOpenAIServingChat._create_audio_choice(
+            serving_chat,
+            omni_res,
+            role,
+            request,
+            stream=stream,
+            first_chunk=first_chunk,
+        )
 
     serving_chat._create_audio_choice = create_audio_choice
 
@@ -451,7 +534,9 @@ async def test_audio_choice_error_response_is_not_iterated_as_choices():
     request = _make_request(modalities=["text", "audio"])
 
     serving_chat._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
+        side_effect=lambda omni_res, role, request, stream=False, first_chunk=True: (
+            serving_chat._create_error_response("boom")
+        )
     )
 
     async def result_generator():
