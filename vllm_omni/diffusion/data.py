@@ -433,7 +433,9 @@ class DiffusionCacheConfig:
     # "forecast50" (default): use the two latest fresh observations and a
     # damped first-order prediction (nominal gain 0.5, with a trust-region cap
     # to prevent early-step overshoot); "reuse": return the latest fresh hints.
-    # The published <=8% DINOv2 quality result uses forecast50.
+    # The published <=8% mean-DINOv2 quality result uses forecast50. This
+    # strategy retains two full hint sets per active branch and can materially
+    # increase peak VRAM; see the reference-hint cache guide.
     ref_hint_strategy: str = "forecast50"
     # Any skipped hint computation is approximate and must be explicitly acknowledged.
     # ref_hint_refresh_interval=1 recomputes every step and is exempt.
