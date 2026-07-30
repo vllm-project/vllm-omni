@@ -799,6 +799,7 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
 def test_realtime_duplex_demo_partitions_timing_by_response_identity():
     demo = _load_demo_module()
     state = demo.DemoState()
+    state.input_commit_sent_at_s.extend((9.9, 19.9))
     for response_id, created_at_s, audio_at_s, token_count in (
         ("resp-1", 10.0, 10.1, 3),
         ("resp-2", 20.0, 20.2, 5),
@@ -826,15 +827,58 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             },
             received_at_s=audio_at_s,
         )
+        state.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": "audio",
+            },
+            received_at_s=created_at_s + 0.05,
+        )
 
     timings = state.response_timing_summaries()
+    requests = state.session_request_metrics(session_id="seed-tts-session")
 
     assert timings["resp-1"]["stage0_tokens"]["output_token_count"] == 3
     assert timings["resp-1"]["audio_output"]["response_created_to_first_audio_ms"] == 100.0
-    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] == 200.0
     assert timings["resp-2"]["stage0_tokens"]["output_token_count"] == 5
     assert timings["resp-2"]["audio_output"]["response_created_to_first_audio_ms"] == 200.0
-    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] == 300.0
+    assert requests == [
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 0,
+            "response_id": "resp-1",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 200.0,
+            "rtf": 2.5,
+            "audio_generation_ms": 200.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 1,
+            "response_id": "resp-2",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 300.0,
+            "rtf": 3.75,
+            "audio_generation_ms": 300.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+    ]
 
 
 def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():

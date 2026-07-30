@@ -1,0 +1,47 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100",
+            "npu": "A3"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "no_oversample": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "save_duplex_request_metrics": true
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]
