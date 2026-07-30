@@ -5,8 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
-            "npu": "A3"
+            "cuda": "H100"
           },
           "num_cards": 1
         }
@@ -53,7 +52,7 @@
             "use_tts_template": true
           }
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "request_throughput": [
             0.7803,
@@ -66,12 +65,6 @@
             307.7133,
             323.584,
             356.6077
-          ],
-          "mean_tpot_ms": [
-            1.0,
-            1.0,
-            1.0,
-            1.0
           ],
           "mean_e2el_ms": [
             1361.1682,
