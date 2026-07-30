@@ -133,7 +133,9 @@ def build_engine_core_request_from_tokens(
 
     sampling_params = None
     pooling_params = None
-    if isinstance(params, SamplingParams):
+    if params is None:
+        sampling_params = SamplingParams(max_tokens=model_config.max_model_len - len(prompt_token_ids)) if model_config else SamplingParams()
+    elif isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
