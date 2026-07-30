@@ -10,9 +10,7 @@ This section contains design documents and architecture specifications for vLLM-
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
-- [Adding Step Execution Support for Diffusion Pipelines](feature/diffusion_step_execution.md)
-- [Request-Level Batching for Diffusion](feature/diffusion_request_level_batching.md)
-- [Continuous Batching for Step-Wise Diffusion](feature/diffusion_continuous_batching.md)
+- [Diffusion Execution Modes](feature/diffusion_execution_modes.md)
 
 ## Infrastructure Design Documents
 
