@@ -28,7 +28,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTextPrompt
 
 
-def test_audio(model_path: str, llm: Omni, out_dir: str) -> dict:
+def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dict:
     result: dict = {"modality": "audio"}
 
     ref_voice_path = os.path.join(model_path, "assets", "vc_zh3.wav")
@@ -110,7 +110,7 @@ def test_audio(model_path: str, llm: Omni, out_dir: str) -> dict:
     return result
 
 
-def test_image(model_path: str, llm: Omni, out_dir: str) -> dict:
+def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dict:
     result: dict = {"modality": "image"}
 
     prompt_text = (
@@ -188,7 +188,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("[wired] === Audio modality test ===")
     print("=" * 60 + "\n")
-    audio_result = test_audio(model_path, llm, out_dir)
+    audio_result = test_audio(model_path, llm, out_dir, num_stages)
     results["audio"] = audio_result
     print(f"\n[wired-audio] result: {json.dumps(audio_result, indent=2)}\n")
 
@@ -196,7 +196,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("[wired] === Image modality test ===")
     print("=" * 60 + "\n")
-    image_result = test_image(model_path, llm, out_dir)
+    image_result = test_image(model_path, llm, out_dir, num_stages)
     results["image"] = image_result
     print(f"\n[wired-image] result: {json.dumps(image_result, indent=2)}\n")
 
