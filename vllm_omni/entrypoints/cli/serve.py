@@ -702,8 +702,7 @@ class OmniServeCommand(CLISubcommand):
             "--cfg-parallel-size",
             type=int,
             default=1,
-            choices=[1, 2],
-            help="Number of devices for CFG parallel computation for diffusion models. "
+            help="Number of devices used to execute diffusion guidance passes in parallel. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
         )
         omni_config_group.add_argument(

@@ -110,7 +110,7 @@ class TestLTXImageToVideoForwardStages:
 
         kwargs = pipe._denoise_timestep_kwargs(
             ts,
-            SimpleNamespace(cfg_parallel_ready=False),
+            SimpleNamespace(guidance_parallel_ready=False),
             denoise_ctx,
             video_token_count=2,
             audio_token_count=1,
