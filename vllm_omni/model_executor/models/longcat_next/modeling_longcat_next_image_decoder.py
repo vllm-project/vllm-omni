@@ -119,10 +119,16 @@ class LongcatNextImageDecoder(nn.Module):
             or kwargs.get("runtime_additional_information")
             or {}
         )
-        additional_info = next(
-            (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
-            {},
-        )
+        if isinstance(model_intermediate_buffer, dict):
+            additional_info = next(
+                (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
+                {},
+            )
+        else:
+            additional_info = next(
+                (info for info in model_intermediate_buffer if isinstance(info, dict)),
+                {},
+            )
         visual_codes = additional_info.get("visual_token_ids")
         if not visual_codes:
             logger.warning("No visual token IDs provided for image decoder")

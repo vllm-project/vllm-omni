@@ -140,10 +140,16 @@ class LongcatNextAudioDecoder(nn.Module):
             or kwargs.get("runtime_additional_information")
             or {}
         )
-        additional_info = next(
-            (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
-            {},
-        )
+        if isinstance(model_intermediate_buffer, dict):
+            additional_info = next(
+                (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
+                {},
+            )
+        else:
+            additional_info = next(
+                (info for info in model_intermediate_buffer if isinstance(info, dict)),
+                {},
+            )
         audio_codes = additional_info.get("audio_token_ids")
         if not audio_codes:
             logger.warning("No audio token IDs provided for audio decoder")
