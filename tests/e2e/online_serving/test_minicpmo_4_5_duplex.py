@@ -83,7 +83,7 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", CORE_SERVER_PARAMS, indirect=True)
 def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None:
     ref_audio = resolve_ref_audio(model_prefix)
@@ -101,7 +101,7 @@ def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_single_session_response_required(omni_server, model_prefix: str, tmp_path: Path) -> None:
     result = asyncio.run(
@@ -123,7 +123,7 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str, tmp_path: Path) -> None:
     result = asyncio.run(

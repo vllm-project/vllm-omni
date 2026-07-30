@@ -68,7 +68,7 @@ def get_max_batch_size(size_type="few"):
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
     """
     Test text + video input generating text output.
-    Deploy Setting: default 2GPU
+    Deploy Setting: default single GPU
     Input Modal: text + video
     Output Modal: text
     Input Setting: stream=False
@@ -96,7 +96,7 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
     """
     Verify that sequential requests produce independent results and that the
     second request does not receive the first request's audio or token state.
-    Deploy Setting: default 2GPU
+    Deploy Setting: default single GPU
     Input Modal: text (two different prompts)
     Output Modal: text + audio (both)
     """
@@ -137,7 +137,7 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     Test text input generating a longer audio output to exercise the
     Code2Wav stage across multiple frames.
-    Deploy Setting: default 2GPU
+    Deploy Setting: default single GPU
     Input Modal: text (longer prompt)
     Output Modal: text + audio
     Input Setting: stream=True
