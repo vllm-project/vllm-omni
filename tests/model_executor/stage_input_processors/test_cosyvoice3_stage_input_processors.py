@@ -4,6 +4,7 @@
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
@@ -11,6 +12,8 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     text2flow_full_payload,
     text2flow_token_only,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):

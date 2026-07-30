@@ -35,7 +35,7 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - timeout 20m pytest -s -v tests/e2e/offline_inference/custom_pipeline/ -m "core_model"
+    - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
 
 
 - label: "Voxtral TTS CUDA Unit Test"
