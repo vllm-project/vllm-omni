@@ -176,6 +176,25 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         torch.npu.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        """Record a NPU event on the default stream to mark tensor readiness.
+
+        On NPU/Ascend with HCCL, distributed communication may use internal
+        streams not visible to the default stream. Synchronize the default
+        stream first so that HCCL results are written back before we record
+        the event, ensuring d2h_stream.wait_event() captures the complete
+        output data.
+        """
+        try:
+            torch.npu.current_stream().synchronize()
+            event = torch.npu.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record NPU event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.npu.mem_get_info(device)
         return free

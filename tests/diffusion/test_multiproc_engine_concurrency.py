@@ -56,7 +56,7 @@ def _make_executor(num_gpus: int = 1):
 
     Returns ``(executor, request_queue, result_queue)``.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False)
+    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False, step_execution=True)
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_cfg
 
@@ -616,6 +616,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
 
     def test_collective_rpc_raises_when_is_failed(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(step_execution=True)
         executor._closed = False
         executor._broadcast_mq = MagicMock()
         executor._result_mq = MagicMock()
@@ -661,7 +662,7 @@ class TestMultiprocExecutorStepStreamingOutput:
 
     def test_execute_step_allows_streaming_output_mode(self):
         executor, req_q, res_q = _make_executor()
-        executor.od_config = SimpleNamespace(streaming_output=True)  # pyright: ignore[reportAttributeAccessIssue]
+        executor.od_config = SimpleNamespace(streaming_output=True, step_execution=True)  # pyright: ignore[reportAttributeAccessIssue]
         runner_outputs = [
             RunnerOutput(
                 request_id="sched-stream",
@@ -939,6 +940,14 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
         executor._finalizer = lambda: None
+        # ------------------------------------------------------------------
+        # Attributes added by remove_bubble_v2 (async D2H); shutdown() iterates
+        # over them, so they need to exist even when constructed via __new__.
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
 
         proc = _make_short_lived_process()
         executor._processes = [proc]

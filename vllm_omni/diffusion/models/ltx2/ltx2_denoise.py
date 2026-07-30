@@ -33,7 +33,7 @@ class LTXForwardContext:
     request_inputs: LTXRequestInputs
     prompt_context: LTXPromptContext
     device: torch.device
-    cfg_parallel_ready: bool
+    guidance_parallel_ready: bool
     attention_kwargs: dict[str, Any] | None
     latent_num_frames: int
     latent_height: int
@@ -358,9 +358,9 @@ def step_denoised_latents(
         do_true_cfg=pipeline.do_classifier_free_guidance,
         per_request_scheduler=forward_ctx.video_audio_step_adapter,
     )
-    return pipeline._synchronize_cfg_parallel_step_output(
+    return pipeline._synchronize_guidance_parallel_step_output(
         latents,
-        do_true_cfg=pipeline.do_classifier_free_guidance,
+        guidance_parallel_ready=forward_ctx.guidance_parallel_ready,
     )
 
 
@@ -382,7 +382,7 @@ class LTXPhaseExecutor:
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
         pipeline._check_forward_inputs(request_inputs, image=image)
-        cfg_parallel_ready = pipeline._setup_forward_runtime(req, request_inputs, attention_kwargs)
+        guidance_parallel_ready = pipeline._setup_forward_runtime(req, request_inputs, attention_kwargs)
         device = pipeline.device
         if prompt_context is None:
             prompt_context = pipeline._prepare_prompt_context(
@@ -429,7 +429,7 @@ class LTXPhaseExecutor:
             request_inputs=request_inputs,
             prompt_context=prompt_context,
             device=device,
-            cfg_parallel_ready=cfg_parallel_ready,
+            guidance_parallel_ready=guidance_parallel_ready,
             attention_kwargs=attention_kwargs,
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
@@ -449,7 +449,7 @@ class LTXPhaseExecutor:
             audio_coords=audio_coords,
             conditioning_mask=conditioning_mask,
         )
-        denoise_ctx = pipeline._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
+        denoise_ctx = pipeline._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)
         state = LTXDenoiseExecutor.run(
             pipeline,
             LTXAVState(video=denoise_ctx.latents, audio=denoise_ctx.audio_latents),

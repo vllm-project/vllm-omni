@@ -18,6 +18,8 @@ import pytest
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class _FakeCoordinator:
     def __init__(self, timed_out_ids):

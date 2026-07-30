@@ -30,8 +30,6 @@ also provided.
   `hf_config.version="4.5"`):
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Recommended 2-GPU continuous-batching layout:
-    [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
   - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
@@ -68,7 +66,7 @@ Code2Wav consumes them through a shared-memory async connector.
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
 request-local codec generation and Code2Wav owns waveform state and
 reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
-single-GPU entry point; `minicpmo_4_5_batching.yaml` is the recommended
+single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
 
@@ -105,7 +103,7 @@ The deploy config is auto-loaded by the model registry — no
 For the recommended two-GPU layout, add:
 
 ```bash
---deploy-config vllm_omni/deploy/minicpmo_4_5_batching.yaml
+--deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
 
 #### Performance comparison

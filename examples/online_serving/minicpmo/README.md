@@ -25,15 +25,14 @@ The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
 logical device 0 with memory budgets of 55%, 22%, and 22%. The profile admits
 at most four sequences per stage and bounds startup video profiling to 32
-frames per video. For throughput,`minicpmo_4_5_batching.yaml` gives the Thinker
+frames per video. For throughput,`minicpmo_4_5_2gpu.yaml` gives the Thinker
 GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
 profile admits at most four concurrent sequences per stage.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
 | `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
-| `minicpmo_4_5_batching.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | Backward-compatible alias for `minicpmo_4_5_batching.yaml`. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
