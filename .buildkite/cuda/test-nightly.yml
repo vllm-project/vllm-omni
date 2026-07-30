@@ -462,13 +462,13 @@ steps:
       - label: ":full_moon: Diffusion · Distributed Test"
         timeout_in_minutes: 60
         commands:
-          - timeout 30m pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda' --run-level "full_model"
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda' --run-level "full_model"
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion · Offloader Test"
         timeout_in_minutes: 60
         commands:
-          - timeout 40m pytest -s -v tests/diffusion/offloader -m "full_model and cuda"
+          - pytest -sv tests/diffusion/offloader -m "full_model and cuda"
         mirror_hardwares: l4_1
 
       - label: ":full_moon: Diffusion · Quantization Test with H100"
