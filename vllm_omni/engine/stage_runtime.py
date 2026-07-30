@@ -449,6 +449,35 @@ class StageRuntime:
             for replica in plan.replicas:
                 init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
 
+        # Merge groups whose device sets overlap to prevent deadlock:
+        # stages sharing any device must initialize sequentially because
+        # acquire_device_locks() takes exclusive flock() per physical device.
+        # E.g. stage 0 (devices "0,1,2,3") and stage 1 (devices "3") would
+        # deadlock if initialized concurrently on device 3's lock.
+        _devices_by_group: dict[str, set[str]] = {}
+        _group_list = list(init_groups)
+        for key in _group_list:
+            if key.startswith("inline:") or key.startswith("remote:"):
+                _devices_by_group[key] = set()
+                continue
+            parts = key.removeprefix("device:").split(",")
+            _devices_by_group[key] = {p.strip() for p in parts if p.strip()}
+        _changed = True
+        while _changed:
+            _changed = False
+            for ka in list(_devices_by_group):
+                if ka not in _devices_by_group:
+                    continue
+                for kb in list(_devices_by_group):
+                    if ka == kb or kb not in _devices_by_group:
+                        continue
+                    da, db = _devices_by_group[ka], _devices_by_group[kb]
+                    if da and db and (da & db):
+                        init_groups[ka].extend(init_groups.pop(kb))
+                        da.update(db)
+                        _devices_by_group.pop(kb)
+                        _changed = True
+
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
