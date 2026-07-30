@@ -1233,6 +1233,45 @@ stages:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
+    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe_thinking.yaml"))
+        with patch(
+            "vllm_omni.config.config_factory.get_config",
+            return_value=Q3_OMNI_THINKER_HF_CONFIG,
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+                trust_remote_code=False,
+                deploy_config_path=str(deploy_path),
+            )
+
+        assert pipeline is not None
+        assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 1
+        thinker = stages[0]
+        assert thinker.model_stage == "thinker"
+        assert thinker.final_output is True
+        assert thinker.final_output_type == "text"
+        assert thinker.worker_type == "ar"
+        assert thinker.scheduler_cls == "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler"
+        assert thinker.hf_config_name == "thinker_config"
+        assert thinker.is_comprehension is True
+        assert thinker.yaml_runtime["devices"] == "0,1"
+        assert thinker.yaml_engine_args["engine_output_type"] == "text"
+        assert thinker.yaml_engine_args["tensor_parallel_size"] == 2
+        assert thinker.yaml_engine_args["max_num_seqs"] == 1
+        assert thinker.yaml_engine_args["gpu_memory_utilization"] == 0.9
+        assert thinker.yaml_engine_args["enforce_eager"] is True
+        assert thinker.yaml_engine_args["async_scheduling"] is False
+        assert thinker.yaml_engine_args["distributed_executor_backend"] == "mp"
+        assert thinker.yaml_engine_args["enable_prefix_caching"] is True
+        assert thinker.yaml_engine_args["async_chunk"] is False
+        assert thinker.yaml_extras["default_sampling_params"]["detokenize"] is True
+
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
         deploy = load_deploy_config(deploy_path)
