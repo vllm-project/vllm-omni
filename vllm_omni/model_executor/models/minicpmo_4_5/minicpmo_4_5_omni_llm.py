@@ -4413,18 +4413,25 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             device=wavforms.device,
         )
 
+        selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
             past_key_values=self.audio_past_key_values,
             use_cache=True,
-            output_hidden_states=True,
+            output_hidden_states=not selects_final_layer,
             attention_mask=audio_attention_mask,
             use_extra_context=use_extra_context,
             prefix_extra_frames=prefix_extra_frames,
             suffix_extra_frames=suffix_extra_frames,
             cnn_min_length=cnn_min_length,
         )
-        audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
+        if selects_final_layer:
+            audio_states = audio_outputs.last_hidden_state
+        else:
+            # Whisper hidden states contain the embedding output followed by
+            # each encoder layer output.
+            assert audio_outputs.hidden_states is not None
+            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
         self.audio_past_key_values = audio_outputs.past_key_values
 
         audio_embeds = self.audio_projection_layer(audio_states)
