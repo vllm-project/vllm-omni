@@ -18,6 +18,7 @@ import base64
 import binascii
 from typing import Any
 
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -31,6 +32,8 @@ from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPo
 #: Input modes this model accepts. Anything else is rejected rather than
 #: silently degraded -- per Sy0307's RFC #3745 review point that append mode
 #: must be an explicit per-model capability.
+logger = init_logger(__name__)
+
 #: float32 little-endian PCM.
 _BYTES_PER_SAMPLE = 4
 
@@ -69,9 +72,14 @@ def duplex_audio_token_count(payload: object) -> int:
     ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
     """
     num_samples = _payload_num_samples(payload)
-    if num_samples <= 0:
-        return Qwen3OmniDuplexPolicy.tokens_per_chunk()
-    return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
+    if num_samples > 0:
+        return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
+    if isinstance(payload, dict) and "audio" in payload:
+        # Explicitly empty audio, e.g. a commit whose buffer was already
+        # drained by earlier appends. Reserve nothing; the prompt is the
+        # turn-closing scaffolding alone.
+        return 0
+    return Qwen3OmniDuplexPolicy.tokens_per_chunk()
 
 
 def _payload_num_samples(payload: object) -> int:
@@ -142,6 +150,19 @@ def build_duplex_prompt_token_ids(
     suffix = _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY) if closes_turn else []
 
     prompt_token_ids = prefix + [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens + suffix
+    logger.info(
+        "[qwen3omni-duplex] plan seq=%s turn_seq=%s final=%s closes_turn=%s "
+        "prefix=%d audio=%d suffix=%d total=%d scaffold_keys=%s",
+        seq,
+        turn_seq,
+        final,
+        closes_turn,
+        len(prefix),
+        audio_tokens,
+        len(suffix),
+        len(prompt_token_ids),
+        sorted(k for k in runtime_config if "token_ids" in k),
+    )
     return prompt_token_ids, len(prefix), audio_tokens
 
 

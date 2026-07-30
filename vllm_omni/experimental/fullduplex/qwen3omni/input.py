@@ -158,12 +158,15 @@ class Qwen3OmniPcmAppendBuffer:
             if reservation.payload is not None:
                 reservation.payload[Qwen3OmniDuplexPolicy.TURN_FINAL_KEY] = True
             return reservation
-        # Nothing buffered: hand back an empty, already-shaped reservation so
-        # the caller's commit/rollback bookkeeping stays uniform.
+        # Nothing buffered -- normally because `prepare_append` already
+        # streamed every whole chunk out. The turn still has to be closed, or
+        # the assistant generation prompt is never emitted and the model has
+        # nothing telling it to reply. Hand back a zero-audio payload carrying
+        # only the turn-final marker.
         return Qwen3OmniPcmReservation(
             self,
             operation_id=operation_id,
-            payload=None,
+            payload={**self._payload(b""), Qwen3OmniDuplexPolicy.TURN_FINAL_KEY: True},
             consumed=b"",
         )
 

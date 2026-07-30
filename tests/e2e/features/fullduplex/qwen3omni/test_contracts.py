@@ -542,3 +542,33 @@ def test_sample_count_measured_from_audio_not_a_stale_key() -> None:
     assert duplex_audio_token_count(payload) == Qwen3OmniDuplexPolicy.audio_tokens_for_samples(
         Qwen3OmniDuplexPolicy.CHUNK_SAMPLES * 3
     )
+
+
+def test_data_plane_reads_omni_request_output_objects() -> None:
+    """collect_registered_outputs yields objects, not dicts.
+
+    Guarding projection on isinstance(..., Mapping) silently discards every
+    stage output, which presents as "the model never replies" with no error
+    anywhere.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        Qwen3OmniDataPlaneContext,
+        Qwen3OmniDataPlaneSession,
+    )
+
+    completion = SimpleNamespace(text="hello there")
+    output = SimpleNamespace(
+        request_id="r1",
+        finished=False,
+        stage_id=0,
+        request_output=SimpleNamespace(outputs=[completion]),
+        multimodal_output={},
+    )
+    dp = Qwen3OmniDataPlaneSession(lambda *_a: "enc")
+    dp.begin_request("r1")
+    events = list(dp.project({"data_plane_outputs": [output]}, context=Qwen3OmniDataPlaneContext()))
+    assert events, "object-shaped outputs must not be dropped"
+    assert events[0]["text"] == "hello there"
+    assert events[0]["stage_role"] == "llm"

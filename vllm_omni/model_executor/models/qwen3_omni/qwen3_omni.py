@@ -751,6 +751,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         appended audio.
         """
         duplex = info_dict.get("duplex")
+        logger.info(
+            "[qwen3omni-duplex] thinker preprocess: span=%s duplex=%s offset=%s prompt_len=%s",
+            tuple(input_ids.shape),
+            bool(isinstance(duplex, dict) and duplex.get("data_plane") is True),
+            info_dict.get("duplex_token_offset"),
+            info_dict.get("duplex_prompt_len"),
+        )
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
             return input_ids, self._thinker_input_embeds(input_ids, input_embeds), {}
 
@@ -772,6 +779,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             duplex=duplex,
             token_offset=int(token_offset) if isinstance(token_offset, int) else 0,
             prompt_len=int(prompt_len) if isinstance(prompt_len, int) else 0,
+        )
+        logger.info(
+            "[qwen3omni-duplex] audio embeds=%s audio_offset=%s",
+            None if audio_embeds is None else tuple(audio_embeds.shape),
+            duplex.get("audio_offset"),
         )
         if audio_embeds is None:
             # Append did not complete a whole chunk; nothing to splice.

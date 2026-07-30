@@ -20,7 +20,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 
+from vllm.logger import init_logger
+
 from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPolicy
+
+logger = init_logger(__name__)
 
 #: ``(audio, sample_rate_hz, response_format, speed) -> base64 | None``
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
@@ -61,6 +65,18 @@ class _RequestState:
     #: Byte offset into cumulative audio already sent.
     audio_offset: int = 0
     seen_stage_ids: set[int] = field(default_factory=set)
+
+
+def _field(output: object, name: str, default: object = None) -> object:
+    """Read a field from a stage output.
+
+    ``collect_registered_outputs`` yields ``OmniRequestOutput`` *objects*
+    (``request_client.py:183``), not mappings. Reading them as dicts silently
+    discards every output, so both shapes are accepted here.
+    """
+    if isinstance(output, Mapping):
+        return output.get(name, default)
+    return getattr(output, name, default)
 
 
 def _coerce_int(value: object) -> int | None:
@@ -114,27 +130,40 @@ class Qwen3OmniDataPlaneSession:
             return
         ctx = context if isinstance(context, Qwen3OmniDataPlaneContext) else Qwen3OmniDataPlaneContext()
         outputs = result.get("data_plane_outputs")
+        logger.info(
+            "[qwen3omni-dp] project: result_keys=%s outputs=%s types=%s",
+            sorted(result.keys())[:8],
+            None if not isinstance(outputs, list) else len(outputs),
+            None if not isinstance(outputs, list) else [type(o).__name__ for o in outputs[:3]],
+        )
         if not isinstance(outputs, list):
             return
         for output in outputs:
-            if isinstance(output, Mapping):
+            if output is not None:
                 yield from self._project_output(output, ctx)
 
     # ---- projection -------------------------------------------------------
 
     def _project_output(
         self,
-        output: Mapping[str, object],
+        output: object,
         ctx: Qwen3OmniDataPlaneContext,
     ) -> Iterable[dict[str, object]]:
-        request_id = output.get("request_id")
+        request_id = _field(output, "request_id")
         request_id = request_id if isinstance(request_id, str) else None
         state = self._requests.get(request_id) if request_id else None
         if state is not None and state.terminal:
             return
 
-        stage_id = _coerce_int(output.get("stage_id"))
-        metadata = output.get("multimodal_output")
+        stage_id = _coerce_int(_field(output, "stage_id"))
+        logger.info(
+            "[qwen3omni-dp] output: stage=%s finished=%s rid=%s text=%r",
+            stage_id,
+            _field(output, "finished"),
+            request_id,
+            self._cumulative_text(output)[:60],
+        )
+        metadata = _field(output, "multimodal_output")
         metadata = metadata if isinstance(metadata, Mapping) else {}
 
         # Drop outputs from a superseded epoch/turn. The fence travels with
@@ -148,7 +177,7 @@ class Qwen3OmniDataPlaneSession:
         if state is not None and stage_id is not None:
             state.seen_stage_ids.add(stage_id)
 
-        finished = bool(output.get("finished"))
+        finished = bool(_field(output, "finished"))
 
         if stage_id == _THINKER_STAGE_ID:
             event = self._project_thinker(output, state, model_turn_id, finished)
@@ -176,7 +205,7 @@ class Qwen3OmniDataPlaneSession:
 
     def _project_thinker(
         self,
-        output: Mapping[str, object],
+        output: object,
         state: _RequestState | None,
         model_turn_id: int | None,
         finished: bool,
@@ -191,7 +220,7 @@ class Qwen3OmniDataPlaneSession:
         if not delta and not finished:
             return None
         return {
-            "data_plane_request_id": output.get("request_id"),
+            "data_plane_request_id": _field(output, "request_id"),
             "stage_role": "llm",
             "text": delta,
             "end_of_turn": finished,
@@ -202,7 +231,7 @@ class Qwen3OmniDataPlaneSession:
 
     def _project_code2wav(
         self,
-        output: Mapping[str, object],
+        output: object,
         state: _RequestState | None,
         ctx: Qwen3OmniDataPlaneContext,
         model_turn_id: int | None,
@@ -211,7 +240,7 @@ class Qwen3OmniDataPlaneSession:
         """Emit newly-produced audio from the vocoder stage."""
         if "audio" not in ctx.modalities:
             return None
-        metadata = output.get("multimodal_output")
+        metadata = _field(output, "multimodal_output")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         audio = metadata.get("audio")
         if audio is None:
@@ -221,7 +250,7 @@ class Qwen3OmniDataPlaneSession:
         if not encoded:
             return None
         return {
-            "data_plane_request_id": output.get("request_id"),
+            "data_plane_request_id": _field(output, "request_id"),
             "stage_role": "tts",
             "audio_data": encoded,
             "audio_format": ctx.response_format,
@@ -233,14 +262,14 @@ class Qwen3OmniDataPlaneSession:
         }
 
     @staticmethod
-    def _cumulative_text(output: Mapping[str, object]) -> str:
-        request_output = output.get("request_output")
+    def _cumulative_text(output: object) -> str:
+        request_output = _field(output, "request_output")
         completions = getattr(request_output, "outputs", None)
         if completions:
             text = getattr(completions[0], "text", None)
             if isinstance(text, str):
                 return text
-        text = output.get("text")
+        text = _field(output, "text")
         return text if isinstance(text, str) else ""
 
 
