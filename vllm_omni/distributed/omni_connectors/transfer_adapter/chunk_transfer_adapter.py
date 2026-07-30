@@ -283,7 +283,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 # Empty chunk with more data expected: keep polling.
                 has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
-                if not has_new_ids and not payload_finished:
+                if not has_new_ids and payload_segment_finished:
+                    # Preserve an explicit scheduler boundary even when it
+                    # contains no new codec frames.
+                    request.prompt_token_ids = [0]
+                if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the
@@ -338,7 +342,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        if payload_data.meta.is_segment_finished is None:
+            payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -736,6 +741,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         queue_snapshot = list(queue)
         for request in queue_snapshot:
             if not self._ensure_active_stream(request):
+                if target_status == RequestStatus.WAITING:
+                    # A non-active placeholder must not remain visible to the
+                    # scheduler: it has no connector payload yet, so running
+                    # it would execute the downstream model with empty
+                    # additional_information. Park it until restore_queues()
+                    # and retry admission on the next scheduler tick.
+                    queue.remove(request)
+                    waiting_for_chunk_list.append(request)
                 continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:

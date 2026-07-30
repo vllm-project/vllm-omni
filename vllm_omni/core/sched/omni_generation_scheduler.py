@@ -56,6 +56,21 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
+    def _handle_stopped_request(self, request: Request) -> bool:
+        if (
+            request.resumable
+            and not request.streaming_queue
+            and self.chunk_transfer_adapter is not None
+            and self.chunk_transfer_adapter.receives_chunks
+        ):
+            # Downstream async-chunk stages receive the next segment from the
+            # connector, not from an API StreamingUpdate. Enqueue them as
+            # schedulable before the base class can park them in skipped_waiting.
+            request.status = RequestStatus.WAITING
+            self._enqueue_waiting_request(request)
+            return False
+        return super()._handle_stopped_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """One-shot generation fast path:
         - Feed all input tokens of the request at once

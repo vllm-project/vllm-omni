@@ -471,7 +471,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
+                num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
+                    # A mid-step stop (e.g. spec-decode tokens sampled past
+                    # EOS) trims new_token_ids after the validation slice
+                    # above; re-slice so the emitted logprob rows stay 1:1
+                    # with the emitted tokens, as upstream vLLM does by
+                    # slicing after the trim.
+                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -801,9 +809,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        update_info = getattr(update, "additional_information", None)
-        update_meta = update_info.get("meta") if isinstance(update_info, dict) else None
-        if isinstance(update_meta, dict) and update_meta.get("replace_streaming_prompt") is True:
+        update_infos = (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        )
+        replace_streaming_prompt = any(
+            isinstance(info, dict)
+            and isinstance(info.get("meta"), dict)
+            and info["meta"].get("replace_streaming_prompt") is True
+            for info in update_infos
+        )
+        if replace_streaming_prompt:
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)

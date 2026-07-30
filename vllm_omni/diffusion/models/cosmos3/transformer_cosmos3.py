@@ -55,6 +55,9 @@ class RMSNorm(_VllmRMSNorm):
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
 
 def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:
     """Return (ulysses_size, ulysses_rank, ulysses_pg) from vllm-omni parallel state.
