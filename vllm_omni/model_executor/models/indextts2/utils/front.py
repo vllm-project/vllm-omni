@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import re
 import warnings
 from typing import overload
 
@@ -13,16 +14,55 @@ from vllm_omni.model_executor.models.indextts2.utils.common import (
 )
 
 
-class TextTokenizer:
-    def __init__(self, vocab_file: str):
-        self.vocab_file = vocab_file
+# Chinese punctuation → ASCII punctuation mapping used by the official
+# IndexTTS-2 inference pipeline (indextts/utils/front.py).  The BPE
+# vocabulary contains English punctuation tokens (``.``, ``!``, ``?``)
+# which the model was trained on; feeding raw Chinese punctuation
+# produces incorrect subword tokenization and garbled pronunciation
+# (e.g. '。' read as '哦').  Normalise before tokenisation.
+_CHAR_REP_MAP = {
+    "\u3002": ".",  # 。
+    "\uff01": "!",  # ！
+    "\uff1f": "?",  # ？
+    "\uff1a": ",",  # ：
+    "\uff1b": ",",  # ；
+    "\uff0c": ",",  # ，
+    "\u201c": "'",  # "
+    "\u201d": "'",  # "
+    "\u2018": "'",  # '
+    "\u2019": "'",  # '
+    "\uff08": "'",  # （
+    "\uff09": "'",  # ）
+    "\u300a": "'",  # 《
+    "\u300b": "'",  # 》
+    "\u3010": "'",  # 【
+    "\u3011": "'",  # 】
+    "\u2014": " ",  # —
+    "\uff5e": " ",  # ～
+    "\u00b7": "-",  # ·
+    "\u3001": ",",  # 、
+    "\n": " ",
+    ";": ",",
+    ":": ",",
+}
 
-        if self.vocab_file is None:
-            raise ValueError("vocab_file is None")
-        if not os.path.exists(self.vocab_file):
-            raise ValueError(f"vocab_file {self.vocab_file} does not exist")
-        self.sp_model = SentencePieceProcessor(model_file=self.vocab_file)
-        self.pre_tokenizers = [tokenize_by_CJK_char]
+_CHAR_REP_PATTERN = re.compile("|".join(re.escape(p) for p in _CHAR_REP_MAP.keys()))
+
+
+def normalize_text(text: str) -> str:
+    """Normalise Chinese punctuation to ASCII equivalents.
+
+    This is a lightweight replacement for the ``TextNormalizer`` used in
+    the official index-tts-vllm pipeline.  It strips Chinese punctuation
+    marks and replaces them with the ASCII tokens the BPE model was
+    trained on.  Full text normalisation (numbers, dates, currency, etc.)
+    is intentionally omitted here — it should be handled by the caller
+    when needed.
+    """
+    return _CHAR_REP_PATTERN.sub(lambda m: _CHAR_REP_MAP[m.group()], text)
+
+
+class TextTokenizer:
 
     @property
     def vocab_size(self):
@@ -95,6 +135,12 @@ class TextTokenizer:
             return []
         if len(text.strip()) == 1:
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
+        # Normalise Chinese punctuation to ASCII equivalents before
+        # tokenisation so that the BPE model sees the same tokens it was
+        # trained on.  This prevents mispronunciation of Chinese punctuation
+        # marks (e.g. 。→哦) and ensures sentence-segment boundaries are
+        # correctly detected.
+        text = normalize_text(text)
         for pre_tokenizer in self.pre_tokenizers:
             text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
