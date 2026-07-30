@@ -81,6 +81,9 @@ async def run_client(
     delta_dump_dir: Path | None,
     request_idx: int = 1,
     total_requests: int = 1,
+    tools: list[dict] | None = None,
+    tool_choice: str = "auto",
+    tool_output: str | None = None,
 ) -> None:
     log_prefix = f"[req {request_idx:02d}/{total_requests:02d}] " if total_requests > 1 else ""
     pcm16 = _read_wav_pcm16(input_wav)
@@ -92,20 +95,18 @@ async def run_client(
     delta_index = 0
     text_chunks: list[str] = []
     final_text: str = ""
+    tool_calls: list[dict] = []
 
     if delta_dump_dir is not None:
         delta_dump_dir.mkdir(parents=True, exist_ok=True)
 
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
-        # 1) Validate model.
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "model": model,
-                }
-            )
-        )
+        # 1) Validate model, and declare tools if the caller asked for them.
+        session_update: dict = {"type": "session.update", "model": model}
+        if tools:
+            session_update["tools"] = tools
+            session_update["tool_choice"] = tool_choice
+        await ws.send(json.dumps(session_update))
 
         # 2) Start generation once (non-final commit).
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
@@ -176,11 +177,45 @@ async def run_client(
                     print(f"{log_prefix}text usage: {usage}")
                 continue
 
+            if event_type == "response.function_call_arguments.delta":
+                print(
+                    f"{log_prefix}function call (delta): {event.get('name')} "
+                    f"call_id={event.get('call_id')} arguments+={event.get('delta')}"
+                )
+                continue
+
+            if event_type == "response.function_call_arguments.done":
+                print(
+                    f"{log_prefix}function call: {event.get('name')}"
+                    f"({event.get('arguments')}) call_id={event.get('call_id')}"
+                )
+                tool_calls.append(event)
+                continue
+
             if event_type == "response.audio.done":
                 break
 
             if event_type == "error":
                 raise RuntimeError(f"Server error: {event}")
+
+        # 6) Return a tool result, if the model asked for one and the caller
+        #    supplied a canned output. The result becomes context for the next
+        #    turn, so send audio again to hear the model use it.
+        if tool_calls and tool_output is not None:
+            for call in tool_calls:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call.get("call_id"),
+                                "output": tool_output,
+                            },
+                        }
+                    )
+                )
+                print(f"{log_prefix}sent tool result for call_id={call.get('call_id')}: {tool_output}")
 
         all_pcm16 = b"".join(incremental_pcm_parts)
         if not all_pcm16:
@@ -215,6 +250,9 @@ async def run_clients_concurrent(
     delta_dump_dir: Path | None,
     num_requests: int,
     concurrency: int,
+    tools: list[dict] | None = None,
+    tool_choice: str = "auto",
+    tool_output: str | None = None,
 ) -> None:
     sem = asyncio.Semaphore(concurrency)
 
@@ -237,6 +275,9 @@ async def run_clients_concurrent(
                     delta_dump_dir=per_delta_dir,
                     request_idx=index,
                     total_requests=num_requests,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    tool_output=tool_output,
                 )
                 return index, True, None
             except Exception as exc:
@@ -290,7 +331,32 @@ def main() -> None:
         default=1,
         help="Maximum number of concurrent websocket requests",
     )
+    parser.add_argument(
+        "--tools",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file with a list of tool definitions (same shape as the "
+            "chat completions `tools` field). Declared on session.update, so the model "
+            "can answer with a function call instead of speaking."
+        ),
+    )
+    parser.add_argument(
+        "--tool-choice",
+        default="auto",
+        help="tool_choice for session.update: none | auto | required (default: auto)",
+    )
+    parser.add_argument(
+        "--tool-output",
+        default=None,
+        help=(
+            "Canned tool result (a JSON string) returned via conversation.item.create "
+            "for every function call the model makes"
+        ),
+    )
     args = parser.parse_args()
+
+    tools = json.loads(args.tools.read_text(encoding="utf-8")) if args.tools is not None else None
 
     if args.num_requests <= 0:
         raise ValueError("--num-requests must be >= 1")
@@ -309,6 +375,9 @@ def main() -> None:
                 chunk_ms=args.chunk_ms,
                 send_delay_ms=args.send_delay_ms,
                 delta_dump_dir=args.delta_dump_dir,
+                tools=tools,
+                tool_choice=args.tool_choice,
+                tool_output=args.tool_output,
             )
         )
     else:
@@ -324,6 +393,9 @@ def main() -> None:
                 delta_dump_dir=args.delta_dump_dir,
                 num_requests=args.num_requests,
                 concurrency=concurrency,
+                tools=tools,
+                tool_choice=args.tool_choice,
+                tool_output=args.tool_output,
             )
         )
 

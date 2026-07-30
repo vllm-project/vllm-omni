@@ -73,6 +73,33 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def drain_realtime_prompt_context(input_stream: "asyncio.Queue[list[int]]", context_token_ids: list[int]) -> None:
+    """Move everything queued on the realtime context channel into ``context_token_ids``.
+
+    ``input_stream`` is the channel upstream threads from the realtime connection
+    into ``buffer_realtime_audio`` ("context token IDs ... for autoregressive
+    multi-turn processing"). The connection uses it to hand over already-rendered
+    turns -- today the tool definitions and tool results of a tool-calling session,
+    which have nowhere else to go because the realtime prompt has no system turn.
+    """
+    while True:
+        try:
+            context_token_ids.extend(input_stream.get_nowait())
+        except asyncio.QueueEmpty:
+            return
+
+
+def build_realtime_prompt_token_ids(context_token_ids: list[int], prompt_token_ids: list[int]) -> list[int]:
+    """Prefix the per-segment prompt with any context the connection staged.
+
+    With an empty channel this returns the prompt unchanged, so a session that
+    configures no tools behaves exactly as before.
+    """
+    if not context_token_ids:
+        return prompt_token_ids
+    return [*context_token_ids, *prompt_token_ids]
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -245,6 +272,11 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # Context handed over by the realtime connection (tool definitions, tool
+        # results) is prepended to every segment prompt; an empty channel leaves
+        # the prompt untouched.
+        context_token_ids: list[int] = []
+
         # In non-async-chunk (full-payload) mode the engine treats each
         # streaming TokensPrompt as a fresh decode, so mid-stream segment
         # yields cause the thinker to emit duplicate responses and the
@@ -257,15 +289,17 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             if async_chunk:
                 while (segment := buffer.read_audio()) is not None:
+                    drain_realtime_prompt_context(input_stream, context_token_ids)
                     yield TokensPrompt(
-                        prompt_token_ids=prompt_token_ids,
+                        prompt_token_ids=build_realtime_prompt_token_ids(context_token_ids, prompt_token_ids),
                         multi_modal_data={"audio": segment},
                     )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
+            drain_realtime_prompt_context(input_stream, context_token_ids)
             yield TokensPrompt(
-                prompt_token_ids=prompt_token_ids,
+                prompt_token_ids=build_realtime_prompt_token_ids(context_token_ids, prompt_token_ids),
                 multi_modal_data={"audio": remaining},
             )
 
