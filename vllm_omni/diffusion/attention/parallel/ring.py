@@ -10,7 +10,12 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
+    FA3_SUPPORTED_CUDA_MAJORS,
+    HAS_AITER,
+    HAS_FA3,
+    HAS_FLASH_ATTN,
+)
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -22,6 +27,34 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 logger = init_logger(__name__)
+
+
+def _can_use_fa3(device: torch.device) -> bool:
+    """Return whether the installed FA3 kernels support ``device``.
+
+    Importing an extension only proves that its Python module is installed.
+    When the source publishes a supported-major contract, also check it before
+    entering a CUDA launcher that may abort instead of raising an exception.
+    """
+    if not HAS_FA3 or device.type != "cuda":
+        return False
+    if FA3_SUPPORTED_CUDA_MAJORS is None:
+        return True
+    major, _minor = torch.cuda.get_device_capability(device)
+    return major in FA3_SUPPORTED_CUDA_MAJORS
+
+
+def _can_use_fa2(device: torch.device) -> bool:
+    """Return whether the FA2 backend supports ``device``.
+
+    FA2's CUDA backend supports Ampere, Ada, and Hopper.  Blackwell support is
+    provided by the separate FA4 implementation, which this ring backend does
+    not expose.
+    """
+    if not HAS_FLASH_ATTN or device.type != "cuda":
+        return False
+    major, _minor = torch.cuda.get_device_capability(device)
+    return major in (8, 9)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +143,17 @@ class RingParallelAttention:
         if backend_pref is not None:
             backend_pref = backend_pref.lower()
 
+        can_use_fa3 = _can_use_fa3(query.device)
+        can_use_fa2 = _can_use_fa2(query.device)
+
         # FP32 is not supported by Flash Attention, force SDPA
         if query.dtype == torch.float32:
             backend_pref = "sdpa"
-        elif not HAS_FA3 and not HAS_FLASH_ATTN and not HAS_AITER:
+        elif not can_use_fa3 and not can_use_fa2 and not HAS_AITER:
             if backend_pref != "sdpa":
-                logger.warning_once("Flash Attention (FA2/FA3/AITER) is not available! Force enabling SDPA.")
+                logger.warning_once(
+                    "Flash Attention (FA2/FA3/AITER) is not available for this device! Force enabling SDPA."
+                )
             backend_pref = "sdpa"
 
         # Extract joint tensors
@@ -147,12 +185,14 @@ class RingParallelAttention:
 
         # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
         # On ROCm, use AITER
-        if HAS_FA3:
+        if can_use_fa3:
             attn_type = AttnType.FA3
         elif HAS_AITER:
             attn_type = AttnType.AITER
-        else:
+        elif can_use_fa2:
             attn_type = AttnType.FA
+        else:
+            raise RuntimeError("No compatible Flash Attention backend is available for ring attention.")
 
         return ring_flash_attn_func(
             query,
