@@ -71,7 +71,10 @@ def _validate_dreamzero_openpi_session(response: OpenPIWebSocketResponse) -> Non
     assert metadata["needs_stereo_camera"] is False
     assert metadata["needs_session_id"] is True
     assert metadata["action_space"] == "joint_position"
-    assert response.operation_responses[-1]["status"] == "reset successful"
+    # The policy session runs infer, infer, reset, infer, so the reset response is
+    # second to last; indexing the trailing infer's action array with a string key
+    # raises IndexError from NumPy instead of comparing a status.
+    assert response.operation_responses[-2]["status"] == "reset successful"
 
     action_tensors = response.action_tensors
     assert action_tensors is not None
