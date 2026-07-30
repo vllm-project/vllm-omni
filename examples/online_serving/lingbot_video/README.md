@@ -75,6 +75,10 @@ Refiner by default and rejects an explicit `run_refiner=true`. Base and Refiner
 share one text encoder, processor, and VAE, but use independent native weight
 sources, schedulers, generators, and denoise schedules.
 
+The optional Refiner is a second DiT. With model-level CPU offload, Base and
+Refiner are mutually exclusive on GPU. Layerwise offload discovers both
+`blocks` stacks through the generic multi-DiT contract.
+
 The client defaults to a small `320x192`, 9-frame Refiner validation workload.
 Production deployments can override `REFINER_HEIGHT`, `REFINER_WIDTH`,
 `REFINER_STEPS`, and `REFINER_MAX_VIDEO_FRAMES`; the official high-resolution
