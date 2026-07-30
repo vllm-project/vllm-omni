@@ -183,6 +183,7 @@ def _build_common_args(ns: argparse.Namespace, *, result_filename: str) -> list[
         result_dir=ns.result_dir,
         result_filename=result_filename,
         ready_check_timeout_sec=ns.ready_check_timeout_sec,
+        trust_remote_code=ns.trust_remote_code,
     )
 
 
@@ -265,6 +266,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="If set, forwarded to ``vllm bench serve`` (probe first request until success). "
         "Omit to use upstream default (typically skip).",
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Forward trust_remote_code to ``vllm bench serve`` for models with custom code.",
     )
     p.add_argument(
         "--result-dir",

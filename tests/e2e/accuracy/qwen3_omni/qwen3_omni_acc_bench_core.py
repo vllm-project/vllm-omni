@@ -22,8 +22,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Protocol
 
-DEFAULT_DAILY_OMNI_HF_REPO = "liarliar/Daily-Omni"
-DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
+DEFAULT_DAILY_OMNI_HF_REPO = "/data/models/datasets/Daily-Omni"
+DEFAULT_SEED_TTS_HF_REPO = "/data/models/datasets/seed-tts-eval"
 
 
 class OmniBenchServerEndpoint(Protocol):
@@ -150,6 +150,7 @@ def build_serve_common_argv(
     result_dir: Path,
     result_filename: str,
     ready_check_timeout_sec: int | None = None,
+    trust_remote_code: bool = False,
 ) -> list[str]:
     out = [
         "bench",
@@ -184,6 +185,8 @@ def build_serve_common_argv(
     ]
     if ready_check_timeout_sec is not None:
         out.extend(["--ready-check-timeout-sec", str(int(ready_check_timeout_sec))])
+    if trust_remote_code:
+        out.append("--trust-remote-code")
     return out
 
 

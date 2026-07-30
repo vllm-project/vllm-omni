@@ -53,6 +53,7 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    summarize_session_request_metrics,
 )
 
 _url_with_model = build_realtime_url
@@ -214,6 +215,17 @@ class DemoState:
                 }
             )
         return requests
+
+    def session_metric_summary(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Average TTFT, TTFP, and RTF across responses that emitted audio."""
+        return summarize_session_request_metrics(
+            self.session_request_metrics(session_id=session_id),
+            session_id=session_id,
+        )
 
     def first_index(self, event_type: str, predicate=None) -> int | None:
         for index, event in enumerate(self.events):
@@ -1545,6 +1557,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
         "request_metrics": state.session_request_metrics(session_id=args.session_id),
+        "session_metrics": state.session_metric_summary(session_id=args.session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,

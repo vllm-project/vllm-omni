@@ -45,6 +45,15 @@ def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
         assert request["audio_duration_ms"] > 0
 
 
+def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
+    assert isinstance(metrics, dict)
+    assert isinstance(metrics["session_id"], str)
+    assert metrics["audio_turn_count"] == expected_count
+    assert metrics["mean_ttft_ms"] is not None and metrics["mean_ttft_ms"] >= 0
+    assert metrics["mean_ttfp_ms"] is not None and metrics["mean_ttfp_ms"] >= 0
+    assert metrics["mean_rtf"] is not None and metrics["mean_rtf"] >= 0
+
+
 async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
     async def receive() -> list[dict[str, object]]:
         events: list[dict[str, object]] = []
@@ -132,6 +141,7 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
     assert result["all_audio_responses_have_transcript"] is True
     assert result["transcript_delta_done_ok"] is True
     _assert_request_metrics(result["request_metrics"], expected_count=2)
+    _assert_session_metrics(result["session_metrics"], expected_count=2)
 
 
 @pytest.mark.advanced_model
@@ -159,3 +169,4 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str,
     assert all(session["error_count"] == 0 for session in result["sessions"])
     for session in result["sessions"]:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
+        _assert_session_metrics(session["session_metrics"], expected_count=1)

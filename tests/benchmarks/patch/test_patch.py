@@ -50,10 +50,14 @@ class MockResponse:
 @pytest.mark.asyncio
 async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
     class FakeRealtimeClient:
+        last_instance = None
+
         def __init__(self, url):
-            assert url == "ws://localhost:8000/v1/realtime"
+            assert url == "ws://localhost:8000/v1/realtime?duplex=1"
             self.events = RealtimeEventCollector()
             self.configure_kwargs = None
+            self.sent = []
+            type(self).last_instance = self
 
         async def __aenter__(self):
             return self
@@ -65,10 +69,10 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             assert model == "openbmb/MiniCPM-o-4_5"
             self.configure_kwargs = kwargs
 
-        async def stream_pcm16(self, pcm16, **_kwargs):
-            assert len(pcm16) == 32_000
-
-        async def commit(self):
+        async def send(self, event):
+            self.sent.append(event)
+            if event["type"] != "response.create":
+                return
             now = time.monotonic()
             self.events.add(
                 {"type": "response.created", "response": {"id": "resp-1"}},
@@ -95,6 +99,40 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.events.add(
                 {"type": "response.done", "response": {"id": "resp-1"}},
                 received_at_s=now + 0.04,
+            )
+            self.events.add(
+                {"type": "response.created", "response": {"id": "resp-listen"}},
+                received_at_s=now + 0.045,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": "resp-listen"}},
+                received_at_s=now + 0.05,
+            )
+            self.events.add(
+                {"type": "response.created", "response": {"id": "resp-2"}},
+                received_at_s=now + 0.055,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": "resp-2",
+                    "delta": " again",
+                },
+                received_at_s=now + 0.06,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-2",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {"audio_duration_ms": 100},
+                },
+                received_at_s=now + 0.09,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": "resp-2"}},
+                received_at_s=now + 0.1,
             )
 
         async def acknowledge_playback(self):
@@ -127,31 +165,71 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         session=None,
     )
 
+    client = FakeRealtimeClient.last_instance
+    assert client.configure_kwargs["native_duplex"] is False
+    assert client.configure_kwargs["extra_body"] == {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+    }
+    assert client.sent == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        },
+        {"type": "response.create"},
+    ]
     assert output.success is True
-    assert output.generated_text == "hello"
-    assert output.audio_duration == pytest.approx(0.1)
+    assert output.generated_text == "hello again"
+    assert output.audio_duration == pytest.approx(0.2)
     assert output.ttft > 0
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
+    session_id = output.duplex_request_metrics[0]["session_id"]
     assert output.duplex_request_metrics == [
         {
-            "session_id": output.duplex_request_metrics[0]["session_id"],
+            "session_id": session_id,
             "request_index": 0,
             "response_id": "resp-1",
             "source": "client_monotonic_receive",
             "measurement_origin": {
-                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
             },
             "ttft_ms": pytest.approx(20.0, abs=2.0),
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
-        }
+        },
+        {
+            "session_id": session_id,
+            "request_index": 1,
+            "response_id": "resp-2",
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+            },
+            "ttft_ms": pytest.approx(60.0, abs=2.0),
+            "ttfp_ms": pytest.approx(90.0, abs=2.0),
+            "rtf": pytest.approx(0.9, abs=0.03),
+            "audio_generation_ms": pytest.approx(90.0, abs=2.0),
+            "audio_duration_ms": 100.0,
+        },
     ]
+    assert output.duplex_session_metrics == {
+        "session_id": session_id,
+        "audio_turn_count": 2,
+        "mean_ttft_ms": pytest.approx(40.0, abs=2.0),
+        "mean_ttfp_ms": pytest.approx(60.0, abs=2.0),
+        "mean_rtf": pytest.approx(0.6, abs=0.03),
+    }
 
 
 def create_sse_chunk(data_dict):

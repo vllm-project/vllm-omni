@@ -48,6 +48,30 @@ def _interval_summary(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def summarize_session_request_metrics(
+    request_metrics: list[dict[str, object]],
+    *,
+    session_id: str | None,
+) -> dict[str, object]:
+    """Average client-observed metrics across turns that emitted audio."""
+
+    def mean(metric: str, *, digits: int = 3) -> float | None:
+        values = [
+            float(request[metric])
+            for request in request_metrics
+            if isinstance(request.get(metric), int | float) and math.isfinite(float(request[metric]))
+        ]
+        return round(sum(values) / len(values), digits) if values else None
+
+    return {
+        "session_id": session_id,
+        "audio_turn_count": len(request_metrics),
+        "mean_ttft_ms": mean("ttft_ms"),
+        "mean_ttfp_ms": mean("ttfp_ms"),
+        "mean_rtf": mean("rtf", digits=6),
+    }
+
+
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
     candidates: list[object] = [event.get("vllm_omni")]
     metadata = event.get("metadata")
@@ -207,6 +231,7 @@ class RealtimeEventCollector:
         after_s: float,
         input_committed_at_s: float | None = None,
         response_id: str | None = None,
+        measurement_origin: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
         stage0_metrics: dict[str, object] | None = None
@@ -313,7 +338,8 @@ class RealtimeEventCollector:
                 )
                 result["request_metrics"] = {
                     "source": "client_monotonic_receive",
-                    "measurement_origin": {
+                    "measurement_origin": measurement_origin
+                    or {
                         "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                         "ttfp": "input_audio_buffer.commit client send to first audio packet",
                         "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
@@ -387,9 +413,23 @@ class RealtimeDuplexClient:
         ref_audio: str | None = None,
         instructions: str | None = None,
         initial_user_text: str | None = None,
+        native_duplex: bool = True,
+        auto_response: bool = True,
+        extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
         timeout_s: float = 20.0,
     ) -> None:
+        session_extra_body = dict(extra_body or {})
+        if native_duplex:
+            session_extra_body.update(
+                {
+                    "auto_response": auto_response,
+                    "minicpmo45_native_duplex": True,
+                    "force_listen_count": 0,
+                }
+            )
+        else:
+            session_extra_body["minicpmo45_native_duplex"] = False
         session: dict[str, object] = {
             "model": model,
             "modalities": ["audio", "text"],
@@ -398,11 +438,7 @@ class RealtimeDuplexClient:
             "turn_detection": None,
             "overlap_policy": "listen_only",
             "playback_commit_policy": "ack_only",
-            "extra_body": {
-                "auto_response": True,
-                "minicpmo45_native_duplex": True,
-                "force_listen_count": 0,
-            },
+            "extra_body": session_extra_body,
         }
         if ref_audio is not None:
             session["ref_audio"] = ref_audio
