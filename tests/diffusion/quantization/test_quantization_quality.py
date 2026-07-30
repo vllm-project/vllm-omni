@@ -341,15 +341,15 @@ def _generate_video(omni, config: QualityTestConfig):
     )
 
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
-    first = outputs[0]
-    if isinstance(first, OmniRequestOutput) and isinstance(first, list):
-        inner = first[0]
-        if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
-            frames = inner.images[0] if inner.images else None
-        else:
-            frames = inner
-    elif hasattr(first, "images") and first.images:
-        frames = first.images[0]
+    if isinstance(outputs, list) and isinstance(outputs[0], OmniRequestOutput):
+        first = outputs[0]
+    elif isinstance(outputs, OmniRequestOutput):
+        first = outputs
+    else:
+        raise ValueError("Could not extract video frames from output.")
+
+    if hasattr(first, "images"):
+        frames = first.images[0] if first.images else None
     else:
         raise ValueError("Could not extract video frames from output.")
 
