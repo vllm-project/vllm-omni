@@ -291,6 +291,14 @@ _DIFFUSION_MODELS = {
         "pipeline_hidream_image",
         "HiDreamImagePipeline",
     ),
+    # Architecturally unrelated to HiDreamImagePipeline above (HiDream-I1,
+    # diffusers-style, has its own VAE/text-encoder) -- HiDreamO1ImagePipeline
+    # is a Pixel-level Unified Transformer (no VAE, no separate text encoder).
+    "HiDreamO1ImagePipeline": (
+        "hidream_o1_image",
+        "pipeline_hidream_o1_image",
+        "HiDreamO1ImagePipeline",
+    ),
     "DreamZeroPipeline": (
         "dreamzero",
         "pipeline_dreamzero",
@@ -539,6 +547,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
