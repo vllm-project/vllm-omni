@@ -152,6 +152,16 @@ def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     return state
 
 
+def commit_one_block(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
+    state = runner._get_or_create_session(session_id)
+    assert runner.kv_cache is not None
+    seq_len = BLOCK * runner.kv_cache.frames_per_block
+    ctx = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
+    state.commit_paged_context(kv_branch)
+    return state
+
+
 def test_ar_runner_rejects_pipeline_without_capability():
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(max_num_seqs=1)
@@ -225,6 +235,31 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     runner.close_session("s1")
     assert "s1" not in runner._sessions
     assert pipeline.closes == ["s1"]
+
+
+def test_lingbot_like_interleaved_sessions_keep_independent_kv_partitions():
+    runner = make_runner(CapablePipeline(lingbot_like_spec(capacity=2)))
+    kv = runner.kv_cache
+    assert kv is not None
+
+    session_a = commit_one_block(runner, "world-a", "main")
+    a0_blocks = kv.window_block_ids(session_a.adapter("main"))
+    session_b = commit_one_block(runner, "world-b", "main")
+    b0_blocks = kv.window_block_ids(session_b.adapter("main"))
+    session_a_again = commit_one_block(runner, "world-a", "main")
+    a1_blocks = kv.window_block_ids(session_a_again.adapter("main"))
+
+    assert session_a_again is session_a
+    assert session_a.adapter("main").request_id == "ar::world-a::main"
+    assert session_b.adapter("main").request_id == "ar::world-b::main"
+    assert session_a.adapter("main").completed_chunks == 6
+    assert session_b.adapter("main").completed_chunks == 3
+    assert len(a0_blocks) == 3
+    assert len(b0_blocks) == 3
+    assert len(a1_blocks) == 6
+    assert set(a0_blocks) <= set(a1_blocks)
+    assert set(a1_blocks).isdisjoint(b0_blocks)
+    assert tuple(runner._sessions) == ("world-b", "world-a")
 
 
 def test_lingbot_like_sink_survives_sliding_window_eviction():

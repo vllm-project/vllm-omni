@@ -367,6 +367,47 @@ async def test_reset_close_and_disconnect_reach_lifecycle_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_manager_keeps_interleaved_sessions_independent() -> None:
+    consumer = FakeTickConsumer()
+    manager = ARDiffusionSessionManager(
+        tick_consumer=consumer,
+        lifecycle=FakeLifecycle(),
+        max_pending_events=4,
+        request_id_factory=lambda session_id, chunk_index: f"{session_id}-request-{chunk_index}",
+    )
+    session_a = await manager.create_session("world-a")
+    session_b = await manager.create_session("world-b")
+
+    await session_a.accept_event(ARDiffusionSessionEvent(event_id=10, prompt="a0"))
+    await session_a.next_chunk()
+    await session_b.accept_event(ARDiffusionSessionEvent(event_id=1, prompt="b0"))
+    await session_b.next_chunk()
+    await session_a.accept_event(ARDiffusionSessionEvent(event_id=11, prompt="a1"))
+    await session_a.next_chunk()
+
+    assert [
+        (
+            tick.session_id,
+            tick.request_id,
+            tick.chunk_index,
+            tick.applied_event_ids,
+        )
+        for tick in consumer.ticks
+    ] == [
+        ("world-a", "world-a-request-0", 0, (10,)),
+        ("world-b", "world-b-request-0", 0, (1,)),
+        ("world-a", "world-a-request-1", 1, (11,)),
+    ]
+    assert session_a.chunk_index == 2
+    assert session_b.chunk_index == 1
+    with pytest.raises(ARDiffusionStaleEventError, match="event floor is 11"):
+        await session_a.accept_event(ARDiffusionSessionEvent(event_id=2, prompt="stale only for a"))
+    assert (
+        await session_b.accept_event(ARDiffusionSessionEvent(event_id=2, prompt="b1"))
+    ).status is ARDiffusionEventAcceptanceStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
 async def test_failed_close_retains_tombstone_until_cleanup_retry_succeeds() -> None:
     consumer = FakeTickConsumer()
     lifecycle = FakeLifecycle()

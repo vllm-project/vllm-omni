@@ -1479,8 +1479,15 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
 
     first_sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=0))
     first = pipeline(_request(sampling=first_sampling))
-    second_sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=1))
-    second = pipeline(_request(sampling=second_sampling))
+    switched_prompt = _prompt()
+    switched_prompt["prompt"] = "enter the snowy valley"
+    second_sampling = _SamplingParams(
+        extra_args=_tick_extra_args(
+            chunk_index=1,
+            prompt=switched_prompt["prompt"],
+        )
+    )
+    second = pipeline(_request(sampling=second_sampling, prompt=switched_prompt))
 
     assert generated[0]["start_frame"] == 0
     assert generated[1]["start_frame"] == 3
@@ -1490,7 +1497,7 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
         torch.zeros_like(generated[1]["condition"][:, :4]),
     )
     assert torch.count_nonzero(generated[1]["condition"][:, 4:]) > 0
-    assert cross_calls == [False, False]
+    assert cross_calls == [False, True]
     assert first.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
     assert second.output["metadata"]["ar_diffusion"] == {
         "session_id": "world-1",
@@ -1499,6 +1506,7 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
         "applied_event_ids": [1],
     }
     assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
+    assert pipeline._ar_sessions["world-1"].prompt == "enter the snowy valley"
     assert pipeline._ar_sessions["world-1"].camera_tail is not None
     assert pipeline._ar_sessions["world-1"].camera_tail.poses.shape == (1, 4, 4)
     expected_generator = torch.Generator(device="cpu").manual_seed(17)
