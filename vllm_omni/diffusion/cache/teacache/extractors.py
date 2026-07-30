@@ -829,6 +829,8 @@ def extract_mammoth_moda2_context(
     freqs_cis: torch.Tensor,
     text_attention_mask: torch.Tensor,
     ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    ar_image_hidden_states: torch.Tensor | None = None,
+    ar_image_attention_mask: torch.Tensor | None = None,
     return_dict: bool = False,
     teacache_branch: str | None = None,
 ) -> CacheContext:
@@ -847,6 +849,7 @@ def extract_mammoth_moda2_context(
     (
         temb,
         text_hidden_states,
+        text_attention_mask,
         img_tokens,
         img_mask,
         img_len,
@@ -864,6 +867,8 @@ def extract_mammoth_moda2_context(
         batch_size,
         height,
         width,
+        ar_image_hidden_states,
+        ar_image_attention_mask,
     )
 
     text_hidden_states, img_tokens = module._apply_refiners(
