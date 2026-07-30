@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
@@ -365,6 +366,65 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
+_ROCM_VARLEN_FA: Callable[..., Any] | None = None
+_ROCM_VARLEN_FA_RESOLVED = False
+
+
+def _rocm_varlen_fa() -> Callable[..., Any] | None:
+    """aiter's varlen attention via vLLM's ``_aiter_ops``, or ``None`` off ROCm / without aiter.
+
+    Ungated by ``VLLM_ROCM_USE_AITER``, like the provider itself (vllm-project/vllm#33749),
+    since aiter is the only working kernel here. Resolved once: ``find_spec`` is not traceable.
+    """
+    global _ROCM_VARLEN_FA, _ROCM_VARLEN_FA_RESOLVED
+    if not _ROCM_VARLEN_FA_RESOLVED:
+        _ROCM_VARLEN_FA_RESOLVED = True
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            try:
+                from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops
+            except ImportError:
+                pass
+            else:
+                if is_aiter_found():
+                    _ROCM_VARLEN_FA = rocm_aiter_ops.flash_attn_varlen_func
+    return _ROCM_VARLEN_FA
+
+
+def _pack_paged_kv(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy paged K/V into the packed varlen layout, returning ``(k, v, cu_seqlens_k)``.
+
+    KV is gathered because aiter has no usable paged path for this cache -- passing it a
+    ``block_table`` faults the GPU on gfx950. The copy runs at HBM bandwidth, 3-7% of
+    attention time.
+
+    TODO: build the index once per forward rather than per layer. It depends only on the block
+    table, and per layer its flat ~0.055ms is 1-22% of attention time, worst at small windows.
+    """
+    page = key_cache.shape[1]
+    lens = seq_lens.to(torch.int64)
+    cu_seqlens_k = torch.cat([lens.new_zeros(1), lens.cumsum(0)])
+    total = int(cu_seqlens_k[-1])
+    seq_id = torch.repeat_interleave(
+        torch.arange(lens.numel(), device=lens.device),
+        lens,
+    )
+    pos = torch.arange(total, device=lens.device) - cu_seqlens_k[seq_id]
+    logical = torch.div(pos, page, rounding_mode="floor")
+    flat = block_table[seq_id, logical].to(torch.int64) * page + pos % page
+    return (
+        key_cache.flatten(0, 1)[flat],
+        value_cache.flatten(0, 1)[flat],
+        cu_seqlens_k.to(torch.int32),
+    )
+
+
 def ar_diffusion_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -390,6 +450,8 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
+    rocm_fa = _rocm_varlen_fa() if query_flat.is_cuda else None
+
     if not query_flat.is_cuda:
         out = _reference_paged_attention(
             query_flat,
@@ -401,6 +463,25 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
+    elif rocm_fa is not None:
+        packed_k, packed_v, cu_seqlens_k = _pack_paged_kv(key_cache, value_cache, block_table, seq_lens)
+        out = rocm_fa(
+            q=query_flat,
+            k=packed_k,
+            v=packed_v,
+            cu_seqlens_q=query_start_loc.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(max_query_len),
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
+            causal=causal,
+            # The provider forwards None for these two, which aiter rejects; both values below
+            # are aiter's own defaults, i.e. no sliding window and no minimum query length.
+            window_size=(-1, -1),
+            min_seqlen_q=0,
+        )
+        if isinstance(out, (tuple, list)):
+            out = out[0]
     else:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 

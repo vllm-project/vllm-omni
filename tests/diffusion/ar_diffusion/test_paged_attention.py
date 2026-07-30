@@ -60,6 +60,13 @@ def _dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     return torch.einsum("bhqk,bkhd->bqhd", probs, value)
 
 
+def _rocm_flash_attn_usable() -> bool:
+    """ROCm reaches the paged kernel through aiter's vLLM provider, not vllm.vllm_flash_attn."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_rocm() and find_spec("aiter") is not None and find_spec("vllm._aiter_ops") is not None
+
+
 def _cuda_flash_attn_usable() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -227,12 +234,16 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
-@pytest.mark.skipif(not _cuda_flash_attn_usable(), reason="usable CUDA FlashAttention is required")
+@pytest.mark.skipif(
+    not (_cuda_flash_attn_usable() or _rocm_flash_attn_usable()),
+    reason="a usable CUDA FlashAttention or ROCm aiter is required",
+)
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len, commit_current):
-    pytest.importorskip("vllm.vllm_flash_attn")
+    if not _rocm_flash_attn_usable():
+        pytest.importorskip("vllm.vllm_flash_attn")
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.float16
