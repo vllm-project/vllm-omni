@@ -5,7 +5,6 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -16,25 +15,26 @@ AUDIO_MODEL = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 100, "rocm": None},
 }
 
-IMAGE_VIDEO_MODELS = {
+IMAGE_MODELS = {
     "riverclouds/qwen_image_random": {"cuda": 2200, "rocm": 2100},
-    "Tongyi-MAI/Z-Image-Turbo": {"cuda": 2500, "rocm": 2100},
-    "OmniGen2/OmniGen2": {"cuda": 2500, "rocm": 2100},
 }
 
-MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+MODELS = {**AUDIO_MODEL, **IMAGE_MODELS}
+
+MODEL_MARKS = {
+    "riverclouds/qwen_image_random": pytest.mark.core_model,
+    "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
+}
 
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
 
-# Aliased for backward compatibility (imported by test_diffusion_layerwise_offload.py).
-_skip_if_gated_repo_inaccessible = skip_if_gated_repo_inaccessible
 
 AUDIO_MODEL_PARAMS = {
     "runner_params": {},
     "sampler_params": {},
 }
 
-IMAGE_VIDEO_MODELS_PARAMS = {
+IMAGE_MODEL_PARAMS = {
     "runner_params": {},
     "sampler_params": {
         "height": 256,
@@ -53,7 +53,7 @@ def inference(model_name: str, offload: bool = True):
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
     else:
-        params = IMAGE_VIDEO_MODELS_PARAMS
+        params = IMAGE_MODEL_PARAMS
 
     with OmniRunner(
         model_name,
@@ -97,24 +97,19 @@ def check_audio_determinism(audio1, audio2, atol=1e-2):
     return True
 
 
-@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", list(MODELS.keys()))
+@pytest.mark.parametrize(
+    "model_name",
+    [pytest.param(name, marks=MODEL_MARKS[name]) for name in MODELS],
+)
 def test_cpu_offload_diffusion_model(model_name: str):
-    if model_name == "OmniGen2/OmniGen2":
-        pytest.skip("issue #4537")
-    if model_name in _GATED_MODELS:
-        _skip_if_gated_repo_inaccessible(model_name)
     try:
         offload_peak_memory, output_offload = inference(model_name, offload=True)
         cleanup_dist_env_and_memory()
         no_offload_peak_memory, output_no_offload = inference(model_name, offload=False)
     except ValueError as exc:
-        # omni_snapshot_download wraps GatedRepoError in a ValueError.
-        # If the pre-flight guard above did not catch it (e.g. partial
-        # HF_TOKEN where config.json is accessible but weight shards are
-        # blocked), skip instead of failing.
+        # omni_snapshot_download wraps GatedRepoError in a ValueError; skip instead of failing.
         if "Access to model" in str(exc) and "is restricted" in str(exc):
             pytest.skip(
                 f"Skipping: gated HF repo {model_name!r} inaccessible "

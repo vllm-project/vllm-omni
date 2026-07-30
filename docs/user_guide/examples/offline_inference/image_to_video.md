@@ -4,7 +4,7 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 
 This example demonstrates how to generate videos from images using Wan2.2,
-LTX-2/LTX-2.3, and HunyuanVideo-1.5 Image-to-Video models with vLLM-Omni's
+LTX-2, and HunyuanVideo-1.5 Image-to-Video models with vLLM-Omni's
 offline inference API.
 
 ## Local CLI Usage
@@ -53,34 +53,22 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
-### LTX-2.3
+### LTX-2
 
 ```bash
 python image_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
-  --model-class-name LTX23ImageToVideoPipeline \
+  --model Lightricks/LTX-2 \
   --image cherry_blossom.jpg \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --guidance-scale 4.0 \
-  --num-inference-steps 20 \
-  --frame-rate 24 \
-  --fps 24 \
-  --output ltx23_i2v_output.mp4
+  --output ltx2_i2v_output.mp4
 ```
 
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
-the LTX-2.3 image-to-video pipeline.
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, T2V, defaults, and advanced options.
 
 Key arguments:
 
-- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or
-  LTX-2/LTX-2.3).
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or LTX-2).
 - `--image`: Path to input image (required).
 - `--prompt`: Text description of desired motion/animation.
 - `--height/--width`: Output resolution (auto-calculated from image if not set).

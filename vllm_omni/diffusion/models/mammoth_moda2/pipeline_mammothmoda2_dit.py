@@ -42,6 +42,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "llm_model.": None,
+            "gen_tokenizer.": None,
         }
     )
 
@@ -77,11 +78,23 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             )
         self._reinit_caption_embedder(llm_hidden_size)
 
-        # Optional: image condition refiner (Q-Former)
-        if self.config.gen_image_condition_refiner_config is not None:
+        # Optional image condition Q-Former. Preview stores it as a standalone
+        # module; Dev stores it under the DiT timestep/caption embedder.
+        llm_model_type = getattr(self.config.llm_config, "model_type", "")
+        refiner_config = self.config.gen_image_condition_refiner_config
+        if refiner_config is not None and llm_model_type == "mammothmoda2_qwen3_vl":
+            dit_hidden_size = int(self.gen_transformer.hidden_size)
+            self.gen_transformer.time_caption_embed.image_embedder = SimpleQFormerImageRefiner(
+                hidden_size=llm_hidden_size,
+                output_hidden_size=dit_hidden_size,
+                num_heads=max(1, dit_hidden_size // 128),
+                **refiner_config,
+            )
+            self.gen_image_condition_refiner = None
+        elif refiner_config is not None:
             self.gen_image_condition_refiner = SimpleQFormerImageRefiner(
                 hidden_size=llm_hidden_size,
-                **self.config.gen_image_condition_refiner_config,
+                **refiner_config,
             )
         else:
             self.gen_image_condition_refiner = None
@@ -237,6 +250,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
         image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
+        if image_cond.shape[0] == 0:
+            answer_token_ids = info.get("full_token_ids", [])[int(info.get("answer_start_index", [0])[0]) :]
+            raise ValueError(
+                "MammothModa2 AR stage produced no visual-token hidden states; "
+                "the DiT stage requires at least one generated visual token. "
+                f"Generated token ids: {answer_token_ids[:32]}"
+            )
         text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
         image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
@@ -263,8 +283,17 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 device=image_embeds.device,
             )
 
-        prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
-        prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+        nested_image_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
+        if nested_image_embedder is None:
+            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+            prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+            ar_image_embeds = None
+            ar_image_attention_mask = None
+        else:
+            prompt_embeds = text_embeds
+            prompt_attention_mask = text_attention_mask
+            ar_image_embeds = image_embeds
+            ar_image_attention_mask = image_attention_mask
 
         # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
         negative_prompt_embeds = None
@@ -337,6 +366,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 text_hidden_states=prompt_embeds,
                 text_attention_mask=prompt_attention_mask,
                 ref_image_hidden_states=None,
+                ar_image_hidden_states=ar_image_embeds,
+                ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
             )
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0

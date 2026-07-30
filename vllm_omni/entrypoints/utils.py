@@ -12,7 +12,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
@@ -103,12 +103,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
             return True
         return isinstance(
             value,
-            (
-                types.FunctionType,
-                types.MethodType,
-                types.BuiltinFunctionType,
-                types.BuiltinMethodType,
-            ),
+            types.FunctionType | types.MethodType | types.BuiltinFunctionType | types.BuiltinMethodType,
         )
 
     result = {}
@@ -193,10 +188,10 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if callable(obj):
         return None
     # Handle lists and tuples (recurse into items)
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return type(obj)(_convert_dataclasses_to_dict(item) for item in obj if not callable(item))
     # Try to convert any dict-like object (has keys/values methods) to dict
-    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
+    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, str | bytes):
         try:
             return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError):
@@ -314,6 +309,8 @@ def resolve_model_config_path(model: str) -> str:
 
 def load_stage_configs_from_model(
     model: str,
+    *,
+    trust_remote_code: bool | None,
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -322,13 +319,14 @@ def load_stage_configs_from_model(
     """Load stage configurations from model's default config file.
 
     For models registered in the pipeline registry (new path), uses
-    ``StageConfigFactory.create_from_model()`` which merges
+    ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
     For other models (legacy path), loads stage configs from YAML.
 
     Args:
         model: Model name or path (used to determine model_type)
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
@@ -346,20 +344,30 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+    # A False inherited from the engine-args dump is the store_true flag's
+    # default, not an explicit choice — drop it so only the tri-state
+    # parameter below decides (see with_trust_remote_code_override).
+    if not cli_overrides.get("trust_remote_code"):
+        cli_overrides.pop("trust_remote_code", None)
+    cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
                 cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
+    # Current runtime initialization still consumes legacy OmegaConf stage
+    # configs. ``StageConfigFactory.create_from_model`` now produces the
+    # structured ``VllmOmniConfig`` object; future RFC #4021 changes will
+    # migrate the engine/runtime consumers and replace this legacy resolver.
     strategy_specs = None
     if strategy_config_path is not None:
         from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
 
         strategy_specs = load_strategy_specs(strategy_config_path)
 
-    stages, omni_lb_policy = StageConfigFactory.create_from_model(
+    stages, omni_lb_policy = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
-        trust_remote_code=cli_overrides.get("trust_remote_code", False),
+        trust_remote_code=trust_remote_code,
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
         strategy_specs=strategy_specs,
@@ -550,6 +558,8 @@ def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
     kwargs: dict | None,
+    *,
+    trust_remote_code: bool | None,
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -561,6 +571,7 @@ def load_and_resolve_stage_configs(
         model: Model name or path
         stage_configs_path: Optional path to legacy YAML (stage_args format)
         kwargs: Engine arguments to merge with stage configs
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
         deploy_config_path: Optional path to deploy YAML (new format).
@@ -606,6 +617,7 @@ def load_and_resolve_stage_configs(
         config_path = deploy_config_path
         stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
@@ -621,6 +633,7 @@ def load_and_resolve_stage_configs(
         config_path = resolve_model_config_path(model)
         stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
@@ -715,7 +728,7 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
         if origin in (list, tuple, set):
             args = get_args(annotation)
             inner = args[0] if args else None
-            if isinstance(value, (list, tuple, set)):
+            if isinstance(value, list | tuple | set):
                 return type(value)(_filter_value(v, inner) for v in value)
             return value
 

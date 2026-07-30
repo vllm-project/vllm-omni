@@ -47,7 +47,7 @@ When running on Ray, the system automatically adapts its communication strategy:
 
 *   **Cross-Node**: Recommended to use `MooncakeTransferEngineConnector` (RDMA, fastest) or `MooncakeStoreConnector` (TCP fallback).
 *   **Same-Node**: Can still use `SharedMemoryConnector` for efficiency, or Ray's native object store (plasma).
-*   **SHM threshold default differs**: when `worker_backend="ray"`, the SharedMemoryConnector default threshold is set to `sys.maxsize`, which forces payloads to go inline (no SHM). Override `shm_threshold_bytes` in the connector config if you want SHM for Ray runs.
+*   **SHM payload routing**: `SharedMemoryConnector` always stores payloads in `/dev/shm`.
 
 ### 2.4 Internal Helpers
 

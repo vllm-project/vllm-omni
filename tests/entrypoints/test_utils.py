@@ -315,13 +315,17 @@ class TestResolveModelConfigPath:
 
 
 class TestLoadAndResolveStageConfigs:
-    def test_load_and_resolve_with_kwargs(self):
+    def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
         """Ensure that dtype survives default stage creation."""
         kwargs = {"dtype": torch.float32}
+        mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
+        mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
+
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
             stage_configs_path=None,
             kwargs=kwargs,
+            trust_remote_code=False,
             default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
         )
         assert config_path is None
@@ -356,10 +360,12 @@ class TestLoadAndResolveStageConfigs:
             model="dummy-model",
             stage_configs_path=str(deploy_path),
             kwargs={},
+            trust_remote_code=True,
         )
 
         load_stage_configs.assert_called_once_with(
             "dummy-model",
+            trust_remote_code=True,
             base_engine_args={},
             deploy_config_path=str(deploy_path),
             stage_overrides=None,

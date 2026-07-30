@@ -24,6 +24,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.higgs_audio_v3"
 
 HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
     model_type="higgs_multimodal_qwen3",
+    default_deploy_config_name="higgs_multimodal_qwen3.yaml",
     model_arch="HiggsAudioV3TalkerForConditionalGeneration",
     hf_architectures=("HiggsMultimodalQwen3ForConditionalGeneration",),
     stages=(

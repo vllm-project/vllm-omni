@@ -100,8 +100,7 @@ def test_device_check_survives_cli_override():
     # guard: effective world=1, replicas=2 admits only 1 or 2 device ids.
     pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
     with pytest.raises(StrategyApplyError):
-        StageConfigFactory._create_from_registry(
-            "qwen2_5_omni",
+        StageConfigFactory._create_legacy_from_registry(
             pipeline_cfg,
             cli_overrides={"stage_1_devices": "0,1,2"},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
@@ -126,8 +125,7 @@ def test_cli_overrides_strategy_with_warning():
     log.addHandler(handler)
     try:
         pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
-        stages, _ = StageConfigFactory._create_from_registry(
-            "qwen2_5_omni",
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
             pipeline_cfg,
             cli_overrides={"stage_1_num_replicas": 3},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},

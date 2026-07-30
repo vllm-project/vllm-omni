@@ -25,6 +25,10 @@ from vllm.entrypoints.chat_utils import (
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.diffusion_request_utils import (
+    apply_normalized_diffusion_request_extra_args,
+    normalize_diffusion_request_args,
+)
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -33,7 +37,10 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
-from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    get_extra_output_params,
+)
 
 try:
     import soundfile
@@ -79,7 +86,7 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
@@ -95,7 +102,10 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression, validate_layered_layers
+from vllm_omni.entrypoints.openai.image_api_utils import (
+    encode_image_base64_with_compression,
+    validate_layered_layers,
+)
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
@@ -152,6 +162,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+    # Common fields stay at the request root, but still participate in
+    # conflicts with model-specific compatibility forms.
+    _diffusion_common_root_fields = frozenset(
+        {
+            "height",
+            "width",
+            "num_outputs_per_prompt",
+            "seed",
+            "num_inference_steps",
+            "guidance_scale",
+            "true_cfg_scale",
+            "num_frames",
+            "guidance_scale_2",
+            "layers",
+            "resolution",
+        }
+    )
+    _diffusion_existing_control_fields = frozenset(
+        {
+            "size",
+            "negative_prompt",
+            "lora",
+            "modalities",
+        }
+    )
+    _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
+    _diffusion_serving_root_fields = _diffusion_common_root_fields | _diffusion_existing_control_fields
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -186,6 +223,63 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # parser_cls may be None (no tool parser configured); guard accordingly
         tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
         return request.tools and tp_cls is not None and self.enable_auto_tools and request.tool_choice in ["auto", None]
+
+    @staticmethod
+    def _stage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _has_minicpmo45_stage(self) -> bool:
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = self._stage_get(stage, "engine_args")
+            model_arch = self._stage_get(engine_args, "model_arch")
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                return True
+        return False
+
+    def _fix_minicpmo45_audio_stream_output_kinds(
+        self,
+        sampling_params_list: list[Any],
+        output_modalities: list[str] | tuple[str, ...] | None,
+    ) -> list[Any]:
+        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+
+        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
+        That is correct for token-level text streaming, but MiniCPM-o 4.5's
+        Talker consumes the completed TTS span plus aligned thinker hidden
+        states. If Stage0 is DELTA, llm2tts receives one generated token at a
+        time and repeatedly starts tiny, independent TTS streams. The API then
+        never represents one coherent audio response.
+
+        For this model, stream the audio stage, not the thinker-to-talker
+        boundary.
+        """
+        if not output_modalities or "audio" not in output_modalities:
+            return sampling_params_list
+        if not self._has_minicpmo45_stage():
+            return sampling_params_list
+
+        stage_configs = getattr(self.engine_client, "stage_configs", []) or []
+        for idx, stage in enumerate(stage_configs):
+            if idx >= len(sampling_params_list):
+                break
+            sp = sampling_params_list[idx]
+            if not hasattr(sp, "output_kind"):
+                continue
+
+            engine_args = self._stage_get(stage, "engine_args")
+            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+
+            model_stage = self._stage_get(engine_args, "model_stage")
+            if model_stage == "llm":
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
+            elif model_stage == "tts":
+                sp.output_kind = RequestOutputKind.DELTA
+        return sampling_params_list
 
     @classmethod
     def for_diffusion(
@@ -233,6 +327,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         self._diffusion_extra_body_params = params
         return params
+
+    def _normalize_diffusion_request_args(
+        self,
+        request: ChatCompletionRequest,
+    ) -> tuple[dict[str, object], dict[str, Any]]:
+        """Normalize extras and preserve validated common root fields."""
+        root = dict(request.model_extra or {})
+        nested = root.pop("extra_body", None)
+        if nested is None:
+            nested = getattr(request, "extra_body", None)
+        explicit = getattr(request, "model_fields_set", None)
+        if explicit is None:
+            explicit = getattr(request, "__fields_set__", ())
+        explicit_root_args = {
+            key: getattr(request, key) for key in explicit if key != "extra_body" and hasattr(request, key)
+        }
+        return normalize_diffusion_request_args(
+            root=root,
+            nested=nested,
+            explicit_root_args=explicit_root_args,
+            serving_root_fields=self._diffusion_serving_root_fields,
+            registered_extra_fields=self._get_diffusion_extra_body_params(),
+            root_field_aliases=self._diffusion_root_field_aliases,
+        )
 
     def _get_diffusion_extra_output_params(
         self,
@@ -329,9 +447,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
+        serves_diffusion = self._diffusion_mode or any(
+            get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
+        )
+        normalized_extra_args: dict[str, object] = {}
+        diffusion_request_args: dict[str, Any] = {}
+        if serves_diffusion:
+            try:
+                normalized_extra_args, diffusion_request_args = self._normalize_diffusion_request_args(request)
+            except ValueError as exc:
+                return self._create_error_response(str(exc), status_code=400)
+
         # Handle diffusion mode
         if self._diffusion_mode:
-            return await self._create_diffusion_chat_completion(request, raw_request)
+            return await self._create_diffusion_chat_completion(
+                request,
+                normalized_extra_args,
+                diffusion_request_args,
+                raw_request,
+            )
 
         request_timestamp = time.time()
         if raw_request is not None:
@@ -455,13 +590,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
+        if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
+            return self.create_error_response("'modalities' must be a list of strings.")
+        allowed_modalities = set(engine_output_modalities)
+        if is_single_stage_diffusion(self.engine_client):
+            allowed_modalities.add("text")
+        unsupported = set(request.modalities) - allowed_modalities
+        if unsupported:
+            return self.create_error_response(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+            )
+
         if request.modalities and "audio" in request.modalities:
             audio_format_check = self._resolve_audio_format(request)
             if isinstance(audio_format_check, ErrorResponse):
                 return audio_format_check
 
         num_inference_steps = None
-        extra_body: dict[str, Any] = {}
+        extra_body = diffusion_request_args
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -474,12 +621,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
-
-                # [NOTE] When sending request via openai client Python library,
-                #   `extra_body` is flattented and merged into the payload's root.
-                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
-                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-                extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
 
@@ -593,16 +734,38 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+                if request.stream:
+                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                        sampling_params_list,
+                        output_modalities,
+                    )
 
+                comprehension_idx = (
+                    self._get_comprehension_stage_index()
+                    if _image_gen_height is not None and _image_gen_width is not None
+                    else None
+                )
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
+                    if idx == comprehension_idx:
+                        extra_args = dict(getattr(sp, "extra_args", {}) or {})
+                        extra_args["target_h"] = int(_image_gen_height)
+                        extra_args["target_w"] = int(_image_gen_width)
+                        sp.extra_args = extra_args
                     if hasattr(sp, "height") and _image_gen_height is not None:
                         sp.height = _image_gen_height
                     if hasattr(sp, "width") and _image_gen_width is not None:
                         sp.width = _image_gen_width
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
-                    apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
+                    if isinstance(sp, OmniDiffusionSamplingParams):
+                        apply_normalized_diffusion_request_extra_args(sp, normalized_extra_args)
+                    else:
+                        apply_declared_extra_args(
+                            sp,
+                            self._get_diffusion_extra_body_params(),
+                            extra_body,
+                        )
 
                 self._log_inputs(
                     request_id,
@@ -1092,8 +1255,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        For models needing spatial metadata (e.g. GLM-Image), target_h/w is
-        injected into extra_args so the runner can build M-RoPE position grids.
         max_tokens is NOT computed dynamically — it uses the deploy YAML default.
 
         Args:
@@ -1118,19 +1279,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             value = getattr(request, field_name, None)
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
                 setattr(params, field_name, value)
-
-        # For GLM-Image: compute max_tokens from height/width with mode-aware
-        # budgeting (t2i vs i2i).
-        extra_body = getattr(request, "extra_body", {}) or {}
-        height, width = self._resolve_height_width_from_extra_body(extra_body)
-
-        if height is not None and width is not None:
-            # Keep target size in stage-0 sampling params so runner/model can
-            # build deterministic M-RoPE grids for t2i (no MM features).
-            extra_args = dict(getattr(params, "extra_args", {}) or {})
-            extra_args["target_h"] = int(height)
-            extra_args["target_w"] = int(width)
-            params.extra_args = extra_args
 
         return params
 
@@ -1935,6 +2083,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    if isinstance(choices_data, ErrorResponse):
+                        logger.error(
+                            "Skipping audio chunk for request %s: %s",
+                            request_id,
+                            choices_data.error.message,
+                        )
+                        continue
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2207,6 +2362,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ]
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                if isinstance(choices_data, ErrorResponse):
+                    return choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2534,12 +2691,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ):
+    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        # The attribute is attached dynamically when stage audio arrives; fall
+        # back to the no-audio error response instead of an AttributeError 500
+        # when the pipeline produced no audio for this request.
+        mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if not audio_data:
@@ -2551,7 +2711,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             audio_tensor = audio_data
         if audio_tensor is None:
-            return self._create_error_response("Audio generation completed but no audio was produced.")
+            if not stream:
+                return self._create_error_response("Audio generation completed but no audio was produced.")
+            # A streamed message can legitimately carry no waveform: the talker
+            # may emit an empty speech segment, and Stage 2 then reports the
+            # chunk with metadata only. Emit an empty audio delta so the
+            # caller's finish_reason bookkeeping still runs and the stream
+            # terminates normally instead of raising mid-generation.
+            return [
+                ChatCompletionResponseStreamChoice(
+                    index=output.index,
+                    delta=DeltaMessage(role=role, content=""),
+                    logprobs=None,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                )
+                for output in final_res.outputs
+            ]
         audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)
@@ -3263,12 +3440,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
+        normalized_extra_args: dict[str, object],
+        diffusion_request_args: dict[str, Any],
         raw_request: Request | None = None,
     ) -> ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
 
         Args:
             request: Chat completion request
+            normalized_extra_args: Validated model-specific request arguments
+            diffusion_request_args: Compatibility arguments plus validated common root fields
             raw_request: Raw FastAPI request object
 
         Returns:
@@ -3293,15 +3474,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages
             )
 
-            # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
-            # [NOTE] When sending request via openai client Python library,
-            #   `extra_body` is flattented and merged into the payload's root.
-            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
-            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-            extra_body = getattr(request, "extra_body", None)
-            if not extra_body:
-                extra_body = request.model_extra or {}
+            extra_body = diffusion_request_args
 
             # Parse size if provided (supports "1024x1024" format)
             height, width = self._resolve_height_width_from_extra_body(extra_body)
@@ -3312,7 +3486,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # not provide a value.
             num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+            true_cfg_scale = extra_body.get("true_cfg_scale")
             seed = extra_body.get("seed")
             if seed is None:
                 seed = getattr(request, "seed", None)
@@ -3327,18 +3501,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Qwen-Image-Layered parameters
             layers = extra_body.get("layers")
             resolution = extra_body.get("resolution")
-
             try:
                 layers = validate_layered_layers(layers)
-            except ValueError as e:
-                return self._create_error_response(str(e), status_code=400)
+            except ValueError as exc:
+                return self._create_error_response(str(exc), status_code=400)
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
                 request_id,
                 prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
-                {k: v for k, v in extra_body.items() if v is not None},
+                {key: value for key, value in extra_body.items() if value is not None},
             )
 
             # Decode reference images if provided
@@ -3370,7 +3543,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.guidance_scale = guidance_scale
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
-            apply_declared_extra_args(gen_params, self._get_diffusion_extra_body_params(), extra_body)
+            apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
@@ -3380,14 +3553,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if resolution is not None:
                 gen_params.resolution = resolution
 
-            # Pipeline-agnostic escape hatch (mirrors ``extra_params`` on the /v1/videos
-            # endpoint in ``serving_video.py``): a single reserved ``extra_args`` dict in
-            # ``extra_body`` flows straight into ``gen_params.extra_args``, with no keys
-            # hardcoded here.
-            extra_args_body = extra_body.get("extra_args")
-            if isinstance(extra_args_body, dict):
-                gen_params.extra_args.update(extra_args_body)
-
             # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
                 try:
@@ -3396,8 +3561,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
                             gen_params.lora_scale = lora_scale
-                except Exception as e:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", e)
+                except Exception as exc:  # pragma: no cover - safeguard
+                    logger.warning("Failed to parse LoRA request: %s", exc)
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []
@@ -3436,13 +3601,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
+            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
             sampling_params_list = build_stage_sampling_params_list(
                 stage_configs,
-                get_default_sampling_params_list(diffusion_engine),
+                default_sampling_params_list,
                 diffusion_params=gen_params,
                 replace_diffusion_params=True,
             )
-
+            for index, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
+                if get_stage_type(stage_config) != "diffusion" or index >= len(default_sampling_params_list):
+                    continue
+                default_extra_args = getattr(default_sampling_params_list[index], "extra_args", None)
+                if default_extra_args:
+                    sampling_params.extra_args = {
+                        **default_extra_args,
+                        **(getattr(sampling_params, "extra_args", None) or {}),
+                    }
             if not sampling_params_list:
                 sampling_params_list = [gen_params]
 
