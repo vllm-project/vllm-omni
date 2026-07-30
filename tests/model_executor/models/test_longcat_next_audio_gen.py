@@ -30,6 +30,7 @@ def _model(**attrs):
     """Stub carrying only what the methods under test touch."""
     base = {
         "_audio_gen": {},
+        "_visual_gen": {},
         "_audio_debug": False,
         "_audio_delay_default": 0,
         "config": SimpleNamespace(hidden_size=HIDDEN),
@@ -104,6 +105,28 @@ def test_make_omni_output_keeps_only_real_rows_in_mixed_batch():
     out = _make_omni_output(_model(), torch.zeros(2, HIDDEN), buffer)
 
     assert torch.equal(out.multimodal_outputs["codes"]["audio"], _frame(5))
+
+
+def test_make_omni_output_routes_mixed_batch_by_request_not_globally():
+    """The runner-key collision fix: a decode batch containing one
+    audio-gen request and one image-gen request must route each request's
+    frame to its OWN modality key, not one guessed key for the whole step.
+    Both frames arrive tagged "audio" on the wire (the runner's
+    talker_mtp_output_key is a single fixed destination) -- req_id is what
+    make_omni_output uses to tell them apart."""
+    # Non-empty state dicts: make_omni_output's hidden-state stash does
+    # ``self._audio_gen.get(req_id) or self._visual_gen.get(req_id)``, which
+    # would fall through to None (and crash) for an empty-dict state.
+    model = _model(_audio_gen={"rA": {"terminal": False}}, _visual_gen={"rB": {"terminal": False}})
+    buffer = [
+        {"req_id": "rA", "codes": {"audio": _frame(3)}},
+        {"req_id": "rB", "codes": {"audio": _frame(9)}},
+    ]
+
+    out = _make_omni_output(model, torch.zeros(2, HIDDEN), buffer)
+
+    assert torch.equal(out.multimodal_outputs["codes"]["audio"], _frame(3))
+    assert torch.equal(out.multimodal_outputs["codes"]["visual"], _frame(9))
 
 
 def test_make_omni_output_empty_without_codes():

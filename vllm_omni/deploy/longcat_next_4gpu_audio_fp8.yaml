@@ -1,5 +1,5 @@
 # LongCat-Next deploy: thinker (fp8, TP=4) + audio decoder, colocated on
-# 4x A100-40GB.
+# 4x 40-48GB (tested on A100-40GB).
 #
 # longcat_next_4gpu_audio.yaml (bf16, no quantization) assumes 80GB GPUs
 # per its own comment -- this cluster's cards are actually A100-SXM4-40GB

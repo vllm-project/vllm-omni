@@ -1,0 +1,56 @@
+# LongCat-Next deploy: thinker (bf16, TP=4) + image decoder + audio decoder on
+# 4x A100-80GB (or H100-80GB, etc.). GPUs 0-2: thinker TP=4 bf16 (~37 GB/GPU,
+# ~43 GiB free for KV cache + activations). GPU 3: thinker rank 3 + both
+# decoders sequentially (image ~15-20 GiB + audio ~3.33 GiB = ~18-23 GiB total,
+# comfortably within the ~43 GiB free on GPU 3).
+#
+# LONGCAT_NEXT_PIPELINE stages: 0=thinker (AR), 1=image_decoder (generation),
+# 2=audio_decoder (generation).
+pipeline: longcat_next
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    tensor_parallel_size: 4
+    devices: "0,1,2,3"
+    trust_remote_code: true
+    enforce_eager: true
+    gpu_memory_utilization: 0.90
+    max_num_batched_tokens: 8192
+    max_model_len: 65536
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      max_tokens: 2048
+      repetition_penalty: 1.05
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    model_stage: image_decoder
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "3"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+  - stage_id: 2
+    model_stage: audio_decoder
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.06
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "3"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+platforms: {}

@@ -1301,6 +1301,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
                 info["generated_len"] = generated_len
+                info["req_id"] = req_id
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]

@@ -233,7 +233,17 @@ def extract_visual_codes(output_ids: Sequence[int]) -> list[list[int]]:
 
 
 def infer_visual_grid(output_ids: Sequence[int]) -> tuple[int, int] | None:
-    """Infer (token_h, token_w) from newline structure of the first image segment."""
+    """Infer (token_h, token_w) from newline structure of the first image segment.
+
+    Counts VISIBLE placeholder tokens per row directly (row_len), with no
+    NUM_CODEBOOKS division: each real-pixel generation step contributes
+    exactly one IMG_PAD_TOKEN_ID to the visible stream (forced in
+    compute_logits, modeling_longcat_next.py), not NUM_CODEBOOKS ids --
+    the real per-level codes ride multimodal_output, not this stream (see
+    extract_visual_codes's docstring for the same point). An earlier
+    version of this function divided by NUM_CODEBOOKS, matching
+    extract_visual_codes's now-corrected wrong assumption.
+    """
     in_segment = False
     row_len = 0
     width: int | None = None
@@ -248,12 +258,12 @@ def infer_visual_grid(output_ids: Sequence[int]) -> tuple[int, int] | None:
             continue
         elif tid == IMG_NEWLINE_TOKEN_ID:
             if width is None:
-                width = row_len // NUM_CODEBOOKS
+                width = row_len
             height += 1
             row_len = 0
         elif tid == IMG_END_TOKEN_ID:
             if row_len and width is None:
-                width = row_len // NUM_CODEBOOKS
+                width = row_len
             if row_len and width:
                 height += 1
             if width and height:

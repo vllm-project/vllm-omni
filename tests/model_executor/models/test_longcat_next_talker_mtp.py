@@ -20,6 +20,8 @@ from vllm_omni.model_executor.models.longcat_next import modeling_longcat_next a
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
     AUDIOTEXT_PAD_TOKEN_ID,
     AUDIOTEXT_START_TOKEN_ID,
+    IMG_NEWLINE_TOKEN_ID,
+    IMG_PAD_TOKEN_ID,
 )
 
 M = mln.LongcatNextForCausalLM
@@ -27,6 +29,9 @@ M = mln.LongcatNextForCausalLM
 # Real values from the checkpoint's config.json.
 CODEBOOK_SIZES = [8192, 4096, 2048, 1024, 1024, 1024, 1024, 1024]
 AUDIO_OFFSET = 131125
+# Visual: every level is 16384-wide (config.json's visual_config.vq_config).
+VISUAL_CODEBOOK_SIZES = [16384] * 8
+VISUAL_OFFSET = 150581
 HIDDEN = 8
 
 
@@ -51,23 +56,62 @@ class _StubModel(nn.Module):
 
     _dbg_step = staticmethod(M._dbg_step)
     _sample_audio_code = M._sample_audio_code
+    _sample_depth_head = M._sample_depth_head
     _ensure_replicated_audio_code_embedding = M._ensure_replicated_audio_code_embedding
     _ensure_audio_code_embed_module = M._ensure_audio_code_embed_module
+    _ensure_replicated_visual_code_embedding = M._ensure_replicated_visual_code_embedding
+    _ensure_visual_code_embed_module = M._ensure_visual_code_embed_module
+    _code_embeddings = M._code_embeddings
     talker_mtp = M.talker_mtp
 
-    def __init__(self, audio_head_fn, embed_tokens_fn, offsets):
+    def __init__(self, audio_head_fn, visual_head_fn, embed_tokens_fn, offsets, visual_offsets):
         super().__init__()
         self._audio_gen: dict = {}
+        self._visual_gen: dict = {}
         self._audio_debug = False
         self._dbg_sampled = 0
         self._dbg_kept = 0
         self._dbg_emitted = 0
         self.audio_codebook_sizes = list(CODEBOOK_SIZES)
+        self.visual_codebook_sizes = list(VISUAL_CODEBOOK_SIZES)
         self.register_buffer("audio_offset_vals", offsets, persistent=False)
+        self.register_buffer("visual_offset_vals", visual_offsets, persistent=False)
         self.audio_head = audio_head_fn
+        self.visual_head = visual_head_fn
         self.dtype = torch.float32
         self.max_gen = 750
         self.model = SimpleNamespace(embed_tokens=embed_tokens_fn)
+        # visual_embedding_layer: the real DecoderLayer bridge just refines
+        # an existing embedding tensor (pre_layernorm + MLP residual) --
+        # identity is a faithful-enough stand-in for shape/crash testing,
+        # matching this suite's existing philosophy (structural correctness
+        # on CPU, exact numerics reserved for GPU runs against real weights).
+        self.visual_tokenizer = SimpleNamespace(visual_embedding_layer=lambda x: x)
+
+
+def _depth_head_fn(codebook_sizes):
+    def head(hidden, tokens, emb_layers, level):
+        """Mimics the checkpoint's CasualDepthTransformerHead.forward.
+
+        Deliberately faithful on the two things that actually broke a GPU run:
+        emb_layers is `.to()`-d and *called* (so None raises), and it is
+        called once per level with globally-offset ids, so the indices must be
+        in range for the embedding table it was handed. Shared between
+        audio_head and visual_head stubs since it's the same checkpoint class.
+        """
+        assert emb_layers is not None, "depth head needs an embedding module"
+        emb_layers = emb_layers.to(hidden.device)
+        assert tokens.shape[-1] == len(codebook_sizes)
+        stacked = torch.stack(
+            [emb_layers(tokens[..., i]) for i in range(len(codebook_sizes) - 1)],
+            dim=1,
+        )
+        cumsum = torch.cumsum(stacked, dim=1)
+        hidden_states = torch.concat([hidden.reshape(-1, 1, HIDDEN), cumsum], dim=1)
+        assert hidden_states.size(1) == len(codebook_sizes)
+        return torch.randn(1, codebook_sizes[level])
+
+    return head
 
 
 @pytest.fixture
@@ -77,31 +121,17 @@ def model(monkeypatch):
     offsets = torch.cumsum(
         torch.tensor([AUDIO_OFFSET] + CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0
     )
-
-    def audio_head(hidden, visual_tokens, visual_emb_layers, level):
-        """Mimics the checkpoint's CasualDepthTransformerHead.forward.
-
-        Deliberately faithful on the two things that actually broke a GPU run:
-        visual_emb_layers is `.to()`-d and *called* (so None raises), and it is
-        called once per level with globally-offset ids, so the indices must be
-        in range for the embedding table it was handed.
-        """
-        assert visual_emb_layers is not None, "audio_head needs an embedding module"
-        visual_emb_layers = visual_emb_layers.to(hidden.device)
-        assert visual_tokens.shape[-1] == len(CODEBOOK_SIZES)
-        stacked = torch.stack(
-            [visual_emb_layers(visual_tokens[..., i]) for i in range(len(CODEBOOK_SIZES) - 1)],
-            dim=1,
-        )
-        cumsum = torch.cumsum(stacked, dim=1)
-        hidden_states = torch.concat([hidden.reshape(-1, 1, HIDDEN), cumsum], dim=1)
-        assert hidden_states.size(1) == len(CODEBOOK_SIZES)
-        return torch.randn(1, CODEBOOK_SIZES[level])
+    visual_offsets = torch.cumsum(
+        torch.tensor([VISUAL_OFFSET] + VISUAL_CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0
+    )
 
     def embed_tokens(tok):
         return torch.zeros(int(tok.reshape(-1).shape[0]), HIDDEN)
 
-    return _StubModel(audio_head, embed_tokens, offsets)
+    return _StubModel(
+        _depth_head_fn(CODEBOOK_SIZES), _depth_head_fn(VISUAL_CODEBOOK_SIZES),
+        embed_tokens, offsets, visual_offsets,
+    )
 
 
 def _state(**over):
@@ -253,6 +283,114 @@ def test_empty_batch_short_circuits(model):
 
 
 # ------------------------------------------------------------------ #
+# talker_mtp -- visual (image-gen) dispatch branch
+# ------------------------------------------------------------------ #
+
+
+def _visual_state(**over):
+    base = {"gen_step": 3, "token_w": 4, "ext_id": IMG_PAD_TOKEN_ID, "terminal": False}
+    base.update(over)
+    return base
+
+
+def _call_visual(model, state, text_token=None):
+    if text_token is None:
+        text_token = state.get("ext_id", IMG_PAD_TOKEN_ID)
+    model._visual_gen["r0"] = state
+    return M.talker_mtp(
+        model,
+        input_ids=torch.tensor([text_token], dtype=torch.long),
+        inputs_embeds=torch.zeros(1, HIDDEN),
+        last_talker_hidden=torch.zeros(1, HIDDEN),
+        text_step=torch.zeros(1, HIDDEN),
+        req_ids=["r0"],
+    )
+
+
+def test_visual_mtp_runs_and_returns_per_step_codes(model):
+    """A real-pixel step (ext_id=IMG_PAD, not a row boundary) samples and
+    keeps a code, mirroring test_talker_mtp_runs_and_returns_per_step_codes
+    but for the visual dispatch branch."""
+    embeds, codes = _call_visual(model, _visual_state())
+
+    assert embeds.shape == (1, HIDDEN)
+    assert codes is not None
+    assert codes.shape == (1, len(VISUAL_CODEBOOK_SIZES))
+    assert (codes >= 0).all(), "a real-pixel step should be kept, not -1"
+
+
+def test_visual_mtp_discards_row_boundary_frame(model):
+    """A row-boundary step (ext_id=IMG_NEWLINE) never carries a real pixel,
+    regardless of what visual_head sampled -- mirrors the reference's
+    output_processor.py discarding tmp_multi_ids at row boundaries."""
+    _, codes = _call_visual(model, _visual_state(ext_id=IMG_NEWLINE_TOKEN_ID))
+
+    assert (codes == -1).all()
+
+
+def test_visual_mtp_terminal_row_yields_no_codes(model):
+    _, codes = _call_visual(model, _visual_state(terminal=True))
+
+    assert (codes == -1).all()
+
+
+def test_visual_mtp_codes_stay_in_range_for_every_level(model):
+    """Each level's sampled code must be a valid index into that level's
+    codebook (all 16384-wide for visual), since the embedding lookup
+    (_code_embeddings + visual_embedding_layer) offsets by level."""
+    _, codes = _call_visual(model, _visual_state())
+
+    for level, size in enumerate(VISUAL_CODEBOOK_SIZES):
+        assert 0 <= int(codes[0, level]) < size
+
+
+def test_visual_mtp_end_sentinel_marks_terminal(model):
+    """Level-0 head output is codebook_sizes[0]+1 wide (see OmniImageHead's
+    heads), so codebook_sizes[0] itself (16384) is the end-of-image
+    sentinel -- force it via a rigged visual_head and confirm termination,
+    mirroring test_max_gen_cap_marks_terminal's rigging style."""
+
+    def rigged_head(hidden, tokens, emb_layers, level):
+        if level == 0:
+            logits = torch.full((1, VISUAL_CODEBOOK_SIZES[0] + 1), -100.0)
+            logits[0, VISUAL_CODEBOOK_SIZES[0]] = 100.0  # force the sentinel
+            return logits
+        return torch.zeros(1, VISUAL_CODEBOOK_SIZES[level])
+
+    model.visual_head = rigged_head
+    state = _visual_state()
+    _call_visual(model, state, text_token=IMG_PAD_TOKEN_ID)
+
+    assert state["terminal"] is True
+
+
+def test_visual_mtp_runs_across_multiple_decode_steps(model):
+    """Same rationale as the audio equivalent: talker_mtp is called once per
+    decode step on the same model instance for the life of a request."""
+    state = _visual_state()
+    for _ in range(3):
+        _, codes = _call_visual(model, state)
+        assert codes.shape == (1, len(VISUAL_CODEBOOK_SIZES))
+
+
+def test_audio_and_visual_gen_are_mutually_exclusive_per_row(model):
+    """A request in _visual_gen must not also be treated as an audio
+    request (and vice versa) -- talker_mtp checks audio_state first, so
+    this pins that a visual-only request never takes the audio branch."""
+    model._visual_gen["r0"] = _visual_state()
+    assert model._audio_gen.get("r0") is None
+    _, codes = M.talker_mtp(
+        model,
+        input_ids=torch.tensor([IMG_PAD_TOKEN_ID], dtype=torch.long),
+        inputs_embeds=torch.zeros(1, HIDDEN),
+        last_talker_hidden=torch.zeros(1, HIDDEN),
+        text_step=torch.zeros(1, HIDDEN),
+        req_ids=["r0"],
+    )
+    assert codes.shape == (1, len(VISUAL_CODEBOOK_SIZES))
+
+
+# ------------------------------------------------------------------ #
 # _sample_audio_code
 # ------------------------------------------------------------------ #
 
@@ -374,6 +512,7 @@ class _LogitsModel:
 
     def __init__(self):
         self._audio_gen: dict = {}
+        self._visual_gen: dict = {}
         self._eos_id = 2
         self.logits_processor = _FakeLogitsProcessor()
         self.lm_head = None

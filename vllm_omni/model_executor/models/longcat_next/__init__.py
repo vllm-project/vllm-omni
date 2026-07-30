@@ -9,6 +9,7 @@ from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next_audio_de
 )
 from vllm_omni.model_executor.models.longcat_next.pipeline import (
     LONGCAT_NEXT_PIPELINE,
+    LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
     LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "LongcatNextImageDecoder",
     "LongcatNextAudioDecoder",
     "LONGCAT_NEXT_PIPELINE",
+    "LONGCAT_NEXT_THINKER_AUDIO_PIPELINE",
     "LONGCAT_NEXT_THINKER_ONLY_PIPELINE",
 ]

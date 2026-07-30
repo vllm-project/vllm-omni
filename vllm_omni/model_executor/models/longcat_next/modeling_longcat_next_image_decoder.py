@@ -39,8 +39,8 @@ class LongcatNextImageDecoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
-        self.has_preprocess = True
-        self.has_postprocess = True
+        self.has_preprocess = False
+        self.has_postprocess = False
         self.prefix = prefix
 
         self.model_path: str = vllm_config.model_config.model
@@ -114,8 +114,16 @@ class LongcatNextImageDecoder(nn.Module):
     ) -> OmniOutput:
         del input_ids, positions, intermediate_tensors, inputs_embeds
 
-        additional_info = kwargs.get("additional_information") or {}
-        visual_codes = additional_info.get("visual_token_ids") or kwargs.get("visual_token_ids")
+        model_intermediate_buffer = (
+            kwargs.get("model_intermediate_buffer")
+            or kwargs.get("runtime_additional_information")
+            or {}
+        )
+        additional_info = next(
+            (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
+            {},
+        )
+        visual_codes = additional_info.get("visual_token_ids")
         if not visual_codes:
             logger.warning("No visual token IDs provided for image decoder")
             return OmniOutput(text_hidden_states=None, multimodal_outputs={})
@@ -127,27 +135,44 @@ class LongcatNextImageDecoder(nn.Module):
         if codes.ndim == 1:
             codes = codes.reshape(-1, NUM_CODEBOOKS)
 
+        # The reference's own GEN_IMAGE_STAGE (output_processor.py:204-216)
+        # reads token_h but never uses it -- only token_w gates per-row
+        # IMAGE_NEWLINE forcing, so there is no analogous forced-termination
+        # transition once token_h rows are complete (unlike audio's max_gen
+        # cap). A thinker call with a loose max_tokens keeps sampling frames
+        # past the intended grid until the token budget runs out or the
+        # model happens to naturally sample IMAGE_END (observed NOT to
+        # happen reliably -- job 15032548 produced 51 frames for a
+        # requested 4x4=16 grid). VisionTransformerDecoder.forward's
+        # positions_2d assert requires exactly token_h*s * token_w*s
+        # positions, so passing every kept frame through unconditionally
+        # crashes decoding (`AssertionError: positions_2d != L`) the moment
+        # generation overruns. The intended image is always the *first*
+        # token_h*token_w kept frames.
+        expected_positions = token_h * token_w
+        if codes.shape[0] > expected_positions:
+            logger.warning(
+                "Image decoder got %d code frames, expected token_h*token_w=%d "
+                "-- generation ran past the intended grid; truncating to the "
+                "first %d frames",
+                codes.shape[0], expected_positions, expected_positions,
+            )
+            codes = codes[:expected_positions]
+
         self._ensure_weights()
 
-        # lazy_decode_and_save expects offset-carrying ids (it subtracts
-        # visual_offset_vals itself); the stage input processor hands us raw
-        # codebook indices, so re-apply the offsets here.
-        offset_vals = torch.cumsum(
-            torch.tensor(
-                [self.hf_config.visual_offset]
-                + list(self.hf_config.visual_config.vq_config.codebook_sizes[:-1]),
-                dtype=torch.long,
-                device=self.device,
-            ),
-            dim=0,
-        )
-        ids_with_offsets = codes + offset_vals
-
+        # lazy_decode_and_save indexes each level's codebook directly
+        # (embed[data[..., idx]] in modular_longcat_next_visual.py's
+        # LongcatNextVisualTokenizer.lazy_decode_and_save) -- it wants raw
+        # per-level codebook indices (0..codebook_size-1), not global-vocab
+        # offset ids. Adding visual_offset_vals here (as an earlier version
+        # of this code did) pushes indices past each level's embedding table
+        # size and triggers an out-of-bounds device-side assert.
         with tempfile.TemporaryDirectory(prefix="longcat_imgdec_") as tmp_dir:
             save_prefix = os.path.join(tmp_dir, "out")
             with torch.inference_mode():
                 image_paths = self.visual_tokenizer.lazy_decode_and_save(
-                    ids_with_offsets, token_h, token_w, f"{save_prefix}_0.png"
+                    codes, token_h, token_w, f"{save_prefix}_0.png"
                 )
             from PIL import Image
 

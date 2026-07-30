@@ -43,8 +43,8 @@ class LongcatNextAudioDecoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
-        self.has_preprocess = True
-        self.has_postprocess = True
+        self.has_preprocess = False
+        self.has_postprocess = False
         self.prefix = prefix
 
         self.model_path: str = vllm_config.model_config.model
@@ -135,8 +135,16 @@ class LongcatNextAudioDecoder(nn.Module):
     ) -> OmniOutput:
         del input_ids, positions, intermediate_tensors, inputs_embeds
 
-        additional_info = kwargs.get("additional_information") or {}
-        audio_codes = additional_info.get("audio_token_ids") or kwargs.get("audio_token_ids")
+        model_intermediate_buffer = (
+            kwargs.get("model_intermediate_buffer")
+            or kwargs.get("runtime_additional_information")
+            or {}
+        )
+        additional_info = next(
+            (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
+            {},
+        )
+        audio_codes = additional_info.get("audio_token_ids")
         if not audio_codes:
             logger.warning("No audio token IDs provided for audio decoder")
             return OmniOutput(text_hidden_states=None, multimodal_outputs={})
