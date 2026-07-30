@@ -2446,8 +2446,7 @@ class Cosmos3OmniDiffusersPipeline(
     # (Stage C/D), else the session adapter (Stage B), else the bespoke
     # transformer-instance cache. All gated so the default path is unchanged.
 
-    def _get_or_create_cosmos3_state(self, session_id: str | None) -> Cosmos3StateAdapter | None:
-        # getattr guard so lightweight `__new__` test fixtures (no _memory_manager) work.
+    def _new_cosmos3_state(self, session_id: str | None) -> Cosmos3StateAdapter | None:
         if getattr(self, "_memory_manager", None) is None:
             return None
         return Cosmos3StateAdapter(session_id, self._memory_manager)
@@ -2456,14 +2455,12 @@ class Cosmos3OmniDiffusersPipeline(
         """Load this branch's UND K/V onto the transformer before forward.
 
         Returns True if the session/BDE path handled the load (caller skips the
-        bespoke ``cond_cache`` assignment), False for the bespoke path. ``freqs_gen``
-        is reset to None so the transformer recomputes it (it is not stored).
+        bespoke ``cond_cache`` assignment), False for the bespoke path.
         """
         if getattr(self, "_bde_kv_state", None) is not None:
             raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
         if state is not None:
-            state.load_into_transformer(self.transformer, is_negative)  # sets cached_kv (None if first)
-            self.transformer.cached_freqs_gen = None
+            state.load_into_transformer(self.transformer, is_negative)
             return True
         return False
 
@@ -2544,8 +2541,19 @@ class Cosmos3OmniDiffusersPipeline(
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         step_scheduler = scheduler if scheduler is not None else self.scheduler
         # Session-keyed UND K/V (RFC #4480); None => bespoke transformer-instance cache.
-        kv_state = self._get_or_create_cosmos3_state(session_id)
+        kv_state = self._new_cosmos3_state(session_id)
         self._kv_reset_und(kv_state)
+
+        def _denoise_steps():
+            """Yield denoise steps and release request-scoped state on every exit."""
+            try:
+                yield from self.progress_bar(timesteps)
+            finally:
+                # Cosmos3 currently receives a unique request_id rather than a
+                # reusable rollout session id. Retaining its state would only
+                # pin K/V buffers on device after this generation finishes.
+                if kv_state is not None:
+                    self._memory_manager.drop_session(session_id)
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
@@ -2685,7 +2693,7 @@ class Cosmos3OmniDiffusersPipeline(
             # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
             # else uncond), so session keying loads/stores only this rank's branch.
             cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
-            for t in self.progress_bar(timesteps):
+            for t in _denoise_steps():
                 timestep = t.unsqueeze(0)
                 # Out-of-interval steps run with effective scale 1.0 so the
                 # combined output equals the cond branch (uncond is dropped).
@@ -2726,7 +2734,7 @@ class Cosmos3OmniDiffusersPipeline(
 
             keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
-            for t in self.progress_bar(timesteps):
+            for t in _denoise_steps():
                 timestep = t.unsqueeze(0)
                 cfg_active = _cfg_active_at(t)
 
@@ -2775,7 +2783,7 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             # No CFG: a single cond branch per step. Bespoke (state None) keeps
             # using the transformer-instance cache exactly as before.
-            for t in self.progress_bar(timesteps):
+            for t in _denoise_steps():
                 timestep = t.unsqueeze(0)
                 self._kv_load_und(kv_state, is_negative=False)
                 noise_pred = self.transformer(

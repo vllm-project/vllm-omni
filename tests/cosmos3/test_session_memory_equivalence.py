@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bit-equivalence + concurrency tests for Cosmos3StateAdapter (RFC #4480).
+"""Equivalence and session-isolation tests for Cosmos3StateAdapter (RFC #4480).
 
 These drive the adapter directly with tiny CPU tensors -- no model, no GPU --
-and assert it stores/returns the per-branch UND K/V exactly, and that two
-sessions do not clobber each other (the bug the session keying fixes).
+and assert it stores/returns the per-branch UND K/V exactly and isolates
+durable state between sessions. They do not cover the transformer's mutable
+load-to-forward handoff.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ def _assert_kv_equal(got: list | None, expected: list) -> None:
 
 class _FakeTransformer:
     cached_kv = None
+    cached_freqs_gen = None
 
 
 # ----------------------------- equivalence -----------------------------
@@ -87,27 +89,59 @@ def test_capture_writes_when_uninitialized() -> None:
     a = _adapter("s0")
     tr = _FakeTransformer()
     tr.cached_kv = _fake_cached_kv(5)
+    tr.cached_freqs_gen = (torch.ones(2), torch.zeros(2))
     a.capture_from_transformer(tr, False)
     _assert_kv_equal(a.get_branch_kv(False), _fake_cached_kv(5))
 
 
-def test_load_into_transformer_sets_only_kv() -> None:
+def test_capture_without_freqs_does_not_partially_initialize() -> None:
+    a = _adapter("s0")
+    tr = _FakeTransformer()
+    tr.cached_kv = _fake_cached_kv(5)
+    tr.cached_freqs_gen = None
+    with pytest.raises(RuntimeError, match="did not produce GEN RoPE frequencies"):
+        a.capture_from_transformer(tr, False)
+    assert a.is_branch_initialized(False) is False
+
+
+def test_load_into_transformer_without_freqs_sets_kv() -> None:
     a = _adapter("s0")
     kv = _fake_cached_kv(1)
     a.set_branch_kv(False, kv)
     tr = _FakeTransformer()
     a.load_into_transformer(tr, False)
     _assert_kv_equal(tr.cached_kv, kv)
-    # freqs_gen is recomputed by the transformer, never set by the adapter.
-    assert not hasattr(tr, "cached_freqs_gen")
+    assert tr.cached_freqs_gen is None
 
 
-def test_set_does_not_alias_source_after_dict_wrap() -> None:
+def test_set_then_get_preserves_per_layer_values() -> None:
     # The stored value must reflect the tensors passed in (per-layer).
     a = _adapter("s0")
     kv = _fake_cached_kv(3)
     a.set_branch_kv(False, kv)
     _assert_kv_equal(a.get_branch_kv(False), kv)
+
+
+def test_load_into_transformer_restores_kv_and_freqs_gen() -> None:
+    a = _adapter("s0")
+    tr = _FakeTransformer()
+    tr.cached_kv = _fake_cached_kv(3)
+    tr.cached_freqs_gen = (torch.ones(2), torch.zeros(2))
+    a.capture_from_transformer(tr, False)
+    tr.cached_kv = None
+    tr.cached_freqs_gen = None
+    a.load_into_transformer(tr, False)
+    _assert_kv_equal(tr.cached_kv, _fake_cached_kv(3))
+    assert tr.cached_freqs_gen is not None
+    torch.testing.assert_close(tr.cached_freqs_gen[0], torch.ones(2))
+
+
+def test_partial_branch_raises() -> None:
+    a = _adapter("s0")
+    a.set_branch_kv(False, _fake_cached_kv(1))
+    a._session.get("und_kv/1").reset()  # type: ignore[union-attr]
+    with pytest.raises(RuntimeError, match="partially initialized"):
+        a.get_branch_kv(False)
 
 
 # ----------------------------- reset -----------------------------

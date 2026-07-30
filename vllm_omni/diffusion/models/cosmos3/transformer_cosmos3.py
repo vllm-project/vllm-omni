@@ -1672,11 +1672,8 @@ class Cosmos3VFMTransformer(nn.Module):
             s_sound = sound_tokens.shape[1]
 
         # Run UND pathway once and cache K/V (replicated across all ranks).
-        # freqs_gen (M-RoPE cos/sin, derived purely from shape/fps) is recomputed
-        # whenever it is absent, so the session-memory path (RFC #4480) can store
-        # only the UND K/V and let the transformer recompute freqs each forward
-        # without re-running the language model. The bespoke path sets cached_kv
-        # and cached_freqs_gen together, so this stays byte-identical there.
+        # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
+        # cached alongside UND K/V by both the bespoke and session-state paths.
         need_kv = self.cached_kv is None
         if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
