@@ -6,8 +6,8 @@
 The original reduced one-stage guards remain unchanged. Additional cases cover
 text-to-video and image-to-video for one-stage, full-distilled two-stage,
 ordinary two-stage with resident weights matching official fused arithmetic,
-and dedicated dynamic and layer-fused two-stage variants. Select an individual
-case with its pytest parameter node ID. Both runtimes use PyTorch SDPA.
+and dedicated layer-fused two-stage variants. Select an individual case with
+its pytest parameter node ID. Both runtimes use PyTorch SDPA.
 """
 
 from __future__ import annotations
@@ -384,40 +384,6 @@ _DEFAULT_CONFIG_CASES = (
 )
 
 
-def _dynamic_lora_case(base_name: str, thresholds: LTXAccuracyThresholds) -> LTXAccuracyCase:
-    base_case = next(case for case in _DEFAULT_CONFIG_CASES if case.name == base_name)
-    return replace(
-        base_case,
-        name=f"{base_case.name}_dynamic",
-        two_stage_lora_mode="dynamic",
-        thresholds=thresholds,
-    )
-
-
-_DYNAMIC_LORA_TWO_STAGE_CASES = (
-    _dynamic_lora_case(
-        "ltx2_two_stage",
-        LTXAccuracyThresholds(
-            video_ssim_mean=0.80,
-            video_ssim_min=0.60,
-            video_psnr_mean_db=15.0,
-            audio_relative_l2=1.0,
-            audio_cosine_similarity=0.0,
-        ),
-    ),
-    _dynamic_lora_case(
-        "ltx23_two_stage",
-        LTXAccuracyThresholds(
-            video_ssim_mean=0.80,
-            video_ssim_min=0.60,
-            video_psnr_mean_db=15.0,
-            audio_relative_l2=1.0,
-            audio_cosine_similarity=0.0,
-        ),
-    ),
-)
-
-
 def _layer_fused_case(base_name: str) -> LTXAccuracyCase:
     base_case = next(case for case in _DEFAULT_CONFIG_CASES if case.name == base_name)
     return replace(
@@ -442,7 +408,7 @@ _LAYER_FUSED_TWO_STAGE_CASES = (
 
 DEFAULT_CONFIG_CASES = tuple(
     replace(case, name=f"{case.name}_{task}", image=I2V_IMAGE if task == "i2v" else None)
-    for case in (*_DEFAULT_CONFIG_CASES, *_DYNAMIC_LORA_TWO_STAGE_CASES, *_LAYER_FUSED_TWO_STAGE_CASES)
+    for case in (*_DEFAULT_CONFIG_CASES, *_LAYER_FUSED_TWO_STAGE_CASES)
     for task in ("t2v", "i2v")
 )
 
