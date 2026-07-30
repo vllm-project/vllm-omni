@@ -27,6 +27,32 @@ def get_physical_device_indices(devices):
     return [index_mapping[i] for i in devices if i in index_mapping]
 
 
+def pick_least_used_device_indices(num_devices: int) -> list[int]:
+    """Return physical device indices for the least-used accelerators.
+
+    Args:
+        num_devices: Number of device indices to return.
+
+    Returns:
+        Physical device indices sorted from least to most used memory.
+    """
+    if num_devices <= 0:
+        raise ValueError(f"num_devices must be positive, got {num_devices}.")
+
+    logical_count = current_omni_platform.get_device_count()
+    if logical_count < num_devices:
+        raise RuntimeError(f"Need {num_devices} devices, but only {logical_count} are available.")
+
+    device_usage: list[tuple[int, int]] = []
+    for device_index in range(logical_count):
+        with current_omni_platform.device(device_index):
+            free_bytes, total_bytes = current_omni_platform.get_device_memory()
+        device_usage.append((total_bytes - free_bytes, device_index))
+    device_usage.sort()
+    logical_indices = [device_index for _, device_index in device_usage[:num_devices]]
+    return get_physical_device_indices(logical_indices)
+
+
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
@@ -264,6 +290,7 @@ class DeviceMemoryMonitor:
 __all__ = [
     "DeviceMemoryMonitor",
     "get_physical_device_indices",
+    "pick_least_used_device_indices",
     "run_post_test_cleanup",
     "run_pre_test_cleanup",
     "wait_for_gpu_memory_to_clear",

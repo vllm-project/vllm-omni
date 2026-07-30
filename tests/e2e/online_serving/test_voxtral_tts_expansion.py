@@ -30,7 +30,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_speech_english_basic(omni_server, openai_client) -> None:
     """Test basic English TTS generation."""
     openai_client.send_audio_speech_request(
@@ -46,7 +46,7 @@ def test_speech_english_basic(omni_server, openai_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_speech_english_streaming(omni_server, openai_client) -> None:
     """Test basic streaming English TTS generation (PCM via streaming API)."""
     openai_client.send_audio_speech_request(

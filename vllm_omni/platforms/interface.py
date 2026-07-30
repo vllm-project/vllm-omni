@@ -109,6 +109,7 @@ class OmniPlatform(Platform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for this platform.
 
@@ -119,6 +120,7 @@ class OmniPlatform(Platform):
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
                 "TORCH_SDPA", "SAGE_ATTN"). If None, uses platform default.
             head_size: Attention head size.
+            allow_trtllm_default: Whether TRTLLM may be chosen as the default.
 
         Returns:
             Fully qualified class path of the selected backend.
@@ -187,6 +189,24 @@ class OmniPlatform(Platform):
     @classmethod
     def synchronize(cls) -> None:
         raise NotImplementedError
+
+    # ── Async diffusion output: cross-stream sync ──
+
+    @classmethod
+    def record_device_event(cls):
+        """Record a device event on the default stream to mark tensor readiness.
+
+        On platforms where distributed communication (e.g. HCCL) may use
+        internal streams not visible to the default stream, this method
+        should synchronize the default stream before recording the event
+        to ensure the event captures all completed work including
+        cross-device communication results.
+
+        Returns ``None`` by default so that platforms without a native
+        implementation (ROCm, XPU, MUSA) fall through to a safe no-op.
+        Override in platform subclasses to provide real event support.
+        """
+        return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

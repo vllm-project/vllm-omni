@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+
 __all__ = [
     "DiffusionEngine",
     "DiffusionExecutionMode",
@@ -288,6 +290,10 @@ class DiffusionEngine:
         generator = self.async_add_req_and_stream_response(request)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            # Async mode: wait for background D2H/SHM to complete.
+            if output.async_output_id:
+                fut = self.executor.wait_output_ready(output.async_output_id)
+                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time
@@ -744,11 +750,15 @@ class DiffusionEngine:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
                     req_output = runner_output.get_request_output(target_request_id)
-                    return self._finalize_finished_request(
+                    output = self._finalize_finished_request(
                         target_request_id,
                         runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
+                    if output.async_output_id:
+                        fut = self.executor.wait_output_ready(output.async_output_id)
+                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                    return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.
@@ -1035,5 +1045,8 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.result is not None:
             return runner_output.result
+
+        if runner_output is not None and runner_output.async_output_id is not None:
+            return DiffusionOutput(async_output_id=runner_output.async_output_id)
 
         return DiffusionOutput(error=missing_result_error)

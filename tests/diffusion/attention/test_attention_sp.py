@@ -49,6 +49,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def update_environment_variables(envs_dict: dict[str, str]):
     """Update multiple environment variables with logging."""

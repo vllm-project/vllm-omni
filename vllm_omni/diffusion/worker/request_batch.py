@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -20,7 +21,7 @@ def _slice_request_output(value: Any, start: int, stop: int) -> Any:
         return tuple(_slice_request_output(item, start, stop) for item in value)
     if isinstance(value, list):
         return value[start:stop]
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, (np.ndarray, torch.Tensor)):
         return value[start:stop]
     return value
 

@@ -19,7 +19,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from minicpmo_realtime_duplex_scenarios import _url_with_model, run_demo  # noqa: E402
+from minicpmo_realtime_duplex_scenarios import (  # noqa: E402
+    _ref_audio_data_url,
+    _url_with_model,
+    run_demo,
+)
 
 
 def _with_resume_mode(url: str) -> str:
@@ -114,7 +118,12 @@ async def _open_admission_session(
     args: argparse.Namespace,
     session_id: str,
 ) -> tuple[object, dict[str, object]]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+        session_id=session_id,
+    )
     ws = await websockets.connect(url, max_size=64 * 1024 * 1024)
     await ws.send(
         json.dumps(
@@ -125,6 +134,7 @@ async def _open_admission_session(
                     "model": args.model,
                     "modalities": ["audio", "text"],
                     "extra_body": {"minicpmo45_native_duplex": True},
+                    **({"ref_audio": _ref_audio_data_url(args.ref_audio)} if getattr(args, "ref_audio", None) else {}),
                 },
             }
         )
@@ -151,7 +161,12 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
             accepted.append(await _open_admission_session(args, f"{prefix}-accepted-{index}"))
 
         overflow_id = f"{prefix}-overflow"
-        overflow_url = _url_with_model(args.url, args.model, session_id=overflow_id)
+        overflow_url = _url_with_model(
+            args.url,
+            args.model,
+            autostart=False if getattr(args, "ref_audio", None) else None,
+            session_id=overflow_id,
+        )
         async with websockets.connect(overflow_url, max_size=64 * 1024 * 1024) as overflow:
             await overflow.send(
                 json.dumps(
@@ -162,6 +177,11 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
                             "model": args.model,
                             "modalities": ["audio", "text"],
                             "extra_body": {"minicpmo45_native_duplex": True},
+                            **(
+                                {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                                if getattr(args, "ref_audio", None)
+                                else {}
+                            ),
                         },
                     }
                 )
@@ -207,16 +227,27 @@ async def _resume_probe(
     session_id: str,
     expect_expired: bool = False,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+        session_id=session_id,
+    )
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as first:
         await first.send(
             json.dumps(
                 {
                     "type": "session.update",
                     "session": {
+                        "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
                         "extra_body": {"minicpmo45_native_duplex": True},
+                        **(
+                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                            if getattr(args, "ref_audio", None)
+                            else {}
+                        ),
                     },
                 }
             )
@@ -306,7 +337,12 @@ async def _takeover_probe(
     *,
     session_id: str,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+        session_id=session_id,
+    )
     first = await websockets.connect(url, max_size=64 * 1024 * 1024)
     second = None
     try:
@@ -315,9 +351,15 @@ async def _takeover_probe(
                 {
                     "type": "session.update",
                     "session": {
+                        "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
                         "extra_body": {"minicpmo45_native_duplex": True},
+                        **(
+                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                            if getattr(args, "ref_audio", None)
+                            else {}
+                        ),
                     },
                 }
             )
@@ -451,20 +493,7 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             args,
             session_id=f"takeover-{args.takeover_session_index}-{uuid.uuid4().hex}",
         )
-    expiry_result = None
-    if args.expire_session_index is not None:
-        if not 0 <= args.expire_session_index < args.sessions:
-            raise ValueError("--expire-session-index is outside the session range")
-        expiry_result = await _resume_probe(
-            args,
-            session_id=f"expire-{args.expire_session_index}-{uuid.uuid4().hex}",
-            expect_expired=True,
-        )
-    admission_result = (
-        await _admission_probe(args, limit=args.verify_admission_limit)
-        if args.verify_admission_limit is not None
-        else None
-    )
+    lifecycle_result = await run_lifecycle_probes(args)
 
     session_results = await asyncio.gather(
         *(run_demo(_demo_args(args, index)) for index in range(args.sessions)),
@@ -487,16 +516,15 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             and semantic_isolation_ok
             and (resume_result is None or resume_result.get("ok") is True)
             and (takeover_result is None or takeover_result.get("ok") is True)
-            and (expiry_result is None or expiry_result.get("ok") is True)
-            and (admission_result is None or admission_result.get("ok") is True)
+            and lifecycle_result["ok"] is True
         ),
         "session_count": args.sessions,
         "identity_isolation_ok": identity_isolation_ok,
         "semantic_isolation_ok": semantic_isolation_ok,
         "resume": resume_result,
         "takeover": takeover_result,
-        "expiry": expiry_result,
-        "admission": admission_result,
+        "expiry": lifecycle_result["expiry"],
+        "admission": lifecycle_result["admission"],
         "failures": failures,
         "sessions": completed,
     }
@@ -505,6 +533,34 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         encoding="utf-8",
     )
     return result
+
+
+async def run_lifecycle_probes(args: argparse.Namespace) -> dict[str, object]:
+    """Run expiry and admission probes without requiring model output."""
+    if args.sessions < 1:
+        raise ValueError("--sessions must be positive")
+    expiry_result = None
+    if args.expire_session_index is not None:
+        if not 0 <= args.expire_session_index < args.sessions:
+            raise ValueError("--expire-session-index is outside the session range")
+        expiry_result = await _resume_probe(
+            args,
+            session_id=f"expire-{args.expire_session_index}-{uuid.uuid4().hex}",
+            expect_expired=True,
+        )
+    admission_result = (
+        await _admission_probe(args, limit=args.verify_admission_limit)
+        if args.verify_admission_limit is not None
+        else None
+    )
+    return {
+        "ok": (
+            (expiry_result is None or expiry_result.get("ok") is True)
+            and (admission_result is None or admission_result.get("ok") is True)
+        ),
+        "expiry": expiry_result,
+        "admission": admission_result,
+    }
 
 
 def parse_args() -> argparse.Namespace:

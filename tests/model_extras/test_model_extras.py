@@ -183,6 +183,36 @@ def test_magi_human_extra_registry_declares_request_and_response_params() -> Non
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_ltx_extra_registry_declares_official_guidance_params() -> None:
+    expected = frozenset(
+        {
+            "video_cfg_scale",
+            "audio_cfg_scale",
+            "video_cfg_guidance_scale",
+            "audio_cfg_guidance_scale",
+            "video_stg_scale",
+            "audio_stg_scale",
+            "video_stg_guidance_scale",
+            "audio_stg_guidance_scale",
+            "video_modality_scale",
+            "audio_modality_scale",
+            "a2v_guidance_scale",
+            "v2a_guidance_scale",
+            "video_rescale_scale",
+            "audio_rescale_scale",
+            "video_stg_blocks",
+            "audio_stg_blocks",
+        }
+    )
+
+    assert get_extra_body_params("LTX2Pipeline") == expected
+    assert get_extra_output_params("LTX2Pipeline") == frozenset()
+    assert get_extra_body_params("LTX2DistilledPipeline") == expected
+    assert get_extra_output_params("LTX2DistilledPipeline") == frozenset()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_ming_flash_omni_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("MingImagePipeline") == frozenset(
         {
