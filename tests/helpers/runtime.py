@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, cast
 from urllib.parse import quote
 
+import numpy as np
 import psutil
 import requests
 import soundfile as sf
@@ -800,6 +801,189 @@ class WebSocketJsonResponse:
     """First JSON object delivered as a text WebSocket frame (streaming endpoints)."""
 
     json_body: dict[str, Any]
+
+
+@dataclass
+class OpenPIWebSocketResponse:
+    """Msgpack WebSocket session against ``/v1/realtime/robot/openpi``."""
+
+    server_metadata: dict[str, Any]
+    operation_responses: list[Any]
+    actions: dict[str, np.ndarray] | None = None
+    action_tensors: list[np.ndarray] | None = None
+
+
+def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[str, Any]:
+    """Build a minimal DROID-style observation payload for the OpenPI robot endpoint."""
+    identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
+    identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    return {
+        "session_id": session_id,
+        "video": {
+            "exterior_image_1_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+            "wrist_image_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+        },
+        "state": {
+            "eef_9d": identity_eef_9d,
+            "gripper_position": np.zeros((1, 1, 1), dtype=np.float32),
+            "joint_position": np.zeros((1, 1, 7), dtype=np.float32),
+        },
+        "language": {"annotation.language.language_instruction": [["pick up the object"]]},
+    }
+
+
+DREAMZERO_DEFAULT_PROMPT = (
+    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
+)
+DREAMZERO_ACTION_HORIZON = 24
+DREAMZERO_ACTION_DIM = 8
+DREAMZERO_CAMERA_FILES = {
+    "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
+    "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
+    "observation/wrist_image_left": "wrist_image_left.mp4",
+}
+
+
+def _require_opencv() -> Any:
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - optional e2e dependency
+        raise ModuleNotFoundError("DreamZero OpenPI test dependencies are missing: opencv-python") from exc
+    return cv2
+
+
+def load_dreamzero_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
+    cv2 = _require_opencv()
+    camera_frames: dict[str, np.ndarray] = {}
+    for camera_key, file_name in DREAMZERO_CAMERA_FILES.items():
+        video_path = video_dir / file_name
+        if not video_path.exists():
+            raise FileNotFoundError(f"Missing DreamZero test asset: {video_path}")
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames:
+            raise RuntimeError(f"No frames loaded from {video_path}")
+        camera_frames[camera_key] = np.stack(frames, axis=0)
+    return camera_frames
+
+
+def build_dreamzero_demo_observations(
+    camera_frames: dict[str, np.ndarray],
+    *,
+    prompt: str,
+    session_id: str,
+    num_chunks: int = 2,
+) -> list[dict[str, Any]]:
+    if num_chunks < 1:
+        raise ValueError("num_chunks must be at least 1")
+
+    relative_offsets = [-23, -16, -8, 0]
+    total_frames = min(frames.shape[0] for frames in camera_frames.values())
+    frame_schedules = [[0]]
+    current_frame = 23
+    for _ in range(num_chunks - 1):
+        indices = [max(current_frame + offset, 0) for offset in relative_offsets]
+        if indices[-1] >= total_frames:
+            break
+        frame_schedules.append(indices)
+        current_frame += DREAMZERO_ACTION_HORIZON
+
+    observations: list[dict[str, Any]] = []
+    for frame_indices in frame_schedules:
+        obs: dict[str, Any] = {}
+        for camera_key, all_frames in camera_frames.items():
+            selected = all_frames[frame_indices]
+            obs[camera_key] = selected[0] if len(frame_indices) == 1 else selected
+        obs["observation/joint_position"] = np.zeros(7, dtype=np.float32)
+        obs["observation/cartesian_position"] = np.zeros(6, dtype=np.float32)
+        obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
+        obs["prompt"] = prompt
+        obs["session_id"] = session_id
+        observations.append(obs)
+    return observations
+
+
+class OpenPIWebSocketSession:
+    """Persistent msgpack session for ``/v1/realtime/robot/openpi``."""
+
+    DEFAULT_PING_INTERVAL_SECS = 300
+    DEFAULT_PING_TIMEOUT_SECS = 3600
+
+    @staticmethod
+    def _require_dependencies() -> tuple[Any, Any]:
+        try:
+            import websockets.sync.client as websockets_client
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
+        try:
+            from openpi_client import msgpack_numpy
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        return websockets_client, msgpack_numpy
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        ping_interval: float = DEFAULT_PING_INTERVAL_SECS,
+        ping_timeout: float = DEFAULT_PING_TIMEOUT_SECS,
+        open_timeout: float = 120.0,
+        close_timeout: float = 120.0,
+    ) -> None:
+        websockets_client, msgpack_numpy = self._require_dependencies()
+        self._msgpack_numpy = msgpack_numpy
+        self._packer = msgpack_numpy.Packer()
+        self._conn = websockets_client.connect(
+            uri,
+            compression=None,
+            max_size=None,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=open_timeout,
+            close_timeout=close_timeout,
+        )
+        server_metadata = msgpack_numpy.unpackb(self._conn.recv())
+        if not isinstance(server_metadata, dict):
+            raise TypeError(f"Expected dict metadata from {uri}, got {type(server_metadata)!r}")
+        self._server_metadata = server_metadata
+
+    def get_server_metadata(self) -> dict[str, Any]:
+        return dict(self._server_metadata)
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
+        response = self._send_operation("infer", obs)
+        if not isinstance(response, dict):
+            raise TypeError(f"Expected dict infer response, got {type(response)!r}")
+        return {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+
+    def reset(self, reset_info: dict[str, Any] | None = None) -> str:
+        response = self._send_operation("reset", dict(reset_info or {}))
+        return str(response["status"])
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def _send_operation(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        body = dict(payload)
+        body["endpoint"] = endpoint
+        self._conn.send(self._packer.pack(body))
+        raw = self._conn.recv()
+        if isinstance(raw, str):
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {raw}")
+        decoded = self._msgpack_numpy.unpackb(raw)
+        if isinstance(decoded, dict) and decoded.get("type") == "error":
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {decoded.get('message')}")
+        if endpoint == "reset":
+            if not isinstance(decoded, dict) or decoded.get("status") != "reset successful":
+                raise RuntimeError(f"Unexpected OpenPI reset response: {decoded!r}")
+            return decoded
+        return decoded
 
 
 def _merge_http_expectation_kwargs(
@@ -1592,6 +1776,92 @@ class OpenAIClientHandler:
             ws_error_code=ws_error_code,
         )
         return self._send_websocket_first_json_request("/v1/realtime", cfg)
+
+    def send_robot_openpi_ws_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+    ) -> list[OpenPIWebSocketResponse]:
+        """WebSocket ``/v1/realtime/robot/openpi`` — msgpack metadata plus optional infer/reset ops.
+
+        ``request_config`` keys:
+
+        - ``operations``: optional sequence of ``{"endpoint": "infer"|"reset", "payload": {...}}``.
+        - ``run_default_policy_session``: when true and ``operations`` is omitted, run infer then reset
+          using :func:`build_openpi_droid_observation`.
+        - ``run_dreamzero_policy_session``: when true and ``operations`` is omitted, run the DreamZero
+          infer/reset/infer sequence using :func:`build_dreamzero_demo_observations`.
+        - ``video_dir``: required for ``run_dreamzero_policy_session``.
+        - ``prompt``: language instruction for DreamZero observations (optional).
+        - ``session_id``: used by the default policy session observation builder.
+        - ``num_chunks``: DreamZero chunk count (default ``2``).
+        - ``timeout``: seconds to wait for each inbound msgpack frame (default ``120``).
+        - ``ping_interval`` / ``ping_timeout``: forwarded to :func:`websockets.sync.client.connect`.
+        """
+        cfg = dict(request_config or {})
+        operations_cfg = cfg.get("operations")
+        if operations_cfg is not None:
+            operations = [dict(op) for op in operations_cfg]
+        elif cfg.get("run_dreamzero_policy_session"):
+            video_dir = cfg.get("video_dir")
+            if video_dir is None:
+                raise ValueError("run_dreamzero_policy_session requires video_dir")
+            session_id = str(cfg.get("session_id", "dreamzero-smoke"))
+            prompt = str(cfg.get("prompt", DREAMZERO_DEFAULT_PROMPT))
+            num_chunks = int(cfg.get("num_chunks", 2))
+            observations = build_dreamzero_demo_observations(
+                load_dreamzero_camera_frames(Path(video_dir)),
+                prompt=prompt,
+                session_id=session_id,
+                num_chunks=num_chunks,
+            )
+            operations = [{"endpoint": "infer", "payload": obs} for obs in observations]
+            operations.append({"endpoint": "reset", "payload": {}})
+            operations.append({"endpoint": "infer", "payload": observations[0]})
+        elif cfg.get("run_default_policy_session"):
+            session_id = str(cfg.get("session_id", "gr00t-smoke"))
+            operations = [
+                {"endpoint": "infer", "payload": build_openpi_droid_observation(session_id=session_id)},
+                {"endpoint": "reset", "payload": {}},
+            ]
+        else:
+            operations = []
+        timeout = float(cfg.get("timeout", 120.0))
+        ping_interval = float(cfg.get("ping_interval", OpenPIWebSocketSession.DEFAULT_PING_INTERVAL_SECS))
+        ping_timeout = float(cfg.get("ping_timeout", OpenPIWebSocketSession.DEFAULT_PING_TIMEOUT_SECS))
+
+        uri = self._build_ws_url("/v1/realtime/robot/openpi")
+        session = OpenPIWebSocketSession(
+            uri,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=timeout,
+            close_timeout=timeout,
+        )
+        try:
+            operation_responses: list[Any] = []
+            actions: dict[str, np.ndarray] | None = None
+            action_tensors: list[np.ndarray] = []
+            for operation in operations:
+                endpoint = str(operation["endpoint"])
+                payload = dict(operation.get("payload") or {})
+                response = session._send_operation(endpoint, payload)
+                operation_responses.append(response)
+                if endpoint == "infer":
+                    if isinstance(response, dict):
+                        actions = {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+                    else:
+                        action_tensors.append(np.asarray(response, dtype=np.float32))
+        finally:
+            session.close()
+
+        return [
+            OpenPIWebSocketResponse(
+                server_metadata=session.get_server_metadata(),
+                operation_responses=operation_responses,
+                actions=actions,
+                action_tensors=action_tensors or None,
+            )
+        ]
 
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """Chat completions via the OpenAI Python SDK (not raw HTTP)."""
@@ -2946,6 +3216,14 @@ __all__ = [
     "DiffusionResponse",
     "HttpResponse",
     "WebSocketJsonResponse",
+    "OpenPIWebSocketResponse",
+    "build_openpi_droid_observation",
+    "build_dreamzero_demo_observations",
+    "DREAMZERO_ACTION_DIM",
+    "DREAMZERO_ACTION_HORIZON",
+    "DREAMZERO_CAMERA_FILES",
+    "load_dreamzero_camera_frames",
+    "OpenPIWebSocketSession",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",

@@ -57,6 +57,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = True,
     ) -> str:
         from vllm_omni.diffusion.envs import PACKAGES_CHECKER
 
@@ -119,6 +120,18 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             # not abort startup — just treat FlashInfer as unavailable.
             logger.debug("FlashInfer probe failed (%s); treating as unavailable", e)
 
+        # TRTLLM_ATTN needs the trtllm-gen kernel specifically, not just any FlashInfer
+        # wheel. Probe the actual symbol so a released wheel lacking it does not get
+        # auto-routed to TRTLLM_ATTN and then crash on the first forward.
+        trtllm_gen_available = False
+        if flashinfer_available:
+            try:
+                from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
+
+                trtllm_gen_available = True
+            except Exception as e:
+                logger.debug("trtllm-gen kernel probe failed (%s); treating as unavailable", e)
+
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
@@ -172,9 +185,36 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "SageAttention/sageattention3_blackwell. Falling back to TORCH_SDPA backend."
                     )
                     return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+            if backend_upper == "TRTLLM_ATTN":
+                trtllm_attn_supported = compute_capability is not None and compute_capability.major == 10
+                if not trtllm_attn_supported:
+                    raise ValueError(
+                        "TRTLLM_ATTN diffusion attention backend requires a datacenter "
+                        "Blackwell GPU (SM100 / SM103, compute capability 10.x). Select a "
+                        "different --diffusion-attention-backend."
+                    )
+                if not flashinfer_available:
+                    raise ValueError(
+                        "TRTLLM_ATTN diffusion attention backend requires flashinfer, which is not installed."
+                    )
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
+
+        trtllm_attn_default_ok = (
+            allow_trtllm_default
+            and compute_capability is not None
+            and compute_capability.major == 10
+            and head_size == 128
+            and trtllm_gen_available
+        )
+        if trtllm_attn_default_ok:
+            logger.info(
+                "Defaulting to diffusion attention backend TRTLLM_ATTN (datacenter Blackwell %s, head_dim %d)",
+                sm_str,
+                head_size,
+            )
+            return DiffusionAttentionBackendEnum.TRTLLM_ATTN.get_path()
 
         if is_blackwell and cudnn_blackwell_ready:
             logger.info(
@@ -234,6 +274,17 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         torch.accelerator.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        """Record a device event on the default stream to mark tensor readiness."""
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
@@ -246,6 +297,16 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
+
+    @classmethod
+    def get_device_total_memory(cls, device_id: int = 0) -> int:
+        device_props = torch.cuda.get_device_properties(device_id)
+        return device_props.total_memory
+
+    @classmethod
+    def is_fully_connected(cls, device_ids: list[int]) -> bool:
+        logger.debug("NVLink detection not available on CudaOmniPlatform; assuming no NVLink.")
+        return False
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:

@@ -6,20 +6,22 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-import numpy as np
 import torch
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .ltx2_latents import LTXAVState
+from .ltx2_guidance import euler_step_from_velocity
+from .ltx2_latents import LTXAVState, unpack_audio_latents, unpad_audio_latents
 
 if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
+    from .ltx2_recipes import LTXPhaseRecipe
     from .ltx2_request import LTXRequestInputs
 
 
@@ -31,7 +33,7 @@ class LTXForwardContext:
     request_inputs: LTXRequestInputs
     prompt_context: LTXPromptContext
     device: torch.device
-    cfg_parallel_ready: bool
+    guidance_parallel_ready: bool
     attention_kwargs: dict[str, Any] | None
     latent_num_frames: int
     latent_height: int
@@ -41,7 +43,7 @@ class LTXForwardContext:
     padded_audio_num_frames: int
     timesteps: torch.Tensor
     audio_scheduler: Any
-    video_audio_scheduler: Any
+    video_audio_step_adapter: Any
 
     @property
     def batch_size(self) -> int:
@@ -71,6 +73,7 @@ class LTXPhaseResult:
     forward_context: LTXForwardContext
     video: torch.Tensor
     audio: torch.Tensor
+    audio_for_next_phase: torch.Tensor | None = None
 
 
 class LTXDenoisePipeline(Protocol):
@@ -122,59 +125,79 @@ def calculate_shift(
     return image_seq_len * slope + intercept
 
 
-class VideoAudioScheduler:
-    """Composite scheduler dispatching video and audio updates."""
+class LTXVideoAudioStepAdapter:
+    """Expose the shared LTX Euler update through the distributed scheduler API."""
 
-    def __init__(self, video_scheduler, audio_scheduler):
-        self.video_scheduler = video_scheduler
-        self.audio_scheduler = audio_scheduler
-
-    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self.video_scheduler.step(
-            noise_pred[0],
-            t[0],
-            latents[0],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
-            latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        return ((video_out, audio_out),)
-
-
-class I2VVideoAudioScheduler:
-    """Update the unconditioned video frames and the full audio state."""
-
-    def __init__(self, pipeline, audio_scheduler, latent_num_frames, latent_height, latent_width):
-        self.video_scheduler = pipeline.scheduler
-        self.audio_scheduler = audio_scheduler
+    def __init__(
+        self,
+        pipeline: Any,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+        *,
+        image_conditioned: bool,
+    ) -> None:
         self._pipeline = pipeline
+        self._audio_scheduler = audio_scheduler
         self._latent_num_frames = latent_num_frames
         self._latent_height = latent_height
         self._latent_width = latent_width
+        self._image_conditioned = image_conditioned
+        self._step_index = 0
 
     def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self._pipeline._step_video_latents_i2v(
-            noise_pred[0],
-            latents[0],
-            t[0],
-            self._latent_num_frames,
-            self._latent_height,
-            self._latent_width,
-        )
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
+        del t, return_dict, generator
+        if self._image_conditioned:
+            video_out = self._pipeline._step_video_latents_i2v(
+                noise_pred[0],
+                latents[0],
+                self._step_index,
+                self._latent_num_frames,
+                self._latent_height,
+                self._latent_width,
+            )
+        else:
+            video_out = euler_step_from_velocity(
+                latents[0],
+                noise_pred[0],
+                self._pipeline.scheduler.sigmas,
+                self._step_index,
+            )
+        audio_out = euler_step_from_velocity(
             latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
+            noise_pred[1],
+            self._audio_scheduler.sigmas,
+            self._step_index,
+        )
+        self._step_index += 1
         return ((video_out, audio_out),)
+
+
+def _official_ltx_sigmas(scheduler: Any, steps: int, device: torch.device) -> torch.Tensor:
+    """Build the official LTX one-stage sigma schedule in torch fp32."""
+    config = scheduler.config
+    base_anchor = config.get("base_image_seq_len", 1024)
+    max_anchor = config.get("max_image_seq_len", 4096)
+    base_shift = config.get("base_shift", 0.95)
+    max_shift = config.get("max_shift", 2.05)
+
+    sigmas = torch.linspace(1.0, 0.0, steps + 1)
+    slope = (max_shift - base_shift) / (max_anchor - base_anchor)
+    # Official LTX2 one-stage intentionally uses the max sequence anchor, so the shift stays at max_shift.
+    sigma_shift = max_anchor * slope + (base_shift - slope * base_anchor)
+    exp_shift = math.exp(sigma_shift)
+    sigmas = torch.where(sigmas != 0, exp_shift / (exp_shift + (1 / sigmas - 1)), 0)
+
+    # Official non-distilled checkpoints explicitly set this to 0.1. Missing
+    # or None means the loaded scheduler disabled terminal stretching.
+    terminal = config.get("shift_terminal")
+    if terminal is not None:
+        non_zero = sigmas != 0
+        one_minus_sigmas = 1.0 - sigmas[non_zero]
+        scale = one_minus_sigmas[-1] / (1.0 - terminal)
+        sigmas[non_zero] = 1.0 - one_minus_sigmas / scale
+    return sigmas.to(dtype=torch.float32, device=device)
 
 
 def _set_scheduler_sigmas(scheduler: Any, sigmas: torch.Tensor) -> torch.Tensor:
@@ -198,16 +221,20 @@ def prepare_scheduler_stage(
     latent_num_frames: int,
     latent_height: int,
     latent_width: int,
+    use_official_sigma_schedule: bool,
+    image_conditioned: bool = False,
 ) -> tuple[Any, Any, torch.Tensor]:
     if sigmas is not None and timesteps is not None:
         raise ValueError("Only one of `sigmas` or `timesteps` may be provided.")
 
     audio_scheduler = copy.deepcopy(pipeline.scheduler)
-    video_audio_scheduler = pipeline._make_video_audio_scheduler(
+    video_audio_step_adapter = LTXVideoAudioStepAdapter(
+        pipeline,
         audio_scheduler,
         latent_num_frames,
         latent_height,
         latent_width,
+        image_conditioned=image_conditioned,
     )
     if sigmas is not None:
         scheduler_sigmas = torch.as_tensor(sigmas, dtype=torch.float32, device=device)
@@ -217,12 +244,14 @@ def prepare_scheduler_stage(
             scheduler_sigmas = torch.cat([scheduler_sigmas, scheduler_sigmas.new_zeros(1)])
         timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
-        return audio_scheduler, video_audio_scheduler, timesteps_tensor
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
-    sigmas = np.linspace(1.0, 1 / request_inputs.num_inference_steps, request_inputs.num_inference_steps)
-    # Official LTX2 one-stage omits the latent, so mu stays at max_shift across resolutions.
-    # Mu varies with latent token count only when the scheduler receives a latent, as in official HQ two-stage;
-    # explicit sigma schedules bypass mu entirely.
+    if sigmas is None and timesteps is None and use_official_sigma_schedule:
+        scheduler_sigmas = _official_ltx_sigmas(pipeline.scheduler, request_inputs.num_inference_steps, device)
+        timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
+        _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
+
     mu = calculate_shift(
         pipeline.scheduler.config.get("max_image_seq_len", 4096),
         pipeline.scheduler.config.get("base_image_seq_len", 1024),
@@ -246,7 +275,7 @@ def prepare_scheduler_stage(
         sigmas=sigmas,
         mu=mu,
     )
-    return audio_scheduler, video_audio_scheduler, timesteps_tensor
+    return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
 
 def prepare_rope_coords_stage(
@@ -283,15 +312,25 @@ def build_transformer_kwargs(
     encoder_attention_mask: torch.Tensor | None,
     audio_encoder_attention_mask: torch.Tensor | None,
     ts: torch.Tensor,
+    attention_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    del encoder_attention_mask, audio_encoder_attention_mask
     return {
         "hidden_states": hidden_states,
         "audio_hidden_states": audio_hidden_states,
         "encoder_hidden_states": encoder_hidden_states,
         "audio_encoder_hidden_states": audio_encoder_hidden_states,
-        **pipeline._denoise_timestep_kwargs(ts, forward_ctx, denoise_ctx),
-        "encoder_attention_mask": encoder_attention_mask,
-        "audio_encoder_attention_mask": audio_encoder_attention_mask,
+        **pipeline._denoise_timestep_kwargs(
+            ts,
+            forward_ctx,
+            denoise_ctx,
+            video_token_count=hidden_states.shape[1],
+            audio_token_count=audio_hidden_states.shape[1],
+        ),
+        # This is valid only because LTX connectors replace every padding token
+        # with a learned register, making all output context tokens valid.
+        "encoder_attention_mask": None,
+        "audio_encoder_attention_mask": None,
         "num_frames": forward_ctx.latent_num_frames,
         "height": forward_ctx.latent_height,
         "width": forward_ctx.latent_width,
@@ -299,7 +338,7 @@ def build_transformer_kwargs(
         "audio_num_frames": forward_ctx.padded_audio_num_frames,
         "video_coords": denoise_ctx.video_coords,
         "audio_coords": denoise_ctx.audio_coords,
-        "attention_kwargs": forward_ctx.attention_kwargs,
+        "attention_kwargs": forward_ctx.attention_kwargs if attention_kwargs is None else attention_kwargs,
         "return_dict": False,
     }
 
@@ -317,11 +356,11 @@ def step_denoised_latents(
         (timestep, timestep),
         (denoise_ctx.latents, denoise_ctx.audio_latents),
         do_true_cfg=pipeline.do_classifier_free_guidance,
-        per_request_scheduler=forward_ctx.video_audio_scheduler,
+        per_request_scheduler=forward_ctx.video_audio_step_adapter,
     )
-    return pipeline._synchronize_cfg_parallel_step_output(
+    return pipeline._synchronize_guidance_parallel_step_output(
         latents,
-        do_true_cfg=pipeline.do_classifier_free_guidance,
+        guidance_parallel_ready=forward_ctx.guidance_parallel_ready,
     )
 
 
@@ -338,11 +377,12 @@ class LTXPhaseExecutor:
         sigmas: list[float] | None,
         timesteps: list[int] | None,
         attention_kwargs: dict[str, Any] | None,
+        phase_recipe: LTXPhaseRecipe,
         image: Any | None = None,
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
         pipeline._check_forward_inputs(request_inputs, image=image)
-        cfg_parallel_ready = pipeline._setup_forward_runtime(request_inputs, attention_kwargs)
+        guidance_parallel_ready = pipeline._setup_forward_runtime(req, request_inputs, attention_kwargs)
         device = pipeline.device
         if prompt_context is None:
             prompt_context = pipeline._prepare_prompt_context(
@@ -372,7 +412,7 @@ class LTXPhaseExecutor:
                 noise_scale=noise_scale,
             )
         )
-        audio_scheduler, video_audio_scheduler, timesteps_tensor = prepare_scheduler_stage(
+        audio_scheduler, video_audio_step_adapter, timesteps_tensor = prepare_scheduler_stage(
             pipeline,
             request_inputs,
             device=device,
@@ -381,13 +421,15 @@ class LTXPhaseExecutor:
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
             latent_width=latent_width,
+            use_official_sigma_schedule=phase_recipe.use_official_sigma_schedule,
+            image_conditioned=conditioning_mask is not None,
         )
         forward_ctx = LTXForwardContext(
             req=req,
             request_inputs=request_inputs,
             prompt_context=prompt_context,
             device=device,
-            cfg_parallel_ready=cfg_parallel_ready,
+            guidance_parallel_ready=guidance_parallel_ready,
             attention_kwargs=attention_kwargs,
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
@@ -397,7 +439,7 @@ class LTXPhaseExecutor:
             padded_audio_num_frames=padded_audio_num_frames,
             timesteps=timesteps_tensor,
             audio_scheduler=audio_scheduler,
-            video_audio_scheduler=video_audio_scheduler,
+            video_audio_step_adapter=video_audio_step_adapter,
         )
         video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
         denoise_ctx = LTXDenoiseContext(
@@ -407,7 +449,7 @@ class LTXPhaseExecutor:
             audio_coords=audio_coords,
             conditioning_mask=conditioning_mask,
         )
-        denoise_ctx = pipeline._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
+        denoise_ctx = pipeline._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)
         state = LTXDenoiseExecutor.run(
             pipeline,
             LTXAVState(video=denoise_ctx.latents, audio=denoise_ctx.audio_latents),
@@ -427,4 +469,13 @@ class LTXPhaseExecutor:
             state.video,
             state.audio,
         )
-        return LTXPhaseResult(forward_context=forward_ctx, video=latents, audio=audio_latents)
+        normalized_audio = unpack_audio_latents(
+            unpad_audio_latents(state.audio, forward_ctx.original_audio_num_frames),
+            num_mel_bins=forward_ctx.latent_mel_bins,
+        )
+        return LTXPhaseResult(
+            forward_context=forward_ctx,
+            video=latents,
+            audio=audio_latents,
+            audio_for_next_phase=normalized_audio,
+        )
