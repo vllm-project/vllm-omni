@@ -141,11 +141,7 @@ class Cosmos3StateAdapter:
 
     def get_branch_freqs_gen(self, is_negative: bool) -> tuple[torch.Tensor, torch.Tensor] | None:
         value = self._session.attrs.get(_freqs_key(is_negative))
-        if (
-            isinstance(value, tuple)
-            and len(value) == 2
-            and all(isinstance(freq, torch.Tensor) for freq in value)
-        ):
+        if isinstance(value, tuple) and len(value) == 2 and all(isinstance(freq, torch.Tensor) for freq in value):
             return value
         return None
 
