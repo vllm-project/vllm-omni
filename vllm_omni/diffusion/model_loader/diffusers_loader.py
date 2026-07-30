@@ -363,23 +363,34 @@ class DiffusersPipelineLoader:
             else:
                 model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
-                # Skip load_weights only for DLO+AllGather (meta device path).
-                # Gate on the explicit offload config, not on meta param detection,
-                # because online quantization (FP8) also creates meta params but
-                # requires _process_weights_after_loading() which the mmap path
-                # bypasses.
+                # Skip load_weights only for DLO+AllGather when the model
+                # supports mmap loading and no online quantization is active.
+                # This condition MUST match the gate in
+                # DistributedLayerwiseOffloadBackend.enable() so that the
+                # loader skips ⟺ enable() uses mmap.
+                from vllm_omni.diffusion.offloader.offload_plan import supports_mmap_loading
+
                 _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
                 _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
                 _has_online_quant = self._has_online_quant(model)
+                _supports_mmap = supports_mmap_loading(model)
 
-                if _dist_offload and _use_ag and not _has_online_quant:
+                _skip_load = _dist_offload and _use_ag and _supports_mmap and not _has_online_quant
+
+                if _skip_load:
                     logger.info("DLO+AllGather active: skipping load_weights (will load via mmap in enable())")
                 else:
-                    if _dist_offload and _has_online_quant:
-                        logger.warning(
-                            "Online quantization detected with DLO+AllGather: "
-                            "falling back to regular load_weights (mmap bypass "
-                            "is incompatible with online quant)."
+                    if _dist_offload and _use_ag and _has_online_quant:
+                        raise ValueError(
+                            "Online quantization is incompatible with DLO+AllGather: "
+                            "the sharding + AllGather mechanism flattens weights by "
+                            "dtype, which breaks quantized weight/scale layouts. "
+                            "Please use --dlo-no-use-allgather or disable online "
+                            "quantization."
+                        )
+                    if _dist_offload and _use_ag and not _supports_mmap:
+                        logger.info(
+                            "DLO+AllGather active but model does not support mmap: loading weights via regular loader."
                         )
                     logger.debug("Loading weights on %s ...", load_device)
                     if load_format == "diffusers":

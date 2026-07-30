@@ -31,7 +31,7 @@ from vllm_omni.platforms import current_omni_platform
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import get_blocks_from_dit
 from .module_collector import ModuleDiscovery
-from .offload_plan import OffloadPlan, get_offload_plan
+from .offload_plan import OffloadPlan, get_offload_plan, supports_mmap_loading
 from .tensor_utils import (
     dtype_size as _dtype_size,
 )
@@ -1103,27 +1103,27 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         plan = get_offload_plan(pipeline)
 
         # Load weights via mmap for DLO+AllGather.
-        # Gate on _remap_ckpt_key (model supports mmap layout) AND absence
-        # of online quantization (which requires _process_weights_after_loading
-        # that the mmap path bypasses).  This mirrors the gate in
-        # diffusers_loader.py to ensure the same condition is checked in both
-        # the loader path and the enable() path.
+        # Gate condition MUST match diffusers_loader.py:
+        #   supports_mmap_loading(pipeline) and not _has_online_quant
+        # When the gate is False, the loader has already loaded weights via
+        # regular load_weights() + _process_weights_after_loading().
         if self.config.dlo_use_allgather and self.dp_size > 1:
-            _has_remap = any(callable(getattr(type(m), "_remap_ckpt_key", None)) for m in pipeline.modules())
             _has_online_quant = any(
                 getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
                 for module in pipeline.modules()
             )
-            if _has_remap and not _has_online_quant:
-                self._load_weights_via_mmap(pipeline, modules)
-            elif _has_online_quant:
-                logger.warning(
-                    "Online quantization detected with DLO+AllGather: "
-                    "skipping mmap loading (weights already loaded and "
-                    "quantized via regular loader path)."
+            if _has_online_quant:
+                raise ValueError(
+                    "Online quantization is incompatible with DLO+AllGather: "
+                    "the sharding + AllGather mechanism flattens weights by "
+                    "dtype, which breaks quantized weight/scale layouts. "
+                    "Please use --dlo-no-use-allgather or disable online "
+                    "quantization."
                 )
+            if supports_mmap_loading(pipeline):
+                self._load_weights_via_mmap(pipeline, modules)
             else:
-                logger.info("Weights already loaded via regular loader — skipping mmap (no _remap_ckpt_key)")
+                logger.info("Weights loaded via regular loader — skipping mmap (model does not support mmap)")
 
         # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
         # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
