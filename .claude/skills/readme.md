@@ -53,6 +53,27 @@ include:
   `vllm-omni-local-test`) plus optional Buildkite scheduled nightly; optional
   archive to `vllm-omni-kanban` via `push_report_to_kanban.py` / `push_kanban_report.py`
 - `review-pr`: provides a structured workflow for reviewing pull requests
+- `ci-resource-pool-stats`: fetches Buildkite build data for `vllm-omni` and
+  `vllm-omni-npu-ci` pipelines and computes per-resource-pool queue wait time
+  (avg, max, p50, p90) and occupancy statistics for the previous day (UTC);
+  **default output is always an HTML file** (Markdown/JSON only when explicitly
+  requested)
+- `buildkite-ci-daily-analysis`: fetches **yesterday's** Buildkite builds
+  (UTC) across `vllm-omni` and `vllm-omni-npu-ci` so the 18:00 UTC
+  scheduled nightly runs are included, and emits an HTML report with
+  interactive **Pipeline** / **Branch** / **CI** / **State** / **Job
+  Name** filter dropdowns plus a **CI Aggregate** panel broken down by
+  `ready` / `merge` / `nightly` / `weekly` buckets — each card has both
+  job-level and build-level success rate, duration (`finished_at −
+  started_at`), avg / P50 / P90 / max runtime; default infra-job
+  filtering (`:pipeline: init`, `:docker: Build image`, `:buildkit: Build
+  and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect
+  results`); **default output is always an HTML file** (Markdown/JSON
+  only when explicitly requested); says "today's report" but actually
+  fetches yesterday UTC; pass `--today` for in-progress data, `--date
+  YYYY-MM-DD` for an arbitrary day; CI Aggregate panel split by
+  (CI bucket × pipeline); on `归档报告`, archives to
+  `vllm-omni-kanban/data/ci_monitor/`, commits, and pushes to `origin`
 - `vllm-omni-npu-model-runner-upgrade`: upgrades NPU model runners to align with the
   latest vllm-ascend NPUModelRunner
 

@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI Resource Pool Statistics — 2026-07-27 ~ 2026-07-27 CST</title>
+<style>
+
+:root {
+  --dashboard-bg: #f5f8fb;
+  --dashboard-panel-bg: #ffffff;
+  --dashboard-panel-strong: #f1f5f9;
+  --dashboard-border: #d9e2ec;
+  --dashboard-border-strong: #d6dde6;
+  --dashboard-text: #26323f;
+  --dashboard-muted: #607080;
+  --dashboard-soft-text: #52606d;
+  --dashboard-shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
+  --dashboard-badge-bg: #edf3f8;
+  --dashboard-badge-text: #435466;
+  --dashboard-chart-text: #5b6775;
+  --dashboard-chart-grid: rgba(148, 163, 184, 0.2);
+  --dashboard-tooltip-bg: rgba(15, 23, 42, 0.92);
+  --dashboard-tooltip-text: #f8fafc;
+  --dashboard-healthy: #1f9d63;
+  --dashboard-alert: #d14343;
+  --dashboard-warning: #d97706;
+  --dashboard-violet: #4f46e5;
+  --dashboard-violet-bg: rgba(79, 70, 229, 0.1);
+  --bg: var(--dashboard-bg);
+  --surface: var(--dashboard-panel-bg);
+  --surface-muted: #edf3f8;
+  --text: var(--dashboard-text);
+  --muted: var(--dashboard-muted);
+  --border: var(--dashboard-border);
+  --shadow: var(--dashboard-shadow);
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-soft: rgba(59, 130, 246, 0.22);
+  --accent-tint: rgba(59, 130, 246, 0.08);
+  --ci: #7c3aed;
+  --ci-soft: rgba(124, 58, 237, 0.18);
+  --ci-tint: rgba(124, 58, 237, 0.08);
+  --danger: var(--dashboard-alert);
+  --danger-strong: #b91c1c;
+  --danger-bg: rgba(209, 67, 67, 0.08);
+  --ok: var(--dashboard-healthy);
+  --ok-bg: var(--dashboard-healthy-bg);
+  --ok-edge: var(--dashboard-healthy);
+  --fail-bg: var(--dashboard-alert-bg);
+  --fail-edge: var(--dashboard-alert);
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dashboard-bg: #111827;
+    --dashboard-panel-bg: #162130;
+    --dashboard-panel-strong: #131d2b;
+    --dashboard-border: rgba(148, 163, 184, 0.18);
+    --dashboard-border-strong: rgba(148, 163, 184, 0.22);
+    --dashboard-text: #edf3fb;
+    --dashboard-muted: #b6c4d5;
+    --dashboard-soft-text: #c6d3e1;
+    --dashboard-shadow: 0 20px 40px rgba(2, 6, 23, 0.35);
+    --dashboard-badge-bg: rgba(148, 163, 184, 0.12);
+    --dashboard-badge-text: #d5dfeb;
+    --dashboard-chart-text: #c8d4e3;
+    --dashboard-chart-grid: rgba(148, 163, 184, 0.16);
+    --dashboard-tooltip-bg: rgba(15, 23, 42, 0.96);
+    --dashboard-tooltip-text: #f8fafc;
+    --dashboard-healthy-bg: rgba(31, 157, 99, 0.16);
+    --dashboard-alert-bg: rgba(209, 67, 67, 0.18);
+    --dashboard-warning: #fbbf24;
+    --dashboard-warning-bg: rgba(251, 191, 36, 0.14);
+    --dashboard-violet: #818cf8;
+    --dashboard-violet-bg: rgba(129, 140, 248, 0.14);
+    --surface-muted: rgba(148, 163, 184, 0.1);
+    --accent: #60a5fa;
+    --accent-hover: #3b82f6;
+    --accent-soft: rgba(96, 165, 250, 0.28);
+    --accent-tint: rgba(96, 165, 250, 0.12);
+    --ci: #a78bfa;
+    --ci-soft: rgba(167, 139, 250, 0.22);
+    --ci-tint: rgba(167, 139, 250, 0.1);
+    --danger-strong: #fecaca;
+    --danger-bg: rgba(209, 67, 67, 0.14);
+    --unknown-bg: rgba(148, 163, 184, 0.08);
+    --unknown-edge: #94a3b8;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  font-size: 15px;
+}
+.top-bar {
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  padding: 0;
+  box-shadow: 0 1px 0 rgba(148, 163, 184, 0.18);
+  border-bottom: 3px solid var(--ci);
+}
+.top-bar-inner {
+  padding: 1.4rem 1.25rem 1.55rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 1.1rem;
+}
+.brand-mark {
+  width: 3.2rem;
+  height: 3.2rem;
+  border-radius: var(--radius-sm);
+  background: var(--dashboard-badge-bg);
+  border: 1px solid var(--dashboard-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+}
+.brand-mark .ico { stroke: var(--ci); }
+.brand-copy h1 {
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  color: var(--dashboard-text);
+}
+.tagline {
+  margin: 0.35rem 0 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dashboard-muted);
+}
+.shell {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+.panel {
+  background: var(--dashboard-panel-bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--dashboard-border);
+  box-shadow: var(--dashboard-shadow);
+  padding: 1.15rem 1.3rem;
+  margin-bottom: 1.35rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.panel:hover {
+  box-shadow: 0 16px 28px rgba(15, 23, 42, 0.1);
+  border-color: rgba(124, 58, 237, 0.28);
+}
+.panel-bk {
+  border-top: 4px solid var(--ci);
+  background: linear-gradient(
+    180deg,
+    var(--dashboard-panel-bg) 0%,
+    color-mix(in srgb, var(--ci-soft) 35%, var(--dashboard-panel-bg)) 100%
+  );
+}
+.panel h2 {
+  margin: 0 0 1rem;
+  font-size: 1.12rem;
+  font-weight: 800;
+  color: var(--dashboard-text);
+  letter-spacing: -0.02em;
+  border-bottom: 2px solid var(--dashboard-border);
+  padding-bottom: 0.55rem;
+}
+.panel-bk h2 {
+  border-bottom-color: var(--ci-soft);
+}
+.heading-row {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+}
+.heading-ico {
+  display: flex;
+  margin-top: 0.12rem;
+  color: var(--ci);
+}
+.meta {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0.4rem 0;
+}
+.meta strong {
+  color: var(--dashboard-badge-text);
+  font-weight: 650;
+}
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius-sm);
+  margin: 0.65rem 0 0;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dashboard-panel-bg) 65%, transparent);
+}
+.table-scroll > table {
+  width: 100%;
+  min-width: 860px;
+}
+table.pool-stats {
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+table.pool-stats th, table.pool-stats td {
+  border: 1px solid var(--border);
+  padding: 0.65rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+table.pool-stats th {
+  background: var(--dashboard-panel-strong);
+  font-weight: 650;
+  color: var(--dashboard-chart-text);
+  white-space: nowrap;
+}
+table.pool-stats tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--dashboard-badge-bg) 45%, var(--dashboard-panel-bg));
+}
+table.pool-stats td.num {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+table.pool-stats td.pool-name {
+  font-weight: 650;
+  color: var(--dashboard-text);
+}
+table.pool-stats td.pipeline-cell {
+  border-left: 3px solid var(--ci);
+  padding-left: calc(0.8rem - 2px);
+  font-weight: 650;
+  color: var(--dashboard-violet);
+}
+table.pool-stats td.na {
+  color: var(--dashboard-muted);
+  font-style: italic;
+}
+.legend {
+  margin: 1rem 0 0;
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--dashboard-badge-bg) 72%, var(--dashboard-panel-bg));
+  border: 1px solid var(--dashboard-border);
+  font-size: 0.88rem;
+  color: var(--dashboard-soft-text);
+}
+.legend dt {
+  font-weight: 650;
+  color: var(--dashboard-text);
+  margin-top: 0.3rem;
+}
+.legend dd {
+  margin: 0 0 0.3rem 0.3rem;
+}
+.legend dl {
+  margin: 0;
+  padding: 0;
+}
+.focus-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.85rem;
+  margin: 0.85rem 0 1rem;
+}
+.focus-card {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  padding: 0.85rem 0.95rem;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dashboard-panel-bg) 65%, transparent);
+}
+.focus-card--ci {
+  border-left: 4px solid var(--ci);
+  background: color-mix(in srgb, var(--ci-soft) 76%, var(--dashboard-panel-bg));
+}
+.focus-card-title {
+  color: var(--dashboard-muted);
+  font-size: 0.78rem;
+  font-weight: 760;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+.focus-card-value {
+  margin-top: 0.2rem;
+  font-size: 1.18rem;
+  font-weight: 820;
+  color: var(--dashboard-text);
+}
+.focus-card-detail {
+  margin-top: 0.15rem;
+  color: var(--dashboard-muted);
+  font-size: 0.84rem;
+}
+.ico { display: block; }
+.chart-container {
+  margin: 0.65rem 0 0;
+  overflow-x: auto;
+}
+.chart-container svg {
+  display: block;
+  width: 100%;
+  max-width: 860px;
+  height: auto;
+}
+.chart-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 1rem;
+  margin: 0.55rem 0 0;
+  font-size: 0.82rem;
+  color: var(--dashboard-chart-text);
+}
+.chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.chart-legend-swatch {
+  width: 1rem;
+  height: 0.35rem;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.chart-group-title {
+  margin: 1.2rem 0 0.55rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--dashboard-soft-text);
+}
+.chart-group-title:first-child {
+  margin-top: 0;
+}
+
+</style>
+</head>
+<body>
+<header class="top-bar">
+<div class="top-bar-inner">
+<div class="brand">
+  <div class="brand-mark"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg></div>
+  <div class="brand-copy">
+    <h1>CI Resource Pool Statistics</h1>
+    <p class="tagline">2026-07-27 — 2026-07-27 CST (UTC+8)</p>
+  </div>
+</div>
+</div>
+</header>
+<div class="shell">
+<div class="focus-card-grid">
+<div class="focus-card focus-card--ci">
+  <div class="focus-card-title"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> Total Jobs</div>
+  <div class="focus-card-value">1804</div>
+  <div class="focus-card-detail">across 7 pool(s)</div>
+</div>
+<div class="focus-card focus-card--ci">
+  <div class="focus-card-title"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Avg Queue Wait</div>
+  <div class="focus-card-value">9m1s</div>
+  <div class="focus-card-detail">1324 job(s) with wait data</div>
+</div>
+<div class="focus-card focus-card--ci">
+  <div class="focus-card-title"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg> Total Occupancy</div>
+  <div class="focus-card-value">194h27m3s</div>
+  <div class="focus-card-detail">sum of all job runtimes</div>
+</div>
+<div class="focus-card focus-card--ci">
+  <div class="focus-card-title"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg> Resource Pools</div>
+  <div class="focus-card-value">7</div>
+  <div class="focus-card-detail">vllm-omni, vllm-omni-npu-ci</div>
+</div>
+</div>
+<div class="panel panel-bk">
+  <h2><span class="heading-row"><span class="heading-ico"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span> Per-Pool Detail</span></h2>
+<div class="table-scroll">
+<table class="pool-stats">
+<thead>
+<tr>
+  <th>Pipeline</th>
+  <th>Resource Pool</th>
+  <th>Jobs</th>
+  <th>Avg Wait</th>
+  <th>Max Wait</th>
+  <th>P50 Wait</th>
+  <th>P90 Wait</th>
+  <th>Avg Duration</th>
+  <th>Total Occupancy</th>
+  <th>Total Wait</th>
+</tr>
+</thead>
+<tbody>
+<tr><td class="pipeline-cell">vllm-omni</td><td class="pool-name">cpu_queue_premerge</td><td class="num">354</td><td class="num">2m7s</td><td class="num">11m43s</td><td class="num">1m49s</td><td class="num">3m36s</td><td class="num">20.8s</td><td class="num">1h8m49s</td><td class="num">7h2m9s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni</td><td class="pool-name">gpu_1_queue</td><td class="num">510</td><td class="num">6m51s</td><td class="num">15m4s</td><td class="num">6m3s</td><td class="num">9m42s</td><td class="num">10m27s</td><td class="num">84h18m47s</td><td class="num">55h57m49s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni</td><td class="pool-name">gpu_4_queue</td><td class="num">29</td><td class="num">12m34s</td><td class="num">33m13s</td><td class="num">7m33s</td><td class="num">28m44s</td><td class="num">15m22s</td><td class="num">4h52m8s</td><td class="num">3h59m1s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni</td><td class="pool-name">mithril-h100-pool</td><td class="num">304</td><td class="num">32m16s</td><td class="num">7h32m19s</td><td class="num">7m49s</td><td class="num">32m42s</td><td class="num">26m43s</td><td class="num">64h7m59s</td><td class="num">77h27m22s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni-npu-ci</td><td class="pool-name">ascend-a2b3</td><td class="num">318</td><td class="num">5m11s</td><td class="num">38m32s</td><td class="num">3m13s</td><td class="num">14m1s</td><td class="num">5m28s</td><td class="num">25h53m12s</td><td class="num">24h44m12s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni-npu-ci</td><td class="pool-name">ascend-a3</td><td class="num">59</td><td class="num">15m3s</td><td class="num">46m26s</td><td class="num">13m10s</td><td class="num">18m44s</td><td class="num">15m36s</td><td class="num">13h46m57s</td><td class="num">13h32m49s</td></tr>
+<tr><td class="pipeline-cell">vllm-omni-npu-ci</td><td class="pool-name">cpu_queue_premerge</td><td class="num">230</td><td class="num">7m30s</td><td class="num">46m3s</td><td class="num">3m0s</td><td class="num">15m18s</td><td class="num">8.7s</td><td class="num">19m8s</td><td class="num">16h31m17s</td></tr>
+</tbody>
+</table>
+</div>
+<div class="legend">
+<dl>
+  <dt>Wait</dt>
+  <dd>Time a job spent in the queue before an agent picked it up (<code>started_at − scheduled_at</code>).</dd>
+  <dt>Duration</dt>
+  <dd>Time a job spent running on the agent (<code>finished_at − started_at</code>).</dd>
+  <dt>Occupancy</dt>
+  <dd>Total running time across all jobs in the pool (sum of durations).</dd>
+  <dt>Total Wait</dt>
+  <dd>Total queue time across all jobs in the pool (sum of wait times).</dd>
+  <dt>Resource Pool</dt>
+  <dd>Derived from each job's <code>agent_query_rules</code> (<code>queue=…</code>); jobs without an explicit queue go into <code>default</code>.</dd>
+</dl>
+</div>
+</div>
+<div class="panel panel-bk">
+  <h2><span class="heading-row"><span class="heading-ico"><svg class="ico" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span> Hourly Trends (CST, UTC+8)</span></h2>
+<div class="chart-group-title">Avg Queue Wait per Hour (CST, UTC+8)</div>
+<div class="chart-container">
+<svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Avg Queue Wait — 2026-07-27">
+<rect x="0" y="0" width="860" height="280" fill="var(--dashboard-panel-bg)" rx="8"/>
+<text x="60" y="18" font-size="13" font-weight="700" fill="var(--dashboard-text)">Avg Queue Wait — 2026-07-27</text>
+<text x="4" y="132" font-size="11" fill="var(--dashboard-chart-text)">Wait (s)</text>
+<line x1="60" y1="235" x2="840" y2="235" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="239" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">0s</text>
+<line x1="60" y1="194" x2="840" y2="194" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="198" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">920s</text>
+<line x1="60" y1="153" x2="840" y2="153" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="157" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">1841s</text>
+<line x1="60" y1="112" x2="840" y2="112" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="116" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">2761s</text>
+<line x1="60" y1="71" x2="840" y2="71" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="75" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">1h1m21s</text>
+<line x1="60" y1="30" x2="840" y2="30" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="34" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">1h16m42s</text>
+<line x1="60" y1="235" x2="840" y2="235" stroke="var(--dashboard-chart-text)" stroke-width="1.5"/>
+<line x1="60" y1="30" x2="60" y2="235" stroke="var(--dashboard-chart-text)" stroke-width="1.5"/>
+<line x1="60" y1="235" x2="60" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="94" y1="235" x2="94" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="128" y1="235" x2="128" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="162" y1="235" x2="162" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="196" y1="235" x2="196" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="230" y1="235" x2="230" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="263" y1="235" x2="263" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="297" y1="235" x2="297" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="331" y1="235" x2="331" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="365" y1="235" x2="365" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="399" y1="235" x2="399" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="433" y1="235" x2="433" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="467" y1="235" x2="467" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="501" y1="235" x2="501" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="535" y1="235" x2="535" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="569" y1="235" x2="569" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="603" y1="235" x2="603" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="637" y1="235" x2="637" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="670" y1="235" x2="670" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="704" y1="235" x2="704" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="738" y1="235" x2="738" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="772" y1="235" x2="772" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="806" y1="235" x2="806" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="840" y1="235" x2="840" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<text x="60" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">00:00</text>
+<text x="94" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">01:00</text>
+<text x="128" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">02:00</text>
+<text x="162" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">03:00</text>
+<text x="196" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">04:00</text>
+<text x="230" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">05:00</text>
+<text x="263" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">06:00</text>
+<text x="297" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">07:00</text>
+<text x="331" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">08:00</text>
+<text x="365" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">09:00</text>
+<text x="399" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">10:00</text>
+<text x="433" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">11:00</text>
+<text x="467" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">12:00</text>
+<text x="501" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">13:00</text>
+<text x="535" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">14:00</text>
+<text x="569" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">15:00</text>
+<text x="603" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">16:00</text>
+<text x="637" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">17:00</text>
+<text x="670" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">18:00</text>
+<text x="704" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">19:00</text>
+<text x="738" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">20:00</text>
+<text x="772" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">21:00</text>
+<text x="806" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">22:00</text>
+<text x="840" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">23:00</text>
+<polygon points="127.8,228.2 365.2,231.0 399.1,228.3 433.0,228.9 467.0,230.0 500.9,228.7 534.8,228.4 568.7,229.8 602.6,229.9 636.5,230.2 636.5,235.0 127.8,235.0" fill="#7c3aed" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,228.2 365.2,231.0 399.1,228.3 433.0,228.9 467.0,230.0 500.9,228.7 534.8,228.4 568.7,229.8 602.6,229.9 636.5,230.2" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="228.2" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="365.2" cy="231.0" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="399.1" cy="228.3" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="433.0" cy="228.9" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="467.0" cy="230.0" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="500.9" cy="228.7" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="534.8" cy="228.4" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="568.7" cy="229.8" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="602.6" cy="229.9" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="636.5" cy="230.2" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<polygon points="127.8,217.9 365.2,221.3 399.1,216.7 433.0,208.9 467.0,219.3 500.9,214.4 534.8,215.0 568.7,217.7 602.6,216.9 636.5,219.5 636.5,235.0 127.8,235.0" fill="#3b82f6" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,217.9 365.2,221.3 399.1,216.7 433.0,208.9 467.0,219.3 500.9,214.4 534.8,215.0 568.7,217.7 602.6,216.9 636.5,219.5" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="217.9" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="365.2" cy="221.3" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="399.1" cy="216.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="433.0" cy="208.9" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="467.0" cy="219.3" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="500.9" cy="214.4" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="534.8" cy="215.0" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="568.7" cy="217.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="602.6" cy="216.9" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="636.5" cy="219.5" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<polygon points="127.8,153.8 365.2,221.3 399.1,213.1 433.0,194.9 467.0,219.0 500.9,206.6 534.8,198.4 568.7,216.5 602.6,190.3 636.5,216.6 636.5,235.0 127.8,235.0" fill="#1f9d63" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,153.8 365.2,221.3 399.1,213.1 433.0,194.9 467.0,219.0 500.9,206.6 534.8,198.4 568.7,216.5 602.6,190.3 636.5,216.6" fill="none" stroke="#1f9d63" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="153.8" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="365.2" cy="221.3" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="399.1" cy="213.1" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="433.0" cy="194.9" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="467.0" cy="219.0" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="500.9" cy="206.6" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="534.8" cy="198.4" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="568.7" cy="216.5" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="602.6" cy="190.3" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="636.5" cy="216.6" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<polygon points="127.8,56.7 365.2,227.4 399.1,212.2 467.0,210.6 500.9,220.5 534.8,156.0 568.7,79.1 568.7,235.0 127.8,235.0" fill="#d97706" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,56.7 365.2,227.4 399.1,212.2 467.0,210.6 500.9,220.5 534.8,156.0 568.7,79.1" fill="none" stroke="#d97706" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="56.7" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="365.2" cy="227.4" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="399.1" cy="212.2" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="467.0" cy="210.6" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="500.9" cy="220.5" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="534.8" cy="156.0" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="568.7" cy="79.1" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<polygon points="60.0,224.6 127.8,219.7 195.7,221.4 365.2,220.8 399.1,221.0 433.0,217.8 467.0,221.9 500.9,221.9 534.8,220.0 568.7,222.1 602.6,222.1 636.5,224.2 636.5,235.0 60.0,235.0" fill="#ef4444" fill-opacity="0.12" stroke="none"/>
+<polyline points="60.0,224.6 127.8,219.7 195.7,221.4 365.2,220.8 399.1,221.0 433.0,217.8 467.0,221.9 500.9,221.9 534.8,220.0 568.7,222.1 602.6,222.1 636.5,224.2" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="60.0" cy="224.6" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="127.8" cy="219.7" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="195.7" cy="221.4" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="365.2" cy="220.8" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="399.1" cy="221.0" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="433.0" cy="217.8" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="467.0" cy="221.9" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="500.9" cy="221.9" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="534.8" cy="220.0" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="568.7" cy="222.1" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="602.6" cy="222.1" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="636.5" cy="224.2" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<polygon points="127.8,201.7 195.7,202.0 365.2,179.5 399.1,200.4 433.0,186.8 467.0,187.9 500.9,196.6 534.8,198.6 568.7,201.7 602.6,202.3 602.6,235.0 127.8,235.0" fill="#06b6d4" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,201.7 195.7,202.0 365.2,179.5 399.1,200.4 433.0,186.8 467.0,187.9 500.9,196.6 534.8,198.6 568.7,201.7 602.6,202.3" fill="none" stroke="#06b6d4" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="201.7" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="195.7" cy="202.0" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="365.2" cy="179.5" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="399.1" cy="200.4" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="433.0" cy="186.8" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="467.0" cy="187.9" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="500.9" cy="196.6" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="534.8" cy="198.6" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="568.7" cy="201.7" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="602.6" cy="202.3" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<polygon points="60.0,222.1 127.8,214.8 195.7,216.5 365.2,212.7 399.1,216.5 433.0,209.5 467.0,214.3 500.9,214.3 534.8,216.2 568.7,217.9 602.6,216.8 636.5,219.9 636.5,235.0 60.0,235.0" fill="#f472b6" fill-opacity="0.12" stroke="none"/>
+<polyline points="60.0,222.1 127.8,214.8 195.7,216.5 365.2,212.7 399.1,216.5 433.0,209.5 467.0,214.3 500.9,214.3 534.8,216.2 568.7,217.9 602.6,216.8 636.5,219.9" fill="none" stroke="#f472b6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="60.0" cy="222.1" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="127.8" cy="214.8" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="195.7" cy="216.5" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="365.2" cy="212.7" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="399.1" cy="216.5" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="433.0" cy="209.5" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="467.0" cy="214.3" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="500.9" cy="214.3" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="534.8" cy="216.2" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="568.7" cy="217.9" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="602.6" cy="216.8" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="636.5" cy="219.9" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+</svg>
+</div>
+<div class="chart-group-title">Job Count per Hour (CST, UTC+8)</div>
+<div class="chart-container">
+<svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Job Count — 2026-07-27">
+<rect x="0" y="0" width="860" height="280" fill="var(--dashboard-panel-bg)" rx="8"/>
+<text x="60" y="18" font-size="13" font-weight="700" fill="var(--dashboard-text)">Job Count — 2026-07-27</text>
+<text x="4" y="132" font-size="11" fill="var(--dashboard-chart-text)">Jobs</text>
+<line x1="60" y1="235" x2="840" y2="235" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="239" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">0</text>
+<line x1="60" y1="194" x2="840" y2="194" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="198" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">23</text>
+<line x1="60" y1="153" x2="840" y2="153" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="157" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">46</text>
+<line x1="60" y1="112" x2="840" y2="112" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="116" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">69</text>
+<line x1="60" y1="71" x2="840" y2="71" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="75" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">92</text>
+<line x1="60" y1="30" x2="840" y2="30" stroke="var(--dashboard-chart-grid)" stroke-width="1"/>
+<text x="55" y="34" text-anchor="end" font-size="11" fill="var(--dashboard-chart-text)">115</text>
+<line x1="60" y1="235" x2="840" y2="235" stroke="var(--dashboard-chart-text)" stroke-width="1.5"/>
+<line x1="60" y1="30" x2="60" y2="235" stroke="var(--dashboard-chart-text)" stroke-width="1.5"/>
+<line x1="60" y1="235" x2="60" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="94" y1="235" x2="94" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="128" y1="235" x2="128" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="162" y1="235" x2="162" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="196" y1="235" x2="196" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="230" y1="235" x2="230" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="263" y1="235" x2="263" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="297" y1="235" x2="297" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="331" y1="235" x2="331" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="365" y1="235" x2="365" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="399" y1="235" x2="399" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="433" y1="235" x2="433" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="467" y1="235" x2="467" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="501" y1="235" x2="501" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="535" y1="235" x2="535" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="569" y1="235" x2="569" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="603" y1="235" x2="603" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="637" y1="235" x2="637" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="670" y1="235" x2="670" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="704" y1="235" x2="704" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="738" y1="235" x2="738" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="772" y1="235" x2="772" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="806" y1="235" x2="806" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<line x1="840" y1="235" x2="840" y2="241" stroke="var(--dashboard-chart-text)" stroke-width="1"/>
+<text x="60" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">00:00</text>
+<text x="94" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">01:00</text>
+<text x="128" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">02:00</text>
+<text x="162" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">03:00</text>
+<text x="196" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">04:00</text>
+<text x="230" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">05:00</text>
+<text x="263" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">06:00</text>
+<text x="297" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">07:00</text>
+<text x="331" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">08:00</text>
+<text x="365" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">09:00</text>
+<text x="399" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">10:00</text>
+<text x="433" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">11:00</text>
+<text x="467" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">12:00</text>
+<text x="501" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">13:00</text>
+<text x="535" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">14:00</text>
+<text x="569" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">15:00</text>
+<text x="603" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">16:00</text>
+<text x="637" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">17:00</text>
+<text x="670" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">18:00</text>
+<text x="704" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">19:00</text>
+<text x="738" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">20:00</text>
+<text x="772" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">21:00</text>
+<text x="806" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">22:00</text>
+<text x="840" y="253" text-anchor="middle" font-size="11" fill="var(--dashboard-chart-text)">23:00</text>
+<polygon points="127.8,220.7 365.2,185.1 399.1,172.6 433.0,195.8 467.0,113.8 500.9,140.5 534.8,140.5 568.7,197.6 602.6,154.8 636.5,197.6 636.5,235.0 127.8,235.0" fill="#7c3aed" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,220.7 365.2,185.1 399.1,172.6 433.0,195.8 467.0,113.8 500.9,140.5 534.8,140.5 568.7,197.6 602.6,154.8 636.5,197.6" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="220.7" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="365.2" cy="185.1" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="399.1" cy="172.6" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="433.0" cy="195.8" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="467.0" cy="113.8" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="500.9" cy="140.5" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="534.8" cy="140.5" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="568.7" cy="197.6" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="602.6" cy="154.8" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<circle cx="636.5" cy="197.6" r="3.5" fill="#7c3aed" stroke="#7c3aed" stroke-width="1"/>
+<polygon points="127.8,204.7 365.2,188.7 399.1,122.7 433.0,186.9 467.0,56.7 500.9,104.9 534.8,88.8 568.7,181.5 602.6,112.0 636.5,194.0 636.5,235.0 127.8,235.0" fill="#3b82f6" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,204.7 365.2,188.7 399.1,122.7 433.0,186.9 467.0,56.7 500.9,104.9 534.8,88.8 568.7,181.5 602.6,112.0 636.5,194.0" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="204.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="365.2" cy="188.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="399.1" cy="122.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="433.0" cy="186.9" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="467.0" cy="56.7" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="500.9" cy="104.9" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="534.8" cy="88.8" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="568.7" cy="181.5" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="602.6" cy="112.0" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<circle cx="636.5" cy="194.0" r="3.5" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<polygon points="127.8,229.7 365.2,233.2 399.1,229.7 433.0,233.2 467.0,220.7 500.9,227.9 534.8,227.9 568.7,233.2 602.6,229.7 636.5,233.2 636.5,235.0 127.8,235.0" fill="#1f9d63" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,229.7 365.2,233.2 399.1,229.7 433.0,233.2 467.0,220.7 500.9,227.9 534.8,227.9 568.7,233.2 602.6,229.7 636.5,233.2" fill="none" stroke="#1f9d63" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="229.7" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="365.2" cy="233.2" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="399.1" cy="229.7" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="433.0" cy="233.2" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="467.0" cy="220.7" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="500.9" cy="227.9" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="534.8" cy="227.9" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="568.7" cy="233.2" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="602.6" cy="229.7" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<circle cx="636.5" cy="233.2" r="3.5" fill="#1f9d63" stroke="#1f9d63" stroke-width="1"/>
+<polygon points="127.8,144.1 365.2,233.2 399.1,231.4 467.0,67.4 500.9,137.0 534.8,151.2 568.7,220.7 602.6,160.1 636.5,227.9 636.5,235.0 127.8,235.0" fill="#d97706" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,144.1 365.2,233.2 399.1,231.4 467.0,67.4 500.9,137.0 534.8,151.2 568.7,220.7 602.6,160.1 636.5,227.9" fill="none" stroke="#d97706" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="144.1" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="365.2" cy="233.2" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="399.1" cy="231.4" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="467.0" cy="67.4" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="500.9" cy="137.0" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="534.8" cy="151.2" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="568.7" cy="220.7" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="602.6" cy="160.1" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<circle cx="636.5" cy="227.9" r="3.5" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<polygon points="60.0,222.5 127.8,211.8 195.7,227.9 365.2,183.3 399.1,167.3 433.0,176.2 467.0,137.0 500.9,156.6 534.8,161.9 568.7,208.3 602.6,188.7 636.5,211.8 636.5,235.0 60.0,235.0" fill="#ef4444" fill-opacity="0.12" stroke="none"/>
+<polyline points="60.0,222.5 127.8,211.8 195.7,227.9 365.2,183.3 399.1,167.3 433.0,176.2 467.0,137.0 500.9,156.6 534.8,161.9 568.7,208.3 602.6,188.7 636.5,211.8" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="60.0" cy="222.5" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="127.8" cy="211.8" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="195.7" cy="227.9" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="365.2" cy="183.3" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="399.1" cy="167.3" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="433.0" cy="176.2" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="467.0" cy="137.0" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="500.9" cy="156.6" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="534.8" cy="161.9" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="568.7" cy="208.3" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="602.6" cy="188.7" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<circle cx="636.5" cy="211.8" r="3.5" fill="#ef4444" stroke="#ef4444" stroke-width="1"/>
+<polygon points="127.8,227.9 195.7,233.2 365.2,227.9 399.1,222.5 433.0,222.5 467.0,219.0 500.9,215.4 534.8,222.5 568.7,229.7 602.6,224.3 602.6,235.0 127.8,235.0" fill="#06b6d4" fill-opacity="0.12" stroke="none"/>
+<polyline points="127.8,227.9 195.7,233.2 365.2,227.9 399.1,222.5 433.0,222.5 467.0,219.0 500.9,215.4 534.8,222.5 568.7,229.7 602.6,224.3" fill="none" stroke="#06b6d4" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="127.8" cy="227.9" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="195.7" cy="233.2" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="365.2" cy="227.9" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="399.1" cy="222.5" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="433.0" cy="222.5" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="467.0" cy="219.0" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="500.9" cy="215.4" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="534.8" cy="222.5" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="568.7" cy="229.7" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<circle cx="602.6" cy="224.3" r="3.5" fill="#06b6d4" stroke="#06b6d4" stroke-width="1"/>
+<polygon points="60.0,224.3 127.8,219.0 195.7,229.7 365.2,192.2 399.1,190.4 433.0,192.2 467.0,158.3 500.9,181.5 534.8,192.2 568.7,213.6 602.6,202.9 636.5,213.6 636.5,235.0 60.0,235.0" fill="#f472b6" fill-opacity="0.12" stroke="none"/>
+<polyline points="60.0,224.3 127.8,219.0 195.7,229.7 365.2,192.2 399.1,190.4 433.0,192.2 467.0,158.3 500.9,181.5 534.8,192.2 568.7,213.6 602.6,202.9 636.5,213.6" fill="none" stroke="#f472b6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="60.0" cy="224.3" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="127.8" cy="219.0" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="195.7" cy="229.7" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="365.2" cy="192.2" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="399.1" cy="190.4" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="433.0" cy="192.2" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="467.0" cy="158.3" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="500.9" cy="181.5" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="534.8" cy="192.2" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="568.7" cy="213.6" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="602.6" cy="202.9" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+<circle cx="636.5" cy="213.6" r="3.5" fill="#f472b6" stroke="#f472b6" stroke-width="1"/>
+</svg>
+</div>
+<div class="chart-legend-row"><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#7c3aed"></span>vllm-omni/cpu_queue_premerge</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#3b82f6"></span>vllm-omni/gpu_1_queue</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#1f9d63"></span>vllm-omni/gpu_4_queue</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#d97706"></span>vllm-omni/mithril-h100-pool</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#ef4444"></span>vllm-omni-npu-ci/ascend-a2b3</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#06b6d4"></span>vllm-omni-npu-ci/ascend-a3</span><span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#f472b6"></span>vllm-omni-npu-ci/cpu_queue_premerge</span></div>
+</div>
+<p class="meta">Source: <code>scripts/resource_pool_stats.py</code>; pipelines: vllm-omni, vllm-omni-npu-ci; window: <code>2026-07-27</code> — <code>2026-07-27</code> CST (UTC+8; maps to <code>2026-07-26T16:00:00Z</code> — <code>2026-07-27T15:59:59Z</code> UTC).</p>
+</div>
+</body>
+</html>
