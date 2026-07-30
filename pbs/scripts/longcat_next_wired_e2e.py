@@ -192,7 +192,7 @@ def main() -> None:
         deploy_config=args.deploy_yaml,
         trust_remote_code=True,
     )
-    num_stages = len(llm.stage_names) if hasattr(llm, "stage_names") else 3
+    num_stages = llm.num_stages
 
     print("\n" + "=" * 60)
     print(f"[wired] === {args.modality.title()} modality test ===")
