@@ -14,6 +14,8 @@ extension implements no model-owned turn policy -- see ``decide_output``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any
 
 from vllm.sampling_params import SamplingParams
@@ -29,6 +31,9 @@ from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPo
 #: Input modes this model accepts. Anything else is rejected rather than
 #: silently degraded -- per Sy0307's RFC #3745 review point that append mode
 #: must be an explicit per-model capability.
+#: float32 little-endian PCM.
+_BYTES_PER_SAMPLE = 4
+
 SUPPORTED_INPUT_MODES = frozenset(
     {
         DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -63,12 +68,33 @@ def duplex_audio_token_count(payload: object) -> int:
     ``Qwen3OmniStage0DuplexRuntime.expected_embedding_count`` both defer to
     ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
     """
-    num_samples = 0
-    if isinstance(payload, dict):
-        num_samples = _coerce_int(payload.get("num_samples")) or 0
+    num_samples = _payload_num_samples(payload)
     if num_samples <= 0:
         return Qwen3OmniDuplexPolicy.tokens_per_chunk()
     return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
+
+
+def _payload_num_samples(payload: object) -> int:
+    """Sample count of an audio payload, measured from the audio itself.
+
+    Deliberately does not trust a ``num_samples`` key: the serving layer may
+    concatenate two payloads (``serving.py:_merge_native_audio_payloads``),
+    and that merge rebuilds ``audio`` while copying the second payload's
+    other keys verbatim -- so a carried-over ``num_samples`` would describe
+    only the tail. Under-counting here under-reserves scheduler slots, which
+    the model runner absorbs by silently truncating embeddings.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    audio = payload.get("audio")
+    if isinstance(audio, str) and audio:
+        try:
+            return len(base64.b64decode(audio, validate=True)) // _BYTES_PER_SAMPLE
+        except (binascii.Error, ValueError):
+            return 0
+    if isinstance(audio, (bytes, bytearray)):
+        return len(audio) // _BYTES_PER_SAMPLE
+    return _coerce_int(payload.get("num_samples")) or 0
 
 
 def _token_ids(runtime_config: dict[str, Any], key: str) -> list[int]:
@@ -112,7 +138,8 @@ def build_duplex_prompt_token_ids(
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
 
     audio_tokens = duplex_audio_token_count(payload)
-    suffix = _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY) if final else []
+    closes_turn = final or (isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True)
+    suffix = _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY) if closes_turn else []
 
     prompt_token_ids = prefix + [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens + suffix
     return prompt_token_ids, len(prefix), audio_tokens

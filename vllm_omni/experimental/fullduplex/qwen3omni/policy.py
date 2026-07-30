@@ -102,6 +102,17 @@ class Qwen3OmniDuplexPolicy:
     #: Client opt-in flag on ``extra_body``.
     ENABLE_FLAG = "qwen3_omni_native_duplex"
 
+    #: Marks an audio payload produced by a client commit rather than a
+    #: mid-turn append.
+    #:
+    #: The framework's append path always passes ``final=False``
+    #: (``session_runner.py:1184,1434``) because MiniCPM decides listen/speak
+    #: natively and never needs the turn closed for it. Qwen3-Omni does: the
+    #: assistant generation prompt is what produces a reply. The commit is
+    #: therefore signalled on the payload, which is model-owned data and
+    #: survives ``_merge_native_audio_payloads`` (it does ``dict(second)``).
+    TURN_FINAL_KEY = "duplex_turn_final"
+
     @staticmethod
     def audio_tokens_for_mel_frames(mel_frames: int) -> int:
         """Thinker audio tokens produced by ``mel_frames`` mel frames.

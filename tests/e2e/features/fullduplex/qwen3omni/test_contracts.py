@@ -488,3 +488,57 @@ def test_missing_scaffolding_degrades_to_audio_only() -> None:
     )
     assert audio_offset == 0
     assert ids == [_PAD] * audio_tokens
+
+
+def test_commit_payload_closes_the_turn_without_the_final_flag() -> None:
+    """The framework never passes final=True; the commit rides on the payload.
+
+    session_runner.py:1184,1434 hard-code final=False because MiniCPM decides
+    listen/speak natively. Qwen3-Omni needs the assistant generation prompt,
+    so a commit is signalled on the payload instead.
+    """
+    payload = _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES)
+    payload[Qwen3OmniDuplexPolicy.TURN_FINAL_KEY] = True
+    ids, _, audio_tokens = build_duplex_prompt_token_ids(
+        runtime_config=dict(_SCAFFOLD), payload=payload, seq=2, turn_seq=2, final=False
+    )
+    assert ids[-3:] == [6, 7, 8], "assistant generation prompt must be appended"
+    assert ids == [_PAD] * audio_tokens + [6, 7, 8]
+
+
+def test_prepare_commit_marks_the_payload_turn_final() -> None:
+    buffer = Qwen3OmniPcmAppendBuffer()
+    buffer.prepare_append(
+        _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
+        operation_id="o1",
+        chunk_period_ms=CHUNK_MS,
+        allow_emit=False,
+    )
+    reservation = buffer.prepare_commit(operation_id="o2", chunk_period_ms=CHUNK_MS)
+    assert reservation.payload is not None
+    assert reservation.payload[Qwen3OmniDuplexPolicy.TURN_FINAL_KEY] is True
+
+
+def test_plain_append_is_not_marked_turn_final() -> None:
+    buffer = Qwen3OmniPcmAppendBuffer()
+    reservation = buffer.prepare_append(
+        _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
+        operation_id="o1",
+        chunk_period_ms=CHUNK_MS,
+        allow_emit=True,
+    )
+    assert reservation is not None and reservation.payload is not None
+    assert Qwen3OmniDuplexPolicy.TURN_FINAL_KEY not in reservation.payload
+
+
+def test_sample_count_measured_from_audio_not_a_stale_key() -> None:
+    """_merge_native_audio_payloads rebuilds `audio` but copies num_samples.
+
+    A concatenated payload therefore carries the tail's num_samples. Trusting
+    it would under-reserve slots and the runner would truncate silently.
+    """
+    payload = _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES * 3)
+    payload["num_samples"] = Qwen3OmniDuplexPolicy.CHUNK_SAMPLES  # stale, as after a merge
+    assert duplex_audio_token_count(payload) == Qwen3OmniDuplexPolicy.audio_tokens_for_samples(
+        Qwen3OmniDuplexPolicy.CHUNK_SAMPLES * 3
+    )

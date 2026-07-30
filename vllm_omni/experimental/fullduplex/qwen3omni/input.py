@@ -153,6 +153,10 @@ class Qwen3OmniPcmAppendBuffer:
             chunk_period_ms=chunk_period_ms,
         )
         if reservation is not None:
+            # Tell the engine this append closes the user's turn, so the
+            # prompt gets the assistant generation suffix.
+            if reservation.payload is not None:
+                reservation.payload[Qwen3OmniDuplexPolicy.TURN_FINAL_KEY] = True
             return reservation
         # Nothing buffered: hand back an empty, already-shaped reservation so
         # the caller's commit/rollback bookkeeping stays uniform.
