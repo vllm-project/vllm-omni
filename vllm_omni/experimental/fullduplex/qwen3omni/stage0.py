@@ -3,12 +3,14 @@
 
 """Worker-side stage-0 duplex runtime for Qwen3-Omni.
 
-STATUS: NOT IMPLEMENTED. This module defines the required structure and
-documents precisely what is missing. ``build_append_embeddings`` raises
-``NotImplementedError``; it has never been executed against a checkpoint.
+Turns appended PCM into thinker input embeddings.
 
-Why this piece is unavoidable
------------------------------
+STATUS: implemented but NOT validated against a checkpoint or a GPU. The
+shape and length arithmetic is verified against vLLM's own functions; the
+forward pass has never been executed.
+
+Why this piece is needed at all
+-------------------------------
 In the duplex append path, audio cannot reach the thinker by Qwen3-Omni's
 normal multimodal route:
 
@@ -25,50 +27,33 @@ So audio arrives as base64 PCM inside
 become thinker embeddings is the model's own ``preprocess`` hook, dispatched
 at ``gpu_model_runner.py:1685`` under ``model.has_preprocess``.
 
-Two blockers, both real
------------------------
-1. **The thinker has no preprocess hook.**
-   ``Qwen3OmniMoeForConditionalGeneration`` sets ``has_preprocess = False``
-   at ``qwen3_omni.py:107`` and only enables it for the talker stage
-   (``qwen3_omni.py:156``). MiniCPM enables it for both its LM and TTS stages
-   (``minicpmo_4_5_omni.py:140``). Enabling it for the Qwen3-Omni thinker and
-   implementing ``preprocess`` is core model-code work, outside this package.
+Chunk alignment (why per-chunk encoding is sound here)
+------------------------------------------------------
+``Qwen3OmniMoeAudioEncoder.forward`` splits its conv input into
+``n_window * 2 == 100`` mel-frame chunks and runs the conv stack on each
+independently. At ``hop_length=160`` / 16 kHz that is exactly 1.0 s, which is
+``Qwen3OmniDuplexPolicy.CHUNK_PERIOD_MS``. A duplex chunk therefore lands on
+the model's own conv boundary and per-chunk encoding introduces **no
+convolutional boundary error** -- unlike MiniCPM, which needs an audio
+encoder KV cache plus explicit prefix/suffix context frames.
 
-2. **Qwen3-Omni's audio tower has no incremental/streaming encode.**
-   MiniCPM carries an audio-encoder KV cache across chunks
-   (``minicpmo45/stage0.py:443-489``: ``get_audio_embedding_streaming`` plus
-   ``audio_past_key_values``, with explicit prefix/suffix context frames).
-   Qwen3-Omni exposes no equivalent -- the only streaming affordance in the
-   model is ``code2wav.chunked_decode_streaming`` (``qwen3_omni.py:593``),
-   which is on the OUTPUT side. Without incremental encode there are three
-   options, none free:
-
-   a. Re-encode the whole accumulated buffer each append: correct, but
-      quadratic in session length, which defeats the purpose of a persistent
-      session.
-   b. Encode each chunk in isolation: cheap, but wrong at chunk boundaries,
-      because the convolutional front end loses its left context.
-   c. Encode a bounded sliding window (new chunk + N frames of left context)
-      and keep only the new chunk's embeddings: bounded cost and
-      approximately correct. This is the shape MiniCPM achieves via
-      ``cnn_redundancy_ms`` / ``prefix_extra_frames``, and it is the
-      recommended approach -- but the exact frame arithmetic (mel hop ->
-      conv stride -> pooling ratio -> embeddings per chunk) must be derived
-      from the checkpoint, not guessed.
+The tower's *attention* still spans up to
+``n_window_infer // (n_window * 2) == 8`` such chunks, so encoding one chunk
+at a time remains an approximation at the attention level. That is the known
+residual inaccuracy of this design and is not corrected here.
 
 Reservation invariant
 ---------------------
 ``duplex_scheduler_token_budget`` in ``runtime.py`` reserves scheduler slots
 via ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``, which reimplements
-vLLM's ``_get_feat_extract_output_lengths`` (13 tokens per whole second plus
-a sub-second remainder, derived from the checkpoint's Whisper feature
-extractor at ``hop_length=160``). This module MUST produce exactly that many
-embeddings per chunk. If the counts disagree the model runner truncates or
-pads without raising, so both sides call the same helper.
+vLLM's ``_get_feat_extract_output_lengths``. This module MUST produce exactly
+that many embeddings per chunk; a mismatch is absorbed silently by the model
+runner, so ``_encode_chunk`` asserts it instead.
 """
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,13 +66,10 @@ class Qwen3OmniStage0SessionState:
 
     #: Raw float32 PCM not yet consumed into embeddings.
     audio_buffer: Any = None
-    #: Count of chunks already turned into embeddings.
+    #: Count of whole chunks already turned into embeddings.
     chunk_index: int = 0
-    #: Tail of the previous chunk retained as encoder left context (option
-    #: (c) above). Length is a function of the audio tower's receptive field.
-    left_context: Any = None
-    #: Memoized result keyed by (epoch, seq) so a scheduler retry of the same
-    #: append is idempotent -- mirrors minicpmo45/stage0.py:164-173.
+    #: Memoized results keyed by ``(epoch, seq)`` so a scheduler retry of the
+    #: same append is idempotent -- mirrors ``minicpmo45/stage0.py:164-173``.
     prepared: dict[tuple[int, int], Any] = field(default_factory=dict)
 
 
@@ -99,11 +81,18 @@ class Qwen3OmniStage0DuplexRuntime:
     imports and instantiates this itself on the first duplex append.
     """
 
+    #: Bound on memoized appends per session, so a long session cannot grow
+    #: this table without limit.
+    _MAX_PREPARED = 8
+
     def __init__(self, stage_model: Any, *, model_path: str | None = None, device: str | None = None) -> None:
         self._model = stage_model
         self._model_path = model_path
         self._device = device
+        self._feature_extractor: Any = None
         self.sessions: dict[tuple[str, int], Qwen3OmniStage0SessionState] = {}
+
+    # ---- session bookkeeping ---------------------------------------------
 
     def session(self, session_id: str, incarnation: int) -> Qwen3OmniStage0SessionState:
         key = (session_id, incarnation)
@@ -116,6 +105,36 @@ class Qwen3OmniStage0DuplexRuntime:
     def drop_session(self, session_id: str, incarnation: int) -> None:
         self.sessions.pop((session_id, incarnation), None)
 
+    # ---- model handles ----------------------------------------------------
+
+    @property
+    def thinker(self) -> Any:
+        thinker = getattr(self._model, "thinker", None)
+        if thinker is None:
+            raise RuntimeError("Qwen3-Omni duplex stage 0 requires the thinker submodule")
+        return thinker
+
+    @property
+    def audio_tower(self) -> Any:
+        tower = getattr(self.thinker, "audio_tower", None)
+        if tower is None:
+            raise RuntimeError("Qwen3-Omni thinker has no audio_tower; cannot encode duplex audio")
+        return tower
+
+    def feature_extractor(self) -> Any:
+        """The checkpoint's ``WhisperFeatureExtractor``."""
+        if self._feature_extractor is None:
+            from vllm.transformers_utils.processor import cached_processor_from_config
+
+            model_config = getattr(getattr(self._model, "vllm_config", None), "model_config", None)
+            if model_config is None:
+                raise RuntimeError("Qwen3-Omni duplex stage 0 requires a model_config to load the processor")
+            processor = cached_processor_from_config(model_config)
+            self._feature_extractor = processor.feature_extractor
+        return self._feature_extractor
+
+    # ---- audio -> embeddings ---------------------------------------------
+
     def build_append_embeddings(
         self,
         *,
@@ -125,39 +144,126 @@ class Qwen3OmniStage0DuplexRuntime:
     ) -> Any:
         """Decode appended PCM and return thinker input embeddings.
 
-        Not implemented. See the module docstring for the two blockers.
+        Returns a ``(num_tokens, hidden_size)`` tensor covering whole chunks
+        completed by this append. May return ``None`` when the append did not
+        complete a chunk (the serving-side buffer normally prevents that, so
+        it indicates a partial payload reached the worker).
 
-        A correct implementation must:
-
-        1. Decode ``duplex["payload"]`` (base64 ``pcm_f32le``) and append it
-           to ``state.audio_buffer``.
-        2. While a whole ``Qwen3OmniDuplexPolicy.CHUNK_SAMPLES`` unit is
-           available, encode ``left_context + chunk`` through the thinker's
-           audio tower and keep only the embeddings corresponding to
-           ``chunk`` -- discarding the left-context prefix outputs.
-        3. Retain a new ``left_context`` tail sized to the tower's receptive
-           field.
-        4. Assert the produced embedding count equals ``prompt_len`` (the
-           reserved slot count). A mismatch must raise here rather than be
-           silently absorbed downstream.
-        5. Return embeddings positioned at ``token_offset`` within the
-           request's prompt.
-
-        The embedding count for step 4 is already settled:
-        ``expected_embedding_count`` implements the checkpoint's own conv
-        length arithmetic. What remains unknown is the receptive-field width
-        needed for ``left_context`` in step 3, which must come from the
-        audio tower's conv stack.
+        ``token_offset`` / ``prompt_len`` describe the reserved prompt span
+        and are used only to validate the count; slicing into the request's
+        prompt is the caller's job.
         """
-        raise NotImplementedError(
-            "Qwen3-Omni stage-0 duplex audio embedding is not implemented. "
-            "Two prerequisites are unmet: (1) the thinker stage sets "
-            "has_preprocess=False (qwen3_omni.py:107) and has no preprocess hook; "
-            "(2) Qwen3-Omni exposes no incremental audio encode equivalent to "
-            "MiniCPM's get_audio_embedding_streaming/audio_past_key_values. "
-            "See this module's docstring and "
-            "docs/design/qwen3_omni_duplex_assessment.md."
+        import numpy as np
+        import torch
+
+        session_id = str(duplex.get("session_id") or "")
+        incarnation = _coerce_int(duplex.get("incarnation")) or 0
+        epoch = _coerce_int(duplex.get("epoch")) or 0
+        seq = _coerce_int(duplex.get("seq")) or 0
+
+        state = self.session(session_id, incarnation)
+
+        # Idempotent replay: the scheduler may re-present the same append.
+        cache_key = (epoch, seq)
+        if cache_key in state.prepared:
+            return state.prepared[cache_key]
+
+        pcm = self._decode_pcm(duplex.get("payload"))
+        if pcm.size:
+            state.audio_buffer = pcm if state.audio_buffer is None else np.concatenate([state.audio_buffer, pcm])
+
+        chunk_samples = Qwen3OmniDuplexPolicy.CHUNK_SAMPLES
+        buffered = state.audio_buffer
+        if buffered is None or buffered.shape[0] < chunk_samples:
+            return None
+
+        num_chunks = buffered.shape[0] // chunk_samples
+        consumed = num_chunks * chunk_samples
+        chunk_embeds = [
+            self._encode_chunk(buffered[i * chunk_samples : (i + 1) * chunk_samples]) for i in range(num_chunks)
+        ]
+        state.audio_buffer = buffered[consumed:]
+        state.chunk_index += num_chunks
+
+        embeds = torch.cat(chunk_embeds, dim=0)
+        expected = self.expected_embedding_count(consumed)
+        if embeds.shape[0] != expected:
+            raise RuntimeError(
+                f"Qwen3-Omni duplex stage 0 produced {embeds.shape[0]} embeddings for "
+                f"{consumed} samples but reserved {expected}. The model runner would "
+                f"absorb this silently; failing instead."
+            )
+
+        state.prepared[cache_key] = embeds
+        while len(state.prepared) > self._MAX_PREPARED:
+            state.prepared.pop(next(iter(state.prepared)))
+        return embeds
+
+    def _encode_chunk(self, chunk: Any) -> Any:
+        """Encode exactly one ``CHUNK_SAMPLES`` unit through the audio tower.
+
+        Mirrors ``Qwen3OmniMoeThinkerForConditionalGeneration._process_audio_input``
+        (``qwen3_omni_moe_thinker.py:1101-1116``) for a single item.
+        """
+        import torch
+
+        extractor = self.feature_extractor()
+        features = extractor(
+            chunk,
+            sampling_rate=Qwen3OmniDuplexPolicy.SAMPLE_RATE_HZ,
+            return_tensors="pt",
+            # Whisper's extractor pads to its 30 s ``n_samples`` by default,
+            # which would produce 3000 mel frames instead of 100 and blow the
+            # reservation. Take the natural length instead.
+            padding="longest",
+            truncation=False,
         )
+        input_features = features["input_features"]
+        # The tower expects (num_mel_bins, total_frames); the extractor
+        # returns a leading batch dim for a single item.
+        if input_features.dim() == 3:
+            input_features = input_features[0]
+
+        num_frames = int(input_features.shape[-1])
+        tower = self.audio_tower
+        device = self._tower_device(tower)
+        feature_lens = torch.tensor([num_frames], dtype=torch.long, device=device)
+        aftercnn_lens = torch.tensor(
+            [Qwen3OmniDuplexPolicy.audio_tokens_for_mel_frames(num_frames)],
+            dtype=torch.long,
+            device=device,
+        )
+        outputs = tower(
+            input_features.to(device=device, dtype=tower.dtype),
+            feature_lens=feature_lens,
+            aftercnn_lens=aftercnn_lens,
+        )
+        return outputs if isinstance(outputs, torch.Tensor) else outputs.last_hidden_state
+
+    @staticmethod
+    def _tower_device(tower: Any) -> Any:
+        for parameter in tower.parameters():
+            return parameter.device
+        raise RuntimeError("Qwen3-Omni audio_tower has no parameters; cannot resolve device")
+
+    @staticmethod
+    def _decode_pcm(payload: object) -> Any:
+        """Decode a duplex audio payload to a float32 mono array."""
+        import numpy as np
+
+        if not isinstance(payload, dict):
+            return np.zeros(0, dtype=np.float32)
+        audio_format = payload.get("format", Qwen3OmniDuplexPolicy.PCM_FORMAT)
+        if audio_format != Qwen3OmniDuplexPolicy.PCM_FORMAT:
+            raise ValueError(
+                f"unsupported duplex audio format: {audio_format!r} (expected {Qwen3OmniDuplexPolicy.PCM_FORMAT})"
+            )
+        data = payload.get("audio")
+        if isinstance(data, str):
+            data = base64.b64decode(data)
+        if not isinstance(data, (bytes, bytearray)):
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(bytes(data), dtype="<f4").astype(np.float32, copy=False)
 
     @staticmethod
     def expected_embedding_count(num_samples: int) -> int:
@@ -167,3 +273,10 @@ class Qwen3OmniStage0DuplexRuntime:
         to the same checkpoint-derived formula.
         """
         return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
+
+
+def _coerce_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
