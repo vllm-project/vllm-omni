@@ -53,11 +53,6 @@ higher-priority strategy is selected.
 | LingBotVideoPipeline | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | `LingBotVideoTransformer3DModel` | yes | yes | — | `blocks` |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
 
-LingBot's optional Refiner is a second DiT. When enabled at startup,
-model-level offloading keeps Base and Refiner mutually exclusive on GPU;
-layerwise offloading discovers both `blocks` stacks through the generic
-multi-DiT component contract.
-
 Model-level support requires discoverable DiT and encoder components.
 Layerwise support requires transformer block topology. Distributed support
 reuses that topology but still requires validation for the model, checkpoint,
