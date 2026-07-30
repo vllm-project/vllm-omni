@@ -5,8 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
-            "npu": "A3"
+            "cuda": "H100"
           },
           "num_cards": 1
         }
@@ -15,21 +14,21 @@
       "omni"
     ],
     "server_params": {
-      "model": "/data/models/MiniCPM-o-4_5",
+      "model": "openbmb/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "/data/yrr/vllm-omni/vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
+        "vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
         "--trust-remote-code"
       ]
     },
     "benchmark_params": [
       {
         "dataset_name": "seed-tts",
-        "dataset_path": "/data/models/datasets/seed-tts-eval",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
         "backend": "openai-realtime-tts",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          1
         ],
         "max_concurrency": [
           1
@@ -37,10 +36,30 @@
         "no_oversample": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
+        "seed_tts_turns_per_session": 4,
+        "expected_duplex_audio_turns_per_session": 4,
+        "baseline_hardware": "L20X (provisional; H100 recalibration required)",
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "request_throughput": [
+            0.2415
+          ],
+          "mean_ttft_ms": [
+            122.6731
+          ],
+          "mean_e2el_ms": [
+            4073.804
+          ],
+          "mean_audio_ttfp_ms": [
+            523.4768
+          ],
+          "mean_audio_rtf": [
+            0.28295
+          ]
+        }
       }
     ]
   }

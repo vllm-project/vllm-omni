@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,11 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     find_vllm_cli,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.minicpmo_4_5_duplex import SERVER_PARAMS as DUPLEX_TEST_PARAMS
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-_MODEL = "/data/models/MiniCPM-o-4_5"
+_MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
 _RESULT_DIR = Path(__file__).resolve().parent / "results"
 _MIN_DAILY_OMNI_ACCURACY = 0.64
@@ -109,6 +111,41 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             str(_MAX_SEED_TTS_MEAN_WER),
             "--seed-extra-body-json",
             json.dumps(_CHAT_EXTRA_BODY, separators=(",", ":")),
+            "--trust-remote-code",
+        ]
+    )
+
+    assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", DUPLEX_TEST_PARAMS, indirect=True)
+def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
+    """Gate Seed-TTS WER through the explicit Realtime TTS contract."""
+    _require_vllm_cli()
+    pytest.importorskip("huggingface_hub")
+
+    argv = build_acc_benchmark_cli_argv(
+        omni_server,
+        skip_seed=False,
+        skip_daily=True,
+        num_prompts=50,
+        max_concurrency=1,
+    )
+    argv.extend(
+        [
+            "--result-dir",
+            str(_RESULT_DIR),
+            "--max-seed-tts-mean-wer",
+            str(_MAX_SEED_TTS_MEAN_WER),
+            "--seed-extra-body-json",
+            json.dumps({"save_duplex_request_metrics": True}, separators=(",", ":")),
+            "--seed-backend",
+            "openai-realtime-tts",
+            "--seed-endpoint",
+            "/v1/realtime",
+            "--seed-tts-turns-per-session",
+            "4",
             "--trust-remote-code",
         ]
     )

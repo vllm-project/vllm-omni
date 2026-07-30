@@ -285,3 +285,69 @@ def test_create_paired_omni_benchmark_pytest_params(tmp_path):
     assert bench_row == ("test_tts", 0)
     assert any(m.name == "tts" for m in by_id["test_tts-p0"].marks)
     assert not any(m.name == "tts" for m in by_id["test_omni-p0"].marks)
+
+
+@pytest.mark.parametrize(
+    ("metric", "current", "baseline"),
+    [
+        ("request_throughput", 1.0, 1.0),
+        ("mean_ttft_ms", 100.0, 100.0),
+    ],
+)
+def test_omni_baseline_accepts_values_at_threshold(metric, current, baseline):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {"completed": 1, metric: current},
+        {"baseline": {metric: baseline}},
+        1,
+        assert_baseline=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("metric", "current", "baseline", "message"),
+    [
+        ("request_throughput", 0.9, 1.0, "below baseline"),
+        ("mean_ttft_ms", 101.0, 100.0, "exceeded baseline"),
+    ],
+)
+def test_omni_baseline_rejects_regressions(metric, current, baseline, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match=message):
+        assert_result(
+            {"completed": 1, metric: current},
+            {"baseline": {metric: baseline}},
+            1,
+            assert_baseline=True,
+        )
+
+
+def test_omni_duplex_expected_audio_turns_accepts_complete_session():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 1,
+            "duplex_session_metrics": [{"audio_turn_count": 4}],
+        },
+        {"expected_duplex_audio_turns_per_session": 4},
+        1,
+        assert_baseline=False,
+    )
+
+
+def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="emitted 4 audio turns"):
+        assert_result(
+            {
+                "completed": 1,
+                "duplex_session_metrics": [{"audio_turn_count": 3}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+            assert_baseline=False,
+        )

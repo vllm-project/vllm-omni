@@ -22,8 +22,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Protocol
 
-DEFAULT_DAILY_OMNI_HF_REPO = "/data/models/datasets/Daily-Omni"
-DEFAULT_SEED_TTS_HF_REPO = "/data/models/datasets/seed-tts-eval"
+DEFAULT_DAILY_OMNI_HF_REPO = "liarliar/Daily-Omni"
+DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
 
 
 class OmniBenchServerEndpoint(Protocol):
@@ -151,6 +151,8 @@ def build_serve_common_argv(
     result_filename: str,
     ready_check_timeout_sec: int | None = None,
     trust_remote_code: bool = False,
+    backend: str = "openai-chat-omni",
+    endpoint: str = "/v1/chat/completions",
 ) -> list[str]:
     out = [
         "bench",
@@ -163,9 +165,9 @@ def build_serve_common_argv(
         "--model",
         model,
         "--endpoint",
-        "/v1/chat/completions",
+        endpoint,
         "--backend",
-        "openai-chat-omni",
+        backend,
         "--request-rate",
         "inf",
         "--num-prompts",
