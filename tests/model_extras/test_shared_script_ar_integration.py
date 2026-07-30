@@ -81,6 +81,20 @@ def _patch_tokenizer_loader(monkeypatch: pytest.MonkeyPatch, module: Any) -> lis
     return calls
 
 
+def _patch_failing_tokenizer_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch AutoTokenizer.from_pretrained to always raise, simulating a
+    missing --trust-remote-code / network / cache failure."""
+
+    class _FailingAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str, trust_remote_code: bool = False) -> Any:
+            raise OSError("simulated tokenizer load failure")
+
+    fake_transformers = type(sys)("transformers")
+    fake_transformers.AutoTokenizer = _FailingAutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+
 @pytest.mark.parametrize(
     "module_name,relpath",
     [
@@ -239,3 +253,77 @@ def test_trust_remote_code_flag_parses_from_real_cli(
     monkeypatch.setattr(sys, "argv", ["prog", *argv])
     args = module.parse_args()
     assert args.trust_remote_code is expected
+
+
+@pytest.mark.parametrize(
+    "module_name,relpath",
+    [
+        ("_shared_text_to_image_failfast", "examples/offline_inference/text_to_image/text_to_image.py"),
+        ("_shared_image_edit_failfast", "examples/offline_inference/image_to_image/image_edit.py"),
+    ],
+)
+def test_apply_ar_stage_inputs_tokenizer_load_failure_raises_by_default(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, relpath: str
+) -> None:
+    """A tokenizer load failure must surface as an error by default, not
+    silently degrade to the string-prompt form -- that degraded form can
+    complete "successfully" with subtly wrong stop tokens, masking the real
+    problem (e.g. a missing --trust-remote-code)."""
+    from vllm_omni.model_extras import get_ar_input_builder
+
+    module = _load_module(module_name, relpath)
+    _patch_failing_tokenizer_loader(monkeypatch)
+    ar_input_builder = get_ar_input_builder("HunyuanImage3ForCausalMM")
+
+    with pytest.raises(OSError, match="simulated tokenizer load failure"):
+        module._apply_ar_stage_inputs(
+            ar_input_builder,
+            model="tencent/HunyuanImage-3.0-Instruct",
+            prompt_text="a red panda",
+            extra_body={},
+            num_images=0,
+            height=1024,
+            width=1024,
+            prompt_dict={},
+            sampling_params_list=[_FakeARSamplingParams(), OmniDiffusionSamplingParams()],
+            trust_remote_code=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "module_name,relpath",
+    [
+        ("_shared_text_to_image_fallback", "examples/offline_inference/text_to_image/text_to_image.py"),
+        ("_shared_image_edit_fallback", "examples/offline_inference/image_to_image/image_edit.py"),
+    ],
+)
+def test_apply_ar_stage_inputs_allow_tokenizer_fallback_optin(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, relpath: str
+) -> None:
+    """With allow_tokenizer_fallback=True (the CLI's --allow-tokenizer-fallback),
+    a tokenizer load failure degrades to the string-prompt form instead of
+    raising -- for a deliberate offline-compat run, not the default."""
+    from vllm_omni.model_extras import get_ar_input_builder
+
+    module = _load_module(module_name, relpath)
+    _patch_failing_tokenizer_loader(monkeypatch)
+    ar_input_builder = get_ar_input_builder("HunyuanImage3ForCausalMM")
+
+    prompt_dict: dict[str, Any] = {}
+    module._apply_ar_stage_inputs(
+        ar_input_builder,
+        model="tencent/HunyuanImage-3.0-Instruct",
+        prompt_text="a red panda",
+        extra_body={"bot_task": "recaption"},
+        num_images=0,
+        height=1024,
+        width=1024,
+        prompt_dict=prompt_dict,
+        sampling_params_list=[_FakeARSamplingParams(), OmniDiffusionSamplingParams()],
+        trust_remote_code=False,
+        allow_tokenizer_fallback=True,
+    )
+
+    # No tokenizer -> string-prompt form, not the byte-for-byte token-ids form.
+    assert "prompt_token_ids" not in prompt_dict
+    assert prompt_dict.get("prompt") and "a red panda" in prompt_dict["prompt"]

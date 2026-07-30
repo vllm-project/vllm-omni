@@ -127,13 +127,14 @@ def _apply_ar_stage_inputs(
     text_output: bool = False,
     trust_remote_code: bool = False,
     validate_tokenizer: Any | None = None,
+    allow_tokenizer_fallback: bool = False,
 ) -> None:
     """Apply a model's declared AR-stage inputs to the request in place.
 
     Mirrors the helper in ``text_to_image.py``: loads the tokenizer for
-    byte-for-byte HF-parity AR tokenization (string-prompt fallback otherwise),
-    asks the model's ``ar_input_builder`` for the AR prefill + stop tokens, and
-    writes them onto ``prompt_dict`` and the non-diffusion (AR) stage params.
+    byte-for-byte HF-parity AR tokenization, asks the model's
+    ``ar_input_builder`` for the AR prefill + stop tokens, and writes them
+    onto ``prompt_dict`` and the non-diffusion (AR) stage params.
     Model-agnostic -- only the declared-hook contract is assumed.
 
     ``trust_remote_code`` must be threaded in from the caller's own resolved
@@ -146,12 +147,22 @@ def _apply_ar_stage_inputs(
     tokenizer -- outside the load's try/except, so a validation failure (a
     model/tokenizer revision drifting from hardcoded special-token ids)
     raises instead of being swallowed into the string-prompt fallback.
+
+    ``allow_tokenizer_fallback`` (default ``False``, i.e. fail fast): a
+    tokenizer load failure normally raises, since silently degrading to the
+    string-prompt form can produce a request that completes with subtly
+    wrong stop tokens instead of surfacing the real problem (missing
+    ``--trust-remote-code``, network/cache issue, etc.). Set ``True`` only
+    for explicit unit tests or a deliberate offline-compat run where the
+    caller has already decided a degraded prompt is acceptable.
     """
     try:
         from transformers import AutoTokenizer
 
         ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
-    except Exception as exc:  # noqa: BLE001 - tokenizer is optional; fall back to string prompt
+    except Exception as exc:  # noqa: BLE001 - re-raised unless the caller opts into the fallback
+        if not allow_tokenizer_fallback:
+            raise
         logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
         ar_tokenizer = None
 
@@ -501,6 +512,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
     )
+    parser.add_argument(
+        "--allow-tokenizer-fallback",
+        action="store_true",
+        help=(
+            "For models with a declared ar_input_builder (e.g. HunyuanImage-3.0): if loading "
+            "the AR tokenizer fails, degrade to the string-prompt form (no BPE parity) instead "
+            "of failing the run. Off by default -- a tokenizer load failure usually means a "
+            "missing --trust-remote-code or a network/cache issue that's worth surfacing, not "
+            "silently masking with a possibly-wrong prompt."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -689,6 +711,7 @@ def main():
             sampling_params_list=sampling_params_list,
             trust_remote_code=args.trust_remote_code,
             validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+            allow_tokenizer_fallback=args.allow_tokenizer_fallback,
         )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
