@@ -15,7 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import numpy as np
@@ -50,8 +50,8 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.experimental.fullduplex.client import (
-    PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
+    summarize_session_request_metrics,
     wait_for,
 )
 from vllm_omni.metrics import definitions as defs
@@ -352,11 +352,13 @@ def get_samples(args, tokenizer):
             "openai-audio-speech",
             "openai-chat-omni",
             "openai-realtime-duplex",
+            "openai-realtime-tts",
         ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
                 "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
-                "--backend openai-realtime-duplex (WebSocket /v1/realtime). "
+                "--backend openai-realtime-duplex or openai-realtime-tts "
+                "(WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
         repo_id = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -454,6 +456,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     stage_id: int | None = None
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
+    duplex_session_metrics: dict[str, object] | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -1272,7 +1275,9 @@ async def async_request_openai_audio_speech(
 def _realtime_websocket_url(api_url: str) -> str:
     parts = urlsplit(api_url)
     scheme = "wss" if parts.scheme == "https" else "ws"
-    return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.setdefault("duplex", "1")
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 async def async_request_openai_realtime_duplex(
@@ -1280,70 +1285,94 @@ async def async_request_openai_realtime_duplex(
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    """Run one Seed-TTS row as one native-duplex Realtime session."""
+    """Run one Seed-TTS row through the explicit Realtime TTS contract."""
     del session
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     output.start_time = time.perf_counter()
-    ref_audio = None
     speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
-    if isinstance(speech_extra, dict):
-        candidate = speech_extra.get("ref_audio")
-        if isinstance(candidate, str):
-            ref_audio = candidate
+    if not isinstance(speech_extra, dict):
+        speech_extra = {}
     session_id = f"seed-tts-{request_func_input.request_id or uuid.uuid4().hex}"
     try:
         async with RealtimeDuplexClient(_realtime_websocket_url(request_func_input.api_url)) as client:
             await client.configure(
                 request_func_input.model_name or request_func_input.model,
                 output_audio_format="pcm16",
-                ref_audio=ref_audio,
                 instructions=getattr(
                     request_func_input,
                     "seed_tts_system_prompt",
                     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
                 ),
-                initial_user_text=request_func_input.prompt,
+                native_duplex=False,
+                auto_response=False,
+                extra_body=speech_extra,
                 session_id=session_id,
                 timeout_s=120.0,
             )
-            # Native duplex requires a committed audio unit to schedule Stage 0.
-            # The target text is already in the session context, so use one
-            # silent unit solely as the model scheduling clock.
-            await client.stream_pcm16(
-                b"\x00\x00" * PCM16_SAMPLE_RATE,
-                chunk_ms=1000,
-                realtime=False,
+            request_started_at_s = time.monotonic()
+            await client.send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": request_func_input.prompt}],
+                    },
+                }
             )
-            committed_at_s = time.monotonic()
-            await client.commit()
+            await client.send({"type": "response.create"})
             await wait_for(
-                lambda: client.events.count("response.done") > 0,
+                lambda: client.events.count("response.done") > 0 or bool(client.events.errors()),
                 timeout_s=180.0,
-                label="Seed-TTS duplex response.done",
+                label="Seed-TTS Realtime TTS response.done",
             )
+            if errors := client.events.errors():
+                raise RuntimeError(f"Seed-TTS Realtime TTS server error: {errors[-1]}")
             request_finished_at = time.perf_counter()
-            response_id = client.events.response_ids[-1] if client.events.response_ids else None
-            if response_id is None:
-                raise RuntimeError("Seed-TTS duplex response omitted response_id")
-            timing = client.events.timing_summary(
-                after_s=committed_at_s,
-                input_committed_at_s=committed_at_s,
-                response_id=response_id,
-            )
-            request_metrics = timing.get("request_metrics")
-            if not isinstance(request_metrics, dict):
-                raise RuntimeError("Seed-TTS duplex response omitted per-request metrics")
-            audio = client.events.audio_bytes(response_id)
-            if not audio:
+            audio_response_ids = [
+                response_id for response_id in client.events.response_ids if client.events.audio_bytes(response_id)
+            ]
+            if not audio_response_ids:
                 raise RuntimeError("Seed-TTS duplex response produced no audio")
+            turn_metrics: list[dict[str, object]] = []
+            turn_timings: list[dict[str, object]] = []
+            measurement_origin = {
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+            }
+            for request_index, response_id in enumerate(audio_response_ids):
+                timing = client.events.timing_summary(
+                    after_s=request_started_at_s,
+                    input_committed_at_s=request_started_at_s,
+                    response_id=response_id,
+                    measurement_origin=measurement_origin,
+                )
+                request_metrics = timing.get("request_metrics")
+                if not isinstance(request_metrics, dict):
+                    raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
+                turn_timings.append(timing)
+                turn_metrics.append(
+                    {
+                        "session_id": session_id,
+                        "request_index": request_index,
+                        "response_id": response_id,
+                        **request_metrics,
+                    }
+                )
+            session_metrics = summarize_session_request_metrics(
+                turn_metrics,
+                session_id=session_id,
+            )
+            audio = client.events.audio_bytes()
             await client.acknowledge_playback()
             await client.close_session(timeout_s=30.0)
 
             transcript = "".join(
                 str(event.get("delta") or "")
                 for event in client.events.events
-                if client.events.response_id(event) == response_id
+                if client.events.response_id(event) in audio_response_ids
                 and event.get("type")
                 in {
                     "response.audio_transcript.delta",
@@ -1352,31 +1381,29 @@ async def async_request_openai_realtime_duplex(
                 }
             )
             output.generated_text = transcript
-            output.ttft = float(request_metrics.get("ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(request_metrics.get("ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(request_metrics.get("rtf") or 0.0)
-            output.audio_duration = float(request_metrics.get("audio_duration_ms") or 0.0) / 1000.0
+            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
+            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
+            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.audio_duration = (
+                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+            )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
             output.tts_output_pcm_bytes = audio
             if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
-                output.duplex_request_metrics = [
-                    {
-                        "session_id": session_id,
-                        "request_index": 0,
-                        "response_id": response_id,
-                        **request_metrics,
-                    }
-                ]
-            stage0 = timing.get("stage0_tokens")
-            if isinstance(stage0, dict):
-                output.output_tokens = int(stage0.get("output_token_count") or 0)
+                output.duplex_request_metrics = turn_metrics
+                output.duplex_session_metrics = session_metrics
+            output.output_tokens = sum(
+                int(stage0.get("output_token_count") or 0)
+                for timing in turn_timings
+                if isinstance((stage0 := timing.get("stage0_tokens")), dict)
+            )
             output.success = True
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
         logger.error(
-            "Seed-TTS native-duplex request failed: %s",
+            "Seed-TTS Realtime TTS request failed: %s",
             output.error,
         )
     if pbar:
@@ -1395,6 +1422,9 @@ if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
 if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
+if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
 
 ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edits_omni
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
@@ -1745,6 +1775,11 @@ async def benchmark(
     duplex_request_metrics = [metric for output in outputs for metric in (output.duplex_request_metrics or [])]
     if duplex_request_metrics:
         result["duplex_request_metrics"] = duplex_request_metrics
+    duplex_session_metrics = [
+        output.duplex_session_metrics for output in outputs if output.duplex_session_metrics is not None
+    ]
+    if duplex_session_metrics:
+        result["duplex_session_metrics"] = duplex_session_metrics
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

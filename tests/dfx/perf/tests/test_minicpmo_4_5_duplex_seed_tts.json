@@ -15,18 +15,18 @@
       "omni"
     ],
     "server_params": {
-      "model": "openbmb/MiniCPM-o-4_5",
+      "model": "/data/models/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
+        "/data/yrr/vllm-omni/vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
         "--trust-remote-code"
       ]
     },
     "benchmark_params": [
       {
         "dataset_name": "seed-tts",
-        "dataset_path": "zhaochenyang20/seed-tts-eval",
-        "backend": "openai-realtime-duplex",
+        "dataset_path": "/data/models/datasets/seed-tts-eval",
+        "backend": "openai-realtime-tts",
         "endpoint": "/v1/realtime",
         "num_prompts": [
           4

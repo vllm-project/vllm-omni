@@ -127,6 +127,34 @@ async def test_realtime_client_configure_sends_seed_tts_text_condition():
     assert session["extra_body"]["duplex_initial_user_text"] == "The quick brown fox."
 
 
+@pytest.mark.asyncio
+async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        native_duplex=False,
+        auto_response=False,
+        extra_body={"ref_audio": "data:audio/wav;base64,AAAA"},
+        timeout_s=1,
+    )
+
+    session_extra_body = client.sent[0]["session"]["extra_body"]
+    assert session_extra_body == {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+        "minicpmo45_native_duplex": False,
+    }
+
+
 def test_realtime_event_collector_partitions_audio_by_response():
     collector = RealtimeEventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})

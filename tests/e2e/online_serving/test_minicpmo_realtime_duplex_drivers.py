@@ -838,6 +838,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
 
     timings = state.response_timing_summaries()
     requests = state.session_request_metrics(session_id="seed-tts-session")
+    session_metrics = state.session_metric_summary(session_id="seed-tts-session")
 
     assert timings["resp-1"]["stage0_tokens"]["output_token_count"] == 3
     assert timings["resp-1"]["audio_output"]["response_created_to_first_audio_ms"] == 100.0
@@ -879,6 +880,13 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             },
         },
     ]
+    assert session_metrics == {
+        "session_id": "seed-tts-session",
+        "audio_turn_count": 2,
+        "mean_ttft_ms": 150.0,
+        "mean_ttfp_ms": 250.0,
+        "mean_rtf": 3.125,
+    }
 
 
 def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():

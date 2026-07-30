@@ -17,7 +17,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-_MODEL = "openbmb/MiniCPM-o-4_5"
+_MODEL = "/data/models/MiniCPM-o-4_5"
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
 _RESULT_DIR = Path(__file__).resolve().parent / "results"
 _MIN_DAILY_OMNI_ACCURACY = 0.64
@@ -83,6 +83,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
             str(_MIN_DAILY_OMNI_ACCURACY),
             "--daily-extra-body-json",
             json.dumps(_CHAT_EXTRA_BODY, separators=(",", ":")),
+            "--trust-remote-code",
         ]
     )
 
@@ -108,6 +109,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             str(_MAX_SEED_TTS_MEAN_WER),
             "--seed-extra-body-json",
             json.dumps(_CHAT_EXTRA_BODY, separators=(",", ":")),
+            "--trust-remote-code",
         ]
     )
 
