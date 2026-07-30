@@ -444,6 +444,70 @@ environment matching upstream/main's vLLM (`v0.26.0`, per
 `docker/Dockerfile.cuda:1`); the available image ships vLLM 0.24.0, which
 lacks `vllm.entrypoints.scale_out` and cannot import `api_server`.
 
+### 2.12 End-to-end bring-up log (2026-07-30)
+
+A live 3-stage duplex server was stood up on vLLM 0.26.0 (GPUs 2-3) and
+driven over `/v1/duplex`. Four defects surfaced that no amount of code
+review or mocked testing had caught.
+
+**Endpoint note.** Qwen3-Omni cannot use `/v1/realtime?duplex=1` the way
+MiniCPM's demo does: that route is already owned by Qwen3-Omni's existing
+half-duplex handler. Duplex must use `/v1/duplex`, which appears to be the
+less-exercised protocol path -- see defect 3.
+
+| # | defect | origin | failure mode |
+|---|--------|--------|--------------|
+| 1 | token geometry 10 vs 13 tokens/s | this port | silent truncation |
+| 2 | Whisper 30 s default padding (3000 vs 100 mel frames) | this port | 230x reservation over-run |
+| 3 | `DuplexFence` not JSON serializable in `runtime_control` | **framework** | session dies at handshake |
+| 4 | `mtp_inputs` demanded on thinker decode | this port | stage-0 engine core crash |
+
+Defect 3 is not Qwen3-Omni specific: any adapter declaring
+`implementation_level="model_native_duplex"` hits it on `/v1/duplex`.
+Defect 4 was latent -- `talker_mtp` is an unconditional method on the
+unified model class, so `has_talker_mtp` was already True for the thinker;
+enabling `has_preprocess` merely opened the path that acts on it.
+
+**What now works, verified against the live server:**
+
+- session handshake on `/v1/duplex`
+- audio append + commit, with the engine creating resumable stage-0 requests
+- **barge-in**: `input.cancel` bumps the epoch and aborts the in-flight
+  stage-0 request. Observed directly in request ids:
+  `...i.0.e.0.r.stage0` -> `...i.0.e.1.r.stage0`
+- **session persistence**: a second turn is served on the same session after
+  the barge-in, which is exactly what the half-duplex path cannot do
+- clean shutdown via `session.close`
+
+**What does not work yet: the model produces no reply.** Both turns end as
+`response.listen` with no text and no audio, and the pipeline logs no error.
+
+The cause is conversation scaffolding, not audio. `plan_append` currently
+builds a prompt of `[scheduler_token_id] * budget` -- 13 placeholder slots
+that stage 0 overwrites with audio embeddings -- and nothing else. There is
+no system prompt, no `<|im_start|>user` / `<|im_end|>` framing, and no
+`<|im_start|>assistant` generation prompt, so the thinker has nothing
+instructing it to respond and emits EOS immediately. The turn then completes
+with no output and the bridge projects `response.listen`
+(`runtime_bridge.py:936-956`).
+
+MiniCPM solves this with `duplex_first_append_context_reserve`
+(`minicpmo45/runtime.py:73`, applied at `:113-114`), which reserves extra
+slots on the first append that stage 0 fills from
+`_prepare_session_context` (`minicpmo45/stage0.py:112-143`).
+
+Remaining work, in order:
+
+1. Reserve context tokens on the first append and a generation-prompt suffix
+   on every turn, in `runtime.duplex_scheduler_token_budget`.
+2. Build those embeddings in `stage0`: render the chat template (reusing the
+   `safe_apply_chat_template` path already established for tools and
+   instructions at `qwen3_omni.py:274-291`), embed it, and splice prefix +
+   audio + suffix.
+3. Keep the reservation arithmetic in exact agreement with what stage 0
+   produces. This invariant has already produced two of the four defects
+   above, and the model runner absorbs violations silently.
+
 ### 2.9 Comparable PRs offer no better template
 
 Checked the three PRs #3745 cites as having hit the same wall:
