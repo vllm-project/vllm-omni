@@ -705,12 +705,12 @@ class LTXI2VConditioningMixin:
             latents=request_inputs.latents,
         )
 
-    def _prepare_denoise_context_for_cfg(
+    def _prepare_denoise_context_for_guidance(
         self,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> LTXDenoiseContext:
-        denoise_ctx = super()._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
+        denoise_ctx = super()._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)
         if denoise_ctx.conditioning_mask is None:
             if self.unified_text_image_entry:
                 return denoise_ctx
@@ -755,9 +755,7 @@ class LTXI2VConditioningMixin:
             video_token_count=video_token_count,
             audio_token_count=audio_token_count,
         )
-        conditioning_mask = (
-            denoise_ctx.conditioning_mask if forward_ctx.cfg_parallel_ready else denoise_ctx.conditioning_mask_for_model
-        )
+        conditioning_mask = denoise_ctx.conditioning_mask_for_model
         if conditioning_mask is None:
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
         kwargs.update(

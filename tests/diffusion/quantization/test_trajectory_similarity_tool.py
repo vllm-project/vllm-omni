@@ -22,6 +22,8 @@ from vllm_omni.quantization.tools.compare_diffusion_trajectory_similarity import
     summarize_output_image_metrics,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def test_compute_tensor_metrics_identical_tensors():
     metrics = compute_tensor_metrics(torch.ones(2, 3), torch.ones(2, 3))

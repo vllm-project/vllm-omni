@@ -471,7 +471,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
+                num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
+                    # A mid-step stop (e.g. spec-decode tokens sampled past
+                    # EOS) trims new_token_ids after the validation slice
+                    # above; re-slice so the emitted logprob rows stay 1:1
+                    # with the emitted tokens, as upstream vLLM does by
+                    # slicing after the trim.
+                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
