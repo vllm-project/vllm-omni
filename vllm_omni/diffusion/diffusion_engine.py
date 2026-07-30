@@ -156,6 +156,10 @@ class DiffusionEngine:
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
 
+    # Class-level default so tests using object.__new__ (without __init__)
+    # don't hit AttributeError when _busy_loop accesses self.dp_concurrent.
+    dp_concurrent: bool = False
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
