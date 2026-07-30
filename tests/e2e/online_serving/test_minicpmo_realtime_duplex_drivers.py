@@ -874,6 +874,39 @@ def test_realtime_duplex_demo_model_policy_accepts_continuous_input_without_comm
     assert state.model_policy_event_order_ok(expected_turns=3, require_input_commit=False)
 
 
+def test_realtime_duplex_demo_distinguishes_late_and_missing_commit():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    response_id = "resp-1"
+    item_id = f"item_{response_id}"
+    for event in (
+        {"type": "session.created"},
+        {"type": "response.created", "response_id": response_id},
+        {"type": "conversation.item.added", "item": {"id": item_id}},
+        {"type": "response.output_item.added", "response_id": response_id},
+        {"type": "response.content_part.added", "response_id": response_id},
+        {"type": "response.speak", "response_id": response_id},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA"},
+        {"type": "response.audio.done", "response_id": response_id},
+        {"type": "response.content_part.done", "response_id": response_id},
+        {"type": "response.output_item.done", "response_id": response_id},
+        {"type": "response.done", "response_id": response_id},
+        {"type": "input_audio_buffer.committed"},
+    ):
+        state.add(event)
+
+    assert not state.event_order_ok(require_input_commit=True)
+    assert state.event_order_ok(
+        require_input_commit=True,
+        require_commit_before_response=False,
+    )
+    state.events.pop()
+    assert not state.event_order_ok(
+        require_input_commit=True,
+        require_commit_before_response=False,
+    )
+
+
 def test_realtime_duplex_demo_accepts_overlap_unit_terminating_continuous_response():
     demo = _load_demo_module()
     state = demo.DemoState()

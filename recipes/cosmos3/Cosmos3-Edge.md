@@ -17,7 +17,9 @@ The small Cosmos3 checkpoint, for constrained deployments. It runs on the shared
 
 - **Transformer**: `Cosmos3EdgeVFMTransformer` (Nemotron-based), auto-selected from
   `backbone_type: cosmos3_edge_nemotron_dense` — nothing to pass.
-- **Defaults** differ; omit `--height` / `--width` to get them:
+- **Defaults** differ. The offline examples auto-detect Edge (from `edge` in the model id /
+  transformer class) and apply the Edge column below, so you can omit `--height` / `--width` /
+  `--guidance-scale` / `--flow-shift` and still get native Edge output:
 
 | | Edge | Nano / Super |
 |---|---|---|
@@ -25,6 +27,10 @@ The small Cosmos3 checkpoint, for constrained deployments. It runs on the shared
 | T2V / I2V | 480×832 | 1280×720 |
 | Video `guidance_scale` | 5.0 | 6.0 |
 | Video `flow_shift` | 3.0 | 10.0 |
+
+> **Important:** these auto-defaults live in the example CLIs
+> (`text_to_video.py` / `image_to_video.py`). Do **not** pass the Nano/Super numbers
+> (720p / `guidance_scale` 6.0 / `flow_shift` 10.0) to Edge — they produce degenerate output.
 
 For the larger checkpoints see [Cosmos3-Nano](./Cosmos3-Nano.md) and [Cosmos3-Super](./Cosmos3-Super.md).
 
