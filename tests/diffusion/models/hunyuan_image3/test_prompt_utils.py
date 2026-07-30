@@ -319,9 +319,7 @@ def test_example_routes_through_shared_seam():
     # build_x_to_text_prompt must route through build_ar_stage_inputs, not
     # re-derive the AR prefill / stop-token logic itself.
     build_x_to_text_prompt_node = next(
-        n
-        for n in ast.walk(seam_tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "build_x_to_text_prompt"
+        n for n in ast.walk(seam_tree) if isinstance(n, ast.FunctionDef) and n.name == "build_x_to_text_prompt"
     )
     called_names = {
         node.func.id
@@ -383,9 +381,7 @@ def test_build_ar_prompt_inputs_string_fallback_without_tokenizer():
 
 def test_build_ar_prompt_inputs_explicit_size_stops_at_terminator():
     """Explicit image_size makes 'recaption' stop at </recaption> only."""
-    ar = build_ar_prompt_inputs(
-        "x", task="t2i", bot_task="recaption", image_size="1024x1024"
-    )
+    ar = build_ar_prompt_inputs("x", task="t2i", bot_task="recaption", image_size="1024x1024")
     assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
 
 

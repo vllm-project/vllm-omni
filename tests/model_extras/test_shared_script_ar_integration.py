@@ -161,7 +161,7 @@ def test_apply_ar_stage_inputs_routes_through_real_registry(
         ("_shared_text_to_image_trc", "examples/offline_inference/text_to_image/text_to_image.py", True),
     ],
 )
-def test_apply_ar_stage_inputs_respects_trust_remote_code_optin(
+def test_apply_ar_stage_inputs_respects_trust_remote_code_option(
     monkeypatch: pytest.MonkeyPatch, module_name: str, relpath: str, cli_flag: bool
 ) -> None:
     """The tokenizer load must use the caller's resolved --trust-remote-code
@@ -305,7 +305,7 @@ def test_apply_ar_stage_inputs_tokenizer_load_failure_raises_by_default(
         ("_shared_image_edit_fallback", "examples/offline_inference/image_to_image/image_edit.py"),
     ],
 )
-def test_apply_ar_stage_inputs_allow_tokenizer_fallback_optin(
+def test_apply_ar_stage_inputs_allow_tokenizer_fallback_option(
     monkeypatch: pytest.MonkeyPatch, module_name: str, relpath: str
 ) -> None:
     """With allow_tokenizer_fallback=True (the CLI's --allow-tokenizer-fallback),

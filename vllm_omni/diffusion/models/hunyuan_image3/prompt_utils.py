@@ -101,6 +101,7 @@ def validate_special_token_ids(tokenizer: Any) -> None:
             "table in prompt_utils.py to match."
         )
 
+
 # bot_task -> (sys_type, trigger_tag).
 # ``vanilla`` is special-cased downstream: it bypasses the chat template
 # (no ``User:`` / ``Assistant:`` framing) and is only valid with

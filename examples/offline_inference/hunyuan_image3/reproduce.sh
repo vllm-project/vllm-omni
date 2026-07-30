@@ -17,7 +17,7 @@ set -euo pipefail
 # HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS assumes a specific tokenizer.json; if the
 # repo's tokenizer ever changes, validate_special_token_ids() (wired into
 # the shared scripts via get_ar_tokenizer_validator) fails loudly instead of
-# silently mis-tokenizing. Revision pinning would need `revision` support
+# silently producing wrong tokenization. Revision pinning would need `revision` support
 # added to Omni's engine args first -- tracked as a follow-up, not in scope
 # for this migration.
 export MODEL="${MODEL:-tencent/HunyuanImage-3.0-Instruct}"
