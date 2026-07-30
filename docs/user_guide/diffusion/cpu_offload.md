@@ -54,6 +54,10 @@ higher-priority strategy is selected.
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | — | yes | — | `layers`, customized modules |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
 
+LingBot's optional Refiner is a second DiT. When it is enabled at startup,
+model-level offload keeps Base and Refiner mutually exclusive on the GPU, while
+layerwise offload discovers both `blocks` stacks through the multi-DiT contract.
+
 Model-level support requires discoverable DiT and encoder components.
 Layerwise support requires transformer block topology. Distributed support
 reuses that topology but still requires validation for the model, checkpoint,
