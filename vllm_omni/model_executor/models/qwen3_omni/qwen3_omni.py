@@ -158,6 +158,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             # payload. Mirrors minicpmo_4_5_omni.py:140.
             self.has_preprocess = True
             self.set_custom_preprocess(self.thinker_duplex_preprocess)
+            # `talker_mtp` is an unconditional method on this class, so
+            # `GPUModelRunner._init_talker_mtp` would set has_talker_mtp=True
+            # even for the thinker. That was inert while the thinker had no
+            # preprocess hook, but the custom-preprocess path then requires
+            # every decode step to return `mtp_inputs`
+            # (gpu_model_runner.py:1787-1788) -- a talker-only contract the
+            # thinker cannot satisfy, producing KeyError: 'mtp_inputs'.
+            # Multi-token prediction belongs to the talker stage; shadow the
+            # method so this stage does not advertise it.
+            self.talker_mtp = None
             self.tts_tokens = torch.tensor(
                 [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
                 device=self._module_device(self.thinker),
