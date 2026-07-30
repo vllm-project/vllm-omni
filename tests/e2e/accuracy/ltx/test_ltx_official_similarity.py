@@ -6,8 +6,8 @@
 The original reduced one-stage guards remain unchanged. Additional cases cover
 text-to-video and image-to-video for one-stage, full-distilled two-stage,
 ordinary two-stage with resident weights matching official fused arithmetic,
-and dedicated dynamic-LoRA two-stage variants. Select an individual case with
-its pytest parameter node ID. Both runtimes use PyTorch SDPA.
+and dedicated dynamic and layer-fused two-stage variants. Select an individual
+case with its pytest parameter node ID. Both runtimes use PyTorch SDPA.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ class LTXAccuracyCase:
     image: LTXArtifact | None = None
     spatial_upsampler: LTXArtifact | None = None
     distilled_lora: LTXArtifact | None = None
-    two_stage_lora_mode: Literal["dynamic", "resident"] | None = None
+    two_stage_lora_mode: Literal["dynamic", "layer_fused", "resident"] | None = None
 
 
 LTX2_REVISION = "47da56e2ad66ce4125a9922b4a8826bf407f9d0a"
@@ -418,9 +418,31 @@ _DYNAMIC_LORA_TWO_STAGE_CASES = (
 )
 
 
+def _layer_fused_case(base_name: str) -> LTXAccuracyCase:
+    base_case = next(case for case in _DEFAULT_CONFIG_CASES if case.name == base_name)
+    return replace(
+        base_case,
+        name=f"{base_case.name}_layer_fused",
+        two_stage_lora_mode="layer_fused",
+        thresholds=LTXAccuracyThresholds(
+            video_ssim_mean=0.95,
+            video_ssim_min=0.90,
+            video_psnr_mean_db=30.0,
+            audio_relative_l2=0.20,
+            audio_cosine_similarity=0.95,
+        ),
+    )
+
+
+_LAYER_FUSED_TWO_STAGE_CASES = (
+    _layer_fused_case("ltx2_two_stage"),
+    _layer_fused_case("ltx23_two_stage"),
+)
+
+
 DEFAULT_CONFIG_CASES = tuple(
     replace(case, name=f"{case.name}_{task}", image=I2V_IMAGE if task == "i2v" else None)
-    for case in (*_DEFAULT_CONFIG_CASES, *_DYNAMIC_LORA_TWO_STAGE_CASES)
+    for case in (*_DEFAULT_CONFIG_CASES, *_DYNAMIC_LORA_TWO_STAGE_CASES, *_LAYER_FUSED_TWO_STAGE_CASES)
     for task in ("t2v", "i2v")
 )
 

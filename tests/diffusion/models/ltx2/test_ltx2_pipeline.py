@@ -1351,6 +1351,9 @@ def test_ltx_phase_weight_factory_selects_resident_mode(monkeypatch):
 @pytest.mark.parametrize("mode", [None, " DyNaMiC "])
 def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
     pipeline = _make_phase_weight_factory_pipeline()
+    # Dynamic LoRA delegates the base projection to its original quant method,
+    # then adds the low-rank activation-space residual.
+    pipeline.od_config.quantization_config = object()
     manifest = object()
     installed = []
 
@@ -1366,10 +1369,11 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
     )
 
     class DynamicRuntime:
-        def __init__(self, transformer, parsed_manifest, *, dtype):
+        def __init__(self, transformer, parsed_manifest, *, dtype, execution_mode):
             assert transformer is pipeline.transformer
             assert parsed_manifest is manifest
             assert dtype is torch.float32
+            assert execution_mode == "dynamic"
 
         def install_structure(self):
             installed.append(True)
@@ -1380,6 +1384,61 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
 
     assert isinstance(runtime, DynamicRuntime)
     assert installed == [True]
+
+
+def test_ltx_phase_weight_factory_selects_layer_fused_mode(monkeypatch):
+    pipeline = _make_phase_weight_factory_pipeline()
+    pipeline.od_config.dtype = torch.bfloat16
+    pipeline.od_config.quantization_config = None
+    manifest = object()
+    installed = []
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " LaYeR_FuSeD ")
+    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
+    monkeypatch.setattr(
+        ltx2_phase_weights,
+        "LTXAdapterParser",
+        lambda transformer: SimpleNamespace(parse=lambda path, name: manifest),
+    )
+
+    class LayerFusedRuntime:
+        def __init__(self, transformer, parsed_manifest, *, dtype, execution_mode):
+            assert transformer is pipeline.transformer
+            assert parsed_manifest is manifest
+            assert dtype is torch.bfloat16
+            assert execution_mode == "layer_fused"
+
+        def install_structure(self):
+            installed.append(True)
+
+    monkeypatch.setattr(ltx2_phase_weights, "LTXPhaseAdapterRuntime", LayerFusedRuntime)
+
+    runtime = ltx2_phase_weights.build_ltx_phase_weights(pipeline)
+
+    assert isinstance(runtime, LayerFusedRuntime)
+    assert installed == [True]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "quantization_config", "error"),
+    [
+        (torch.float16, None, "bfloat16"),
+        (torch.bfloat16, object(), "unquantized"),
+    ],
+)
+def test_ltx_phase_weight_factory_rejects_unsupported_layer_fused_config(
+    monkeypatch,
+    dtype,
+    quantization_config,
+    error,
+):
+    pipeline = _make_phase_weight_factory_pipeline()
+    pipeline.od_config.dtype = dtype
+    pipeline.od_config.quantization_config = quantization_config
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "layer_fused")
+    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
+
+    with pytest.raises(ValueError, match=error):
+        ltx2_phase_weights.build_ltx_phase_weights(pipeline)
 
 
 def test_ltx_phase_weight_factory_rejects_invalid_environment_mode(monkeypatch):
@@ -1502,6 +1561,252 @@ def test_ltx_phase_adapter_keeps_one_transformer_and_switches_a_fixed_slot(tmp_p
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[1.0, 1.0]]))
     runtime.activate("ltx_distilled")
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[10.0, 13.0]]))
+
+
+def test_ltx_layer_fused_adapter_matches_official_bf16_weight_fusion():
+    layer = torch.nn.Linear(4, 3, bias=True, dtype=torch.bfloat16)
+    base_weight = torch.tensor(
+        [
+            [0.5, -0.25, 0.125, 0.75],
+            [-0.375, 0.625, 0.25, -0.5],
+            [0.875, -0.125, -0.75, 0.375],
+        ],
+        dtype=torch.bfloat16,
+    )
+    lora_a = torch.tensor(
+        [
+            [0.1015625, -0.203125, 0.3046875, -0.40625],
+            [0.5078125, -0.609375, 0.7109375, -0.8125],
+        ],
+        dtype=torch.bfloat16,
+    )
+    lora_b = torch.tensor(
+        [
+            [0.9140625, -0.1171875],
+            [-0.21875, 0.3203125],
+            [0.421875, -0.5234375],
+        ],
+        dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        layer.weight.copy_(base_weight)
+        layer.bias.copy_(torch.tensor([0.125, -0.25, 0.5], dtype=torch.bfloat16))
+    target = AdapterTarget(
+        source_module="proj",
+        module="proj",
+        slice=None,
+        rank=2,
+        a_source=AdapterTensorSource(path="unused", key="a", shape=tuple(lora_a.shape)),
+        b_source=AdapterTensorSource(path="unused", key="b", shape=tuple(lora_b.shape)),
+    )
+    wrapper = ltx2_phase_adapter._PhaseAdapterLinear(
+        layer,
+        [target],
+        adapter_name="ltx_distilled",
+        adapter_dtype=torch.bfloat16,
+        execution_mode="layer_fused",
+    )
+    wrapper.load_target(target, lora_a, lora_b)
+    wrapper.set_active("ltx_distilled")
+
+    expected_weight = torch.matmul(lora_b, lora_a)
+    expected_weight.add_(base_weight)
+    x = torch.tensor(
+        [[0.6015625, -0.703125, 0.8046875, -0.90625]],
+        dtype=torch.bfloat16,
+    )
+    expected = torch.nn.functional.linear(x, expected_weight, layer.bias)
+    actual = wrapper(x)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(layer.weight, base_weight)
+
+
+def test_ltx_layer_fused_row_parallel_uses_one_collective(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class FakeRow(torch.nn.Module):
+        input_size = 4
+        output_size = 2
+        input_size_per_partition = 2
+        input_is_parallel = True
+        tp_rank = 0
+        tp_size = 2
+        reduce_results = True
+        skip_bias_add = False
+        return_bias = False
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.bfloat16))
+            self.bias = torch.nn.Parameter(torch.tensor([0.25, -0.5], dtype=torch.bfloat16))
+            self.quant_method = UnquantizedLinearMethod()
+
+    monkeypatch.setattr(ltx2_phase_adapter, "RowParallelLinear", FakeRow)
+    reductions = []
+
+    def all_reduce(value):
+        reductions.append(value.clone())
+        return value + 1
+
+    monkeypatch.setattr(ltx2_phase_adapter, "tensor_model_parallel_all_reduce", all_reduce)
+    layer = FakeRow()
+    lora_a = torch.tensor([[0.5, -0.25, 0.75, -0.125]], dtype=torch.bfloat16)
+    lora_b = torch.tensor([[0.25], [-0.5]], dtype=torch.bfloat16)
+    target = AdapterTarget(
+        source_module="proj",
+        module="proj",
+        slice=None,
+        rank=1,
+        a_source=AdapterTensorSource(path="unused", key="a", shape=tuple(lora_a.shape)),
+        b_source=AdapterTensorSource(path="unused", key="b", shape=tuple(lora_b.shape)),
+    )
+    wrapper = ltx2_phase_adapter._PhaseAdapterLinear(
+        layer,
+        [target],
+        adapter_name="ltx_distilled",
+        adapter_dtype=torch.bfloat16,
+        execution_mode="layer_fused",
+    )
+    wrapper.load_target(target, lora_a, lora_b)
+    wrapper.set_active("ltx_distilled")
+
+    local_a = lora_a[:, :2]
+    expected_weight = torch.matmul(lora_b, local_a)
+    expected_weight.add_(layer.weight)
+    x = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    expected_local = torch.nn.functional.linear(x, expected_weight, layer.bias)
+
+    actual = wrapper(x)
+
+    assert len(reductions) == 1
+    assert torch.equal(reductions[0], expected_local)
+    assert torch.equal(actual, expected_local + 1)
+
+
+def test_ltx_layer_fused_column_parallel_uses_local_weight_shard(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class FakeColumn(torch.nn.Module):
+        input_size = 3
+        output_size = 4
+        output_size_per_partition = 2
+        tp_rank = 1
+        tp_size = 2
+        gather_output = False
+        skip_bias_add = False
+        return_bias = False
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor(
+                    [[0.5, -0.25, 0.125], [-0.375, 0.625, 0.25]],
+                    dtype=torch.bfloat16,
+                )
+            )
+            self.bias = torch.nn.Parameter(torch.tensor([0.25, -0.5], dtype=torch.bfloat16))
+            self.quant_method = UnquantizedLinearMethod()
+
+    monkeypatch.setattr(ltx2_phase_adapter, "ColumnParallelLinear", FakeColumn)
+    layer = FakeColumn()
+    base_weight = layer.weight.detach().clone()
+    lora_a = torch.tensor([[0.5, -0.25, 0.75]], dtype=torch.bfloat16)
+    lora_b = torch.tensor([[0.25], [-0.5], [0.75], [-1.0]], dtype=torch.bfloat16)
+    target = AdapterTarget(
+        source_module="proj",
+        module="proj",
+        slice=None,
+        rank=1,
+        a_source=AdapterTensorSource(path="unused", key="a", shape=tuple(lora_a.shape)),
+        b_source=AdapterTensorSource(path="unused", key="b", shape=tuple(lora_b.shape)),
+    )
+    wrapper = ltx2_phase_adapter._PhaseAdapterLinear(
+        layer,
+        [target],
+        adapter_name="ltx_distilled",
+        adapter_dtype=torch.bfloat16,
+        execution_mode="layer_fused",
+    )
+    wrapper.load_target(target, lora_a, lora_b)
+    wrapper.set_active("ltx_distilled")
+
+    expected_weight = torch.matmul(lora_b[2:], lora_a)
+    expected_weight.add_(base_weight)
+    x = torch.tensor([[1.0, -0.5, 0.25]], dtype=torch.bfloat16)
+    expected = torch.nn.functional.linear(x, expected_weight, layer.bias)
+
+    actual = wrapper(x)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(layer.weight, base_weight)
+
+
+def test_ltx_layer_fused_packed_qkv_updates_only_the_target_slice(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class FakeColumn(torch.nn.Module):
+        pass
+
+    class FakeQKV(FakeColumn):
+        input_size = 4
+        head_size = 2
+        v_head_size = 2
+        total_num_heads = 2
+        total_num_kv_heads = 2
+        num_heads = 1
+        num_kv_heads = 1
+        num_kv_head_replicas = 1
+        tp_rank = 1
+        tp_size = 2
+        gather_output = False
+        skip_bias_add = True
+        return_bias = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16) / 16
+            )
+            self.bias = torch.nn.Parameter(torch.arange(6, dtype=torch.float32).to(torch.bfloat16) / 8)
+            self.quant_method = UnquantizedLinearMethod()
+
+    monkeypatch.setattr(ltx2_phase_adapter, "ColumnParallelLinear", FakeColumn)
+    monkeypatch.setattr(ltx2_phase_adapter, "QKVParallelLinear", FakeQKV)
+    layer = FakeQKV()
+    base_weight = layer.weight.detach().clone()
+    lora_a = torch.tensor([[0.5, -0.25, 0.75, -0.125]], dtype=torch.bfloat16)
+    lora_b = torch.tensor([[0.25], [-0.5], [0.75], [-1.0]], dtype=torch.bfloat16)
+    target = AdapterTarget(
+        source_module="to_k",
+        module="to_qkv",
+        slice="k",
+        rank=1,
+        a_source=AdapterTensorSource(path="unused", key="a", shape=tuple(lora_a.shape)),
+        b_source=AdapterTensorSource(path="unused", key="b", shape=tuple(lora_b.shape)),
+    )
+    wrapper = ltx2_phase_adapter._PhaseAdapterLinear(
+        layer,
+        [target],
+        adapter_name="ltx_distilled",
+        adapter_dtype=torch.bfloat16,
+        execution_mode="layer_fused",
+    )
+    wrapper.load_target(target, lora_a, lora_b)
+    wrapper.set_active("ltx_distilled")
+
+    expected_weight = base_weight.clone()
+    expected_k = torch.matmul(lora_b[2:], lora_a)
+    expected_k.add_(base_weight[2:4])
+    expected_weight[2:4].copy_(expected_k)
+    x = torch.tensor([[1.0, -0.5, 0.25, -0.125]], dtype=torch.bfloat16)
+    expected_output = torch.nn.functional.linear(x, expected_weight)
+
+    actual_output, returned_bias = wrapper(x)
+
+    assert torch.equal(actual_output, expected_output)
+    assert returned_bias is layer.bias
+    assert torch.equal(layer.weight, base_weight)
 
 
 @pytest.mark.parametrize(

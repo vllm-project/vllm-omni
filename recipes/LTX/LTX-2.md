@@ -70,7 +70,7 @@ feature.
 | Layerwise CPU offload | ✅ | ✅ | ✅ |
 | VAE patch parallel decode | ✅ | ✅ | ✅ |
 | Quantization | ⚠️ | ⚠️ | ⚠️ |
-| Internal distilled LoRA | — | ✅ dynamic/resident | — merged weights |
+| Internal distilled LoRA | — | ✅ dynamic/layer-fused/resident | — merged weights |
 | Cache-DiT | ✅ | ❌ | ❌ |
 | TeaCache | ❌ | ❌ | ❌ |
 | Step execution | ❌ | ❌ | ❌ |
@@ -84,9 +84,11 @@ explicitly unsupported; — not applicable.
 - CFG parallel supports only a two-branch CFG plan. Disable STG and modality
   guidance and set both rescale fields to `0.0`.
 - Quantization support depends on the checkpoint format and LoRA strategy.
-  Dynamic phase LoRA can reuse an online-quantized base. Resident phase LoRA
-  requires an unquantized checkpoint so the adapter can be merged before
+  Dynamic phase LoRA delegates the base projection to its configured quant
+  method and adds the low-rank residual separately. Resident phase LoRA
+  requires dense source weights so the adapter can be merged before optional
   online quantization; serialized quantized checkpoints are rejected.
+  Layer-fused phase LoRA requires an unquantized BF16 checkpoint.
 - Cache-DiT is deliberately limited to `LTX2Pipeline`. Multi-stage entries
   need phase-aware cache enable/refresh across different denoise schedules and,
   in resident mode, different Transformer instances. They fail at startup when
@@ -159,10 +161,15 @@ Ordinary two-stage defaults to a `1536 × 1024` final output. Stage 1 uses the
 selected one-stage recipe at half resolution; Stage 2 uses the fixed
 three-step positive-only schedule. All two-stage pipelines reject custom sigma
 schedules and request-provided video/audio latents. Ordinary two-stage uses one
-DiT with a dynamic Stage 2 LoRA by default. Set
+DiT with a dynamic Stage 2 LoRA by default; it evaluates
+`base(x) + lora_b(lora_a(x))` and therefore also works with a quantized base.
+Set
+`VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE=layer_fused` to materialize each affected
+BF16 weight only for its Stage 2 layer forward, matching official weight-space
+fusion without keeping a second DiT. Set
 `VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE=resident` before startup to create a second
-DiT with the Stage 2 LoRA pre-merged; this resident override requires an
-unquantized base checkpoint.
+DiT with the Stage 2 LoRA pre-merged. Unsupported mode, dtype, quantization,
+and checkpoint-format combinations fail during pipeline initialization.
 
 ## Serving
 
@@ -428,9 +435,9 @@ bundled offline CLI do not currently expose `sigmas`.
   request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
   `tests/dfx/perf/scripts/run_diffusion_benchmark.py`.
-- Ordinary two-stage keeps one base DiT plus the Stage 2 LoRA by default. The
-  `resident` override keeps two Transformer copies and should be sized
-  accordingly.
+- Ordinary two-stage keeps one base DiT plus the Stage 2 LoRA by default.
+  `layer_fused` keeps one DiT and creates only a layer-local fused weight;
+  `resident` keeps two Transformer copies and should be sized accordingly.
 
 ## References
 

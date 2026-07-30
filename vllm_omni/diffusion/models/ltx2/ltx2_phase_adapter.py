@@ -18,9 +18,22 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.distributed import tensor_model_parallel_all_reduce
+import vllm.envs as envs
+from vllm.distributed import (
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.platforms import current_platform
 
 from .ltx2_adapter_parser import AdapterManifest, AdapterTarget, iter_adapter_tensors
 
@@ -180,6 +193,64 @@ class _AdapterPiece(nn.Module):
             delta = tensor_model_parallel_all_reduce(delta)
         return delta
 
+    def weight_delta(self) -> torch.Tensor:
+        """Materialize the rank-local BF16 weight delta used by official fusion."""
+        if self.lora_a.numel() == 0 or self.lora_b.numel() == 0:
+            raise RuntimeError(f"LTX phase adapter target {self.target.module!r} was not materialized.")
+        return torch.matmul(self.lora_b, self.lora_a)
+
+
+def _apply_unquantized_gemm_with_weight(
+    layer: nn.Module,
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+        return linear_batch_invariant(input_, weight, bias)
+    return dispatch_unquantized_gemm()(layer, input_, weight, bias)
+
+
+def _forward_with_weight(
+    layer: nn.Module,
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Run an unquantized base layer with an ephemeral fused weight."""
+    if isinstance(layer, nn.Linear):
+        return F.linear(input_, weight, layer.bias)
+
+    quant_method = getattr(layer, "quant_method", None)
+    if not isinstance(quant_method, UnquantizedLinearMethod):
+        raise ValueError("LTX layer-fused phase LoRA requires unquantized Transformer linears.")
+
+    if isinstance(layer, RowParallelLinear):
+        if layer.input_is_parallel:
+            input_parallel = input_
+        else:
+            input_parallel = split_tensor_along_last_dim(input_, num_partitions=layer.tp_size)[
+                layer.tp_rank
+            ].contiguous()
+        bias = None if layer.tp_rank > 0 or layer.skip_bias_add else layer.bias
+        output_parallel = _apply_unquantized_gemm_with_weight(layer, input_parallel, weight, bias)
+        if layer.reduce_results and layer.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+    elif isinstance(layer, ColumnParallelLinear):
+        bias = layer.bias if not layer.skip_bias_add else None
+        output_parallel = _apply_unquantized_gemm_with_weight(layer, input_, weight, bias)
+        if layer.gather_output and layer.tp_size > 1:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+    else:
+        raise TypeError(f"Unsupported LTX layer-fused linear type {type(layer).__name__}.")
+
+    if not layer.return_bias:
+        return output
+    return output, layer.bias if layer.skip_bias_add else None
+
 
 class _PhaseAdapterLinear(nn.Module):
     """Delegate the base linear unchanged and add an enabled adapter slot."""
@@ -191,10 +262,19 @@ class _PhaseAdapterLinear(nn.Module):
         *,
         adapter_name: str,
         adapter_dtype: torch.dtype,
+        execution_mode: str = "dynamic",
     ) -> None:
         super().__init__()
         self.base_layer = base_layer
         self.adapter_dtype = adapter_dtype
+        if execution_mode not in {"dynamic", "layer_fused"}:
+            raise ValueError(f"Unsupported LTX phase adapter execution mode {execution_mode!r}.")
+        if execution_mode == "layer_fused" and not (
+            isinstance(base_layer, nn.Linear)
+            or isinstance(getattr(base_layer, "quant_method", None), UnquantizedLinearMethod)
+        ):
+            raise ValueError("LTX layer-fused phase LoRA requires unquantized Transformer linears.")
+        self.execution_mode = execution_mode
         pieces = [_AdapterPiece(target, _build_layout(base_layer, target)) for target in targets]
         self.adapters = nn.ModuleDict({adapter_name: nn.ModuleList(pieces)})
         self._pieces_by_target = {piece.target: piece for piece in pieces}
@@ -224,10 +304,32 @@ class _PhaseAdapterLinear(nn.Module):
             output[..., start : start + piece.layout.b_output_size].add_(delta)
         return output
 
+    @torch.no_grad()
+    def _fused_weight(self, adapter_name: str) -> torch.Tensor:
+        base_weight = self.base_layer.weight
+        fused_weight = base_weight.clone()
+        for piece in self.adapters[adapter_name]:
+            start = piece.layout.output_start
+            base_slice = base_weight.narrow(0, start, piece.layout.b_output_size)
+            delta = piece.weight_delta()
+            if delta.shape != base_slice.shape:
+                raise ValueError(
+                    f"LTX layer-fused delta shape {tuple(delta.shape)} does not match base weight slice "
+                    f"{tuple(base_slice.shape)} for {piece.target.module!r}."
+                )
+            # Match official fusion exactly: materialize B@A in the adapter
+            # dtype, then add the base tensor in-place before the main GEMM.
+            delta.add_(base_slice)
+            fused_weight.narrow(0, start, piece.layout.b_output_size).copy_(delta)
+        return fused_weight
+
     def forward(self, input_: torch.Tensor):
+        adapter_name = self._active_adapter
+        if adapter_name is None:
+            return self.base_layer(input_)
+        if self.execution_mode == "layer_fused":
+            return _forward_with_weight(self.base_layer, input_, self._fused_weight(adapter_name))
         output = self.base_layer(input_)
-        if self._active_adapter is None:
-            return output
         if isinstance(output, tuple):
             return (self._add_adapter_delta(input_, output[0]), *output[1:])
         return self._add_adapter_delta(input_, output)
@@ -236,10 +338,18 @@ class _PhaseAdapterLinear(nn.Module):
 class LTXPhaseAdapterRuntime:
     """Install and operate one fixed phase adapter on an existing transformer."""
 
-    def __init__(self, transformer: nn.Module, manifest: AdapterManifest, *, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        transformer: nn.Module,
+        manifest: AdapterManifest,
+        *,
+        dtype: torch.dtype,
+        execution_mode: str = "dynamic",
+    ) -> None:
         self.transformer = transformer
         self.manifest = manifest
         self.dtype = dtype
+        self.execution_mode = execution_mode
         self._wrappers: dict[str, _PhaseAdapterLinear] = {}
         self._target_names: tuple[str, ...] = ()
         self._installed = False
@@ -260,6 +370,7 @@ class LTXPhaseAdapterRuntime:
                 targets,
                 adapter_name=self.manifest.name,
                 adapter_dtype=self.dtype,
+                execution_mode=self.execution_mode,
             )
             parent_name, _, child_name = name.rpartition(".")
             parent = self.transformer.get_submodule(parent_name) if parent_name else self.transformer
@@ -273,7 +384,12 @@ class LTXPhaseAdapterRuntime:
         # adaptation local to that loader rather than changing AutoWeightsLoader.
         self.transformer._phase_adapter_parameter_name = self.base_parameter_name
         self._installed = True
-        logger.info("Installed %d LTX phase-adapter linears for slot %s", len(self._wrappers), self.manifest.name)
+        logger.info(
+            "Installed %d LTX %s phase-adapter linears for slot %s",
+            len(self._wrappers),
+            self.execution_mode,
+            self.manifest.name,
+        )
 
     def base_parameter_name(self, name: str) -> str:
         for target_name in self._target_names:

@@ -24,7 +24,7 @@ _LTX_TWO_STAGE_LORA_MODE_ENV = "VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE"
 
 
 class LTXPhaseWeights(Protocol):
-    """Common lifecycle for resident and dynamic phase-specific weights."""
+    """Common lifecycle for phase-specific Transformer weight strategies."""
 
     @property
     def transformer(self) -> nn.Module: ...
@@ -83,8 +83,10 @@ def _uses_serialized_quantization(quant_config: Any) -> bool:
 
 def _resolve_two_stage_lora_mode() -> str:
     mode = os.getenv(_LTX_TWO_STAGE_LORA_MODE_ENV, "dynamic").strip().lower()
-    if mode not in {"resident", "dynamic"}:
-        raise ValueError(f"{_LTX_TWO_STAGE_LORA_MODE_ENV} must be either 'resident' or 'dynamic', got {mode!r}.")
+    if mode not in {"resident", "dynamic", "layer_fused"}:
+        raise ValueError(
+            f"{_LTX_TWO_STAGE_LORA_MODE_ENV} must be 'resident', 'dynamic', or 'layer_fused', got {mode!r}."
+        )
     return mode
 
 
@@ -229,8 +231,18 @@ def build_ltx_phase_weights(pipeline: Any) -> LTXPhaseWeights | None:
 
     if mode == "resident":
         return LTXResidentLoRAController(pipeline, adapter_path)
+    if mode == "layer_fused":
+        if getattr(pipeline.od_config, "quantization_config", None) is not None:
+            raise ValueError("LTX layer-fused phase LoRA requires an unquantized base checkpoint.")
+        if pipeline.od_config.dtype is not torch.bfloat16:
+            raise ValueError("LTX layer-fused phase LoRA requires a bfloat16 pipeline dtype.")
 
     manifest = LTXAdapterParser(pipeline.transformer).parse(adapter_path, name="ltx_distilled")
-    runtime = LTXPhaseAdapterRuntime(pipeline.transformer, manifest, dtype=pipeline.od_config.dtype)
+    runtime = LTXPhaseAdapterRuntime(
+        pipeline.transformer,
+        manifest,
+        dtype=pipeline.od_config.dtype,
+        execution_mode=mode,
+    )
     runtime.install_structure()
     return runtime
