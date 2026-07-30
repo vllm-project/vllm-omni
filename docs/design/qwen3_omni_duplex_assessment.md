@@ -18,13 +18,17 @@ serving layers port cleanly; the worker-side audio ingress does not, and that
 is the binding constraint. It does *not* need the scheduler work the RFC
 implies.**
 
-> **Update (2026-07-29, after implementing the engine/serving layers on
+> **Update 1 (2026-07-29, after implementing the engine/serving layers on
 > `feat/qwen3-omni-fullduplex`):** two further blockers were found that are
-> not visible from reading the adapter contracts alone. They are the reason
-> the port cannot be completed as an adapter-only change. See §2.10. The
-> engine-side and serving-side layers are now implemented and pass the
-> framework's own duck-type gates; the worker-side stage-0 audio embedding
-> path is unimplemented and raises.
+> not visible from reading the adapter contracts alone. See §2.10.
+>
+> **Update 2 (2026-07-30, after implementing stage-0 audio ingress):** both
+> §2.10 blockers are now **resolved**, and one of them turned out to be much
+> smaller than this document originally claimed. See §2.11. Current state:
+> engine, serving and worker-side audio ingress are all implemented; the
+> audio tower has been driven with real checkpoint weights on a GPU and
+> produces exactly the reserved embedding count. What remains unvalidated is
+> the full 3-stage duplex serving path.
 
 Three things drive this verdict:
 
@@ -377,6 +381,68 @@ pooling ratio → embeddings per chunk) must be derived from the checkpoint.
 placeholder**, and it is load-bearing: the engine reserves scheduler slots
 from it and the worker must produce exactly that many embeddings, or the model
 runner truncates/pads with no error.
+
+### 2.11 Resolution of §2.10 (2026-07-30)
+
+Both blockers are closed. One was real but small; the other was overstated in
+§2.10 and is worth correcting explicitly.
+
+**Blocker (a) — no thinker `preprocess` hook: real, and fixed.**
+`qwen3_omni.py` now sets `has_preprocess = True` on the thinker stage and
+registers `thinker_duplex_preprocess` via `set_custom_preprocess`. This is
+behaviour-neutral for ordinary serving: the thinker is a multimodal stage
+(`requires_multimodal_data=True`, `pipeline.py:57`), so the runner already
+routed it through `inputs_embeds` (`gpu_model_runner.py:1569`) rather than
+the token-id fast path. `has_preprocess` only adds the dispatch at
+`gpu_model_runner.py:1685`, and the hook returns the ordinary embeddings
+when no duplex payload is present.
+
+**Blocker (b) — "no incremental audio encode": substantially overstated.**
+§2.10 assumed Qwen3-Omni needs MiniCPM-style encoder-state carryover. It does
+not. `Qwen3OmniMoeAudioEncoder.forward` already splits its conv input into
+`n_window * 2 == 100` mel-frame chunks and runs the conv stack on each
+independently. At `hop_length=160` / 16 kHz that is exactly 1.0 s. So a 1 s
+duplex chunk lands on the model's own conv boundary and per-chunk encoding
+carries **no convolutional boundary error at all** — the sliding-window
+scheme §2.10 called for is unnecessary.
+
+The residual approximation is at the *attention* level only: the tower's
+attention spans up to `n_window_infer // (n_window * 2) == 8` chunks, so
+encoding one chunk at a time is not bit-identical to encoding 8 s at once.
+That is a real but bounded inaccuracy, and it is not corrected.
+
+**The token geometry was the actual hazard, and it was wrong.** The original
+`SAMPLES_PER_AUDIO_TOKEN = 1600` placeholder implied 10 tokens/s; the model
+produces **13**. Two independent ways to get this wrong were found and fixed:
+
+1. The linear ratio itself (10 vs 13 — a 30% under-reservation).
+2. Whisper's feature extractor pads to its 30 s `n_samples` by default,
+   yielding **3000** mel frames for a 1 s chunk instead of 100 — a 230×
+   over-run of the reservation. `stage0._encode_chunk` passes
+   `padding="longest", truncation=False`.
+
+Both are silent failures: the model runner absorbs an embedding/reservation
+mismatch by truncating or padding without raising. `_encode_chunk` now
+asserts the counts agree.
+
+**What was actually executed** (see commit `bc9648e8`):
+
+- Real checkpoint weights on a GPU: 525 `thinker.audio_tower` tensors loaded
+  from Qwen3-Omni-30B-A3B-Instruct; 1 s of audio → mel `(128, 100)` → tower →
+  `(13, 2048)` bf16, rows equal to the reservation, all finite.
+- Real feature extractor with a stubbed tower: chunk accumulation, 3 s → 39
+  embeddings via 3 per-chunk calls, `(epoch, seq)` replay memoized without
+  re-encoding, per-session buffer isolation, mismatch raises, bad format
+  rejected.
+- `validate_duplex_runtime_extension` and `validate_serving_runtime_adapter`
+  — the engine's and API server's own startup gates — pass.
+- Our token-geometry helper equals vLLM's `_get_feat_extract_output_lengths`
+  for mel-frame counts 1–1000.
+
+**Still unvalidated:** the full 3-stage duplex serving path. That requires an
+environment matching upstream/main's vLLM (`v0.26.0`, per
+`docker/Dockerfile.cuda:1`); the available image ships vLLM 0.24.0, which
+lacks `vllm.entrypoints.scale_out` and cannot import `api_server`.
 
 ### 2.9 Comparable PRs offer no better template
 

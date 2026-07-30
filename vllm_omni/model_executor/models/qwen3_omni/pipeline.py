@@ -28,18 +28,14 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     # control token, so there is no model-owned turn policy here (unlike
     # MiniCPM-o 4.5).
     #
-    # duplex_control_enabled stays False: the worker-side stage-0 audio
-    # embedding path is not implemented (see
-    # vllm_omni/experimental/fullduplex/qwen3omni/stage0.py), so arming the
-    # duplex endpoint would surface a NotImplementedError at the first
-    # append rather than a clean startup failure. The extension and adapter
-    # paths below are declared so the wiring is reviewable and testable, and
-    # so enabling the feature later is a one-line change.
+    # The duplex endpoint additionally requires the client to opt in per
+    # session via extra_body["qwen3_omni_native_duplex"], so enabling the
+    # control plane here does not change behaviour for ordinary requests.
     duplex_runtime_extension=("vllm_omni.experimental.fullduplex.qwen3omni.runtime.Qwen3OmniDuplexRuntimeExtension"),
     duplex_serving_adapter=(
         "vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter.Qwen3OmniServingRuntimeAdapter"
     ),
-    duplex_control_enabled=False,
+    duplex_control_enabled=True,
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,
