@@ -15,7 +15,7 @@ import torch
 import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, CLIPImageProcessor, CLIPVisionModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -182,17 +182,14 @@ class Wan22I2VPipeline(
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
         ]
-        if od_config.parallel_config.tensor_parallel_size != 1:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="text_encoder",
-                    revision=None,
-                    prefix="text_encoder.",
-                    fall_back_to_pt=True,
-                )
-            )
 
         # Load model_index.json to detect available components
         try:
@@ -242,19 +239,9 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
-        if od_config.parallel_config.tensor_parallel_size == 1:
-            self.text_encoder = from_pretrained_with_prefetch(
-                UMT5EncoderModel.from_pretrained,
-                model,
-                subfolder="text_encoder",
-                prefetch_list=subfolders,
-                local_files_only=local_files_only,
-                torch_dtype=dtype,
-            ).to(self.device)
-        else:
-            self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
-                device=self.device, dtype=dtype
-            )
+        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+            device=self.device, dtype=dtype
+        )
 
         if self.has_image_encoder:
             self.image_processor = from_pretrained_with_prefetch(

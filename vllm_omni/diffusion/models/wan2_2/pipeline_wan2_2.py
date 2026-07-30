@@ -14,7 +14,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
@@ -326,17 +326,15 @@ class Wan22Pipeline(
         )
 
         # Set up weights sources for transformer(s)
-        self.weights_sources = []
-        if od_config.parallel_config.tensor_parallel_size != 1:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="text_encoder",
-                    revision=None,
-                    prefix="text_encoder.",
-                    fall_back_to_pt=True,
-                )
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
             )
+        ]
         if load_transformer:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
@@ -384,19 +382,9 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
         )
-        if od_config.parallel_config.tensor_parallel_size == 1:
-            self.text_encoder = from_pretrained_with_prefetch(
-                UMT5EncoderModel.from_pretrained,
-                model,
-                subfolder="text_encoder",
-                prefetch_list=component_subfolders,
-                local_files_only=local_files_only,
-                torch_dtype=dtype,
-            ).to(self.device)
-        else:
-            self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
-                device=self.device, dtype=dtype
-            )
+        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+            device=self.device, dtype=dtype
+        )
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
             model,
