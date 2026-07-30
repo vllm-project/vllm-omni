@@ -1,0 +1,88 @@
+#!/bin/bash
+#PBS -N longcat_next_mn_img_decoder
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=00:15:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_img_decoder.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_img_decoder.err
+
+# Node B of the 2-node LongCat-Next thinker+image e2e test. Mirrors
+# longcat_next_multinode_audio_decoder.pbs. Only needs 1 GPU: the image
+# decoder (visual_tokenizer's VQ dequant + VisionTransformerDecoder +
+# flow-matching refiner, no MoE weights) is not autoregressive, so it runs
+# as a plain Python call -- no vLLM engine/server needed on this node.
+#
+# PBS submission order (from the login/head node):
+#   jobA=$(qsub pbs/longcat_next_multinode_image_thinker.pbs)
+#   qsub -W depend=afterok:$jobA pbs/longcat_next_multinode_image_decoder.pbs
+# `afterok` ensures this job only starts once node A's handoff file exists
+# and the thinker exited 0.
+
+set -u
+
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export TORCH_SHOW_CPP_STACKTRACES=1
+export CUDA_LAUNCH_BLOCKING=1
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+RESULT_DIR="$OMNI_DIR/pbs/logs"
+HANDOFF_JSON="$RESULT_DIR/longcat_next_mn_img_handoff.json"
+OUT_PNG="$RESULT_DIR/longcat_next_mn_img_output.png"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="$RESULT_DIR/longcat_next_mn_img_decoder_${RUN_TS}.log"
+STATUS_FILE="$RESULT_DIR/.mn_img_decoder_status_$$"
+
+mkdir -p "$RESULT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+{
+echo "[$(date)] ===== LongCat-Next multinode IMAGE DECODER ====="
+echo "[$(date)] job=${PBS_JOBID:-<none>} node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+echo "[$(date)] run_log=$RUN_LOG"
+nvidia-smi -L
+
+if [ ! -f "$HANDOFF_JSON" ]; then
+  echo "[$(date)] FAIL: handoff file $HANDOFF_JSON not found -- did node A's job finish successfully first?"
+  echo 1 > "$STATUS_FILE"
+else
+echo "[$(date)] handoff size: $(wc -c < "$HANDOFF_JSON") bytes; head: $(head -c 400 "$HANDOFF_JSON")"
+
+echo "[$(date)] Decoding image from thinker handoff -> $OUT_PNG ..."
+stdbuf -oL -eL python -X faulthandler pbs/scripts/longcat_next_multinode_image_decoder.py \
+  "$MODEL_PATH" "$HANDOFF_JSON" "$OUT_PNG"
+status=$?
+
+echo "[$(date)] image decoder python exited status=$status"
+if [ -f "$OUT_PNG" ]; then
+  echo "[$(date)] output png size: $(wc -c < "$OUT_PNG") bytes"
+fi
+
+if [ $status -ne 0 ]; then
+  echo "[$(date)] Image decoder stage FAILED (exit=$status)"
+else
+  echo "[$(date)] Done. Output image: $OUT_PNG"
+fi
+echo "$status" > "$STATUS_FILE"
+fi
+} 2>&1 | tee "$RUN_LOG"
+
+{
+echo "[$(date)] ================ MULTINODE IMAGE DECODER SUMMARY ================"
+echo "--- memory ---"
+grep -a -E "before load|after weight load" "$RUN_LOG"
+echo "--- decode result ---"
+grep -a -E "\[image_decoder\] (OK|wrote)" "$RUN_LOG"
+echo "--- verdict ---"
+grep -a "VERDICT" "$RUN_LOG"
+echo "[$(date)] =================================================================="
+} 2>&1 | tee -a "$RUN_LOG"
+
+status="$(cat "$STATUS_FILE" 2>/dev/null || echo 1)"
+rm -f "$STATUS_FILE"
+exit "$status"

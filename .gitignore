@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-pbs/
+# pbs/   # removed to track e2e test scripts
 
 # C extensions
 *.so

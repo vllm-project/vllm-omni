@@ -1,0 +1,106 @@
+#!/bin/bash
+#PBS -N longcat_next_wired_audio
+#PBS -l select=1:ncpus=64:ngpus=4:mem=440gb
+# 30min: first-ever GPU exercise of BOTH the audio decoder stage (its own
+# weight load + VQ-bridge/flow-matching/vocoder forward, never run before)
+# AND longcat_next_4gpu_audio.yaml itself (bf16, no fp8, tuned for 80GB GPUs
+# -- every prior successful run used the fp8/40GB-tuned longcat_next_4gpu.yaml
+# instead). Both are unknowns; budget accordingly.
+#PBS -l walltime=00:30:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_wired_audio.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_wired_audio.err
+
+# Single-node, wired 2-stage LongCat-Next audio test: thinker (TP=4) + audio
+# decoder colocated on GPU 3, via the real orchestrated pipeline
+# (longcat_next_4gpu_audio.yaml, pipeline: longcat_next_thinker_audio) --
+# NOT the manual file-handoff pattern longcat_next_multinode_thinker.pbs
+# uses. No second node/job needed; the orchestrator routes stage 0's codes
+# into stage 1 internally via thinker2audio_decoder_token_only.
+
+set -u
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+export NCCL_DEBUG=WARN
+export VLLM_LOG_STATS_INTERVAL=10
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export VLLM_LOGGING_LEVEL=INFO
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export TORCH_SHOW_CPP_STACKTRACES=1
+export CUDA_LAUNCH_BLOCKING=1
+export LONGCAT_AUDIO_DEBUG=1
+# Thinker-side audio-gen mechanics are already GPU-proven (job 15025030,
+# PASS: 2 frames); this cap just keeps the known-good chunk length so any
+# new failure here is attributable to the decoder/wiring, not a different
+# audio-gen run.
+export LONGCAT_MAX_GEN=300
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+DEPLOY_CONFIG="$OMNI_DIR/vllm_omni/deploy/longcat_next_4gpu_audio.yaml"
+RESULT_DIR="$OMNI_DIR/pbs/logs"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="$RESULT_DIR/longcat_next_wired_audio_${RUN_TS}.log"
+OUT_WAV="$RESULT_DIR/longcat_next_wired_audio_${RUN_TS}.wav"
+OUT_JSON="$RESULT_DIR/longcat_next_wired_audio_${RUN_TS}.json"
+STATUS_FILE="$RESULT_DIR/.wired_audio_status_$$"
+
+mkdir -p "$RESULT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+{
+echo "[$(date)] ===== LongCat-Next WIRED audio test (thinker + audio decoder, single node) ====="
+echo "[$(date)] job=${PBS_JOBID:-<none>} node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+echo "[$(date)] run_log=$RUN_LOG out_wav=$OUT_WAV out_json=$OUT_JSON"
+nvidia-smi -L
+echo "[$(date)] --- code version ---"
+git -C "$OMNI_DIR" rev-parse HEAD 2>/dev/null && git -C "$OMNI_DIR" status --short 2>/dev/null | head -30
+echo "[$(date)] --- deploy config ---"
+cat "$DEPLOY_CONFIG"
+
+echo "[$(date)] Running wired thinker+audio_decoder pipeline ..."
+stdbuf -oL -eL python -X faulthandler pbs/scripts/longcat_next_wired_audio.py \
+  "$MODEL_PATH" "$DEPLOY_CONFIG" "$OUT_WAV" "$OUT_JSON"
+status=$?
+
+echo "[$(date)] wired-audio python exited status=$status"
+if [ -f "$OUT_JSON" ]; then
+  echo "[$(date)] result json: $(cat "$OUT_JSON")"
+fi
+if [ -f "$OUT_WAV" ]; then
+  echo "[$(date)] wav file size: $(wc -c < "$OUT_WAV") bytes"
+fi
+
+if [ $status -ne 0 ]; then
+  echo "[$(date)] Wired-audio stage FAILED (exit=$status)"
+else
+  echo "[$(date)] Wired-audio run completed."
+fi
+echo "$status" > "$STATUS_FILE"
+} 2>&1 | tee "$RUN_LOG"
+
+{
+echo "[$(date)] ================ WIRED AUDIO SUMMARY ================"
+echo "--- returned stage messages ---"
+grep -a "\[wired\] outputs\[" "$RUN_LOG"
+echo "--- thinker text ---"
+grep -a -E "\[wired\] thinker (generated|decoded)" "$RUN_LOG"
+echo "--- decoder result ---"
+grep -a -E "\[wired\] (decoder multimodal_output|waveform shape|wrote)" "$RUN_LOG"
+echo "--- verdict ---"
+grep -a "\[wired\] VERDICT" "$RUN_LOG"
+echo "--- audio-gen debug lines (thinker side, should match the known-good pattern) ---"
+echo "  advance : $(grep -ac 'longcat-audio.*advance step=' "$RUN_LOG" || true)"
+echo "  mtp     : $(grep -ac 'longcat-audio.*mtp step='     "$RUN_LOG" || true)"
+echo "  emit    : $(grep -ac 'make_omni_output emitting'    "$RUN_LOG" || true)"
+echo "[$(date)] ======================================================"
+} 2>&1 | tee -a "$RUN_LOG"
+
+status="$(cat "$STATUS_FILE" 2>/dev/null || echo 1)"
+rm -f "$STATUS_FILE"
+exit "$status"

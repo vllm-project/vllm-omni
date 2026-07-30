@@ -1,0 +1,91 @@
+#!/bin/bash
+#PBS -N longcat_next_mn_img_thinker
+#PBS -l select=1:ncpus=64:ngpus=4:mem=440gb
+#PBS -l walltime=00:20:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_img_thinker.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_img_thinker.err
+
+# Node A of the 2-node LongCat-Next thinker+image e2e test. Mirrors
+# longcat_next_multinode_thinker.pbs (audio's proven node A) -- same
+# rationale for the 2-node file-handoff split (this cluster caps every node
+# at 4 GPUs, no cross-node TP wiring in vllm-omni). Thinker-only smoke test
+# already passed on GPU in-process (job 15030222); this run proves the same
+# mechanism plus writing the handoff file for node B's image decoder.
+#
+# PBS submission order (from the login/head node):
+#   jobA=$(qsub pbs/longcat_next_multinode_image_thinker.pbs)
+#   qsub -W depend=afterok:$jobA pbs/longcat_next_multinode_image_decoder.pbs
+
+set -u
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+export NCCL_DEBUG=WARN
+export VLLM_LOG_STATS_INTERVAL=10
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export VLLM_LOGGING_LEVEL=INFO
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export TORCH_SHOW_CPP_STACKTRACES=1
+export CUDA_LAUNCH_BLOCKING=1
+export LONGCAT_AUDIO_DEBUG=1
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+DEPLOY_CONFIG="$OMNI_DIR/vllm_omni/deploy/longcat_next_4gpu.yaml"
+RESULT_DIR="$OMNI_DIR/pbs/logs"
+HANDOFF_JSON="$RESULT_DIR/longcat_next_mn_img_handoff.json"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="$RESULT_DIR/longcat_next_mn_img_thinker_${RUN_TS}.log"
+STATUS_FILE="$RESULT_DIR/.img_thinker_status_$$"
+
+mkdir -p "$RESULT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+{
+echo "[$(date)] ===== LongCat-Next multinode IMAGE THINKER (talker_mtp visual) ====="
+echo "[$(date)] job=${PBS_JOBID:-<none>} node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+echo "[$(date)] run_log=$RUN_LOG"
+nvidia-smi -L
+echo "[$(date)] --- code version ---"
+git -C "$OMNI_DIR" rev-parse HEAD 2>/dev/null && git -C "$OMNI_DIR" status --short 2>/dev/null | head -30
+
+rm -f "$HANDOFF_JSON"
+
+echo "[$(date)] Running thinker offline (TP=4); visual codes -> $HANDOFF_JSON ..."
+stdbuf -oL -eL python -X faulthandler pbs/scripts/longcat_next_multinode_image_thinker.py \
+  "$MODEL_PATH" "$DEPLOY_CONFIG" "$HANDOFF_JSON"
+status=$?
+
+echo "[$(date)] thinker python exited status=$status"
+if [ -f "$HANDOFF_JSON" ]; then
+  echo "[$(date)] handoff file size: $(wc -c < "$HANDOFF_JSON") bytes"
+  echo "[$(date)] handoff head: $(head -c 400 "$HANDOFF_JSON")"
+fi
+
+if [ $status -ne 0 ] || [ ! -f "$HANDOFF_JSON" ]; then
+  echo "[$(date)] Thinker stage FAILED (exit=$status, handoff present=$([ -f "$HANDOFF_JSON" ] && echo yes || echo no))"
+else
+  echo "[$(date)] Thinker stage done. Handoff written to $HANDOFF_JSON"
+  echo "[$(date)] Submit node B with:"
+  echo "  qsub -W depend=afterok:\$PBS_JOBID $OMNI_DIR/pbs/longcat_next_multinode_image_decoder.pbs"
+fi
+echo "$status" > "$STATUS_FILE"
+} 2>&1 | tee "$RUN_LOG"
+
+{
+echo "[$(date)] ================ IMAGE PATH SUMMARY ================"
+echo "--- prompt / entry conditions (did image-gen engage at all?) ---"
+grep -a -E "prompt tokens=|ends with img_start" "$RUN_LOG" | head -8
+echo "--- generated text / verdict ---"
+grep -a -E "\[thinker\] (VERDICT|talker_mtp produced|multimodal_output type|frame widths|frames containing)" "$RUN_LOG" | head -14
+echo "[$(date)] ====================================================="
+} 2>&1 | tee -a "$RUN_LOG"
+
+status="$(cat "$STATUS_FILE" 2>/dev/null || echo 1)"
+rm -f "$STATUS_FILE"
+exit "$status"

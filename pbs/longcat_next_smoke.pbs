@@ -1,0 +1,183 @@
+#!/bin/bash
+#PBS -N longcat_next_smoke
+#PBS -l select=1:ncpus=64:ngpus=4:mem=440gb
+#PBS -l walltime=00:15:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_smoke.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_smoke.err
+
+# LongCat-Next thinker smoke test on vLLM-Omni (4x GPU, TP=4, fp8 weights).
+# Stage 0 only (longcat_next_4gpu.yaml = thinker-only pipeline). The full
+# 3-stage pipeline (image/audio decoders) needs 6 GPUs; switch the deploy
+# config to longcat_next_6gpu.yaml and ngpus=6 once the thinker passes.
+
+set -u
+
+# ---- env ----------------------------------------------------------------
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+
+# TP=4 worker init previously failed at ncclCommInitRank with "unhandled cuda
+# error". NCCL_DEBUG=INFO revealed the real cause: "CUDA driver version is
+# insufficient for CUDA runtime version" — the venv had orphaned cu13 NVIDIA
+# packages (nvidia-nccl-cu13==2.29.7 etc., leftover from an earlier
+# torch==2.13.0+cu130 install) shadowing the cu12 libs torch==2.11.0+cu128
+# actually declares as dependencies. Fixed by purging the cu13 packages and
+# force-reinstalling the cu12 ones (see build.md dev-env notes). Kept
+# NCCL_DEBUG=INFO for visibility on this run; the earlier P2P/IB env guesses
+# were red herrings (not the actual cause) and have been removed.
+export NCCL_DEBUG=INFO
+export VLLM_LOG_STATS_INTERVAL=10
+# flashinfer is optional; don't let the sampler probe import it if absent.
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+# Use the complete hub snapshot; the flattened hf_downloads/LongCat-Next dir
+# is a partial download (no tokenizer/processor/modeling files).
+export MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+DEPLOY_CONFIG="$OMNI_DIR/vllm_omni/deploy/longcat_next_4gpu.yaml"
+export RESULT_DIR="$OMNI_DIR/pbs/logs"
+SERVER_LOG="$RESULT_DIR/longcat_next_server.log"
+export PORT=8091
+
+mkdir -p "$RESULT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+echo "[$(date)] node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+nvidia-smi -L
+
+# ---- unit tests first (cheap, catches import/regression errors) ----------
+echo "[$(date)] Running longcat_next stage-processor tests..."
+python -m pytest tests/model_executor/stage_input_processors/test_longcat_next.py -q \
+  || { echo "[$(date)] Unit tests FAILED — aborting before GPU run"; exit 1; }
+
+# ---- kill any leftover vllm procs ----------------------------------------
+pkill -u "$(id -un)" -f "vllm.entrypoints" 2>/dev/null || true
+sleep 5
+
+# ---- start vllm-omni server (thinker only, TP=4) --------------------------
+# vllm comes from the source checkout (.pth), so there is no `vllm` console
+# script — invoke the CLI module directly.
+echo "[$(date)] Starting vLLM-Omni server for LongCat-Next..."
+python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" --omni \
+  --deploy-config "$DEPLOY_CONFIG" \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --trust-remote-code \
+  > "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+
+# ---- wait for readiness (74B over 15 shards takes a while) ----------------
+echo "[$(date)] Waiting for server (pid=$SERVER_PID)..."
+for i in $(seq 1 120); do
+  if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+    echo "[$(date)] Server healthy after ~$((i * 15))s"
+    break
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "[$(date)] Server process died; tail of log:"
+    tail -50 "$SERVER_LOG"
+    exit 1
+  fi
+  sleep 15
+done
+
+if ! curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+  echo "[$(date)] Server never became healthy; tail of log:"
+  tail -50 "$SERVER_LOG"
+  kill "$SERVER_PID" 2>/dev/null
+  exit 1
+fi
+
+# ---- smoke request 1: text-only -------------------------------------------
+echo "[$(date)] Text-only smoke request..."
+curl -s "http://127.0.0.1:$PORT/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "'"$MODEL_PATH"'",
+        "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+        "max_tokens": 64
+      }' | tee "$RESULT_DIR/smoke_text.json"
+echo ""
+
+# ---- smoke request 2: image understanding (checkpoint sample asset) -------
+echo "[$(date)] Image-understanding smoke request..."
+python - <<'EOF'
+import base64
+import json
+import os
+import urllib.request
+
+model = os.environ["MODEL_PATH"]
+port = os.environ["PORT"]
+image_path = os.path.join(model, "assets", "book.png")
+with open(image_path, "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+payload = {
+    "model": model,
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What book is this?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ],
+    }],
+    "max_tokens": 128,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/chat/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=600) as resp:
+    body = resp.read().decode()
+print(body)
+with open(os.path.join(os.environ["RESULT_DIR"], "smoke_image.json"), "w") as f:
+    f.write(body)
+EOF
+
+# ---- smoke request 3: audio understanding (checkpoint sample asset) --------
+echo "[$(date)] Audio-understanding smoke request..."
+python - <<'EOF'
+import base64
+import json
+import os
+import urllib.request
+
+model = os.environ["MODEL_PATH"]
+port = os.environ["PORT"]
+audio_path = os.path.join(model, "assets", "math1.wav")
+with open(audio_path, "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+payload = {
+    "model": model,
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Transcribe and answer the question in this audio."},
+            {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
+        ],
+    }],
+    "max_tokens": 256,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/chat/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=600) as resp:
+    body = resp.read().decode()
+print(body)
+with open(os.path.join(os.environ["RESULT_DIR"], "smoke_audio.json"), "w") as f:
+    f.write(body)
+EOF
+
+echo "[$(date)] Smoke tests done; shutting down server."
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null
+echo "[$(date)] Done. Results in $RESULT_DIR (smoke_text/image/audio.json, server log)."

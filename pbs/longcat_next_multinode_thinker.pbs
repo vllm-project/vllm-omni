@@ -1,0 +1,152 @@
+#!/bin/bash
+#PBS -N longcat_next_mn_thinker
+#PBS -l select=1:ncpus=64:ngpus=4:mem=440gb
+#PBS -l walltime=00:20:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_thinker.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_mn_thinker.err
+
+# Node A of the 2-node LongCat-Next thinker+audio e2e test.
+#
+# This cluster caps every GPU node at 4 GPUs (confirmed via `pbsnodes -a`:
+# resources_available.ngpus = 4 on every g*/q* node checked), so "2 nodes x
+# 4 GPUs" here means splitting the pipeline across nodes, not one TP=8
+# group spanning both -- there is no existing cross-node NCCL/KV-transfer
+# wiring in vllm-omni's stage config (stages select local GPU indices via
+# `devices: "0,1,2,3"` and run in-process under one orchestrator; see
+# vllm_omni/config/stage_config.py). Building genuine cross-node tensor
+# parallelism was out of scope for "run multinode quick".
+#
+# Instead: thinker (TP=4, proven config from longcat_next_4gpu.yaml) runs
+# here on node A's 4 GPUs via the offline Omni() API (not the HTTP server).
+# With talker_mtp wired up (modeling_longcat_next.py -- the audio_head
+# depth-transformer loop that produces real per-frame audio codes), the
+# thinker's real audio codes surface on the finished RequestOutput as
+# outputs[0].multimodal_output["codes"]["audio"], the same field
+# thinker2audio_decoder_token_only() reads in the in-process pipeline
+# (stage_input_processors/longcat_next.py). Those codes are written to a
+# shared scratch file; node B (see longcat_next_multinode_audio_decoder.pbs,
+# submitted with `qsub -W depend=afterok:<this_job_id>`) reads them and runs
+# the audio decoder standalone (no engine needed -- it's not autoregressive;
+# see pbs/scripts/longcat_next_audio_decoder_standalone.py, whose pattern
+# longcat_next_multinode_audio_decoder.py reuses).
+
+set -u
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+# --- debugging aids (first GPU run of the talker_mtp audio path) ------------
+# NCCL/vLLM verbosity deliberately dialled DOWN from the earlier runs: those
+# produced 6-9 MB logs that were ~95% NCCL AllGather spam, which buried the
+# [longcat-audio] lines this run exists to read. Deadlock triage is no longer
+# the open question (the collectives have been proven to run); the audio path
+# is. NCCL warnings/errors still surface at WARN.
+export NCCL_DEBUG=WARN
+export VLLM_LOG_STATS_INTERVAL=10
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export VLLM_LOGGING_LEVEL=INFO            # [longcat-audio] logs are INFO-level
+export PYTHONFAULTHANDLER=1               # dump Python tracebacks on fatal signals
+export PYTHONUNBUFFERED=1                 # no stdout buffering -> logs land live
+export TORCH_SHOW_CPP_STACKTRACES=1       # C++ stack traces on torch errors
+export CUDA_LAUNCH_BLOCKING=1             # make CUDA errors point at the real op
+export LONGCAT_AUDIO_DEBUG=1              # log every audio-substate transition
+# Cap audio-gen at 300 frames (~12 s at 25 fps) instead of the config's 750
+# (~30 s). Weight load alone is ~10 min of the 30 min walltime, and 750 steps
+# could outlast the rest -- a run killed mid-generation proves nothing. The
+# test prompt is a single short sentence (~4-5 s of speech), so the model
+# should hit its own chunk-end well before this cap; it exists only so the
+# run cannot be truncated by walltime. Unset for full-length audio.
+export LONGCAT_MAX_GEN=300
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+DEPLOY_CONFIG="$OMNI_DIR/vllm_omni/deploy/longcat_next_4gpu.yaml"
+RESULT_DIR="$OMNI_DIR/pbs/logs"
+# Shared scratch handoff file -- must be visible from node B's job too, so
+# this lives under /scratch, not node-local storage.
+HANDOFF_JSON="$RESULT_DIR/longcat_next_mn_handoff.json"
+# Full combined stdout+stderr transcript for this run (in addition to PBS's
+# own .out/.err), timestamped so successive runs don't clobber each other.
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="$RESULT_DIR/longcat_next_mn_thinker_${RUN_TS}.log"
+# Carries the python exit status out of the tee'd subshell (see end of file).
+STATUS_FILE="$RESULT_DIR/.thinker_status_$$"
+
+mkdir -p "$RESULT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+# Everything below is teed into RUN_LOG as well as PBS stdout.
+{
+echo "[$(date)] ===== LongCat-Next multinode THINKER (audio talker_mtp) ====="
+echo "[$(date)] job=${PBS_JOBID:-<none>} node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+echo "[$(date)] run_log=$RUN_LOG"
+nvidia-smi -L
+# Record exactly which code is running, for reproducibility when debugging.
+echo "[$(date)] --- code version ---"
+git -C "$OMNI_DIR" rev-parse HEAD 2>/dev/null && git -C "$OMNI_DIR" status --short 2>/dev/null | head -30
+echo "[$(date)] --- vllm-omni longcat_next files (mtime) ---"
+ls -la "$OMNI_DIR/vllm_omni/model_executor/models/longcat_next/modeling_longcat_next.py" \
+       "$OMNI_DIR/vllm_omni/worker/gpu_model_runner.py" 2>/dev/null
+
+rm -f "$HANDOFF_JSON"
+
+echo "[$(date)] Running thinker offline (TP=4); audio codes -> $HANDOFF_JSON ..."
+# `stdbuf -oL -eL` keeps the child's output line-buffered so a hang still shows
+# the last log line; faulthandler (env above) prints stacks if it's killed.
+stdbuf -oL -eL python -X faulthandler pbs/scripts/longcat_next_multinode_thinker.py \
+  "$MODEL_PATH" "$DEPLOY_CONFIG" "$HANDOFF_JSON"
+status=$?
+
+echo "[$(date)] thinker python exited status=$status"
+if [ -f "$HANDOFF_JSON" ]; then
+  echo "[$(date)] handoff file size: $(wc -c < "$HANDOFF_JSON") bytes"
+  echo "[$(date)] handoff head: $(head -c 400 "$HANDOFF_JSON")"
+fi
+
+if [ $status -ne 0 ] || [ ! -f "$HANDOFF_JSON" ]; then
+  echo "[$(date)] Thinker stage FAILED (exit=$status, handoff present=$([ -f "$HANDOFF_JSON" ] && echo yes || echo no))"
+else
+  echo "[$(date)] Thinker stage done. Handoff written to $HANDOFF_JSON"
+  echo "[$(date)] Submit node B with:"
+  echo "  qsub -W depend=afterok:\$PBS_JOBID $OMNI_DIR/pbs/longcat_next_multinode_audio_decoder.pbs"
+fi
+# The block runs in a subshell (pipeline), so $status cannot propagate by
+# variable; hand it to the parent through a file.
+echo "$status" > "$STATUS_FILE"
+} 2>&1 | tee "$RUN_LOG"
+
+# ---- audio-path summary -------------------------------------------------
+# Runs *after* the tee above has closed, so RUN_LOG is complete on disk --
+# grepping it from inside that pipeline would race the still-buffered writes.
+# The per-step [longcat-audio] lines are interleaved across 4 TP ranks and
+# thousands of engine lines; this pulls the decisive ones together so the tail
+# of the log answers "did it work, and if not where did it stop" directly.
+{
+echo "[$(date)] ================ AUDIO PATH SUMMARY ================"
+echo "--- prompt / entry conditions (did audio-gen engage at all?) ---"
+grep -a -E "prompt tokens=|ends with audiogen_start|audio_gen created" "$RUN_LOG" | head -8
+echo "--- state machine milestones ---"
+grep -a -E "TEXT_END|TERMINAL at step|audio_gen ended" "$RUN_LOG" | head -12
+echo "--- first audio-gen steps (advance) ---"
+grep -a "longcat-audio.*advance step=" "$RUN_LOG" | head -14
+echo "--- first audio-gen steps (talker_mtp sampling) ---"
+grep -a "longcat-audio.*mtp step=" "$RUN_LOG" | head -14
+echo "--- make_omni_output emissions (the boundary that used to drop everything) ---"
+grep -a "make_omni_output emitting" "$RUN_LOG" | head -12
+echo "--- per-request final tally (sampled vs kept vs emitted) ---"
+grep -a "FINISHED audio_gen=" "$RUN_LOG" | head -8
+echo "--- line counts ---"
+printf '  advance lines : %s\n' "$(grep -ac 'longcat-audio.*advance step=' "$RUN_LOG" || true)"
+printf '  mtp lines     : %s\n' "$(grep -ac 'longcat-audio.*mtp step='     "$RUN_LOG" || true)"
+printf '  emit lines    : %s\n' "$(grep -ac 'make_omni_output emitting'    "$RUN_LOG" || true)"
+echo "--- generated text / verdict ---"
+grep -a -E "\[thinker\] (VERDICT|talker_mtp produced|multimodal_output type|frame widths|frames containing|generated |decoded visible|audio markers)" "$RUN_LOG" | head -14
+echo "[$(date)] ===================================================="
+} 2>&1 | tee -a "$RUN_LOG"
+
+status="$(cat "$STATUS_FILE" 2>/dev/null || echo 1)"
+rm -f "$STATUS_FILE"
+exit "$status"
