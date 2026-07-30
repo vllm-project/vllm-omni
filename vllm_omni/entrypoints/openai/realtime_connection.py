@@ -58,6 +58,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
         self._tools: list[dict[str, Any]] | None = None
+        # The current turn's prompt as handed to the engine BEFORE multimodal
+        # expansion: un-expanded `prompt_token_ids` (one `<|audio_pad|>`) plus the
+        # audio in `multi_modal_data`. Tool-call continuations rebuild from this
+        # rather than from the engine's post-expansion `output.prompt_token_ids`,
+        # because those contain the expanded audio placeholder run with no way to
+        # re-attach the audio - see _await_tool_results_and_continue.
+        self._turn_prompt: dict[str, Any] | None = None
         # index (parser-assigned, per generation) -> {"call_id", "name", "arguments"}
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -109,10 +116,25 @@ class RealtimeConnection(VllmRealtimeConnection):
             audio_stream, input_stream, self.serving.model_config, tools=self._tools
         )
         async for prompt in stream_input_iter:
+            # Remember the pre-expansion prompt so tool-call continuations can
+            # re-anchor on the user's audio (see self._turn_prompt).
+            if isinstance(prompt, dict):
+                self._turn_prompt = dict(prompt)
             yield await self._render_prompt(prompt)
 
-    async def _render_token_prompt(self, prompt_token_ids: list[int]) -> AsyncGenerator[StreamingInput, None]:
-        yield await self._render_prompt(TokensPrompt(prompt_token_ids=prompt_token_ids))
+    async def _render_token_prompt(
+        self,
+        prompt_token_ids: list[int],
+        multi_modal_data: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[StreamingInput, None]:
+        token_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        # Tool-call continuation: re-attach the turn's audio. Without it the
+        # `<|audio_pad|>` placeholder still sits in the token ids but has no
+        # encoder output behind it, so the thinker cannot see what the user asked
+        # and free-associates unrelated tool calls instead of answering.
+        if multi_modal_data:
+            token_prompt["multi_modal_data"] = multi_modal_data
+        yield await self._render_prompt(token_prompt)
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:
@@ -397,12 +419,27 @@ class RealtimeConnection(VllmRealtimeConnection):
             add_generation_prompt=True,
             tokenize=False,
         )
-        continuation_token_ids = (
-            list(prior_prompt_token_ids) + list(assistant_token_ids) + tokenizer.encode(suffix_text)
-        )
+        # Splice onto the turn's PRE-expansion prompt, not the engine's
+        # post-expansion `output.prompt_token_ids`. The latter carries the expanded
+        # `<|audio_pad|>` run, and re-submitting it as a bare TokensPrompt drops the
+        # audio itself: the thinker then sees placeholder tokens with no encoder
+        # output, loses the user's question entirely, and answers by inventing
+        # further tool calls (unrelated cities/items) instead of replying. Falling
+        # back to `prior_prompt_token_ids` only matters for a continuation that never
+        # went through buffer_realtime_audio (no audio to lose in that case).
+        base_prompt = self._turn_prompt or {}
+        base_token_ids = list(base_prompt.get("prompt_token_ids") or prior_prompt_token_ids)
+        multi_modal_data = base_prompt.get("multi_modal_data")
+        continuation_token_ids = base_token_ids + list(assistant_token_ids) + tokenizer.encode(suffix_text)
+
+        # Advance the base so a chained tool call next round splices onto this
+        # turn's full history while the audio stays attached exactly once, at the
+        # front, still un-expanded.
+        if self._turn_prompt is not None:
+            self._turn_prompt = {**base_prompt, "prompt_token_ids": continuation_token_ids}
 
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        await self._run_generation(self._render_token_prompt(continuation_token_ids), input_stream)
+        await self._run_generation(self._render_token_prompt(continuation_token_ids, multi_modal_data), input_stream)
 
     async def send_json(self, payload: dict):
         try:

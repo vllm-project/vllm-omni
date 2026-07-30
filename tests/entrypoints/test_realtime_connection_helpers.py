@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.inputs import TokensPrompt
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -146,3 +147,66 @@ class TestRealtimeConnectionToolCallEventRouting:
         asyncio.run(tool_call_conn.handle_event(event))
 
         base_handle_event.assert_awaited_once_with(event)
+
+
+class TestRenderTokenPromptReattachesAudio:
+    """Regression test for a real bug: the tool-call continuation re-submitted
+    the engine's POST-expansion `output.prompt_token_ids` as a bare
+    TokensPrompt. Those ids still contain the expanded `<|audio_pad|>` run for
+    the user's spoken turn, but with no `multi_modal_data` the audio encoder
+    output is gone - so the thinker saw placeholder tokens backed by nothing,
+    lost the question entirely, and "answered" by emitting further tool calls
+    for unrelated cities/items (and even fabricating tool results) instead of
+    replying, never terminating. Fixed by splicing onto the PRE-expansion
+    prompt and re-attaching its audio on every continuation."""
+
+    def _conn(self, mocker):
+        conn = RealtimeConnection.__new__(RealtimeConnection)
+        conn.serving = mocker.Mock()
+        conn.serving.model_config.is_encoder_decoder = False
+        conn.serving.renderer.render_cmpl_async = mocker.AsyncMock(side_effect=lambda prompts: [dict(prompts[0])])
+        return conn
+
+    @staticmethod
+    def _first(gen):
+        async def _run():
+            return await anext(gen)
+
+        return asyncio.run(_run())
+
+    def test_audio_is_reattached_to_continuation_prompt(self, mocker) -> None:
+        conn = self._conn(mocker)
+        audio = {"audio": np.zeros(16000, dtype=np.float32)}
+
+        result = self._first(conn._render_token_prompt([1, 2, 3], audio))
+
+        assert result.prompt["multi_modal_data"] is audio
+
+    def test_no_multi_modal_data_is_a_noop(self, mocker) -> None:
+        conn = self._conn(mocker)
+
+        result = self._first(conn._render_token_prompt([1, 2, 3]))
+
+        assert "multi_modal_data" not in result.prompt
+
+    def test_turn_prompt_capture_keeps_unexpanded_ids_and_audio(self, mocker) -> None:
+        """_buffer_realtime_audio_with_tools must stash the pre-render prompt so
+        the continuation has something audio-bearing to splice onto."""
+        conn = self._conn(mocker)
+        conn._tools = None
+        conn._turn_prompt = None
+        audio = {"audio": np.zeros(8000, dtype=np.float32)}
+        prompt = TokensPrompt(prompt_token_ids=[10, 11], multi_modal_data=audio)
+
+        async def _fake_buffer(*_args, **_kwargs):
+            yield prompt
+
+        conn.serving.model_cls.buffer_realtime_audio = _fake_buffer
+
+        async def _drain():
+            return [x async for x in conn._buffer_realtime_audio_with_tools(None, None)]
+
+        asyncio.run(_drain())
+
+        assert conn._turn_prompt["prompt_token_ids"] == [10, 11]
+        assert conn._turn_prompt["multi_modal_data"] is audio
