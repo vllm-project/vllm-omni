@@ -35,7 +35,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
@@ -417,7 +417,7 @@ def mock_async_omni(
     mock_instance.stage_configs = server_case.stage_configs
     mock_instance.output_modalities = _build_output_modalities(server_case.stage_configs)
     mock_instance.default_sampling_params_list = [
-        SamplingParams() if _stage_type(stage) != "diffusion" else mocker.MagicMock()
+        OmniDiffusionSamplingParams() if _stage_type(stage) == "diffusion" else SamplingParams()
         for stage in server_case.stage_configs
     ]
     mock_instance.errored = False
