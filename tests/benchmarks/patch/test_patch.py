@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
@@ -57,6 +58,8 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.events = RealtimeEventCollector()
             self.configure_kwargs = None
             self.sent = []
+            self.response_count = 0
+            self.ack_count = 0
             type(self).last_instance = self
 
         async def __aenter__(self):
@@ -73,23 +76,25 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.sent.append(event)
             if event["type"] != "response.create":
                 return
+            self.response_count += 1
+            response_id = f"resp-{self.response_count}"
             now = time.monotonic()
             self.events.add(
-                {"type": "response.created", "response": {"id": "resp-1"}},
+                {"type": "response.created", "response": {"id": response_id}},
                 received_at_s=now + 0.01,
             )
             self.events.add(
                 {
                     "type": "response.audio_transcript.delta",
-                    "response_id": "resp-1",
-                    "delta": "hello",
+                    "response_id": response_id,
+                    "delta": f"turn {self.response_count}",
                 },
                 received_at_s=now + 0.02,
             )
             self.events.add(
                 {
                     "type": "response.audio.delta",
-                    "response_id": "resp-1",
+                    "response_id": response_id,
                     "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
                     "sample_rate_hz": 24_000,
                     "metadata": {"audio_duration_ms": 100},
@@ -97,46 +102,12 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
                 received_at_s=now + 0.03,
             )
             self.events.add(
-                {"type": "response.done", "response": {"id": "resp-1"}},
+                {"type": "response.done", "response": {"id": response_id}},
                 received_at_s=now + 0.04,
-            )
-            self.events.add(
-                {"type": "response.created", "response": {"id": "resp-listen"}},
-                received_at_s=now + 0.045,
-            )
-            self.events.add(
-                {"type": "response.done", "response": {"id": "resp-listen"}},
-                received_at_s=now + 0.05,
-            )
-            self.events.add(
-                {"type": "response.created", "response": {"id": "resp-2"}},
-                received_at_s=now + 0.055,
-            )
-            self.events.add(
-                {
-                    "type": "response.audio_transcript.delta",
-                    "response_id": "resp-2",
-                    "delta": " again",
-                },
-                received_at_s=now + 0.06,
-            )
-            self.events.add(
-                {
-                    "type": "response.audio.delta",
-                    "response_id": "resp-2",
-                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
-                    "sample_rate_hz": 24_000,
-                    "metadata": {"audio_duration_ms": 100},
-                },
-                received_at_s=now + 0.09,
-            )
-            self.events.add(
-                {"type": "response.done", "response": {"id": "resp-2"}},
-                received_at_s=now + 0.1,
             )
 
         async def acknowledge_playback(self):
-            return None
+            self.ack_count += 1
 
         async def close_session(self, **_kwargs):
             return None
@@ -159,6 +130,9 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     )
     request_input.seed_tts_speech_extra = {"ref_audio": "data:audio/wav;base64,AAAA"}
     request_input.seed_tts_system_prompt = "Speak exactly."
+    request_input.seed_tts_turns = tuple(
+        SimpleNamespace(utterance_id=f"utt-{index}", target_text=f"text {index}") for index in range(4)
+    )
 
     output = await async_request_openai_realtime_duplex(
         request_input,
@@ -171,29 +145,38 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         "ref_audio": "data:audio/wav;base64,AAAA",
     }
     assert client.sent == [
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "hello"}],
+        event
+        for index in range(4)
+        for event in (
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"text {index}"}],
+                },
             },
-        },
-        {"type": "response.create"},
+            {"type": "response.create"},
+        )
     ]
+    assert client.ack_count == 4
     assert output.success is True
-    assert output.generated_text == "hello again"
-    assert output.audio_duration == pytest.approx(0.2)
+    assert output.generated_text == "turn 1 turn 2 turn 3 turn 4"
+    assert output.audio_duration == pytest.approx(0.4)
     assert output.ttft > 0
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
+    assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
+    assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
     session_id = output.duplex_request_metrics[0]["session_id"]
-    assert output.duplex_request_metrics == [
-        {
+    assert len(output.duplex_request_metrics) == 4
+    for index, metrics in enumerate(output.duplex_request_metrics):
+        assert metrics == {
             "session_id": session_id,
-            "request_index": 0,
-            "response_id": "resp-1",
+            "request_index": index,
+            "utterance_id": f"utt-{index}",
+            "response_id": f"resp-{index + 1}",
             "source": "client_monotonic_receive",
             "measurement_origin": {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
@@ -205,30 +188,13 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
-        },
-        {
-            "session_id": session_id,
-            "request_index": 1,
-            "response_id": "resp-2",
-            "source": "client_monotonic_receive",
-            "measurement_origin": {
-                "ttft": "conversation.item.create client send to first non-empty text delta",
-                "ttfp": "conversation.item.create client send to first audio packet",
-                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
-            },
-            "ttft_ms": pytest.approx(60.0, abs=2.0),
-            "ttfp_ms": pytest.approx(90.0, abs=2.0),
-            "rtf": pytest.approx(0.9, abs=0.03),
-            "audio_generation_ms": pytest.approx(90.0, abs=2.0),
-            "audio_duration_ms": 100.0,
-        },
-    ]
+        }
     assert output.duplex_session_metrics == {
         "session_id": session_id,
-        "audio_turn_count": 2,
-        "mean_ttft_ms": pytest.approx(40.0, abs=2.0),
-        "mean_ttfp_ms": pytest.approx(60.0, abs=2.0),
-        "mean_rtf": pytest.approx(0.6, abs=0.03),
+        "audio_turn_count": 4,
+        "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
+        "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
+        "mean_rtf": pytest.approx(0.3, abs=0.03),
     }
 
 

@@ -14,11 +14,16 @@ from tests.dfx.conftest import (
     get_benchmark_params_for_server,
     get_runtime_resource_label,
     is_diffusion_perf_config,
+    is_hardware_nested_baseline,
     load_benchmark_configs,
+    resolve_baseline_value,
     run_benchmark,
 )
 from tests.helpers.runtime import OmniServer
 
+# Compare metrics to each test JSON ``baseline`` block only when pytest is run with ``--assert-baseline``
+# (registered in ``tests/dfx/conftest.py``; default: off).
+#
 # Optional JSON field ``mark`` is applied as pytest marks via
 # ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
 # {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "omni"]``).
@@ -157,8 +162,54 @@ def benchmark_params(request):
     }
 
 
-def assert_result(result, num_prompt) -> None:
+def assert_result(
+    result,
+    params,
+    num_prompt,
+    *,
+    assert_baseline: bool,
+    sweep_index: int | None = None,
+    max_concurrency: Any | None = None,
+    request_rate: Any | None = None,
+) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    expected_audio_turns = params.get("expected_duplex_audio_turns_per_session")
+    if expected_audio_turns is not None:
+        session_metrics = result.get("duplex_session_metrics")
+        assert isinstance(session_metrics, list), "Duplex session metrics are missing"
+        assert len(session_metrics) == num_prompt, (
+            f"Expected {num_prompt} duplex session metric rows, got {len(session_metrics)}"
+        )
+        assert all(
+            isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
+            for metric in session_metrics
+        ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
+    if not assert_baseline:
+        return
+    baseline_data = params.get("baseline", {}) or {}
+    if is_hardware_nested_baseline(baseline_data):
+        hardware = get_runtime_resource_label()
+        if hardware not in baseline_data:
+            raise AssertionError(
+                f"No baseline for runtime hardware {hardware!r}; available={sorted(baseline_data)}"
+            )
+        baseline_data = baseline_data[hardware]
+    for metric_name, baseline_raw in baseline_data.items():
+        current_value = result[metric_name]
+        baseline_value = resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        if "throughput" in metric_name:
+            assert current_value >= baseline_value, (
+                f"Throughput test result was below baseline: {metric_name}: {current_value} < {baseline_value}"
+            )
+        else:
+            assert current_value <= baseline_value, (
+                f"Test result exceeded baseline: {metric_name}: {current_value} > {baseline_value}"
+            )
 
 
 @pytest.mark.benchmark
@@ -167,7 +218,7 @@ def assert_result(result, num_prompt) -> None:
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, request):
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     dataset_name = params.get("dataset_name", "")
@@ -179,6 +230,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
 
+    assert_baseline = request.config.getoption("--assert-baseline", default=False)
     resource_label = get_runtime_resource_label()
 
     def to_list(value, default=None):
@@ -212,6 +264,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "enabled",
         "eval_phase",
         "trust_remote_code",
+        "expected_duplex_audio_turns_per_session",
+        "baseline_hardware",
     }
 
     for key, value in params.items():
@@ -236,8 +290,13 @@ def test_performance_benchmark(omni_server, benchmark_params):
             args.append("--trust-remote-code")
         break
 
+    # Hardware-nested baselines are resolved inside ``run_benchmark``; flat MiniCPM
+    # baselines stay on ``params`` and are asserted only when ``--assert-baseline``.
+    baseline = params.get("baseline")
+    baseline_for_run = baseline if isinstance(baseline, dict) and is_hardware_nested_baseline(baseline) else None
+
     # QPS / request-rate sweep
-    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
+    for i, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
             args=args,
@@ -245,16 +304,23 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
+            baseline_config=baseline_for_run,
+            sweep_index=i,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(result, num_prompt)
+        assert_result(
+            result,
+            params,
+            num_prompt,
+            assert_baseline=assert_baseline,
+            sweep_index=i,
+            request_rate=qps,
+        )
 
     # concurrency test
-    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+    for i, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
             args=args,
@@ -262,10 +328,17 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
+            baseline_config=baseline_for_run,
+            sweep_index=i,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(result, num_prompt)
+        assert_result(
+            result,
+            params,
+            num_prompt,
+            assert_baseline=assert_baseline,
+            sweep_index=i,
+            max_concurrency=concurrency,
+        )
