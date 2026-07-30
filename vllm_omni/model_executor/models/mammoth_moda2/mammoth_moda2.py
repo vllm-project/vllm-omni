@@ -932,7 +932,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
-        self._dit_cache_backend = None
         self._maybe_enable_dit_cache_backend()
 
         # Expose intermediate tensor factory for PP if provided by the submodule.
@@ -968,7 +967,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self.dit.set_cache_backend(cache_backend)
         else:
             self.dit.cache_backend = cache_backend
-        self._dit_cache_backend = cache_backend
         logger.info("MammothModa2 DiT cache backend enabled: backend=%s", cache_backend_name)
 
     @classmethod
