@@ -1,18 +1,20 @@
-"""Single-node, wired 3-stage LongCat-Next e2e test (all modalities).
+"""Single-node, wired multi-stage LongCat-Next e2e test (one modality per run).
 
-Orchestrated pipeline: thinker (TP=4 fp8) + image decoder + audio decoder,
-via the official vllm-omni multi-stage API: Omni.generate() returns one
-OmniRequestOutput per stage.
+Orchestrated pipeline via the official vllm-omni multi-stage API: Omni.generate()
+returns one OmniRequestOutput per stage.
 
-Two prompts:
-  - Audio: text-based voice cloning + speech synthesis.
-  - Image: text-based image generation.
+Usage:
+  python longcat_next_wired_e2e.py <model_path> <deploy_yaml> <out_dir> [--modality audio|image]
 
-Writes <out_dir>/audio.wav, <out_dir>/image.png, and <out_dir>/result.json.
+Examples:
+  # Audio-only test (use audio-decoder yaml)
+  python longcat_next_wired_e2e.py /model longcat_next_4gpu_80gb_audio.yaml /results --modality audio
 
-Run with: python longcat_next_wired_e2e.py <model_path> <deploy_yaml> <out_dir>
+  # Image-only test (use image+audio yaml; stage 2 is ignored)
+  python longcat_next_wired_e2e.py /model longcat_next_4gpu_80gb_image_audio.yaml /results --modality image
 """
 
+import argparse
 import json
 import os
 import sys
@@ -43,6 +45,7 @@ def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
     prompt = OmniTextPrompt(
         prompt=prompt_text,
         multi_modal_data={"audio": (audio_signal, sr)},
+        modalities=["audio"],
     )
 
     sampling_params = SamplingParams(
@@ -118,7 +121,11 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
         "<longcat_user>请生成一张图片，内容是一只猫。 "
         "<longcat_assistant><longcat_img_start>"
     )
-    prompt = OmniTextPrompt(prompt=prompt_text, multi_modal_data=None)
+    prompt = OmniTextPrompt(
+        prompt=prompt_text,
+        multi_modal_data=None,
+        modalities=["image"],
+    )
 
     sampling_params = SamplingParams(
         max_tokens=2048,
@@ -170,52 +177,43 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
 
 
 def main() -> None:
-    model_path = sys.argv[1]
-    deploy_yaml = sys.argv[2]
-    out_dir = sys.argv[3]
-    os.makedirs(out_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description="LongCat-Next wired e2e test")
+    parser.add_argument("model_path", help="Path to model")
+    parser.add_argument("deploy_yaml", help="Path to deploy config YAML")
+    parser.add_argument("out_dir", help="Output directory")
+    parser.add_argument("--modality", choices=["audio", "image"], default="audio",
+                        help="Modality to test (default: audio)")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
 
     llm = Omni(
-        model=model_path,
-        deploy_config=deploy_yaml,
+        model=args.model_path,
+        deploy_config=args.deploy_yaml,
         trust_remote_code=True,
     )
     num_stages = len(llm.stage_names) if hasattr(llm, "stage_names") else 3
 
-    results: dict = {}
-
-    # Test audio modality
     print("\n" + "=" * 60)
-    print("[wired] === Audio modality test ===")
+    print(f"[wired] === {args.modality.title()} modality test ===")
     print("=" * 60 + "\n")
-    audio_result = test_audio(model_path, llm, out_dir, num_stages)
-    results["audio"] = audio_result
-    print(f"\n[wired-audio] result: {json.dumps(audio_result, indent=2)}\n")
 
-    # Test image modality
-    print("\n" + "=" * 60)
-    print("[wired] === Image modality test ===")
-    print("=" * 60 + "\n")
-    image_result = test_image(model_path, llm, out_dir, num_stages)
-    results["image"] = image_result
-    print(f"\n[wired-image] result: {json.dumps(image_result, indent=2)}\n")
+    if args.modality == "audio":
+        result = test_audio(args.model_path, llm, args.out_dir, num_stages)
+    else:
+        result = test_image(args.model_path, llm, args.out_dir, num_stages)
+
+    print(f"\n[wired-{args.modality}] result: {json.dumps(result, indent=2)}\n")
 
     # Summary
     print("=" * 60)
-    print("[wired] === E2E Summary ===")
-    print(f"[wired] Audio: {audio_result.get('verdict', 'UNKNOWN')} ({audio_result.get('duration_s', 'N/A'):.2f}s)"
-          if audio_result.get("duration_s") else f"[wired] Audio: {audio_result.get('verdict', 'UNKNOWN')}")
-    print(f"[wired] Image: {image_result.get('verdict', 'UNKNOWN')}")
-    overall = all(
-        r.get("verdict", "FAIL").startswith("PASS")
-        for r in results.values()
-    )
-    results["overall"] = "PASS" if overall else "FAIL"
-    print(f"[wired] Overall: {results['overall']}")
+    print(f"[wired] === E2E Summary ===")
+    label = f"{result.get('duration_s', 0):.2f}s" if result.get("duration_s") else ""
+    print(f"[wired] {args.modality.title()}: {result.get('verdict', 'UNKNOWN')} {label}")
 
-    out_json = os.path.join(out_dir, "result.json")
+    out_json = os.path.join(args.out_dir, "result.json")
     with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(result, f, indent=2)
     print(f"[wired] wrote result metadata to {out_json}")
 
 
