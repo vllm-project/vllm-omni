@@ -356,7 +356,11 @@ class _ProjectedTransformer(nn.Module):
         self.downsample_ratio: int = 1
         self.in_proj = nn.Linear(input_dimension, d_model, bias=False) if input_dimension != d_model else nn.Identity()
         self.transformer = _Transformer(d_model=d_model, **kwargs)
-        self.out_proj = nn.Linear(d_model, output_dimension, bias=False) if output_dimension != d_model else nn.Identity()
+        self.out_proj = (
+            nn.Linear(d_model, output_dimension, bias=False)
+            if output_dimension != d_model
+            else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(x.transpose(1, 2))  # (B, D, T) → (B, T, d_model)
