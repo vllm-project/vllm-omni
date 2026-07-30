@@ -137,10 +137,7 @@ class MockStageResult:
             outputs = [SimpleNamespace(text=text, index=0)]
         else:
             outputs = []
-        self = SimpleNamespace(
-            outputs=outputs,
-            images=self.images,
-        )
+        self.outputs = outputs
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
