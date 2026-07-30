@@ -54,7 +54,7 @@ def test_audio(model_path: str, llm: Omni, out_dir: str) -> dict:
         detokenize=True,
     )
 
-    outputs = llm.generate([prompt], sampling_params)
+    outputs = llm.generate([prompt], [sampling_params] + [None] * (num_stages - 1))
     result["num_outputs"] = len(outputs)
 
     audio_decoder_out = None
@@ -127,7 +127,7 @@ def test_image(model_path: str, llm: Omni, out_dir: str) -> dict:
         detokenize=True,
     )
 
-    outputs = llm.generate([prompt], sampling_params)
+    outputs = llm.generate([prompt], [sampling_params] + [None] * (num_stages - 1))
     result["num_outputs"] = len(outputs)
 
     image_decoder_out = None
@@ -180,6 +180,7 @@ def main() -> None:
         deploy_config=deploy_yaml,
         trust_remote_code=True,
     )
+    num_stages = len(llm.stage_names) if hasattr(llm, "stage_names") else 3
 
     results: dict = {}
 
