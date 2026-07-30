@@ -239,11 +239,8 @@ def test_mammoth_moda2_dit_stage_enables_cache_backend(monkeypatch):
         is_enabled=Mock(return_value=True),
         refresh=Mock(),
     )
-    monkeypatch.setattr(
-        mammoth_model_module,
-        "get_cache_backend",
-        lambda *_args, **_kwargs: fake_backend,
-    )
+    get_cache_backend = Mock(return_value=fake_backend)
+    monkeypatch.setattr(mammoth_model_module, "get_cache_backend", get_cache_backend)
     wrapper = object.__new__(MammothModa2ForConditionalGeneration)
     nn.Module.__init__(wrapper)
     wrapper.model_stage = "dit"
@@ -251,15 +248,37 @@ def test_mammoth_moda2_dit_stage_enables_cache_backend(monkeypatch):
     wrapper.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             cache_backend="tea_cache",
-            cache_config={"rel_l1_thresh": 0.1},
+            cache_config='{"rel_l1_thresh": 0.1}',
         )
     )
 
     wrapper._maybe_enable_dit_cache_backend()
 
+    get_cache_backend.assert_called_once_with("tea_cache", {"rel_l1_thresh": 0.1})
     fake_backend.enable.assert_called_once_with(pipe)
     assert wrapper._dit_cache_backend is fake_backend
     assert pipe.cache_backend is fake_backend
+
+
+def test_mammoth_moda2_dit_stage_rejects_unsupported_cache_backend(monkeypatch):
+    pipe = _build_pipeline(monkeypatch)
+    get_cache_backend = Mock()
+    monkeypatch.setattr(mammoth_model_module, "get_cache_backend", get_cache_backend)
+    wrapper = object.__new__(MammothModa2ForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "dit"
+    wrapper.dit = pipe
+    wrapper.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            cache_backend="cache_dit",
+            cache_config={},
+        )
+    )
+
+    with pytest.raises(ValueError, match="MammothModa2.*only supports.*tea_cache.*cache_dit"):
+        wrapper._maybe_enable_dit_cache_backend()
+
+    get_cache_backend.assert_not_called()
 
 
 def test_mammoth_moda2_dit_stage_refreshes_cache_from_sampling_steps(monkeypatch):

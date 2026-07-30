@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable, Mapping
 from itertools import islice
 from typing import Any
@@ -945,9 +946,17 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         cache_backend_name = getattr(model_config, "cache_backend", None)
         if cache_backend_name in (None, "", "none"):
             return
+        if cache_backend_name not in {"tea_cache"}:
+            raise ValueError(f"MammothModa2 DiT only supports cache_backend='tea_cache'; got {cache_backend_name!r}.")
 
         cache_config = getattr(model_config, "cache_config", None)
-        if cache_config is None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid MammothModa2 DiT cache_config JSON, using defaults.")
+                cache_config = {}
+        elif cache_config is None:
             cache_config = {}
 
         cache_backend = get_cache_backend(cache_backend_name, cache_config)
