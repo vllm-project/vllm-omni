@@ -31,6 +31,20 @@ from vllm_omni.experimental.fullduplex.client import build_realtime_url
 pytestmark = pytest.mark.omni
 
 
+def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
+    assert isinstance(metrics, list)
+    assert len(metrics) == expected_count
+    for request_index, request in enumerate(metrics):
+        assert isinstance(request["session_id"], str)
+        assert request["request_index"] == request_index
+        assert isinstance(request["response_id"], str)
+        assert request["ttft_ms"] is not None and request["ttft_ms"] >= 0
+        assert request["ttfp_ms"] >= 0
+        assert request["rtf"] is not None and request["rtf"] >= 0
+        assert request["audio_generation_ms"] >= 0
+        assert request["audio_duration_ms"] > 0
+
+
 async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
     async def receive() -> list[dict[str, object]]:
         events: list[dict[str, object]] = []
@@ -103,22 +117,21 @@ def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_single_session_response_required(omni_server, model_prefix: str, tmp_path: Path) -> None:
-    result = asyncio.run(
-        run_demo(
-            demo_args(
-                omni_server=omni_server,
-                input_wav=validated_input_wav(),
-                ref_audio=resolve_ref_audio(model_prefix),
-                output_dir=tmp_path / "single_session",
-            )
-        )
+    args = demo_args(
+        omni_server=omni_server,
+        input_wav=validated_input_wav(),
+        ref_audio=resolve_ref_audio(model_prefix),
+        output_dir=tmp_path / "single_session",
     )
+    args.turns = 2
+    result = asyncio.run(run_demo(args))
     assert result["ok"] is True
     assert result["audio_delta_count"] > 0
-    assert result["done_count"] == 1
+    assert result["done_count"] == 2
     assert result["error_count"] == 0
     assert result["all_audio_responses_have_transcript"] is True
     assert result["transcript_delta_done_ok"] is True
+    _assert_request_metrics(result["request_metrics"], expected_count=2)
 
 
 @pytest.mark.advanced_model
@@ -144,3 +157,5 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str,
     assert all(session["audio_delta_count"] > 0 for session in result["sessions"])
     assert all(session["done_count"] == 1 for session in result["sessions"])
     assert all(session["error_count"] == 0 for session in result["sessions"])
+    for session in result["sessions"]:
+        _assert_request_metrics(session["request_metrics"], expected_count=1)

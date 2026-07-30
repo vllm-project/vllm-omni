@@ -6,13 +6,20 @@ Unit tests for patch.py
 """
 
 import asyncio
+import base64
 import json
+import time
 
 import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    async_request_openai_chat_omni_completions,
+    async_request_openai_realtime_duplex,
+)
+from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -38,6 +45,113 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
+    class FakeRealtimeClient:
+        def __init__(self, url):
+            assert url == "ws://localhost:8000/v1/realtime"
+            self.events = RealtimeEventCollector()
+            self.configure_kwargs = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def configure(self, model, **kwargs):
+            assert model == "openbmb/MiniCPM-o-4_5"
+            self.configure_kwargs = kwargs
+
+        async def stream_pcm16(self, pcm16, **_kwargs):
+            assert len(pcm16) == 32_000
+
+        async def commit(self):
+            now = time.monotonic()
+            self.events.add(
+                {"type": "response.created", "response": {"id": "resp-1"}},
+                received_at_s=now + 0.01,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": "resp-1",
+                    "delta": "hello",
+                },
+                received_at_s=now + 0.02,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-1",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {"audio_duration_ms": 100},
+                },
+                received_at_s=now + 0.03,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": "resp-1"}},
+                received_at_s=now + 0.04,
+            )
+
+        async def acknowledge_playback(self):
+            return None
+
+        async def close_session(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "vllm_omni.benchmarks.patch.patch.RealtimeDuplexClient",
+        FakeRealtimeClient,
+    )
+    request_input = RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="hello",
+        api_url="http://localhost:8000/v1/realtime",
+        prompt_len=1,
+        output_len=20,
+        logprobs=None,
+        multi_modal_content=None,
+        ignore_eos=False,
+        extra_body={"save_duplex_request_metrics": True},
+    )
+    request_input.seed_tts_speech_extra = {"ref_audio": "data:audio/wav;base64,AAAA"}
+    request_input.seed_tts_system_prompt = "Speak exactly."
+
+    output = await async_request_openai_realtime_duplex(
+        request_input,
+        session=None,
+    )
+
+    assert output.success is True
+    assert output.generated_text == "hello"
+    assert output.audio_duration == pytest.approx(0.1)
+    assert output.ttft > 0
+    assert output.audio_ttfp > output.ttft
+    assert output.audio_rtf > 0
+    assert output.latency > 0
+    assert output.duplex_request_metrics == [
+        {
+            "session_id": output.duplex_request_metrics[0]["session_id"],
+            "request_index": 0,
+            "response_id": "resp-1",
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+            "ttft_ms": pytest.approx(20.0, abs=2.0),
+            "ttfp_ms": pytest.approx(30.0, abs=2.0),
+            "rtf": pytest.approx(0.3, abs=0.03),
+            "audio_generation_ms": pytest.approx(30.0, abs=2.0),
+            "audio_duration_ms": 100.0,
+        }
+    ]
 
 
 def create_sse_chunk(data_dict):

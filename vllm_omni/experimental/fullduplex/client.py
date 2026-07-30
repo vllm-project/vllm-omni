@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from vllm_omni.metrics.definitions import compute_audio_rtf
+
 try:
     import websockets
     from websockets.exceptions import ConnectionClosed
@@ -209,6 +211,7 @@ class RealtimeEventCollector:
         """Summarize engine token metrics and client-observed audio cadence."""
         stage0_metrics: dict[str, object] | None = None
         response_created_at_s: float | None = None
+        first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
         cumulative_audio_ms: list[float] = []
         for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
@@ -219,6 +222,18 @@ class RealtimeEventCollector:
                 continue
             if event.get("type") == "response.created" and response_created_at_s is None:
                 response_created_at_s = received_at_s
+            if (
+                event.get("type")
+                in {
+                    "response.audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
 
             stage_metrics = _event_stage_metrics(event)
             stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
@@ -283,6 +298,44 @@ class RealtimeEventCollector:
                 "chunk_duration_ms": _interval_summary(chunk_durations_ms),
                 "max_chunk_gap_ms": interval_summary["max"],
             }
+            request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
+            if request_started_at_s is not None:
+                audio_duration_ms = (
+                    max(cumulative_audio_ms)
+                    if cumulative_audio_ms
+                    else len(self.audio_bytes(response_id))
+                    * 1000.0
+                    / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
+                )
+                audio_generation_ms = max(
+                    0.0,
+                    (audio_received_at_s[-1] - request_started_at_s) * 1000.0,
+                )
+                result["request_metrics"] = {
+                    "source": "client_monotonic_receive",
+                    "measurement_origin": {
+                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                    },
+                    "ttft_ms": (
+                        _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                        if first_text_received_at_s is not None
+                        else None
+                    ),
+                    "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
+                    "rtf": round(
+                        compute_audio_rtf(
+                            audio_generation_ms / 1000.0,
+                            audio_duration_ms / 1000.0,
+                        ),
+                        6,
+                    )
+                    if audio_duration_ms > 0
+                    else None,
+                    "audio_generation_ms": _rounded_ms(audio_generation_ms),
+                    "audio_duration_ms": _rounded_ms(audio_duration_ms),
+                }
         return result
 
 
@@ -332,6 +385,8 @@ class RealtimeDuplexClient:
         *,
         output_audio_format: str = "pcm16",
         ref_audio: str | None = None,
+        instructions: str | None = None,
+        initial_user_text: str | None = None,
         session_id: str | None = None,
         timeout_s: float = 20.0,
     ) -> None:
@@ -351,6 +406,12 @@ class RealtimeDuplexClient:
         }
         if ref_audio is not None:
             session["ref_audio"] = ref_audio
+        if instructions is not None:
+            session["instructions"] = instructions
+        if initial_user_text is not None:
+            extra_body = session["extra_body"]
+            assert isinstance(extra_body, dict)
+            extra_body["duplex_initial_user_text"] = initial_user_text
         if session_id:
             session["session_id"] = session_id
         await self.send({"type": "session.update", "session": session})
