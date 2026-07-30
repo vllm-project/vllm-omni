@@ -370,6 +370,31 @@ class RealtimeConnection(VllmRealtimeConnection):
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
 
+    @staticmethod
+    def _close_assistant_turn(tokenizer, assistant_token_ids: list[int]) -> list[int]:
+        """Terminate the model's tool-call turn with `<|im_end|>\\n` before a
+        tool-result turn is appended.
+
+        The tool-result suffix opens with `<|im_start|>user`, but the raw generated
+        token ids stop at the tool call without the closing `<|im_end|>` that the
+        chat template would emit. Splicing them directly yields
+        `</tool_call><|im_start|>user`, leaving the assistant turn open - a
+        malformed conversation the thinker responds to by re-emitting the same tool
+        call instead of answering, looping until something bounds it. The reference
+        HF path answers the identical prompt because `apply_chat_template` closes
+        the turn. Idempotent: only the missing pieces are added.
+        """
+        ids = list(assistant_token_ids)
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if im_end_id in (None, getattr(tokenizer, "unk_token_id", None)):
+            return ids  # unexpected tokenizer; leave the splice untouched
+        if im_end_id not in ids[-2:]:
+            ids.append(im_end_id)
+        if newline_ids and ids[-len(newline_ids) :] != newline_ids:
+            ids.extend(newline_ids)
+        return ids
+
     async def _await_tool_results_and_continue(
         self,
         prior_prompt_token_ids: list[int],
@@ -430,7 +455,9 @@ class RealtimeConnection(VllmRealtimeConnection):
         base_prompt = self._turn_prompt or {}
         base_token_ids = list(base_prompt.get("prompt_token_ids") or prior_prompt_token_ids)
         multi_modal_data = base_prompt.get("multi_modal_data")
-        continuation_token_ids = base_token_ids + list(assistant_token_ids) + tokenizer.encode(suffix_text)
+        continuation_token_ids = (
+            base_token_ids + self._close_assistant_turn(tokenizer, assistant_token_ids) + tokenizer.encode(suffix_text)
+        )
 
         # Advance the base so a chained tool call next round splices onto this
         # turn's full history while the audio stays attached exactly once, at the

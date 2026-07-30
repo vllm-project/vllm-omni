@@ -210,3 +210,52 @@ class TestRenderTokenPromptReattachesAudio:
 
         assert conn._turn_prompt["prompt_token_ids"] == [10, 11]
         assert conn._turn_prompt["multi_modal_data"] is audio
+
+
+class TestCloseAssistantTurnBeforeToolResult:
+    """Regression test for a real bug: the tool-result suffix opens with
+    `<|im_start|>user`, but the raw generated token ids stop at the tool call
+    without the `<|im_end|>` the chat template would emit. Splicing them
+    directly produced `</tool_call><|im_start|>user`, leaving the assistant turn
+    open. The thinker answered that malformed conversation by re-emitting the
+    same tool call, looping until something bounded it - while the reference HF
+    path (apply_chat_template, which closes the turn) answered the identical
+    prompt correctly. Verified against a live Qwen3-Omni realtime session:
+    tool results that previously looped 8+ times now answer in one round, with
+    wording matching the reference implementation."""
+
+    class _Tok:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            assert token == "<|im_end|>"
+            return 151645
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            assert text == "\n"
+            return [198]
+
+    def test_appends_terminator_and_newline(self) -> None:
+        out = RealtimeConnection._close_assistant_turn(self._Tok(), [1, 2, 3])
+        assert out == [1, 2, 3, 151645, 198]
+
+    def test_adds_only_newline_when_terminator_present(self) -> None:
+        out = RealtimeConnection._close_assistant_turn(self._Tok(), [1, 2, 151645])
+        assert out == [1, 2, 151645, 198]
+
+    def test_is_idempotent_when_already_closed(self) -> None:
+        out = RealtimeConnection._close_assistant_turn(self._Tok(), [1, 151645, 198])
+        assert out == [1, 151645, 198]
+
+    def test_does_not_mutate_caller_list(self) -> None:
+        original = [1, 2, 3]
+        RealtimeConnection._close_assistant_turn(self._Tok(), original)
+        assert original == [1, 2, 3]
+
+    def test_unknown_terminator_leaves_splice_untouched(self) -> None:
+        class _Bad(self._Tok().__class__):
+            def convert_tokens_to_ids(self, token: str) -> int:
+                return 0  # == unk_token_id
+
+        out = RealtimeConnection._close_assistant_turn(_Bad(), [1, 2, 3])
+        assert out == [1, 2, 3]
