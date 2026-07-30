@@ -24,8 +24,6 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
-    load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 

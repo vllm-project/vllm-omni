@@ -96,6 +96,18 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
         "and matches official separate video/audio streams.",
     )
     group.add_argument(
+        "--daily-omni-pack-mode",
+        type=str,
+        choices=["qwen", "minicpm-interleave"],
+        default="qwen",
+        help="How to pack multimodal parts into OpenAI chat messages. "
+        "'qwen' (default): one video_url + one audio_url (Daily-Omni/Qwen protocol). "
+        "'minicpm-interleave': MiniCPM-o official recipe — 1fps frames interleaved with "
+        "matching 1s audio segments as image_url/audio_url pairs (needed to approach "
+        "OpenBMB ~80%% Daily-Omni; requires local Videos extract). For MiniCPM-o 4.5 "
+        "string chat templates also start the server with --interleave-mm-strings.",
+    )
+    group.add_argument(
         "--daily-omni-save-eval-items",
         action="store_true",
         default=False,
