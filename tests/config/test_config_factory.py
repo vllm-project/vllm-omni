@@ -2164,6 +2164,17 @@ class TestBaseConfigInheritance:
 class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
+    def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[0].enforce_eager is None
+        assert base.stages[1].enforce_eager is False
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[0].enforce_eager is None
+        assert rocm.stages[1].enforce_eager is True
+
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         if not deploy_path.exists():
