@@ -3,6 +3,7 @@
 import os
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -321,7 +322,11 @@ class TestResolveModelConfigPath:
     def test_uses_registry_default_deploy_when_hf_model_type_differs(
         self,
         mocker: MockerFixture,
+        tmp_path,
     ):
+        from vllm_omni.config.stage_config import _DEPLOY_DIR as real_deploy_dir
+        from vllm_omni.entrypoints import utils as utils_mod
+
         hf_config = SimpleNamespace(
             model_type="minicpmo",
             architectures=["MiniCPMO"],
@@ -336,11 +341,17 @@ class TestResolveModelConfigPath:
             "vllm_omni.config.config_factory.get_config",
             return_value=hf_config,
         )
+        # A bare deploy/<hf_model_type>.yaml must not win over the registered
+        # pipeline default when HF model_type is not an OMNI_PIPELINES key.
+        (tmp_path / "minicpmo.yaml").write_text("stages: []\n", encoding="utf-8")
+        (tmp_path / "minicpmo_4_5.yaml").write_bytes((real_deploy_dir / "minicpmo_4_5.yaml").read_bytes())
+        mocker.patch.object(utils_mod, "_DEPLOY_DIR", tmp_path)
 
         result = resolve_model_config_path(model)
 
         assert result is not None
-        assert result.endswith("vllm_omni/deploy/minicpmo_4_5.yaml")
+        assert Path(result).as_posix().endswith("minicpmo_4_5.yaml")
+        assert Path(result).name == "minicpmo_4_5.yaml"
         transfer_config = load_omni_transfer_config_for_model(model, result)
         assert transfer_config is not None
 
