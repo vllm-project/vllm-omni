@@ -100,6 +100,10 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
+# audex_omni covers the audex_s2s S2S deployment, whose
+# TTS pass uses the same /v1/audio/speech surface.
+_AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
+_AUDEX_TTA_MODEL_STAGES = {"audex_tta_thinker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -117,6 +121,8 @@ _TTS_MODEL_STAGES: set[str] = (
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
+    | _AUDEX_TTS_MODEL_STAGES
+    | _AUDEX_TTA_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -127,7 +133,13 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2",
+    "audex",
+    "audex_tta",
 }
+# Audex contract: zero-codec / invalid generations arrive as empty terminal
+# payloads and must fail the request, never serialize as a successful empty
+# WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
+_AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
 _TTS_LANGUAGES = frozenset(
     {
         "Auto",
@@ -493,6 +505,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
+        self._audex_tokenizer = None
+        self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
@@ -673,12 +687,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _find_tts_stage(self):
         """Find and return the TTS stage config, or None if not found."""
+        all_stages = {getattr(stage.engine_args, "model_stage", None) for stage in self.engine_client.stage_configs}
         for stage in self.engine_client.stage_configs:
             engine_args = stage.engine_args
             model_stage = engine_args.model_stage
             model_arch = getattr(engine_args, "model_arch", None)
             worker_type = getattr(engine_args, "worker_type", None)
             if model_stage in _TTS_MODEL_STAGES:
+                # The audio-capable Audex thinker is only speech-capable when
+                # deployed WITH the speech decoder (audex_s2s);
+                # the thinker-only deployment is text-final and must not
+                # accept /v1/audio/speech requests.
+                if model_stage == "audex_omni" and "audex_code2wav" not in all_stages:
+                    continue
                 return stage
             # Ming dense identifies its AR entry stage by architecture because
             # it does not use a dedicated TTS model_stage value.
@@ -729,6 +750,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "step_audio2"
         if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
             return "indextts2"
+        if model_stage in _AUDEX_TTS_MODEL_STAGES:
+            return "audex"
+        if model_stage in _AUDEX_TTA_MODEL_STAGES:
+            return "audex_tta"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -807,7 +832,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
                 # Default is qwen3_tts path
-                config = self.engine_client.model_config.hf_config.talker_config
+                config = getattr(self.engine_client.model_config.hf_config, "talker_config", None)
+                if config is None:
+                    return set()
 
             # Check for speakers in either spk_id or speaker_id
             for attr_name in ["spk_id", "speaker_id"]:
@@ -1739,7 +1766,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # headline improvement is multilingual synthesis when the language is
         # given (build_user_message(..., language=...)); 1.0 ignores it
         # gracefully. Sound-effect output is non-verbal, so skip it there.
-        if v in ("tts", "ttsd", "voice_generator") and getattr(request, "language", None):
+        if v in ("tts", "local", "ttsd", "voice_generator") and getattr(request, "language", None):
             user_kwargs["language"] = request.language
 
         # Build the unified-codes prompt: (L, 1+n_vq) where col 0 is text/special
@@ -2124,37 +2151,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             waveform = resample_audio(waveform, int(sample_rate), SAMPLE_RATE)
         return waveform
 
-    def _build_ming_prompt_waveform(
+    def _build_ming_reference_waveforms(
         self,
         ref_audio_data: tuple[list[float], int] | list[tuple[list[float], int]] | None,
-    ):
-        if isinstance(ref_audio_data, list):
-            return torch.cat(
-                [self._coerce_ming_prompt_waveform(item[0], item[1]) for item in ref_audio_data],
-                dim=-1,
-            )
-        if ref_audio_data is not None:
-            return self._coerce_ming_prompt_waveform(ref_audio_data[0], ref_audio_data[1])
-        return None
-
-    def _extract_ming_speaker_embeddings_from_ref_audio(
-        self,
-        ref_audio_data_list: list[tuple[list[float], int]],
-    ) -> list[list[float]]:
-        from vllm_omni.model_executor.models.ming_tts.speaker_extractor import MingSpeakerEmbeddingExtractor
-
-        extractor = MingSpeakerEmbeddingExtractor(self.engine_client.model_config.model, target_sr=16000)
-        embeddings = []
-        for wav_samples, sr in ref_audio_data_list:
-            waveform = torch.as_tensor(wav_samples, dtype=torch.float32).reshape(1, -1)
-            embedding = extractor.extract_from_waveform(waveform, int(sr))
-            flat = embedding.detach().reshape(-1).to(torch.float32).cpu()
-            if int(flat.numel()) != SPEAKER_EMBEDDING_DIM:
-                raise ValueError(
-                    f"Ming speaker extractor returned {int(flat.numel())} dims; expected {SPEAKER_EMBEDDING_DIM}"
-                )
-            embeddings.append(flat.tolist())
-        return embeddings
+    ) -> tuple[list[torch.Tensor], list[int]]:
+        if ref_audio_data is None:
+            return [], []
+        items = ref_audio_data if isinstance(ref_audio_data, list) else [ref_audio_data]
+        waveforms = [torch.as_tensor(samples, dtype=torch.float32).reshape(1, -1) for samples, _ in items]
+        sample_rates = [int(sample_rate) for _, sample_rate in items]
+        if any(sample_rate <= 0 for sample_rate in sample_rates):
+            raise ValueError(f"Ming reference audio sample rates must be positive, got {sample_rates}")
+        return waveforms, sample_rates
 
     def _parse_ming_instruction_fields(
         self,
@@ -2197,11 +2205,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         *,
         ref_audio_data: tuple[list[float], int] | list[tuple[list[float], int]] | None = None,
+        voice_name: str | None = None,
+        voice_created_at: int = 0,
     ) -> dict[str, Any]:
         """Build a Ming dense prompt directly from the OpenAI speech request."""
         from transformers import AutoTokenizer
 
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_MAX_DECODE_STEPS
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            KEY_MAX_DECODE_STEPS,
+            KEY_SPEAKER_SAMPLE_RATES,
+            KEY_SPEAKER_WAVEFORM,
+            KEY_SPEAKER_WAVEFORM_LENGTHS,
+        )
         from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 
         if self._tts_tokenizer is None:
@@ -2210,9 +2225,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
         ref_text = request.ref_text
-        prompt_waveform = self._build_ming_prompt_waveform(ref_audio_data) if ref_text is not None else None
+        reference_waveforms, reference_sample_rates = self._build_ming_reference_waveforms(ref_audio_data)
+        reference_waveform = torch.cat(reference_waveforms, dim=-1) if reference_waveforms else None
+        prompt_waveforms = (
+            [
+                self._coerce_ming_prompt_waveform(waveform, sample_rate)
+                for waveform, sample_rate in zip(reference_waveforms, reference_sample_rates, strict=True)
+            ]
+            if ref_text is not None
+            else []
+        )
+        prompt_waveform = torch.cat(prompt_waveforms, dim=-1) if prompt_waveforms else None
         speaker_embedding = request.speaker_embedding
-        use_zero_spk_emb = prompt_waveform is None and speaker_embedding is None
+        pending_speaker_extraction = speaker_embedding is None and reference_waveform is not None
+        use_zero_spk_emb = not pending_speaker_extraction and prompt_waveform is None and speaker_embedding is None
 
         runtime_controls = {}
         if request.max_new_tokens is not None:
@@ -2229,8 +2255,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt_text=ref_text,
             prompt_waveform=prompt_waveform,
             speaker_embedding=speaker_embedding,
+            speaker_count=len(reference_waveforms) if pending_speaker_extraction else None,
             use_zero_spk_emb=use_zero_spk_emb,
         )
+        additional_information = prompt_dict["additional_information"]
+        if pending_speaker_extraction:
+            additional_information[KEY_SPEAKER_WAVEFORM] = reference_waveform
+            additional_information[KEY_SPEAKER_WAVEFORM_LENGTHS] = torch.tensor(
+                [int(waveform.shape[-1]) for waveform in reference_waveforms],
+                dtype=torch.int32,
+            )
+            additional_information[KEY_SPEAKER_SAMPLE_RATES] = torch.tensor(
+                reference_sample_rates,
+                dtype=torch.int32,
+            )
+            if voice_name:
+                additional_information["voice_name"] = voice_name
+                additional_information["voice_created_at"] = int(voice_created_at)
         prompt = tokens_input(prompt_token_ids=prompt_dict["prompt_token_ids"])
         prompt["prompt"] = prompt_dict["prompt"]
         prompt["text"] = prompt_dict["text"]
@@ -2304,6 +2345,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(chunk_np)) == 0:
+                        # Zero-size chunks must not emit a WAV header or count
+                        # as first audio; the post-loop guard below needs to
+                        # see an audio-less stream to fail the request.
+                        continue
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -2335,6 +2381,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         yield audio_bytes, sample_rate_val
                     else:
                         yield audio_bytes
+            if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and first_audio_chunk_s is None:
+                # Audex contract: zero codec tokens must abort the stream, not
+                # complete it cleanly with zero audio bytes.
+                raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -2808,6 +2858,140 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return {"prompt_token_ids": prompt_ids}
 
+    def _get_audex_tokenizer(self):
+        """Load (once per process) the Audex thinker tokenizer for CFG/TTA prompts.
+
+        The folder follows the serving stage: the full-pipeline thinker
+        (``audex_omni``) tokenizes with ``checkpoint_folder_full``; the TTS
+        and TTA thinkers use ``checkpoint_folder_audiogen``.
+        """
+        if self._audex_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+            stage = getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            if stage == "audex_omni":
+                profile, folder = "full", "checkpoint_folder_full"
+            elif stage == "audex_tta_thinker":
+                profile, folder = "tta", "checkpoint_folder_audiogen"
+            else:
+                profile, folder = "tts", "checkpoint_folder_audiogen"
+            # The serving model_config may already hold the RESOLVED per-stage
+            # checkpoint folder (stage init joins model_subdir onto the
+            # snapshot root); joining again would produce a non-existent path
+            # that transformers then mistakes for a repo id.
+            model_path = os.path.normpath(self.engine_client.model_config.model)
+            if os.path.basename(model_path).startswith("checkpoint_folder"):
+                root = os.path.dirname(model_path)
+            else:
+                root = ensure_audex_snapshot(model_path, profile=profile)
+            self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
+        return self._audex_tokenizer
+
+    def _inject_audex_tta_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+        """Complete the Audex TTA contract on a CLONE of the stage-0 params.
+
+        Always attaches the RVQ phase-mask contract (required for token
+        validity) and the CFG pair contract at the official default scale
+        3.0 unless the caller passed ``cfg_scale`` (1.0 disables guidance).
+
+        Returns the cloned params; the input is never mutated. On the
+        no-extra_params online path the input is an element of the engine's
+        SHARED ``default_sampling_params_list`` — writing per-request pair
+        state (``cfg_pair_id``/``cfg_null_prompt``) into it would race
+        concurrent requests and leak stale CFG metadata into later ones.
+        """
+        import copy
+
+        from vllm_omni.model_executor.models.audex.prompt import build_tta_null_prompt
+        from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
+
+        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
+        if not isinstance(cond_prompt, str) or not cond_prompt:
+            raise ValueError("Audex TTA requires the adapter-built caption prompt")
+
+        stage0_params = copy.deepcopy(stage0_params)
+        tokenizer = self._get_audex_tokenizer()
+        if self._audex_tta_rvq is None:
+            phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
+            self._audex_tta_rvq = {
+                "phase_token_ids": phase_token_ids,
+                "start_tid": start_tid,
+                "end_tid": end_tid,
+                # Official generation cap (decode truncates at 500 frames).
+                "codec_cap": 4000,
+                # The TTA prompt ends with <audiogen_start>.
+                "start_in_prompt": True,
+            }
+
+        extra_args = getattr(stage0_params, "extra_args", None)
+        if extra_args is None:
+            extra_args = {}
+            stage0_params.extra_args = extra_args
+        extra_args["tta_rvq"] = self._audex_tta_rvq
+
+        cfg_scale = extra_args.get("cfg_scale")
+        cfg_scale = 3.0 if cfg_scale is None else float(cfg_scale)
+        if cfg_scale <= 1.0:
+            extra_args.pop("cfg_scale", None)
+            return stage0_params
+        extra_args.update(
+            {
+                "cfg_scale": cfg_scale,
+                "cfg_role": "cond",
+                "cfg_pair_id": request_id,
+                "cfg_null_prompt": build_tta_null_prompt(cond_prompt, tokenizer),
+            }
+        )
+        return stage0_params
+
+    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+        """Complete the Audex CFG contract on a CLONE of the stage-0 params.
+
+        The adapter validated ``cfg_scale``; here (where the final request id
+        exists) the cond role, pair id, and the length-matched null prompt are
+        attached. ``cfg_scale`` absent/1.0 returns a clone value-identical to
+        the non-CFG flow (the key is dropped rather than forwarded).
+
+        Returns the cloned params; the input is never mutated (it may be an
+        element of the engine's shared ``default_sampling_params_list`` —
+        see ``_inject_audex_tta_args``).
+        """
+        import copy
+
+        stage0_params = copy.deepcopy(stage0_params)
+        extra_args = getattr(stage0_params, "extra_args", None)
+        if not extra_args or extra_args.get("cfg_scale") is None:
+            if extra_args:
+                extra_args.pop("cfg_scale", None)
+            return stage0_params
+        cfg_scale = float(extra_args["cfg_scale"])
+        if cfg_scale <= 1.0:
+            extra_args.pop("cfg_scale", None)
+            return stage0_params
+
+        from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
+
+        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
+        if not isinstance(cond_prompt, str) or not cond_prompt:
+            raise ValueError("Audex CFG requires the adapter-built text prompt")
+        null_prompt = build_null_prompt(cond_prompt, self._get_audex_tokenizer())
+        extra_args.update(
+            {
+                "cfg_scale": cfg_scale,
+                "cfg_role": "cond",
+                "cfg_pair_id": request_id,
+                "cfg_null_prompt": null_prompt,
+            }
+        )
+        # Guided decoding sharpens the distribution; the unguided default
+        # temperature (0.1) adds excess sampling noise under CFG. Measured
+        # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
+        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
+        stage0_params.temperature = 0.05
+        return stage0_params
+
     def _apply_cosyvoice3_dynamic_tokens(
         self,
         sampling_params_list: list,
@@ -3191,6 +3375,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list[0].extra_args.update(request.extra_params)
             logger.info("Applied extra_params: %s", request.extra_params)
 
+        # Audex CFG: turn an adapter-validated cfg_scale into the engine-side
+        # pair contract. This must run here (not in the adapter) because the
+        # pair id is the final request_id, which the adapter never sees.
+        # The injectors return a CLONE: without extra_params above,
+        # sampling_params_list still holds the engine's shared default params,
+        # which must never carry per-request CFG state.
+        if self._tts_model_type == "audex" and sampling_params_list:
+            sampling_params_list[0] = self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
+        elif self._tts_model_type == "audex_tta" and sampling_params_list:
+            sampling_params_list[0] = self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
+
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only
         # override it when the caller explicitly requests max_new_tokens.
@@ -3390,6 +3585,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.squeeze()
+
+            if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(audio_tensor)) == 0:
+                # Audex contract: zero codec tokens must fail the request, not
+                # serialize as an empty-but-successful WAV.
+                raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

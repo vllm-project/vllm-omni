@@ -30,8 +30,6 @@ also provided.
   `hf_config.version="4.5"`):
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Recommended 2-GPU continuous-batching layout:
-    [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
   - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
@@ -68,7 +66,7 @@ Code2Wav consumes them through a shared-memory async connector.
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
 request-local codec generation and Code2Wav owns waveform state and
 reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
-single-GPU entry point; `minicpmo_4_5_batching.yaml` is the recommended
+single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
 
@@ -79,9 +77,9 @@ a fallback because it would duplicate state machines and correctness paths.
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
-`gpu_memory_utilization` budgets are 0.65, 0.15, and 0.15. This layout
-minimizes the GPU count; use a large-memory accelerator and leave the
-remaining 5% for runtime overhead.
+`gpu_memory_utilization` budgets are 0.55, 0.22, and 0.22. All stages admit
+up to four sequences. Startup video profiling is bounded to 32 frames per
+video. Use the two-GPU profile for production throughput.
 
 #### Environment
 
@@ -105,7 +103,7 @@ The deploy config is auto-loaded by the model registry — no
 For the recommended two-GPU layout, add:
 
 ```bash
---deploy-config vllm_omni/deploy/minicpmo_4_5_batching.yaml
+--deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
 
 #### Performance comparison
@@ -175,16 +173,18 @@ in another choice's `message.audio.data` (24 kHz mono, see Notes). With
 `modalities: ["text", "audio"]` you typically get two `choices` entries
 (one text, one audio).
 
-**Streaming text + speech**:
+**Streaming text + speech** (use `--stream`):
 
 ```bash
-python examples/online_serving/minicpmo/streaming_chat_completion.py \
-    --base-url http://localhost:8099/v1 \
-    --output minicpmo_stream.wav
+python examples/online_serving/minicpmo/openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Say hello, then introduce vLLM in one sentence." \
+    --port 8099 \
+    --stream
 ```
 
-The client prints text deltas as they arrive and reconstructs one valid WAV
-from the independently encoded audio deltas.
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
 
 **Gradio demo (text + image + audio + video UI)**:
 
@@ -202,8 +202,8 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: Thinker, Talker, and Code2Wav reserve 0.65, 0.15, and
-  0.15 of GPU 0. The larger Thinker share protects its multimodal KV cache;
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.22, and
+  0.22 of GPU 0. The larger Thinker share protects its multimodal KV cache;
   all three model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
@@ -214,6 +214,9 @@ speech output (TTS)"** checkbox on / off.
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
   exact-shape-compatible chunks and does not fall back to serial decode.
+- `limit_mm_per_prompt.video.num_frames: 32` bounds startup dummy profiling,
+  not runtime media decoding. Use `media_io_kwargs.video.num_frames` when a
+  matching URL/file video sampling limit is required.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1

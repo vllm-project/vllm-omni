@@ -348,9 +348,16 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
-        overlap = int(window.shape[0] // 2)
+        overlap = min(
+            int(window.shape[0] // 2),
+            int(speech.shape[-1]),
+            int(previous.shape[-1]),
+        )
         result = speech.clone()
-        result[..., :overlap] = result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[overlap:]
+        if overlap > 0:
+            result[..., :overlap] = (
+                result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
+            )
         return result
 
     def decode_batch(
@@ -360,6 +367,7 @@ class BatchedToken2Wav(nn.Module):
         states: list[BatchedToken2WavState],
         *,
         last_chunk: bool,
+        flush_encoder: bool = False,
     ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
         batch_size = int(tokens.shape[0])
         if batch_size != len(states):
@@ -382,7 +390,7 @@ class BatchedToken2Wav(nn.Module):
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
-                last_chunk=last_chunk,
+                last_chunk=last_chunk or flush_encoder,
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )

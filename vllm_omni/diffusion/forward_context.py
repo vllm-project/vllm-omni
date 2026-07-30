@@ -32,6 +32,7 @@ class ForwardContext:
     denoise_step_idx: int | None = None
     # Optional request-scoped handler for acceleration-neutral model regions.
     model_region_handler: ModelRegionHandler | None = None
+    denoise_timestep: float | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -220,6 +221,21 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+class DenoiseProgressMixin:
+    def record_denoise_step(
+        self,
+        step_idx: int | None,
+        timestep=None,
+        scheduler=None,
+    ) -> None:
+        set_forward_context_denoise_step_idx(step_idx)
+        if timestep is None or _forward_context is None:
+            return
+        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
+        ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
+        _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
