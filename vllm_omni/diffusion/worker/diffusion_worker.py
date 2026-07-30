@@ -844,12 +844,10 @@ class WorkerProc:
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
-            # Flush all streams (including NCCL all_reduce for tensor parallelism)
-            # before recording the event. Without this, the event can fire before
-            # the last TP all_reduce has committed its results to GPU memory,
-            # causing the async D2H copy to capture stale values for the last
-            # image tokens (manifests as noise at the bottom of the output image).
-            current_omni_platform.synchronize()
+            # On XPU, flush all streams (including TP collectives) before
+            # recording the event so async D2H does not capture stale tail tokens.
+            if current_omni_platform.is_xpu():
+                current_omni_platform.synchronize()
             gpu_event = current_omni_platform.record_device_event()
             self._async_output_queue.put((output, async_output_id, gpu_event))
             msg = AsyncDiffusionOutput(
