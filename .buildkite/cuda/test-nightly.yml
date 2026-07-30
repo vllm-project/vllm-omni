@@ -432,9 +432,14 @@ steps:
         commands:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
-          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_one_stage_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_video_streaming_output_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
+
+      - label: ":full_moon: Diffusion X2V · LTX Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Perf Test"
         key: nightly-diffusion-x2v-performance
