@@ -129,11 +129,14 @@ def build_ar_stage_inputs(
     """Resolve HunyuanImage-3.0 AR-stage inputs declaratively.
 
     Invoked generically by the shared task examples (``text_to_image`` /
-    ``image_to_image`` / understanding / chat) whenever the model declares an
+    ``image_to_image`` / ``x_to_text``) whenever the model declares an
     ``ar_input_builder``. All model-specific knobs (``bot_task`` /
     ``use_system_prompt`` / ``system_prompt``) arrive via ``extra_body``, so
     the example itself stays model-agnostic. The heavy lifting is delegated to
-    :func:`build_ar_prompt_inputs`, the same seam the OpenAI server uses.
+    :func:`build_ar_prompt_inputs`. The OpenAI server's ``serving_chat.py``
+    does not go through this seam -- it independently calls the same
+    underlying ``build_prompt``/``build_prompt_tokens``/``resolve_stop_token_ids``
+    primitives (see that function's docstring for the resulting divergence risk).
     """
     from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
         build_ar_prompt_inputs,

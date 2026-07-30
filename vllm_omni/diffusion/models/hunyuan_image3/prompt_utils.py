@@ -397,16 +397,17 @@ def build_ar_prompt_inputs(
     value to both but resolves "omitted" vs. "explicit None" differently for
     each (this seam always forwards the identical resolved value to both).
 
-    Used by the offline shared task examples (``text_to_image.py`` /
-    ``image_edit.py`` via ``model_extras.hunyuan_image3.build_ar_stage_inputs``).
-    The OpenAI server's ``serving_chat.py`` does not currently call this
-    seam -- it still independently calls ``build_prompt``/``build_prompt_tokens``/
-    ``resolve_stop_token_ids``, and can hit exactly the divergence described
-    above when ``bot_task`` is omitted from ``extra_body`` (pre-existing,
-    unrelated to this module). ``image_size`` follows the same convention as
-    :func:`resolve_stop_token_ids` (``None``/``"auto"`` lets the AR predict
-    the aspect ratio; an explicit ``"{w}x{h}"`` makes it stop at the
-    terminator).
+    Used by all four offline shared task examples: ``text_to_image.py`` /
+    ``image_edit.py`` (via ``model_extras.hunyuan_image3.build_ar_stage_inputs``)
+    and ``x_to_text.py`` (via ``build_x_to_text_prompt``, which also calls
+    ``build_ar_stage_inputs``). The OpenAI server's ``serving_chat.py`` does
+    not currently call this seam -- it still independently calls
+    ``build_prompt``/``build_prompt_tokens``/``resolve_stop_token_ids``, and
+    can hit exactly the divergence described above when ``bot_task`` is
+    omitted from ``extra_body`` (pre-existing, unrelated to this module).
+    ``image_size`` follows the same convention as :func:`resolve_stop_token_ids`
+    (``None``/``"auto"`` lets the AR predict the aspect ratio; an explicit
+    ``"{w}x{h}"`` makes it stop at the terminator).
     """
     if tokenizer is not None:
         result = build_prompt_tokens(

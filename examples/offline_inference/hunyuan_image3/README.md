@@ -15,8 +15,12 @@ with all model-specific knobs declared centrally in
 All four paths build the AR prefill + stop tokens through the declarative
 `vllm_omni.model_extras.hunyuan_image3.build_ar_stage_inputs` seam (t2i/it2i)
 or the equivalent `build_x_to_text_prompt` seam (t2t/i2t) — both wrap
-`prompt_utils.build_ar_prompt_inputs`, the same logic the OpenAI server uses,
-so prompt formatting is identical across offline and online flows.
+`prompt_utils.build_ar_prompt_inputs`, so prompt formatting is identical
+across all four offline paths. The OpenAI server's `serving_chat.py` does
+not go through this seam yet — it independently calls the same underlying
+`build_prompt_tokens`/`resolve_stop_token_ids` primitives, which can diverge
+from this seam's `bot_task` resolution (see `build_ar_prompt_inputs`'s
+docstring).
 
 ## Deploy Configs
 
