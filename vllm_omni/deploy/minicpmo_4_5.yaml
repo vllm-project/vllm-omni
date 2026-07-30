@@ -25,9 +25,10 @@ stages:
     max_model_len: 32768
     devices: "0"
     limit_mm_per_prompt:
-      video:
-        count: 1
-        num_frames: 32
+      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      image: 64
+      audio: 64
+      video: 1
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -35,7 +36,8 @@ stages:
       max_tokens: 2048
       seed: 42
       detokenize: true
-      repetition_penalty: 1.1
+      # 1.0 for MCQ accuracy; 1.1 can bias short A–D answers.
+      repetition_penalty: 1.0
 
   - stage_id: 1
     max_num_seqs: 16

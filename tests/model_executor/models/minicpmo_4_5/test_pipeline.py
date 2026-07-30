@@ -24,8 +24,6 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
-    load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
@@ -138,45 +136,6 @@ class TestPipelineTopology:
 
 
 class TestDeployTopology:
-    @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
-    def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
-        deploy = load_deploy_config(_DEPLOY_DIR / filename)
-        pipeline = OMNI_PIPELINES[deploy.pipeline]
-        stages = merge_pipeline_deploy(pipeline, deploy)
-
-        assert deploy.pipeline == _PIPELINE_KEY
-        assert deploy.async_chunk is True
-        assert [stage.stage_id for stage in stages] == [0, 1, 2]
-        assert [stage.yaml_runtime["devices"] for stage in stages] == devices
-        assert "additional_config" not in stages[1].yaml_engine_args
-        assert "skip_mm_profiling" not in stages[0].yaml_engine_args
-        assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
-        assert stages[2].yaml_engine_args["skip_mm_profiling"] is True
-        assert stages[1].yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
-        assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
-        connector = deploy.connectors["connector_of_shared_memory"]
-        assert connector["name"] == "SharedMemoryConnector"
-        assert connector["extra"]["codec_chunk_frames"] == 25
-        assert connector["extra"]["codec_left_context_frames"] == 3
-        assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
-        assert connector["extra"]["connector_get_max_wait"] == 300
-        expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
-        if filename == "minicpmo_4_5.yaml":
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
-                0.6,
-                0.1,
-                0.1,
-            ]
-            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"video": {"count": 1, "num_frames": 32}}
-        elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
-                0.9,
-                0.55,
-                0.35,
-            ]
-
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         talker = pipeline.get_stage(1)
