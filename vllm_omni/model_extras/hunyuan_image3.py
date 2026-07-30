@@ -15,29 +15,30 @@ def build_x_to_text_prompt(
     prompt: str,
     has_image: bool,
 ) -> tuple[dict[str, Any], list[int] | None]:
-    """Build HunyuanImage-3 prompt tokens and stopping rules for T2T/I2T."""
+    """Build HunyuanImage-3 prompt tokens and stopping rules for T2T/I2T.
+
+    Routes through :func:`build_ar_stage_inputs`, the same declarative seam
+    the shared text_to_image / image_edit examples use, instead of
+    re-deriving the AR prefill and stop-token logic here.
+    """
     from transformers import AutoTokenizer
 
-    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-        build_prompt_tokens,
-        resolve_stop_token_ids,
-        resolve_sys_type,
-    )
-
-    task = "i2t" if has_image else "t2t"
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    build_kwargs: dict[str, Any] = {"task": task, "bot_task": None}
-    if has_image:
-        build_kwargs["num_images"] = 1
-    built = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
+    ar_inputs = build_ar_stage_inputs(
+        prompt=prompt,
+        tokenizer=tokenizer,
+        extra_body=None,
+        num_images=1 if has_image else 0,
+        text_output=True,
+    )
     return (
         {
-            "prompt": prompt,
-            "prompt_token_ids": built.token_ids,
-            "modalities": ["text"],
-            "use_system_prompt": resolve_sys_type(None),
+            "prompt": ar_inputs.prompt,
+            "prompt_token_ids": ar_inputs.prompt_token_ids,
+            "modalities": ar_inputs.modalities,
+            "use_system_prompt": ar_inputs.use_system_prompt,
         },
-        resolve_stop_token_ids(task=task, bot_task=None, tokenizer=tokenizer, image_size="auto"),
+        ar_inputs.stop_token_ids,
     )
 
 

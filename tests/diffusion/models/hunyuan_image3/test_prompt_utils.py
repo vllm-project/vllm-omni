@@ -299,33 +299,38 @@ def _repo_root() -> pathlib.Path:
 
 
 def test_example_routes_through_shared_seam():
-    """The comprehension example must not duplicate AR prompt tokenization; it
-    routes through the shared ``model_extras -> prompt_utils`` seam.
+    """Neither the shared task examples nor the ``model_extras`` seam itself
+    should duplicate AR prompt tokenization.
 
-    After the model_extras migration the bespoke ``end2end.py`` is gone: t2i /
-    image-editing run through the shared task examples, and the AR-only
-    comprehension flow uses ``run_hunyuan_image3_understanding.py``. This test
-    pins that the example imports the declarative ``build_ar_stage_inputs``
-    helper (rather than re-implementing tokenization) and that the helper in
-    turn routes down to ``prompt_utils.build_ar_prompt_inputs``.
+    After the model_extras migration, t2i / image-editing run through the
+    shared ``text_to_image.py`` / ``image_edit.py`` examples (both call
+    ``build_ar_stage_inputs``), and t2t / i2t run through the shared
+    ``x_to_text.py`` example (which calls ``build_x_to_text_prompt``). This
+    test pins that both ``model_extras.hunyuan_image3`` seam functions
+    delegate to ``prompt_utils.build_ar_prompt_inputs`` / ``build_ar_stage_inputs``
+    rather than re-implementing tokenization inline.
     """
-    example_path = (
-        _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "run_hunyuan_image3_understanding.py"
-    )
-    example_tree = ast.parse(example_path.read_text(encoding="utf-8"))
-
-    local_func_names = {n.name for n in ast.walk(example_tree) if isinstance(n, ast.FunctionDef)}
-    assert not (local_func_names & {"build_prompt", "build_prompt_tokens", "resolve_stop_token_ids"})
-
-    imported_from_model_extras: set[str] = set()
-    for node in ast.walk(example_tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("model_extras.hunyuan_image3"):
-            imported_from_model_extras.update(alias.name for alias in node.names)
-    assert "build_ar_stage_inputs" in imported_from_model_extras
-
-    # The model_extras seam itself must delegate to the shared prompt_utils.
     seam_path = _repo_root() / "vllm_omni" / "model_extras" / "hunyuan_image3.py"
     seam_tree = ast.parse(seam_path.read_text(encoding="utf-8"))
+
+    local_func_names = {n.name for n in ast.walk(seam_tree) if isinstance(n, ast.FunctionDef)}
+    assert not (local_func_names & {"build_prompt", "build_prompt_tokens", "resolve_stop_token_ids"})
+
+    # build_x_to_text_prompt must route through build_ar_stage_inputs, not
+    # re-derive the AR prefill / stop-token logic itself.
+    build_x_to_text_prompt_node = next(
+        n
+        for n in ast.walk(seam_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "build_x_to_text_prompt"
+    )
+    called_names = {
+        node.func.id
+        for node in ast.walk(build_x_to_text_prompt_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "build_ar_stage_inputs" in called_names
+
+    # The model_extras seam itself must delegate to the shared prompt_utils.
     routed_from_prompt_utils: set[str] = set()
     for node in ast.walk(seam_tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):

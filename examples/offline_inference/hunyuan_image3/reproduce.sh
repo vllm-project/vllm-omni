@@ -57,12 +57,11 @@ else
   echo "[skip] image-editing: set EDIT_IMAGE=/path/to/image.png to run it2i"
 fi
 
-# ---- 3) Image-to-text (this directory) --------------------------------------
+# ---- 3) Image-to-text (shared x_to_text.py) ---------------------------------
 if [[ -n "${UNDERSTAND_IMAGE:-}" ]]; then
-  python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
+  python examples/offline_inference/x_to_text/x_to_text.py \
     --model "${MODEL}" \
     --deploy-config "${AR_DEPLOY}" \
-    --modality image2text \
     --image "${UNDERSTAND_IMAGE}" \
     --prompt "Describe the content of the picture." \
     | tee "${OUT_DIR}/i2t.txt"
@@ -70,11 +69,10 @@ else
   echo "[skip] image-to-text: set UNDERSTAND_IMAGE=/path/to/image.jpg to run i2t"
 fi
 
-# ---- 4) Text-to-text (this directory) ---------------------------------------
-python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
+# ---- 4) Text-to-text (shared x_to_text.py) -----------------------------------
+python examples/offline_inference/x_to_text/x_to_text.py \
   --model "${MODEL}" \
   --deploy-config "${AR_DEPLOY}" \
-  --modality text2text \
   --prompt "What is the capital of France?" \
   | tee "${OUT_DIR}/t2t.txt"
 

@@ -1,21 +1,21 @@
 # HunyuanImage-3.0-Instruct
 
-HunyuanImage-3.0-Instruct now runs through the **shared task examples** for its
-two image-generating modalities, with all model-specific knobs declared
-centrally in `vllm_omni/model_extras/hunyuan_image3.py` and routed via
-`--extra-body` / `--extra-args`. Only the AR-only comprehension modalities keep
-a small dedicated script in this directory.
+HunyuanImage-3.0-Instruct now runs entirely through **shared task examples**,
+with all model-specific knobs declared centrally in
+`vllm_omni/model_extras/hunyuan_image3.py` and routed via `--extra-body` /
+`--extra-args`. There is no dedicated script left in this directory.
 
 | Modality | How to run |
 | :--- | :--- |
 | Text to image (`t2i`) | shared `examples/offline_inference/text_to_image/text_to_image.py` |
 | Image editing (`it2i`) | shared `examples/offline_inference/image_to_image/image_edit.py` |
-| Image to text (`i2t`) | `run_hunyuan_image3_understanding.py --modality image2text` |
-| Text to text (`t2t`) | `run_hunyuan_image3_understanding.py --modality text2text` |
+| Image to text (`i2t`) | shared `examples/offline_inference/x_to_text/x_to_text.py --image ...` |
+| Text to text (`t2t`) | shared `examples/offline_inference/x_to_text/x_to_text.py` |
 
-All four paths build the AR prefill + stop tokens through one declarative seam,
-`vllm_omni.model_extras.hunyuan_image3.build_ar_stage_inputs`, which wraps
-`prompt_utils.build_ar_prompt_inputs` — the same logic the OpenAI server uses —
+All four paths build the AR prefill + stop tokens through the declarative
+`vllm_omni.model_extras.hunyuan_image3.build_ar_stage_inputs` seam (t2i/it2i)
+or the equivalent `build_x_to_text_prompt` seam (t2t/i2t) — both wrap
+`prompt_utils.build_ar_prompt_inputs`, the same logic the OpenAI server uses,
 so prompt formatting is identical across offline and online flows.
 
 ## Deploy Configs
@@ -78,22 +78,20 @@ python examples/offline_inference/image_to_image/image_edit.py \
 `image_edit.py` accepts up to 3 reference images (repeat `--image`) for
 HunyuanImage-3.0 multi-image fusion.
 
-### Image to text (this directory)
+### Image to text (shared script)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
+python examples/offline_inference/x_to_text/x_to_text.py \
   --model tencent/HunyuanImage-3.0-Instruct \
-  --modality image2text \
   --image /path/to/image.jpg \
   --prompt "Describe the content of the picture."
 ```
 
-### Text to text (this directory)
+### Text to text (shared script)
 
 ```bash
-python examples/offline_inference/hunyuan_image3/run_hunyuan_image3_understanding.py \
+python examples/offline_inference/x_to_text/x_to_text.py \
   --model tencent/HunyuanImage-3.0-Instruct \
-  --modality text2text \
   --prompt "What is the capital of France?"
 ```
 
