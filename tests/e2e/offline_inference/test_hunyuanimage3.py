@@ -15,7 +15,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras import get_ar_input_builder, get_ar_tokenizer_validator, get_model_class_name
+from vllm_omni.model_extras import get_ar_input_builder, get_model_class_name
 from vllm_omni.platforms import current_omni_platform
 
 PROMPT = "A brown and white dog is running on the grass"
@@ -423,7 +423,13 @@ def test_shared_script_ar_path_reaches_generation(
         prompt_dict=prompt_dict,
         sampling_params_list=sampling_params_list,
         trust_remote_code=True,
-        validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+        # Not wiring get_ar_tokenizer_validator here: HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS
+        # is documented as sourced from the -Instruct tokenizer.json, but this file's
+        # MODEL_NAME is the base "tencent/HunyuanImage-3.0" -- if the two tokenizers
+        # differ even slightly, validating here would fail for a reason unrelated to
+        # what this test checks. The validator has its own dedicated coverage in
+        # test_prompt_utils.py / test_shared_script_ar_integration.py.
+        validate_tokenizer=None,
     )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
