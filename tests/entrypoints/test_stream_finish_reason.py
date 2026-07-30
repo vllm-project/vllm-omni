@@ -16,20 +16,10 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
-import enum
 import json
 from unittest.mock import MagicMock
 
 import pytest
-
-# Python 3.10 compat: StrEnum was added in 3.11
-if not hasattr(enum, "StrEnum"):
-
-    class _StrEnum(str, enum.Enum):
-        """Minimal StrEnum backport for Python 3.10."""
-
-    enum.StrEnum = _StrEnum  # type: ignore[attr-defined]
-
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
@@ -401,6 +391,90 @@ async def test_declared_modality_not_produced_text_finish_suppressed():
             if c.get("modality") == "text" and ch.get("delta", {}).get("content") == "!":
                 # Text finish should be suppressed because audio hasn't appeared
                 assert ch["finish_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: audio chunks that carry no waveform
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audio_chunk_without_waveform_keeps_stream_alive():
+    """An audio message with no PCM must not break the stream.
+
+    ``_create_audio_choice`` used to return an ErrorResponse here, which the
+    stream generator then iterated as a list of choices; the pydantic model
+    yields (field, value) tuples, so the loop raised
+    ``AttributeError: 'tuple' object has no attribute 'finish_reason'``.
+    """
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["text", "audio"])
+
+    empty_audio = _make_audio_omni_output()
+    empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
+
+    def create_audio_choice(omni_res, role, request, stream=False):
+        return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
+
+    serving_chat._create_audio_choice = create_audio_choice
+
+    async def result_generator():
+        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
+        yield _make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
+        yield empty_audio
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    assert not any("Error in chat completion stream generator" in line for line in raw_lines)
+    chunks = _parse_sse_chunks(raw_lines)
+    finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
+    assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
+    assert finish_reasons[-1] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_audio_choice_error_response_is_not_iterated_as_choices():
+    """Any ErrorResponse from the audio path is skipped, not iterated."""
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["text", "audio"])
+
+    serving_chat._create_audio_choice = MagicMock(
+        side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
+    )
+
+    async def result_generator():
+        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason="stop")
+        yield _make_audio_omni_output()
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    assert isinstance(serving_chat._create_error_response("boom"), ErrorResponse)
+    assert not any("AttributeError" in line for line in raw_lines)
+    chunks = _parse_sse_chunks(raw_lines)
+    finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
+    assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
 
 
 # ---------------------------------------------------------------------------

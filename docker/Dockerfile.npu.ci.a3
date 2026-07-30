@@ -1,5 +1,5 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.25.0-a3
+ARG VLLM_ASCEND_TAG=v0.26.0-a3
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
@@ -37,10 +37,28 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "pyttsx3>=2.99" \
       "opencv-python>=4.12.0.88" \
       "imageio[ffmpeg]>=0.6.0" \
+      "jiwer>=3.0.0" \
+      "zhon>=2.0.0" \
+      "zhconv>=1.4.2" \
+      "funasr>=1.0.0" \
+      "hyperpyyaml>=1.2.0" \
+      "onnx>=1.16.0" \
+      "librosa>=0.10.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \
     python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation \
+      --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+      --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+      --default-timeout=60
+
+# MiniCPM-o 4.5 Stage-2 vocoder assets: s3tokenizer plus flashcosyvoice, which
+# is shipped by step-audio2. --no-deps keeps pip from replacing the Ascend torch
+# build and from shadowing onnxruntime-cann with the vanilla onnxruntime wheel;
+# the deps these two actually need are installed above.
+RUN python3 -m pip install -v --no-deps \
+      "s3tokenizer>=0.3.0" \
+      "step-audio2>=1.0.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60

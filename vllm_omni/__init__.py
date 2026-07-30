@@ -27,8 +27,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     patch = None  # type: ignore
 
 # Register custom configs (AutoConfig, AutoTokenizer) as early as possible.
-from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
-from vllm_omni.transformers_utils import parsers as _parsers  # noqa: F401, E402
+try:
+    from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
+    from vllm_omni.transformers_utils import parsers as _parsers  # noqa: F401, E402
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    if exc.name != "vllm":
+        raise
+    # Allow importing vllm_omni without vllm (e.g., documentation builds)
+    pass
 
 from .config import OmniModelConfig
 

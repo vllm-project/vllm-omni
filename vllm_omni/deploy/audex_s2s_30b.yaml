@@ -1,0 +1,60 @@
+# Audex 30B-A3B full deploy: cascaded speech-to-speech.
+# See audex_s2s.yaml for the cascade/routing notes and audex_tts_30b.yaml
+# for the 30B sizing notes (hybrid Mamba: no prefix caching; single-H100
+# layout, TP2 fallback; pass this yaml explicitly).
+pipeline: audex_s2s
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      initial_codec_chunk_frames: 1
+      codec_token_offset: 131077
+      codec_vocab_size: 65536
+      decoder_emit_chunk_frames: 5
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.85
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    # Sound embeddings (up to 30 clips x 750) + speech-token generation.
+    max_model_len: 32768
+    dtype: bfloat16
+    devices: "0"
+    logits_processors:
+      - "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.1
+      top_k: 80
+      max_tokens: 2048
+      seed: 0
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 8192
+      seed: 0

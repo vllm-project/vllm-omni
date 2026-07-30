@@ -77,14 +77,20 @@ class Attention(nn.Module):
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
 
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+        model_class_name = getattr(config, "model_class_name", None) if config is not None else None
+        allow_trtllm_default = get_diffusion_model_metadata(model_class_name).attention_mask_free
+
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
             head_size=head_size,
             attention_config=attention_config,
             role_category=role_category,
+            allow_trtllm_default=allow_trtllm_default,
         )
         if spec is not None:
-            backend_kwargs = spec.extra or None
+            backend_kwargs = spec.backend_kwargs()
             self.backend_pref = spec.backend
             logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
@@ -99,6 +105,7 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
             qkv_layout=qkv_layout,
+            prefix=prefix,
             backend_kwargs=backend_kwargs,
         )
         # Instantiate fallback backend for float32 support
@@ -140,6 +147,7 @@ class Attention(nn.Module):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            causal=causal,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
@@ -282,6 +290,8 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
+        self._assert_piecewise_compatible(attn_metadata)
+
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
@@ -292,7 +302,28 @@ class Attention(nn.Module):
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
+    def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
+        if attn_metadata is None or attn_metadata.full_attn_spans is None:
+            return
+        if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
+            return
+        backend_name = self.attn_backend.get_name()
+        if not self.attn_backend.supports_piecewise_spans:
+            raise ValueError(
+                f"Attention backend '{backend_name}' does not support "
+                f"piecewise attention (full_attn_spans without a 4D attn_mask). "
+                f"Use a Flash backend (FLASH_ATTN / FLASH_ATTN_HUB / FLASH_ATTN_3_HUB), "
+                f"or provide a 4D attn_mask that encodes the mixed causal/full pattern."
+            )
+
     def _run_ring_attention(self, query, key, value, attn_metadata):
+        skip = getattr(self.attention, "skip", None)
+        if skip is not None and getattr(skip, "configured", False):
+            raise NotImplementedError(
+                "Skip-Softmax (TRTLLM_ATTN) is not supported with ring sequence parallelism: "
+                "the ring path bypasses the backend, so the skip config would be silently ignored. "
+                "Use Ulysses SP instead, or remove the skip_softmax config."
+            )
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(

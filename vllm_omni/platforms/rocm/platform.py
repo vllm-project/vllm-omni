@@ -30,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -144,6 +144,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     @classmethod
     def synchronize(cls) -> None:
         torch.accelerator.synchronize()
+
+    @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

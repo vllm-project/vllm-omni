@@ -12,10 +12,64 @@ from vllm_omni.model_extras import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
     build_text_to_image_prompt,
+    build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"model_type": "bagel"}, "bagel"),
+        ({"architectures": ["HunyuanImage3ForConditionalGeneration"]}, "hunyuan_image3"),
+        ({"model_type": "mammothmoda2"}, "mammoth_moda2"),
+        ({"model_type": "qwen2_vl"}, "generic"),
+    ],
+)
+def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[str, object], expected: str) -> None:
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", lambda *args: config)
+    assert get_x_to_text_model_family("unused") == expected
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_bagel_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
+    assert prompt == {
+        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "modalities": ["text"],
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammoth_x_to_text_prompt_builder() -> None:
+    prompt, stop_token_ids = build_x_to_text_prompt("mammoth_moda2", "unused", "Hello.", has_image=False)
+    assert prompt == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nHello.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "modalities": ["text"],
+        "additional_information": {"omni_task": ["chat"]},
+    }
+    assert stop_token_ids is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_generic_x_to_text_prompt_builder() -> None:
+    assert build_x_to_text_prompt("generic", "unused", "Hello.", has_image=False) == (
+        {"prompt": "Hello.", "modalities": ["text"]},
+        None,
+    )
 
 
 @pytest.mark.core_model
@@ -125,6 +179,36 @@ def test_magi_human_extra_registry_declares_request_and_response_params() -> Non
     )
     assert get_extra_output_params("MagiHumanPipeline") == frozenset()
     assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_extra_registry_declares_official_guidance_params() -> None:
+    expected = frozenset(
+        {
+            "video_cfg_scale",
+            "audio_cfg_scale",
+            "video_cfg_guidance_scale",
+            "audio_cfg_guidance_scale",
+            "video_stg_scale",
+            "audio_stg_scale",
+            "video_stg_guidance_scale",
+            "audio_stg_guidance_scale",
+            "video_modality_scale",
+            "audio_modality_scale",
+            "a2v_guidance_scale",
+            "v2a_guidance_scale",
+            "video_rescale_scale",
+            "audio_rescale_scale",
+            "video_stg_blocks",
+            "audio_stg_blocks",
+        }
+    )
+
+    assert get_extra_body_params("LTX2Pipeline") == expected
+    assert get_extra_output_params("LTX2Pipeline") == frozenset()
+    assert get_extra_body_params("LTX2DistilledPipeline") == expected
+    assert get_extra_output_params("LTX2DistilledPipeline") == frozenset()
 
 
 @pytest.mark.core_model
@@ -479,15 +563,29 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
-        {
-            "text_guidance_scale",
-            "cfg_range",
-            "num_inference_steps",
-        }
+    for model_class_name in (
+        "MammothModa2DiTPipeline",
+        "MammothModa2ForConditionalGeneration",
+        "Mammothmoda2Model",
+    ):
+        assert get_extra_body_params(model_class_name) == frozenset(
+            {
+                "text_guidance_scale",
+                "cfg_range",
+                "num_inference_steps",
+            }
+        )
+        assert get_extra_output_params(model_class_name) == frozenset()
+        assert should_init_extra_args_for_non_diffusion_stages(model_class_name) is True
+
+    wrapper_prompt = build_text_to_image_prompt(
+        "MammothModa2ForConditionalGeneration",
+        prompt="a cat",
+        negative_prompt=None,
+        height=256,
+        width=256,
     )
-    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+    assert wrapper_prompt["additional_information"]["omni_task"] == ["t2i"]
 
 
 @pytest.mark.core_model
@@ -514,5 +612,8 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "ar_height": [32],
             "image_height": [512],
             "image_width": [768],
+            "eol_token_id": [152064],
+            "visual_token_start_id": [152072],
+            "visual_token_end_id": [168456],
         },
     }

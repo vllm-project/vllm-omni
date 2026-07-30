@@ -65,7 +65,7 @@ connectors:
 
 | Connector class | Use case | `extra` keys |
 |-----------------|----------|--------------|
-| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | `shm_threshold_bytes` (int, default `65536`). |
+| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | None. All payloads use shared memory. |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
@@ -377,7 +377,12 @@ Default: `"0"`
 
 #### `engine_args.max_num_seqs`
 
-The maximum number of sequences for concurrent processing in this stage. For LLM stages, this controls the vLLM scheduler's maximum concurrent sequences. For all stage types, this also controls how many tasks can be batched together in the task processing loop.
+The maximum number of sequences for concurrent processing in this stage. For
+LLM stages, this controls the vLLM scheduler's maximum concurrent sequences.
+For diffusion stages, this controls scheduler wave capacity in both request
+batch mode and step batch mode. `max_num_seqs: 1` is the serial/conservative
+path; values above `1` allow compatible requests to batch when the selected
+diffusion pipeline supports that batching mode.
 
 Default: `1`
 

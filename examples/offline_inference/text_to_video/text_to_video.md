@@ -8,7 +8,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `diffusers/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
+| `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
@@ -55,45 +55,17 @@ python text_to_video.py \
   --output vace_t2v_output.mp4
 ```
 
-LTX2 example:
+### LTX-2
 
 ```bash
 python text_to_video.py \
-  --model "Lightricks/LTX-2" \
-  --prompt "A cinematic close-up of ocean waves at golden hour." \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --output ltx2_out.mp4
-```
-
-### LTX-2.3
-
-```bash
-python text_to_video.py \
-  --model diffusers/LTX-2.3-Diffusers \
-  --model-class-name LTX23Pipeline \
+  --model Lightricks/LTX-2 \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --num-inference-steps 20 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --fps 24 \
-  --audio-sample-rate 48000 \
-  --output ltx23_t2v_output.mp4
+  --output ltx2_output.mp4
 ```
 
-Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23Pipeline` to select the LTX-2.3
-text-to-video pipeline explicitly.
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, I2V, defaults, and advanced options.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -212,8 +184,7 @@ python text_to_video.py \
 ### Common
 
 - `--model`: Diffusers model ID or local path.
-- `--model-class-name`: Optional explicit pipeline class. Use `LTX23Pipeline`
-  for LTX-2.3 text-to-video.
+- `--model-class-name`: Optional explicit pipeline override.
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution. Default depends on model.
 - `--num-frames`: number of frames. Default depends on model.
@@ -229,8 +200,7 @@ python text_to_video.py \
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the
-  pipeline returns audio; LTX-2.3 outputs 48kHz audio).
+- `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
