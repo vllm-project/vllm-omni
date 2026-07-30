@@ -162,6 +162,11 @@ class RefHintCacheBackend(CacheBackend):
                 num_inference_steps,
             )
 
+    def finish_request(self, pipeline: object) -> None:
+        """Release retained hint tensors as soon as a request finishes."""
+        for transformer in self._get_transformers(pipeline):
+            self._state_for(transformer).reset()
+
     def get_model_region_handler(self) -> ModelRegionHandler:
         """Install this backend only in the active request's ForwardContext."""
         return self
@@ -174,6 +179,10 @@ class RefHintCacheBackend(CacheBackend):
     ) -> T:
         """Handle a reference-hint region; pass unrelated regions through."""
         if not self.enabled or region is not ModelRegion.REFERENCE_HINTS:
+            return compute()
+        if self._refresh_interval() == 1:
+            # K=1 never reuses hints. Avoid retaining full hint tensors for a
+            # mode that is intentionally equivalent to direct computation.
             return compute()
 
         step = get_forward_context().denoise_step_idx if is_forward_context_available() else None

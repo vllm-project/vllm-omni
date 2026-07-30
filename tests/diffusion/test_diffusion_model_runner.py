@@ -396,6 +396,9 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
         def get_model_region_handler(self):
             return None
 
+        def finish_request(self, pipeline):
+            pass
+
         def refresh(self, pipeline, num_inference_steps, verbose=True):
             self.refresh_calls.append((pipeline, num_inference_steps, verbose))
 
@@ -420,6 +423,43 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
     assert cache_backend.refresh_calls == [(runner.pipeline, 4, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_finishes_cache_request_when_forward_raises(monkeypatch):
+    class _EnabledCacheBackend:
+        def __init__(self):
+            self.finished_pipelines = []
+
+        def is_enabled(self):
+            return True
+
+        def get_model_region_handler(self):
+            return None
+
+        def refresh(self, pipeline, num_inference_steps, verbose=True):
+            pass
+
+        def finish_request(self, pipeline):
+            self.finished_pipelines.append(pipeline)
+
+    class _FailingPipeline(_DummyPipeline):
+        def forward(self, req):
+            raise RuntimeError("forward failed")
+
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="ref_hint")
+    runner.pipeline = _FailingPipeline(output=None)
+    req = _make_request()
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        DiffusionModelRunner.execute_model(runner, req)
+
+    assert cache_backend.finished_pipelines == [runner.pipeline]
 
 
 @pytest.mark.core_model

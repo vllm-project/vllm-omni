@@ -493,19 +493,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 if self.cache_backend is not None and self.cache_backend.is_enabled()
                 else None
             )
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=od_config,
-                model_region_handler=model_region_handler,
-            ):
-                with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
-                    outputs = _normalize_pipeline_outputs(
-                        raw_outputs,
-                        expected_count=len(reqs),
-                        allow_single_output=allow_single_output,
-                        pipeline_name=type(self.pipeline).__name__,
-                    )
+            try:
+                with set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=od_config,
+                    model_region_handler=model_region_handler,
+                ):
+                    with record_function(record_name):
+                        raw_outputs = self.pipeline.forward(batch)
+                        outputs = _normalize_pipeline_outputs(
+                            raw_outputs,
+                            expected_count=len(reqs),
+                            allow_single_output=allow_single_output,
+                            pipeline_name=type(self.pipeline).__name__,
+                        )
+            finally:
+                if self.cache_backend is not None and self.cache_backend.is_enabled():
+                    self.cache_backend.finish_request(self.pipeline)
 
             if is_primary and outputs:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()

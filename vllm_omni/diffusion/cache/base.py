@@ -109,6 +109,9 @@ class CacheBackend(ABC):
         """Return a request-scoped semantic-region handler, if this backend has one."""
         return None
 
+    def finish_request(self, pipeline: Any) -> None:
+        """Release request-scoped state after a pipeline forward completes."""
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"
 

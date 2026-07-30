@@ -5,14 +5,16 @@
 Comprehensive e2e tests of diffusion features for Wan2.1-VACE in online serving mode.
 
 Wan2.1-VACE supports: Cache-DiT, Ulysses-SP, Ring, CFG-Parallel, TP,
-VAE-Patch-Parallel, HSDP. TeaCache is NOT supported for this model, so
-Cache-DiT is used in place of TeaCache for single-card and CFG tests.
+VAE-Patch-Parallel, HSDP, and reference-hint caching. TeaCache is NOT
+supported for this model, so Cache-DiT is used in place of TeaCache for
+single-card and CFG tests.
 
 Uses the 1.3B variant for faster CI testing.
 
 Coverage:
   Single GPU:
     - Cache-DiT + layerwise CPU offload
+    - Ref-Hint forecast50
   Two GPUs:
     - Cache-DiT + Ulysses-SP = 2
     - Cache-DiT + Ring = 2
@@ -61,6 +63,23 @@ def _get_vace_feature_cases():
                 ],
             ),
             id="single_card_001",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        # Single GPU: reference-hint cache with explicit lossy opt-in
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--cache-backend",
+                    "ref_hint",
+                    "--cache-config",
+                    '{"ref_hint_refresh_interval":2,'
+                    '"ref_hint_strategy":"forecast50",'
+                    '"ref_hint_acknowledge_lossy":true}',
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="single_card_ref_hint",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         # 2 GPUs: Cache-DiT + Ulysses-SP = 2

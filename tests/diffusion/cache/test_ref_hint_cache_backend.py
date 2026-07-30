@@ -54,10 +54,21 @@ def test_lossy_interval_requires_acknowledgement():
 
 
 def test_lossless_interval_is_exempt_and_exposes_handler():
+    owner = _VaceLikeTransformer()
     backend = RefHintCacheBackend(_cfg(ref_hint_refresh_interval=1))
-    backend.enable(_FakePipeline(_VaceLikeTransformer()))
+    backend.enable(_FakePipeline(owner))
     assert backend.enabled
     assert backend.get_model_region_handler() is backend
+
+    sentinel = [torch.tensor([1.0])]
+    context = ForwardContext()
+    with override_forward_context(context):
+        context.denoise_step_idx = 0
+        assert backend.execute(ModelRegion.REFERENCE_HINTS, owner, lambda: sentinel) is sentinel
+
+    state = backend._states[id(owner)]
+    assert state._history == {}
+    assert state.misses == 0
 
 
 def test_both_experts_get_isolated_state_and_reset():
@@ -148,6 +159,34 @@ def test_forecast50_uses_two_fresh_values_and_damped_prediction():
     # Nominal gain 0.5 is limited by the 0.25 trust region:
     # 2 + 0.25 * (2 - 0) = 2.5.
     assert torch.equal(forecast[0], torch.tensor([2.5]))
+
+
+def test_finish_request_releases_retained_hints():
+    owner = _VaceLikeTransformer()
+    pipeline = _FakePipeline(owner)
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="reuse",
+            ref_hint_acknowledge_lossy=True,
+        )
+    )
+    backend.enable(pipeline)
+    context = ForwardContext()
+
+    with override_forward_context(context):
+        context.denoise_step_idx = 0
+        backend.execute(
+            ModelRegion.REFERENCE_HINTS,
+            owner,
+            lambda: [torch.tensor([1.0])],
+        )
+
+    state = backend._states[id(owner)]
+    assert state._history
+    backend.finish_request(pipeline)
+    assert state._history == {}
+    assert state.misses == 0
 
 
 def test_unrelated_region_behavior_is_direct_compute():
