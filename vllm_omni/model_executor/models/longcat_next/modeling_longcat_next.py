@@ -1275,4 +1275,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             module.eval()
             loaded.update(f"{ckpt_prefix}{k}" for k in state)
 
+        # Mark remote-code submodules as loaded — their weights come from the
+        # checkpoint's own lazy loading path, not from the thinker's sharded
+        # weight iter. Without this, vLLM's track_weights_loading raises:
+        #   ValueError: Following weights were not initialized from checkpoint
+        _skip_substrs = ("visual_tokenizer", "audio_tokenizer", "visual_head", "audio_head")
+        for name, _ in self.named_parameters():
+            if any(s in name for s in _skip_substrs):
+                loaded.add(name)
+
         return loaded
