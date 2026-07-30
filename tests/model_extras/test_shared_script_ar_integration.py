@@ -212,3 +212,30 @@ def test_apply_ar_stage_inputs_runs_declared_tokenizer_validator(
             trust_remote_code=False,
             validate_tokenizer=validator,
         )
+
+
+@pytest.mark.parametrize(
+    "module_name,relpath",
+    [
+        ("_shared_text_to_image_cli", "examples/offline_inference/text_to_image/text_to_image.py"),
+        ("_shared_image_edit_cli", "examples/offline_inference/image_to_image/image_edit.py"),
+    ],
+)
+@pytest.mark.parametrize("argv,expected", [([], False), (["--trust-remote-code"], True)])
+def test_trust_remote_code_flag_parses_from_real_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    relpath: str,
+    argv: list[str],
+    expected: bool,
+) -> None:
+    """The other tests in this file call _apply_ar_stage_inputs directly with
+    an already-resolved trust_remote_code bool, which never exercises
+    argparse itself. Closing that specific gap doesn't need a GPU or a model
+    load -- parse_args() only touches sys.argv -- so cover it here instead of
+    the (expensive, one-model-load-per-invocation) full CLI subprocess a
+    stricter GPU e2e test would need."""
+    module = _load_module(module_name, relpath)
+    monkeypatch.setattr(sys, "argv", ["prog", *argv])
+    args = module.parse_args()
+    assert args.trust_remote_code is expected
