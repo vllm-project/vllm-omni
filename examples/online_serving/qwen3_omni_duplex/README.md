@@ -80,10 +80,22 @@ audio does not affect it. The session and its KV survive a cancel.
 starts a response on commit. Do not send `response.create` — on this path it
 routes to the chat fallback rather than the native duplex runtime.
 
-## Multi-turn
+## Multi-turn, and the remaining wedge
 
-Multi-turn works. Verified: two spoken turns in one session produce two
-independent replies, 9 audio deltas total.
+Two spoken turns in one session work: two independent replies, 9 audio deltas.
+
+**But the server still wedges after a few sessions.** Once wedged, every client
+fails identically -- audio is accepted and framed correctly, `response.created`
+is never emitted, and the session panel stays at 0 turns. A restart clears it.
+
+This is not client specific. `is_speech: true` on appends was suspected and
+ruled out: it works on a freshly started server and fails on a wedged one,
+exactly like every other payload shape. Any measurement taken after the wedge
+is worthless, so **reset before each experiment** -- two of ours were
+contaminated this way.
+
+The browser reaches the wedge sooner than a script because each interaction
+opens a session.
 
 This needed a framework fix. Downstream async-chunk stages stop polling the
 connector once their segment finishes, and only resume when they receive a
