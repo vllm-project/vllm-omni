@@ -1109,7 +1109,8 @@ class LingBotWorldCausalDMDPipeline(
         if tick is not None:
             if tick.prompt is not None and " ".join(tick.prompt.split()) != " ".join(inputs.prompt.split()):
                 raise ValueError("ar_diffusion_tick.prompt must match the standard request prompt.")
-            if inputs.num_latent_frames != int(self.transformer.config.num_frames_per_block):
+            block_frames = int(self.transformer.config.num_frames_per_block)
+            if inputs.num_latent_frames != block_frames:
                 raise ValueError("A LingBot AR-Diffusion request must generate exactly one three-latent-frame block.")
             if (inputs.height, inputs.width) != (
                 self._ar_height,
@@ -1119,6 +1120,16 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot AR-Diffusion request resolution must match the "
                     "fixed cache geometry "
                     f"{self._ar_height}x{self._ar_width}."
+                )
+            horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+            max_realtime_ticks = horizon_latent_frames // block_frames
+            if tick.chunk_index >= max_realtime_ticks:
+                raise ValueError(
+                    "LingBot realtime generation currently supports at most "
+                    f"{max_realtime_ticks} ticks per generation epoch "
+                    f"(chunk_index 0 through {max_realtime_ticks - 1}) because "
+                    f"the image-condition horizon is {_MAX_RAW_FRAMES} pixel "
+                    "frames; reset or create a session to start a new world."
                 )
             session_state = self._ar_sessions.setdefault(
                 tick.session_id,

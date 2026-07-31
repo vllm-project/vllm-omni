@@ -14,6 +14,7 @@ action directories must be siblings under the same trusted root.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -182,6 +183,20 @@ def test_realtime_example_rejects_non_monotonic_event_ids(tmp_path: Path) -> Non
     events.write_text('{"event_id":2,"prompt":"a"}\n{"event_id":1,"prompt":"b"}\n')
 
     with pytest.raises(ValueError, match="strictly increasing"):
+        module._load_events(events)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_realtime_example_rejects_more_than_ten_ticks(tmp_path: Path) -> None:
+    module = _load_realtime_example()
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "".join(json.dumps({"event_id": event_id, "prompt": f"scene {event_id}"}) + "\n" for event_id in range(1, 12))
+    )
+
+    with pytest.raises(ValueError, match="at most 10 events.*117 pixel frames"):
         module._load_events(events)
 
 

@@ -1646,6 +1646,31 @@ def test_typed_tick_rejects_non_contiguous_chunk_index(
         pipeline(_request(sampling=sampling))
 
 
+def test_typed_tick_rejects_chunk_beyond_realtime_condition_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    pipeline._ar_sessions["world-1"] = module._LingBotARSessionState(
+        next_chunk_index=10,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "encode_prompt",
+        lambda *args, **kwargs: pytest.fail("the realtime horizon must be validated before prompt encoding"),
+    )
+
+    sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=10))
+    with pytest.raises(
+        ValueError,
+        match=r"at most 10 ticks.*chunk_index 0 through 9.*117 pixel frames",
+    ):
+        pipeline(_request(sampling=sampling))
+
+
 def test_request_cache_is_released_before_vae_decode() -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
