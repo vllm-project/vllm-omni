@@ -23,6 +23,11 @@ _CAMERA_ACTION_SCHEMA = "lingbot.camera_actions.v1"
 _FRAMES_PER_BLOCK = 3
 
 
+def _camera_event_data(frames: list[list[str]]) -> dict[str, Any]:
+    """Build the event-side script consumed by LingBotCameraControlReducer."""
+    return {"mode": "script", "frames": frames}
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an in-process realtime LingBot-World 2.0 session.")
     parser.add_argument("--model", default=_MODEL, help="Hugging Face model ID or local checkpoint path.")
@@ -167,7 +172,7 @@ async def run(argv: Sequence[str] | None = None) -> Path:
                     ARDiffusionControlInput(
                         track="camera",
                         schema=_CAMERA_ACTION_SCHEMA,
-                        data={"mode": "frames", "frames": event["frames"]},
+                        data=_camera_event_data(event["frames"]),
                     ),
                 )
             await session.accept_event(

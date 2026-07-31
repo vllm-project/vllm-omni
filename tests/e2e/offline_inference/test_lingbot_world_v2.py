@@ -133,6 +133,49 @@ def test_realtime_example_loads_prompt_and_action_events(tmp_path: Path) -> None
     ]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_realtime_example_uses_event_side_camera_script() -> None:
+    module = _load_realtime_example()
+    frames = [["j"], [], []]
+
+    from vllm_omni.diffusion.models.lingbot_world.actions import (
+        LINGBOT_CAMERA_ACTION_SCHEMA,
+        LingBotCameraControlReducer,
+    )
+    from vllm_omni.experimental.ar_diffusion.session import (
+        ARDiffusionSessionEvent,
+    )
+    from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+        ARDiffusionControlInput,
+    )
+
+    event_data = module._camera_event_data(frames)
+    prepared = LingBotCameraControlReducer().prepare(
+        current_controls={},
+        events=(
+            ARDiffusionSessionEvent(
+                event_id=1,
+                controls=(
+                    ARDiffusionControlInput(
+                        track="camera",
+                        schema=LINGBOT_CAMERA_ACTION_SCHEMA,
+                        data=event_data,
+                    ),
+                ),
+            ),
+        ),
+        chunk_index=0,
+    )
+
+    assert event_data == {"mode": "script", "frames": frames}
+    assert prepared.controls[0].data == {
+        "mode": "frames",
+        "frames": (("j",), (), ()),
+    }
+
+
 def test_realtime_example_rejects_non_monotonic_event_ids(tmp_path: Path) -> None:
     module = _load_realtime_example()
     events = tmp_path / "events.jsonl"
