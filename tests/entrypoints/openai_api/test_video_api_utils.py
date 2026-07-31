@@ -48,6 +48,24 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["audio"] is None
 
 
+@pytest.mark.parametrize("num_frames", [3, 4])
+def test_coerce_video_preserves_channel_last_tensor_with_few_frames(num_frames):
+    video = torch.arange(num_frames * 2 * 5 * 3, dtype=torch.uint8).reshape(num_frames, 2, 5, 3)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    np.testing.assert_array_equal(frames, video.numpy())
+
+
+def test_coerce_video_converts_channel_first_tensor():
+    video = torch.arange(3 * 4 * 2 * 5, dtype=torch.uint8).reshape(3, 4, 2, 5)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    expected = video.permute(1, 2, 3, 0).numpy()
+    np.testing.assert_array_equal(frames, expected)
+
+
 def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
     muxers = []
 
