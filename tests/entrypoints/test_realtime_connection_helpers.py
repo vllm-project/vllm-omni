@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass, field
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -339,9 +340,10 @@ class TestRenderTokenPromptReattachesAudio:
         the continuation has something audio-bearing to splice onto."""
         conn = self._conn(mocker)
         conn._tools = None
-        # _buffer_realtime_audio_with_tools now also reads _speaker/_instructions.
+        # _buffer_realtime_audio_with_tools also reads these now.
         conn._speaker = None
         conn._instructions = None
+        conn._history = []
         conn._turn_prompt = None
         audio = {"audio": np.zeros(8000, dtype=np.float32)}
         prompt = TokensPrompt(prompt_token_ids=[10, 11], multi_modal_data=audio)
@@ -672,3 +674,86 @@ class TestRenderPromptPropagatesAdditionalInformation:
         result = asyncio.run(conn._render_prompt(prompt))
 
         assert "additional_information" not in result.prompt
+
+
+class TestConversationHistory:
+    """Audio conversation history: the omni realtime endpoint is stateless per
+    turn and returns only the assistant's own reply text (no ASR of the user),
+    so prior turns are replayed as the user's ORIGINAL AUDIO paired with the
+    model's reply text. These cover the pairing state machine; the prompt-side
+    contract (one audio placeholder per replayed turn, in the same order as the
+    multi_modal_data audio list) lives in buffer_realtime_audio."""
+
+    def _conn(self):
+        conn = RealtimeConnection.__new__(RealtimeConnection)
+        conn._history = []
+        conn._pending_user_audio = None
+        conn.send_error = mock.AsyncMock()
+        return conn
+
+    @staticmethod
+    def _pcm_b64(samples: list[int]) -> str:
+        return base64.b64encode(np.array(samples, dtype=np.int16).tobytes()).decode()
+
+    def _user(self, samples):
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_audio", "audio": self._pcm_b64(samples)}],
+        }
+
+    @staticmethod
+    def _assistant(text):
+        return {"type": "message", "role": "assistant", "content": [{"type": "text", "text": text}]}
+
+    def test_user_then_assistant_forms_one_turn(self) -> None:
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._user([32767, -32768])))
+        assert conn._history == []  # held until the reply arrives
+        asyncio.run(conn._handle_history_item(self._assistant("sunny in Madrid")))
+        assert len(conn._history) == 1
+        assert conn._history[0]["text"] == "sunny in Madrid"
+        np.testing.assert_allclose(conn._history[0]["audio"], [32767 / 32768.0, -1.0], rtol=1e-6)
+        assert conn._pending_user_audio is None
+
+    def test_unpaired_user_turn_is_not_replayed(self) -> None:
+        """The turn currently being spoken has no reply yet; replaying a dangling
+        user turn would leave the conversation malformed."""
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._user([1, 2, 3])))
+        assert conn._history == []
+
+    def test_assistant_without_user_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._assistant("orphan")))
+        assert conn._history == []
+        conn.send_error.assert_awaited_once()
+
+    def test_user_without_audio_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(
+            conn._handle_history_item(
+                {"type": "message", "role": "user", "content": [{"type": "text", "text": "no audio"}]}
+            )
+        )
+        assert conn._pending_user_audio is None
+        conn.send_error.assert_awaited_once()
+
+    def test_unknown_role_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(
+            conn._handle_history_item({"type": "message", "role": "system", "content": [{"type": "text", "text": "x"}]})
+        )
+        assert conn._history == []
+        conn.send_error.assert_awaited_once()
+
+    def test_multiple_turns_accumulate_in_order(self) -> None:
+        conn = self._conn()
+        for i, reply in enumerate(["first", "second", "third"], start=1):
+            asyncio.run(conn._handle_history_item(self._user([i])))
+            asyncio.run(conn._handle_history_item(self._assistant(reply)))
+        assert [h["text"] for h in conn._history] == ["first", "second", "third"]
+
+    def test_decode_matches_base_class_pcm16_conversion(self) -> None:
+        out = RealtimeConnection._decode_pcm16(self._pcm_b64([0, 16384, -16384]))
+        np.testing.assert_allclose(out, [0.0, 0.5, -0.5], rtol=1e-6)

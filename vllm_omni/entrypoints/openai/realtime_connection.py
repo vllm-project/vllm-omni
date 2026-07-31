@@ -121,6 +121,53 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._tool_rounds = 0
         self._speaker: str | None = None
         self._instructions: str | None = None
+        # Completed prior turns, each {"audio": np.ndarray, "text": str}, replayed
+        # into every subsequent prompt so the model can refer back to them.
+        self._history: list[dict[str, Any]] = []
+        # A user message whose assistant reply has not arrived yet.
+        self._pending_user_audio: np.ndarray | None = None
+
+    @staticmethod
+    def _decode_pcm16(b64_audio: str) -> np.ndarray:
+        """Same PCM16 -> float32 conversion the base class applies to
+        `input_audio_buffer.append`, so history audio and live audio are
+        represented identically."""
+        return np.frombuffer(base64.b64decode(b64_audio), dtype=np.int16).astype(np.float32) / 32768.0
+
+    async def _handle_history_item(self, item: dict) -> None:
+        """Accept a prior conversation turn, OpenAI-Realtime shaped:
+
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_audio", "audio": "<b64 pcm16>"}]}
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "text", "text": "..."}]}
+
+        A user item is held until its assistant reply arrives; the pair is then
+        appended to the replayed history. A user item with no reply yet (the
+        turn currently being spoken) is simply never paired, so it cannot be
+        replayed twice.
+        """
+        role = item.get("role")
+        contents = item.get("content") or []
+        if role == "user":
+            audio_b64 = next(
+                (c.get("audio") for c in contents if c.get("type") in ("input_audio", "audio") and c.get("audio")),
+                None,
+            )
+            if audio_b64 is None:
+                await self.send_error("history user message needs input_audio content", "invalid_history_item")
+                return
+            self._pending_user_audio = self._decode_pcm16(audio_b64)
+        elif role == "assistant":
+            if self._pending_user_audio is None:
+                await self.send_error("history assistant message has no preceding user message", "invalid_history_item")
+                return
+            text = " ".join(c.get("text") or "" for c in contents if c.get("type") == "text").strip()
+            self._history.append({"audio": self._pending_user_audio, "text": text})
+            self._pending_user_audio = None
+            logger.info("realtime history: %d prior turn(s) will be replayed", len(self._history))
+        else:
+            await self.send_error(f"Unsupported history message role: {role!r}", "invalid_history_item")
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -153,10 +200,13 @@ class RealtimeConnection(VllmRealtimeConnection):
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
-            if item.get("type") == "function_call_output":
+            item_type = item.get("type")
+            if item_type == "function_call_output":
                 await self._enqueue_tool_result(item)
+            elif item_type == "message":
+                await self._handle_history_item(item)
             else:
-                await self.send_error(f"Unsupported conversation.item type: {item.get('type')!r}", "unsupported_item")
+                await self.send_error(f"Unsupported conversation.item type: {item_type!r}", "unsupported_item")
         else:
             await super().handle_event(event)
 
@@ -235,13 +285,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools`/`self._speaker`/`self._instructions` through
-        to the model's
-        `buffer_realtime_audio`. The base class's `transcribe_realtime` has a
-        fixed (audio_stream, input_stream, model_config) call signature with
-        no seam for extra per-connection state like these, so this
-        reimplements its (short) body directly rather than patching upstream
-        vLLM."""
+        threads `self._tools`/`self._speaker`/`self._instructions`/
+        `self._history` through to the model's `buffer_realtime_audio`. The
+        base class's `transcribe_realtime` has a fixed (audio_stream,
+        input_stream, model_config) call signature with no seam for extra
+        per-connection state like these, so this reimplements its (short)
+        body directly rather than patching upstream vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
             audio_stream,
             input_stream,
@@ -249,6 +298,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             tools=self._tools,
             speaker=self._speaker,
             instructions=self._instructions,
+            history=self._history,
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
