@@ -105,6 +105,23 @@ marked its segment finished while stage 1 was still parked from the previous
 turn and never read the new chunks. Stages 1 and 2 sat idle and the client saw
 nothing.
 
+## Open: generic replies
+
+Later turns have been observed returning a generic greeting ("I'm doing well,
+how can I assist you today") regardless of what was said. The same clip has
+previously produced contextual replies, so this is not simply determinism.
+
+A generic greeting is what the model produces when the user turn carries no
+meaningful content, which points at the audio embeddings not landing for that
+turn rather than at generation. Worth checking first: whether the spliced
+embedding norm on turn 2+ matches turn 1 (instrument the splice in
+`thinker_duplex_preprocess`), since a silent or zeroed span would look exactly
+like this.
+
+Note the test clip is identical every time, so repeating it *should* give the
+same answer. Only differing spoken input producing identical replies is
+evidence of this bug.
+
 ## Troubleshooting
 
 | Symptom | Cause |
