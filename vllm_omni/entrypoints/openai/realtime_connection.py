@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
 
@@ -20,10 +21,25 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallStreamState, extract_deltas
+from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallDelta, ToolCallStreamState, extract_deltas
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 
 logger = init_logger(__name__)
+
+# How long to block on a client tool result before re-checking the connection.
+# Only bounds the wait between liveness checks, not the total wait: a tool may
+# legitimately take a long time, but a client that has gone away must not leave
+# the generation task parked forever.
+_TOOL_RESULT_POLL_S = 0.5
+
+
+@dataclass
+class _PendingToolCall:
+    """A tool call being accumulated from the model's streamed output."""
+
+    call_id: str
+    name: str
+    arguments: str = ""
 
 
 class RealtimeConnection(VllmRealtimeConnection):
@@ -46,12 +62,20 @@ class RealtimeConnection(VllmRealtimeConnection):
       - generation then continues automatically with the tool result appended,
         streaming the model's actual spoken reply as normal.
 
-    No audio is synthesized/forwarded for a turn that turns out to be a tool
-    call - the underlying 3-stage pipeline (thinker->talker->code2wav) still
-    runs end to end for it (there is no clean lower-level hook to skip talker/
-    code2wav without changing the shared orchestrator - see PR description),
-    but the resulting audio bytes are simply not sent to the client.
+    Audio for a tool-call turn is not forwarded to the client once the
+    `<tool_call>` tag has been parsed - the underlying 3-stage pipeline
+    (thinker->talker->code2wav) still synthesizes it (there is no clean
+    lower-level hook to skip talker/code2wav without changing the shared
+    orchestrator - see PR description), the bytes are just dropped. Any audio
+    that arrived before the tag was recognized has already been sent; in
+    practice the tag appears in the thinker's text well ahead of the
+    corresponding synthesized audio.
+
+    A chain of tool calls is bounded by MAX_TOOL_ROUNDS.
     """
+
+    # Upper bound on consecutive tool-call rounds within one user turn.
+    MAX_TOOL_ROUNDS = 8
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -65,9 +89,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         # because those contain the expanded audio placeholder run with no way to
         # re-attach the audio - see _await_tool_results_and_continue.
         self._turn_prompt: dict[str, Any] | None = None
-        # index (parser-assigned, per generation) -> {"call_id", "name", "arguments"}
-        self._pending_tool_calls: dict[int, dict[str, Any]] = {}
+        # parser-assigned index (per generation) -> the call being accumulated
+        self._pending_tool_calls: dict[int, _PendingToolCall] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # Consecutive tool-call rounds in this turn, bounded by MAX_TOOL_ROUNDS.
+        self._tool_rounds = 0
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -89,6 +115,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
+
+        # New user turn: reset the tool-round budget and discard any tool result
+        # left over from a previous turn, which would otherwise be consumed as if
+        # it answered one of this turn's calls.
+        self._tool_rounds = 0
+        while not self._tool_result_queue.empty():
+            self._tool_result_queue.get_nowait()
 
         audio_stream = self.audio_stream_generator()
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
@@ -219,26 +252,26 @@ class RealtimeConnection(VllmRealtimeConnection):
         pcm16 = (clipped * 32767.0).astype(np.int16)
         return base64.b64encode(pcm16.tobytes()).decode("utf-8")
 
-    async def _emit_tool_call_deltas(self, tool_deltas: list) -> None:
+    async def _emit_tool_call_deltas(self, tool_deltas: list[ToolCallDelta]) -> None:
         for delta in tool_deltas:
             if delta.name is not None:
-                call_id = f"call_{uuid4().hex[:24]}"
-                self._pending_tool_calls[delta.index] = {"call_id": call_id, "name": delta.name, "arguments": ""}
+                call = _PendingToolCall(call_id=f"call_{uuid4().hex[:24]}", name=delta.name)
+                self._pending_tool_calls[delta.index] = call
                 await self.send_json(
                     {
                         "type": "response.output_item.added",
-                        "item": {"type": "function_call", "name": delta.name, "call_id": call_id},
+                        "item": {"type": "function_call", "name": call.name, "call_id": call.call_id},
                     }
                 )
             if delta.arguments_delta:
-                info = self._pending_tool_calls.get(delta.index)
-                if info is None:
+                call = self._pending_tool_calls.get(delta.index)
+                if call is None:
                     continue  # shouldn't happen: name delta always precedes argument deltas for the same index
-                info["arguments"] += delta.arguments_delta
+                call.arguments += delta.arguments_delta
                 await self.send_json(
                     {
                         "type": "response.function_call_arguments.delta",
-                        "call_id": info["call_id"],
+                        "call_id": call.call_id,
                         "delta": delta.arguments_delta,
                     }
                 )
@@ -325,12 +358,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                     break
 
             if tool_state.has_tool_calls():
-                for idx, info in self._pending_tool_calls.items():
+                for call in self._pending_tool_calls.values():
                     await self.send_json(
                         {
                             "type": "response.function_call_arguments.done",
-                            "call_id": info["call_id"],
-                            "arguments": info["arguments"],
+                            "call_id": call.call_id,
+                            "arguments": call.arguments,
                         }
                     )
                 if self._is_connected:
@@ -406,13 +439,31 @@ class RealtimeConnection(VllmRealtimeConnection):
         own generated tool-call tokens + a freshly-rendered tool-result turn)
         and continue generation - which streams the model's actual spoken
         reply as a normal `_run_generation` call, recursing again if the
-        model chains into another tool call."""
+        model chains into another tool call (bounded by MAX_TOOL_ROUNDS)."""
+        self._tool_rounds += 1
+        if self._tool_rounds > self.MAX_TOOL_ROUNDS:
+            # A model that keeps re-emitting tool calls instead of answering
+            # would otherwise recurse without bound. Observed during bring-up
+            # when the spliced prompt was malformed (see _close_assistant_turn).
+            logger.warning("tool-call chain exceeded %d rounds; abandoning turn", self.MAX_TOOL_ROUNDS)
+            if self._is_connected:
+                await self.send_error(
+                    f"Tool-call chain exceeded {self.MAX_TOOL_ROUNDS} rounds without a final response",
+                    "tool_call_loop",
+                )
+            return
+
         pending = dict(self._pending_tool_calls)
-        call_id_to_index = {info["call_id"]: idx for idx, info in pending.items()}
+        call_id_to_index = {call.call_id: idx for idx, call in pending.items()}
         results_by_index: dict[int, str] = {}
 
         while len(results_by_index) < len(pending) and self._is_connected:
-            item = await self._tool_result_queue.get()
+            # Bounded wait so a client that disappears mid-tool-call cannot park
+            # this task forever; a slow-but-live client is unaffected.
+            try:
+                item = await asyncio.wait_for(self._tool_result_queue.get(), timeout=_TOOL_RESULT_POLL_S)
+            except TimeoutError:
+                continue
             call_id = item.get("call_id")
             idx = call_id_to_index.get(call_id)
             if idx is None:

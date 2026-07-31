@@ -15,7 +15,7 @@ from vllm.inputs import TokensPrompt
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection, _PendingToolCall
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -31,6 +31,7 @@ def tool_call_conn() -> RealtimeConnection:
     conn._tools = None
     conn._tool_result_queue = asyncio.Queue()
     conn._pending_tool_calls = {}
+    conn._tool_rounds = 0
     return conn
 
 
@@ -259,3 +260,66 @@ class TestCloseAssistantTurnBeforeToolResult:
 
         out = RealtimeConnection._close_assistant_turn(_Bad(), [1, 2, 3])
         assert out == [1, 2, 3]
+
+
+class TestToolChainIsBounded:
+    """A model that keeps re-emitting tool calls instead of answering must not
+    recurse without bound: `_await_tool_results_and_continue` re-enters
+    `_run_generation`, so an unbounded chain grows the stack and holds every
+    round's result generator open. Observed during bring-up when the spliced
+    prompt was malformed (see TestCloseAssistantTurnBeforeToolResult)."""
+
+    def test_exceeding_max_rounds_reports_error_and_stops(self, tool_call_conn, mocker) -> None:
+        tool_call_conn._is_connected = True
+        tool_call_conn._tool_rounds = RealtimeConnection.MAX_TOOL_ROUNDS
+        send_error = mocker.patch.object(tool_call_conn, "send_error", new_callable=mocker.AsyncMock)
+        run_generation = mocker.patch.object(tool_call_conn, "_run_generation", new_callable=mocker.AsyncMock)
+
+        asyncio.run(tool_call_conn._await_tool_results_and_continue([1, 2], [3]))
+
+        send_error.assert_awaited_once()
+        assert send_error.await_args.args[1] == "tool_call_loop"
+        run_generation.assert_not_awaited()
+
+    def test_rounds_below_the_cap_still_continue(self, tool_call_conn, mocker) -> None:
+        """The cap must not fire early: with no pending calls the wait loop is
+        skipped and generation continues."""
+        tool_call_conn._is_connected = True
+        tool_call_conn._tool_rounds = 0
+        tool_call_conn._turn_prompt = None
+        mocker.patch.object(tool_call_conn, "send_error", new_callable=mocker.AsyncMock)
+        run_generation = mocker.patch.object(tool_call_conn, "_run_generation", new_callable=mocker.AsyncMock)
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.realtime_connection.cached_tokenizer_from_config",
+            return_value=mocker.Mock(
+                encode=lambda text, add_special_tokens=True: [9],
+                convert_tokens_to_ids=lambda token: 151645,
+                unk_token_id=0,
+            ),
+        )
+        mocker.patch("vllm_omni.entrypoints.openai.realtime_connection.cached_processor_from_config")
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.realtime_connection.safe_apply_chat_template",
+            return_value="<|im_start|>user\nresult<|im_end|>\n<|im_start|>assistant\n",
+        )
+        tool_call_conn.serving = mocker.Mock()
+
+        asyncio.run(tool_call_conn._await_tool_results_and_continue([1, 2], [3]))
+
+        run_generation.assert_awaited_once()
+
+
+class TestToolResultWaitReleasesOnDisconnect:
+    """A client that vanishes mid-tool-call must not park the generation task
+    forever. The wait is bounded so `_is_connected` is re-checked instead of
+    blocking indefinitely on an empty queue."""
+
+    def test_wait_returns_when_client_disconnects(self, tool_call_conn, mocker) -> None:
+        tool_call_conn._is_connected = False  # client already gone
+        tool_call_conn._pending_tool_calls = {0: _PendingToolCall(call_id="call_x", name="get_weather")}
+        run_generation = mocker.patch.object(tool_call_conn, "_run_generation", new_callable=mocker.AsyncMock)
+
+        # Returns rather than hanging on the empty queue.
+        asyncio.run(asyncio.wait_for(tool_call_conn._await_tool_results_and_continue([1], [2]), timeout=5))
+
+        run_generation.assert_not_awaited()

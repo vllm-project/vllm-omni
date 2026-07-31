@@ -29,6 +29,7 @@ tool-parser internals that may change across versions.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -36,6 +37,7 @@ _TOOL_CALL_START = "<tool_call>"
 _TOOL_CALL_END = "</tool_call>"
 _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 _ARGS_KEY_RE = re.compile(r'"arguments"\s*:\s*')
+_JSON_DECODER = json.JSONDecoder()
 
 
 @dataclass
@@ -77,36 +79,25 @@ def _partial_tag_overlap(text: str, tag: str) -> int:
 
 def _json_value_end(text: str) -> int | None:
     """If `text` starts (after optional leading whitespace) with a complete
-    JSON object or array, return the index just past its matching closing
-    bracket. Returns None if `text` doesn't start with '{'/'[' or the value
-    isn't complete yet. Used to find exactly where an "arguments" value ends
+    JSON object or array, return the index just past its closing bracket.
+    Returns None if `text` doesn't start with '{'/'[' or the value isn't
+    complete yet. Used to find exactly where an "arguments" value ends
     without assuming anything about what (if anything) follows it - argument
-    values can themselves contain nested objects/arrays."""
+    values can themselves contain nested objects/arrays.
+
+    `raw_decode` is exactly this primitive: it parses one JSON value from the
+    start of the string and reports where it stopped, ignoring trailing text,
+    and raises on an incomplete value (the normal case mid-stream)."""
     stripped = text.lstrip()
+    # Restrict to object/array: `raw_decode` would also accept a bare scalar,
+    # but "arguments" is always a JSON object per the tool-call format.
     if not stripped or stripped[0] not in "{[":
         return None
-    offset = len(text) - len(stripped)
-    depth = 0
-    in_string = False
-    escape = False
-    for i, ch in enumerate(stripped):
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            depth -= 1
-            if depth == 0:
-                return offset + i + 1
-    return None
+    try:
+        _, end = _JSON_DECODER.raw_decode(stripped)
+    except ValueError:
+        return None
+    return (len(text) - len(stripped)) + end
 
 
 def extract_deltas(current_text: str, state: ToolCallStreamState) -> tuple[str, list[ToolCallDelta]]:
