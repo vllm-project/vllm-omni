@@ -185,3 +185,21 @@ def test_non_pcm_f32le_payload_is_rejected(runtime) -> None:
     duplex["payload"]["format"] = "pcm_s16le"
     with pytest.raises(ValueError, match="unsupported duplex audio format"):
         runtime.build_append_embeddings(duplex=duplex, token_offset=0, prompt_len=1)
+
+
+def test_turn_audio_resets_at_a_turn_boundary(runtime) -> None:
+    """A turn is encoded with its own context, not the whole conversation.
+
+    Carrying `turn_audio` across turns made every later turn re-encode all
+    prior audio, so replies kept answering the first question.
+    """
+    final = {**_duplex(CHUNK, seq=1), "final": True}
+    runtime.build_append_embeddings(duplex=final, token_offset=0, prompt_len=13)
+
+    state = runtime.session("s1", 1)
+    assert state.turn_audio is None, "closing a turn must clear its audio context"
+    assert state.chunk_index == 0
+
+    runtime.build_append_embeddings(duplex={**_duplex(CHUNK, seq=2), "final": True}, token_offset=0, prompt_len=13)
+    mel_shape, feature_lens, _ = runtime._model.thinker.audio_tower.calls[-1]
+    assert feature_lens == 100, "turn 2 encodes 1 s, not 2 s of accumulated audio"

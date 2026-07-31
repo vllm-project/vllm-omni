@@ -162,6 +162,10 @@ class Qwen3OmniStage0DuplexRuntime:
         incarnation = _coerce_int(duplex.get("incarnation")) or 0
         epoch = _coerce_int(duplex.get("epoch")) or 0
         seq = _coerce_int(duplex.get("seq")) or 0
+        payload = duplex.get("payload")
+        closes_turn = bool(duplex.get("final")) or (
+            isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True
+        )
 
         state = self.session(session_id, incarnation)
 
@@ -170,7 +174,7 @@ class Qwen3OmniStage0DuplexRuntime:
         if cache_key in state.prepared:
             return state.prepared[cache_key]
 
-        pcm = self._decode_pcm(duplex.get("payload"))
+        pcm = self._decode_pcm(payload)
         if pcm.size:
             state.audio_buffer = pcm if state.audio_buffer is None else np.concatenate([state.audio_buffer, pcm])
 
@@ -205,6 +209,18 @@ class Qwen3OmniStage0DuplexRuntime:
 
         state.audio_buffer = buffered[consumed:]
         state.chunk_index += num_chunks
+
+        # Start the next turn's context empty.
+        #
+        # `turn_audio` exists so a turn's chunks are encoded with each other's
+        # context, not so turns accumulate. Carrying it across a boundary made
+        # every later turn re-encode the whole conversation's audio: replies
+        # kept answering the first question, and the cost grew without bound.
+        # Earlier turns are already in the thinker's KV, so they do not need
+        # re-encoding here.
+        if closes_turn:
+            state.turn_audio = None
+            state.chunk_index = 0
 
         expected = self.expected_embedding_count(consumed)
         if embeds.shape[0] != expected:
