@@ -784,4 +784,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 max_batch=max_batch,
             )
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
+            token2wav.enable_trt_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
         self.backend = BatchedToken2Wav(token2wav, trt_stepper=trt_stepper)
