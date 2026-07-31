@@ -129,26 +129,34 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "indextts2",
 }
 
-# VoxCPM2 generates on a single audio timeline shared with the reference clip
-# (ref-continuation cloning), and its usable timeline tops out around ~30 s of
-# ref + generated audio. As the total approaches that budget the learned stop
-# head starts firing at phrase boundaries and silently drops the final words
+# VoxCPM2 generates on a single audio timeline shared with the prompt clip
+# (voice cloning via the `continuation` / `ref_continuation` prompt modes, and
+# plain `reference` prompts), and its usable timeline tops out around ~30 s of
+# prompt + generated audio. This is an observed model-behavior limit, not an
+# architectural one: as the total approaches that budget the learned stop head
+# starts firing at phrase boundaries and silently drops the final words
 # (measured: a 22 s ref pins generation at exactly 8.0 s, truncating any chunk
 # whose natural rendering is longer; a 10 s ref renders the same chunks fully).
 _VOXCPM2_TIMELINE_BUDGET_S = 30.0
 # ~0.92 decode steps (160 ms audio each) per input text token is the upper end
-# of the measured natural speaking rate for this model.
+# of the natural speaking rate measured on Turkish traffic. Treat it as an
+# empirical Turkish calibration, not a language-independent constant: the
+# token-to-speech ratio shifts with the tokenizer's per-language efficiency,
+# so validate before relying on the estimate for other languages.
 _VOXCPM2_EST_SECONDS_PER_TEXT_TOKEN = 0.16 * 0.92
 
 
 def _voxcpm2_timeline_budget_warning(ref_seconds: float, num_text_tokens: int) -> str | None:
-    """Return a warning when ref audio + estimated speech exceed the timeline budget."""
+    """Return a warning when ref audio + estimated speech approach the timeline budget.
+
+    Starts warning 0.5 s below the budget so borderline requests surface too.
+    """
     est_gen_seconds = num_text_tokens * _VOXCPM2_EST_SECONDS_PER_TEXT_TOKEN
     if ref_seconds + est_gen_seconds <= _VOXCPM2_TIMELINE_BUDGET_S - 0.5:
         return None
     return (
         f"VoxCPM2 timeline budget: ref_audio {ref_seconds:.1f}s + estimated speech "
-        f"{est_gen_seconds:.1f}s exceeds the ~{_VOXCPM2_TIMELINE_BUDGET_S:.0f}s "
+        f"{est_gen_seconds:.1f}s approaches or exceeds the ~{_VOXCPM2_TIMELINE_BUDGET_S:.0f}s "
         f"ref+generation budget; the stop head is likely to truncate the final words "
         f"at ~{max(0.0, _VOXCPM2_TIMELINE_BUDGET_S - ref_seconds):.1f}s. Use a shorter "
         f"reference clip (<=15s recommended) or shorter text chunks."
@@ -1069,11 +1077,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif request.voice is not None:
             voice_profile = self.precomputed_speakers.get(request.voice.lower())
 
+        ref_timeline_seconds: float | None = None
         if ref_audio is not None and ref_sr:
-            warning = _voxcpm2_timeline_budget_warning(
-                len(ref_audio) / float(ref_sr),
-                len(self._voxcpm2_encode(request.input)),
-            )
+            ref_timeline_seconds = len(ref_audio) / float(ref_sr)
+        elif voice_profile is not None:
+            ref_timeline_seconds = self._voxcpm2_profile_timeline_seconds(voice_profile)
+        if ref_timeline_seconds is not None:
+            # Use the same normalized target ids as build_voxcpm2_prompt (BOS stripped).
+            target_ids = self._voxcpm2_encode(request.input)
+            if target_ids and target_ids[0] == self._voxcpm2_tokenizer.bos_token_id:
+                target_ids = target_ids[1:]
+            warning = _voxcpm2_timeline_budget_warning(ref_timeline_seconds, len(target_ids))
             if warning:
                 logger.warning("%s", warning)
         return build_voxcpm2_prompt(
@@ -1086,6 +1100,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_text=request.ref_text,
             voice_profile=voice_profile,
         )
+
+    def _voxcpm2_profile_timeline_seconds(self, voice_profile: dict[str, Any]) -> float | None:
+        """Timeline seconds a precomputed voice profile already consumes.
+
+        Mirrors the per-mode feat accounting in ``build_voxcpm2_prompt``:
+        ``reference`` counts ``ref_audio_feat_len``, ``continuation`` counts
+        ``audio_feat_len``, and ``ref_continuation`` counts both. Returns None
+        when the profile carries no usable feat lengths.
+        """
+        mode = str(voice_profile.get("mode") or "reference").lower()
+        feat_len = 0
+        if mode in ("reference", "ref_continuation"):
+            feat_len += int(voice_profile.get("ref_audio_feat_len") or 0)
+        if mode in ("continuation", "ref_continuation"):
+            feat_len += int(voice_profile.get("audio_feat_len") or 0)
+        if feat_len <= 0:
+            return None
+        hf_config = self.engine_client.model_config.hf_config
+        vae = getattr(hf_config, "audio_vae_config", None)
+        patch_size = getattr(hf_config, "patch_size", None)
+        if not vae or not patch_size:
+            return None
+        patch_samples = patch_size * math.prod(vae["encoder_rates"])
+        return feat_len * patch_samples / float(vae["sample_rate"])
 
     def _load_uploaded_audio(self, voice_name: str) -> tuple[np.ndarray, int] | None:
         """Load decoded audio samples + sample rate from an uploaded voice's safetensors."""

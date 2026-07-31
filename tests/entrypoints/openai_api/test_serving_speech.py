@@ -3971,3 +3971,129 @@ class TestVoxCPM2TimelineBudgetWarning:
         msg = _voxcpm2_timeline_budget_warning(25.0, 65)
         assert msg is not None
         assert "at ~5.0s" in msg
+
+    def test_exact_safety_margin_boundary_is_silent(self):
+        # The helper starts warning strictly above budget - 0.5s.
+        assert _voxcpm2_timeline_budget_warning(29.5, 0) is None
+
+    def test_just_above_safety_margin_warns(self):
+        msg = _voxcpm2_timeline_budget_warning(29.6, 0)
+        assert msg is not None
+        assert "approaches or exceeds" in msg
+
+
+class _FakeVoxCPM2Tokenizer:
+    """Whitespace tokenizer with a BOS token, mirroring the real encode contract."""
+
+    bos_token_id = 7
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        ids = [100 + i for i, _ in enumerate(text.split())]
+        return [self.bos_token_id, *ids] if add_special_tokens else ids
+
+
+class TestVoxCPM2TimelineBudgetIntegration:
+    """The budget warning must fire on the real _build_voxcpm2_prompt path."""
+
+    # patch_size * prod(encoder_rates) / sample_rate = 2 * 1280 / 16000 = 0.16s,
+    # the real VoxCPM2 per-feat-patch duration.
+    _HF_CONFIG = SimpleNamespace(
+        patch_size=2,
+        audio_vae_config={"sample_rate": 16000, "encoder_rates": (8, 8, 5, 4)},
+    )
+
+    @pytest.fixture
+    def voxcpm2_server(self, mocker: MockerFixture):
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_configs = []
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.model_config = SimpleNamespace(hf_config=self._HF_CONFIG)
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        server._tts_model_type = "voxcpm2"
+        server._voxcpm2_tokenizer = _FakeVoxCPM2Tokenizer()
+        server._voxcpm2_split_map = {}
+        yield server
+        server.shutdown()
+
+    @staticmethod
+    def _words(n: int) -> str:
+        return " ".join(["word"] * n)
+
+    def test_uploaded_ref_over_budget_logs_warning(self, voxcpm2_server, mocker: MockerFixture):
+        warn = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.warning")
+        req = OpenAICreateSpeechRequest(input=self._words(65))
+        wav = np.zeros(22 * 16000, dtype=np.float32)
+
+        prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req, uploaded_ref=(wav, 16000)))
+
+        assert prompt["prompt_token_ids"]
+        warn.assert_called_once()
+        assert "timeline budget" in warn.call_args[0][1]
+
+    def test_uploaded_ref_within_budget_is_silent(self, voxcpm2_server, mocker: MockerFixture):
+        warn = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.warning")
+        req = OpenAICreateSpeechRequest(input=self._words(20))
+        wav = np.zeros(10 * 16000, dtype=np.float32)
+
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req, uploaded_ref=(wav, 16000)))
+
+        warn.assert_not_called()
+
+    def test_estimate_uses_bos_stripped_target_ids(self, voxcpm2_server, mocker: MockerFixture):
+        # The estimate must use the same normalized target ids as prompt
+        # construction: 5 words encode to 6 ids with BOS, 5 without.
+        helper = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech._voxcpm2_timeline_budget_warning",
+            return_value=None,
+        )
+        req = OpenAICreateSpeechRequest(input=self._words(5))
+        wav = np.zeros(10 * 16000, dtype=np.float32)
+
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req, uploaded_ref=(wav, 16000)))
+
+        helper.assert_called_once_with(10.0, 5)
+
+    def test_precomputed_reference_profile_over_budget_warns(self, voxcpm2_server, mocker: MockerFixture):
+        warn = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.warning")
+        # 150 feat patches * 0.16s = 24s of reference timeline.
+        voxcpm2_server.precomputed_speakers = {"alice": {"mode": "reference", "ref_audio_feat_len": 150}}
+        req = OpenAICreateSpeechRequest(input=self._words(65), voice="Alice")
+
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req))
+
+        warn.assert_called_once()
+        assert "timeline budget" in warn.call_args[0][1]
+
+    def test_precomputed_ref_continuation_profile_counts_both_clips(self, voxcpm2_server, mocker: MockerFixture):
+        helper = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech._voxcpm2_timeline_budget_warning",
+            return_value=None,
+        )
+        # ref 100 patches (16s) + prompt 50 patches (8s) = 24s on the timeline.
+        voxcpm2_server.precomputed_speakers = {
+            "bob": {"mode": "ref_continuation", "ref_audio_feat_len": 100, "audio_feat_len": 50}
+        }
+        req = OpenAICreateSpeechRequest(input=self._words(10), voice="Bob")
+
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req))
+
+        helper.assert_called_once_with(24.0, 10)
+
+    def test_precomputed_profile_without_feat_lens_skips_estimate(self, voxcpm2_server, mocker: MockerFixture):
+        helper = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech._voxcpm2_timeline_budget_warning",
+            return_value=None,
+        )
+        voxcpm2_server.precomputed_speakers = {"carol": {"mode": "reference"}}
+        req = OpenAICreateSpeechRequest(input=self._words(10), voice="Carol")
+
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(req))
+
+        helper.assert_not_called()
