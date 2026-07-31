@@ -14,6 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
@@ -29,6 +30,8 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @dataclass
@@ -56,6 +59,8 @@ class MockScheduler:
     def __init__(self):
         self._waiting_queue = []
         self._step_id = 0
+        # Match RequestScheduler API used by request-batch admission wait.
+        self.max_num_running_reqs = 5
 
     def add_request(self, request):
         self._waiting_queue.append(request)
@@ -63,6 +68,12 @@ class MockScheduler:
 
     def has_requests(self):
         return len(self._waiting_queue) > 0
+
+    def num_waiting_requests(self) -> int:
+        return len(self._waiting_queue)
+
+    def num_running_requests(self) -> int:
+        return 0
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -80,6 +91,21 @@ class MockScheduler:
     def update_from_output(self, sched_output, runner_output):
         # assume all new req finished
         return [req.request_id for req in sched_output.scheduled_new_reqs]
+
+    def get_request_state(self, request_id):
+        return None
+
+    def pop_request_state(self, request_id):
+        return None
+
+    def finish_requests(self, request_id, status):
+        pass
+
+    def close(self):
+        pass
+
+    def initialize(self, od_config):
+        pass
 
 
 class _BatchCapablePipeline:
@@ -392,6 +418,57 @@ class TestRequestBatchCapability:
         warmup.assert_called_once_with()
 
 
+class TestDiffusionCompileConfig:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_config_defaults_to_dynamic_regional_compile(self) -> None:
+        config = OmniDiffusionConfig(model="test")
+
+        assert config.diffusion_compile_granularity == "regional"
+        assert config.diffusion_compile_dynamic is True
+
+    def test_from_kwargs_preserves_compile_controls(self) -> None:
+        config = OmniDiffusionConfig.from_kwargs(
+            model="test",
+            diffusion_compile_granularity="full",
+            diffusion_compile_dynamic=False,
+        )
+
+        assert config.diffusion_compile_granularity == "full"
+        assert config.diffusion_compile_dynamic is False
+
+    def test_config_rejects_invalid_compile_granularity(self) -> None:
+        with pytest.raises(ValueError, match="diffusion_compile_granularity"):
+            OmniDiffusionConfig(model="test", diffusion_compile_granularity="block")
+
+    def test_config_rejects_non_boolean_compile_dynamic(self) -> None:
+        with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
+            OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
+
+    @pytest.mark.parametrize(
+        "kwargs, feature",
+        [
+            ({"parallel_config": {"ulysses_degree": 2}, "num_gpus": 2}, "sequence parallelism"),
+            (
+                {
+                    "parallel_config": {"use_hsdp": True, "hsdp_shard_size": 2},
+                    "num_gpus": 2,
+                },
+                "HSDP",
+            ),
+            ({"enable_cpu_offload": True}, "CPU offload"),
+            ({"enable_layerwise_offload": True}, "layerwise offload"),
+        ],
+    )
+    def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
+        with pytest.raises(ValueError, match=feature):
+            OmniDiffusionConfig(
+                model="test",
+                diffusion_compile_granularity="full",
+                **kwargs,
+            )
+
+
 class TestRequestBatchAdmission:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -531,9 +608,7 @@ def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
     assert moved is value
 
 
-@pytest.mark.diffusion
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
     tensor = torch.arange(8, dtype=torch.float32, device="cuda")
     other = torch.arange(4, dtype=torch.int64, device="cuda")
@@ -559,6 +634,7 @@ async def _consume_final_output(generator):
     return final_output
 
 
+@pytest.mark.cpu
 @pytest.mark.asyncio
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
@@ -570,13 +646,24 @@ async def test_async_add_req_and_stream_response():
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._init_lock = asyncio.Lock()
     engine._closed = False
-    engine.od_config = SimpleNamespace(streaming_output=False)
+    # Enable admission wait so concurrent adds land in one schedule wave;
+    # otherwise the first request can execute alone (~1s) and the rest in a
+    # second wave (~2s), failing the latency-spread assertion.
+    engine.od_config = SimpleNamespace(
+        streaming_output=False,
+        request_batch_max_wait_ms=500.0,
+    )
     engine._loop_started = False
     engine.main_loop = None
-    engine.supports_request_batch = False
+    engine.supports_request_batch = True
+    engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
-    engine._finalize_finished_request = lambda rid, out, err: out.result
+    def _finalize(rid, out, err=None, **kwargs):
+        # Stream consumers stop on ``finished``; keep result_data for assertions.
+        return SimpleNamespace(result_data=out.result.result_data, finished=True)
+
+    engine._finalize_finished_request = _finalize
 
     def mock_execute_batch(sched_output):
         request_ids = sched_output.scheduled_request_ids

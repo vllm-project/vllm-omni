@@ -31,20 +31,26 @@ from vllm_omni.diffusion.data import (
     parse_attention_config,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 class TestAttentionSpec:
-    def test_construct_no_extra(self):
+    def test_construct_no_skip_softmax(self):
         spec = AttentionSpec(backend="FLASH_ATTN")
-        assert spec.extra == {}
+        assert spec.skip_softmax is None
 
-    def test_mapping_extra_normalized(self):
-        spec = AttentionSpec(backend="SAGE_ATTN", extra={"quant": "int8"})
-        assert spec.backend == "SAGE_ATTN"
-        assert spec.extra == {"quant": "int8"}
+    def test_skip_softmax_mapping_coerced(self):
+        spec = AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"target_sparsity": 0.5})
+        assert spec.backend == "TRTLLM_ATTN"
+        assert spec.skip_softmax.target_sparsity == 0.5
 
     def test_invalid_backend_type(self):
         with pytest.raises(TypeError):
             AttentionSpec(backend=123)  # type: ignore[arg-type]
+
+    def test_skip_softmax_rejected_on_non_trtllm(self):
+        with pytest.raises(ValueError, match="only supported by the TRTLLM_ATTN"):
+            AttentionSpec(backend="TORCH_SDPA", skip_softmax={"target_sparsity": 0.5})
 
 
 class TestAttentionConfig:
@@ -57,13 +63,13 @@ class TestAttentionConfig:
         config = AttentionConfig(
             default={"backend": "FLASH_ATTN"},
             per_role={
-                "self": {"backend": "SPARSE_BLOCK", "extra": {"block_size": 128}},
+                "self": {"backend": "TRTLLM_ATTN", "skip_softmax": {"target_sparsity": 0.5}},
                 "cross": "SAGE_ATTN",
             },
         )
         assert config.default.backend == "FLASH_ATTN"
-        assert config.per_role["self"].backend == "SPARSE_BLOCK"
-        assert config.per_role["self"].extra == {"block_size": 128}
+        assert config.per_role["self"].backend == "TRTLLM_ATTN"
+        assert config.per_role["self"].skip_softmax.target_sparsity == 0.5
         assert config.per_role["cross"].backend == "SAGE_ATTN"
 
     def test_constructor_flattens_nested_per_role_tree(self):
@@ -178,10 +184,10 @@ class TestAttentionConfig:
         config = AttentionConfig(
             default=AttentionSpec(backend="FLASH_ATTN"),
             per_role={
-                "self": AttentionSpec(backend="SPARSE_BLOCK", extra={"block_size": 128}),
+                "self": AttentionSpec(backend="SPARSE_BLOCK"),
                 "cross": AttentionSpec(backend="SAGE_ATTN"),
                 "ltx2.audio_self": AttentionSpec(backend="FLASH_ATTN"),
-                "ltx2.audio_to_video": AttentionSpec(backend="FLASH_ATTN", extra={"causal_window": 64}),
+                "ltx2.audio_to_video": AttentionSpec(backend="FLASH_ATTN"),
             },
         )
 
@@ -200,7 +206,6 @@ class TestAttentionConfig:
         # audio-to-video → exact match
         spec, _ = config.resolve_with_source("ltx2.audio_to_video", "cross")
         assert spec.backend == "FLASH_ATTN"
-        assert spec.extra == {"causal_window": 64}
 
         # video-to-audio → category fallback to "cross"
         assert config.resolve_with_source("ltx2.video_to_audio", "cross")[0].backend == "SAGE_ATTN"
@@ -283,6 +288,13 @@ class TestBuildAttentionConfig:
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_diffusion_attention_backend_env(self, monkeypatch):
+        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
+        # build_attention_config(); clear it so these tests assert config defaults,
+        # not whatever the process inherited from CI / sibling tests.
+        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
+
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")
         assert isinstance(config.diffusion_attention_config, AttentionConfig)
@@ -364,12 +376,13 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             head_size,
             attention_config=None,
             role_category=None,
+            allow_trtllm_default=False,
         ):
             captured["role"] = role
             captured["head_size"] = head_size
             captured["role_category"] = role_category
             captured["attention_config"] = attention_config
-            return _FakeBackend, AttentionSpec(backend="TORCH_SDPA", extra={"block_size": 128})
+            return _FakeBackend, AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"target_sparsity": 0.5})
 
         class _FakeRingParallelAttention:
             def __init__(self, sp_group, attn_backend_pref=None):
@@ -391,7 +404,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         od_config = SimpleNamespace(
             diffusion_attention_config=AttentionConfig(
                 default=AttentionSpec(backend="FLASH_ATTN"),
-                per_role={"cross": AttentionSpec(backend="TORCH_SDPA", extra={"block_size": 128})},
+                per_role={"cross": AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"target_sparsity": 0.5})},
             ),
             parallel_config=SimpleNamespace(ring_degree=2),
             diffusion_kv_cache_dtype=None,
@@ -414,12 +427,12 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert captured["role_category"] == "cross"
         assert captured["head_size"] == 64
         assert captured["attention_config"] is od_config.diffusion_attention_config
-        assert attn.backend_pref == "TORCH_SDPA"
-        assert attn.attention.kwargs["backend_kwargs"] == {"block_size": 128}
+        assert attn.backend_pref == "TRTLLM_ATTN"
+        assert attn.attention.kwargs["backend_kwargs"] == {"target_sparsity": 0.5}
         assert attn.attention.kwargs["qkv_layout"] == "BSND"
         assert attn.use_ring is True
         assert attn.ring_runner is not None
-        assert attn.ring_runner.attn_backend_pref == "TORCH_SDPA"
+        assert attn.ring_runner.attn_backend_pref == "TRTLLM_ATTN"
 
 
 class TestDiffusionKvCacheQuantization:
@@ -453,7 +466,10 @@ class TestDiffusionKvCacheQuantization:
         monkeypatch.setattr(
             layer_mod,
             "get_attn_backend_for_role",
-            lambda role, head_size, attention_config=None, role_category=None: (_FakeBackend, None),
+            lambda role, head_size, attention_config=None, role_category=None, allow_trtllm_default=False: (
+                _FakeBackend,
+                None,
+            ),
         )
         monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
         monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())

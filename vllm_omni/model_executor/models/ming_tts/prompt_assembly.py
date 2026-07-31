@@ -265,6 +265,7 @@ def build_ming_dense_prompt(
     prompt_waveform: Any = None,
     prompt_latents: Any = None,
     speaker_embedding: Any = None,
+    speaker_count: int | None = None,
     use_zero_spk_emb: bool = False,
     request_id: str | None = None,
     model_variant: str | None = None,
@@ -273,6 +274,17 @@ def build_ming_dense_prompt(
         model_variant = detect_model_variant(tokenizer)
     instruction_text = create_instruction(instruction)
     speaker_embeddings = coerce_speaker_embeddings(speaker_embedding, use_zero_spk_emb=use_zero_spk_emb)
+    if speaker_count is None:
+        effective_speaker_count = 0 if speaker_embeddings is None else len(speaker_embeddings)
+    else:
+        effective_speaker_count = int(speaker_count)
+        if effective_speaker_count < 0:
+            raise ValueError(f"speaker_count must be >= 0, got {effective_speaker_count}")
+        if speaker_embeddings is not None and effective_speaker_count != len(speaker_embeddings):
+            raise ValueError(
+                f"speaker_count={effective_speaker_count} does not match "
+                f"{len(speaker_embeddings)} provided speaker embeddings"
+            )
     effective_runtime_controls = resolve_effective_runtime_controls(text=text, runtime_controls=runtime_controls)
 
     prompt_waveform_tensor = None
@@ -305,7 +317,7 @@ def build_ming_dense_prompt(
         text=text,
         instruction=instruction_text,
         prompt_text=prompt_text if prompt_patch_count > 0 else None,
-        speaker_count=0 if speaker_embeddings is None else len(speaker_embeddings),
+        speaker_count=effective_speaker_count,
         prompt_patch_count=prompt_patch_count,
     )
 

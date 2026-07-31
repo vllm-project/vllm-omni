@@ -1023,7 +1023,7 @@ class OmniKVTransferManager:
         value_cache: list[torch.Tensor | None] = [None] * num_layers
 
         for layer_idx, layer_kv in enumerate(kv_caches):
-            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
+            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx, block_size=block_size)
             if kv_pair is None:
                 continue
             key_blocks, value_blocks = kv_pair
