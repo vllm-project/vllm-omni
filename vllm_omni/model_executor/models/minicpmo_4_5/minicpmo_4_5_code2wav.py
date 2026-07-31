@@ -727,8 +727,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
-        from vllm_omni.platforms import current_omni_platform
-
         # In-tree adapter over StepAudio2Token2WavCore on every platform. It
         # matches the external `stepaudio2-minicpmo` Token2wav bit-for-bit on
         # CUDA (same cosyvoice2 flow/DiT modules and weights) while dropping
@@ -738,6 +736,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
+        from vllm_omni.platforms import current_omni_platform
 
         extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
