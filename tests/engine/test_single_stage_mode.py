@@ -12,6 +12,7 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
@@ -496,6 +497,23 @@ class TestEndpointRestrictionsTrustRemoteCode:
     the ``get_pipeline_config`` call site so the restriction is still computed.
     """
 
+    @pytest.fixture(autouse=True)
+    def clear_config_factory_caches(self):
+        """Isolate the process-wide ``functools.cache`` on StageConfigFactory.
+
+        ``get_hf_config`` / ``try_infer_model_type`` cache per-model results for
+        the whole process. These tests patch ``get_config`` with a synthetic
+        Qwen3-Omni config for ``"fake-model"``; without clearing on teardown the
+        synthetic entry would leak to later tests in the same worker (after the
+        mock is restored), making the suite order-dependent. Clear both before
+        and after.
+        """
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+        yield
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
     def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
         mocker.patch.object(
             AsyncOmniEngine,
@@ -517,10 +535,6 @@ class TestEndpointRestrictionsTrustRemoteCode:
             trust_remote_code |= False  # TypeError if None reaches here
             return Qwen3OmniMoeConfig(enable_audio_output=True)
 
-        from vllm_omni.config.config_factory import StageConfigFactory
-
-        StageConfigFactory.get_hf_config.cache_clear()
-        StageConfigFactory.try_infer_model_type.cache_clear()
         mocker.patch("vllm_omni.config.config_factory.get_config", side_effect=fake_get_config)
 
     @pytest.mark.parametrize("trc_kwargs", [{}, {"trust_remote_code": False}, {"trust_remote_code": True}])
