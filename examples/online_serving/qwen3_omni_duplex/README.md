@@ -48,6 +48,20 @@ work without setting up TLS.
 
 The reply plays automatically and the transcript appears as it arrives.
 
+## Without a browser
+
+`headless_client.py` speaks the same protocol this page does, reading
+`sample_16k.wav` instead of a microphone, so you can exercise the pipeline over
+SSH with no tunnel and no mic — and repeat it enough times to turn "it goes
+quiet sometimes" into a number:
+
+```bash
+python examples/online_serving/qwen3_omni_duplex/headless_client.py \
+  --sessions 5 --turns 3
+```
+
+It exits non-zero unless every turn of every session produced audio.
+
 ## What the diagram shows
 
 ```
