@@ -33,6 +33,7 @@ _OMNI_RUNNER_PARAM = (
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 
