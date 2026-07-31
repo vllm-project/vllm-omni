@@ -306,12 +306,23 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
-            if self._async_chunk and context.stage_id == 0:
-                await self._prewarm_async_chunk_stages(
-                    context.request_id,
-                    request,
-                    request_state,
-                )
+        # Re-arm the downstream async-chunk stages on every stage-0 submit,
+        # not only the first.
+        #
+        # A downstream stage stops polling the connector once its segment
+        # finishes (`is_done_receiving_chunks` covers
+        # `segment_finished_requests`), and its marker is only cleared when it
+        # receives a streaming update. Prewarming just the initial submit left
+        # a second turn deadlocked: stage 0 generated and marked its segment
+        # finished, while stage 1 was still parked from the previous turn and
+        # never read the new chunks. Observed as turn 1 answering normally and
+        # every later turn producing nothing, with stage 1 and stage 2 idle.
+        if self._async_chunk and context.stage_id == 0:
+            await self._prewarm_async_chunk_stages(
+                context.request_id,
+                request,
+                request_state,
+            )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:

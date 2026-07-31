@@ -80,46 +80,18 @@ audio does not affect it. The session and its KV survive a cancel.
 starts a response on commit. Do not send `response.create` — on this path it
 routes to the chat fallback rather than the native duplex runtime.
 
-## Known limitation: one turn per server boot
+## Multi-turn
 
-The pipeline currently serves **one spoken turn per server start**. The first
-turn works end to end. The next one -- whether it is a second question in the
-same session or a new session entirely -- completes the handshake, accepts
-audio, frames it correctly, and produces no output.
+Multi-turn works. Verified: two spoken turns in one session produce two
+independent replies, 9 audio deltas total.
 
-Observed directly in the browser demo: the first question produced a spoken
-reply with every stage lighting up, and the second stalled with no stage
-advancing past the microphone.
-
-Isolated so far:
-
-- Not session capacity. Reproduces with `max_sessions: 4` and matching stage
-  `max_num_seqs`.
-- Not the client. The scripted client and the browser fail identically.
-- Not `session.close`. A first session that never closes still poisons the
-  second.
-- Not stage 0 admission. The second request is created and generates its
-  first token; the reply never reaches the client, and the data plane sees
-  `outputs=None`.
-- Not session lifecycle. It reproduces across a session boundary *and* within
-  one open session, so the trigger is a completed turn rather than a completed
-  session.
-- Not the stop token. Removing `stop_token_ids` from stage-0 sampling was
-  tried on the theory that finishing the request made it unresumable
-  (`_handle_stopped_request` only re-enqueues stages where
-  `receives_chunks` is true, which excludes stage 0). Turn 2 fails identically
-  without it.
-
-Reproduces deterministically with two turns in one session against a freshly
-started server, so it is a state problem rather than a race.
-
-Between conversations:
-
-```bash
-./reset_server.sh              # restart and wait for :8099
-```
-
-Roughly a five minute model reload, so this is a workaround rather than a fix.
+This needed a framework fix. Downstream async-chunk stages stop polling the
+connector once their segment finishes, and only resume when they receive a
+streaming update. The orchestrator prewarmed them on the *initial* stage-0
+submit but not on updates, so a second turn deadlocked: stage 0 generated and
+marked its segment finished while stage 1 was still parked from the previous
+turn and never read the new chunks. Stages 1 and 2 sat idle and the client saw
+nothing.
 
 ## Troubleshooting
 
