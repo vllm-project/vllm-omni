@@ -121,11 +121,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._tool_rounds = 0
         self._speaker: str | None = None
         self._instructions: str | None = None
-        # Completed prior turns, each {"audio": np.ndarray, "text": str}, replayed
-        # into every subsequent prompt so the model can refer back to them.
+        # Prior conversation as an ordered message list, replayed into every
+        # subsequent prompt. Entries are {"role": ..., "audio": np.ndarray} for the
+        # user's spoken turns and {"role": ..., "content": str} otherwise. A flat
+        # message list (rather than user/assistant pairs) is what lets a completed
+        # TOOL turn be replayed in full - assistant `<tool_call>`, the
+        # `<tool_response>` result, then the spoken answer - which the model needs
+        # in order to keep calling tools on later turns. See _handle_history_item.
         self._history: list[dict[str, Any]] = []
-        # A user message whose assistant reply has not arrived yet.
-        self._pending_user_audio: np.ndarray | None = None
 
     @staticmethod
     def _decode_pcm16(b64_audio: str) -> np.ndarray:
@@ -135,17 +138,23 @@ class RealtimeConnection(VllmRealtimeConnection):
         return np.frombuffer(base64.b64decode(b64_audio), dtype=np.int16).astype(np.float32) / 32768.0
 
     async def _handle_history_item(self, item: dict) -> None:
-        """Accept a prior conversation turn, OpenAI-Realtime shaped:
+        """Append a prior conversation turn, OpenAI-Realtime shaped:
 
             {"type": "message", "role": "user",
              "content": [{"type": "input_audio", "audio": "<b64 pcm16>"}]}
             {"type": "message", "role": "assistant",
              "content": [{"type": "text", "text": "..."}]}
+            {"type": "message", "role": "tool",
+             "content": [{"type": "text", "text": "<tool result>"}]}
 
-        A user item is held until its assistant reply arrives; the pair is then
-        appended to the replayed history. A user item with no reply yet (the
-        turn currently being spoken) is simply never paired, so it cannot be
-        replayed twice.
+        A completed tool turn MUST be replayed in full: the assistant message
+        carrying the `<tool_call>` block, then the `tool` message with its result,
+        then the spoken answer. Replaying only the answer makes the history read as
+        "the model answers these questions from its own knowledge", and it stops
+        calling the tool on later turns and confabulates instead - reproduced on the
+        reference HF path, so it is the prompt shape rather than any serving detail.
+        Conversely a `<tool_call>` replayed with no matching result reads as an
+        unanswered call, and the model retries it indefinitely.
         """
         role = item.get("role")
         contents = item.get("content") or []
@@ -157,17 +166,17 @@ class RealtimeConnection(VllmRealtimeConnection):
             if audio_b64 is None:
                 await self.send_error("history user message needs input_audio content", "invalid_history_item")
                 return
-            self._pending_user_audio = self._decode_pcm16(audio_b64)
-        elif role == "assistant":
-            if self._pending_user_audio is None:
-                await self.send_error("history assistant message has no preceding user message", "invalid_history_item")
-                return
+            self._history.append({"role": "user", "audio": self._decode_pcm16(audio_b64)})
+        elif role in ("assistant", "tool"):
             text = " ".join(c.get("text") or "" for c in contents if c.get("type") == "text").strip()
-            self._history.append({"audio": self._pending_user_audio, "text": text})
-            self._pending_user_audio = None
-            logger.info("realtime history: %d prior turn(s) will be replayed", len(self._history))
+            if not text:
+                await self.send_error(f"history {role} message needs text content", "invalid_history_item")
+                return
+            self._history.append({"role": role, "content": text})
         else:
             await self.send_error(f"Unsupported history message role: {role!r}", "invalid_history_item")
+            return
+        logger.info("realtime history: %d message(s) queued for replay", len(self._history))
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")

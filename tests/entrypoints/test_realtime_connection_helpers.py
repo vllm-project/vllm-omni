@@ -677,17 +677,22 @@ class TestRenderPromptPropagatesAdditionalInformation:
 
 
 class TestConversationHistory:
-    """Audio conversation history: the omni realtime endpoint is stateless per
-    turn and returns only the assistant's own reply text (no ASR of the user),
-    so prior turns are replayed as the user's ORIGINAL AUDIO paired with the
-    model's reply text. These cover the pairing state machine; the prompt-side
-    contract (one audio placeholder per replayed turn, in the same order as the
-    multi_modal_data audio list) lives in buffer_realtime_audio."""
+    """Audio conversation history. The endpoint is audio-in and returns only the
+    assistant's own reply text (no ASR of the user), so prior turns are replayed as
+    the user's ORIGINAL AUDIO plus text for everything else.
+
+    A completed TOOL turn must be replayed in full - assistant `<tool_call>`, the
+    `tool` result, then the spoken answer. Replaying only the answer makes the
+    history read as "the model answers these from its own knowledge" and it stops
+    calling tools on later turns, confabulating instead; replaying a `<tool_call>`
+    with no result reads as an unanswered call and it retries forever. Both were
+    reproduced on the reference HF path, i.e. they are prompt-shape issues rather
+    than serving details.
+    """
 
     def _conn(self):
         conn = RealtimeConnection.__new__(RealtimeConnection)
         conn._history = []
-        conn._pending_user_audio = None
         conn.send_error = mock.AsyncMock()
         return conn
 
@@ -703,31 +708,34 @@ class TestConversationHistory:
         }
 
     @staticmethod
-    def _assistant(text):
-        return {"type": "message", "role": "assistant", "content": [{"type": "text", "text": text}]}
+    def _msg(role, text):
+        return {"type": "message", "role": role, "content": [{"type": "text", "text": text}]}
 
-    def test_user_then_assistant_forms_one_turn(self) -> None:
+    def test_user_audio_is_decoded_and_appended(self) -> None:
         conn = self._conn()
         asyncio.run(conn._handle_history_item(self._user([32767, -32768])))
-        assert conn._history == []  # held until the reply arrives
-        asyncio.run(conn._handle_history_item(self._assistant("sunny in Madrid")))
         assert len(conn._history) == 1
-        assert conn._history[0]["text"] == "sunny in Madrid"
+        assert conn._history[0]["role"] == "user"
         np.testing.assert_allclose(conn._history[0]["audio"], [32767 / 32768.0, -1.0], rtol=1e-6)
-        assert conn._pending_user_audio is None
 
-    def test_unpaired_user_turn_is_not_replayed(self) -> None:
-        """The turn currently being spoken has no reply yet; replaying a dangling
-        user turn would leave the conversation malformed."""
+    def test_full_tool_turn_is_preserved_in_order(self) -> None:
+        """The regression this class exists for: all four messages, in order."""
         conn = self._conn()
-        asyncio.run(conn._handle_history_item(self._user([1, 2, 3])))
-        assert conn._history == []
+        call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Madrid"}}\n</tool_call>'
+        asyncio.run(conn._handle_history_item(self._user([1, 2])))
+        asyncio.run(conn._handle_history_item(self._msg("assistant", call)))
+        asyncio.run(conn._handle_history_item(self._msg("tool", "sunny and 72 degrees")))
+        asyncio.run(conn._handle_history_item(self._msg("assistant", "It is sunny in Madrid.")))
 
-    def test_assistant_without_user_is_rejected(self) -> None:
+        assert [m["role"] for m in conn._history] == ["user", "assistant", "tool", "assistant"]
+        assert conn._history[1]["content"] == call
+        assert conn._history[2]["content"] == "sunny and 72 degrees"
+
+    def test_tool_role_is_accepted(self) -> None:
         conn = self._conn()
-        asyncio.run(conn._handle_history_item(self._assistant("orphan")))
-        assert conn._history == []
-        conn.send_error.assert_awaited_once()
+        asyncio.run(conn._handle_history_item(self._msg("tool", "12 units in stock")))
+        assert conn._history == [{"role": "tool", "content": "12 units in stock"}]
+        conn.send_error.assert_not_awaited()
 
     def test_user_without_audio_is_rejected(self) -> None:
         conn = self._conn()
@@ -736,23 +744,20 @@ class TestConversationHistory:
                 {"type": "message", "role": "user", "content": [{"type": "text", "text": "no audio"}]}
             )
         )
-        assert conn._pending_user_audio is None
+        assert conn._history == []
+        conn.send_error.assert_awaited_once()
+
+    def test_empty_text_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._msg("assistant", "   ")))
+        assert conn._history == []
         conn.send_error.assert_awaited_once()
 
     def test_unknown_role_is_rejected(self) -> None:
         conn = self._conn()
-        asyncio.run(
-            conn._handle_history_item({"type": "message", "role": "system", "content": [{"type": "text", "text": "x"}]})
-        )
+        asyncio.run(conn._handle_history_item(self._msg("system", "x")))
         assert conn._history == []
         conn.send_error.assert_awaited_once()
-
-    def test_multiple_turns_accumulate_in_order(self) -> None:
-        conn = self._conn()
-        for i, reply in enumerate(["first", "second", "third"], start=1):
-            asyncio.run(conn._handle_history_item(self._user([i])))
-            asyncio.run(conn._handle_history_item(self._assistant(reply)))
-        assert [h["text"] for h in conn._history] == ["first", "second", "third"]
 
     def test_decode_matches_base_class_pcm16_conversion(self) -> None:
         out = RealtimeConnection._decode_pcm16(self._pcm_b64([0, 16384, -16384]))

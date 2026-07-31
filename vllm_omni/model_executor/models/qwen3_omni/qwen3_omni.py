@@ -245,13 +245,20 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        # Prior turns of this conversation, each `{"audio": np.ndarray, "text": str}`
-        # (what the user said, and what the model answered). They are replayed as
-        # real conversation turns - the user's ORIGINAL AUDIO, not a transcript -
-        # because this endpoint is audio-in and the model returns only its own
-        # reply text, so there is no transcript of the user's speech to replay.
-        # Cheap in context: audio costs ~25 thinker tokens/second here.
+        # Prior conversation as an ordered message list. User turns carry the
+        # ORIGINAL AUDIO (`{"role": "user", "audio": ndarray}`) because this endpoint
+        # is audio-in and returns only the model's own reply text - there is no
+        # transcript of the user's speech to replay. Everything else carries text,
+        # including the `assistant` message holding a `<tool_call>` and the `tool`
+        # message holding its result: a completed tool turn has to be replayed in
+        # full or the model stops calling tools on later turns (it reads the history
+        # as "answer these from knowledge") and confabulates instead. Cheap in
+        # context: audio costs ~25 thinker tokens/second here.
         history = list(history or [])
+        # Drop a trailing user turn with no reply yet - that is the turn being
+        # spoken now, and replaying it would duplicate the live audio.
+        while history and history[-1].get("role") == "user":
+            history.pop()
 
         if tools or instructions or history:
             # Render through the model's own chat template (rather than the
@@ -283,16 +290,18 @@ class Qwen3OmniMoeForConditionalGeneration(
             # always wins and still respects `tools` when applying it).
             from vllm.renderers.hf import safe_apply_chat_template
 
-            # One user/assistant pair per prior turn, then the turn being spoken
-            # now. Every user turn is an audio placeholder; the placeholders are
-            # matched positionally against the multi_modal_data audio list below,
+            # Replay the prior messages verbatim, then the turn being spoken now.
+            # Each replayed user turn becomes an audio placeholder; the placeholders
+            # are matched POSITIONALLY against the multi_modal_data audio list below,
             # so the two MUST stay in the same order and count.
             messages: list[dict[str, Any]] = []
             if instructions:
                 messages.append({"role": "system", "content": instructions})
             for past in history:
-                messages.append({"role": "user", "content": audio_placeholder})
-                messages.append({"role": "assistant", "content": past.get("text") or ""})
+                if past.get("role") == "user":
+                    messages.append({"role": "user", "content": audio_placeholder})
+                else:
+                    messages.append({"role": past.get("role") or "assistant", "content": past.get("content") or ""})
             messages.append({"role": "user", "content": audio_placeholder})
 
             prompt_template = safe_apply_chat_template(
@@ -321,7 +330,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         # flush so the thinker sees one complete prompt.
         async_chunk = getattr(model_config, "async_chunk", False)
 
-        past_audio = [past["audio"] for past in history if past.get("audio") is not None]
+        # Same order as the replayed user placeholders above.
+        past_audio = [p["audio"] for p in history if p.get("role") == "user" and p.get("audio") is not None]
 
         def _mm(current: np.ndarray) -> dict[str, Any]:
             # Prior turns first, current turn last - same order as the audio
