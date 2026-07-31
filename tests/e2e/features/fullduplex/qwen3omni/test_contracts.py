@@ -804,3 +804,38 @@ def test_audio_length_uses_the_sample_axis_not_the_batch_axis() -> None:
     assert _audio_length(_T(7125)) == 7125
     assert _audio_length([0] * 40) == 40
     assert _audio_tail(_T(55125), 7125).shape == (1, 48000)
+
+
+def test_audio_cursor_survives_a_turn_boundary() -> None:
+    """One request id spans the session; Code2Wav accumulates across it.
+
+    Resetting the cursor per turn made each reply resend every previously
+    spoken sample before the new audio, so replies grew by repeating the whole
+    conversation.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        Qwen3OmniDataPlaneContext,
+        Qwen3OmniDataPlaneSession,
+    )
+
+    seen: list[int] = []
+    dp = Qwen3OmniDataPlaneSession(lambda a, *_: (seen.append(len(a)), "x" * len(a))[1])
+    ctx = Qwen3OmniDataPlaneContext(modalities=("audio",))
+
+    def turn(total: int) -> None:
+        out = SimpleNamespace(
+            request_id="r1",
+            finished=False,
+            stage_id=2,
+            multimodal_output={"audio": list(range(total)), "sr": 24000},
+        )
+        list(dp.project({"data_plane_outputs": [out]}, context=ctx))
+
+    dp.begin_request("r1")
+    turn(100)
+    dp.begin_request("r1")  # next turn, same request id
+    turn(260)
+
+    assert seen == [100, 160], f"turn 2 must send only its own 160 samples, got {seen}"
