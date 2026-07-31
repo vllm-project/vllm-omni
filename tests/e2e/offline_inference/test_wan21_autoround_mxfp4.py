@@ -16,30 +16,26 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 QUANTIZED_MODEL = os.environ.get(
     "WAN21_AUTOROUND_MXFP4_MODEL",
-    "Intel/Wan2.1-T2V-1.3B-Diffusers-MXFP4-AutoRoundFormat-rtn",
+    "Intel/Wan2.1-T2V-1.3B-MXFP4-AutoRound",
 )
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"xpu": "B60"})
 @pytest.mark.parametrize(
     "omni_runner",
-    [(QUANTIZED_MODEL, None, {"enforce_eager": True})],
+    [(QUANTIZED_MODEL, None)],
     indirect=True,
 )
-def test_wan21_autoround_mxfp4_generates_video(
-    omni_runner, omni_runner_handler
-):
+def test_wan21_autoround_mxfp4_generates_video(omni_runner, omni_runner_handler):
     sampling_params = OmniDiffusionSamplingParams(
         height=256,
         width=256,
         num_frames=5,
         num_inference_steps=1,
         guidance_scale=1.0,
-        generator=torch.Generator(
-            device=current_omni_platform.device_type
-        ).manual_seed(42),
+        generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
     )
     response = omni_runner_handler.send_diffusion_request(
         {

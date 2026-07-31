@@ -4,6 +4,7 @@
 
 from unittest.mock import patch
 
+import pytest
 from torch import nn
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.model_loader.utils import configure_quant_config
@@ -13,6 +14,8 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
 )
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.inc_config import OmniINCConfig
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _autoround_mxfp4_config() -> dict:
@@ -50,18 +53,12 @@ def test_wan_autoround_config_maps_runtime_layer_names():
     config = build_quant_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
-    assert config.packed_modules_mapping == {
-        "to_qkv": ["to_q", "to_k", "to_v"]
-    }
+    assert config.packed_modules_mapping == {"to_qkv": ["to_q", "to_k", "to_v"]}
     assert config.block_name_to_quantize == ["blocks"]
     mapper = WanTransformer3DModel.hf_to_vllm_mapper
-    assert mapper._map_name("blocks.0.ffn.net.0.proj") == (
-        "blocks.0.ffn.net_0.proj"
-    )
+    assert mapper._map_name("blocks.0.ffn.net.0.proj") == ("blocks.0.ffn.net_0.proj")
     assert mapper._map_name("blocks.0.ffn.net.2") == "blocks.0.ffn.net_2"
-    assert mapper._map_name("blocks.0.attn1.to_out.0") == (
-        "blocks.0.attn1.to_out"
-    )
+    assert mapper._map_name("blocks.0.attn1.to_out.0") == ("blocks.0.attn1.to_out")
 
 
 def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
@@ -70,12 +67,8 @@ def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
 
     layer = object.__new__(LinearBase)
     nn.Module.__init__(layer)
-    layer_config = config.config_parser.resolve(
-        layer, "blocks.0.ffn.net_0.proj"
-    )
-    outside_config = config.config_parser.resolve(
-        layer, "condition_embedder.time_proj"
-    )
+    layer_config = config.config_parser.resolve(layer, "blocks.0.ffn.net_0.proj")
+    outside_config = config.config_parser.resolve(layer, "condition_embedder.time_proj")
 
     assert layer_config.quantized
     assert layer_config.is_mxfp4
@@ -83,11 +76,8 @@ def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
 
     fake_method = object()
     with patch(
-        "vllm.model_executor.layers.quantization.inc.schemes."
-        "inc_mxfp4_scheme.INCMxfp4Scheme.get_linear_method",
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_scheme.INCMxfp4Scheme.get_linear_method",
         return_value=fake_method,
     ):
-        method = config.get_quant_method(
-            layer, "blocks.0.ffn.net_0.proj"
-        )
+        method = config.get_quant_method(layer, "blocks.0.ffn.net_0.proj")
     assert method is fake_method
