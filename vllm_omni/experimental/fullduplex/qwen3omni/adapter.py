@@ -136,6 +136,7 @@ class Qwen3OmniNativeDuplexServingAdapter:
             Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY: encode(session_prefix),
             Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY: encode(Qwen3OmniDuplexPolicy.TURN_PREFIX),
             Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY: encode(Qwen3OmniDuplexPolicy.TURN_SUFFIX),
+            Qwen3OmniDuplexPolicy.NEWLINE_IDS_KEY: encode("\n"),
         }
 
     @classmethod

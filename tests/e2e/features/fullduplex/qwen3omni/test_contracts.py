@@ -419,7 +419,10 @@ _SCAFFOLD = {
     Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY: [1, 2, 3],
     Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY: [4, 5],
     Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY: [6, 7, 8],
+    Qwen3OmniDuplexPolicy.NEWLINE_IDS_KEY: [9],
 }
+#: A later turn opens by closing the assistant's previous turn.
+_CLOSE_PREV = [Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID, 9]
 _PAD = Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID
 
 
@@ -451,9 +454,10 @@ def test_mid_turn_append_has_no_scaffolding() -> None:
 
 def test_later_turn_reopens_user_without_repeating_system_block() -> None:
     ids, audio_offset, _ = _prompt(seq=9, turn_seq=1, final=False)
-    assert ids[:2] == [4, 5]
-    assert ids[2] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
-    assert audio_offset == 3, "system block belongs to the session, not each turn"
+    assert ids[:2] == _CLOSE_PREV, "must close the assistant's previous turn"
+    assert ids[2:4] == [4, 5]
+    assert ids[4] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+    assert audio_offset == 5, "system block belongs to the session, not each turn"
 
 
 def test_final_append_closes_user_and_opens_assistant() -> None:
@@ -464,13 +468,13 @@ def test_final_append_closes_user_and_opens_assistant() -> None:
     """
     ids, audio_offset, audio_tokens = _prompt(seq=3, turn_seq=3, final=True)
     assert ids[-3:] == [6, 7, 8]
-    assert ids == [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
+    assert ids == _CLOSE_PREV + [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
         Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID,
         6,
         7,
         8,
     ]
-    assert audio_offset == 3
+    assert audio_offset == 5
 
 
 def test_prompt_length_equals_reservation() -> None:
@@ -481,6 +485,8 @@ def test_prompt_length_equals_reservation() -> None:
         assert ids.count(_PAD) == audio_tokens, "audio span is exactly the pad tokens"
         trailing = len(ids) - audio_offset - audio_tokens
         assert trailing == (4 if final else 0), "audio_end + turn suffix when closing"
+        if seq > 1 and audio_offset >= 2:
+            assert ids[:2] == _CLOSE_PREV, "later turns close the assistant first"
 
 
 def test_audio_span_is_contiguous_and_located_by_audio_offset() -> None:
@@ -519,7 +525,7 @@ def test_commit_payload_closes_the_turn_without_the_final_flag() -> None:
         runtime_config=dict(_SCAFFOLD), payload=payload, seq=2, turn_seq=2, final=False
     )
     assert ids[-3:] == [6, 7, 8], "assistant generation prompt must be appended"
-    assert ids == [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
+    assert ids == _CLOSE_PREV + [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
         Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID,
         6,
         7,

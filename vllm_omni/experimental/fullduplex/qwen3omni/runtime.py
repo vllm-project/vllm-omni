@@ -178,6 +178,15 @@ def build_duplex_prompt_token_ids(
     prefix: list[int] = []
     if seq <= 1:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY)
+    elif starts_turn:
+        # Close the assistant's previous turn before opening a new user turn.
+        #
+        # Generation stops *at* <|im_end|>, so the stop token is not written
+        # back into the KV. Without this the conversation reads as a run-on
+        # assistant message followed by a user turn, and from the second turn
+        # on the model answers generically regardless of what was said.
+        prefix.append(Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID)
+        prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.NEWLINE_IDS_KEY)
     if starts_turn:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
         prefix.append(Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID)

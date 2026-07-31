@@ -100,6 +100,8 @@ class Qwen3OmniDuplexPolicy:
     SESSION_PREFIX_IDS_KEY = "duplex_session_prefix_token_ids"
     TURN_PREFIX_IDS_KEY = "duplex_turn_prefix_token_ids"
     TURN_SUFFIX_IDS_KEY = "duplex_turn_suffix_token_ids"
+    #: A bare newline, used to close the assistant's turn before the next one.
+    NEWLINE_IDS_KEY = "duplex_newline_token_ids"
 
     #: Server-owned runtime-config keys. A client that sets any of these in
     #: ``extra_body`` is rejected rather than silently overridden.
@@ -113,6 +115,7 @@ class Qwen3OmniDuplexPolicy:
             "duplex_session_prefix_token_ids",
             "duplex_turn_prefix_token_ids",
             "duplex_turn_suffix_token_ids",
+            "duplex_newline_token_ids",
         }
     )
 
