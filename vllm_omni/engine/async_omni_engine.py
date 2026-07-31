@@ -209,13 +209,13 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get the pipeline endpoint
-        # restriction beforehand. TODO (Alex) make this cleaner and refactor
-        # stage config resolution to remove kwargs hacks.
-        deploy_config_path = kwargs.get("deploy_config")
+        # Stage resolution pops deploy_config, so get pipeline-wide settings
+        # beforehand. The stage CLI exposes the same deploy YAML through
+        # stage_configs_path.
+        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
@@ -465,6 +465,13 @@ class AsyncOmniEngine:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                logger.warning(
+                    "[AsyncOmniEngine] Orchestrator startup timed out after %ss. "
+                    "Multi-stage deployments that initialize stages sequentially on one device "
+                    "or load checkpoints from slow storage may need larger --init-timeout and "
+                    "--stage-init-timeout values.",
+                    startup_timeout,
+                )
                 self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
@@ -1008,6 +1015,8 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
+            "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

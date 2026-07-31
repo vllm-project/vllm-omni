@@ -183,6 +183,7 @@ class RunnerOutput(BaseRunnerOutput):
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+    async_output_id: str | None = None
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

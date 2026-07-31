@@ -11,6 +11,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
+import huggingface_hub
 import torch
 from PIL import Image
 from pydantic import Field, model_validator
@@ -20,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.transformers_utils.repo_utils import get_model_path
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
@@ -185,7 +187,7 @@ class DiffusionParallelConfig:
     """
 
     cfg_parallel_size: int = 1
-    """Number of Classifier Free Guidance (CFG) parallel groups."""
+    """Number of ranks used to execute guidance passes in parallel."""
 
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
@@ -233,9 +235,6 @@ class DiffusionParallelConfig:
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2, 3], (
-            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
-        )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
@@ -675,6 +674,12 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
+    enable_distributed_layerwise_offload: bool = False
+    # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
+    # concurrent requests in DP mode). If False: each rank loads full weights
+    # via H2D only (N× CPU memory, but no AllGather synchronization needed).
+    dlo_use_allgather: bool = True
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -1015,6 +1020,18 @@ class OmniDiffusionConfig:
                 "valid together with diffusion_load_format=diffusers"
             )
 
+        # when use hf offline, replace model to local model path
+        # align with ar stage behavior, see vllm/engine/arg_utils.py
+        if huggingface_hub.constants.HF_HUB_OFFLINE and self.model:
+            model_id = self.model
+            self.model = get_model_path(self.model, self.revision)
+            if model_id != self.model:
+                logger.info(
+                    "HF_HUB_OFFLINE is True, replace model_id [%s] to model_path [%s]",
+                    model_id,
+                    self.model,
+                )
+
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:
             return
@@ -1273,6 +1290,7 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1331,6 +1349,37 @@ class DiffusionOutput:
             error_status_code=status_code,
             error_type=error_type,
         )
+
+
+class AsyncOutputKind(Enum):
+    """Message kind for ``AsyncDiffusionOutput`` — routes async results.
+
+    * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
+    * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
+    * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
+      is available via ``async_output_id``
+    """
+
+    RPC_RESULT = "rpc_result"
+    COMPUTE_DONE = "compute_done"
+    OUTPUT_READY = "output_ready"
+
+
+@dataclass
+class AsyncDiffusionOutput:
+    """Async protocol envelope for ``result_mq`` messages.
+
+    In request-mode (``step_execution=False``), all ``result_mq``
+    messages use this envelope.  The ``kind`` field routes the message
+    to the correct consumer.
+    """
+
+    kind: AsyncOutputKind
+    rpc_id: str | None = None
+    async_output_id: str | None = None
+    result: Any | None = None
+    output: DiffusionOutput | None = None
+    error: str | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

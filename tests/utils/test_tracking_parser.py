@@ -23,6 +23,9 @@ from vllm_omni.utils.tracking_parser import (
     build_shadow_kwargs,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 ### Fake pipeline/deploy config for integration tests
 
 _TEST_MODEL = "_test_tracking"

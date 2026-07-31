@@ -410,7 +410,7 @@ class OmniServeCommand(CLISubcommand):
             dest="model_class_name",
             type=str,
             default=None,
-            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+            help="Override the diffusion pipeline class name (e.g. LTX2Pipeline).",
         )
         omni_config_group.add_argument(
             "--diffusion-load-format",
@@ -641,6 +641,30 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
+        omni_config_group.add_argument(
+            "--enable-distributed-layerwise-offload",
+            action="store_true",
+            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
+            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
+            "and overlaps H2D transfers and AllGather with computation. "
+            "DP size is automatically derived from the parallel configuration.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-use-allgather",
+            dest="dlo_use_allgather",
+            action="store_true",
+            default=True,
+            help="Use shard + AllGather for weight reconstruction (default: True). "
+            "When disabled (--dlo-no-use-allgather), each rank loads full weights "
+            "via H2D only — no sharding, no AllGather, no concurrent request "
+            "requirement, but N× CPU memory.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-no-use-allgather",
+            dest="dlo_use_allgather",
+            action="store_false",
+            help="Disable AllGather: each rank loads full weights independently.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
@@ -678,8 +702,7 @@ class OmniServeCommand(CLISubcommand):
             "--cfg-parallel-size",
             type=int,
             default=1,
-            choices=[1, 2],
-            help="Number of devices for CFG parallel computation for diffusion models. "
+            help="Number of devices used to execute diffusion guidance passes in parallel. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
         )
         omni_config_group.add_argument(
@@ -894,7 +917,7 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
+        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's

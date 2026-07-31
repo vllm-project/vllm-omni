@@ -63,6 +63,11 @@ class OmniSchedulerMixin:
         session.num_computed_tokens = 0
         session.prompt_token_ids = new_prompt
         session.additional_information = update.additional_information or None
+        session.model_intermediate_buffer = getattr(
+            update,
+            "model_intermediate_buffer",
+            None,
+        )
         session.update_block_hashes()
         session.num_prompt_tokens = len(new_prompt)
         session.arrival_time = update.arrival_time

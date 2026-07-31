@@ -1,7 +1,7 @@
-"""
-E2E Online expansion tests for MiniCPM-o 4.5 covering modality combinations,
-in-process token2wav vocoder behavior, max_num_seqs=1 serial execution,
-and edge-case validation.
+"""E2E online expansion tests for MiniCPM-o 4.5.
+
+These cover modality combinations, separate Code2Wav behavior, sequential
+request isolation, longer audio output, and Chinese speech.
 """
 
 import os
@@ -18,14 +18,14 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
             ],
@@ -63,7 +63,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
     """
@@ -90,14 +90,12 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_sequential_requests_independent(omni_server, openai_client) -> None:
     """
-    Verify that sequential requests produce independent results and state
-    does not leak between requests. MiniCPM-o 4.5 has max_num_seqs=1 so
-    requests are processed one-at-a-time; the second request must not
-    receive the first request's audio or token state.
+    Verify that sequential requests produce independent results and that the
+    second request does not receive the first request's audio or token state.
     Deploy Setting: default 2GPU
     Input Modal: text (two different prompts)
     Output Modal: text + audio (both)
@@ -133,12 +131,12 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     Test text input generating a longer audio output to exercise the
-    token2wav decoder across multiple frames.
+    Code2Wav stage across multiple frames.
     Deploy Setting: default 2GPU
     Input Modal: text (longer prompt)
     Output Modal: text + audio
@@ -146,20 +144,29 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text="Tell me a short story about a cat in about 50 words.",
+        content_text="What is the capital of China? Answer in 40 words.",
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
+        "modalities": ["text", "audio"],
         "stream": True,
-        "key_words": {"audio": ["cat"]},
+        # Delimit the assistant answer with the TTS template so the Talker
+        # does not spend its codec-token budget speaking hidden reasoning.
+        "extra_body": {
+            "chat_template_kwargs": {
+                "use_tts_template": True,
+                "enable_thinking": False,
+            }
+        },
+        "key_words": {"audio": ["Beijing"]},
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """
