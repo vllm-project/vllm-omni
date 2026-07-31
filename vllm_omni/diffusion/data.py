@@ -11,6 +11,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
+import huggingface_hub
 import torch
 from PIL import Image
 from pydantic import Field, model_validator
@@ -20,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.transformers_utils.repo_utils import get_model_path
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
@@ -1017,6 +1019,18 @@ class OmniDiffusionConfig:
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+        # when use hf offline, replace model to local model path
+        # align with ar stage behavior, see vllm/engine/arg_utils.py
+        if huggingface_hub.constants.HF_HUB_OFFLINE and self.model:
+            model_id = self.model
+            self.model = get_model_path(self.model, self.revision)
+            if model_id != self.model:
+                logger.info(
+                    "HF_HUB_OFFLINE is True, replace model_id [%s] to model_path [%s]",
+                    model_id,
+                    self.model,
+                )
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:

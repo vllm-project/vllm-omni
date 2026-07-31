@@ -772,10 +772,10 @@ class Orchestrator:
     async def _handle_abort(self, msg: AbortRequestMessage) -> None:
         """Handle an abort message from the main thread."""
         request_ids = msg.request_ids
-        await self._cleanup_request_ids(
-            self._cfg_tracker.abort_parents(request_ids),
-            abort=True,
-        )
+        # _cleanup_request_ids is CFG-aware: it expands aborted parents to
+        # their companions and fails a deferred parent whose companion is
+        # aborted before its output arrived.
+        await self._cleanup_request_ids(list(request_ids), abort=True)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
@@ -1098,11 +1098,41 @@ class Orchestrator:
         abort: bool = False,
         close_duplex_sessions: bool = False,
     ) -> None:
-        """Release pool bindings and logical request state for the given ids."""
+        """Release pool bindings and logical request state for the given ids.
+
+        CFG-aware: cleaning a parent releases its tracker state and pulls its
+        companions into the batch; cleaning a companion whose parent is NOT in
+        the batch and whose output never arrived fails that parent (its bundle
+        can never complete). Every teardown path (stage error, abort, replica
+        loss, membership unregister) funnels through here, so tracker state
+        cannot outlive its requests.
+        """
         if not request_ids:
             return
 
         cleanup_ids = list(dict.fromkeys(request_ids))
+        batch = set(cleanup_ids)
+        orphaned_parents: dict[str, str] = {}
+        for rid in cleanup_ids:
+            pid = self._cfg_tracker.get_parent_id(rid)
+            if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
+                orphaned_parents.setdefault(pid, rid)
+        for pid, cid in orphaned_parents.items():
+            deferred = self._cfg_tracker.pop_pending_parent(pid)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=pid,
+                    stage_id=deferred["stage_id"] if deferred is not None else None,
+                    error=f"CFG companion {cid} was aborted or lost before its outputs arrived",
+                )
+            )
+            batch.add(pid)
+            cleanup_ids.append(pid)
+        for rid in list(cleanup_ids):
+            for cid in self._cfg_tracker.cleanup_parent(rid):
+                if cid not in batch:
+                    batch.add(cid)
+                    cleanup_ids.append(cid)
         closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
             closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(
@@ -1596,7 +1626,12 @@ class Orchestrator:
             if req_state is None:
                 continue
             if self._cfg_tracker.is_companion(req_id):
-                await self._handle_cfg_companion_ready(req_id)
+                # kv_ready only says the companion's KV hit the connector; its
+                # processed output has not been stashed yet. Counting it as
+                # done here let the parent pass the all_companions_done gate
+                # and dispatch with 0/N companion outputs (degraded CFG).
+                # Done-marking now happens solely on the processed-output path
+                # in _route_output, after set_companion_output.
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
@@ -1711,16 +1746,48 @@ class Orchestrator:
         _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
-            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            # Gate: never dispatch with an incomplete CFG bundle. Checked
+            # non-destructively BEFORE popping — a pop-then-redefer would lose
+            # the partial outputs. all_companions_done is trustworthy here
+            # because done-marking happens only after set_companion_output.
+            if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
+                self._cfg_tracker.defer_parent(req_id, output, src_stage_id)
+                logger.info(
+                    "[Orchestrator] req=%s: CFG companion outputs not all stashed yet; re-deferring parent",
+                    req_id,
+                )
+                return
+            # Peek, don't pop: outputs stay stashed until cleanup_parent so a
+            # streaming re-submission bundles the complete set again rather
+            # than an empty one.
+            companion_outputs = self._cfg_tracker.get_companion_outputs(req_id)
             expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
             if expected > len(companion_outputs):
-                logger.warning(
-                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
-                    "downstream CFG conditioning may degrade",
+                # Companions are done but outputs are missing — inconsistent
+                # tracker state (should be unreachable with peek semantics).
+                # Fail the request rather than degrade CFG conditioning.
+                logger.error(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs available; "
+                    "failing the request instead of dispatching degraded CFG",
                     req_id,
                     len(companion_outputs),
                     expected,
                 )
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=req_id,
+                        stage_id=src_stage_id,
+                        error=(
+                            f"CFG companion outputs incomplete ({len(companion_outputs)}/{expected}); "
+                            "request aborted to avoid degraded CFG conditioning"
+                        ),
+                    )
+                )
+                await self._cleanup_request_ids(
+                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    abort=True,
+                )
+                return
             diffusion_source_outputs = [output, *companion_outputs]
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()

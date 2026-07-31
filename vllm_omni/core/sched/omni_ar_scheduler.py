@@ -917,6 +917,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return kv_xfer_params, None
         finally:
             self._free_input_coordinator_request(request_id)
+            # Normal completion runs through here, not finish_requests()
+            # (the abort path) -- see vllm-project/vllm-omni#5349.
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.cleanup_receiver(request_id)
 
     def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""
