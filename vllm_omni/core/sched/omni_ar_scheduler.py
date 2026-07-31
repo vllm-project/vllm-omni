@@ -401,6 +401,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
+            ec_transfer_params = None
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
@@ -489,6 +490,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
+                        ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,

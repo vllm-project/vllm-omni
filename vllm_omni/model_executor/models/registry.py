@@ -381,6 +381,11 @@ _OMNI_MODELS = {
         "modeling_longcat_next_audio_decoder",
         "LongcatNextAudioDecoder",
     ),
+    "LongcatNextMultiDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_multi_decoder",
+        "LongcatNextMultiDecoder",
+    ),
 }
 
 
