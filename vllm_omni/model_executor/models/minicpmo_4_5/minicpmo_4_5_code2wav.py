@@ -776,3 +776,42 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
+        self._maybe_warmup_hift()
+
+    def _maybe_warmup_hift(self) -> None:
+        """Run one representative HiFT inference before serving requests.
+
+        Gated by ``enable_hift_warmup`` in the stage extra config. The first
+        HiFT forward after loading pays a one-time kernel-compile /
+        weight-load cost (observed ~5.6s on Ascend 910C). Executing it here,
+        during model load and before the API is ready, moves that one-time
+        cost out of the first user request. Uses an independent cache source
+        so no real request state is touched.
+        """
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", False):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        hift = getattr(backend, "hift", None)
+        if hift is None:
+            return
+        device = next(hift.parameters()).device
+        dtype = next(hift.parameters()).dtype
+        # Representative first-chunk mel: [B=1, mel_bins=80, frames].
+        mel = torch.randn(1, 80, 86, device=device, dtype=dtype)
+        cache_source = torch.zeros(1, 1, 0, device=device, dtype=dtype)
+        try:
+            with torch.inference_mode():
+                hift(mel, cache_source)
+            torch.synchronize(device)
+            logger.info("HiFT startup warmup done")
+        except Exception:
+            # Warmup is a performance optimization, not a correctness
+            # requirement; never block serving on it.
+            logger.warning(
+                "HiFT startup warmup failed; continuing with cold execution",
+                exc_info=True,
+            )
+        del mel, cache_source
