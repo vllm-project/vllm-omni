@@ -727,7 +727,15 @@ class LTX2Attention(torch.nn.Module):
         # LTX-2.3: per-head gated attention
         # leave unquantized for this linear
         if apply_gated_attention:
-            self.to_gate_logits = nn.Linear(query_dim, self.query_num_heads, bias=True)
+            self.to_gate_logits = ColumnParallelLinear(
+                query_dim,
+                heads,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.to_gate_logits" if prefix else "to_gate_logits",
+            )
         else:
             self.to_gate_logits = None
 

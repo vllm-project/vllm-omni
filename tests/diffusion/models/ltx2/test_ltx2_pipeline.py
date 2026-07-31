@@ -14,7 +14,12 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.models.ltx2 import ltx2_components, ltx2_phase_adapter, ltx2_phase_weights
+from vllm_omni.diffusion.models.ltx2 import (
+    ltx2_components,
+    ltx2_phase_adapter,
+    ltx2_phase_weights,
+    ltx2_transformer,
+)
 from vllm_omni.diffusion.models.ltx2.ltx2_adapter_parser import (
     AdapterTarget,
     AdapterTensorSource,
@@ -1561,6 +1566,61 @@ def test_ltx_phase_adapter_keeps_one_transformer_and_switches_a_fixed_slot(tmp_p
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[1.0, 1.0]]))
     runtime.activate("ltx_distilled")
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[10.0, 13.0]]))
+
+
+def test_ltx23_gate_projection_declares_its_global_column_parallel_layout(monkeypatch):
+    class FakeColumn(torch.nn.Module):
+        def __init__(
+            self,
+            input_size,
+            output_size,
+            *,
+            bias,
+            gather_output,
+            return_bias,
+            quant_config,
+            prefix,
+        ):
+            super().__init__()
+            self.input_size = input_size
+            self.output_size = output_size
+            self.bias_enabled = bias
+            self.gather_output = gather_output
+            self.return_bias = return_bias
+            self.quant_config = quant_config
+            self.prefix = prefix
+
+    class FakeRow(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeAttention(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(ltx2_transformer, "ColumnParallelLinear", FakeColumn)
+    monkeypatch.setattr(ltx2_transformer, "RowParallelLinear", FakeRow)
+    monkeypatch.setattr(ltx2_transformer, "_LTX2ParallelAttention", FakeAttention)
+    monkeypatch.setattr(ltx2_transformer, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    attention = ltx2_transformer.LTX2Attention(
+        query_dim=16,
+        heads=4,
+        dim_head=4,
+        qk_norm="rms_norm",
+        apply_gated_attention=True,
+        pack_qkv=False,
+        prefix="transformer_blocks.0.attn1",
+    )
+
+    gate = attention.to_gate_logits
+    assert isinstance(gate, FakeColumn)
+    assert gate.input_size == 16
+    assert gate.output_size == 4
+    assert gate.gather_output is False
+    assert gate.return_bias is False
+    assert gate.quant_config is None
+    assert gate.prefix == "transformer_blocks.0.attn1.to_gate_logits"
 
 
 def test_ltx_layer_fused_adapter_matches_official_bf16_weight_fusion():
