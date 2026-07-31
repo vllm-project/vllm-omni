@@ -403,6 +403,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # corner case slips past upstream's status-driven removal.
         self._purge_finished_from_running()
 
+        # See ``OmniSchedulerMixin._resync_streaming_input_counter`` -- keeps
+        # ``num_waiting_for_streaming_input`` from outliving the request it was
+        # counted for, which otherwise makes ``EngineCore.has_work()`` read
+        # false with live work queued and parks the stage permanently.
+        self._resync_streaming_input_counter()
+
         if self.input_coordinator is not None:
             for request in finished:
                 self._free_input_coordinator_request(request.request_id)

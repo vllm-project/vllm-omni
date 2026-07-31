@@ -275,6 +275,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # with it. Sweep again immediately before handing over.
         self._drop_aborted_queued_requests()
 
+        # `process_pending_chunks` above rewrites `request.status` when it parks
+        # and un-parks requests, which can move a request out of
+        # WAITING_FOR_STREAMING_REQ without unwinding upstream's counter. Restate
+        # it from queue membership while `self.waiting` is still the real queue
+        # (the deferred-admission dance below swaps in an empty one).
+        self._resync_streaming_input_counter()
+
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
@@ -801,6 +808,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ``input_batch`` slot never pins a freed request and starves
         # new admissions. See ``OmniSchedulerMixin._purge_finished_from_running``.
         self._purge_finished_from_running()
+
+        # An abort is the one leak that is never recoverable on its own: the
+        # engine only calls `schedule()` when `has_work()` is true, and an
+        # inflated `num_waiting_for_streaming_input` is precisely what makes
+        # `has_work()` false. Resync here, on the path that removes the
+        # request, or the next request to arrive at this stage is masked and
+        # the engine parks in `input_queue.get()` forever.
+        self._resync_streaming_input_counter()
 
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
