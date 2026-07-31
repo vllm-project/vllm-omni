@@ -219,8 +219,18 @@ function playPcm16(u8, sr) {
   src.start(playAt); playAt += b.duration;
 }
 
+function closeSession() {
+  // A duplex session outlives the socket: dropping the transport alone leaves
+  // the session holding its stage-0 slot until it is reaped. With one slot per
+  // session and a small max_num_seqs, a few reloads exhaust the pipeline and
+  // every later turn silently produces nothing. Always tell the server.
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({type:"session.close"})); } catch (e) { /* closing anyway */ }
+  }
+}
+
 $("connect").onclick = () => {
-  if (ws) { ws.close(); return; }
+  if (ws) { closeSession(); ws.close(); return; }
   const url = `${$("url").value}?duplex=1&model=${encodeURIComponent(MODEL)}`
             + `&qwen3_omni_native_duplex=1&autostart=0`;
   ws = new WebSocket(url);
@@ -427,6 +437,11 @@ $("sendclip").onclick = async () => {
     setTimeout(() => { $("sendclip").disabled = false; }, 1500);
   }
 };
+
+// A refresh or tab close must release the session too. `pagehide` fires in
+// cases `beforeunload` does not (bfcache, mobile), so handle both.
+window.addEventListener("pagehide", closeSession);
+window.addEventListener("beforeunload", closeSession);
 
 $("bargein").onclick = () => {
   if (!ws || ws.readyState !== 1) return;
