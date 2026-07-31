@@ -805,7 +805,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         try:
             with torch.inference_mode():
                 hift(mel, cache_source)
-            torch.synchronize(device)
+            torch.accelerator.synchronize(device)
             logger.info("HiFT startup warmup done")
         except Exception:
             # Warmup is a performance optimization, not a correctness
