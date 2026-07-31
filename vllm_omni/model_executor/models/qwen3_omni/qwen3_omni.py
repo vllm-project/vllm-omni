@@ -806,6 +806,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             device=base_embeds.device,
             dtype=base_embeds.dtype,
         )
+        logger.info(
+            "[splice] span=%d audio_off=%s start=%d win=%s | pad_norm=%.4f audio_norm=%.4f "
+            "changed=%s ids[start]=%s dtype=%s/%s",
+            span, duplex.get("audio_offset"), start, tuple(window.shape),
+            float(base_embeds[start].norm()) if start < span else -1.0,
+            float(window[0].norm()),
+            not torch.equal(req_embeds, base_embeds),
+            int(input_ids[start]) if start < input_ids.numel() else -1,
+            base_embeds.dtype, window.dtype,
+        )
         return (
             input_ids,
             req_embeds,

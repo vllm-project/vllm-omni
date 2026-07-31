@@ -1311,15 +1311,6 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
-        if self._is_duplex_session_request(req_state) and stage_id == 0:
-            _ro = getattr(output, "request_output", None) or output
-            _c = getattr(_ro, "outputs", None)
-            if _c:
-                _t = getattr(_c[0], "text", "") or ""
-                _n = len(getattr(_c[0], "token_ids", None) or [])
-                if getattr(output, "finished", False) or _n % 25 == 0:
-                    logger.info("[s0] ntok=%s finish=%r text=%r", _n,
-                                getattr(_c[0], "finish_reason", None), _t[:200])
         duplex_output_decision = self._duplex_output_decision(stage_id, output, req_state)
         if duplex_output_decision is not None:
             await self._emit_duplex_direct_output(

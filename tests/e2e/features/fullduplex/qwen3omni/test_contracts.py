@@ -272,37 +272,37 @@ def test_decide_output_never_short_circuits() -> None:
 # --- PCM buffer ------------------------------------------------------------
 
 
-def test_buffer_emits_only_whole_chunks() -> None:
+def test_appends_never_emit_mid_turn() -> None:
+    """Audio is held until commit so the thinker gets one well-formed turn.
+
+    Emitting mid-turn makes the framework append a partial user turn with no
+    <|audio_end|> and no assistant generation prompt, and auto_response then
+    asks the model to continue it. Observed live: only the first second of a
+    4 s utterance reached the model and it emitted ' 1000000...'.
+    """
     buffer = Qwen3OmniPcmAppendBuffer()
-    half = Qwen3OmniDuplexPolicy.CHUNK_SAMPLES // 2
-    assert (
-        buffer.prepare_append(
-            _pcm_payload(half),
-            operation_id="op-1",
-            chunk_period_ms=CHUNK_MS,
-            allow_emit=True,
-        )
-        is None
-    )
-    reservation = buffer.prepare_append(
-        _pcm_payload(half),
-        operation_id="op-2",
-        chunk_period_ms=CHUNK_MS,
-        allow_emit=True,
-    )
-    assert reservation is not None
-    assert reservation.payload is not None
-    assert reservation.payload["num_samples"] == Qwen3OmniDuplexPolicy.CHUNK_SAMPLES
+    for i in range(4):
+        assert (
+            buffer.prepare_append(
+                _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
+                operation_id=f"op-{i}",
+                chunk_period_ms=CHUNK_MS,
+                allow_emit=True,
+            )
+            is None
+        ), "no append may emit mid-turn"
+    assert buffer.has_pending(), "audio is retained for the commit"
 
 
 def test_buffer_rollback_restores_audio_in_wire_order() -> None:
     buffer = Qwen3OmniPcmAppendBuffer()
-    reservation = buffer.prepare_append(
+    buffer.prepare_append(
         _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
-        operation_id="op-1",
+        operation_id="op-0",
         chunk_period_ms=CHUNK_MS,
         allow_emit=True,
     )
+    reservation = buffer.prepare_commit(operation_id="op-1", chunk_period_ms=CHUNK_MS)
     assert reservation is not None
     assert buffer.pending_byte_count == 0
     reservation.rollback()
@@ -312,12 +312,13 @@ def test_buffer_rollback_restores_audio_in_wire_order() -> None:
 
 def test_buffer_commit_consumes_audio() -> None:
     buffer = Qwen3OmniPcmAppendBuffer()
-    reservation = buffer.prepare_append(
+    buffer.prepare_append(
         _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
-        operation_id="op-1",
+        operation_id="op-0",
         chunk_period_ms=CHUNK_MS,
         allow_emit=True,
     )
+    reservation = buffer.prepare_commit(operation_id="op-1", chunk_period_ms=CHUNK_MS)
     assert reservation is not None
     reservation.commit()
     assert buffer.pending_byte_count == 0
@@ -524,16 +525,18 @@ def test_prepare_commit_marks_the_payload_turn_final() -> None:
     assert reservation.payload[Qwen3OmniDuplexPolicy.TURN_FINAL_KEY] is True
 
 
-def test_plain_append_is_not_marked_turn_final() -> None:
+def test_plain_append_yields_no_reservation() -> None:
+    """Only a commit produces a payload, and it is always turn-final."""
     buffer = Qwen3OmniPcmAppendBuffer()
-    reservation = buffer.prepare_append(
-        _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
-        operation_id="o1",
-        chunk_period_ms=CHUNK_MS,
-        allow_emit=True,
+    assert (
+        buffer.prepare_append(
+            _pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES),
+            operation_id="o1",
+            chunk_period_ms=CHUNK_MS,
+            allow_emit=True,
+        )
+        is None
     )
-    assert reservation is not None and reservation.payload is not None
-    assert Qwen3OmniDuplexPolicy.TURN_FINAL_KEY not in reservation.payload
 
 
 def test_sample_count_measured_from_audio_not_a_stale_key() -> None:

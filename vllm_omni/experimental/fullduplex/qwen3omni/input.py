@@ -126,9 +126,25 @@ class Qwen3OmniPcmAppendBuffer:
     ) -> Qwen3OmniPcmReservation | None:
         """Buffer incoming PCM, returning a reservation once a whole chunk exists."""
         self._pending.extend(decode_pcm_payload(payload))
-        if not allow_emit:
-            return None
-        return self._reserve_whole_chunks(operation_id=operation_id, chunk_period_ms=chunk_period_ms)
+        # Deliberately never emit mid-turn.
+        #
+        # The framework streams each emitted chunk to stage 0 as its own
+        # append, and with auto_response the thinker generates off whatever it
+        # has. For a model with learned listen/speak tokens (MiniCPM-o 4.5)
+        # that is the point. Qwen3-Omni has no such token, so an intermediate
+        # append asks it to continue a user turn that has no <|audio_end|> and
+        # no assistant generation prompt yet -- observed output was
+        # ' 1000000...' and ' a i \n\n\nuser\n...', i.e. the model completing a
+        # truncated prompt. Only the first second of a 4 s utterance ever
+        # reached it.
+        #
+        # Holding the audio until commit gives the thinker one well-formed
+        # turn, identical in shape to what the working non-duplex path builds.
+        # Cost: audio is not encoded incrementally, so time-to-first-token
+        # starts at commit rather than during speech. Barge-in is unaffected --
+        # it runs on the session epoch, not on append cadence.
+        del allow_emit, operation_id, chunk_period_ms
+        return None
 
     def prepare_commit(
         self,
