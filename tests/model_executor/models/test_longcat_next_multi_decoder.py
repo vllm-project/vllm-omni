@@ -16,11 +16,15 @@ is actually present, without ever needing a real checkpoint on disk.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next_multi_decoder import (
     LongcatNextMultiDecoder,
     _retag_model_outputs,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _IMAGE_SENTINEL = OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": "image"})
 _AUDIO_SENTINEL = OmniOutput(
