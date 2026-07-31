@@ -161,15 +161,27 @@ def build_duplex_prompt_token_ids(
     needs to replace the audio span. ``audio_offset`` tells it where that
     span begins.
     """
+    audio_tokens = duplex_audio_token_count(payload)
+    closes_turn = final or (isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True)
+
+    # `turn_seq` counts turns in the session, not appends within one turn, so
+    # gating the opener on `turn_seq <= 1` framed only the session's first
+    # turn and left every later turn as bare audio with no <|im_start|>user
+    # and no <|audio_start|>. Observed: turn 1 answered correctly, turns 2 and
+    # 3 came through as prefix=0 and produced nothing usable.
+    #
+    # Audio is held until commit, so an append that closes a turn carries the
+    # whole turn and needs the opener as well as the closer. The `turn_seq`
+    # arm remains for a mid-turn append, which the current buffer never emits.
+    starts_turn = closes_turn or turn_seq <= 1
+
     prefix: list[int] = []
     if seq <= 1:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY)
-    if turn_seq <= 1:
+    if starts_turn:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
         prefix.append(Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID)
 
-    audio_tokens = duplex_audio_token_count(payload)
-    closes_turn = final or (isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True)
     suffix: list[int] = []
     if closes_turn:
         suffix.append(Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID)

@@ -457,10 +457,20 @@ def test_later_turn_reopens_user_without_repeating_system_block() -> None:
 
 
 def test_final_append_closes_user_and_opens_assistant() -> None:
-    """This suffix is what actually prompts a reply."""
-    ids, _, audio_tokens = _prompt(seq=3, turn_seq=3, final=True)
+    """This suffix is what actually prompts a reply.
+
+    A closing append carries the whole turn, so it is framed on both sides:
+    user opener + <|audio_start|> ... <|audio_end|> + assistant opener.
+    """
+    ids, audio_offset, audio_tokens = _prompt(seq=3, turn_seq=3, final=True)
     assert ids[-3:] == [6, 7, 8]
-    assert ids == [_PAD] * audio_tokens + [Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID, 6, 7, 8]
+    assert ids == [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
+        Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID,
+        6,
+        7,
+        8,
+    ]
+    assert audio_offset == 3
 
 
 def test_prompt_length_equals_reservation() -> None:
@@ -509,7 +519,12 @@ def test_commit_payload_closes_the_turn_without_the_final_flag() -> None:
         runtime_config=dict(_SCAFFOLD), payload=payload, seq=2, turn_seq=2, final=False
     )
     assert ids[-3:] == [6, 7, 8], "assistant generation prompt must be appended"
-    assert ids == [_PAD] * audio_tokens + [Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID, 6, 7, 8]
+    assert ids == [4, 5, Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
+        Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID,
+        6,
+        7,
+        8,
+    ], "a later turn is framed too, not just the first"
 
 
 def test_prepare_commit_marks_the_payload_turn_final() -> None:
@@ -678,3 +693,26 @@ def test_audio_span_is_delimited_for_the_model() -> None:
     assert ids[audio_offset - 1] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
     assert ids[audio_offset + audio_tokens] == Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID
     assert ids[audio_offset : audio_offset + audio_tokens] == [_PAD] * audio_tokens
+
+
+def test_every_turn_is_framed_not_just_the_first() -> None:
+    """turn_seq counts turns, not appends within a turn.
+
+    Gating the opener on turn_seq <= 1 framed only the session's first turn;
+    later turns arrived as bare audio with no <|im_start|>user and no
+    <|audio_start|>, and produced nothing usable. Observed live as
+    prefix=0 on turns 2 and 3.
+    """
+    for turn_seq in (1, 2, 5):
+        ids, audio_offset, audio_tokens = build_duplex_prompt_token_ids(
+            runtime_config=dict(_SCAFFOLD),
+            payload={**_pcm_payload(Qwen3OmniDuplexPolicy.CHUNK_SAMPLES), Qwen3OmniDuplexPolicy.TURN_FINAL_KEY: True},
+            seq=turn_seq,
+            turn_seq=turn_seq,
+            final=False,
+        )
+        assert 4 in ids and 5 in ids, f"turn {turn_seq} lost its user opener"
+        assert ids[audio_offset - 1] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+        assert ids[audio_offset + audio_tokens] == Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID
+        # Only the first turn of the session repeats the system block.
+        assert (1 in ids) == (turn_seq == 1)
