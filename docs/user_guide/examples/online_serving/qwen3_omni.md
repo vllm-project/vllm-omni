@@ -306,7 +306,7 @@ The gradio script supports the following arguments:
     ``````
 ??? abstract "qwen3_omni_moe_thinking.yaml"
     ``````yaml
-    --8<-- "examples/online_serving/qwen3_omni/qwen3_omni_moe_thinking.yaml"
+    --8<-- "vllm_omni/deploy/qwen3_omni_moe_thinking.yaml"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh
