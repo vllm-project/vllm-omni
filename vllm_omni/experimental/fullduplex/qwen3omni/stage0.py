@@ -68,6 +68,9 @@ class Qwen3OmniStage0SessionState:
     audio_buffer: Any = None
     #: Count of whole chunks already turned into embeddings.
     chunk_index: int = 0
+    #: All audio in the current turn, kept so each append can be encoded with
+    #: its context instead of in isolation. Reset at a turn boundary.
+    turn_audio: Any = None
     #: Memoized results keyed by ``(epoch, seq)`` so a scheduler retry of the
     #: same append is idempotent -- mirrors ``minicpmo45/stage0.py:164-173``.
     prepared: dict[tuple[int, int], Any] = field(default_factory=dict)
@@ -154,7 +157,6 @@ class Qwen3OmniStage0DuplexRuntime:
         prompt is the caller's job.
         """
         import numpy as np
-        import torch
 
         session_id = str(duplex.get("session_id") or "")
         incarnation = _coerce_int(duplex.get("incarnation")) or 0
@@ -179,13 +181,31 @@ class Qwen3OmniStage0DuplexRuntime:
 
         num_chunks = buffered.shape[0] // chunk_samples
         consumed = num_chunks * chunk_samples
-        chunk_embeds = [
-            self._encode_chunk(buffered[i * chunk_samples : (i + 1) * chunk_samples]) for i in range(num_chunks)
-        ]
+
+        # Encode the whole turn so far and keep only the newly completed rows,
+        # rather than encoding each chunk in isolation.
+        #
+        # The audio tower's attention spans n_window_infer // (n_window * 2) ==
+        # 8 one-second chunks, so a chunk encoded alone sees none of its
+        # context. Measured against a single whole-utterance encode of the same
+        # 4 s audio: per-chunk gives cosine 0.844 (min 0.154), cumulative gives
+        # 0.949 (min 0.727). Per-chunk embeddings were degrading the thinker's
+        # output to nonsense.
+        #
+        # Cost is quadratic in turn length, which is acceptable only because a
+        # spoken turn is short and `turn_audio` resets at each turn boundary.
+        # A model with a streaming audio encoder (as MiniCPM-o 4.5 has) would
+        # not need this.
+        state.turn_audio = (
+            buffered[:consumed] if state.turn_audio is None else np.concatenate([state.turn_audio, buffered[:consumed]])
+        )
+        already = self.expected_embedding_count(state.turn_audio.shape[0] - consumed) if state.chunk_index else 0
+        full = self._encode_chunk(state.turn_audio)
+        embeds = full[already:]
+
         state.audio_buffer = buffered[consumed:]
         state.chunk_index += num_chunks
 
-        embeds = torch.cat(chunk_embeds, dim=0)
         expected = self.expected_embedding_count(consumed)
         if embeds.shape[0] != expected:
             raise RuntimeError(

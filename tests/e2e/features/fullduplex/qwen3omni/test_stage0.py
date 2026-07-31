@@ -125,12 +125,30 @@ def test_partial_chunks_accumulate(runtime) -> None:
     assert embeds.shape[0] == 13
 
 
-def test_multi_chunk_append_encodes_per_chunk(runtime) -> None:
+def test_multi_chunk_append_encodes_with_context(runtime) -> None:
+    """The whole turn is encoded once, not each second in isolation.
+
+    The tower attends across 8 one-second chunks, so an isolated chunk sees no
+    context. Measured against a whole-utterance encode of the same 4 s audio:
+    per-chunk cosine 0.844 (min 0.154) vs cumulative 0.949 (min 0.727).
+    """
     embeds = runtime.build_append_embeddings(duplex=_duplex(CHUNK * 3), token_offset=0, prompt_len=39)
     assert embeds.shape[0] == 39
-    # Encoding per 1 s chunk is what keeps each call on the tower's own
-    # n_window*2 conv boundary.
-    assert len(runtime._model.thinker.audio_tower.calls) == 3
+    calls = runtime._model.thinker.audio_tower.calls
+    assert len(calls) == 1, "one encode over the whole span, not three"
+    mel_shape, feature_lens, _ = calls[-1]
+    assert feature_lens == 300, "3 s of audio at 100 mel frames per second"
+    assert mel_shape == (128, 300)
+
+
+def test_successive_appends_re_encode_the_whole_turn(runtime) -> None:
+    """Each append re-encodes the turn so far and returns only the new rows."""
+    first = runtime.build_append_embeddings(duplex=_duplex(CHUNK, seq=1), token_offset=0, prompt_len=13)
+    second = runtime.build_append_embeddings(duplex=_duplex(CHUNK, seq=2), token_offset=13, prompt_len=13)
+    assert first.shape[0] == 13
+    assert second.shape[0] == 13, "only the newly completed second is returned"
+    calls = runtime._model.thinker.audio_tower.calls
+    assert calls[-1][1] == 200, "second append encodes 2 s of context"
 
 
 def test_replay_of_same_append_is_memoized(runtime) -> None:
