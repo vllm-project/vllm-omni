@@ -222,25 +222,24 @@ DAILY_OMNI_SYSTEM_TEXT = (
     "capable of perceiving auditory and visual inputs, as well as generating text and speech."
 )
 
-# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string.
+# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string
+# (still sent as role=system; see ``_build_daily_omni_openai_messages``).
 MINICPM_OMNI_SYSTEM_TEXT = ""
 
 
 def _uniform_sample_indices(n: int, k: int) -> list[int]:
-    """Evenly pick ``k`` indices from ``0..n-1`` (MiniCPM ``uniform_sample`` on index lists)."""
+    """Evenly pick ``k`` indices from ``0..n-1`` (OpenBMB ``uniform_sample`` midpoint bins).
+
+    Matches OmniEvalKit / MiniCPM ``uniform_sample``: midpoint of each equal-width bin,
+    not ``np.linspace`` endpoints. See
+    https://github.com/OpenBMB/OmniEvalKit/blob/1adac0577258d539efc03f16d8a0f4b3f7df6c19/o_e_Kit/utils/utils.py#L50-L54
+    """
     if k <= 0:
         return []
     if n <= k:
         return list(range(n))
-    # Match numpy linspace(..., dtype=int) used upstream.
-    try:
-        import numpy as np
-
-        return [int(i) for i in np.linspace(0, n - 1, k, dtype=int)]
-    except ImportError:
-        if k == 1:
-            return [0]
-        return [int(round(i * (n - 1) / (k - 1))) for i in range(k)]
+    gap = n / k
+    return [int(i * gap + gap / 2) for i in range(k)]
 
 
 def _numpy_to_wav_bytes(audio_np: Any, sample_rate: int = _MINICPM_AUDIO_SR) -> bytes:
@@ -1128,7 +1127,10 @@ class DailyOmniDataset(BenchmarkDataset):
         user_content: list[dict[str, Any]] = [*mm_list, {"type": "text", "text": user_text}]
         system_text = self._system_text_for_pack_mode()
         messages: list[dict[str, Any]] = []
-        if system_text:
+        # MiniCPM-o ``get_sys_prompt(mode="omni")`` still emits role=system with empty
+        # content (no ref-audio). Truthiness would drop that role and change chat-template
+        # control tokens; keep the empty system message for minicpm-interleave.
+        if self.pack_mode == "minicpm-interleave" or system_text:
             messages.append({"role": "system", "content": [{"type": "text", "text": system_text}]})
         messages.append({"role": "user", "content": user_content})
         return messages

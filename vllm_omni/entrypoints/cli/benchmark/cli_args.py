@@ -104,8 +104,13 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
         "'qwen' (default): one video_url + one audio_url (Daily-Omni/Qwen protocol). "
         "'minicpm-interleave': MiniCPM-o official recipe — 1fps frames interleaved with "
         "matching 1s audio segments as image_url/audio_url pairs (needed to approach "
-        "OpenBMB ~80%% Daily-Omni; requires local Videos extract). For MiniCPM-o 4.5 "
-        "string chat templates also start the server with --interleave-mm-strings.",
+        "OpenBMB ~80%% Daily-Omni; requires local Videos extract). By default this mode "
+        "writes JPEG/WAV segments under "
+        "<daily-omni-video-dir>/.minicpm_daily_omni_interleave and sends file:// URLs, "
+        "so start the server with --allowed-local-media-path <daily-omni-video-dir> "
+        "(or a parent). Alternatively pass --daily-omni-inline-local-video to embed "
+        "segments as data URLs. For MiniCPM-o 4.5 string chat templates also start the "
+        "server with --interleave-mm-strings.",
     )
     group.add_argument(
         "--daily-omni-save-eval-items",
