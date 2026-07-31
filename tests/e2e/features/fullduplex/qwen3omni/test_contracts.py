@@ -716,3 +716,91 @@ def test_every_turn_is_framed_not_just_the_first() -> None:
         assert ids[audio_offset + audio_tokens] == Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID
         # Only the first turn of the session repeats the system block.
         assert (1 in ids) == (turn_seq == 1)
+
+
+def test_cumulative_audio_is_sliced_to_the_new_tail() -> None:
+    """Code2Wav emits the whole waveform each time; only the tail is new.
+
+    Forwarding each output in full makes the client replay the reply from the
+    start repeatedly -- heard as "I. I. I. I'm doing great". Measured delta
+    sizes for one reply: 14250, 110250, 206250, 217770 bytes.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        Qwen3OmniDataPlaneContext,
+        Qwen3OmniDataPlaneSession,
+    )
+
+    seen: list[int] = []
+
+    def encode(audio, sr, fmt, speed):
+        seen.append(len(audio))
+        return "x" * len(audio)
+
+    dp = Qwen3OmniDataPlaneSession(encode)
+    dp.begin_request("r1")
+    ctx = Qwen3OmniDataPlaneContext(modalities=("audio",))
+
+    # Cumulative: 100 samples, then 250, then 400.
+    for total in (100, 250, 400):
+        out = SimpleNamespace(
+            request_id="r1",
+            finished=False,
+            stage_id=2,
+            multimodal_output={"audio": list(range(total)), "sr": 24000},
+        )
+        list(dp.project({"data_plane_outputs": [out]}, context=ctx))
+
+    assert seen == [100, 150, 150], f"expected new tails only, got {seen}"
+
+
+def test_repeated_identical_audio_emits_nothing_new() -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        Qwen3OmniDataPlaneContext,
+        Qwen3OmniDataPlaneSession,
+    )
+
+    dp = Qwen3OmniDataPlaneSession(lambda a, *_: "y" * len(a))
+    dp.begin_request("r1")
+    ctx = Qwen3OmniDataPlaneContext(modalities=("audio",))
+    out = SimpleNamespace(
+        request_id="r1",
+        finished=False,
+        stage_id=2,
+        multimodal_output={"audio": list(range(64)), "sr": 24000},
+    )
+    first = list(dp.project({"data_plane_outputs": [out]}, context=ctx))
+    second = list(dp.project({"data_plane_outputs": [out]}, context=ctx))
+    assert first, "first delta must be emitted"
+    assert second == [], "an unchanged cumulative buffer has no new audio"
+
+
+def test_audio_length_uses_the_sample_axis_not_the_batch_axis() -> None:
+    """Code2Wav returns [1, samples]; len() would give the batch dim.
+
+    Reading len() made every cumulative output look like length 1, so only the
+    first delta was ever emitted and the reply was truncated to 0.30 s.
+    """
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        _audio_length,
+        _audio_tail,
+    )
+
+    class _T:
+        def __init__(self, n):
+            self.shape = (1, n)
+            self._n = n
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, key):
+            assert isinstance(key, tuple) and key[0] is Ellipsis, "must slice the sample axis"
+            return _T(self._n - (key[1].start or 0))
+
+    assert _audio_length(_T(7125)) == 7125
+    assert _audio_length([0] * 40) == 40
+    assert _audio_tail(_T(55125), 7125).shape == (1, 48000)

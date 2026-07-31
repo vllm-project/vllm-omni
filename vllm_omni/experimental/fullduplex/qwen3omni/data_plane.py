@@ -62,7 +62,7 @@ class _RequestState:
     terminal: bool = False
     #: Cumulative text already sent, for delta computation.
     sent_text: str = ""
-    #: Byte offset into cumulative audio already sent.
+    #: Samples of the cumulative waveform already sent to the client.
     audio_offset: int = 0
     seen_stage_ids: set[int] = field(default_factory=set)
 
@@ -77,6 +77,32 @@ def _field(output: object, name: str, default: object = None) -> object:
     if isinstance(output, Mapping):
         return output.get(name, default)
     return getattr(output, name, default)
+
+
+def _audio_length(audio: object) -> int:
+    """Sample count of a waveform, tolerating list / ndarray / tensor.
+
+    Code2Wav returns a tensor shaped ``[1, samples]``, so ``len()`` yields the
+    batch dimension -- always 1 -- rather than the sample count. Prefer the
+    last axis.
+    """
+    shape = getattr(audio, "shape", None)
+    if shape is not None and len(shape):
+        return int(shape[-1])
+    try:
+        return len(audio)  # type: ignore[arg-type]
+    except TypeError:
+        return 0
+
+
+def _audio_tail(audio: object, offset: int) -> object:
+    """Samples after ``offset``, slicing the sample axis, not the batch axis."""
+    if offset <= 0:
+        return audio
+    shape = getattr(audio, "shape", None)
+    if shape is not None and len(shape) > 1:
+        return audio[..., offset:]  # type: ignore[index]
+    return audio[offset:]  # type: ignore[index]
 
 
 def _coerce_int(value: object) -> int | None:
@@ -246,6 +272,23 @@ class Qwen3OmniDataPlaneSession:
         if audio is None:
             return None
         sample_rate_hz = _coerce_int(metadata.get("sr")) or OUTPUT_SAMPLE_RATE_HZ
+
+        # Code2Wav emits the waveform cumulatively: every output carries all
+        # audio generated so far, not just the newest frames. Measured sizes
+        # for one reply: 14250, 110250, 206250, 217770 bytes. Forwarding each
+        # in full makes the client replay the reply from the start over and
+        # over -- heard as "I. I. I. I'm doing great".
+        #
+        # Slice the raw samples, not the encoded string: base64 packs 3 bytes
+        # into 4 characters, so cutting the encoded form at an arbitrary
+        # offset corrupts it.
+        if state is not None:
+            total = _audio_length(audio)
+            if total <= state.audio_offset:
+                return None
+            audio = _audio_tail(audio, state.audio_offset)
+            state.audio_offset = total
+
         encoded = self._encode_audio(audio, sample_rate_hz, ctx.response_format, ctx.speed)
         if not encoded:
             return None
