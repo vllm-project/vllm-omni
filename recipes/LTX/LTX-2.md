@@ -60,7 +60,7 @@ feature.
 | STG | ✅ | ⚠️ Stage 1 | — positive-only |
 | Cross-modality guidance / rescale | ✅ | ⚠️ Stage 1 | — positive-only |
 | Tensor parallel | ✅ | ✅ | ✅ |
-| Ulysses sequence parallel | ✅ | ✅ | ✅ |
+| Ulysses sequence parallel | ⚠️ strict mode | ⚠️ strict mode | ⚠️ strict mode |
 | Ring sequence parallel | ⚠️ | ⚠️ | ⚠️ |
 | CFG parallel | ✅ full guidance plan | ⚠️ Stage 1, full guidance plan | — positive-only |
 | HSDP | ✅ | ✅ | ✅ |
@@ -81,6 +81,9 @@ explicitly unsupported; — not applicable.
 - Ring SP requires the logical audio latent length to be divisible by the SP
   size because it cannot consume the key-padding mask; otherwise use pure
   Ulysses.
+- LTX supports `ulysses_mode="strict"`; experimental `advanced_uaa` is
+  rejected. The LTX checkpoints use 32 attention heads, so common Ulysses
+  degrees such as 2, 4, and 8 satisfy strict-mode head divisibility.
 - Quantization support depends on the checkpoint format and LoRA strategy.
   Dynamic phase LoRA delegates the base projection to its configured quant
   method and adds the low-rank residual separately. Resident phase LoRA

@@ -356,18 +356,14 @@ def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
 
 
 class _LTX2ParallelAttention(Attention):
-    """Preserve LTX SP collectives while keeping masked cross-attention key-only."""
-
-    def __init__(self, *args, is_cross_attention: bool, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.is_cross_attention = is_cross_attention
+    """Preserve LTX SP collectives while applying model-specific padding masks."""
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        if self.is_cross_attention and attention_mask is not None:
-            # A 2D LTX cross-attention mask describes K/V padding only. Flash
-            # varlen applies one mask to Q and K when their lengths happen to
-            # match, so use mask-aware SDPA after the SP redistribution.
+        if attention_mask is not None:
+            # LTX masks describe K/V padding. Keep this semantic local to LTX:
+            # Flash varlen applies a 2D mask to both Q and K, while SP uses a
+            # broadcast 4D key mask that only SDPA consumes correctly.
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         return super()._run_local_attention(query, key, value, attn_metadata)
 
@@ -413,10 +409,10 @@ class LTX2AudioVideoAttnProcessor:
             return None
 
         if self._is_sp_enabled():
-            # Ulysses consumes a replicated 2D key-padding mask after Q/K/V
-            # all-to-all. This also supports cross-attention where Q and K have
-            # different sequence lengths.
-            return to_ltx_padding_mask(attention_mask)
+            # Keep the full key mask replicated while strict Ulysses reshards
+            # Q/K/V. The broadcast Q dimension also works when cross-attention
+            # has different Q and K lengths, without changing generic Ulysses.
+            return to_ltx_padding_mask(attention_mask)[:, None, None, :]
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
@@ -598,7 +594,6 @@ class LTX2Attention(torch.nn.Module):
         disable_kv_quant: bool = False,
     ):
         super().__init__()
-        is_cross_attention = cross_attention_dim is not None
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
         # map to the same RMSNorm implementation applied across Q/K heads.
         if qk_norm not in ("rms_norm_across_heads", "rms_norm"):
@@ -721,7 +716,6 @@ class LTX2Attention(torch.nn.Module):
             causal=False,
             prefix=prefix,
             disable_kv_quant=disable_kv_quant,
-            is_cross_attention=is_cross_attention,
         )
 
         # LTX-2.3: per-head gated attention

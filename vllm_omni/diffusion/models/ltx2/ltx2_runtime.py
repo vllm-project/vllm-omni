@@ -138,6 +138,12 @@ class LTXRuntime(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
+        parallel_config = getattr(od_config, "parallel_config", None)
+        if getattr(parallel_config, "ulysses_mode", "strict") == "advanced_uaa":
+            raise ValueError(
+                f"{self.__class__.__name__} does not support ulysses_mode='advanced_uaa'. "
+                "Use the default ulysses_mode='strict' for LTX sequence parallelism."
+            )
         self.model_version = detect_ltx_model_version(od_config.model)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)

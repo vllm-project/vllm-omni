@@ -267,6 +267,16 @@ def test_ltx_checkpoint_validation_rejects_mismatched_scheduler_metadata(expecte
         )
 
 
+def test_ltx_rejects_advanced_uaa_before_component_initialization():
+    od_config = SimpleNamespace(
+        model="unused",
+        parallel_config=SimpleNamespace(ulysses_mode="advanced_uaa"),
+    )
+
+    with pytest.raises(ValueError, match="does not support ulysses_mode='advanced_uaa'"):
+        LTX2Pipeline(od_config=od_config)
+
+
 def test_ltx23_checkpoint_selects_version_specific_one_stage_profile(tmp_path, monkeypatch):
     from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 

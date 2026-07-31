@@ -187,22 +187,15 @@ def _run_attention_case(
 
 
 @pytest.mark.parametrize(
-    "sp_world_size,query_seq_len,key_value_seq_len,num_heads",
+    "sp_world_size,seq_len,num_heads",
     [
-        (2, 6, 6, 3),  # head_cnt not divisible by P=2
-        (2, 5, 5, 4),  # seq_len not divisible by P=2
-        (4, 9, 9, 30),  # Z-Image-like: head_cnt not divisible by P=4
-        (4, 10, 10, 8),  # seq_len not divisible by P=4
-        (2, 5, 4, 4),  # cross-attention: Q and K/V have different lengths
-        (4, 9, 6, 30),  # cross-attention with uneven sequence and head shards
+        (2, 6, 3),  # head_cnt not divisible by P=2
+        (2, 5, 4),  # seq_len not divisible by P=2
+        (4, 9, 30),  # Z-Image-like: head_cnt not divisible by P=4
+        (4, 10, 8),  # seq_len not divisible by P=4
     ],
 )
-def test_ulysses_uaa_matches_baseline(
-    sp_world_size: int,
-    query_seq_len: int,
-    key_value_seq_len: int,
-    num_heads: int,
-) -> None:
+def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_heads: int) -> None:
     if current_omni_platform.get_device_count() < sp_world_size:
         pytest.skip(f"Test requires {sp_world_size} GPUs")
 
@@ -223,9 +216,9 @@ def test_ulysses_uaa_matches_baseline(
 
     try:
         torch.manual_seed(0)
-        q = torch.randn(batch_size, query_seq_len, num_heads, head_size, dtype=torch.float32)
-        k = torch.randn(batch_size, key_value_seq_len, num_heads, head_size, dtype=torch.float32)
-        v = torch.randn(batch_size, key_value_seq_len, num_heads, head_size, dtype=torch.float32)
+        q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
         np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
 
         # Baseline (no SP)
