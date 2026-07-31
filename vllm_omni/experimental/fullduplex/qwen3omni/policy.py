@@ -56,6 +56,12 @@ class Qwen3OmniDuplexPolicy:
     #: normalizes to this before anything reaches the worker.
     PCM_FORMAT = "pcm_f32le"
 
+    #: ``<|im_end|>``, the thinker's EOS. Without it in stage-0
+    #: ``stop_token_ids`` the thinker answers, then keeps generating until it
+    #: hits ``max_tokens`` -- observed as a 4 s input producing ~385 s of
+    #: audio. Verified against the checkpoint tokenizer.
+    IM_END_TOKEN_ID = 151645
+
     #: ``<|audio_pad|>``. Occupies the prompt positions that stage 0 overwrites
     #: with audio embeddings, so the token ids stay meaningful rather than
     #: being filler. Matches ``qwen3_omni.py:AUDIO_PAD_TOKEN_ID``.

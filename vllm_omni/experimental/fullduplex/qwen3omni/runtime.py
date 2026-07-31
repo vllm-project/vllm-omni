@@ -37,6 +37,23 @@ logger = init_logger(__name__)
 #: float32 little-endian PCM.
 _BYTES_PER_SAMPLE = 4
 
+_THINKER_STAGE_ID = 0
+
+
+def _completion_text(output: object) -> str:
+    """Text from a stage output, tolerating both output shapes.
+
+    Stage 0 hands over a raw vllm ``RequestOutput`` (completions on
+    ``.outputs``); wrapped stages nest it under ``.request_output``.
+    """
+    request_output = getattr(output, "request_output", None) or output
+    completions = getattr(request_output, "outputs", None)
+    if not completions:
+        return ""
+    text = getattr(completions[0], "text", None)
+    return text if isinstance(text, str) else ""
+
+
 SUPPORTED_INPUT_MODES = frozenset(
     {
         DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -333,31 +350,37 @@ class Qwen3OmniDuplexRuntimeExtension:
         segment_output_metadata: dict[str, Any],
         output: object,
     ) -> DuplexOutputDecision | None:
-        """Always returns ``None``. This is deliberate, not a stub.
+        r"""Surface the thinker's text to the client.
 
-        MiniCPM's equivalent detects a ``<|listen|>`` token and reports a
-        model-owned "stop talking and listen" decision
-        (``minicpmo45/runtime.py:304-344``). Qwen3-Omni's checkpoint has no
-        such control token -- it is a standard instruct LLM that emits text
-        and stops -- so there is no model-native turn signal to detect.
+        The duplex output collector only accepts outputs whose stage_id is at
+        or past ``response_stage_id`` -- the final stage, code2wav
+        (``request_client.py:299``). Stage-0 text would therefore never reach
+        the client and ``response.audio_transcript.delta`` would always be
+        empty. Note this transcript is not ASR: the thinker *produces* the
+        text that the talker then speaks, so it is already available here.
 
-        Synthesizing one from text EOS would conflate "finished this reply"
-        with "the user should speak now". Those are different events and the
-        model was not trained to distinguish them, so no decision is emitted
-        and turn boundaries come from the client instead. Audio reaches the
-        client through the normal stage-2 ``final_output`` path.
+        Returning a decision would mark the output ``duplex_direct_response``
+        and bypass that filter (``request_client.py:348-354``) -- but the
+        orchestrator ``return``\ s immediately after emitting a direct
+        response (``orchestrator.py:1284-1295``), skipping
+        ``_forward_to_next_stage``. Doing that for thinker output delivers the
+        transcript and *no audio*: verified live, stage 2 never ran.
 
-        Two further reasons not to grow logic here without care:
+        Direct response and stage advancement are therefore mutually
+        exclusive for the same output, and audio matters more. Returning
+        ``None`` keeps the thinker feeding the talker.
 
-        1. ``segment_token_ids`` / ``segment_output_metadata`` are read from a
-           per-request buffer that is NOT keyed by stage
-           (``orchestrator.py:918-932`` writes, ``:1444-1447`` reads). With
-           three independently-paced stages the snapshot passed alongside
-           ``stage_id`` may belong to a different stage. Any policy reading
-           stage-1 or stage-2 metadata is unsound until that is fixed.
-        2. Returning a decision short-circuits the output into a direct
-           response and skips normal routing (``orchestrator.py:1284-1295``).
+        This is why ``response.audio_transcript.delta`` is currently empty.
+        The text exists and is correct -- the collector only admits
+        ``stage_id >= response_stage_id`` (2) and there is no per-output way
+        to both forward and surface. A fix belongs in the framework, not
+        here: either the collector accepts the pipeline's declared text
+        ``final_output`` stage, or a decision gains a "forward as well" mode.
+
+        No turn policy is expressed here either -- Qwen3-Omni has no learned
+        listen/speak token, so this never reports a model listen decision the
+        way MiniCPM's extension does.
         """
-        del stage_id, final_stage_id, segment_finished
-        del segment_token_ids, segment_output_metadata, output
+        del segment_token_ids, segment_output_metadata, segment_finished
+        del stage_id, final_stage_id, output
         return None

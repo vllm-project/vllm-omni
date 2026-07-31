@@ -263,7 +263,11 @@ class Qwen3OmniDataPlaneSession:
 
     @staticmethod
     def _cumulative_text(output: object) -> str:
-        request_output = _field(output, "request_output")
+        # Stage 0 hands the orchestrator a raw vllm ``RequestOutput`` whose
+        # completions live on ``.outputs``; wrapped stages nest it under
+        # ``.request_output``. Reading only the wrapped form yields empty text
+        # for every thinker output.
+        request_output = _field(output, "request_output") or output
         completions = getattr(request_output, "outputs", None)
         if completions:
             text = getattr(completions[0], "text", None)

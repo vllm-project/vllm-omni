@@ -572,3 +572,88 @@ def test_data_plane_reads_omni_request_output_objects() -> None:
     assert events, "object-shaped outputs must not be dropped"
     assert events[0]["text"] == "hello there"
     assert events[0]["stage_role"] == "llm"
+
+
+# --- stop condition and transcript ------------------------------------------
+
+
+def test_stage0_sampling_stops_on_im_end() -> None:
+    """Without an EOS stop token the thinker runs to max_tokens.
+
+    Observed live: a 4 s input produced ~385 s of audio because generation
+    only ended at the cap. Every extra token becomes synthesized speech.
+    """
+    import asyncio
+
+    adapter = Qwen3OmniServingRuntimeAdapter(lambda *_a: "")
+
+    class _Config:
+        instructions = None
+        max_tokens = None
+        temperature = 0.7
+        extra_body: dict = {}
+
+    cfg = asyncio.run(adapter.prepare_runtime_config(_Config(), model_config=None))
+    stage0 = cfg["duplex_stage_sampling_params"]["0"]
+    assert Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID in stage0["stop_token_ids"]
+    assert cfg["duplex_stage_max_tokens"]["0"] <= 256, "a spoken turn should be short"
+
+
+def test_runtime_config_update_keeps_the_stop_token() -> None:
+    adapter = Qwen3OmniServingRuntimeAdapter(lambda *_a: "")
+
+    class _Config:
+        instructions = None
+        max_tokens = None
+        temperature = 0.5
+
+    updated = adapter.runtime_config_for_update(_Config(), {})
+    assert Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID in updated["duplex_stage_sampling_params"]["0"]["stop_token_ids"]
+
+
+def test_decide_output_returns_none_so_audio_still_flows() -> None:
+    """A direct response would surface text but kill the audio.
+
+    orchestrator.py:1284-1295 returns immediately after emitting a direct
+    response, skipping _forward_to_next_stage. Verified live: marking thinker
+    output as a direct response delivered the transcript and zero audio,
+    because stage 2 never ran.
+    """
+    from types import SimpleNamespace
+
+    ext = Qwen3OmniDuplexRuntimeExtension()
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="hello there")])
+    for stage_id in (0, 1, 2):
+        assert (
+            ext.decide_output(
+                stage_id=stage_id,
+                final_stage_id=2,
+                segment_finished=True,
+                segment_token_ids=(1, 2),
+                segment_output_metadata={},
+                output=output,
+            )
+            is None
+        )
+
+
+def test_data_plane_reads_text_from_raw_request_output() -> None:
+    """Stage 0 sends a raw vllm RequestOutput, not a wrapped OmniRequestOutput."""
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.fullduplex.qwen3omni.data_plane import (
+        Qwen3OmniDataPlaneContext,
+        Qwen3OmniDataPlaneSession,
+    )
+
+    raw = SimpleNamespace(
+        request_id="r1",
+        finished=False,
+        stage_id=0,
+        outputs=[SimpleNamespace(text="unwrapped text")],
+        multimodal_output={},
+    )
+    dp = Qwen3OmniDataPlaneSession(lambda *_a: "enc")
+    dp.begin_request("r1")
+    events = list(dp.project({"data_plane_outputs": [raw]}, context=Qwen3OmniDataPlaneContext()))
+    assert events and events[0]["text"] == "unwrapped text"

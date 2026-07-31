@@ -19,14 +19,19 @@ from vllm_omni.experimental.fullduplex.openai.protocol import DuplexCapabilities
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import ServingRuntimeConfigError
 from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPolicy
 
-#: Default stage-0 token bound per duplex segment. Qwen3-Omni emits no
-#: chunk-terminating control token, so this budget is the only stop
-#: condition for a segment.
-_DEFAULT_STAGE0_MAX_TOKENS = 256
+#: Default stage-0 token bound for one spoken reply. A backstop only -- the
+#: real terminator is ``<|im_end|>`` in ``stop_token_ids`` below. Kept in the
+#: same range as the half-duplex realtime path
+#: (``qwen3_omni.py: realtime_max_tokens = 64``), since a spoken turn should
+#: be short; every generated token becomes synthesized speech.
+_DEFAULT_STAGE0_MAX_TOKENS = 128
 
 #: Used when the client sets no `instructions`. The thinker needs a system
 #: turn for the chat template to be well-formed.
-_DEFAULT_INSTRUCTIONS = "You are a helpful voice assistant. Reply naturally and concisely."
+_DEFAULT_INSTRUCTIONS = (
+    "You are a helpful voice assistant. Reply in the same language the user "
+    "speaks. Keep replies short and conversational -- one or two sentences."
+)
 _DEFAULT_TALKER_MAX_TOKENS = 8192
 
 
@@ -142,7 +147,11 @@ class Qwen3OmniNativeDuplexServingAdapter:
         temperature = getattr(config, "temperature", None)
         instructions = getattr(config, "instructions", None)
 
-        stage0_sampling: dict[str, object] = {}
+        # Stop on the thinker's own EOS. Without this the model answers and
+        # then keeps going to the token cap, and every extra token is spoken.
+        stage0_sampling: dict[str, object] = {
+            "stop_token_ids": [Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID],
+        }
         if isinstance(temperature, (int, float)):
             stage0_sampling["temperature"] = float(temperature)
 
@@ -186,6 +195,7 @@ class Qwen3OmniNativeDuplexServingAdapter:
             sampling = updated.get("duplex_stage_sampling_params")
             sampling = dict(sampling) if isinstance(sampling, Mapping) else {}
             stage0 = dict(sampling.get("0")) if isinstance(sampling.get("0"), Mapping) else {}
+            stage0.setdefault("stop_token_ids", [Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID])
             stage0["temperature"] = float(temperature)
             sampling["0"] = stage0
             updated["duplex_stage_sampling_params"] = sampling
