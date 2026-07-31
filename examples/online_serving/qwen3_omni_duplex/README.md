@@ -84,7 +84,15 @@ routes to the chat fallback rather than the native duplex runtime.
 
 Two spoken turns in one session work: two independent replies, 9 audio deltas.
 
-**But the server still wedges after a few sessions.** Once wedged, every client
+**But the server stops responding after two sessions.** It stays healthy and
+keeps accepting connections and audio; it simply never produces output again
+until restarted.
+
+Capacity is not the cause. Raising stage `max_num_seqs` from 4 to 16 and
+`max_sessions` to 12 changed nothing: sessions 1 and 2 answer, session 3
+onward is silent. The limit is two regardless of configured capacity, which
+rules out slot exhaustion and points at per-session state that is established
+twice and then blocks. Once wedged, every client
 fails identically -- audio is accepted and framed correctly, `response.created`
 is never emitted, and the session panel stays at 0 turns. A restart clears it.
 
