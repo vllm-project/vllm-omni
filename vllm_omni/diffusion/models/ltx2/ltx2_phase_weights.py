@@ -82,7 +82,7 @@ def _uses_serialized_quantization(quant_config: Any) -> bool:
 
 
 def _resolve_two_stage_lora_mode() -> str:
-    mode = os.getenv(_LTX_TWO_STAGE_LORA_MODE_ENV, "dynamic").strip().lower()
+    mode = os.getenv(_LTX_TWO_STAGE_LORA_MODE_ENV, "layer_fused").strip().lower()
     if mode not in {"resident", "dynamic", "layer_fused"}:
         raise ValueError(
             f"{_LTX_TWO_STAGE_LORA_MODE_ENV} must be 'resident', 'dynamic', or 'layer_fused', got {mode!r}."

@@ -1363,8 +1363,7 @@ def test_ltx_phase_weight_factory_selects_resident_mode(monkeypatch):
     assert ltx2_phase_weights.build_ltx_phase_weights(pipeline) is resident
 
 
-@pytest.mark.parametrize("mode", [None, " DyNaMiC "])
-def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
+def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch):
     pipeline = _make_phase_weight_factory_pipeline()
     # Dynamic LoRA delegates the base projection to its original quant method,
     # then adds the low-rank activation-space residual.
@@ -1372,10 +1371,7 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
     manifest = object()
     installed = []
 
-    if mode is None:
-        monkeypatch.delenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", mode)
+    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " DyNaMiC ")
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(
         ltx2_phase_weights,
@@ -1401,13 +1397,17 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch, mode):
     assert installed == [True]
 
 
-def test_ltx_phase_weight_factory_selects_layer_fused_mode(monkeypatch):
+@pytest.mark.parametrize("mode", [None, " LaYeR_FuSeD "])
+def test_ltx_phase_weight_factory_selects_layer_fused_mode(monkeypatch, mode):
     pipeline = _make_phase_weight_factory_pipeline()
     pipeline.od_config.dtype = torch.bfloat16
     pipeline.od_config.quantization_config = None
     manifest = object()
     installed = []
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " LaYeR_FuSeD ")
+    if mode is None:
+        monkeypatch.delenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", mode)
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(
         ltx2_phase_weights,
