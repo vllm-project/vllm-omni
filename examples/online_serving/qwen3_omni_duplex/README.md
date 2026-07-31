@@ -80,6 +80,31 @@ audio does not affect it. The session and its KV survive a cancel.
 starts a response on commit. Do not send `response.create` — on this path it
 routes to the chat fallback rather than the native duplex runtime.
 
+## Known limitation: one session per server boot
+
+The pipeline currently serves **one conversation per server start**. The first
+session works; every later one completes the handshake, accepts audio, frames
+it correctly, and produces no output.
+
+Isolated so far:
+
+- Not session capacity. Reproduces with `max_sessions: 4` and matching stage
+  `max_num_seqs`.
+- Not the client. The scripted client and the browser fail identically.
+- Not `session.close`. A first session that never closes still poisons the
+  second.
+- Not stage 0 admission. The second session's stage-0 request is created and
+  generates its first token; the reply never reaches the client, and the data
+  plane sees `outputs=None`.
+
+Between conversations:
+
+```bash
+./reset_server.sh              # restart and wait for :8099
+```
+
+Roughly a five minute model reload, so this is a workaround rather than a fix.
+
 ## Troubleshooting
 
 | Symptom | Cause |
