@@ -528,6 +528,7 @@ def _expand_seed_tts_turn_outputs(
             expanded_outputs.append(output)
             continue
         turn_pcm = getattr(output, "tts_turn_pcm_bytes", None)
+        session_pcm = getattr(output, "tts_output_pcm_bytes", None)
         for turn_index, turn in enumerate(turns):
             expanded_requests.append(
                 replace(
@@ -538,9 +539,13 @@ def _expand_seed_tts_turn_outputs(
                 )
             )
             turn_output = copy(output)
-            turn_output.tts_output_pcm_bytes = (
-                turn_pcm[turn_index] if isinstance(turn_pcm, list) and turn_index < len(turn_pcm) else None
-            )
+            if isinstance(turn_pcm, list) and turn_index < len(turn_pcm):
+                turn_output.tts_output_pcm_bytes = turn_pcm[turn_index]
+            elif len(turns) == 1:
+                # openai-chat-omni Seed-TTS only fills the session-level PCM field.
+                turn_output.tts_output_pcm_bytes = session_pcm
+            else:
+                turn_output.tts_output_pcm_bytes = None
             expanded_outputs.append(turn_output)
     return expanded_requests, expanded_outputs
 

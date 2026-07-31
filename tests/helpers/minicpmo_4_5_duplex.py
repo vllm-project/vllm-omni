@@ -19,6 +19,29 @@ DEPLOY_CONFIG = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
+        # Cap per-stage KV so Thinker/Talker/Code2Wav share one GPU with
+        # max_sessions=2. Talker must stay within its 4096 context so the
+        # 0.5 GiB budget passes vLLM's min-KV check at init.
+        "stages": {
+            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
+            1: {
+                "max_model_len": 4096,
+                "kv_cache_memory_bytes": 512 * 1024 * 1024,
+            },
+            2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
+        },
+        # Platform overrides apply after ordinary stage settings and would
+        # otherwise reinstate the base CUDA 2 GiB Talker default.
+        "platforms": {
+            "cuda": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "kv_cache_memory_bytes": 512 * 1024 * 1024,
+                    }
+                ]
+            }
+        },
     },
 )
 ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "minicpmo_4_5"

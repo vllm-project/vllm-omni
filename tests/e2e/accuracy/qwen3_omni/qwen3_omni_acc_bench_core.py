@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -121,9 +122,13 @@ def seed_tts_bench_argv(*, locale: str = "en") -> list[str]:
 
 def find_vllm_cli() -> str:
     exe = shutil.which("vllm")
-    if not exe:
-        raise FileNotFoundError("Could not find `vllm` on PATH (install vLLM-Omni with CLI entrypoints).")
-    return exe
+    if exe:
+        return exe
+    # Fallback when pytest is invoked via absolute venv path without activating PATH.
+    sibling = Path(sys.executable).resolve().parent / "vllm"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    raise FileNotFoundError("Could not find `vllm` on PATH (install vLLM-Omni with CLI entrypoints).")
 
 
 def run_vllm_bench_subprocess(vllm: str, argv: list[str], *, extra_env: dict[str, str] | None = None) -> None:
@@ -153,6 +158,8 @@ def build_serve_common_argv(
     trust_remote_code: bool = False,
     backend: str = "openai-chat-omni",
     endpoint: str = "/v1/chat/completions",
+    temperature: float | None = None,
+    output_len: int | None = None,
 ) -> list[str]:
     out = [
         "bench",
@@ -189,6 +196,10 @@ def build_serve_common_argv(
         out.extend(["--ready-check-timeout-sec", str(int(ready_check_timeout_sec))])
     if trust_remote_code:
         out.append("--trust-remote-code")
+    if temperature is not None:
+        out.extend(["--temperature", str(temperature)])
+    if output_len is not None:
+        out.extend(["--output-len", str(int(output_len))])
     return out
 
 

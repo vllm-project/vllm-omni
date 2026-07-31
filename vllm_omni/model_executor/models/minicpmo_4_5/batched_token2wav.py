@@ -65,6 +65,27 @@ class BatchedToken2Wav(nn.Module):
         self._token2wav = token2wav
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        hift_parameter = next(self.hift.parameters(), None)
+        if hift_parameter is not None and hift_parameter.device.type == "cuda":
+            # Prime the CUDA state used by HiFT during backend construction.
+            # Otherwise, the first live audio chunk can fail when async stages
+            # share one GPU.
+            device = hift_parameter.device
+            dtype = hift_parameter.dtype
+            mel_channels = int(self.hift.conv_pre.in_channels)
+            with (
+                torch.inference_mode(),
+                torch.random.fork_rng(devices=[device]),
+                _autocast_disabled(device),
+            ):
+                # 50 mel frames match the default first streamed vocoder chunk.
+                speech, source = self.hift(
+                    torch.zeros((1, mel_channels, 50), device=device, dtype=dtype),
+                    torch.zeros((1, 1, 0), device=device, dtype=dtype),
+                )
+            torch.accelerator.synchronize(device)
+            del speech, source
+            torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
