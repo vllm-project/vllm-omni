@@ -1,6 +1,8 @@
 import json
 import os
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -63,35 +65,78 @@ paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_C
 _omni_server_lock = threading.Lock()
 
 
+class _SingleActiveContext:
+    """Reuse one active context while its configuration key is unchanged."""
+
+    def __init__(self) -> None:
+        self._key: Any = None
+        self._stack: ExitStack | None = None
+        self._value: Any = None
+
+    def acquire(self, key: Any, factory: Callable[[], AbstractContextManager[Any]]) -> Any:
+        if self._stack is not None and key == self._key:
+            return self._value
+
+        self.close()
+        stack = ExitStack()
+        value = stack.enter_context(factory())
+        self._key = key
+        self._stack = stack
+        self._value = value
+        return value
+
+    def close(self) -> None:
+        stack = self._stack
+        self._key = None
+        self._stack = None
+        self._value = None
+        if stack is not None:
+            stack.close()
+
+
+@contextmanager
+def _start_omni_server(server_param):
+    test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
+
+    print(f"Starting OmniServer with test: {test_name}, model: {model}")
+
+    server_args: list[str] = []
+    if use_omni:
+        server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
+    # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
+    # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
+    if stage_config_path:
+        server_args = ["--deploy-config", stage_config_path] + server_args
+    if stage_overrides:
+        server_args = ["--stage-overrides", stage_overrides] + server_args
+    if extra_cli_args:
+        server_args = list(extra_cli_args) + server_args
+    with OmniServer(model, server_args, use_omni=use_omni) as server:
+        server.test_name = test_name
+        print("OmniServer started successfully")
+        yield server
+        print("OmniServer stopping...")
+
+    print("OmniServer stopped")
+
+
 @pytest.fixture(scope="module")
-def omni_server(request):
+def omni_server_context():
     """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses session scope so the server starts only once for the entire test session.
+    Reuse it for adjacent benchmark cases with the same server configuration.
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = request.param
+        active_context = _SingleActiveContext()
+        try:
+            yield active_context
+        finally:
+            active_context.close()
 
-        print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args: list[str] = []
-        if use_omni:
-            server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
-        # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
-        # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
-        if stage_config_path:
-            server_args = ["--deploy-config", stage_config_path] + server_args
-        if stage_overrides:
-            server_args = ["--stage-overrides", stage_overrides] + server_args
-        if extra_cli_args:
-            server_args = list(extra_cli_args) + server_args
-        with OmniServer(model, server_args, use_omni=use_omni) as server:
-            server.test_name = test_name
-            print("OmniServer started successfully")
-            yield server
-            print("OmniServer stopping...")
-
-        print("OmniServer stopped")
+@pytest.fixture
+def omni_server(request, omni_server_context):
+    return omni_server_context.acquire(request.param, lambda: _start_omni_server(request.param))
 
 
 @pytest.fixture
