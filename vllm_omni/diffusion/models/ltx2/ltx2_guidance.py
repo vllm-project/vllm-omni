@@ -426,7 +426,7 @@ class LTXGuidanceExecutor:
             attention_kwargs=attention_kwargs,
         )
         with pipeline._transformer_cache_context("guided"):
-            local_video, local_audio = pipeline.transformer(**kwargs)
+            local_video, local_audio = pipeline.denoise_transformer(**kwargs)
         local_video_slots = local_video.chunk(model_pass_count)
         local_audio_slots = local_audio.chunk(model_pass_count)
 

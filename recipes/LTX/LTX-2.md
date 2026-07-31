@@ -62,7 +62,7 @@ feature.
 | Tensor parallel | ✅ | ✅ | ✅ |
 | Ulysses sequence parallel | ✅ | ✅ | ✅ |
 | Ring sequence parallel | ⚠️ | ⚠️ | ⚠️ |
-| CFG parallel | ⚠️ CFG-only | ⚠️ Stage 1, CFG-only | — |
+| CFG parallel | ✅ full guidance plan | ⚠️ Stage 1, full guidance plan | — positive-only |
 | HSDP | ✅ | ✅ | ✅ |
 | Pipeline parallel | ❌ | ❌ | ❌ |
 | Expert parallel | — | — | — |
@@ -81,8 +81,6 @@ explicitly unsupported; — not applicable.
 - Ring SP requires the logical audio latent length to be divisible by the SP
   size because it cannot consume the key-padding mask; otherwise use pure
   Ulysses.
-- CFG parallel supports only a two-branch CFG plan. Disable STG and modality
-  guidance and set both rescale fields to `0.0`.
 - Quantization support depends on the checkpoint format and LoRA strategy.
   Dynamic phase LoRA delegates the base projection to its configured quant
   method and adds the low-rank residual separately. Resident phase LoRA

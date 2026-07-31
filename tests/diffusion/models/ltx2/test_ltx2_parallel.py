@@ -185,7 +185,7 @@ class TestCFGParallelHelpers:
 
         class FakePipeline:
             scheduler = SimpleNamespace(sigmas=torch.stack([video_sigma]))
-            transformer = FakeTransformer()
+            denoise_transformer = FakeTransformer()
 
             @staticmethod
             def _transformer_cache_context(name):
