@@ -80,11 +80,16 @@ audio does not affect it. The session and its KV survive a cancel.
 starts a response on commit. Do not send `response.create` — on this path it
 routes to the chat fallback rather than the native duplex runtime.
 
-## Known limitation: one session per server boot
+## Known limitation: one turn per server boot
 
-The pipeline currently serves **one conversation per server start**. The first
-session works; every later one completes the handshake, accepts audio, frames
-it correctly, and produces no output.
+The pipeline currently serves **one spoken turn per server start**. The first
+turn works end to end. The next one -- whether it is a second question in the
+same session or a new session entirely -- completes the handshake, accepts
+audio, frames it correctly, and produces no output.
+
+Observed directly in the browser demo: the first question produced a spoken
+reply with every stage lighting up, and the second stalled with no stage
+advancing past the microphone.
 
 Isolated so far:
 
@@ -93,9 +98,13 @@ Isolated so far:
 - Not the client. The scripted client and the browser fail identically.
 - Not `session.close`. A first session that never closes still poisons the
   second.
-- Not stage 0 admission. The second session's stage-0 request is created and
-  generates its first token; the reply never reaches the client, and the data
-  plane sees `outputs=None`.
+- Not stage 0 admission. The second request is created and generates its
+  first token; the reply never reaches the client, and the data plane sees
+  `outputs=None`.
+- Not session lifecycle. It reproduces across a session boundary *and* within
+  one open session, so the trigger is a completed turn rather than a completed
+  session. The likely area is the resumable stage-0 request not returning to a
+  state that accepts the next append.
 
 Between conversations:
 
