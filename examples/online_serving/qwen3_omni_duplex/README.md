@@ -105,6 +105,39 @@ marked its segment finished while stage 1 was still parked from the previous
 turn and never read the new chunks. Stages 1 and 2 sat idle and the client saw
 nothing.
 
+## Open: later turns answer the first question
+
+Canonical reproduction, two spoken turns in one session:
+
+```
+turn 1  "What is the capital of France?"  ->  "The capital of France is Paris."   correct
+turn 2  "What is the capital of the USA?" ->  "Yes, Paris is the capital of France."
+```
+
+and every turn after that keeps affirming turn 1. So turn 1 is heard correctly
+and later turns are not heard at all -- the model is answering from context
+rather than from new audio.
+
+What is already ruled out:
+
+- Turn 2's audio *does* reach the model. Instrumenting the splice showed
+  `seq=2 embeds=(52, 2048)` spliced at the right offset, the same count as
+  turn 1.
+- Not accumulated audio context. `turn_audio` now resets when a turn closes,
+  and the earlier "re-encodes the whole conversation" bug is fixed.
+- Not the unclosed assistant turn. Later turns now open with `<|im_end|>` and a
+  newline.
+- Not microphone quality. Turn 1 is transcribed correctly, and capture now runs
+  at 16 kHz natively.
+
+So fresh embeddings are spliced into a well-formed prompt and the model still
+ignores them. The next thing to check is whether those embeddings actually
+differ between turns -- log a cheap fingerprint (mean and norm) of the spliced
+span per turn. If turn 2's fingerprint matches turn 1's, stage 0 is serving
+stale audio despite the reset; if it differs, the problem is positional, and
+the resumable request's KV or position offsets for the appended span are the
+place to look.
+
 ## Open: generic replies
 
 Later turns have been observed returning a generic greeting ("I'm doing well,
