@@ -767,10 +767,8 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         trt_stepper = None
         use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
-        if current_omni_platform.is_npu():
-            if use_trt:
-                raise ValueError("token2wav_trt requires CUDA; TensorRT is unavailable on NPU")
-        elif use_trt:
+        # TensorRT is CUDA-only; other platforms ignore the toggle.
+        if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
             dtype_name = str(
