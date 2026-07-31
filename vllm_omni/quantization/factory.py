@@ -475,8 +475,7 @@ def resolve_quant_config_from_disk(
     # selected according to the checkpoint's bit width.
     if qc_kwargs.get("data_type") == "mx_fp":
         logger.info(
-            "config.json declares data_type='mx_fp'; rebuilding as offline "
-            "AutoRound MXFP%d.",
+            "config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP%d.",
             qc_kwargs.get("bits", getattr(quant_config, "weight_bits", 0)),
         )
         return build_quant_config(qc_method, **qc_kwargs)
