@@ -40,9 +40,37 @@ def test_extract_ratio_index_uses_fixed_special_token_ids():
     assert _extract_ratio_index([1, ratio_33, 2, ratio_36]) == 36
 
 
-def test_truncate_at_cot_end_strips_tail_after_recaption_marker():
-    text = _truncate_at_cot_end("body text</recaption><answer><boi><img_size_1024><img_ratio_0>")
-    assert text == "body text</recaption>"
+@pytest.mark.parametrize(
+    ("bot_task", "generated_text", "expected"),
+    [
+        (
+            "think",
+            "thought</think><answer><boi><img_size_1024><img_ratio_0>",
+            "<think>thought</think>",
+        ),
+        (
+            "recaption",
+            "caption</recaption><answer><boi><img_size_1024><img_ratio_0>",
+            "<recaption>caption</recaption>",
+        ),
+        (
+            "think_recaption",
+            "thought</think><recaption>caption</recaption><answer>",
+            "<think>thought</think><recaption>caption</recaption>",
+        ),
+        (
+            None,
+            "<answer><boi><img_size_1024><img_ratio_0>",
+            "",
+        ),
+    ],
+)
+def test_truncate_at_cot_end_matches_bot_task(
+    bot_task: str | None,
+    generated_text: str,
+    expected: str,
+):
+    assert _truncate_at_cot_end(generated_text, bot_task=bot_task) == expected
 
 
 def test_ar2diffusion_returns_one_request_payload_for_request_level_batching():
@@ -58,14 +86,14 @@ def test_ar2diffusion_returns_one_request_payload_for_request_level_batching():
 def test_ar2diffusion_uses_parent_output_when_companions_are_present():
     result = ar2diffusion(
         [
-            _source_output([100], text="parent thought"),
+            _source_output([100], text="parent thought</think><answer>"),
             _source_output([200], text="companion thought"),
         ],
-        prompt={"prompt": "edit"},
+        prompt={"prompt": "edit", "bot_task": "think"},
     )
 
     assert result is not None
-    assert result["extra"]["ar_generated_text"] == "parent thought"
+    assert result["extra"]["ar_generated_text"] == "<think>parent thought</think>"
 
 
 def test_ar2diffusion_returns_none_without_parent_output():
@@ -90,13 +118,13 @@ def test_ar2diffusion_applies_ratio_and_truncates_tail_without_tokenizer(monkeyp
     token_ids = [100, 101, end_recaption, answer, boi, size, ratio_0]
 
     result = ar2diffusion(
-        [_source_output(token_ids, text="decoded without special tokens")],
-        prompt=[{"prompt": "edit", "height": 64, "width": 64}],
+        [_source_output(token_ids, text="caption</recaption><answer>")],
+        prompt=[{"prompt": "edit", "height": 64, "width": 64, "bot_task": "recaption"}],
     )
 
     assert result is not None
     assert (result["height"], result["width"]) == (512, 2048)
-    assert result["extra"]["ar_generated_text"] == "decoded without special tokens"
+    assert result["extra"]["ar_generated_text"] == "<recaption>caption</recaption>"
     assert "ar_token_ids" not in result["extra"]
 
 

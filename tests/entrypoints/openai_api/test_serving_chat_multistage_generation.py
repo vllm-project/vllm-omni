@@ -498,20 +498,24 @@ def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit
     assert getattr(diff_params, "stop_token_ids", None) is None, "Diffusion stage must not have stop_token_ids set"
 
 
-def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(serving_chat):
+def test_build_multistage_generation_inputs_plain_mode_still_sets_ratio_stop_tokens(serving_chat):
     """Without height+width, ar_image_size=None -> need_ratio=True ->
     stop_token_ids is set to the ratio range (AR predicts ratio).
     This still assigns stop_token_ids, but the set is the ratio range,
     not the terminator.
 
-    Without bot_task at all, ar_stop_token_ids stays None and
-    stop_token_ids is not set on any stage.
+    Without bot_task, Hunyuan plain mode still needs ratio stop tokens
+    so generation ends after selecting the output aspect ratio.
     """
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     engine = SimpleNamespace(
         stage_configs=[
-            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(
+                stage_type="llm",
+                is_comprehension=True,
+                engine_args=SimpleNamespace(model_arch="HunyuanImage3ForCausalMM"),
+            ),
             SimpleNamespace(stage_type="diffusion", is_comprehension=False),
         ],
         default_sampling_params_list=[
@@ -521,9 +525,7 @@ def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(servi
     )
     images = [Image.new("RGB", (32, 32), color="red")]
 
-    # No height/width, no bot_task -> ar_stop_token_ids=None ->
-    # stop_token_ids not set on any stage.
-    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+    engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
         engine=engine,
         prompt="draw a cat",
@@ -532,9 +534,7 @@ def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(servi
         gen_params=OmniDiffusionSamplingParams(),
     )
 
-    # SamplingParams defaults stop_token_ids=[], not None.
-    # The key contract: it was NOT set by resolve_stop_token_ids,
-    # so it stays as the SamplingParams default (empty list).
-    assert sampling_params_list[0].stop_token_ids == [], (
-        "Without bot_task, AR stage stop_token_ids must be the default empty list"
-    )
+    assert engine_prompt["prompt"].endswith("\n\nAssistant: ")
+    assert "bot_task" not in engine_prompt
+    assert len(sampling_params_list[0].stop_token_ids) == 37
+    assert getattr(sampling_params_list[1], "stop_token_ids", None) is None

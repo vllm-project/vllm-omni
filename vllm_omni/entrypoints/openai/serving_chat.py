@@ -2959,7 +2959,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         build_kwargs: dict[str, Any] = {}
         ar_stop_token_ids: list[int] | None = None
 
-        if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
+        # ── HunyuanImage3 AR prompt setup ──────────────────────────
+        # TODO: Abstract to a model-agnostic interface (build_prompt /
+        # build_prompt_tokens / resolve_stop_token_ids) once a second
+        # AR+DiT model is supported.  For now the block is entered when
+        # any Hunyuan-specific param is set, OR when the pipeline stage
+        # declares HunyuanImage3ForCausalMM as its model_arch — this
+        # ensures ar_stop_token_ids is always resolved so the AR stage
+        # stops on <img_ratio_*> even when the caller omits bot_task.
+        _is_hunyuan_image_3 = any(
+            getattr(getattr(s, "engine_args", None), "model_arch", "") == "HunyuanImage3ForCausalMM"
+            for s in stage_configs
+        ) or any(value is not None for value in (bot_task, use_system_prompt, custom_system_prompt))
+        if _is_hunyuan_image_3:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
@@ -2971,14 +2983,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "sys_type": use_system_prompt,
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
+                # API requests use None as plain mode. Pass it explicitly so
+                # the prompt helper does not apply its legacy "think" default.
+                "bot_task": bot_task,
             }
 
-            if bot_task is not None:
-                build_kwargs["bot_task"] = bot_task
-            elif "bot_task" in extra_body:
-                # Explicit None from the caller is plain-mode; omitted lets
-                # each task fall back to its default trigger.
-                build_kwargs["bot_task"] = extra_body["bot_task"]
             if tokenizer is not None:
                 # Feed segment-tokenized prompt_token_ids so AR matches HF
                 # apply_chat_template byte-for-byte (engine BPE would merge
@@ -3010,6 +3019,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["prompt_token_ids"] = prompt_token_ids
         if system_prompt_type is not None:
             engine_prompt["use_system_prompt"] = system_prompt_type
+        # Forward bot_task so the stage input processor can truncate CoT
+        # text at the correct closing tag (</think> vs </recaption>).
+        if bot_task is not None:
+            engine_prompt["bot_task"] = bot_task
         # DiT's get_system_prompt(use_system_prompt, "image", system_prompt) reads
         # this; omitting it makes sys_type=custom yield an empty DiT prefix.
         if custom_system_prompt is not None:
@@ -3295,35 +3308,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
 
-        req_out = getattr(result, "request_output", None)
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
-
-        req_out = getattr(result, "request_output", None)
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
-
-        req_out = getattr(result, "request_output", None)
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
+        # Only return CoT text when the caller explicitly requested it
+        # (bot_task=think/recaption/think_recaption).  In plain mode
+        # (bot_task omitted or None) the AR generates only image-structure
+        # tokens (<answer><boi><img_size_*><img_ratio_*>) which are not
+        # meaningful CoT output — matching the official generate_image()
+        # contract where cot_text stays None when bot_task is None.
+        bot_task = (extra_body or {}).get("bot_task")
+        if bot_task is not None:
+            req_out = getattr(result, "request_output", None)
+            if req_out:
+                prompt_obj = getattr(req_out, "prompt", None)
+                if isinstance(prompt_obj, dict):
+                    extra_prompt = prompt_obj.get("extra", {})
+                    if isinstance(extra_prompt, dict):
+                        ar_text = extra_prompt.get("ar_generated_text")
+                        if isinstance(ar_text, str) and ar_text.strip():
+                            cot_output = ar_text
 
         return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
 

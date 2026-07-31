@@ -32,19 +32,50 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = init_logger(__name__)
 
 
-def _truncate_at_cot_end(generated_text: str) -> str:
-    """Truncate AR output at first `</recaption>` (or `</think>` fallback).
+def _truncate_at_cot_end(
+    generated_text: str,
+    *,
+    bot_task: str | None = None,
+) -> str:
+    """Truncate AR output at the correct CoT closing tag and prepend the
+    opening tag (the AR consumed it as a generation trigger so the decoded
+    output starts *after* ``<think>`` / ``<recaption>``).
 
-    Mirrors upstream `HunyuanImage3ForCausalMM.generate_image` which feeds
-    DiT only the cot text up to the closing tag; the trailing
-    `<answer><boi><img_size_*><img_ratio_*>` is consumed via height/width
-    extraction and must not leak into DiT's prompt builder.
+    Mirrors upstream ``HunyuanImage3ForCausalMM.generate_image`` (line
+    3343-3358): ``bot_task="think"`` stops at ``</think>``, while
+    ``recaption`` and ``think_recaption`` stop at ``</recaption>``.
+    When ``bot_task`` is ``None`` (plain mode) the AR generates only
+    image-structure tokens — returns empty string, matching upstream
+    where ``cot_text`` stays ``None`` in this path.
     """
-    for marker in ("</recaption>", "</think>"):
-        idx = generated_text.find(marker)
+    if bot_task == "think":
+        idx = generated_text.find("</think>")
         if idx != -1:
-            return generated_text[: idx + len(marker)]
-    return generated_text
+            truncated = generated_text[: idx + len("</think>")]
+            if not truncated.startswith("<think>"):
+                truncated = "<think>" + truncated
+            return truncated
+    elif bot_task == "recaption":
+        idx = generated_text.find("</recaption>")
+        if idx != -1:
+            truncated = generated_text[: idx + len("</recaption>")]
+            if not truncated.startswith("<recaption>"):
+                truncated = "<recaption>" + truncated
+            return truncated
+    elif bot_task == "think_recaption":
+        # Emits <think>...</think><recaption>...</recaption>;
+        # stop at </recaption> so recaption conditioning reaches DiT.
+        # AR consumed <think> as the generation trigger, so prepend it.
+        idx = generated_text.find("</recaption>")
+        if idx != -1:
+            truncated = generated_text[: idx + len("</recaption>")]
+            if not truncated.startswith("<think>"):
+                truncated = "<think>" + truncated
+            return truncated
+    # bot_task is None (plain mode) or unknown: upstream keeps
+    # cot_text=None, so return empty — get_cot_sections produces no
+    # text-conditioning sections.
+    return ""
 
 
 @lru_cache(maxsize=4)
@@ -169,7 +200,10 @@ def ar2diffusion(
                 width,
             )
 
-    cot_text_for_dit = _truncate_at_cot_end(generated_text)
+    cot_text_for_dit = _truncate_at_cot_end(
+        generated_text,
+        bot_task=original_prompt.get("bot_task"),
+    )
 
     logger.info(
         "[ar2diffusion] Request 0: AR generated %d tokens, text length=%d, cot_text length=%d, target size=%dx%d (%s)",
