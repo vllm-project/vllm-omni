@@ -77,6 +77,29 @@ def _append_entries(store: dict[str, Any], incoming: dict[str, Any]) -> None:
             store[key] = new_value
 
 
+def _split_nested_payload_value(
+    value: Any,
+    prefix: str,
+    tensors: dict[str, torch.Tensor],
+    metadata: dict[str, Any],
+) -> None:
+    """Route a (possibly nested) payload value into tensors or metadata.
+
+    Tensor leaves are recorded under dotted keys so per-step frames from
+    talkers/code heads (e.g. ``{"codes": {"audio": [n, 8]}}``) accumulate via
+    ``_append_entries`` and consolidate under the modality's concat strategy
+    instead of being replaced by the latest step. Non-tensor leaves (sample
+    rate, dims) and lists (opaque chunk payloads) stay in metadata.
+    """
+    if isinstance(value, torch.Tensor):
+        tensors[prefix] = value
+    elif isinstance(value, dict):
+        for sub_key, sub_value in value.items():
+            _split_nested_payload_value(sub_value, f"{prefix}.{sub_key}", tensors, metadata)
+    else:
+        metadata[prefix] = value
+
+
 @dataclass(eq=False)
 class MultimodalPayload(Mapping):
     """Structured multimodal output payload.
@@ -237,7 +260,14 @@ class MultimodalPayload(Mapping):
         for key, value in payload.items():
             is_producer_key = key == "model_outputs" or (key == "hidden" and modality_key != "hidden")
             remapped[modality_key if is_producer_key else key] = _to_cpu(value)
-        return cls.from_dict(remapped)
+
+        tensors: dict[str, torch.Tensor] = {}
+        metadata: dict[str, Any] = {}
+        for key, value in remapped.items():
+            _split_nested_payload_value(value, key, tensors, metadata)
+        if not tensors and not metadata:
+            return None
+        return cls(tensors=tensors, metadata=metadata)
 
 
 @dataclass
