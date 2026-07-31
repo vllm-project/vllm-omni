@@ -1164,17 +1164,19 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for a stage data-plane edge."""
+    """Return the first connector spec for the stage when async chunking is enabled."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+
+    if not async_chunk:
+        return {}
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
 
-    # A producer does not consume connector data itself. Keep its connector
-    # for both async-chunk and terminal full-payload sends, but mark it
-    # sender-only so the scheduler does not park orchestrator-provided inputs
-    # waiting for an upstream payload.
+    # A stage can be an async producer without consuming chunks itself. Keep
+    # its connector for save_async(), but mark it sender-only so the scheduler
+    # does not park normal orchestrator-provided inputs waiting for a chunk.
     target_stage = str(stage_id)
     for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:

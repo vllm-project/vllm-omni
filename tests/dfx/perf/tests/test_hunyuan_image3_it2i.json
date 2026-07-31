@@ -27,16 +27,8 @@
             "async_chunk": false,
             "trust_remote_code": true,
             "connectors": {
-              "rdma_connector": {
-                "name": "MooncakeTransferEngineConnector",
-                "extra": {
-                  "host": "auto",
-                  "zmq_port": 50051,
-                  "protocol": "rdma",
-                  "device_name": "",
-                  "memory_pool_size": 17179869184,
-                  "memory_pool_device": "cpu"
-                }
+              "shared_memory_connector": {
+                  "name": "SharedMemoryConnector"
               }
             },
             "stages": [
@@ -66,7 +58,7 @@
                   "need_send_cache": true
                 },
                 "output_connectors": {
-                  "to_stage_1": "rdma_connector"
+                  "to_stage_1": "shared_memory_connector"
                 },
                 "default_sampling_params": {
                   "temperature": 0.0,
@@ -87,7 +79,8 @@
                 "devices": "2,3",
                 "distributed_executor_backend": "mp",
                 "omni_kv_config": {
-                  "need_recv_cache": true
+                  "need_recv_cache": true,
+                  "enable_kv_async_prefetch": true
                 },
                 "parallel_config": {
                   "tensor_parallel_size": 2,
@@ -96,7 +89,7 @@
                 },
                 "vae_use_tiling": true,
                 "input_connectors": {
-                  "from_stage_0": "rdma_connector"
+                  "from_stage_0": "shared_memory_connector"
                 },
                 "default_sampling_params": {
                   "num_inference_steps": 50,
