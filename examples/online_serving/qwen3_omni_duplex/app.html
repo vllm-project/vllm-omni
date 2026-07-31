@@ -82,6 +82,7 @@
   <button id="connect" class="primary">Connect</button>
   <button id="talk" disabled>Hold to talk</button>
   <button id="bargein" disabled>Barge in</button>
+  <button id="sendclip" disabled title="Send a known-good 16 kHz clip, bypassing the mic">Send test clip</button>
   <span id="status" class="sub">idle</span>
 </header>
 
@@ -246,7 +247,8 @@ $("connect").onclick = () => {
   ws.onclose = () => {
     ws = null; recording = false;
     $("connect").textContent = "Connect"; $("talk").disabled = true;
-    $("bargein").disabled = true; $("status").textContent = "idle";
+    $("bargein").disabled = true; $("sendclip").disabled = true;
+    $("status").textContent = "disconnected — click Connect";
     $("k-state").textContent = "disconnected";
     ["s-mic","s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
   };
@@ -258,6 +260,7 @@ $("connect").onclick = () => {
 
     if (t === "session.created" || t === "session.updated") {
       $("talk").disabled = false; $("bargein").disabled = false;
+      $("sendclip").disabled = false;
       $("status").textContent = "ready";
       $("k-state").textContent = "open";
       if (m.session?.id || m.session_id) $("k-sid").textContent = (m.session?.id || m.session_id).slice(0, 22);
@@ -384,6 +387,41 @@ $("talk").addEventListener("mousedown", beginTalk);
 $("talk").addEventListener("touchstart", beginTalk, {passive:false});
 window.addEventListener("mouseup", endTalk);
 window.addEventListener("touchend", endTalk);
+
+$("sendclip").onclick = async () => {
+  if (!ws || ws.readyState !== 1) { log("not connected", "err"); return; }
+  $("sendclip").disabled = true;
+  $("status").textContent = "sending test clip…";
+  ["s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  setStage("s-mic", "live");
+  $("transcript").classList.add("muted"); $("transcript").textContent = "—";
+  try {
+    const wav = await (await fetch("sample_16k.wav")).arrayBuffer();
+    // 44-byte canonical WAV header, then 16-bit mono LE samples.
+    const pcm = new Uint8Array(wav, 44);
+    const bytesPerChunk = SR_IN * 2 * CHUNK_MS / 1000;
+    for (let off = 0; off + bytesPerChunk <= pcm.byteLength; off += bytesPerChunk) {
+      sentMs += CHUNK_MS;
+      ws.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: b64(pcm.slice(off, off + bytesPerChunk).buffer),
+        input_audio_format: "pcm16", sample_rate_hz: SR_IN,
+        duration_ms: CHUNK_MS, audio_end_ms: sentMs,
+      }));
+      $("m-mic").textContent = (sentMs / 1000).toFixed(1);
+      await new Promise(r => setTimeout(r, 10));
+    }
+    setStage("s-mic", "done");
+    commitAt = performance.now();
+    ws.send(JSON.stringify({type:"input_audio_buffer.commit", final:true}));
+    log("test clip sent + commit", "life");
+    $("status").textContent = "thinking…";
+  } catch (err) {
+    log("test clip failed: " + err, "err");
+  } finally {
+    setTimeout(() => { $("sendclip").disabled = false; }, 1500);
+  }
+};
 
 $("bargein").onclick = () => {
   if (!ws || ws.readyState !== 1) return;
