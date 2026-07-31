@@ -23,17 +23,18 @@ including `librosa`.
 
 The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
-logical device 0 with memory budgets of 55%, 22%, and 22%. The profile admits
-at most four sequences per stage and bounds startup video profiling to 32
-frames per video. For throughput,`minicpmo_4_5_batching.yaml` gives the Thinker
+logical device 0 with memory budgets of 55%, 15%, and 15%, leaving headroom
+for runtime kernels such as the HiFi-GAN vocoder's cuDNN workspace. The
+profile admits at most four sequences per stage and bounds startup video
+profiling to 32 frames per video. For throughput,
+`minicpmo_4_5_2gpu.yaml` gives the Thinker
 GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
 profile admits at most four concurrent sequences per stage.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
 | `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
-| `minicpmo_4_5_batching.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | Backward-compatible alias for `minicpmo_4_5_batching.yaml`. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
@@ -89,17 +90,18 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     --prompt "Briefly introduce yourself."
 ```
 
-Streaming text + audio:
+Streaming text + audio (use `--stream`):
 
 ```bash
-python streaming_chat_completion.py \
-    --base-url http://localhost:8099/v1 \
-    --output minicpmo_stream.wav
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Briefly introduce yourself." \
+    --port 8099 \
+    --stream
 ```
 
-The example prints text deltas immediately and joins the independently encoded
-24 kHz WAV audio deltas into one valid WAV file. Add `--text-only` to skip
-Talker and Code2Wav.
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
 
 Shared helpers also work if you pass MiniCPM defaults yourself:
 

@@ -18,6 +18,9 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813

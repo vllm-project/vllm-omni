@@ -12,6 +12,11 @@ from __future__ import annotations
 import ast
 import os
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 _ENGINE_PATH = os.path.normpath(
     os.path.join(
         os.path.dirname(__file__),

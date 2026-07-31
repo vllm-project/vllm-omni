@@ -105,11 +105,6 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     NestedTensors,
 )
-
-try:
-    from vllm.multimodal.inputs import ModalityData, MultiModalDataDict
-except ImportError:
-    from vllm.multimodal.parse import ModalityData, MultiModalDataDict
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
@@ -132,15 +127,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
-try:
-    from vllm.transformers_utils.tokenizer import encode_tokens as _vllm_encode_tokens
-except ImportError:
-    _vllm_encode_tokens = None
 
-
+# vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
+# _encode_tokens uses tokenizer.encode() as the only code path.
 def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
-    if _vllm_encode_tokens is not None:
-        return _vllm_encode_tokens(tokenizer, prompt)
     return tokenizer.encode(prompt, add_special_tokens=False)
 
 
