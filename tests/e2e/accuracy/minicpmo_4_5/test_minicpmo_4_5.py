@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage."""
+"""MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
+
+Daily-Omni settings follow the MiniCPM interleaved AV recipe from
+https://github.com/vllm-project/vllm-omni/pull/5606 (``minicpm-interleave``,
+``temperature=0``, ``output-len=512``, text-only modalities, and server
+``--interleave-mm-strings`` + 1fps / 64-frame media-io kwargs).
+"""
 
 from __future__ import annotations
 
@@ -21,24 +27,56 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
-_RESULT_DIR = Path(__file__).resolve().parent / "results"
+_RESULT_DIR = Path(
+    os.environ.get(
+        "ACC_BENCH_RESULT_DIR",
+        str(Path(__file__).resolve().parent / "results"),
+    )
+)
 _MIN_DAILY_OMNI_ACCURACY = 0.64
 _MAX_SEED_TTS_MEAN_WER = 0.05
-_CHAT_EXTRA_BODY = {
+# PR #5606: Daily-Omni MCQ is text-only (no TTS modalities / use_tts_template).
+_DAILY_EXTRA_BODY = {
+    "modalities": ["text"],
+    "chat_template_kwargs": {
+        "enable_thinking": False,
+    },
+}
+_SEED_EXTRA_BODY = {
     "modalities": ["text", "audio"],
     "chat_template_kwargs": {
         "enable_thinking": False,
         "use_tts_template": True,
     },
 }
+# Server flags required for MiniCPM interleaved image/audio packs (Daily-Omni only).
+# Do not reuse these for Seed-TTS: ``--interleave-mm-strings`` + TTS ref_audio can trip
+# msgspec ValidationError and kill the orchestrator mid-suite.
+_DAILY_OMNI_SERVER_ARGS = [
+    "--trust-remote-code",
+    "--interleave-mm-strings",
+    "--media-io-kwargs",
+    '{"video":{"fps":1,"num_frames":64}}',
+]
+_SEED_TTS_SERVER_ARGS = [
+    "--trust-remote-code",
+]
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
-test_params = [
+daily_test_params = [
     OmniServerParams(
         model=_MODEL,
         stage_config_path=_DEPLOY_CONFIG,
-        server_args=["--trust-remote-code"],
+        server_args=list(_DAILY_OMNI_SERVER_ARGS),
+    )
+]
+
+seed_test_params = [
+    OmniServerParams(
+        model=_MODEL,
+        stage_config_path=_DEPLOY_CONFIG,
+        server_args=list(_SEED_TTS_SERVER_ARGS),
     )
 ]
 
@@ -66,7 +104,7 @@ def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", daily_test_params, indirect=True)
 def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("datasets")
@@ -83,8 +121,16 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--min-daily-omni-accuracy",
             str(_MIN_DAILY_OMNI_ACCURACY),
+            "--temperature",
+            "0",
+            "--output-len",
+            "512",
+            "--daily-omni-input-mode",
+            "all",
+            "--daily-omni-pack-mode",
+            "minicpm-interleave",
             "--daily-extra-body-json",
-            json.dumps(_CHAT_EXTRA_BODY, separators=(",", ":")),
+            json.dumps(_DAILY_EXTRA_BODY, separators=(",", ":")),
             "--trust-remote-code",
         ]
     )
@@ -93,7 +139,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
 def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("huggingface_hub")
@@ -110,7 +156,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
             "--seed-extra-body-json",
-            json.dumps(_CHAT_EXTRA_BODY, separators=(",", ":")),
+            json.dumps(_SEED_EXTRA_BODY, separators=(",", ":")),
             "--trust-remote-code",
         ]
     )

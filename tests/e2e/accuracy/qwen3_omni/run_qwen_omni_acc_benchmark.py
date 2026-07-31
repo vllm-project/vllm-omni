@@ -192,6 +192,8 @@ def _build_common_args(
         trust_remote_code=ns.trust_remote_code,
         backend=backend,
         endpoint=endpoint,
+        temperature=getattr(ns, "temperature", None),
+        output_len=getattr(ns, "output_len", None),
     )
 
 
@@ -210,6 +212,9 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
             json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
         ]
     )
+    pack_mode = getattr(ns, "daily_omni_pack_mode", None)
+    if pack_mode:
+        argv.extend(["--daily-omni-pack-mode", pack_mode])
     if ns.daily_omni_save_eval_items:
         argv.append("--daily-omni-save-eval-items")
     print("\n$", vllm, *argv, "\n", flush=True)
@@ -288,6 +293,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Forward trust_remote_code to ``vllm bench serve`` for models with custom code.",
     )
     p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Optional sampling temperature forwarded to ``vllm bench serve`` (e.g. 0 for MiniCPM-o Daily-Omni MCQ).",
+    )
+    p.add_argument(
+        "--output-len",
+        type=int,
+        default=None,
+        help="Optional max output tokens forwarded to ``vllm bench serve`` (e.g. 512 for MiniCPM-o Daily-Omni).",
+    )
+    p.add_argument(
         "--result-dir",
         type=Path,
         default=Path(os.environ.get("ACC_BENCH_RESULT_DIR", str(_default_result_dir()))),
@@ -316,6 +333,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional local Videos root; if omitted, media is fetched lazily from Hub Videos.tar.",
     )
     p.add_argument("--daily-omni-input-mode", choices=("all", "visual", "audio"), default="all")
+    p.add_argument(
+        "--daily-omni-pack-mode",
+        choices=("qwen", "minicpm-interleave"),
+        default=None,
+        help="Daily-Omni multimodal pack recipe. Use ``minicpm-interleave`` for MiniCPM-o "
+        "(1fps interleaved image/audio; see PR #5606).",
+    )
     p.add_argument(
         "--daily-extra-body-json",
         default='{"modalities":["text"]}',
