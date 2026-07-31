@@ -58,10 +58,20 @@ _CFM_STEPS = 10
 
 
 class MingLLMModel(nn.Module):
+    # Drop the tensor on purpose, otherwise upstream vLLM would reject.
+    # The vendor never reaches them either (audio_gate/image_gate never fire)
+    # dropping them keeps routing identical to the reference implementation.
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py#L427-L428
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailing_moe.py#L510-L520
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".mlp.audio_gate.": None,
+            ".mlp.image_gate.": None,
+        },
         orig_to_new_prefix={
+            "model.lm_head.": None,
             "model.model.": "model.",
-        }
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

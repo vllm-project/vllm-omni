@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import multiprocessing as mp
 import multiprocessing.connection
 import queue
@@ -64,12 +65,17 @@ class _ExecutorShutdownCleaner:
 class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
 
+    # Class-level defaults so tests using object.__new__ (without _init_executor)
+    # don't hit AttributeError when collective_rpc accesses these.
+    _rpc_wave_id: int = 0
+
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
         self._result_mq: MessageQueue | None = None
+        self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
         self.wake_events = [mp.Event() for _ in range(num_workers)]
@@ -215,6 +221,30 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
         return response
 
+    _MAX_STALE_DISCARDS = 16
+
+    def _validate_wave_id(self, response: Any, expected_wave_id: int, deadline: float | None, method: str) -> Any:
+        """Discard stale RPC responses from a previous wave."""
+        discards = 0
+        while discards < self._MAX_STALE_DISCARDS:
+            if not isinstance(response, dict):
+                return response
+            resp_wave_id = response.get("wave_id")
+            if resp_wave_id is None or resp_wave_id == expected_wave_id:
+                return response
+            logger.warning(
+                "Discarding stale RPC response (wave_id=%s, expected=%s, method=%s)",
+                resp_wave_id,
+                expected_wave_id,
+                method,
+            )
+            discards += 1
+            response = self._dequeue_one_with_failure_polling(deadline, method)
+        raise TimeoutError(
+            f"Discarded {self._MAX_STALE_DISCARDS} stale RPC responses "
+            f"without finding wave_id={expected_wave_id} for method={method}."
+        )
+
     def _launch_workers(
         self,
         broadcast_handle: Handle,
@@ -355,9 +385,84 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
+        new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
 
-        for new_req in scheduler_output.scheduled_new_reqs:
+        # DP multi-concurrency: when DLO+AllGather is active and multiple
+        # requests are scheduled, send ALL requests in one broadcast RPC.
+        # Each rank picks req[rank % len(reqs)] and computes independently.
+        # All ranks reply (unique_reply_rank=None) so we collect dp_size
+        # responses and match by dp_rank.
+        if (
+            len(new_reqs) > 1
+            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            and getattr(self.od_config, "dlo_use_allgather", True)
+        ):
+            # Validate: all concurrent requests must share the same
+            # num_inference_steps and identical extra_args, because
+            # AllGather is a collective that requires every rank to
+            # participate at each step.
+            step_counts = {
+                nr.req.sampling_params.num_inference_steps
+                for nr in new_reqs
+                if nr.req.sampling_params.num_inference_steps is not None
+            }
+            has_none = any(nr.req.sampling_params.num_inference_steps is None for nr in new_reqs)
+            if (len(step_counts) > 1) or has_none:
+                raise ValueError(
+                    "DP multi-concurrency requires all concurrent requests to have "
+                    "the same explicit num_inference_steps (None is not allowed), got "
+                    f"{[nr.req.sampling_params.num_inference_steps for nr in new_reqs]}."
+                )
+            extra_args_signatures: set = set()
+            for nr in new_reqs:
+                ea = getattr(nr.req, "extra_args", None)
+                if ea and isinstance(ea, dict):
+                    extra_args_signatures.add(json.dumps(ea, sort_keys=True))
+                else:
+                    extra_args_signatures.add(None)
+            if len(extra_args_signatures) > 1:
+                raise ValueError(
+                    "DP multi-concurrency requires all concurrent requests to "
+                    "share identical extra_args. Different extra_args can change "
+                    "the forward schedule and cause AllGather deadlock."
+                )
+
+            reqs_list = [nr.req for nr in new_reqs]
+            try:
+                results = self.collective_rpc(
+                    "execute_model",
+                    args=(reqs_list, self.od_config, scheduler_output.kv_prefetch_job),
+                    unique_reply_rank=None,
+                    exec_all_ranks=True,
+                )
+                results = results if isinstance(results, list) else [results]
+                for i, new_req in enumerate(new_reqs):
+                    res = results[i] if i < len(results) else results[0]
+                    if isinstance(res, DiffusionOutput):
+                        runner_outputs.append(
+                            RunnerOutput(
+                                request_id=new_req.request_id,
+                                step_index=None,
+                                finished=True,
+                                result=res,
+                            )
+                        )
+                    else:
+                        raise RuntimeError(f"Unexpected response type [{i}]: {type(res)!r}")
+            except Exception as exc:
+                for new_req in new_reqs:
+                    runner_outputs.append(
+                        RunnerOutput(
+                            request_id=new_req.request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput(error=str(exc)),
+                        )
+                    )
+            return BatchRunnerOutput.from_list(runner_outputs)
+
+        for new_req in new_reqs:
             req = new_req.req
             try:
                 result = self.collective_rpc(
@@ -511,24 +616,61 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # ── Path 2: step-execution or other non-execute_model RPCs ──
         # _dequeue_one_with_failure_polling reads from _sync_result_buffer
         # when pump is active (request-mode), or result_mq directly otherwise.
+        self._rpc_wave_id += 1
+        wave_id = self._rpc_wave_id
+        rpc_request["wave_id"] = wave_id
+
         try:
             # Broadcast RPC request to all workers via unified message queue
             self._broadcast_mq.enqueue(rpc_request)  # pyright: ignore[reportOptionalMemberAccess] MQ is not None before shutdown
 
-            num_responses = 1
+            # Determine number of responses to collect:
+            # - unique_reply_rank=None + exec_all_ranks=True: all DP ranks reply
+            #   (N responses, one per DP worker).
+            # - Otherwise: 1 response (only rank 0 or specified rank)
+            if unique_reply_rank is None and exec_all_ranks:
+                dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
+                num_responses = max(1, dp_size)
+            else:
+                num_responses = 1
 
-            responses = []
-            for _ in range(num_responses):
-                response = self._dequeue_one_with_failure_polling(deadline, method)
+            responses: list = []
+            if unique_reply_rank is None and exec_all_ranks and num_responses > 1:
+                # DP multi-concurrency: collect num_responses replies, sort by dp_rank.
+                tagged: list[tuple[int, Any]] = []
+                collected_errors: list[str] = []
+                for _ in range(num_responses):
+                    response = self._dequeue_one_with_failure_polling(deadline, method)
+                    response = self._validate_wave_id(response, wave_id, deadline, method)
+                    try:
+                        unpack_diffusion_output_shm(response)
+                    except Exception as e:
+                        logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        collected_errors.append(str(response.get("error", "unknown")))
+                    else:
+                        response = MultiprocDiffusionExecutor._handle_rpc_response(response)
+                        if isinstance(response, dict) and "dp_rank" in response:
+                            tagged.append((response["dp_rank"], response["output"]))
+                        else:
+                            tagged.append((len(tagged), response))
+                if collected_errors:
+                    raise RuntimeError(f"Worker error: {collected_errors[0]}")
+                tagged.sort(key=lambda x: x[0])
+                responses = [r for _, r in tagged]
+            else:
+                for _ in range(num_responses):
+                    response = self._dequeue_one_with_failure_polling(deadline, method)
+                    response = self._validate_wave_id(response, wave_id, deadline, method)
 
-                try:
-                    unpack_diffusion_output_shm(response)
-                except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                    try:
+                        unpack_diffusion_output_shm(response)
+                    except Exception as e:
+                        logger.warning("SHM unpack failed (data may already be inline): %s", e)
 
-                response = MultiprocDiffusionExecutor._handle_rpc_response(response)
+                    response = MultiprocDiffusionExecutor._handle_rpc_response(response)
 
-                responses.append(response)
+                    responses.append(response)
 
             return responses[0] if unique_reply_rank is not None else responses
         except Exception as e:

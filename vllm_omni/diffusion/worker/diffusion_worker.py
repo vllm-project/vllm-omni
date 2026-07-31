@@ -417,12 +417,34 @@ class DiffusionWorker:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest,
+        req: OmniDiffusionRequest | list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
-        """Execute a forward pass by delegating to the model runner."""
+        """Execute a forward pass by delegating to the model runner.
+
+        If *req* is a list (DP multi-concurrency), each rank picks one
+        request based on its distributed rank.  AllGather in the layerwise
+        offload only gathers weight shards (request-independent), so all
+        ranks stay synchronised at each AllGather call while computing
+        different activations.
+
+        Each rank returns its OWN DiffusionOutput (no gather).  The executor
+        collects N responses via result_mq (all ranks share one queue).
+        """
         assert self.model_runner is not None, "Model runner not initialized"
+
+        # DP multi-concurrency: pick one request per DP rank.
+        # Use rank_in_group (DP rank) not global rank, so that SP/TP/CFG
+        # ranks within the same DP replica select the same request.
+        is_batch = isinstance(req, list)
+        if is_batch:
+            from vllm_omni.diffusion.distributed.parallel_state import get_data_parallel_rank
+
+            dp_rank = get_data_parallel_rank()
+            idx = dp_rank % len(req)
+            req = req[idx]
+
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
@@ -436,6 +458,14 @@ class DiffusionWorker:
             output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
         if profiler:
             profiler.step()
+
+        # Each primary rank returns its own output tagged with its DP rank
+        # so the executor can match results to requests by dp_rank.
+        # Non-primary ranks (SP/TP > 0) do not reply.
+        if is_batch:
+            from vllm_omni.diffusion.distributed.parallel_state import get_data_parallel_rank
+
+            return {"dp_rank": get_data_parallel_rank(), "output": output}
         return output
 
     def execute_model_batch(
@@ -781,17 +811,12 @@ class WorkerProc:
         self.result_mq = None
         self.result_mq_handle = None
 
-        # Setup result sender (only for rank 0)
-        if gpu_id == 0:
-            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-            self.result_mq_handle = self.result_mq.export_handle()
-            WorkerProc._shared_result_handle = self.result_mq_handle
-            logger.info(f"Worker {gpu_id} created result MessageQueue")
-        else:
-            handle = getattr(WorkerProc, "_shared_result_handle", None)
-            if handle:
-                self.result_mq = MessageQueue.create_from_handle(handle, gpu_id)
-                logger.info(f"Worker {gpu_id} attached to shared result MessageQueue")
+        # Each worker creates its own result MessageQueue (as writer).
+        # The executor creates one reader per worker to collect responses.
+        # This supports DP multi-concurrency where all ranks reply independently.
+        self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+        self.result_mq_handle = self.result_mq.export_handle()
+        logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
 
@@ -920,12 +945,33 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
+        wave_id = rpc_request.get("wave_id")
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        # For DP multi-concurrency (output_rank=None), only the primary rank
+        # within each DP replica should reply.  This prevents SP/TP/CFG/PP
+        # ranks from enqueuing extra replies that the executor doesn't drain.
+        if output_rank is None and exec_all_ranks:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_classifier_free_guidance_rank,
+                get_pipeline_parallel_rank,
+                get_sequence_parallel_rank,
+            )
+
+            is_primary_in_replica = (
+                get_sequence_parallel_rank() == 0
+                and get_classifier_free_guidance_rank() == 0
+                and get_tensor_model_parallel_rank() == 0
+                and get_pipeline_parallel_rank() == 0
+            )
+            should_reply = is_primary_in_replica and self.result_mq is not None
+        else:
+            should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
 
         if not should_execute:
             return None, False
@@ -968,6 +1014,7 @@ class WorkerProc:
                         "method": method,
                         "result": result,
                         "rank_statuses": rank_statuses,
+                        "wave_id": wave_id,
                     },
                     True,
                 )
@@ -975,6 +1022,8 @@ class WorkerProc:
 
         if rpc_exception is not None:
             raise rpc_exception
+        if isinstance(result, dict) and wave_id is not None:
+            result["wave_id"] = wave_id
         return result, should_reply
 
     def _worker_busy_loop(self) -> None:
@@ -1016,10 +1065,16 @@ class WorkerProc:
                         self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    # Apply the same reply gate as the success path so
+                    # non-output ranks don't enqueue stale error replies
+                    # that compete with the expected responder's message.
+                    output_rank = msg.get("output_rank")
+                    exec_all_ranks = msg.get("exec_all_ranks", False)
+                    wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
                         if rpc_id is not None:
-                            # Async RPC: must complete the executor''s pending
-                            # future so collective_rpc() doesn''t hang.
+                            # Async RPC: must complete the executor's pending
+                            # future so collective_rpc() doesn't hang.
                             self.result_mq.enqueue(
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
@@ -1027,8 +1082,36 @@ class WorkerProc:
                                     error=str(e),
                                 )
                             )
-                        else:
-                            self._return_result({"status": "error", "error": str(e)})
+                        elif output_rank is None and exec_all_ranks:
+                            # DP multi-concurrency: primary ranks reply, tagged
+                            from vllm.distributed.parallel_state import (
+                                get_tensor_model_parallel_rank,
+                            )
+
+                            from vllm_omni.diffusion.distributed.parallel_state import (
+                                get_classifier_free_guidance_rank,
+                                get_data_parallel_rank,
+                                get_pipeline_parallel_rank,
+                                get_sequence_parallel_rank,
+                            )
+
+                            is_primary = (
+                                get_sequence_parallel_rank() == 0
+                                and get_classifier_free_guidance_rank() == 0
+                                and get_tensor_model_parallel_rank() == 0
+                                and get_pipeline_parallel_rank() == 0
+                            )
+                            if is_primary:
+                                try:
+                                    dp_rank = get_data_parallel_rank()
+                                except Exception:
+                                    dp_rank = self.gpu_id
+                                self._return_result(
+                                    {"status": "error", "error": str(e), "dp_rank": dp_rank, "wave_id": wave_id}
+                                )
+                        elif output_rank is None or output_rank == self.gpu_id:
+                            # Normal RPC: only the expected rank replies
+                            self._return_result({"status": "error", "error": str(e), "wave_id": wave_id})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -1103,7 +1186,7 @@ class WorkerProc:
             pipe_writer.send(
                 {
                     "status": "ready",
-                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                    "result_handle": worker_proc.result_mq_handle,
                 }
             )
             worker_proc._worker_busy_loop()
