@@ -179,10 +179,17 @@ function log(type, cls) {
 
 function resample(f32, from, to) {
   if (from === to) return f32;
-  const ratio = from / to, out = new Float32Array(Math.floor(f32.length / ratio));
+  const ratio = from / to;
+  // Fallback only -- used when the browser will not give a 16 kHz context.
+  // Box-average over the source span before picking a sample, which is a
+  // crude but real low-pass; plain interpolation aliases badly at 3:1.
+  const span = Math.max(1, Math.round(ratio));
+  const out = new Float32Array(Math.floor(f32.length / ratio));
   for (let i = 0; i < out.length; i++) {
-    const src = i * ratio, i0 = Math.floor(src), frac = src - i0;
-    out[i] = (f32[i0] || 0) * (1 - frac) + (f32[i0 + 1] || 0) * frac;
+    const start = Math.floor(i * ratio);
+    let acc = 0, n = 0;
+    for (let k = 0; k < span && start + k < f32.length; k++) { acc += f32[start + k]; n++; }
+    out[i] = n ? acc / n : 0;
   }
   return out;
 }
@@ -334,7 +341,21 @@ $("connect").onclick = () => {
 };
 
 async function startMic() {
-  if (!audioCtx) audioCtx = new AudioContext();
+  // Request the capture context at the model's rate. Browsers resample
+  // properly (with anti-aliasing); the hand-rolled 3:1 decimation this
+  // replaces had no low-pass, so everything above 8 kHz aliased back into the
+  // speech band and the model heard mush -- it answered with a generic
+  // greeting because the turn carried no intelligible content.
+  if (!audioCtx) {
+    try {
+      audioCtx = new AudioContext({sampleRate: SR_IN});
+    } catch (e) {
+      audioCtx = new AudioContext();
+    }
+  }
+  if (audioCtx.sampleRate !== SR_IN) {
+    log(`mic context is ${audioCtx.sampleRate} Hz, resampling to ${SR_IN}`, "life");
+  }
   micStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,
     echoCancellation:true, noiseSuppression:true}});
   const src = audioCtx.createMediaStreamSource(micStream);
