@@ -347,6 +347,11 @@ async function startMic() {
         sample_rate_hz: SR_IN,
         duration_ms: CHUNK_MS,
         audio_end_ms: sentMs,
+        // Push-to-talk is itself the speech assertion. Without this the
+        // server falls back to an RMS heuristic and a quiet or slow-starting
+        // utterance is treated as silence, which never starts a response
+        // (commit_policy: auto_responds AND speech_since_commit).
+        is_speech: true,
       }));
       $("m-mic").textContent = (sentMs / 1000).toFixed(1);
     }
@@ -406,7 +411,7 @@ $("sendclip").onclick = async () => {
         type: "input_audio_buffer.append",
         audio: b64(pcm.slice(off, off + bytesPerChunk).buffer),
         input_audio_format: "pcm16", sample_rate_hz: SR_IN,
-        duration_ms: CHUNK_MS, audio_end_ms: sentMs,
+        duration_ms: CHUNK_MS, audio_end_ms: sentMs, is_speech: true,
       }));
       $("m-mic").textContent = (sentMs / 1000).toFixed(1);
       await new Promise(r => setTimeout(r, 10));
