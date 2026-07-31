@@ -13,6 +13,8 @@ from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
@@ -226,22 +228,49 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
-def resolve_model_config_path(model: str) -> str:
-    """Resolve the stage config file path from the model name.
+def _registry_default_deploy_path(model: str) -> str | None:
+    """Return the registered pipeline's default deploy YAML path, if any.
 
-    Resolves stage configuration path based on the model type and device type.
-    First tries to find a device-specific YAML file from stage_configs/{device_type}/
-    directory. If not found, falls back to the default config file.
+    A checkpoint's HF ``model_type`` is not always the registered Omni pipeline
+    key. MiniCPM-o 4.5, for example, reports ``minicpmo`` while its
+    predicate-selected pipeline is ``minicpmo_4_5``. Stage construction already
+    loads that pipeline's default deploy config, so connector discovery must
+    resolve the same path.
+    """
+    pipeline_config = StageConfigFactory.get_pipeline_config(
+        model=model,
+        trust_remote_code=True,
+    )
+    if pipeline_config is None or pipeline_config.default_deploy_config_name is None:
+        return None
+    default_deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+    if default_deploy_path.is_file():
+        return str(default_deploy_path)
+    return None
+
+
+def resolve_model_config_path(model: str) -> str | None:
+    """Resolve the stage/deploy config file path from the model name.
+
+    Resolves configuration path based on the model type and device type.
+    Order:
+    1. Device-specific stage config under ``stage_configs/{device_type}/``
+    2. If HF ``model_type`` is not an ``OMNI_PIPELINES`` key, the registered
+       pipeline's ``default_deploy_config_name`` (keeps connectors aligned with
+       stage construction when HF type and pipeline key differ)
+    3. ``deploy/{model_type}.yaml``
+    4. Legacy ``stage_configs/{model_type}.yaml``
+    5. Registered pipeline default deploy config (final fallthrough)
 
     Args:
         model: Model name or path (used to determine model_type)
 
     Returns:
-        String path to the stage configuration file
+        String path to the stage/deploy configuration file, or ``None`` if no
+        matching config file exists.
 
     Raises:
         ValueError: If model_type cannot be determined
-        FileNotFoundError: If no stage config file exists for the model type
     """
     # Try to get config from standard transformers format first
     try:
@@ -296,15 +325,24 @@ def resolve_model_config_path(model: str) -> str:
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    deploy_config_path = PROJECT_ROOT / "vllm_omni" / "deploy" / model_type_str
+    # Prefer the registry default before deploy/<hf_model_type>.yaml when the
+    # HF type is not itself a pipeline key. Otherwise a future
+    # deploy/minicpmo.yaml would desync connectors from stages for MiniCPM-o 4.5.
+    if normalized_model_type not in OMNI_PIPELINES:
+        registry_path = _registry_default_deploy_path(model)
+        if registry_path is not None:
+            return registry_path
+
+    deploy_config_path = _DEPLOY_DIR / model_type_str
     if os.path.exists(deploy_config_path):
         return str(deploy_config_path)
 
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
-    if not os.path.exists(stage_config_path):
-        return None
-    return str(stage_config_path)
+    if os.path.exists(stage_config_path):
+        return str(stage_config_path)
+
+    return _registry_default_deploy_path(model)
 
 
 def load_stage_configs_from_model(
