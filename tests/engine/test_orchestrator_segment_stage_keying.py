@@ -46,8 +46,6 @@ class _StageOutput:
 class _RecordingPool:
     """Stage pool that records the requests it was asked to build metrics for."""
 
-    final_output = False
-
     def __init__(self) -> None:
         self.built_for: list[str] = []
 
@@ -86,11 +84,12 @@ def test_duplex_output_context_reads_only_its_own_stage_segment() -> None:
     assert thinker is not None
     assert talker is not None
 
+    # These are the assertions that fail on the flat field: the talker is written
+    # second, so the thinker loses its boundary to whichever stage polled last.
     assert thinker.segment_finished is True
     assert thinker.segment_token_ids == (11, 22)
     assert thinker.segment_output_metadata == {"stage": "thinker"}
 
-    # Read back the thinker's boundary from the shared slot before the fix.
     assert talker.segment_finished is False
     assert talker.segment_token_ids == ()
     assert talker.segment_output_metadata == {}

@@ -209,10 +209,17 @@ class StreamingSegmentState:
 class StreamingInputState:
     # Flag of streaming input request
     enabled: bool = False
-    # Keyed by stage: ``_orchestration_loop`` polls every stage into this one
-    # ``req_state``, so a flat slot would be last-writer-wins across stages.
+    # Keyed by stage. ``_orchestration_loop`` records a boundary per stage poll
+    # into this one ``req_state``, while every consumer reads it for a specific
+    # ``stage_id``, so a flat slot is only correct as long as each read happens in
+    # the same iteration as its own stage's write. It is not for a stage that
+    # never records one (the ``poll_diffusion_output`` branch reaches
+    # ``_handle_processed_outputs`` without the raw-output loop) or for any
+    # consumer reading outside the writing iteration.
     segments: dict[int, StreamingSegmentState] = field(default_factory=dict)
-    # Streaming update prompt length
+    # Streaming update prompt length. NOT stage-keyed: its only consumer reads it
+    # through the streaming context on the stage-input-bridge path, not by stage
+    # id. Do not assume the rest of this struct is stage-safe.
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
@@ -1274,6 +1281,7 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
+        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -1283,11 +1291,7 @@ class Orchestrator:
             return
 
         request_finished = False
-        if (
-            finished
-            and self.stage_pools[stage_id].final_output
-            and not (req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished)
-        ):
+        if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -1299,9 +1303,7 @@ class Orchestrator:
         # filter out again (the official implementation returns exactly one
         # result per audio chunk).
         is_duplex_stage0_segment = (
-            stage_id == 0
-            and self._is_duplex_session_request(req_state)
-            and req_state.streaming.segment(stage_id).finished
+            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(
@@ -1351,7 +1353,7 @@ class Orchestrator:
             return
 
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished))
+            (finished or segment_finished)
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
@@ -1482,7 +1484,9 @@ class Orchestrator:
     def _duplex_output_context(
         req_state: OrchestratorRequestState,
         *,
-        stage_id: int | None = None,
+        # Required: segment state is stage-keyed, so a caller that omitted this
+        # would silently read "no boundary" rather than the intended stage's.
+        stage_id: int | None,
     ) -> DuplexOutputContext | None:
         identity = req_state.duplex_identity
         if identity is None:
