@@ -1,3 +1,4 @@
+import concurrent.futures
 import contextlib
 import importlib
 import os
@@ -7,6 +8,7 @@ import types
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
@@ -17,6 +19,30 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)
+    monkeypatch.setattr(engine, "_try_shutdown", lambda _message: None)
+
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr(async_omni_engine_module.time, "monotonic", lambda: next(ticks))
+
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        async_omni_engine_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    with pytest.raises(TimeoutError, match="did not become ready within 1s"):
+        engine._wait_for_orchestrator_init(concurrent.futures.Future(), startup_timeout=1)
+
+    assert len(warnings) == 1
+    message = str(warnings[0][0])
+    assert "--init-timeout" in message
+    assert "--stage-init-timeout" in message
 
 
 def _make_llm_metadata(

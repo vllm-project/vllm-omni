@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
     MossAudioTokenizerConfig,
@@ -45,6 +46,7 @@ class _MossCodecStreamSession:
         *,
         state_capacity: int,
         n_vq: int,
+        vllm_config: VllmConfig,
         graph_batch_sizes: list[int] | None = None,
         graph_frame_sizes: list[int] | None = None,
     ) -> None:
@@ -59,6 +61,13 @@ class _MossCodecStreamSession:
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
         scratch_capacity = max(batch_sizes, default=0) if self._device.type == "cuda" else 0
+        self._total_state_capacity = self._state_capacity + scratch_capacity
+        self._state_slot_ids = torch.arange(
+            self._total_state_capacity,
+            device=self._device,
+            dtype=torch.long,
+        )
+        self._samples_per_frame = int(codec.downsample_rate)
         initialize_state_pool = getattr(codec, "initialize_decoder_state_pool", None)
         if not callable(initialize_state_pool):
             raise RuntimeError("The streaming codec does not implement a decoder state pool.")
@@ -71,6 +80,7 @@ class _MossCodecStreamSession:
                 batch_sizes=batch_sizes,
                 frame_sizes=frame_sizes,
                 num_quantizers=self._n_vq,
+                vllm_config=vllm_config,
             )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
@@ -84,24 +94,32 @@ class _MossCodecStreamSession:
         self._leased_slots.add(slot)
         return slot
 
-    def release(self, slot: int) -> None:
+    def release(self, slot: int, *, state_already_reset: bool = False) -> None:
         if self._closed:
             return
         if slot not in self._leased_slots:
             return
-        self.reset_slots([slot])
+        if not state_already_reset:
+            self.reset_slots([slot])
         self._leased_slots.remove(slot)
         self._free_stream_slots.append(slot)
+
+    def _reset_slot_ids(self, slot_ids: torch.Tensor) -> None:
+        reset_streaming_slots = getattr(self._codec, "reset_decoder_state_slots", None)
+        if not callable(reset_streaming_slots):
+            raise RuntimeError("The streaming codec does not implement state-slot reset.")
+        with torch.no_grad():
+            reset_streaming_slots(slot_ids)
 
     def reset_slots(self, slots: list[int]) -> None:
         if not slots:
             return
-        reset_streaming_slots = getattr(self._codec, "reset_decoder_state_slots", None)
-        if callable(reset_streaming_slots):
-            with torch.no_grad():
-                reset_streaming_slots(torch.tensor(slots, device=self._device, dtype=torch.long))
-            return
-        raise RuntimeError("The streaming codec does not implement state-slot reset.")
+        if min(slots) < 0 or max(slots) >= self._total_state_capacity:
+            raise ValueError(f"Decoder state slots must be in [0, {self._total_state_capacity}), got {slots}")
+        start = slots[0]
+        if slots != list(range(start, start + len(slots))):
+            raise ValueError(f"Decoder state slots must be contiguous, got {slots}")
+        self._reset_slot_ids(self._state_slot_ids[start : start + len(slots)])
 
     def close(self) -> None:
         if self._closed:
@@ -150,9 +168,8 @@ class _MossCodecStreamSession:
 
         used_cudagraph = graph_output is not None
         if used_cudagraph:
-            audio_tensor, lengths_tensor, actual_batch_size = graph_output
+            audio_tensor, _, actual_batch_size = graph_output
             audio_tensor = audio_tensor[:actual_batch_size]
-            lengths_tensor = lengths_tensor[:actual_batch_size]
         else:
             codes_lengths = torch.full(
                 (len(slots),),
@@ -170,16 +187,17 @@ class _MossCodecStreamSession:
             if result.audio is None:
                 return {}
             audio_tensor = result.audio
-            lengths_tensor = result.audio_lengths
+
+        if terminal_slots:
+            terminal_rows = [row for row, slot in enumerate(slots) if slot in terminal_slots]
+            terminal_slot_ids = state_slot_ids if len(terminal_rows) == len(slots) else state_slot_ids[terminal_rows]
+            self._reset_slot_ids(terminal_slot_ids)
 
         audio = audio_tensor.detach().to("cpu", torch.float32)
-        lengths = lengths_tensor.detach().to("cpu") if lengths_tensor is not None else None
+        audio_length = step_t * self._samples_per_frame
         out: dict[int, torch.Tensor] = {}
         for row, slot in enumerate(slots):
-            wav = audio[row]
-            if lengths is not None:
-                wav = wav[..., : int(lengths[row].item())]
-            out[slot] = wav.contiguous()
+            out[slot] = audio[row, ..., :audio_length].contiguous()
         return out
 
 
@@ -479,6 +497,7 @@ class MossTTSCodecDecoder(nn.Module):
             self._codec,
             state_capacity=self._stream_state_capacity,
             n_vq=self._n_vq,
+            vllm_config=self.vllm_config,
             graph_batch_sizes=self._streaming_graph_batch_sizes,
             graph_frame_sizes=self._streaming_graph_frame_sizes,
         )
@@ -517,7 +536,12 @@ class MossTTSCodecDecoder(nn.Module):
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
-                    self._finish_stream_request(request_id, session, slot)
+                    self._finish_stream_request(
+                        request_id,
+                        session,
+                        slot,
+                        state_already_reset=True,
+                    )
                 continue
 
             grouped.setdefault(int(codes_nq_t.shape[1]), []).append(
@@ -533,7 +557,12 @@ class MossTTSCodecDecoder(nn.Module):
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
-                    self._finish_stream_request(request_id, session, slot)
+                    self._finish_stream_request(
+                        request_id,
+                        session,
+                        slot,
+                        state_already_reset=True,
+                    )
 
         return outputs
 
@@ -568,9 +597,11 @@ class MossTTSCodecDecoder(nn.Module):
         request_id: str,
         session: _MossCodecStreamSession,
         slot: int | None,
+        *,
+        state_already_reset: bool = False,
     ) -> None:
         if slot is not None:
-            session.release(slot)
+            session.release(slot, state_already_reset=state_already_reset)
         self._stream_req_slots.pop(request_id, None)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
@@ -630,9 +661,17 @@ class MossTTSCodecDecoder(nn.Module):
             pass
 
         codec_path = self._codec_path
-        logger.info("Loading MOSS Audio Tokenizer from %s", codec_path)
+        device = self.vllm_config.device_config.device
+        logger.info("Loading MOSS Audio Tokenizer from %s directly on %s", codec_path, device)
 
-        codec_cfg, codec = self._build_codec(codec_path)
+        # This codec comes from a secondary checkpoint, so it cannot be built
+        # by the outer stage's normal initialize_model() call. Re-enter the
+        # same target-device/default-dtype contexts used by vLLM's
+        # BaseModelLoader.load_model() instead of constructing an 8 GiB FP32
+        # model on CPU and copying the whole module to the GPU afterwards.
+        with set_default_torch_dtype(torch.float32):
+            with device:
+                codec_cfg, codec = self._build_codec(codec_path)
 
         model_loader = DefaultModelLoader(self.vllm_config.load_config)
         source = DefaultModelLoader.Source(
@@ -710,9 +749,9 @@ class MossTTSCodecDecoder(nn.Module):
             skipped[:3] if skipped else "none",
         )
 
-        device = self.vllm_config.device_config.device
-        codec.to(device=device, dtype=torch.float32)
         codec.eval()
+        if device.type != "cpu":
+            codec.decoder.to(dtype=torch.bfloat16)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
             lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32

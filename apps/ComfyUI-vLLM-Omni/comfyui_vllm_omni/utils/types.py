@@ -1,12 +1,8 @@
 from collections.abc import Callable
 from enum import Enum, auto
-from typing import (
-    Any,
-    Literal,
-    NotRequired,
-    TypeAlias,
-    TypedDict,
-)
+from typing import Any, Literal, TypeAlias
+
+from typing_extensions import NotRequired, TypedDict
 
 AudioFormat: TypeAlias = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 

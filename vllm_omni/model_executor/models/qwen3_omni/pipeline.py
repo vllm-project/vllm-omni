@@ -88,7 +88,7 @@ QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             hf_config_name="thinker_config",
-            engine_output_type="latent",
+            engine_output_type="text",
             sampling_constraints={"detokenize": True},
         ),
     ),

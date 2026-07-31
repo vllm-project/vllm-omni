@@ -73,7 +73,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # but popped at segment boundaries (unlike put_req_chunk which is
         # request-global for connector key continuity).
         self.ramp_chunk_count: dict[str, int] = defaultdict(int)
-        self.finished_requests: set[str] = set()
+        self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -235,13 +235,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
                 if payload_finished:
-                    self.finished_requests.add(req_id)
+                    self.upstream_exhausted_requests.add(req_id)
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
             else:
                 if payload_finished:
-                    self.finished_requests.add(req_id)
+                    self.upstream_exhausted_requests.add(req_id)
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
@@ -384,11 +384,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
 
-        Covers both the whole-request finish marker (``finished_requests``) and
-        the per-segment finish marker (``segment_finished_requests``) used while
-        waiting for the next streaming input slice.
+        Covers both the whole-request marker (``upstream_exhausted_requests``)
+        and the per-segment marker (``segment_finished_requests``) used while
+        waiting for the next streaming input slice. Neither means this
+        stage's own generation is done -- see vllm-project/vllm-omni#5349.
         """
-        return request_id in self.finished_requests or request_id in self.segment_finished_requests
+        return request_id in self.upstream_exhausted_requests or request_id in self.segment_finished_requests
 
     ########################################################################
     # Cleanup
@@ -401,21 +402,40 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         enqueued work that the background thread has not yet processed,
         because it only touches receiver-side dictionaries.
 
+        Must also purge the request from the chunk-parking deques
+        (``waiting_for_chunk_waiting_requests`` / ``_running_requests`` /
+        ``_held_non_active``): otherwise a caller that calls
+        ``restore_queues()`` without ``scheduler_requests`` (e.g. a unit
+        test, or any future caller not synced with the scheduler's own
+        request-removal timing) would re-admit an already-finished
+        request into the visible queue, which ``_promote_active_streams``
+        would then FIFO-promote ahead of genuinely-waiting requests. See
+        vllm-project/vllm-omni#5349's active-stream-window tests.
+
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
-        if request_id in self.finished_requests:
-            self._evict_finished_active_streams({request_id})
-        else:
-            self._active_streams.pop(request_id, None)
-        self.finished_requests.discard(request_id)
+        self._active_streams.pop(request_id, None)
+        self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
+        self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
+        self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
+        self._discard_from_chunk_deque(self._held_non_active, request_id)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+
+    @staticmethod
+    def _discard_from_chunk_deque(deque_list: deque[Any], request_id: str) -> None:
+        if not deque_list:
+            return
+        for _ in range(len(deque_list)):
+            request = deque_list.popleft()
+            if request.request_id != request_id:
+                deque_list.append(request)
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
@@ -524,13 +544,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
 
-    def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
-        for request_id in list(self._active_streams):
-            if request_ids is not None and request_id not in request_ids:
-                continue
-            if request_id in self.finished_requests:
-                self._active_streams.pop(request_id, None)
-
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:
             return
@@ -538,7 +551,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if len(self._active_streams) >= self._active_window:
                 return
             request_id = request.request_id
-            if request_id in self._active_streams or request_id in self.finished_requests:
+            if request_id in self._active_streams:
                 continue
             # Iterating the existing queue preserves FIFO admission.
             self._active_streams[request_id] = request
@@ -550,7 +563,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if request_id in self._active_streams:
             self._active_streams[request_id] = request
             return True
-        if request_id in self.finished_requests or len(self._active_streams) >= self._active_window:
+        if len(self._active_streams) >= self._active_window:
             return False
         self._active_streams[request_id] = request
         return True
@@ -697,25 +710,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
-        scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
         self._clear_chunk_ready(scheduler_output)
-        if scheduled_req_ids:
-            # Terminal chunks must stay active until they are scheduled once.
-            self._evict_finished_active_streams(scheduled_req_ids)
-
-    @staticmethod
-    def _scheduled_request_ids(scheduler_output: Any) -> set[str]:
-        req_ids: set[str] = set()
-        if scheduler_output.scheduled_new_reqs:
-            for req_data in scheduler_output.scheduled_new_reqs:
-                req_id = getattr(req_data, "req_id", None)
-                if req_id:
-                    req_ids.add(req_id)
-        if scheduler_output.scheduled_cached_reqs:
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                if req_id:
-                    req_ids.add(req_id)
-        return req_ids
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
@@ -817,7 +812,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for req_id in request_ids:
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
-            self.finished_requests.discard(req_id)
+            self.upstream_exhausted_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
 
