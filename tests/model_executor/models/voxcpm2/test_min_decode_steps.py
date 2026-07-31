@@ -190,3 +190,36 @@ def test_forced_stop_takes_precedence_over_minimum_guard():
     logits = talker.compute_logits(torch.zeros(1, 1))
 
     assert logits[0, 1] > logits[0, 0]
+
+
+def test_guard_period_flag_does_not_leak_into_first_eligible_step():
+    """A guard-period ``precomputed_is_stopping = False`` must not mask a real
+    stop signal once the request crosses ``min_decode_steps``.
+
+    Every decode path bumps ``decode_step_count`` and then re-commits fresh
+    stop logits via ``_commit_decode_state`` (which resets the cached flag to
+    ``None``) before any stop check runs; this test locks that per-step reset
+    so the guard-period flag can never leak into the first eligible step.
+    """
+    Talker, RState, _ = _voxcpm2_talker_mod()
+    talker = _make_bare_talker()
+    state = RState(
+        request_id="req",
+        precomputed_stop_logits=torch.tensor(_STOP_LOGITS),
+        min_decode_steps=10,
+    )
+    state.decode_step_count = 9
+
+    assert Talker._should_stop_from_cached_logits(state) is False
+    assert state.precomputed_is_stopping is False
+
+    state.decode_step_count = 10
+    talker._commit_decode_state(
+        state,
+        torch.tensor(_STOP_LOGITS),
+        torch.zeros(1, 4),
+        torch.zeros(1, 2, 4),
+    )
+
+    assert Talker._should_stop_from_cached_logits(state) is True
+    assert state.is_stopping is True
