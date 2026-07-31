@@ -125,7 +125,7 @@ def run_text(llm: Omni, model_path: str, out: dict) -> None:
         )
     )
     params = SamplingParams(max_tokens=256, temperature=0.2, top_k=20, top_p=0.85, detokenize=True)
-    outputs = llm.generate([prompt], params)
+    outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
     out["num_outputs"] = len(outputs)
     thinker = _thinker_output(outputs)
     if thinker is None:
@@ -155,7 +155,7 @@ def run_image(llm: Omni, model_path: str, out: dict) -> None:
         )
     )
     params = SamplingParams(max_tokens=2048, temperature=0.4, top_p=0.9, detokenize=True)
-    outputs = llm.generate([prompt], params)
+    outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
     out["num_outputs"] = len(outputs)
     thinker = _thinker_output(outputs)
     if thinker is None:
@@ -167,7 +167,11 @@ def run_image(llm: Omni, model_path: str, out: dict) -> None:
 
     mm = thinker.multimodal_output
     codes = mm.get("codes", {}) if isinstance(mm, Mapping) else {}
-    img = codes.get("visual") or codes.get("image") or codes.get("model_outputs")
+    img = codes.get("visual")
+    if img is None:
+        img = codes.get("image")
+    if img is None:
+        img = codes.get("model_outputs")
     if img is not None:
         _dump_codes(img, out, "image", sentinel=16384)
         out["image_vs_expected"] = f"{out['image_frames']} vs 1369 (37x37 grid)"
@@ -199,7 +203,7 @@ def run_audio(llm: Omni, model_path: str, out: dict) -> None:
         repetition_penalty=1.1,
         detokenize=True,
     )
-    outputs = llm.generate([prompt], params)
+    outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
     out["num_outputs"] = len(outputs)
     thinker = _thinker_output(outputs)
     if thinker is None:
