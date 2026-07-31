@@ -832,7 +832,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
                 # Default is qwen3_tts path
-                config = self.engine_client.model_config.hf_config.talker_config
+                config = getattr(self.engine_client.model_config.hf_config, "talker_config", None)
+                if config is None:
+                    return set()
 
             # Check for speakers in either spk_id or speaker_id
             for attr_name in ["spk_id", "speaker_id"]:

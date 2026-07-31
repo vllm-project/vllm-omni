@@ -471,7 +471,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
+                num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
+                    # A mid-step stop (e.g. spec-decode tokens sampled past
+                    # EOS) trims new_token_ids after the validation slice
+                    # above; re-slice so the emitted logprob rows stay 1:1
+                    # with the emitted tokens, as upstream vLLM does by
+                    # slicing after the trim.
+                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -909,6 +917,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return kv_xfer_params, None
         finally:
             self._free_input_coordinator_request(request_id)
+            # Normal completion runs through here, not finish_requests()
+            # (the abort path) -- see vllm-project/vllm-omni#5349.
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.cleanup_receiver(request_id)
 
     def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""

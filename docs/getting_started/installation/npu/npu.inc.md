@@ -28,7 +28,7 @@ docker run --rm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
     -p 8000:8000 \
-    -it quay.io/atlas-ci/vllm-ascend:0.25.0-a3 bash
+    -it quay.io/atlas-ci/vllm-ascend:v0.26.0-a3 bash
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
@@ -122,9 +122,9 @@ Or build IMAGE from **source code**:
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 # A2
-docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu .
+# docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu .
 # A3
-# docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu.a3 .
+docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu.a3 .
 ```
 
 # --8<-- [end:pre-built-images]

@@ -212,7 +212,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
 
         load_device = (
-            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+            "cpu"
+            if self.od_config.enable_cpu_offload
+            or self.od_config.enable_layerwise_offload
+            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            else str(self.device)
         )
 
         def get_memory_context() -> AbstractContextManager[Any]:
@@ -478,7 +482,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
         use_hsdp = od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             for req in reqs:
                 self._prepare_request_for_forward(
