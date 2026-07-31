@@ -729,16 +729,15 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         from vllm_omni.platforms import current_omni_platform
 
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
+        # In-tree adapter over StepAudio2Token2WavCore on every platform. It
+        # matches the external `stepaudio2-minicpmo` Token2wav bit-for-bit on
+        # CUDA (same cosyvoice2 flow/DiT modules and weights) while dropping
+        # that package's hard-coded `.cuda()` calls, and auto-applies the
+        # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
+        # on NPU.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav as Token2wav,
+        )
 
         extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
@@ -768,9 +767,10 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         trt_stepper = None
         use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
-        if use_trt:
-            if current_omni_platform.is_npu():
+        if current_omni_platform.is_npu():
+            if use_trt:
                 raise ValueError("token2wav_trt requires CUDA; TensorRT is unavailable on NPU")
+        elif use_trt:
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
             dtype_name = str(
