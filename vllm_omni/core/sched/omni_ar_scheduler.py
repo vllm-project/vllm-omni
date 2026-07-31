@@ -243,15 +243,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
-        # them. Upstream vllm raises RuntimeError on this status; omni allows
-        # async abort (e.g. client disconnect during TTS streaming) to leave
-        # requests in the waiting/running queues temporarily.
+    def _drop_aborted_queued_requests(self) -> None:
+        """Evict FINISHED_ABORTED requests from the scheduler queues.
+
+        Upstream vllm raises ``RuntimeError: Invalid request status`` when it
+        dequeues one (``scheduler.py``); omni allows async abort -- client
+        disconnect during TTS streaming, or a duplex barge-in / session close
+        -- to leave requests queued briefly.
+        """
         for queue in (self.waiting, self.running):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._drop_aborted_queued_requests()
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
@@ -259,13 +265,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
 
+        # The three calls above re-enqueue requests -- notably
+        # `process_pending_chunks`, which wakes a downstream stage when its
+        # next chunk lands. If that request was aborted in the meantime it
+        # goes back into `waiting` after the first sweep, and the upstream
+        # scheduler then dequeues it and raises, killing the engine core.
+        # Observed on a Qwen3-Omni duplex session close: stage 1 died with
+        # "Invalid request status: FINISHED_ABORTED", taking the orchestrator
+        # with it. Sweep again immediately before handing over.
+        self._drop_aborted_queued_requests()
+
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
         try:
-            scheduler_output = super().schedule(throttle_prefills)
+            try:
+                scheduler_output = super().schedule(throttle_prefills)
+            except RuntimeError as exc:
+                # Upstream raises on dequeueing a FINISHED_ABORTED request. It
+                # appends to `self.running` *before* checking status, so the
+                # entry is only observable once the exception is in flight --
+                # sweeping the queues beforehand cannot prevent it, as the
+                # request is still schedulable at that point and is aborted
+                # while the call is in progress.
+                #
+                # Observed on Qwen3-Omni duplex session close: stage 1 raised
+                # "Invalid request status: FINISHED_ABORTED" and killed its
+                # engine core, taking the orchestrator down with it, so every
+                # session ended by tearing down the server.
+                #
+                # Drop the aborted residue and retry once. The retry sees a
+                # clean queue; a second failure is a different fault and
+                # propagates.
+                if "Invalid request status" not in str(exc):
+                    raise
+                logger.warning("Recovering from aborted request during schedule: %s", exc)
+                self._drop_aborted_queued_requests()
+                scheduler_output = super().schedule(throttle_prefills)
         finally:
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
