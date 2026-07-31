@@ -103,8 +103,15 @@ Isolated so far:
   `outputs=None`.
 - Not session lifecycle. It reproduces across a session boundary *and* within
   one open session, so the trigger is a completed turn rather than a completed
-  session. The likely area is the resumable stage-0 request not returning to a
-  state that accepts the next append.
+  session.
+- Not the stop token. Removing `stop_token_ids` from stage-0 sampling was
+  tried on the theory that finishing the request made it unresumable
+  (`_handle_stopped_request` only re-enqueues stages where
+  `receives_chunks` is true, which excludes stage 0). Turn 2 fails identically
+  without it.
+
+Reproduces deterministically with two turns in one session against a freshly
+started server, so it is a state problem rather than a race.
 
 Between conversations:
 
