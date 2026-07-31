@@ -592,6 +592,40 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     return value
 
 
+def _is_new_format_deploy_yaml(path: str) -> bool:
+    """Whether *path* holds a new-format deploy YAML (``stages``, not ``stage_args``)."""
+    with open(path, encoding="utf-8") as f:
+        peek = yaml.safe_load(f) or {}
+    return isinstance(peek, dict) and "stages" in peek and "stage_args" not in peek
+
+
+def resolve_deploy_config_path(
+    deploy_config_path: str | None,
+    stage_configs_path: str | None,
+) -> str | None:
+    """Return this run's deploy YAML, honouring the legacy ``--stage-configs-path``.
+
+    For a new-format YAML the two flags are the same input:
+    :func:`load_and_resolve_stage_configs` promotes ``--stage-configs-path`` to
+    ``deploy_config_path`` before loading anything. Callers that need the deploy
+    YAML *before* stage resolution runs (pipeline lookup, duplex session config)
+    must apply the same promotion, or every setting they read from that file
+    silently falls back to its default.
+
+    A missing or unreadable path yields ``None`` rather than raising, because
+    :func:`load_and_resolve_stage_configs` re-reads the file and owns those
+    diagnostics.
+    """
+    if deploy_config_path is not None:
+        return deploy_config_path
+    if not stage_configs_path or not os.path.exists(stage_configs_path):
+        return None
+    try:
+        return stage_configs_path if _is_new_format_deploy_yaml(stage_configs_path) else None
+    except (OSError, yaml.YAMLError):
+        return None
+
+
 def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
@@ -639,9 +673,7 @@ def load_and_resolve_stage_configs(
                 "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
                 "use --deploy-config. See docs/configuration/stage_configs.md."
             )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
+        if _is_new_format_deploy_yaml(stage_configs_path):
             deploy_config_path = stage_configs_path
             stage_configs_path = None
         else:

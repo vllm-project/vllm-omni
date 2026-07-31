@@ -71,6 +71,7 @@ from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
+    resolve_deploy_config_path,
 )
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -211,8 +212,14 @@ class AsyncOmniEngine:
 
         # Stage resolution pops deploy_config, so get pipeline-wide settings
         # beforehand. The stage CLI exposes the same deploy YAML through
-        # stage_configs_path.
-        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # stage_configs_path. Share the promotion rule with
+        # ``load_and_resolve_stage_configs`` so the two cannot disagree about
+        # which file is this run's deploy YAML, and so a legacy ``stage_args``
+        # YAML or a bad path is not mistaken for one here.
+        deploy_config_path = resolve_deploy_config_path(
+            kwargs.get("deploy_config"),
+            kwargs.get("stage_configs_path"),
+        )
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
             trust_remote_code=bool(trust_remote_code),
