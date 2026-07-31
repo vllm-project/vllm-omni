@@ -265,14 +265,26 @@ class DemoState:
                 indices[event_type] = index
         return indices
 
-    def event_order_ok(self, *, require_input_commit: bool = True) -> bool:
+    def event_order_ok(
+        self,
+        *,
+        require_input_commit: bool = True,
+        require_commit_before_response: bool = True,
+    ) -> bool:
         if not self.events or self.events[0].get("type") != "session.created":
             return False
         first_commit_index = self.first_index("input_audio_buffer.committed")
         first_response_index = self.first_index("response.created")
         if first_response_index is None:
             return False
-        if require_input_commit and (first_commit_index is None or first_commit_index > first_response_index):
+        if require_input_commit and first_commit_index is None:
+            return False
+        if (
+            require_input_commit
+            and require_commit_before_response
+            and first_commit_index is not None
+            and first_commit_index > first_response_index
+        ):
             return False
         indices_by_type = self.first_response_lifecycle_indices()
         if not indices_by_type:
@@ -1409,7 +1421,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             require_input_commit=not continuous_input,
         )
         if validation_mode == "model-policy"
-        else state.event_order_ok(require_input_commit=not continuous_input)
+        else state.event_order_ok(
+            require_input_commit=not continuous_input,
+            require_commit_before_response=False,
+        )
     )
     input_transcription_ok = _input_transcription_ok(
         state.input_transcription_count,

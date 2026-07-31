@@ -17,7 +17,9 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size as get_guidance_parallel_world_size,
+)
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -44,8 +46,6 @@ from .ltx2_guidance import (
     LTX_GUIDANCE_EXECUTOR,
     LTXGuidanceExecutor,
     LTXGuidancePlan,
-    LTXGuidanceSpec,
-    LTXModalityGuidance,
 )
 from .ltx2_recipes import (
     LTXPhaseRecipe,
@@ -259,7 +259,7 @@ class LTXRuntime(
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
         """Hook for a future phase-weight strategy."""
-        del phase
+        self._active_phase_name = phase.name
 
     def prepare_latents(
         self,
@@ -324,6 +324,10 @@ class LTXRuntime(
         return self._guidance_plan.spec.do_cfg
 
     @property
+    def do_guidance(self):
+        return len(self._guidance_plan.passes) > 1
+
+    @property
     def interrupt(self):
         return self._interrupt
 
@@ -372,16 +376,16 @@ class LTXRuntime(
             ),
         )
 
-    def _synchronize_cfg_parallel_step_output(
+    def _synchronize_guidance_parallel_step_output(
         self,
         latents: tuple[torch.Tensor, torch.Tensor],
-        do_true_cfg: bool,
+        guidance_parallel_ready: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not (do_true_cfg and get_classifier_free_guidance_world_size() > 1):
+        if not (guidance_parallel_ready and get_guidance_parallel_world_size() > 1):
             return latents
 
         # CUDA async execution otherwise permits numerical drift to accumulate
-        # across CFG-parallel denoise steps.
+        # across guidance-parallel denoise steps.
         latents = tuple(tensor.contiguous() for tensor in latents)
         current_omni_platform.synchronize()
         return latents
@@ -393,26 +397,16 @@ class LTXRuntime(
         attention_kwargs: dict[str, Any] | None,
     ) -> bool:
         self._guidance_plan = LTXGuidancePlan.build(request_inputs.guidance)
-        del attention_kwargs
+        del req, attention_kwargs
         self._interrupt = False
-        cfg_world_size = get_classifier_free_guidance_world_size()
-        if (
-            req.is_dummy_run()
-            and cfg_world_size == 2
-            and self.do_classifier_free_guidance
-            and not self._guidance_plan.cfg_parallel_compatible
-        ):
-            # The single-device warmup follows the full recipe. CFG2 executes
-            # the same per-modality CFG scales without STG/modality passes.
-            self._guidance_plan = LTXGuidancePlan.build(
-                LTXGuidanceSpec(
-                    video=LTXModalityGuidance(cfg_scale=self._guidance_plan.spec.video.cfg_scale),
-                    audio=LTXModalityGuidance(cfg_scale=self._guidance_plan.spec.audio.cfg_scale),
-                )
-            )
-        if self.do_classifier_free_guidance:
-            self.guidance_executor.validate_cfg_world_size(self._guidance_plan, cfg_world_size)
-        return self.do_classifier_free_guidance and cfg_world_size > 1
+        guidance_world_size = get_guidance_parallel_world_size()
+        self.guidance_executor.validate_guidance_world_size(self._guidance_plan, guidance_world_size)
+        self.guidance_executor.warn_if_imbalanced(
+            self._guidance_plan,
+            guidance_world_size,
+            getattr(self, "_active_phase_name", "generate"),
+        )
+        return self.do_guidance and guidance_world_size > 1
 
     def _check_forward_inputs(
         self,
@@ -594,14 +588,15 @@ class LTXRuntime(
         padded_length = latent_ops.get_sp_padded_audio_latent_length(requested_length, int(sp_size))
         return requested_length if provided_length in {requested_length, padded_length} else provided_length
 
-    def _prepare_denoise_context_for_cfg(
+    def _prepare_denoise_context_for_guidance(
         self,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> LTXDenoiseContext:
         return self.guidance_executor.prepare_denoise_context(
             self._guidance_plan,
-            forward_ctx.cfg_parallel_ready,
+            forward_ctx.guidance_parallel_ready,
+            get_guidance_parallel_world_size(),
             denoise_ctx,
         )
 

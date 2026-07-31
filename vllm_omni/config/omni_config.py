@@ -368,7 +368,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    cfg_parallel_size: int = Field(default=1, ge=1, le=3)
+    cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
@@ -474,6 +474,8 @@ class _DiffusionConfigProjection:
     output_type: str = "pil"
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

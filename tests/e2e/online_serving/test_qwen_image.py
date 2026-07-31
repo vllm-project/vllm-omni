@@ -58,7 +58,6 @@ def _get_default_case(model: str):
     ]
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)

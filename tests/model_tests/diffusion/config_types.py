@@ -35,6 +35,7 @@ class DiffusionTasks(str, Enum):
     TEXT_TO_IMAGE = "text_to_image"
     IMAGE_TO_IMAGE = "image_to_image"
     TEXT_TO_VIDEO = "text_to_video"
+    IMAGE_TO_VIDEO = "image_to_video"
     # Text to audio, etc should be added here as needed
 
 

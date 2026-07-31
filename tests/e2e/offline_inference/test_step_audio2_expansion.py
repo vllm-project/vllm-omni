@@ -6,7 +6,6 @@ E2E expansion tests for Step-Audio2 offline inference (nightly CI).
 Full-model inference with audio input and audio output.
 """
 
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,11 +14,12 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
-STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "step_audio2_ci.yaml")
-TEST_PARAMS = [(MODEL, STAGE_CONFIG)]
+DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
+TEST_PARAMS = [(MODEL, None, {"deploy_config": DEPLOY_CONFIG, "trust_remote_code": True})]
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 

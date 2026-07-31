@@ -46,6 +46,16 @@ def test_serve_parser_accepts_strategy_config() -> None:
     assert args.get_explicit_kwargs_dict()["strategy_config"] == "/tmp/strategy.yaml"
 
 
+def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
+
+    assert args.cfg_parallel_size == 4
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

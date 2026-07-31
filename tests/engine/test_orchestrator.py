@@ -2282,12 +2282,15 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
         def finalize_closed_sessions(self, session_ids: list[str]) -> None:
             self.finalized.extend(session_ids)
 
+    from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [_FailingPool()]
     orchestrator.duplex_control_plane = _Plane()
     orchestrator._pd_kv_params = {}
     orchestrator.request_states = {}
     orchestrator._running_counter = None
+    orchestrator._cfg_tracker = CfgCompanionTracker()
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._cleanup_request_ids(
