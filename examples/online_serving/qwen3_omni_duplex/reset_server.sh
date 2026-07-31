@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Restart the duplex server and wait until it is serving.
 #
-# Currently required between conversations: the pipeline serves exactly one
-# session per boot. See "Known limitation" in README.md.
+# No longer required between conversations -- multiple sessions per boot work.
+# Still the right first move when debugging: a wedged pipeline accepts audio
+# and produces nothing, so anything measured after a wedge is worthless.
 set -euo pipefail
 NAME="${1:-qwen-duplex-test}"
 PORT="${2:-8099}"

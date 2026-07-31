@@ -80,38 +80,34 @@ audio does not affect it. The session and its KV survive a cancel.
 starts a response on commit. Do not send `response.create` — on this path it
 routes to the chat fallback rather than the native duplex runtime.
 
-## Multi-turn, and the remaining wedge
+## Multi-turn and multi-session
 
-Two spoken turns in one session work: two independent replies, 9 audio deltas.
+Both work. Measured on one boot with a scripted client replaying this page's
+exact wire protocol: 5 consecutive sessions all answered, and 4 sessions × 3
+turns produced audio on all 12 turns.
 
-**But the server stops responding after two sessions.** It stays healthy and
-keeps accepting connections and audio; it simply never produces output again
-until restarted.
+Two framework fixes got it there.
 
-Capacity is not the cause. Raising stage `max_num_seqs` from 4 to 16 and
-`max_sessions` to 12 changed nothing: sessions 1 and 2 answer, session 3
-onward is silent. The limit is two regardless of configured capacity, which
-rules out slot exhaustion and points at per-session state that is established
-twice and then blocks. Once wedged, every client
-fails identically -- audio is accepted and framed correctly, `response.created`
-is never emitted, and the session panel stays at 0 turns. A restart clears it.
+**One session per boot** — `num_waiting_for_streaming_input` leaked one per
+session. `EngineCore.has_work()` reads through that counter, so a single
+phantom made stage 1 conclude it had no work while a live request sat in its
+`waiting` queue; the engine parked in `input_queue.get()` and never scheduled
+again. The talker never ran, so no codec tokens reached Code2Wav and the client
+waited forever on a healthy-looking server that kept accepting audio. Fixed in
+`OmniSchedulerMixin._resync_streaming_input_counter` — full mechanism in that
+docstring and in `docs/design/qwen3_omni_duplex_pr_map.md`.
 
-This is not client specific. `is_speech: true` on appends was suspected and
-ruled out: it works on a freshly started server and fails on a wedged one,
-exactly like every other payload shape. Any measurement taken after the wedge
-is worthless, so **reset before each experiment** -- two of ours were
-contaminated this way.
-
-The browser reaches the wedge sooner than a script because each interaction
-opens a session.
-
-This needed a framework fix. Downstream async-chunk stages stop polling the
+**One turn per session** — downstream async-chunk stages stop polling the
 connector once their segment finishes, and only resume when they receive a
 streaming update. The orchestrator prewarmed them on the *initial* stage-0
 submit but not on updates, so a second turn deadlocked: stage 0 generated and
 marked its segment finished while stage 1 was still parked from the previous
-turn and never read the new chunks. Stages 1 and 2 sat idle and the client saw
-nothing.
+turn and never read the new chunks.
+
+If you are debugging something new here, still **reset before each experiment**
+-- a wedged server accepts audio and frames it correctly while producing
+nothing, so measurements taken after a wedge look like data and are not. Two of
+ours were contaminated that way.
 
 ## Open: later turns answer the first question
 

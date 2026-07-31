@@ -32,6 +32,13 @@ defensible without reference to Qwen3-Omni.
 | 1 | `DuplexFence` not JSON serializable in `runtime_control` — kills the session at handshake | issue #5612, **PR #5613** |
 | 2 | `chat_fallback.py` raises `AttributeError` while reporting an error, hiding the real cause | draft **PR #5626** |
 | 3 | Abort raised inside the AR scheduler's dequeue kills the engine core | commit `fb8c46fc`, unfiled |
+| 6 | `num_waiting_for_streaming_input` leaks on abort, parking the stage forever | commit `97cefb59`, unfiled |
+
+Defect 6 is the one-session-per-boot wedge, and it is the strongest Tier 1
+candidate after #5613: upstream's counter, omni's status rewrites, no
+Qwen3-Omni in the reproduction. Full mechanism in
+`OmniSchedulerMixin._resync_streaming_input_counter`; regression test in
+`tests/core/sched/test_omni_scheduler_streaming_input_counter.py`.
 
 Defect 3 is worth adding to #5626 or filing separately. Note the mechanism:
 upstream pops from `waiting`, appends to `running`, *then* checks status, so
@@ -98,10 +105,47 @@ cost the most time.
 - **Code2Wav output is cumulative** and shaped `[1, samples]`, so `len()` gives
   the batch dimension.
 
-## Ruled out for the one-turn-per-boot bug
+## The one-session-per-boot bug: solved
 
-Kept because a negative result is worth as much as a positive one when someone
-picks this up:
+**Root cause: upstream's `num_waiting_for_streaming_input` counter leaked one
+per session, and `EngineCore.has_work()` reads through it.**
+
+`get_num_unfinished_requests` computes
+`len(waiting) + len(skipped_waiting) - num_waiting_for_streaming_input + len(running)`.
+Upstream keeps the counter incrementally — `+1` when a resumable request parks
+as `WAITING_FOR_STREAMING_REQ`, `-1` in `_update_request_as_session` or in
+`finish_requests` when the request is *still in that status*. Omni rewrites
+`request.status` outside both hooks (the chunk-transfer adapter's park/restore,
+and `_realign_request_status_to_queues`), so at session close the talker's
+request was aborted while counted but with status already stomped to `RUNNING`.
+Upstream took the running branch, never decremented, and the counter stayed at
+1 for the life of the process.
+
+One phantom is enough. On the next session stage 1 had exactly one request in
+`waiting`, so `(1 + 0 - 1) + 0 == 0`, `has_work()` was false, and the engine
+blocked in `input_queue.get()` — it never called `schedule()` again. The talker
+never ran, no codec tokens reached Code2Wav, and the client waited forever on a
+server that stayed healthy and kept accepting audio.
+
+Fixed by restating the invariant instead of chasing the writes:
+`_resync_streaming_input_counter` re-derives the counter from the waiting
+queues (a no-op when upstream's arithmetic is right, self-healing when it
+isn't), called from both schedulers' `finish_requests` and from
+`OmniARScheduler.schedule`. Measured on a freshly booted server, scripted
+client replaying the browser's exact wire protocol: **before 1/2 sessions
+answered, after 5/5, and 4 sessions × 3 turns = 12/12 turns.**
+
+How it was found, since the log evidence was misleading three times over: the
+API server, orchestrator and stage 0 all looked healthy, and stage 1 logged
+*nothing*. `py-spy dump` on the stage-1 process was the turn — it showed the
+main loop parked in `_process_input_queue`, which is only reachable when
+`has_work()` is false, i.e. the engine believed it had no work while holding a
+queued request. Everything after that was arithmetic.
+
+## Ruled out for the one-session-per-boot bug
+
+Kept because a negative result is worth as much as a positive one, and because
+each of these cost a measurement:
 
 - not session capacity (reproduces at `max_sessions: 4` with matching stage
   slots)
@@ -110,8 +154,10 @@ picks this up:
 - not stage-0 admission (request created, first token generated)
 - not the stop token (removing `stop_token_ids` changes nothing)
 - not a race (deterministic on a freshly booted server)
-
-Next place to look: whether stage 1 receives anything at all on turn 2.
+- not the orchestrator's submit path: stage 1 *was* submitted every session,
+  the request reached its engine core, and `scheduler.add_request` ran. Chasing
+  the submit path cost the most time of anything here — the request arrives
+  fine, it is the engine's decision to sleep that is wrong.
 
 ## Fixes that were wrong
 
