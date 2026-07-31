@@ -145,11 +145,16 @@ def build_duplex_prompt_token_ids(
     blob of audio embeddings:
 
     * first append of the session -- system block, then the user turn opener
-    * first append of any later turn -- the user turn opener
+    * first append of any later turn -- the user turn opener, then
+      ``<|audio_start|>``
     * every append -- ``<|audio_pad|>`` placeholders that stage 0 overwrites
       with audio embeddings
-    * final append of a turn -- close the user turn and open the assistant's,
-      which is what actually prompts a reply
+    * final append of a turn -- ``<|audio_end|>``, close the user turn, open
+      the assistant's, which is what actually prompts a reply
+
+    The ``<|audio_start|>`` / ``<|audio_end|>`` delimiters are not optional:
+    without them the thinker does not treat the span as audio and emits
+    role-marker garbage.
 
     Real token ids are used for the scaffolding (not filler), so the worker
     can embed those positions through the ordinary embedding lookup and only
@@ -161,10 +166,14 @@ def build_duplex_prompt_token_ids(
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY)
     if turn_seq <= 1:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
+        prefix.append(Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID)
 
     audio_tokens = duplex_audio_token_count(payload)
     closes_turn = final or (isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True)
-    suffix = _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY) if closes_turn else []
+    suffix: list[int] = []
+    if closes_turn:
+        suffix.append(Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID)
+        suffix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY)
 
     prompt_token_ids = prefix + [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens + suffix
     logger.info(

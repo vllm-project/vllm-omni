@@ -67,6 +67,17 @@ class Qwen3OmniDuplexPolicy:
     #: being filler. Matches ``qwen3_omni.py:AUDIO_PAD_TOKEN_ID``.
     AUDIO_PAD_TOKEN_ID = 151675
 
+    #: ``<|audio_start|>`` / ``<|audio_end|>``. The audio span MUST be
+    #: delimited by these or the thinker does not read the embeddings as
+    #: audio at all: observed output was role-marker leakage
+    #: (``' a i \n\n\nuser\n\n\nuser\n...'``) and the talker faithfully
+    #: synthesized the nonsense. The working half-duplex path builds
+    #: ``<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>``
+    #: (``qwen3_omni.py:buffer_realtime_audio`` via the processor's
+    #: ``get_placeholder_str``).
+    AUDIO_START_TOKEN_ID = 151669
+    AUDIO_END_TOKEN_ID = 151670
+
     #: Conversation scaffolding.
     #:
     #: Without this the thinker receives bare audio embeddings with no

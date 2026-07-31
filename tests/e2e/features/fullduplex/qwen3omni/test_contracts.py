@@ -435,9 +435,10 @@ def _prompt(*, seq: int, turn_seq: int, final: bool, samples: int = Qwen3OmniDup
 def test_session_opener_carries_system_block_and_user_turn() -> None:
     ids, audio_offset, audio_tokens = _prompt(seq=1, turn_seq=1, final=False)
     assert ids[:5] == [1, 2, 3, 4, 5], "session prefix then turn prefix"
-    assert audio_offset == 5
+    assert ids[5] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+    assert audio_offset == 6
     assert audio_tokens == 13
-    assert ids[5:] == [_PAD] * 13
+    assert ids[6:] == [_PAD] * 13
 
 
 def test_mid_turn_append_has_no_scaffolding() -> None:
@@ -450,24 +451,25 @@ def test_mid_turn_append_has_no_scaffolding() -> None:
 def test_later_turn_reopens_user_without_repeating_system_block() -> None:
     ids, audio_offset, _ = _prompt(seq=9, turn_seq=1, final=False)
     assert ids[:2] == [4, 5]
-    assert audio_offset == 2, "system block belongs to the session, not each turn"
+    assert ids[2] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+    assert audio_offset == 3, "system block belongs to the session, not each turn"
 
 
 def test_final_append_closes_user_and_opens_assistant() -> None:
     """This suffix is what actually prompts a reply."""
     ids, _, audio_tokens = _prompt(seq=3, turn_seq=3, final=True)
     assert ids[-3:] == [6, 7, 8]
-    assert ids == [_PAD] * audio_tokens + [6, 7, 8]
+    assert ids == [_PAD] * audio_tokens + [Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID, 6, 7, 8]
 
 
 def test_prompt_length_equals_reservation() -> None:
     """Budget must equal produced embeddings; the runner truncates silently."""
     for seq, turn_seq, final in ((1, 1, False), (2, 2, False), (3, 3, True), (9, 1, True)):
         ids, audio_offset, audio_tokens = _prompt(seq=seq, turn_seq=turn_seq, final=final)
-        scaffold = len(ids) - audio_tokens
         assert audio_offset + audio_tokens <= len(ids)
         assert ids.count(_PAD) == audio_tokens, "audio span is exactly the pad tokens"
-        assert scaffold == audio_offset + (3 if final else 0)
+        trailing = len(ids) - audio_offset - audio_tokens
+        assert trailing == (4 if final else 0), "audio_end + turn suffix when closing"
 
 
 def test_audio_span_is_contiguous_and_located_by_audio_offset() -> None:
@@ -486,8 +488,11 @@ def test_missing_scaffolding_degrades_to_audio_only() -> None:
         turn_seq=1,
         final=True,
     )
-    assert audio_offset == 0
-    assert ids == [_PAD] * audio_tokens
+    # Delimiters are model constants, not scaffolding, so they survive.
+    assert audio_offset == 1
+    assert ids == [Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID] + [_PAD] * audio_tokens + [
+        Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID
+    ]
 
 
 def test_commit_payload_closes_the_turn_without_the_final_flag() -> None:
@@ -503,7 +508,7 @@ def test_commit_payload_closes_the_turn_without_the_final_flag() -> None:
         runtime_config=dict(_SCAFFOLD), payload=payload, seq=2, turn_seq=2, final=False
     )
     assert ids[-3:] == [6, 7, 8], "assistant generation prompt must be appended"
-    assert ids == [_PAD] * audio_tokens + [6, 7, 8]
+    assert ids == [_PAD] * audio_tokens + [Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID, 6, 7, 8]
 
 
 def test_prepare_commit_marks_the_payload_turn_final() -> None:
@@ -657,3 +662,16 @@ def test_data_plane_reads_text_from_raw_request_output() -> None:
     dp.begin_request("r1")
     events = list(dp.project({"data_plane_outputs": [raw]}, context=Qwen3OmniDataPlaneContext()))
     assert events and events[0]["text"] == "unwrapped text"
+
+
+def test_audio_span_is_delimited_for_the_model() -> None:
+    """Missing <|audio_start|>/<|audio_end|> makes the thinker emit garbage.
+
+    Observed live without them: ' a i \\n\\n\\nuser\\n\\n\\nuser\\n...' -- the model
+    does not read the embeddings as audio and leaks chat role markers, which
+    the talker then synthesizes.
+    """
+    ids, audio_offset, audio_tokens = _prompt(seq=1, turn_seq=1, final=True)
+    assert ids[audio_offset - 1] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+    assert ids[audio_offset + audio_tokens] == Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID
+    assert ids[audio_offset : audio_offset + audio_tokens] == [_PAD] * audio_tokens
