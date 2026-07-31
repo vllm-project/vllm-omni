@@ -96,7 +96,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.core_model
     @pytest.mark.advanced_model
     @pytest.mark.tts
@@ -114,7 +113,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             request_num=3,
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.advanced_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -146,7 +144,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.advanced_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)

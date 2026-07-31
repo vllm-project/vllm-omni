@@ -74,7 +74,6 @@ def _get_test_config() -> str:
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_runner",

@@ -66,7 +66,6 @@ tts_async_chunk_server_params = [
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_zh_001(omni_server, openai_client) -> None:
     """
@@ -89,7 +88,6 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     """
@@ -113,7 +111,6 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_en_001(omni_server, openai_client) -> None:
     """
