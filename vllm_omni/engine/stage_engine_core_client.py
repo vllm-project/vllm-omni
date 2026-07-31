@@ -189,6 +189,32 @@ class StageEngineCoreClientBase(StageClientBase):
                 self.start_engine_core_monitor()
             if coordinator is not None:
                 self.resources.coordinator = coordinator
+
+            # Defensive check for the import-order regression the patch
+            # above exists to prevent: if vllm.v1.engine.core_client had
+            # already bound its own local reference to the *original*
+            # EngineCoreOutputs before this constructor ran (e.g. imported
+            # by some other code path first), super().__init__() would have
+            # built self.decoder against the base 14-field struct instead of
+            # OmniEngineCoreOutputs' 17-field extension (multimodal_output,
+            # is_segment_finished, new_prompt_len_snapshot appended). Decoding
+            # a genuinely Omni-shaped array-like struct with that decoder
+            # doesn't fail cleanly -- it desyncs field positions and surfaces
+            # as an opaque msgspec.ValidationError deep in a later poll,
+            # naming some unrelated field. Fail here instead, immediately and
+            # legibly, the first time this client is used.
+            decoded_type = getattr(getattr(self.decoder, "decoder", None), "type", None)
+            if decoded_type is not None and not (
+                isinstance(decoded_type, type) and issubclass(decoded_type, OmniEngineCoreOutputs)
+            ):
+                raise RuntimeError(
+                    f"[{client_name}] stage-{self.stage_id} [rep-{self.replica_id}] "
+                    f"decoder was built against {decoded_type!r}, not OmniEngineCoreOutputs "
+                    "-- an import-order regression left vllm.v1.engine.core_client's "
+                    "EngineCoreOutputs unpatched before this client's decoder was "
+                    "constructed. Decoding Omni-shaped output structs with this decoder "
+                    "would corrupt field positions instead of failing cleanly."
+                )
         except Exception:
             logger.exception(
                 "[%s] stage-%s [rep-%s] EngineCore init failed",

@@ -90,7 +90,6 @@ class LongcatNextImageDecoder(nn.Module):
             dtype=self.dtype,
         )
         self.visual_tokenizer.to(device=self.device, dtype=self.dtype)
-        self.visual_tokenizer.to(device=self.device, dtype=self.dtype)
         self.visual_tokenizer.eval()
         self._weights_loaded = True
 
@@ -132,7 +131,7 @@ class LongcatNextImageDecoder(nn.Module):
         visual_codes = additional_info.get("visual_token_ids")
         if not visual_codes:
             logger.warning("No visual token IDs provided for image decoder")
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={})
+            return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
         token_h = int(additional_info.get("token_h") or self.default_token_h)
         token_w = int(additional_info.get("token_w") or self.default_token_w)

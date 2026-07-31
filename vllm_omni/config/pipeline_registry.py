@@ -58,6 +58,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELIN
 from vllm_omni.model_executor.models.longcat_next.pipeline import (
     LONGCAT_NEXT_PIPELINE,
     LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
+    LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
     LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
@@ -142,6 +143,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "longcat_next": LONGCAT_NEXT_PIPELINE,
     "longcat_next_thinker_only": LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
     "longcat_next_thinker_audio": LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
+    "longcat_next_thinker_multi_decoder": LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
 }
 
 

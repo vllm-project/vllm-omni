@@ -142,3 +142,62 @@ LONGCAT_NEXT_THINKER_AUDIO_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+# Thinker + ONE combined decoder stage that holds both the image and audio
+# decode paths internally (LongcatNextMultiDecoder), dispatching per request
+# on whichever of visual_token_ids/audio_token_ids talker_mtp populated --
+# mirroring the reference's own PostProcessor.decode_multi(gen_image,
+# gen_audio), a single conditional dispatch in one process, not a chain of
+# services.
+#
+# This exists instead of LONGCAT_NEXT_PIPELINE's 3-stage
+# thinker->image_decoder->audio_decoder chain because the orchestrator's
+# _forward_to_next_stage only ever forwards a stage's own output to
+# src_stage_id + 1 -- it does NOT consult a stage's declared input_sources
+# to fetch data from an earlier stage. So in the 3-stage chain, the audio
+# decoder (stage 2) receives the IMAGE decoder's output (stage 1), never the
+# thinker's (stage 0) -- audio is unconditionally broken there, not just
+# when image-gen happened to run. A 2-stage chain has no such ambiguity:
+# stage 1 is always the immediate successor of stage 0, so it always
+# receives the thinker's real output regardless of which modality it
+# generated.
+#
+# final_output_type is statically "audio" here for schema purposes even
+# though a given response may actually be an image -- this only affects (a)
+# the rarely-hit terminal-empty-output shape when a request finishes with
+# no downstream input at all, and (b) get_final_stage_id_for_e2e's
+# output_modalities matching heuristic (a client hint, not authoritative
+# here since which modality a request produces is decided by the prompt's
+# trigger token, not by client-requested modalities). Neither affects
+# whether the real audio/image is produced or which key it lands under.
+LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE = PipelineConfig(
+    model_type="longcat_next_thinker_multi_decoder",
+    model_arch="LongcatNextForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            # See LONGCAT_NEXT_PIPELINE's stage 0 for why this stays
+            # "latent", not "audio".
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="multi_decoder",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="LongcatNextMultiDecoder",
+            sync_process_input_func=f"{_PROC}.thinker2multi_decoder_token_only",
+        ),
+    ),
+)

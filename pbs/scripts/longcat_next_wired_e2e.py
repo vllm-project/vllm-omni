@@ -6,12 +6,26 @@ returns one OmniRequestOutput per stage.
 Usage:
   python longcat_next_wired_e2e.py <model_path> <deploy_yaml> <out_dir> [--modality audio|image]
 
+No `modalities` are passed on the prompt: LongCat-Next is a native multimodal
+model, so the modality is inferred from whatever the thinker actually generates
+(the decoders no-op when their codes are absent).
+
+Decoder stages are selected by payload CONTENT, not by the static
+final_output_type label, because the combined multi-decoder stage is typed
+"audio" yet still emits images for image-gen prompts. The client-side payload
+key is the stage's engine_output_type ("audio"/"image"), never the raw
+"model_outputs" producer key.
+
 Examples:
-  # Audio-only test (use audio-decoder yaml)
+  # Audio-only test (use audio-decoder yaml; image decoder not even loaded)
   python longcat_next_wired_e2e.py /model longcat_next_4gpu_80gb_audio.yaml /results --modality audio
 
-  # Image-only test (use image+audio yaml; stage 2 is ignored)
+  # Image-only test (use image+audio yaml; audio decoder runs but no-ops)
   python longcat_next_wired_e2e.py /model longcat_next_4gpu_80gb_image_audio.yaml /results --modality image
+
+  # Either modality via the combined 2-stage multi-decoder yaml
+  python longcat_next_wired_e2e.py /model longcat_next_5gpu_a40_multi_decoder.yaml /results --modality audio
+  python longcat_next_wired_e2e.py /model longcat_next_5gpu_a40_multi_decoder.yaml /results --modality image
 """
 
 import argparse
@@ -45,7 +59,6 @@ def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
     prompt = OmniTextPrompt(
         prompt=prompt_text,
         multi_modal_data={"audio": (audio_signal, sr)},
-        modalities=["audio"],
     )
 
     sampling_params = SamplingParams(
@@ -79,15 +92,26 @@ def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
                         n_frames = audio.shape[0] if hasattr(audio, "shape") else len(audio)
                         result["thinker_audio_frames"] = n_frames
                         print(f"[wired-audio] thinker produced {n_frames} audio code frames")
-        elif stage_id == 1 and final_output_type == "audio":
+        elif stage_id >= 1 and isinstance(mm, Mapping) and any(
+            k in mm for k in ("audio", "model_outputs")
+        ):
             audio_decoder_out = o
 
     if audio_decoder_out is None:
-        result["verdict"] = "FAIL: no audio decoder output found"
+        result["verdict"] = "FAIL: no decoder output found"
         return result
 
+    # The client-side payload key is the stage's engine_output_type, never
+    # the raw "model_outputs" producer key: an "audio"-typed stage (both the
+    # standalone audio decoder and the combined multi-decoder) surfaces its
+    # waveform under "audio". Select by content.
     mm = audio_decoder_out.multimodal_output
-    waveform = mm.get("model_outputs") if mm is not None else None
+    waveform = None
+    if mm is not None:
+        for key in ("audio", "model_outputs"):
+            waveform = mm.get(key)
+            if waveform is not None:
+                break
     sr_tensor = mm.get("sr") if mm is not None else None
 
     if waveform is None:
@@ -124,7 +148,6 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
     prompt = OmniTextPrompt(
         prompt=prompt_text,
         multi_modal_data=None,
-        modalities=["image"],
     )
 
     sampling_params = SamplingParams(
@@ -141,19 +164,30 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
     for o in outputs:
         stage_id = getattr(o, "stage_id", None)
         final_output_type = getattr(o, "final_output_type", None)
+        mm = o.multimodal_output
         print(
             f"[wired-image] outputs: stage_id={stage_id} final_output_type={final_output_type} "
             f"multimodal_output_type={type(o.multimodal_output).__name__}"
         )
-        if stage_id == 1 and final_output_type == "image":
+        # Select by content, not the static label: the combined multi-decoder
+        # stage is statically final_output_type="audio" yet still emits an
+        # image for image-gen prompts, keyed "audio" client-side.
+        if stage_id >= 1 and isinstance(mm, Mapping) and any(
+            k in mm for k in ("image", "audio", "model_outputs")
+        ):
             image_decoder_out = o
 
     if image_decoder_out is None:
-        result["verdict"] = "FAIL: no image decoder output found"
+        result["verdict"] = "FAIL: no decoder output found"
         return result
 
     mm = image_decoder_out.multimodal_output
-    image_tensor = mm.get("model_outputs") if mm is not None else None
+    image_tensor = None
+    if mm is not None:
+        for key in ("image", "audio", "model_outputs"):
+            image_tensor = mm.get(key)
+            if image_tensor is not None:
+                break
 
     if image_tensor is None:
         result["verdict"] = "FAIL: image decoder produced no output"

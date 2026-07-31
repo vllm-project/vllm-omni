@@ -124,11 +124,18 @@ def main() -> None:
 
     mm = decoder_out.multimodal_output
     print(f"[wired] decoder multimodal_output type={type(mm).__name__} keys={list(mm.keys()) if mm else None}")
-    waveform = mm.get("model_outputs") if mm is not None else None
+    # The client-side payload key is the stage's engine_output_type ("audio"),
+    # not the raw "model_outputs" producer key.
+    waveform = None
+    if mm is not None:
+        for key in ("audio", "model_outputs"):
+            waveform = mm.get(key)
+            if waveform is not None:
+                break
     sr_tensor = mm.get("sr") if mm is not None else None
 
     if waveform is None:
-        verdict = "FAIL: audio decoder stage ran but produced no 'model_outputs' waveform"
+        verdict = "FAIL: audio decoder stage ran but produced no waveform"
         result["verdict"] = verdict
         result["decoder_mm_keys"] = list(mm.keys()) if mm is not None else None
         print(f"[wired] VERDICT {verdict}")

@@ -162,3 +162,40 @@ def thinker2audio_decoder_token_only(
             )
         )
     return engine_inputs
+
+
+def thinker2multi_decoder_token_only(
+    source_outputs: Sequence[Any],
+    prompt: Any = None,
+    _requires_multimodal_data: bool = True,
+) -> list[OmniTokensPrompt]:
+    """Feeds LongcatNextMultiDecoder (thinker -> multi_decoder, 2-stage
+    pipeline). Extracts both codes.visual and codes.audio from the SAME
+    finished thinker output -- unlike the split image_decoder/audio_decoder
+    pipeline, there's no risk of stage 2 reading stage 1's output here,
+    since this is the only downstream stage. Exactly one of the two will be
+    non-empty per request per the reference's own mutually-exclusive
+    GEN_IMAGE_STAGE/GEN_AUDIO_STAGE state machine; the decoder module itself
+    dispatches on whichever is present."""
+    del prompt
+    engine_inputs: list[OmniTokensPrompt] = []
+    for source_output in source_outputs:
+        if not source_output.finished:
+            continue
+        additional_information: dict[str, Any] = {
+            "visual_token_ids": _extract_codes_from_output(source_output, "visual"),
+            "audio_token_ids": _extract_codes_from_output(source_output, "audio"),
+        }
+        grid = infer_visual_grid(_generated_ids(source_output))
+        if grid is not None:
+            additional_information["token_h"] = grid[0]
+            additional_information["token_w"] = grid[1]
+        engine_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0],
+                additional_information=additional_information,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return engine_inputs

@@ -153,7 +153,7 @@ class LongcatNextAudioDecoder(nn.Module):
         audio_codes = additional_info.get("audio_token_ids")
         if not audio_codes:
             logger.warning("No audio token IDs provided for audio decoder")
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={})
+            return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
         codes = torch.as_tensor(audio_codes, dtype=torch.long, device=self.device)
         if codes.ndim == 1:
@@ -174,7 +174,7 @@ class LongcatNextAudioDecoder(nn.Module):
 
         if not waves:
             logger.warning("Audio decoder produced no valid chunks")
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={})
+            return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
         # Cross-fade consecutive chunks, mirroring decode_save_concat2.
         overlap = self.wave_concat_overlap
