@@ -94,6 +94,7 @@
                   "vae_patch_parallel_size": 2,
                   "enable_expert_parallel": true
                 },
+                "vae_use_tiling": true,
                 "input_connectors": {
                   "from_stage_0": "rdma_connector"
                 },

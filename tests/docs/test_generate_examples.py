@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 ROOT_DIR = Path(__file__).parents[2]
 HOOK_PATH = ROOT_DIR / "docs/mkdocs/hooks/generate_examples.py"
 SPEC = importlib.util.spec_from_file_location("generate_examples", HOOK_PATH)

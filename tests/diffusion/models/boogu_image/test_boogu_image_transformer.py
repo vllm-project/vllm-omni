@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -338,27 +339,43 @@ def test_transformer_load_weights_round_trip():
         assert torch.allclose(reloaded[native_name], expected)
 
 
-def test_transformer_load_weights_warns_for_unexpected_and_unloaded(caplog):
+def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
     )
 
-    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
-    native_params = dict(model.named_parameters())
-    loaded_name = next(iter(native_params))
-    checkpoint_name = _native_to_checkpoint_name(loaded_name)
+    # vllm_omni's logger hierarchy hangs off vLLM's `vllm` logger, which sets
+    # propagate=False, so records never reach the root logger that pytest's
+    # caplog listens on. Capture at the emitting logger instead.
+    messages: list[str] = []
 
-    loaded = model.load_weights(
-        [
-            (checkpoint_name, torch.randn_like(native_params[loaded_name])),
-            ("unexpected.weight", torch.ones(1)),
-        ]
-    )
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
 
+    log = logging.getLogger("vllm_omni.diffusion.models.boogu_image.boogu_image_transformer")
+    handler = _Capture(level=logging.WARNING)
+    log.addHandler(handler)
+    try:
+        model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+        native_params = dict(model.named_parameters())
+        loaded_name = next(iter(native_params))
+        checkpoint_name = _native_to_checkpoint_name(loaded_name)
+
+        loaded = model.load_weights(
+            [
+                (checkpoint_name, torch.randn_like(native_params[loaded_name])),
+                ("unexpected.weight", torch.ones(1)),
+            ]
+        )
+    finally:
+        log.removeHandler(handler)
+
+    text = "\n".join(messages)
     assert loaded == {loaded_name}
-    assert "Skipping unexpected checkpoint weight unexpected.weight" in caplog.text
-    assert "Model parameters not loaded from checkpoint" in caplog.text
-    assert next(name for name in native_params if name != loaded_name) in caplog.text
+    assert "Skipping unexpected checkpoint weight unexpected.weight" in text
+    assert "Model parameters not loaded from checkpoint" in text
+    assert next(name for name in native_params if name != loaded_name) in text
 
 
 def test_transformer_forward_t2i_shape():

@@ -179,7 +179,134 @@ class Flux2Transformer2DModel(nn.Module):
 - Support single GPU only for now
 
 
-### Implementation Notes
+## Distributed Layerwise Offloading
+
+### How It Works
+
+Distributed layerwise offloading extends single-GPU layerwise offloading to
+multi-device deployments.  Each DP rank stores only **1/dp_size** of the model
+weights in host memory; full layer weights are reconstructed at runtime via
+**AllGather** on a dedicated communication stream, overlapped with computation
+via a fixed double-buffer scheme.
+
+**Key features:**
+- **Weight sharding + AllGather**: each rank stores 1/dp_size of weights,
+  reconstructed per-layer via `all_gather_into_tensor`
+- **Fixed double-buffer**: exactly 2 transformer blocks on each device at any
+  time, regardless of model size
+- **DP multi-concurrency**: N concurrent requests processed in parallel
+  (AllGather only gathers weight shards, which are request-independent)
+- **mmap weight loading**: weights loaded as mmap views pointing to shared OS
+  page cache, eliminating O(dp_size × model_size) RSS during model creation
+- **Platform-agnostic**: works on NVIDIA GPU (CUDA/NCCL) and Ascend NPU
+  (CANN/HCCL) via vLLM-Omni's platform abstraction
+
+**Execution Flow (per device):**
+
+```
+Compute Stream:  [Layer N]          [Layer N+1]          [Layer N+2]
+H2D Stream:      [H2D Shard N+1]   [H2D Shard N+2]
+AllGather:       [AG N+1]          [AG N+2]
+Slot Usage:      Slot0: Layer N    Slot1: Layer N+1
+```
+
+### Usage
+
+**CLI:**
+```bash
+# 4× GPU/NPU with AllGather (recommended)
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --data-parallel-size 4
+
+# Without AllGather (each rank loads full weights, no sharding)
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --data-parallel-size 4 \
+  --dlo-no-use-allgather
+
+# With SP instead of DP (long sequences)
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --usp 4
+```
+
+**Python API:**
+```python
+from vllm_omni import Omni
+
+m = Omni(
+    model="/path/to/model",
+    enable_distributed_layerwise_offload=True,
+    dlo_use_allgather=True,  # default
+)
+```
+
+### CLI Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
+| `--data-parallel-size N` | Number of DP ranks for weight sharding | `1` |
+| `--dlo-use-allgather` | Shard + AllGather (saves CPU, requires concurrent requests) | `true` |
+| `--dlo-no-use-allgather` | Full weights per rank (no sharding, no AllGather) | `false` |
+
+### How model weights are loaded (mmap path)
+
+When DLO + AllGather is active, the offloader:
+
+1. **Saves non-persistent buffers** (e.g. RoPE `inv_freq`, timestep `freqs`)
+   from the normally-created transformer
+2. **Converts to meta device** via `to_empty(device="meta")`, releasing random
+   initialization weights
+3. **Loads checkpoint weights as mmap views** via `safe_open().get_tensor()`,
+   which return views into the OS page cache (shared across all ranks, 0 RSS)
+4. **Calls `post_load_weights()`** to apply model-specific dtype conversions
+   (e.g. Cosmos3's `time_embedder` → FP32)
+5. **Restores non-persistent buffers** from saved copies
+
+This approach requires **zero model-specific code changes** — no pipeline or
+transformer modifications are needed.
+
+### OffloadPlan (declarative topology metadata)
+
+Models can optionally declare an `OffloadPlan` class variable to provide
+topology metadata (block attribute names, submodules to offload) without
+any offload-specific logic:
+
+```python
+from vllm_omni.diffusion.offloader import OffloadPlan
+
+class MyPipeline(nn.Module):
+    _dit_modules = ["transformer"]
+    _offload_plan = OffloadPlan(
+        block_attrs={"transformer": ("blocks",)},
+        offload_submodules={"context_encoder": "layers"},
+    )
+```
+
+When not declared, the offloader falls back to `_layerwise_offload_blocks_attrs`
+and heuristic attribute search.  This is backward-compatible — existing models
+work without any changes.
+
+### DP Multi-concurrency
+
+When `--data-parallel-size > 1` and AllGather is enabled, the scheduler batches
+up to `dp_size` requests per denoise step.  Each DP rank processes a different
+request while AllGather synchronizes only weight shards (request-independent).
+
+**Requirements for concurrent requests:**
+- `num_inference_steps` must be specified explicitly (None is not allowed)
+- All concurrent requests must have the same `num_inference_steps` value
+- These constraints exist because AllGather is a collective that requires
+  every rank to participate at each denoise step
+
+### Limitations
+- Online quantization (FP8) is incompatible with mmap loading — falls back to
+  regular `load_weights()` automatically
+- Tensor Parallel is not supported (DLO uses DP-based sharding)
+- HSDP + AllGather is rejected (would double-shard weights)
+- `num_inference_steps=None` is not allowed in DP multi-concurrency mode
 
 **Module Discovery**
 
@@ -208,7 +335,10 @@ OffloadBackend (base class)
 ├── ModelLevelOffloadBackend → uses SequentialOffloadHook (.to() swap)
 │                              (delegates to a pipeline's enable_omni_model_cpu_offload
 │                               for split models like Cosmos3)
-└── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
+├── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
+│                          (single-GPU, full weights on host)
+└── DistributedLayerwiseOffloadBackend → uses DistributedLayerwiseOffloadHook
+                                         (multi-GPU, 1/dp_size sharded weights + AllGather)
 ```
 
 Factory function `get_offload_backend()` selects the appropriate backend based on
@@ -221,19 +351,22 @@ reasoner/generator components inside the model forward pass.
 
 ## Supported Models
 
-| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attrs (Layerwise specific) |
-|--------------|----------------|-----------|---------------------|-------------------|-----------------------------------|
-| LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | `"transformer_blocks"`, `"single_transformer_blocks"` |
-| NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | `"layers"` |
-| OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | `"transformer"` |
-| QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | `"transformer_blocks"` |
-| StableDiffusionXLPipeline | `stabilityai/stable-diffusion-xl-base-1.0` | `SDXLUNet2DConditionModel` | ✓ | ✓ | `"down_blocks"`, `"up_blocks"` |
-| StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | `"transformer_blocks"` |
-| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
-| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
-| SoulXSingerPipeline / SoulXSingerSVCPipeline | `Soul-AILab/SoulX-Singer` | `DiffLlama` (`cfm_decoder.model.diff_estimator`) | ✓ | ✓ | `"layers"` |
-| BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | - | ✓ | `"layers"`, `"customized modules"` |
+| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Distributed Layerwise Offload | Blocks Attrs (Layerwise specific) |
+|--------------|----------------|-----------|---------------------|-------------------|-------------------------------|-----------------------------------|
+| Flux2Pipeline | `black-forest-labs/FLUX.2-dev` | `Flux2Transformer2DModel` | ✓ | ✓ | - | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | - | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | - | `"layers"` |
+| OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | - | `"transformer"` |
+| QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | - | `"transformer_blocks"` |
+| StableDiffusionXLPipeline | `stabilityai/stable-diffusion-xl-base-1.0` | `SDXLUNet2DConditionModel` | ✓ | ✓ | - | `"down_blocks"`, `"up_blocks"` |
+| StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | - | `"transformer_blocks"` |
+| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | - | `"blocks"` |
+| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | - | `"blocks"` |
+| SoulXSingerPipeline / SoulXSingerSVCPipeline | `Soul-AILab/SoulX-Singer` | `DiffLlama` (`cfm_decoder.model.diff_estimator`) | ✓ | ✓ | - | `"layers"` |
+| BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | - | ✓ | - | `"layers"`, `"customized modules"` |
+| Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | ✓ | ✓ | ✓ | `"layers"`, `"gen_layers"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
 - Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attrs` pointing to transformer blocks
+- Distributed Layerwise Offloading works with any model that supports Layerwise Offloading — no additional model changes required.  See [Cosmos3 DistOffload recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md) for usage examples.

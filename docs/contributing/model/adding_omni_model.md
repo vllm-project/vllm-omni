@@ -540,7 +540,7 @@ Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is 
 
 ## Testing
 
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+For comprehensive testing guidelines, please refer to the [Test Writing Guide](../ci/test_writing_guide.md).
 
 ## Adding a Model Recipe
 

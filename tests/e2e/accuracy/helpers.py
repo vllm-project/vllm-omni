@@ -3,8 +3,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
+from abc import ABC, abstractmethod
 from base64 import b64decode, b64encode
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from fractions import Fraction
 from hashlib import sha1
 from io import BytesIO
@@ -53,8 +57,6 @@ def env_to_apply_ftfy_mock_in_subproc(env: dict[str, str] | None = None) -> dict
 
 
 def reset_artifact_dir(path: Path) -> Path:
-    import shutil
-
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -609,3 +611,344 @@ def download_images(urls: list[str]) -> list[Image.Image]:
         images.append(image)
 
     return images
+
+
+_DREAMZERO_UPSTREAM_SERVER_SCRIPT = (
+    Path(__file__).resolve().parent / "upstream_mock" / "upstream_socket_server_no_compile.py"
+)
+_DREAMZERO_DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
+_DREAMZERO_DEFAULT_READY_TIMEOUT_S = int(os.environ.get("OPENPI_SERVICE_READY_TIMEOUT_S", "900"))
+_DREAMZERO_DEFAULT_PROMPT = (
+    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
+)
+_DREAMZERO_DEFAULT_SESSION_ID = "openpi-e2e-parity-session"
+_DREAMZERO_OPENPI_VLLM_PATH = "/v1/realtime/robot/openpi"
+
+
+def require_dreamzero_parity_env() -> tuple[Path, Path]:
+    repo_env = os.environ.get("DREAMZERO_REPO")
+    if repo_env is None:
+        raise ValueError("DREAMZERO_REPO environment variable is required.")
+    repo = Path(repo_env).expanduser()
+    if not repo.is_dir():
+        raise FileNotFoundError(f"DREAMZERO_REPO does not exist: {repo}")
+    checkpoint_dir = repo / "checkpoints" / "dreamzero"
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"DreamZero checkpoint not found: {checkpoint_dir}")
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    return repo, checkpoint_dir
+
+
+def load_dreamzero_upstream_modules():
+    require_dreamzero_parity_env()
+    import test_client_AR as dreamzero_upstream_client
+    from eval_utils.policy_client import WebsocketClientPolicy
+
+    return dreamzero_upstream_client, WebsocketClientPolicy
+
+
+def dreamzero_cfg_parallel_size() -> int:
+    return int(os.environ.get("OPENPI_E2E_CFG_PARALLEL_SIZE", "2"))
+
+
+def _dreamzero_parity_vllm_env() -> dict[str, str]:
+    from tests.helpers.env import pick_least_used_device_indices
+    from tests.helpers.runtime import get_open_port
+
+    parallel_size = dreamzero_cfg_parallel_size()
+    gpus = [str(index) for index in pick_least_used_device_indices(parallel_size)]
+    if parallel_size > len(gpus):
+        raise RuntimeError(
+            f"cfg_parallel_size={parallel_size} requires at least {parallel_size} GPUs, but only got {gpus}."
+        )
+    return {
+        "CUDA_VISIBLE_DEVICES": ",".join(gpus[:parallel_size]),
+        "ATTENTION_BACKEND": "torch",
+        "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        "MASTER_PORT": str(get_open_port()),
+    }
+
+
+def dreamzero_parity_vllm_params(model: str | None = None):
+    from tests.helpers.runtime import OmniServerParams
+    from tests.helpers.stage_config import get_deploy_config_path
+
+    parallel_size = dreamzero_cfg_parallel_size()
+    server_args = [
+        "--served-model-name",
+        "dreamzero-droid",
+        "--enforce-eager",
+    ]
+    if parallel_size > 1:
+        server_args.extend(["--cfg-parallel-size", str(parallel_size)])
+    return OmniServerParams(
+        model=model or os.environ.get("VLLM_DREAMZERO_MODEL", _DREAMZERO_DEFAULT_MODEL),
+        stage_config_path=get_deploy_config_path("dreamzero_tp1_cfg2.yaml"),
+        server_args=server_args,
+        env_dict=_dreamzero_parity_vllm_env(),
+    )
+
+
+def _dreamzero_omni_server_from_params(params):
+    from tests.helpers.runtime import OmniServer
+
+    server_args = list(params.server_args or [])
+    if params.stage_config_path is not None:
+        server_args += ["--stage-configs-path", params.stage_config_path]
+    return OmniServer(
+        params.model,
+        server_args,
+        port=params.port,
+        env_dict=params.env_dict,
+        use_omni=params.use_omni,
+    )
+
+
+@contextmanager
+def dreamzero_parity_vllm_client(
+    params=None,
+    *,
+    ready_timeout_s: float = _DREAMZERO_DEFAULT_READY_TIMEOUT_S,
+) -> Iterator["DreamZeroParityClient"]:
+    """Start vLLM via ``OmniServer`` and return a ready OpenPI parity client."""
+    with _dreamzero_omni_server_from_params(params or dreamzero_parity_vllm_params()) as server:
+        client = _dreamzero_wait_for_client_ready(
+            lambda: _dreamzero_create_openpi_vllm_client(server.host, server.port),
+            timeout_s=ready_timeout_s,
+            proc=server.proc,
+        )
+        yield DreamZeroParityClient(client)
+
+
+def _dreamzero_create_openpi_vllm_client(host: str, port: int) -> Any:
+    from openpi_client import msgpack_numpy
+
+    _, WebsocketClientPolicy = load_dreamzero_upstream_modules()
+
+    class _OpenPIWebsocketClientPolicy(WebsocketClientPolicy):
+        def __init__(
+            self,
+            host: str = "127.0.0.1",
+            port: int = 8000,
+            path: str = _DREAMZERO_OPENPI_VLLM_PATH,
+        ) -> None:
+            self._uri = f"ws://{host}:{port}{path}"
+            self._packer = msgpack_numpy.Packer()
+            self._ws, self._server_metadata = self._wait_for_server()
+
+    return _OpenPIWebsocketClientPolicy(host=host, port=port)
+
+
+def _dreamzero_stop_process(proc: subprocess.Popen[str]) -> None:
+    log_file = getattr(proc, "_codex_log_file", None)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - cleanup path
+            proc.kill()
+            proc.wait(timeout=10)
+    if log_file is not None:
+        log_file.close()
+
+
+def _dreamzero_wait_for_client_ready(
+    client_factory: Callable[[], Any],
+    *,
+    timeout_s: float,
+    proc: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> Any:
+    deadline = time.time() + timeout_s
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            details = ""
+            if log_path is not None and log_path.exists():
+                details = log_path.read_text(errors="replace")[-8000:]
+            raise RuntimeError(f"Service exited before becoming ready with code {proc.returncode}.\n{details}")
+        try:
+            return client_factory()
+        except Exception as exc:  # pragma: no cover - retry path
+            last_err = exc
+            time.sleep(1)
+    raise TimeoutError(f"Timed out waiting for websocket service: {last_err}")
+
+
+def _dreamzero_normalize_reset_response(response: Any) -> str:
+    from openpi_client import msgpack_numpy
+
+    if isinstance(response, str):
+        return response
+    decoded = msgpack_numpy.unpackb(response)
+    if isinstance(decoded, dict):
+        return str(decoded.get("status"))
+    return str(decoded)
+
+
+def normalize_dreamzero_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(metadata)
+    if isinstance(normalized.get("image_resolution"), tuple):
+        normalized["image_resolution"] = list(normalized["image_resolution"])
+    return normalized
+
+
+def assert_dreamzero_logs_clean(log_path: Path) -> None:
+    text = log_path.read_text(errors="replace")
+    if "SignalException: Process" in text and "got signal: 15" in text:
+        text = text.split("Traceback (most recent call last):", 1)[0]
+    assert "Traceback" not in text, text
+    assert "RuntimeError:" not in text, text
+
+
+def assert_dreamzero_upstream_log_matches_vllm_baseline(log_path: Path) -> None:
+    text = log_path.read_text(errors="replace")
+    assert "DIT Compute Steps 8 steps" not in text, text
+    assert "DIT Compute Steps 16 steps" in text, text
+
+
+class DreamZeroParityClient:
+    """Connected OpenPI websocket client for DreamZero parity inference."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @property
+    def raw_client(self) -> Any:
+        return self._client
+
+    def build_obs_sequence(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        dreamzero_upstream_client, _ = load_dreamzero_upstream_modules()
+        camera_frames = dreamzero_upstream_client.load_camera_frames()
+        chunks = dreamzero_upstream_client.build_frame_schedule(
+            min(v.shape[0] for v in camera_frames.values()),
+            1,
+        )
+        obs0 = dreamzero_upstream_client._make_obs_from_video(
+            camera_frames,
+            [0],
+            _DREAMZERO_DEFAULT_PROMPT,
+            _DREAMZERO_DEFAULT_SESSION_ID,
+        )
+        obs1 = dreamzero_upstream_client._make_obs_from_video(
+            camera_frames,
+            chunks[0],
+            _DREAMZERO_DEFAULT_PROMPT,
+            _DREAMZERO_DEFAULT_SESSION_ID,
+        )
+        return obs0, obs1
+
+    def collect_parity_outputs(self) -> tuple[dict[str, Any], list[np.ndarray]]:
+        metadata = self._client.get_server_metadata()
+        obs0, obs1 = self.build_obs_sequence()
+        outputs = [
+            self._client.infer(dict(obs0)),
+            self._client.infer(dict(obs1)),
+        ]
+        assert _dreamzero_normalize_reset_response(self._client.reset({})) == "reset successful"
+        outputs.append(self._client.infer(dict(obs0)))
+        self._client._ws.close()
+        return metadata, outputs
+
+
+class _DreamZeroParityServer(ABC):
+    host = "127.0.0.1"
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        port: int | None = None,
+        ready_timeout_s: float = _DREAMZERO_DEFAULT_READY_TIMEOUT_S,
+    ) -> None:
+        from tests.helpers.runtime import get_open_port
+
+        self.log_path = log_path
+        self.port = get_open_port() if port is None else port
+        self.ready_timeout_s = ready_timeout_s
+        self.proc: subprocess.Popen[str] | None = None
+        self._log_file = None
+
+    @abstractmethod
+    def _build_argv(self) -> list[str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _build_env(self) -> dict[str, str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _create_client(self) -> Any:
+        raise NotImplementedError
+
+    def _start(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_file = self.log_path.open("w")
+        self.proc = subprocess.Popen(
+            self._build_argv(),
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(Path.cwd()),
+            env=self._build_env(),
+        )
+        self.proc._codex_log_file = self._log_file  # type: ignore[attr-defined]
+
+    def __enter__(self) -> DreamZeroParityClient:
+        self._start()
+        client = _dreamzero_wait_for_client_ready(
+            self._create_client,
+            timeout_s=self.ready_timeout_s,
+            proc=self.proc,
+            log_path=self.log_path,
+        )
+        return DreamZeroParityClient(client)
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.proc is not None:
+            _dreamzero_stop_process(self.proc)
+            self.proc = None
+
+
+class DreamZeroUpstreamServer(_DreamZeroParityServer):
+    """Official DreamZero upstream reference server launched via torchrun."""
+
+    def _build_argv(self) -> list[str]:
+        _, checkpoint_dir = require_dreamzero_parity_env()
+        return [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node",
+            str(dreamzero_cfg_parallel_size()),
+            str(_DREAMZERO_UPSTREAM_SERVER_SCRIPT),
+            "--port",
+            str(self.port),
+            "--model_path",
+            str(checkpoint_dir),
+        ]
+
+    def _build_env(self) -> dict[str, str]:
+        from tests.helpers.env import pick_least_used_device_indices
+
+        dreamzero_repo, _ = require_dreamzero_parity_env()
+        env = os.environ.copy()
+        env.setdefault("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{Path.cwd()}:{dreamzero_repo}:{env['PYTHONPATH']}".rstrip(":")
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(index) for index in pick_least_used_device_indices(max(dreamzero_cfg_parallel_size(), 1))
+        )
+        env.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+        env["ATTENTION_BACKEND"] = "torch"
+        env.setdefault("ENABLE_TENSORRT", "false")
+        env["ENABLE_DIT_CACHE"] = "false"
+        env["NUM_DIT_STEPS"] = "16"
+        env["DYNAMIC_CACHE_SCHEDULE"] = "false"
+        return env
+
+    def _create_client(self) -> Any:
+        _, WebsocketClientPolicy = load_dreamzero_upstream_modules()
+        return WebsocketClientPolicy(host=self.host, port=self.port)

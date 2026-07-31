@@ -73,7 +73,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
-| `num_frames` | integer | model default | Number of generated frames |
+| `num_frames` | integer | 1 | Number of generated frames |
 | `fps` | integer | model default | Output frames per second |
 | `num_inference_steps` | integer | model default | Number of diffusion steps |
 | `guidance_scale` | number | null | CFG guidance scale for the low-noise stage |

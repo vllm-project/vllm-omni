@@ -135,8 +135,8 @@ class DiTAttention(nn.Module):
         # The diffusion Attention layer expects (batch, seq, heads, head_dim)
         out = self.attn(query, key, value, attn_metadata=None)
 
-        # Reshape back: (batch, seq, dim)
-        out = out.view(batch_size, seq_len, self.inner_dim)
+        # Some attention backends return a non-contiguous layout.
+        out = out.reshape(batch_size, seq_len, self.inner_dim)
         out = out.to(query.dtype)
 
         # Output projection

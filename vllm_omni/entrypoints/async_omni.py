@@ -44,7 +44,13 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
-    from vllm_omni.inputs.data import OmniPromptType
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+    from vllm_omni.experimental.fullduplex.engine.messages import (
+        DuplexFence,
+        DuplexSessionLifecycleMessage,
+    )
+    from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+    from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -143,12 +149,16 @@ class AsyncOmni(EngineClient, OmniBase):
         self._paused: bool = False
         self._sleeping_tags: set[str] = set()
         self._level2_sleeping: bool = False
+        self._duplex_request_client: DuplexRequestClient | None = None
+        self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
         self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.duplex_session_config = self.engine.duplex_session_config
+        self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -253,6 +263,191 @@ class AsyncOmni(EngineClient, OmniBase):
         uuid = random_uuid()
         prefix = "" if not external_request_id else f"{external_request_id}-"
         return f"{prefix}{uuid:.8}"
+
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Open an engine-level duplex session when the backend supports it."""
+        return await self._get_duplex_request_client().open(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        operation_id: str | None = None,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+        collect_outputs: bool = True,
+    ) -> dict[str, object]:
+        """Append input to an engine-level duplex session."""
+        return await self._get_duplex_request_client().append(
+            session_id,
+            mode=mode,
+            payload=payload,
+            operation_id=operation_id,
+            final=final,
+            expected_epoch=expected_epoch,
+            fence=fence,
+            timeout=timeout,
+            collect_outputs=collect_outputs,
+        )
+
+    async def collect_duplex_data_plane_outputs_async(
+        self,
+        request_id: str,
+        *,
+        response_stage_id: int | None = None,
+        timeout: float | None = 10.0,
+    ) -> list[OmniRequestOutput]:
+        """Collect the next duplex data-plane output batch for a live request."""
+        return await self._get_duplex_request_client().collect_registered_outputs(
+            request_id,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Send a turn/control signal to an engine-level duplex session."""
+        return await self._get_duplex_request_client().signal(
+            session_id,
+            event=event,
+            fence=fence,
+            next_fence=next_fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            timeout=timeout,
+        )
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Close an engine-level duplex session."""
+        return await self._get_duplex_request_client().close(
+            session_id,
+            reason=reason,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def touch_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().touch(
+            session_id,
+            fence=fence,
+            activity=activity,
+            timeout=timeout,
+        )
+
+    async def resume_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().resume(
+            session_id,
+            fence=fence,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
+
+    def _get_duplex_request_client(self) -> DuplexRequestClient:
+        from vllm_omni.experimental.fullduplex.request_client import (
+            DuplexRequestClient,
+            DuplexRequestOutputPort,
+        )
+
+        client = getattr(self, "_duplex_request_client", None)
+        if client is None:
+            engine = getattr(self, "engine", None)
+            client = DuplexRequestClient(
+                engine,
+                DuplexRequestOutputPort(
+                    request_states=getattr(self, "request_states", {}),
+                    num_stages=getattr(engine, "num_stages", 1),
+                    log_stats=getattr(self, "log_stats", False),
+                    start_output_handler=self._final_output_handler,
+                    process_single_result=self._process_single_result,
+                ),
+            )
+            self._duplex_request_client = client
+        return client
+
+    @staticmethod
+    def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.request_info(result)
+
+    async def _collect_duplex_data_plane_outputs(
+        self,
+        request_id: str,
+        req_state: ClientRequestState,
+        *,
+        response_stage_id: int | None,
+        timeout: float | None,
+    ) -> list[OmniRequestOutput]:
+        return await self._get_duplex_request_client().collect_outputs(
+            request_id,
+            req_state,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.is_direct_response(output)
+
+    @classmethod
+    def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.multimodal_output(output)
 
     # ==================== Generate Method ====================
 
@@ -432,6 +627,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 yield output
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
+
+            # The input pump can outlive a normally-completed generation
+            # (e.g. a realtime client that keeps streaming after the final
+            # output); a live pump keeps issuing streaming updates for a
+            # request the orchestrator no longer tracks.
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
 
             self._log_summary_and_cleanup(request_id)
 
@@ -693,6 +895,10 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
+                    if getattr(msg, "type", None) == "duplex_session_lifecycle":
+                        await self.duplex_lifecycle_events.put(msg)
+                        continue
+
                     if isinstance(msg, ErrorMessage) and not msg.fatal:
                         req_state = self.request_states.get(msg.request_id)
                         if req_state is not None:
@@ -807,6 +1013,46 @@ class AsyncOmni(EngineClient, OmniBase):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
 
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        *,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Apply a midway interaction to an active streaming diffusion request.
+
+        ``request_id`` is the external id created by the server-side session,
+        matching the value passed to :meth:`generate`.
+        """
+        event = interaction.get("event")
+        prompt = event.get("prompt") if isinstance(event, dict) else None
+        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("prompt must be non-empty")
+        transition_chunks = interaction.get("transition_chunks")
+        if transition_chunks is not None and transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+
+        if self.num_stages != 1:
+            raise ValueError("interaction requires single-stage diffusion")
+        stage_meta = self.engine.get_stage_metadata(0)
+        if stage_meta.stage_type != "diffusion":
+            raise ValueError("interaction requires a diffusion stage")
+
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if not internal_ids:
+            raise ValueError(f"No active request for interaction: {request_id!r}")
+        if len(internal_ids) > 1:
+            raise ValueError(
+                f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
+            )
+
+        await self.engine.submit_interaction_async(
+            internal_ids[0],
+            interaction=interaction,
+        )
+        if self.log_stats:
+            logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
+
     async def _abort_internal_requests(self, request_id: str | Iterable[str]):
         """Abort request(s) via the Orchestrator given internal request IDs,
         which take the format <external_request_id>-<UUID>.
@@ -820,7 +1066,10 @@ class AsyncOmni(EngineClient, OmniBase):
         """Submit request IDs to be aborted to the engine."""
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
-            self.request_states.pop(rid, None)
+            state = self.request_states.pop(rid, None)
+            input_stream_task = getattr(state, "input_stream_task", None)
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

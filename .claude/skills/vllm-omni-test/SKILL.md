@@ -9,7 +9,7 @@ description: Generate and run tests for vllm-project/vllm-omni with CI-aligned l
 
 Use this skill to generate minimal, stable test cases and run them with the correct marker/level strategy for [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni).
 
-**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/cuda/test-ready.yml`, `../../../docs/contributing/ci/CI_5levels.md`).
+**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/cuda/test-ready.yml`, `../../../docs/contributing/ci/test_system_overview.md`).
 
 Default priorities:
 
@@ -559,7 +559,7 @@ L1 tests under `tests/entrypoints/` may keep **minimal** asserts next to the han
 
 #### Omni Test Writing Guidance (L1-L4 Layering)
 
-When the goal is a general Omni/multimodal test case, prioritize mapping the test to the correct purpose, directory, and resource assumptions aligned with the layers (see [CI_5levels.md](../../../docs/contributing/ci/CI_5levels.md)):
+When the goal is a general Omni/multimodal test case, prioritize mapping the test to the correct purpose, directory, and resource assumptions aligned with the layers (see [test_system_overview.md](../../../docs/contributing/ci/test_system_overview.md) and [test_writing_guide.md](../../../docs/contributing/ci/test_writing_guide.md)):
 
 - **L1**: Unit/logic validation on CPU (`core_model and cpu`). Cover input validation, branches, and exception paths (`tests/<component>/test_*.py`). **Mock with `mocker` / `monkeypatch` only — not `unittest.mock`.**
 - **L2**: Basic e2e (online/offline basic scenarios). Prefer dummy/lightweight models to validate the end-to-end request-to-output-structure/streaming chain (typically `tests/e2e/online_serving/` and `tests/e2e/offline_inference/`).
