@@ -306,3 +306,60 @@ class OmniSchedulerMixin:
         if not self.running:
             return
         self.running[:] = [req for req in self.running if not req.is_finished() and req.request_id in self.requests]
+
+    def _resync_streaming_input_counter(self) -> None:
+        """Re-derive ``num_waiting_for_streaming_input`` from queue membership.
+
+        Upstream maintains that counter incrementally: ``+1`` when a
+        resumable request runs out of input and parks in a waiting queue as
+        ``WAITING_FOR_STREAMING_REQ``, ``-1`` when the next streaming update
+        arrives or when ``finish_requests`` removes a request still in that
+        status.  ``get_num_unfinished_requests`` then *subtracts* it from the
+        waiting queues, so a parked request does not read as runnable work.
+
+        Omni moves requests between queues and rewrites ``request.status``
+        outside those two hooks -- the chunk-transfer adapter parks a request
+        as ``WAITING_FOR_CHUNK`` and restores it from
+        ``requests_origin_status``, and ``_realign_request_status_to_queues``
+        rewrites status to match queue membership.  Any of those that lands on
+        a request counted as ``WAITING_FOR_STREAMING_REQ`` moves it out of
+        that status without the matching ``-1``, and the counter is left one
+        too high *permanently*: nothing in either code path ever recomputes
+        it.
+
+        The consequence is a hung stage, not a slow one. Observed on
+        Qwen3-Omni duplex: the talker's request was aborted at session close
+        while counted but with status already stomped to ``RUNNING``, leaving
+        the counter at 1. On the next session ``get_num_unfinished_requests``
+        computed ``(1 waiting + 0 skipped - 1 phantom) + 0 running == 0``, so
+        ``EngineCore.has_work()`` was False with a live request sitting in
+        ``waiting``. The engine parked in ``input_queue.get()`` and never
+        called ``schedule()`` again -- the talker never ran, no codec tokens
+        reached Code2Wav, and the client waited forever on a server that
+        still reported healthy and still accepted audio. One leak per
+        session, so the endpoint answered the first conversation after every
+        boot and went silent from the second on.
+
+        Rather than chase every status write, restate the invariant the
+        counter is *supposed* to encode -- the number of requests currently
+        in the waiting queues that are parked for streaming input -- and
+        recompute it from that ground truth. In the healthy case this is
+        exactly what upstream's incremental arithmetic produces, so it is a
+        no-op; when a status stomp has desynced it, it self-heals on the next
+        call. O(len(waiting)), which is bounded by ``max_num_seqs``.
+        """
+        counter = getattr(self, "num_waiting_for_streaming_input", None)
+        if counter is None:
+            return
+        parked = 0
+        for queue in (getattr(self, "waiting", None), getattr(self, "skipped_waiting", None)):
+            if not queue:
+                continue
+            parked += sum(1 for req in queue if req.status == RequestStatus.WAITING_FOR_STREAMING_REQ)
+        if parked != counter:
+            logger.debug(
+                "[Omni] resynced num_waiting_for_streaming_input %s -> %s",
+                counter,
+                parked,
+            )
+            self.num_waiting_for_streaming_input = parked
