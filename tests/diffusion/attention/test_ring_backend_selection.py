@@ -1,15 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.attention.backends.ring import ring_globals
 from vllm_omni.diffusion.attention.parallel import ring
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_source_build_fa3_is_hopper_only(monkeypatch):
+    fake_interface = SimpleNamespace(
+        _flash_attn_forward=lambda *args, **kwargs: None,
+        flash_attn_func=lambda *args, **kwargs: None,
+    )
+    try:
+        with monkeypatch.context() as context:
+            context.setitem(sys.modules, "flash_attn_interface", fake_interface)
+            reloaded = importlib.reload(ring_globals)
+            assert reloaded.HAS_FA3
+            assert reloaded.FA3_SUPPORTED_CUDA_MAJORS == frozenset({9})
+    finally:
+        importlib.reload(ring_globals)
 
 
 @pytest.mark.parametrize(

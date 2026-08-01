@@ -34,6 +34,9 @@ try:
     from flash_attn_interface import flash_attn_func as fa3_attn_func  # noqa: F401
 
     HAS_FA3 = True
+    # The source-build FA3 interface is the Hopper implementation. Importing
+    # its Python module on Blackwell does not imply that an SM10x kernel exists.
+    FA3_SUPPORTED_CUDA_MAJORS = frozenset({9})
 except (ImportError, ModuleNotFoundError):
     pass
 
