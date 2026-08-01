@@ -293,15 +293,17 @@ def test_split_chunks_pads_trailing_open_chunk():
 
 def test_split_chunks_drops_nonzero_level_sentinel_rows():
     """A non-zero-level code == codebook_sizes[i] is a sentinel that would OOB
-    that level's VQ codebook embed at decode; the guard must drop the row while
-    keeping the level-0 chunk-end marker intact."""
+    that level's VQ codebook embed at decode; the guard must drop those rows
+    while keeping the surrounding real frames intact."""
     decoder = _decoder_for_split_chunks()
+    good0 = [1, 2, 3, 4, 5, 6, 7, 8]
+    good1 = [17, 18, 19, 20, 21, 22, 23, 24]
     codes = torch.tensor(
         [
-            [1, 2, 3, 4, 5, 6, 7, 8],
+            good0,
             [9, AUDIO_CODEBOOK_SIZES[1], 11, 12, 13, 14, 15, 16],  # level-1 sentinel
-            [AUDIO_CODEBOOK_SIZES[0], 0, 0, 0, 0, 0, 0, 0],  # real end marker
-            [17, 18, AUDIO_CODEBOOK_SIZES[2], 20, 21, 22, 23, 24],  # level-2 sentinel
+            good1,
+            [25, 26, AUDIO_CODEBOOK_SIZES[2], 28, 29, 30, 31, 32],  # level-2 sentinel
         ],
         dtype=torch.long,
     )
@@ -310,7 +312,7 @@ def test_split_chunks_drops_nonzero_level_sentinel_rows():
 
     kept = torch.cat(chunks)
     assert kept.shape[0] == 2
-    assert kept.tolist() == codes[[0, 3]].tolist()
+    assert kept.tolist() == [good0, good1]
 
 
 def test_split_chunks_keeps_level0_end_marker_row_with_sentinels_elsewhere():
