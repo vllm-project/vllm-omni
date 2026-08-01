@@ -354,6 +354,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+
+            if generated_token_ids and getattr(request, "async_tokens_to_discard", 0) > 0:
+                self._update_request_with_output(request, generated_token_ids)
+                continue
+
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False

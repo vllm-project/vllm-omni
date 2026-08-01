@@ -546,7 +546,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
     assert second.codes is None
 
 
-def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
+def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
     request.resumable = True
@@ -558,11 +558,37 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
     assert len(adapter._pending_save_reqs) == 0
     assert adapter.requests_num_chunks_sent["ext-stream"] == 111
 
-    adapter.requests_num_chunks_sent.pop("ext-stream")
+
+def test_save_async_segment_boundary_resets_dedup_before_background_send(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+
+    request.num_computed_tokens = 0
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+    request.num_computed_tokens = 3
     adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
 
-    assert len(adapter._pending_save_reqs) == 1
-    assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+    assert len(adapter._pending_save_reqs) == 2
+    boundary, next_segment = adapter._pending_save_reqs
+    assert boundary["is_segment_finished"] is True
+    assert next_segment["is_segment_finished"] is False
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+    # The queued boundary must not clear the new segment's watermark.
+    adapter._send_single_request(boundary)
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+    assert "ext-stream" not in adapter.ramp_chunk_count
+
+    adapter._send_single_request(next_segment)
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+    assert adapter.ramp_chunk_count["ext-stream"] == 1
+    assert [call.kwargs["put_key"] for call in connector.put.call_args_list] == [
+        "ext-stream_1_0",
+        "ext-stream_1_1",
+    ]
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):

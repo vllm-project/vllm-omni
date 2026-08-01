@@ -191,24 +191,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
-        # If the request is preempted, skip the already saved chunks.
-        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
+        external_req_id = request.external_req_id
+        previous_num_computed_tokens = self.requests_num_chunks_sent.get(external_req_id, 0)
+
+        # Segment boundaries may restart token accounting from zero.
+        if not is_segment_finished and confirmed_num_computed_tokens < previous_num_computed_tokens:
             logger.warning(
-                f"Enqueue save_async for request {request.external_req_id}, "
+                f"Skip stale save_async for request {external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
                 f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
-                f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
+                f"previous_chunks_sent={previous_num_computed_tokens}"
             )
             return
 
-        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
-        self._pending_save_reqs.append(task)
+        if is_segment_finished:
+            self._pending_save_reqs.append(task)
+            self.requests_num_chunks_sent.pop(external_req_id, None)
+        else:
+            self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
+            self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
 
@@ -425,7 +432,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
