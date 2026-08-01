@@ -6,8 +6,10 @@ from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     get_ltx2_post_process_func,
     load_transformer_config,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_condition import LTX2VideoCondition
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
+    LTX2ConditionPipeline,
     LTX2I2VDMD2Pipeline,
     LTX2Pipeline,
     LTX2T2VDMD2Pipeline,
@@ -19,6 +21,8 @@ __all__ = [
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
     "LTX2DistilledPipeline",
+    "LTX2ConditionPipeline",
+    "LTX2VideoCondition",
     "get_ltx2_post_process_func",
     "load_transformer_config",
     "create_transformer_from_config",
