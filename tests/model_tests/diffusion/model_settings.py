@@ -42,13 +42,26 @@ DIFFUSION_TEST_SETTINGS = {
     "LTX2Pipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",
         builder=diff_model_builders.tiny_ltx2_builder,
-        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
-        check_determinism=False,
-        check_multi_output=False,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO, DiffusionTasks.IMAGE_TO_VIDEO],
         extra_test_groups=[
             [DiffusionAccs.HSDP, DiffusionAccs.CACHE_DIT],
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+    ),
+    "QwenImagePipeline": DiffusionModelTestOpts(
+        model="Qwen/Qwen-Image",
+        builder=diff_model_builders.tiny_qwen_image_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+    ),
+    "FluxPipeline": DiffusionModelTestOpts(
+        model="black-forest-labs/FLUX.1-schnell",
+        builder=diff_model_builders.tiny_flux_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+    ),
+    "Flux2Pipeline": DiffusionModelTestOpts(
+        model="black-forest-labs/FLUX.2-dev",
+        builder=diff_model_builders.tiny_flux2_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
     ),
 }

@@ -832,7 +832,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
                 # Default is qwen3_tts path
-                config = self.engine_client.model_config.hf_config.talker_config
+                config = getattr(self.engine_client.model_config.hf_config, "talker_config", None)
+                if config is None:
+                    return set()
 
             # Check for speakers in either spk_id or speaker_id
             for attr_name in ["spk_id", "speaker_id"]:
@@ -1764,7 +1766,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # headline improvement is multilingual synthesis when the language is
         # given (build_user_message(..., language=...)); 1.0 ignores it
         # gracefully. Sound-effect output is non-verbal, so skip it there.
-        if v in ("tts", "ttsd", "voice_generator") and getattr(request, "language", None):
+        if v in ("tts", "local", "ttsd", "voice_generator") and getattr(request, "language", None):
             user_kwargs["language"] = request.language
 
         # Build the unified-codes prompt: (L, 1+n_vq) where col 0 is text/special

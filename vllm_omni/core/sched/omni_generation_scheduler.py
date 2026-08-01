@@ -47,6 +47,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
@@ -54,6 +55,39 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stage_id=getattr(model_config, "stage_id", 0),
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+
+    @staticmethod
+    def _record_prefill_stats(request: Request) -> None:
+        """Mirror upstream first-prefill prompt accounting for generation stages.
+
+        Async-chunk generation stages can grow ``prompt_token_ids`` after the
+        first schedule; until this path tracks final chunk lengths, this records
+        the first scheduled prompt snapshot. Keep this in sync with vLLM
+        Scheduler.schedule() if this fast path gains prefix-cache or external-KV
+        accounting.
+        """
+        if request.prefill_stats is None:
+            return
+        request.prefill_stats.set(
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_local_cached_tokens=0,
+            num_external_cached_tokens=0,
+        )
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        if (
+            request.resumable
+            and not request.streaming_queue
+            and self.chunk_transfer_adapter is not None
+            and self.chunk_transfer_adapter.receives_chunks
+        ):
+            # Downstream async-chunk stages receive the next segment from the
+            # connector, not from an API StreamingUpdate. Enqueue them as
+            # schedulable before the base class can park them in skipped_waiting.
+            request.status = RequestStatus.WAITING
+            self._enqueue_waiting_request(request)
+            return False
+        return super()._handle_stopped_request(request)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """One-shot generation fast path:
@@ -131,6 +165,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if num_computed_tokens == 0:
+                self._record_prefill_stats(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
@@ -145,12 +181,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Fast path selection and scheduling for one-shot generation requests,
         # independent of pooling_params.
-        while (
-            self.waiting
-            and token_budget > 0
-            and len(self.running) < self.max_num_running_reqs
-            and self._pause_state == PauseState.UNPAUSED
-        ):
+        while self.waiting and token_budget > 0 and self._pause_state == PauseState.UNPAUSED:
+            # Requests waiting for their next chunk are temporarily absent
+            # from `running`, but stateful models still retain their model
+            # runner slot. Mirror vLLM's treatment of
+            # `num_waiting_for_streaming_input` when enforcing max_num_seqs.
+            num_running = len(self.running)
+            if self._retains_state_across_chunks and self.chunk_transfer_adapter is not None:
+                num_running += self.chunk_transfer_adapter.num_running_waiting_for_chunk
+            if num_running >= self.max_num_running_reqs:
+                break
+
             request = self.waiting.peek_request()
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
@@ -192,6 +233,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if request.num_computed_tokens == 0:
+                self._record_prefill_stats(request)
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens

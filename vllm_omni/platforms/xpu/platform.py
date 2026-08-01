@@ -44,7 +44,9 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        # XPU has no TRTLLM backend; arg accepted for signature parity but unused.
         compute_capability = torch.xpu.get_device_capability()
         # Intel Max 1100 and 1550 will not support flash_attn currently
         flash_attn_supported = compute_capability["architecture"] not in [13136561920]
@@ -96,6 +98,16 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     @classmethod
     def synchronize(cls) -> None:
         torch.xpu.synchronize()
+
+    @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.xpu.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record XPU device event for cross-stream sync")
+            return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

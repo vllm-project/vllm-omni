@@ -6,6 +6,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.playedFrames = 0;
     this.underrunFrames = 0;
     this.drain = null;
+    this.terminalFadeFrames = 0;
     this.started = false;
     this.activeResponseId = null;
     this.initialBufferFrames = Math.round(sampleRate * 0.2);
@@ -31,6 +32,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       }
     } else if (message.type === 'drain') {
       this.drain = { responseId: message.responseId || null };
+      this.terminalFadeFrames = Math.min(this.fadeFrames, this.bufferedFrames());
       if (!this.started && this.bufferedFrames() > 0) {
         this.bufferWaitFrames = 0;
         this.startPlayback();
@@ -42,6 +44,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       this.playedFrames = 0;
       this.underrunFrames = 0;
       this.drain = null;
+      this.terminalFadeFrames = 0;
       this.started = false;
       this.activeResponseId = null;
       this.bufferWaitFrames = this.initialBufferFrames;
@@ -76,6 +79,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.playedFrames = 0;
     this.underrunFrames = 0;
     this.drain = null;
+    this.terminalFadeFrames = 0;
     this.started = false;
     this.activeResponseId = null;
     this.bufferWaitFrames = this.initialBufferFrames;
@@ -116,12 +120,23 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     while (target < output.length && this.queue.length > 0) {
       const pcm = this.queue[0];
       const count = Math.min(output.length - target, pcm.length - this.offset);
+      const remainingBeforeChunk = this.bufferedFrames();
       for (let index = 0; index < count; index += 1) {
         let sample = pcm[this.offset + index] / 32768;
         if (this.fadeInFrames > 0) {
           const elapsed = this.fadeFrames - this.fadeInFrames;
           sample *= elapsed / this.fadeFrames;
           this.fadeInFrames -= 1;
+        }
+        const remainingFrames = remainingBeforeChunk - index;
+        if (
+          this.drain
+          && this.terminalFadeFrames > 0
+          && remainingFrames <= this.terminalFadeFrames
+        ) {
+          sample *= this.terminalFadeFrames === 1
+            ? 0
+            : (remainingFrames - 1) / (this.terminalFadeFrames - 1);
         }
         output[target + index] = sample;
       }

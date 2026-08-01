@@ -159,6 +159,7 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -341,6 +342,7 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
@@ -393,7 +395,7 @@ class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
 # Fields in ``SHARED_FIELDS`` (e.g. ``model``, ``log_stats``) flow to BOTH
 # orchestrator and engine by design.
 #
-# Invariants enforced by ``tests/test_arg_utils.py``:
+# Invariants enforced by ``tests/engine/test_arg_utils_shared_fields.py``:
 #
 #   1. ``OrchestratorArgs`` ∩ ``OmniEngineArgs`` ⊆ ``SHARED_FIELDS``
 #   2. Every CLI flag is classifiable into one of the three buckets
@@ -478,6 +480,8 @@ class OrchestratorArgs:
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
