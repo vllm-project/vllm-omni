@@ -17,7 +17,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `TRTLLM_ATTN` | FlashInfer's trtllm-gen FMHA (TensorRT-LLM's generated kernels, vendored by FlashInfer). BF16, GQA native, `head_dim=128`. Datacenter Blackwell only (sm_100 / sm_103). Supports **Skip-Softmax** sparse attention and **SAGE** quantized attention — see below. Requires `flashinfer`. |
 | `FLASH_ATTN` | Wraps FlashAttention 2. Default on Hopper / Ada / Ampere when `flash-attn` is installed. |
 | `CUDNN_ATTN` | Pins `sdpa_kernel([CUDNN_ATTENTION])`. Default on Blackwell (sm_10x / sm_12x) with cuDNN ≥ 9.5. Wins on mask-heavy DiTs (HunyuanVideo-1.5: 2× e2e vs SDPA). |
-| `FLASHINFER_ATTN` | Uses FlashInfer's batch-prefill wrapper and supports mixed Q/K and V input dtypes through backend-specific configuration. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer` newer than 0.6.15 for mixed-dtype configurations. |
+| `FLASHINFER_ATTN` | Uses FlashInfer's batch-prefill wrapper and supports mixed Q/K and V input dtypes through backend-specific configuration. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer` >= 0.6.16rc1 for mixed-dtype configurations. |
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
@@ -82,7 +82,7 @@ one is `TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-s
 When constructing `OmniDiffusionConfig` directly:
 
 ```python
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, AttnQuantSpec, OmniDiffusionConfig
 
 config = OmniDiffusionConfig(
     diffusion_attention_config=AttentionConfig(
@@ -99,17 +99,17 @@ A plain dict is also accepted and normalized to `AttentionConfig`.
 
 #### FlashInfer QK16/V8 quantized attention
 
-`FLASHINFER_ATTN` accepts backend-specific quantization options through `AttentionSpec.extra`. For QK16/V8:
+`FLASHINFER_ATTN` accepts quantization options through `AttentionSpec.quant`. For QK16/V8:
 
 ```python
 config = OmniDiffusionConfig(
     diffusion_attention_config=AttentionConfig(
         default=AttentionSpec(
             backend="FLASHINFER_ATTN",
-            extra={
-                "dtype_qk": "bfloat16",
-                "dtype_vo": "float8_e4m3fn",
-            },
+            quant=AttnQuantSpec(
+                dtype_qk="bfloat16",
+                dtype_vo="fp8_e4m3",
+            ),
         ),
     ),
     ...,

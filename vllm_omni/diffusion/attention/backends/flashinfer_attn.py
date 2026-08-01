@@ -90,14 +90,15 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
         backend_kwargs = backend_kwargs or {}
-        self.dtype_qk = self._check_dtype(backend_kwargs.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
-        self.dtype_vo = self._check_dtype(backend_kwargs.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
-        requested_backend = backend_kwargs.get("flashinfer_backend", "auto")
+        quant = backend_kwargs.get("quant") or {}
+        self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
+        self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
+        requested_backend = quant.get("flashinfer_backend", "auto")
 
         if not HAS_FLASHINFER:
             raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
 
-        self._check_future_flashinfer_version()
+        self._check_flashinfer_version()
 
         self.flashinfer_backend = self._select_backend(requested_backend, self.device)
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
@@ -128,7 +129,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             self.device,
         )
 
-    def _check_future_flashinfer_version(self) -> None:
+    def _check_flashinfer_version(self) -> None:
         if self.dtype_qk == self.dtype_vo:
             return
         try:
@@ -136,15 +137,11 @@ class FlashInferAttentionImpl(AttentionImpl):
         except (AttributeError, InvalidVersion):
             return
         if flashinfer_version <= Version("0.6.15"):
-            error_msg = (
-                f"FlashInfer {flashinfer_version} may be too old for reliable mixed "
+            raise RuntimeError(
+                f"FlashInfer {flashinfer_version} is too old for reliable mixed "
                 f"QK/V dtype attention (Q/K={self.dtype_qk}, V={self.dtype_vo}); "
-                "install flashinfer > 0.6.15 or build from later than 41155ec2."
+                "install flashinfer >= 0.6.16rc1."
             )
-            if flashinfer_version == Version("0.6.15"):
-                logger.warning_once(error_msg)
-            else:
-                raise RuntimeError(error_msg)
 
     @staticmethod
     def _select_backend(requested_backend: str, device: torch.device) -> str:
@@ -167,7 +164,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         if dtype is None:
             return None
         if isinstance(dtype, str):
-            dtype = getattr(torch, dtype)  # "bfloat16" -> torch.bfloat16
+            dtype = torch.float8_e4m3fn if dtype == "fp8_e4m3" else getattr(torch, dtype)
         if dtype not in allowed:
             choices = ", ".join(sorted(str(item) for item in allowed))
             raise ValueError(f"Unsupported {option_name}={dtype}; expected one of: {choices}")
