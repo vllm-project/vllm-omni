@@ -4,6 +4,7 @@
 import sys
 import types
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -13,6 +14,8 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
 from vllm_omni.diffusion.attention.backends.registry import (
     DiffusionAttentionBackendEnum,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_fastvideo_vsa_backend_is_registered():
@@ -110,9 +113,7 @@ def test_fastvideo_vsa_uses_learned_gate_when_provided(monkeypatch):
     )
     query = torch.randn(1, 300, 2, 8)
     gate = torch.ones_like(query)
-    metadata = AttentionMetadata(
-        extra={"vsa_dit_seq_shape": (3, 10, 10), "gate_compress": gate}
-    )
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (3, 10, 10), "gate_compress": gate})
     monkeypatch.setattr(impl, "_fallback_reason", lambda *args, **kwargs: None)
 
     output = impl.forward_cuda(query, query, query, metadata)
