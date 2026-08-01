@@ -175,3 +175,27 @@ def test_fastvideo_vsa_falls_back_for_mask(monkeypatch):
 
     assert output.shape == query.shape
     assert calls["reason"]
+
+
+def test_fastvideo_vsa_allows_topk_equal_to_num_blocks():
+    query = torch.randn(1, 512, 2, 8)
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (4, 8, 16)})
+
+    all_blocks = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        causal=False,
+        backend_kwargs={"topk": 2, "block_size": (4, 8, 8), "min_seq_len": 1},
+    )
+    too_many = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        causal=False,
+        backend_kwargs={"topk": 3, "block_size": (4, 8, 8), "min_seq_len": 1},
+    )
+
+    # CPU/float32 is rejected later, but k=N itself must not trigger fallback.
+    assert all_blocks._fallback_reason(query, query, query, metadata) == "dtype torch.float32 is not supported"
+    assert too_many._fallback_reason(query, query, query, metadata) == "topk 3 > num_blocks 2"

@@ -1579,6 +1579,16 @@ DMD scheduler 数学、完整三步 re-noise 循环、VSA tiling/gate/fallback �
 | generate 调用端到端 | 14.0 s | 63.5 s |
 | 输出 | 704×1280, 121 帧 | 704×1280, 121 帧 |
 
+同一 DMD checkpoint 的 top-k 画质对照：
+
+| top-k | block 保留率 | VSA denoise | 端到端 |
+|---:|---:|---:|---:|
+| 64 | 53.3% | 约 8.0 s（首次编译） | 14.00 s |
+| 96 | 80.0% | 约 3.2 s（热缓存） | 9.08 s |
+| 120 | 100.0% | 约 3.6 s（热缓存） | 9.42 s |
+
+`topk=120` 等于实际 block 数，仍走 VSA kernel 并选中所有 block。实现已允许 `topk == num_blocks`；只有 `topk > num_blocks` 才回退 SDPA。当前 `k=N` 仍会执行 block score 与 top-k mask，尚未加入跳过评分的性能 fast path。上述耗时包含不同的 kernel 编译/缓存状态，只用于确认运行正确，不宜直接比较 64/96/120 的性能。
+
 本机 FlashAttention wheel 不包含 B300/SM100 kernel，因此 dense baseline 使用 PyTorch SDPA。FastVideo VSA 0.3.2 已在 `.b_rdma` 安装，并先通过独立 GPU kernel smoke test。实际 DMD+VSA 日志确认：
 
 ```text

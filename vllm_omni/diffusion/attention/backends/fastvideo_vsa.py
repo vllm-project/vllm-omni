@@ -285,8 +285,8 @@ class FastVideoVSAImpl(AttentionImpl):
         num_blocks = math.prod(
             math.ceil(seq_dim / tile_dim) for seq_dim, tile_dim in zip(dit_seq_shape, self.block_size)
         )
-        if self.topk >= num_blocks:
-            return f"topk {self.topk} >= num_blocks {num_blocks}"
+        if self.topk > num_blocks:
+            return f"topk {self.topk} > num_blocks {num_blocks}"
         if query.dtype not in (torch.float16, torch.bfloat16):
             return f"dtype {query.dtype} is not supported"
         if key.dtype != query.dtype or value.dtype != query.dtype:
