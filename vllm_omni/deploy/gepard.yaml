@@ -1,0 +1,49 @@
+# Gepard-1.0 deploy: single-stage native-AR FSQ/NanoCodec TTS (~0.5B).
+# Fits a small card — verified target 1x L4 24GB (AR LM + codec are light).
+#
+# PR1 choices:
+#   * enforce_eager=true — CUDA-graph capture is deferred to the perf PR; the
+#     per-request state is a plain request_id-keyed dict (no slot manager).
+#   * null_prefix-only zero-shot (no ref-audio cloning); cloning is a follow-up
+#     PR, so no ref-audio ingestion here.
+#   * trust_remote_code=true — the checkpoint config is model_type
+#     "qwen3_5_text".
+# Explicit pipeline pin: the checkpoint's config.json self-identifies as
+# qwen3_5_text, so model_type inference can never reach the gepard registry
+# entry — and the architectures fallback matches Qwen3_5ForCausalLM against
+# the wrong (diffusion) pipeline. The top-level `pipeline:` key is the
+# highest-priority resolution path (see StageConfigFactory.get_pipeline_config)
+# and makes the routing deterministic.
+pipeline: gepard
+async_chunk: false
+dtype: bfloat16
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.3      # AR LM + NanoCodec fit in ~2 GiB
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    # Routing: the checkpoint's config.json self-identifies
+    # as qwen3_5_text / Qwen3_5ForCausalLM; override architectures so vLLM
+    # resolves our talker instead of the native Qwen3.5 text model.
+    # Do NOT override model_type: the hf_config must stay qwen3_5_text for
+    # the Qwen3_5DecoderLayer model_type check inside the backbone
+    # (ValueError: Invalid model_type gepard). Same idiom as step_audio_2.yaml.
+    hf_overrides:
+      architectures: ["GepardTalkerForConditionalGeneration"]
+    default_sampling_params:
+      # head0 is sampled by vLLM over our one-hot logits; the real head0 +
+      # 31-head sampling is done in-model (Gumbel-max). Keep vLLM's sampler
+      # deterministic (temperature 0) so it just argmaxes what forward chose.
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
