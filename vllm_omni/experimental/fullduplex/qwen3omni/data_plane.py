@@ -122,17 +122,22 @@ class Qwen3OmniDataPlaneSession:
     # ---- RuntimeDataPlane protocol ----------------------------------------
 
     def begin_request(self, request_id: str) -> None:
-        # Preserve the audio cursor across turns.
+        # Preserve both cursors across turns.
         #
-        # Duplex reuses one request id for the whole session, while Code2Wav
-        # accumulates its waveform across the session too. Resetting the
-        # cursor here made every turn resend all previously spoken audio and
-        # then append the new part, so replies grew by repeating the whole
-        # conversation. Only the per-turn text state is cleared.
+        # Duplex reuses one request id for the whole session, and *both*
+        # downstream texts accumulate across it: Code2Wav's waveform and the
+        # thinker's generated text. Resetting the audio cursor made every turn
+        # resend all previously spoken audio; resetting `sent_text` did the
+        # same to the transcript, so each turn's first delta replayed the whole
+        # conversation. That is not cosmetic -- a client watching the
+        # transcript for `<tool_call>` re-runs every tool it has ever seen,
+        # which is an infinite loop, since dispatching one produces the next
+        # turn.
         existing = self._requests.get(request_id)
         state = _RequestState()
         if existing is not None:
             state.audio_offset = existing.audio_offset
+            state.sent_text = existing.sent_text
             state.terminal = False
         self._requests[request_id] = state
 

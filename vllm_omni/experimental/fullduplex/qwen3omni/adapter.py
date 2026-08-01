@@ -153,13 +153,26 @@ class Qwen3OmniNativeDuplexServingAdapter:
         if not isinstance(tools, list) or not tools:
             return ""
         rendered = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tools)
+        # Appended to the trained wording, not a substitute for it.
+        #
+        # Interception happens when `</tool_call>` closes, but under
+        # `async_chunk` the talker has already been fed everything generated
+        # before that -- so any prose the model emits ahead of the call gets
+        # spoken, and the tail of the call itself with it. Users hear the model
+        # read JSON aloud. Nothing downstream can undo that after the fact, so
+        # the only reliable fix is for the call to be the entire turn.
+        no_preamble = (
+            "\n\nWhen you call a function, the tool call must be your entire reply: emit only the "
+            "<tool_call> block, with no words before or after it. Anything you say alongside a tool "
+            "call is spoken aloud to the user before the call can run."
+        )
         return (
             "\n\n# Tools\n\nYou may call one or more functions to assist with the user query."
             "\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
             f"{rendered}"
             "\n</tools>\n\nFor each function call, return a json object with function name and "
             'arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, '
-            '"arguments": <args-json-object>}\n</tool_call>'
+            '"arguments": <args-json-object>}\n</tool_call>' + no_preamble
         )
 
     @classmethod

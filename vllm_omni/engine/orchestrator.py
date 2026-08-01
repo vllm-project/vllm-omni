@@ -1552,6 +1552,33 @@ class Orchestrator:
             )
         )
 
+        # A direct response returns without forwarding, which strands whatever
+        # `_prewarm_async_chunk_stages` already submitted downstream: those
+        # requests are waiting for chunks that will now never be sent. They sit
+        # in their stage's waiting queue as WAITING_FOR_STREAMING_REQ forever,
+        # holding a slot and — because `get_num_unfinished_requests` subtracts
+        # parked requests — making `EngineCore.has_work()` read false. The next
+        # session's request is then invisible and that stage never schedules
+        # again. Same wedge as vllm-omni#5662, reached from the direct-response
+        # path instead of the abort path.
+        #
+        # Opt-in, because a runtime that expects its prewarmed stages to
+        # survive a direct response would be broken by this. The next stage-0
+        # submit re-prewarms, so releasing here costs only the warm slot.
+        if decision.metadata.get("duplex_release_downstream") is True:
+            req_state = self.request_states.get(req_id)
+            final_stage_id = req_state.final_stage_id if req_state is not None else stage_id
+            for downstream_id in range(stage_id + 1, final_stage_id + 1):
+                pool = self.stage_pools[downstream_id]
+                await pool.abort_requests([req_id])
+                pool.release_bindings([req_id])
+            logger.info(
+                "[Orchestrator] released stranded downstream stages %s-%s for direct response on req=%s",
+                stage_id + 1,
+                final_stage_id,
+                req_id,
+            )
+
     @staticmethod
     def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:
         mm_output = getattr(output, "multimodal_output", None)

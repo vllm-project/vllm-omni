@@ -33,6 +33,8 @@ from vllm_omni.experimental.fullduplex.qwen3omni.input import Qwen3OmniPcmAppend
 from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPolicy
 from vllm_omni.experimental.fullduplex.qwen3omni.runtime import (
     Qwen3OmniDuplexRuntimeExtension,
+    parse_tool_calls,
+    Qwen3OmniDuplexRuntimeExtension,
     build_duplex_prompt_token_ids,
     duplex_audio_token_count,
 )
@@ -913,3 +915,119 @@ def test_audio_turn_is_unchanged_by_the_text_path() -> None:
     assert audio_tokens == 13
     assert ids[5] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
     assert audio_offset == 6
+
+
+# --- tool calls -------------------------------------------------------------
+#
+# Stage 0 is one resumable request for the whole session, so its text
+# accumulates across every turn. Re-reporting a call that was already
+# dispatched is self-sustaining -- the result is itself a turn, whose reply
+# still carries the original call -- and it ran away for real: 1204 turns and
+# 105 s of audio repeating one sentence.
+
+
+class _Completion:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _StageOutput:
+    def __init__(self, text: str, request_id: str = "req-1") -> None:
+        self.request_id = request_id
+        self.outputs = [_Completion(text)]
+
+
+_CALL = '<tool_call>\n{"name": "lookup_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+_CALL2 = '<tool_call>\n{"name": "check_inventory", "arguments": {"item": "spoons"}}\n</tool_call>'
+
+
+def test_parse_tool_calls_reads_the_template_format() -> None:
+    assert parse_tool_calls(_CALL) == [{"name": "lookup_weather", "arguments": {"city": "Paris"}}]
+
+
+def test_parse_tool_calls_ignores_an_unterminated_block() -> None:
+    """The thinker streams; a call without its closing tag is still arriving."""
+    assert parse_tool_calls('<tool_call>\n{"name": "lookup_weather"') == []
+
+
+def test_a_tool_call_is_reported_once_even_as_text_accumulates() -> None:
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    first = extension._new_tool_calls(_StageOutput(f"{_CALL}"))
+    assert [call["name"] for call in first] == ["lookup_weather"]
+
+    # Later turns append to the same cumulative text. The original call is
+    # still in there and must not be dispatched again.
+    again = extension._new_tool_calls(_StageOutput(f"{_CALL}It is 18 degrees in Paris."))
+    assert again == []
+
+
+def test_a_genuinely_new_call_is_still_reported() -> None:
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    extension._new_tool_calls(_StageOutput(_CALL))
+    later = extension._new_tool_calls(_StageOutput(f"{_CALL}It is 18 degrees.{_CALL2}"))
+    assert [call["name"] for call in later] == ["check_inventory"]
+
+
+def test_a_partially_streamed_call_is_not_skipped() -> None:
+    """The cursor may only advance past a closed block.
+
+    Advancing past a half-arrived call would consume its opening tag, so the
+    closing tag would never match and the call would be lost silently.
+    """
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    assert extension._new_tool_calls(_StageOutput('<tool_call>\n{"name": "lookup_weather"')) == []
+    complete = extension._new_tool_calls(_StageOutput(_CALL))
+    assert [call["name"] for call in complete] == ["lookup_weather"]
+
+
+def test_scan_state_is_per_request() -> None:
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    extension._new_tool_calls(_StageOutput(_CALL, request_id="req-a"))
+    other = extension._new_tool_calls(_StageOutput(_CALL, request_id="req-b"))
+    assert [call["name"] for call in other] == ["lookup_weather"]
+
+
+def test_a_reused_request_id_rescans_from_the_start() -> None:
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    extension._new_tool_calls(_StageOutput(f"{_CALL}some more text here"))
+    # Shorter text under the same id means a new request took the id over.
+    fresh = extension._new_tool_calls(_StageOutput(_CALL))
+    assert [call["name"] for call in fresh] == ["lookup_weather"]
+
+
+def test_tool_decision_releases_the_prewarmed_downstream_stages() -> None:
+    """The talker and code2wav were warmed for a reply that is not coming.
+
+    Without the release flag they park waiting for chunks that never arrive,
+    hold their slots, and make `has_work()` read false for later sessions --
+    the same wedge as the streaming-input counter leak, reached from the
+    direct-response path.
+    """
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    decision = extension.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(),
+        segment_output_metadata={},
+        output=_StageOutput(_CALL),
+    )
+    assert decision is not None
+    assert decision.metadata["duplex_direct_response"] is True
+    assert decision.metadata["duplex_release_downstream"] is True
+    assert [call["name"] for call in decision.metadata["tool_calls"]] == ["lookup_weather"]
+
+
+def test_a_plain_reply_still_reaches_the_talker() -> None:
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    assert (
+        extension.decide_output(
+            stage_id=0,
+            final_stage_id=2,
+            segment_finished=True,
+            segment_token_ids=(),
+            segment_output_metadata={},
+            output=_StageOutput("The capital of France is Paris."),
+        )
+        is None
+    )

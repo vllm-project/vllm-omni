@@ -199,6 +199,16 @@ const TOOLS = [
 // server intercepts it before the talker can speak it, so it arrives as text
 // rather than audio. Run it and hand the result straight back as the next turn.
 let turnText = "", toolsFired = false;
+// Every tool call already dispatched this session, by signature.
+//
+// A tool result is itself a turn, so re-dispatching one is self-sustaining: it
+// produces a reply, which is scanned, which dispatches again. That ran away
+// once for real (1204 turns, 105 s of audio repeating a single sentence) when
+// the server was replaying cumulative text. The server no longer does that,
+// but this is the client's own brake -- a loop here costs GPU on every
+// iteration, so it should not depend on the server being correct.
+const dispatched = new Set();
+const MAX_TOOL_DISPATCHES = 8;
 
 // Fire once per turn, as soon as a `<tool_call>` block is closed -- an
 // unterminated one means the arguments are still streaming.
@@ -213,8 +223,16 @@ function maybeRunTools(explicit) {
       catch (e) { log(`unparseable tool call: ${m[1].slice(0, 120)}`, "err"); }
     }
   }
+  calls = calls.filter(c => {
+    const sig = `${c.name}:${JSON.stringify(c.arguments || {})}`;
+    if (dispatched.has(sig)) { log(`tool ${c.name} already dispatched — ignoring repeat`, "warn"); return false; }
+    if (dispatched.size >= MAX_TOOL_DISPATCHES) { log(`tool dispatch cap (${MAX_TOOL_DISPATCHES}) hit — ignoring`, "err"); return false; }
+    dispatched.add(sig);
+    return true;
+  });
   if (!calls.length) return;
   toolsFired = true;
+  stopPlayback();
   $("transcript").classList.remove("muted");
   $("transcript").textContent = calls.map(c => `→ ${c.name}(${JSON.stringify(c.arguments)})`).join("\n");
   runToolCalls(calls);
@@ -244,7 +262,7 @@ async function runToolCalls(calls) {
 const MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 const $ = id => document.getElementById(id);
 
-let ws, audioCtx, micStream, micNode, playCtx, playAt = 0;
+let ws, audioCtx, micStream, micNode, playCtx, playAt = 0, scheduled = [];
 let sentMs = 0, recvBytes = 0, turns = 0, textDeltas = 0, audioDeltas = 0;
 let commitAt = 0, recording = false, buf = [];
 
@@ -311,6 +329,21 @@ function playPcm16(u8, sr) {
   const now = playCtx.currentTime;
   playAt = Math.max(playAt, now + 0.03);
   src.start(playAt); playAt += b.duration;
+  scheduled.push(src);
+  src.onended = () => { const i = scheduled.indexOf(src); if (i >= 0) scheduled.splice(i, 1); };
+}
+
+// Audio already scheduled for the current response, so it can be cut short.
+//
+// A tool call is spoken before it can be intercepted: under async_chunk the
+// talker consumes the thinker's tokens as they stream, so by the time
+// `</tool_call>` closes, the audio for it already exists. Nothing server-side
+// can unmake it -- measured at 6-9 s of the model reading JSON aloud
+// ("Cough name check inventory argument item spoons"). The client hears it
+// only if it plays it, so on detecting a tool call, drop what is queued.
+function stopPlayback() {
+  for (const src of scheduled.splice(0)) { try { src.stop(); } catch (e) { /* already ended */ } }
+  playAt = 0;
 }
 
 function closeSession() {
@@ -331,6 +364,7 @@ $("connect").onclick = () => {
   $("status").textContent = "connecting…";
 
   ws.onopen = () => {
+    dispatched.clear(); turnText = ""; toolsFired = false;
     $("connect").textContent = "Disconnect";
     $("k-state").textContent = "handshaking";
     // Shapes from vllm_omni/experimental/fullduplex/client.py, with the

@@ -388,6 +388,11 @@ def build_duplex_data_plane_prompt(
 class Qwen3OmniDuplexRuntimeExtension:
     """Pure model policy for Qwen3-Omni thinker -> talker -> code2wav."""
 
+    def __init__(self) -> None:
+        #: request_id -> (index already scanned for tool calls, length of the
+        #: text when last scanned). See ``_new_tool_calls``.
+        self._tool_scan_pos: dict[str, tuple[int, int]] = {}
+
     def configure_sampling_params(
         self,
         *,
@@ -469,6 +474,47 @@ class Qwen3OmniDuplexRuntimeExtension:
             )
         )
 
+    def _new_tool_calls(self, output: object) -> list[dict[str, Any]]:
+        """Tool calls that appeared since the last time this request was scanned.
+
+        Stage 0 is a *single resumable request for the whole session*, so
+        ``outputs[0].text`` accumulates every turn's text, not just this one's.
+        Scanning all of it re-matches tool calls that were already dispatched,
+        and because dispatching one produces another turn, that is an infinite
+        loop: the client runs the tool, sends the result, the reply carries the
+        original call again, and it runs forever. Observed live -- 1204 turns
+        and 105 s of audio repeating one sentence before the session was killed.
+
+        The cursor only ever advances past a *closed* ``</tool_call>``, so a
+        call still streaming in is re-examined on the next output rather than
+        skipped.
+        """
+        text = _completion_text(output)
+        if not text:
+            return []
+        request_id = str(getattr(output, "request_id", "") or "")
+        start, previous_len = self._tool_scan_pos.get(request_id, (0, 0))
+        if len(text) < previous_len:
+            # The text shrank, so this is a different request that reused the
+            # id -- session ids get recycled. Compare against the previous
+            # length rather than the cursor: a fresh request whose text happens
+            # to be longer than the old cursor would otherwise inherit it and
+            # its first tool call would be skipped.
+            start = 0
+        matches = list(_TOOL_CALL_RE.finditer(text, start))
+        if not matches:
+            self._tool_scan_pos[request_id] = (start, len(text))
+            return []
+        self._tool_scan_pos[request_id] = (matches[-1].end(), len(text))
+        calls: list[dict[str, Any]] = []
+        for match in matches:
+            calls.extend(parse_tool_calls(match.group(0)))
+        return calls
+
+    def forget_request(self, request_id: str) -> None:
+        """Drop per-request tool-scan state when a session ends."""
+        self._tool_scan_pos.pop(str(request_id), None)
+
     def decide_output(
         self,
         *,
@@ -522,12 +568,26 @@ class Qwen3OmniDuplexRuntimeExtension:
         # needed here: surface the text, do not advance to the talker.
         if stage_id != _THINKER_STAGE_ID:
             return None
-        tool_calls = parse_tool_calls(_completion_text(output))
+        tool_calls = self._new_tool_calls(output)
         if not tool_calls:
             return None
         logger.info("[qwen3omni-duplex] tool call intercepted: %s", [call.get("name") for call in tool_calls])
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
-            metadata={"tool_calls": tool_calls},
+            metadata={
+                # The collector admits an output when its stage is at or past
+                # `response_stage_id`, *or* when the metadata carries this flag
+                # (`request_client.is_direct_response`). Stage 0 is neither the
+                # response stage nor admitted without it, so omitting this
+                # silently drops the tool call: the decision fires, the talker
+                # is skipped, and the client is told nothing.
+                "duplex_direct_response": True,
+                # The talker and code2wav were prewarmed for a spoken reply
+                # that is not coming. Without this they stay parked waiting for
+                # chunks, hold their slots, and wedge the stage for every later
+                # session.
+                "duplex_release_downstream": True,
+                "tool_calls": tool_calls,
+            },
             final_output_type="text",
         )
