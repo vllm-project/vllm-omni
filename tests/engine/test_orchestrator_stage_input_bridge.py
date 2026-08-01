@@ -344,3 +344,154 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False
+
+
+# --- direct responses must not strand prewarmed downstream stages -----------
+
+
+class FakeAbortablePool:
+    """Stage pool recording aborts, with a route binding like a live one."""
+
+    def __init__(self) -> None:
+        self.aborted: list[list[str]] = []
+        self.released: list[list[str]] = []
+
+    async def abort_requests(self, request_ids: list[str]) -> None:
+        self.aborted.append(list(request_ids))
+
+    def release_bindings(self, request_ids: list[str]) -> None:
+        self.released.append(list(request_ids))
+
+    def get_bound_replica_id(self, _request_id: str) -> int:
+        return 0
+
+
+def _direct_response_orchestrator(num_stages: int = 3):
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [FakeAbortablePool() for _ in range(num_stages)]
+    orchestrator.output_async_queue = AsyncMock()
+    return orchestrator
+
+
+def _decision(**metadata: Any):
+    from vllm_omni.experimental.fullduplex.engine.contracts import (
+        DuplexOutputAction,
+        DuplexOutputDecision,
+    )
+
+    return DuplexOutputDecision(
+        action=DuplexOutputAction.DIRECT_RESPONSE,
+        metadata={"duplex_direct_response": True, **metadata},
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_direct_response_releases_prewarmed_downstream_stages() -> None:
+    """The talker and code2wav were warmed for a reply that is not coming.
+
+    A direct response returns before ``_forward_to_next_stage``, so prewarmed
+    downstream stages sit waiting for chunks nobody will send. Left parked they
+    hold a slot and suppress ``EngineCore.has_work()``, and that stage stops
+    scheduling for every later request too.
+    """
+    orchestrator = _direct_response_orchestrator()
+
+    await orchestrator._emit_duplex_direct_output(
+        0,
+        "req-tool-call",
+        _request_output("req-tool-call"),
+        _decision(duplex_release_downstream=True),
+        None,
+        None,
+    )
+
+    assert orchestrator.stage_pools[1].aborted == [["req-tool-call"]]
+    assert orchestrator.stage_pools[2].aborted == [["req-tool-call"]]
+    assert orchestrator.stage_pools[1].released == [["req-tool-call"]]
+
+
+@pytest.mark.asyncio
+async def test_the_responding_stage_is_never_aborted() -> None:
+    """Only *downstream* stages are released.
+
+    Aborting the stage the response came from would kill the request that is
+    still serving the client.
+    """
+    orchestrator = _direct_response_orchestrator()
+
+    await orchestrator._emit_duplex_direct_output(
+        1,
+        "req-mid-pipeline",
+        _request_output("req-mid-pipeline"),
+        _decision(duplex_release_downstream=True),
+        None,
+        None,
+    )
+
+    assert orchestrator.stage_pools[0].aborted == []
+    assert orchestrator.stage_pools[1].aborted == []
+    assert orchestrator.stage_pools[2].aborted == [["req-mid-pipeline"]]
+
+
+@pytest.mark.asyncio
+async def test_a_non_terminal_direct_response_keeps_its_warm_stages() -> None:
+    """Opt-in, because parked is correct for some runtimes.
+
+    MiniCPM's ``listen`` decision reuses the same warm downstream stages when
+    the model later speaks, and prewarm only runs on the initial submit -- so
+    releasing them here would leave that later speak turn with no talker.
+    """
+    orchestrator = _direct_response_orchestrator()
+
+    await orchestrator._emit_duplex_direct_output(
+        0,
+        "req-listen",
+        _request_output("req-listen"),
+        _decision(duplex_native_decision="listen"),
+        None,
+        None,
+    )
+
+    assert all(pool.aborted == [] for pool in orchestrator.stage_pools)
+
+
+@pytest.mark.asyncio
+async def test_the_direct_response_still_reaches_the_client() -> None:
+    """Releasing downstream stages must not swallow the response itself."""
+    orchestrator = _direct_response_orchestrator()
+
+    await orchestrator._emit_duplex_direct_output(
+        0,
+        "req-tool-call",
+        _request_output("req-tool-call"),
+        _decision(duplex_release_downstream=True),
+        None,
+        None,
+    )
+
+    orchestrator.output_async_queue.put.assert_awaited_once()
+    message = orchestrator.output_async_queue.put.await_args.args[0]
+    assert message.request_id == "req-tool-call"
+    assert message.stage_id == 0
+    assert message.finished is True
+
+
+@pytest.mark.asyncio
+async def test_every_downstream_pool_is_walked() -> None:
+    """The release does not need to know the pipeline's final stage id.
+
+    It offers the abort to every downstream pool; ``StagePool.abort_requests``
+    already no-ops for a request it holds no route binding for.
+    """
+    orchestrator = _direct_response_orchestrator(num_stages=4)
+
+    await orchestrator._emit_duplex_direct_output(
+        0,
+        "req-deep-pipeline",
+        _request_output("req-deep-pipeline"),
+        _decision(duplex_release_downstream=True),
+        None,
+        None,
+    )
+
+    assert [bool(pool.aborted) for pool in orchestrator.stage_pools] == [False, True, True, True]

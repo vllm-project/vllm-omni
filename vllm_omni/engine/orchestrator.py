@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -820,11 +820,12 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str], *, stage_ids: Iterable[int] | None = None) -> None:
+        """Forward abort requests to stage pools, or to ``stage_ids`` only."""
         if not request_ids:
             return
-        for pool in self.stage_pools:
+        pools = self.stage_pools if stage_ids is None else [self.stage_pools[stage_id] for stage_id in stage_ids]
+        for pool in pools:
             await pool.abort_requests(request_ids)
             pool.release_bindings(request_ids)
 
@@ -1542,6 +1543,20 @@ class Orchestrator:
                 stage_submit_ts=submit_ts,
             )
         )
+
+        # A direct response returns without forwarding, leaving anything
+        # `_prewarm_async_chunk_stages` submitted downstream parked on chunks
+        # that will never arrive. Parked requests hold a slot and are subtracted
+        # by `get_num_unfinished_requests`, so `EngineCore.has_work()` reads
+        # false and that stage stops scheduling -- for every later request too.
+        #
+        # Opt-in: parked is correct when the direct response is *not* terminal.
+        # MiniCPM's `listen` decision reuses those warm stages when the model
+        # later speaks, and prewarm only runs on the initial submit.
+        if decision.metadata.get("duplex_release_downstream") is True:
+            # Pools this request never reached have no route binding, so
+            # aborting them is a no-op; no need to know the final stage id.
+            await self._abort_request_ids([req_id], stage_ids=range(stage_id + 1, len(self.stage_pools)))
 
     @staticmethod
     def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:
