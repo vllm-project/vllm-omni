@@ -3412,10 +3412,23 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     ) -> bool:
         return False
 
-    def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
+    def get_image_prompt_texts(
+        self,
+        image_size: ImageSize,
+        image_idx: int = 0,
+        max_slice_nums: int | None = None,
+        use_image_id: bool | None = None,
+    ) -> str:
+        # ``process_images`` forwards ``mm_processor_kwargs`` to the pixel path, so the
+        # placeholder grid must honor the same ``max_slice_nums``; otherwise a request that
+        # sets it (e.g. interleaved omni frames with max_slice_nums=1) produces fewer image
+        # features than placeholder ``<unk>`` slots. ``use_image_id`` is likewise per-request
+        # so callers can match MiniCPM-o's omni path, which emits no ``<image_id>`` prefix.
         return self.info.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
+            max_slice_nums=max_slice_nums,
+            **({} if use_image_id is None else {"use_image_id": use_image_id}),
         )
 
     def get_video_prompt_texts(self, image_size: ImageSize, num_frames: int) -> str:
@@ -3605,13 +3618,21 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
+        image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
+
         def get_image_replacement(item_idx: int):
             images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
             image_size = images.get_image_size(item_idx)
 
             return PromptUpdateDetails.select_text(
-                self.get_image_prompt_texts(image_size, item_idx),
+                self.get_image_prompt_texts(
+                    image_size,
+                    item_idx,
+                    max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
+                    use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
+                ),
                 "<unk>",
             )
 

@@ -778,6 +778,7 @@ class TestSingleStageReplicaInitialization:
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
             omni_master_port=26000,
+            log_stats=True,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
@@ -811,10 +812,17 @@ class TestSingleStageReplicaInitialization:
         sentinel_client = SimpleNamespace()
 
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
+        client_kwargs: dict[str, Any] = {}
+
+        def _capture_make_async_mp_client(**kwargs):
+            client_kwargs.update(kwargs)
+            events.append("attach")
+            return sentinel_client
+
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
-            side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
+            side_effect=_capture_make_async_mp_client,
         )
 
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
@@ -824,6 +832,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
+        assert client_kwargs["log_stats"] is True
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):

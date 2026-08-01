@@ -1420,43 +1420,87 @@ class SkipSoftmaxSpec:
 
 
 @dataclass
+class AttnQuantSpec:
+    dtype_qk: str | None = None
+    dtype_vo: str | None = None
+    q_block_size: int = 1
+    k_block_size: int = 16
+    flashinfer_backend: str | None = None
+
+    _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
+    _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
+
+    def __post_init__(self) -> None:
+        for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
+            if v is not None and v not in self._VALID_DTYPES:
+                raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
+        for name, v in (("q_block_size", self.q_block_size), ("k_block_size", self.k_block_size)):
+            if v not in self._VALID_BLOCK_SIZES:
+                raise ValueError(
+                    f"quant.{name}={v!r} unsupported; kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
+                )
+
+    @property
+    def enabled(self) -> bool:
+        return self.dtype_qk is not None or self.dtype_vo is not None
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
+    quant: AttnQuantSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
-        self.skip_softmax = self._coerce_skip_softmax(self.skip_softmax)
+        self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
+        self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
-                f"Remove skip_softmax or set backend to TRTLLM_ATTN."
+                "Remove skip_softmax or set backend to TRTLLM_ATTN."
+            )
+        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+            raise ValueError(
+                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
 
     @staticmethod
-    def _coerce_skip_softmax(value: Any) -> SkipSoftmaxSpec | None:
-        if value is None or isinstance(value, SkipSoftmaxSpec):
+    def _coerce(value: Any, cls: type, field_name: str) -> Any:
+        if value is None or isinstance(value, cls):
             return value
         if isinstance(value, Mapping):
-            return SkipSoftmaxSpec(**dict(value))
-        raise TypeError(f"Expected dict or SkipSoftmaxSpec for skip_softmax, got {type(value)!r}")
+            return cls(**dict(value))
+        raise TypeError(f"Expected dict or {cls.__name__} for {field_name}, got {type(value)!r}")
 
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
-        if self.skip_softmax is None:
-            return None
-        ss = self.skip_softmax
         kw: dict[str, Any] = {}
-        if ss.threshold is not None:
-            kw["skip_softmax_threshold"] = ss.threshold
-        if ss.target_sparsity is not None:
-            kw["target_sparsity"] = ss.target_sparsity
-        if ss.disabled_until_timestep:
-            kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        if self.skip_softmax is not None:
+            ss = self.skip_softmax
+            if ss.threshold is not None:
+                kw["skip_softmax_threshold"] = ss.threshold
+            if ss.target_sparsity is not None:
+                kw["target_sparsity"] = ss.target_sparsity
+            if ss.disabled_until_timestep:
+                kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        if self.quant is not None and self.quant.enabled:
+            q = self.quant
+            quant_kw: dict[str, Any] = {
+                "dtype_qk": q.dtype_qk,
+                "q_block_size": q.q_block_size,
+                "k_block_size": q.k_block_size,
+            }
+            if q.dtype_vo is not None:
+                quant_kw["dtype_vo"] = q.dtype_vo
+            if q.flashinfer_backend is not None:
+                quant_kw["flashinfer_backend"] = q.flashinfer_backend
+            kw["quant"] = quant_kw
         return kw or None
 
 
@@ -1526,7 +1570,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax"}
+        spec_keys = {"backend", "skip_softmax", "quant"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
