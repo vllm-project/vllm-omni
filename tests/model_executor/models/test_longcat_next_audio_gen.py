@@ -10,6 +10,7 @@ reproduce the reference's delay/text_end gating.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
@@ -21,6 +22,8 @@ from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next import (
     LongcatNextForCausalLM,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 HIDDEN = 4
 NUM_LEVELS = 8

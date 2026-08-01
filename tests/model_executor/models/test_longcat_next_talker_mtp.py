@@ -10,11 +10,10 @@ embeddings so the whole body runs on CPU, which is where that class of
 runtime-only AttributeError/shape bug is cheap to catch.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn as nn
+from types import SimpleNamespace
 
 from vllm_omni.model_executor.models.longcat_next import modeling_longcat_next as mln
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
@@ -33,6 +32,8 @@ AUDIO_OFFSET = 131125
 VISUAL_CODEBOOK_SIZES = [16384] * 8
 VISUAL_OFFSET = 150581
 HIDDEN = 8
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeTPGroup:
