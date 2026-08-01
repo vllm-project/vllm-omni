@@ -967,6 +967,10 @@ def destroy_model_parallel():
     vllm_parallel_state._EP = None
     _EXPERT_PARALLEL_GROUP_RANKS = None
 
+    if vllm_parallel_state._PP and vllm_parallel_state._PP is not _PP:
+        vllm_parallel_state._PP.destroy()
+    vllm_parallel_state._PP = None
+
     if _PP:
         _PP.destroy()
     _PP = None
