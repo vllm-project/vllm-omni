@@ -193,6 +193,15 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     assert LTX2TwoStagePipeline.component_profile is LTX2_TWO_STAGE_COMPONENT_PROFILE
     assert LTX2TwoStagePipeline.pipeline_recipe is LTX2_TWO_STAGE_RECIPE
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
+    for pipeline_cls, profile in (
+        (LTX2Pipeline, LTX2_COMPONENT_PROFILE),
+        (LTX2TwoStagePipeline, LTX2_TWO_STAGE_COMPONENT_PROFILE),
+        (LTX2DistilledPipeline, LTX2_DISTILLED_COMPONENT_PROFILE),
+    ):
+        assert pipeline_cls._dit_modules == list(profile.dit_modules)
+        assert pipeline_cls._encoder_modules == list(profile.encoder_modules)
+        assert pipeline_cls._vae_modules == list(profile.vae_modules)
+        assert pipeline_cls._resident_modules == list(profile.resident_modules)
     assert LTX2_DISTILLED_COMPONENT_PROFILE.checkpoint_kind == "distilled"
     assert LTX23_DISTILLED_COMPONENT_PROFILE.checkpoint_kind == "distilled"
     assert LTX2_TWO_STAGE_COMPONENT_PROFILE.checkpoint_kind == "regular"
@@ -850,7 +859,8 @@ def test_ltx_connector_attention_dispatches_through_omni_kernel(has_learned_regi
 
 def test_ltx2_distilled_pipeline_shares_recipe_runtime():
     assert issubclass(LTX2DistilledPipeline, LTXI2VConditioningMixin)
-    assert issubclass(LTX2DistilledPipeline, LTX2Pipeline)
+    assert issubclass(LTX2DistilledPipeline, LTXRuntime)
+    assert not issubclass(LTX2DistilledPipeline, LTX2Pipeline)
     assert LTX2DistilledPipeline._run_recipe is LTXRuntime._run_recipe
     assert "_forward_request" not in LTX2DistilledPipeline.__dict__
 
@@ -859,7 +869,9 @@ def test_ltx_two_stage_entry_is_a_thin_pipeline_variant():
     assert "_run_recipe" not in LTX2TwoStagePipeline.__dict__
     assert "_forward_request" not in LTX2TwoStagePipeline.__dict__
     assert "load_weights" not in LTX2TwoStagePipeline.__dict__
-    assert issubclass(LTX2TwoStagePipeline, LTX2Pipeline)
+    assert issubclass(LTX2TwoStagePipeline, LTXI2VConditioningMixin)
+    assert issubclass(LTX2TwoStagePipeline, LTXRuntime)
+    assert not issubclass(LTX2TwoStagePipeline, LTX2Pipeline)
 
 
 def test_ltx_variants_share_denoise_loop_and_i2v_conditioning():

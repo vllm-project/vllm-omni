@@ -181,10 +181,18 @@ curl -X POST http://localhost:8000/v1/videos/sync \
   -o ltx_t2v.mp4
 ```
 
-For I2V, add exactly one initial image to the request above:
+An I2V request supplies exactly one initial image:
 
 ```bash
--F "input_reference=@/absolute/path/to/reference.png"
+curl -X POST http://localhost:8000/v1/videos/sync \
+  -F "prompt=A cinematic close-up of ocean waves at golden hour." \
+  -F "negative_prompt=worst quality, inconsistent motion, blurry, jittery, distorted" \
+  -F "size=768x512" \
+  -F "num_frames=121" \
+  -F "fps=24" \
+  -F "seed=42" \
+  -F "input_reference=@/absolute/path/to/reference.png" \
+  -o ltx_i2v.mp4
 ```
 
 Use `image_reference` for a URL or JSON-safe reference, but not together with
