@@ -402,6 +402,10 @@ class Wan22Pipeline(
         else:
             self.transformer_2 = None
 
+        for transformer in (self.transformer, self.transformer_2):
+            if transformer is not None:
+                transformer.preserve_vsa_all_blocks = self.is_dmd
+
         # Store the active transformer config
         if load_transformer:
             self.transformer_config = self.transformer.config
@@ -414,7 +418,9 @@ class Wan22Pipeline(
         self._flow_shift = (
             FASTWAN_DMD_SCHEDULER_SHIFT
             if self.is_dmd
-            else od_config.flow_shift if od_config.flow_shift is not None else 5.0
+            else od_config.flow_shift
+            if od_config.flow_shift is not None
+            else 5.0
         )
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
@@ -598,9 +604,7 @@ class Wan22Pipeline(
             num_steps = len(FASTWAN_DMD_TIMESTEPS)
         else:
             num_steps = (
-                40
-                if req.sampling_params.num_inference_steps is None
-                else req.sampling_params.num_inference_steps
+                40 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
             )
 
         # Respect per-request guidance_scale when explicitly provided.
@@ -1002,9 +1006,7 @@ class Wan22Pipeline(
         # Public FullAttn/DMD checkpoints do not contain gate projections. The
         # model initializes those projections to zero, which intentionally means
         # sparse-only VSA. A VSA-trained checkpoint still overwrites them above.
-        loaded_weights.update(
-            name for name, _ in self.named_parameters() if ".to_gate_compress." in name
-        )
+        loaded_weights.update(name for name, _ in self.named_parameters() if ".to_gate_compress." in name)
         return loaded_weights
 
     def check_inputs(

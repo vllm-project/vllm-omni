@@ -1614,6 +1614,45 @@ $$
 
 这不是纯 DMD 的隔离加速比，因为两边同时存在 attention backend 与 CFG 设置差异。画质结论也不能只靠单个样例，应继续做多 prompt、相同 seed 的人工盲评和 VBench/CLIP 类指标。原生模型卡官方 Diffusers 示例为 50 steps、guidance 5.0；本次 30 steps 是按工程对照需求运行。
 
+
+### 9.4 原生 Wan：VSA top-k 精度与性能对比
+
+测试条件：同一原生 Wan2.2-TI2V-5B checkpoint、官方小猫输入与 prompt、704×1280、121 帧、24 fps、seed 1024、30 denoise steps。旧批次以原生 TORCH_SDPA 输出为参考，PSNR/SSIM 衡量的是逐帧像素相似度，不是绝对感知画质或 VBench 分数。
+
+| 路径 | 实际 route | 保留率 | denoise | 端到端 | 相对旧 SDPA 端到端 | PSNR / dB | SSIM |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 原生 SDPA（旧参考） | SDPA | 100% | 57.3 s | 63.48 s | 1.000× | ∞ | 1.0000 |
+| VSA topk=64 | VSA | 53.3% | 48.6 s | 54.54 s | 1.164× | 17.72 | 0.6663 |
+| VSA topk=96 | VSA | 80.0% | 58.8 s | 64.86 s | 0.979× | 22.42 | 0.7754 |
+| VSA topk=120（保留的旧路径） | VSA，全块但仍评分 | 100% | 67.2 s | 73.29 s | 0.866× | 27.71 | 0.8807 |
+
+旧批次说明：
+
+- topk=64 的 attention 支持最稀疏，速度最好，但与 SDPA 参考的像素轨迹偏差最大。
+- topk=96 的相似度明显提高，但本次端到端已经略慢于 SDPA。
+- 旧 topk=120 仍执行 block score、Top-K 和 VSA kernel，因而比 SDPA 慢约 15.5%；该视频与结果被保留作为优化前对照。
+- 生成模型的微小 attention 数值差异会经 30 个扩散步骤逐步放大，因此 PSNR/SSIM 适合比较同一 seed 的轨迹接近程度，不能直接等同于人眼画质。
+
+现在采用 checkpoint-aware 自动路由：
+
+    native Wan + topk == num_blocks -> SDPA
+    FastVideo/DMD + topk == num_blocks -> VSA_ALL_BLOCKS
+
+用户指定 FASTVIDEO_VSA 时，backend 会首次打印动态块数、Top-K、保留率、checkpoint 类型与最终 route。例如本次原生模型输出：
+
+    FASTVIDEO_VSA routing: seq_len=27280, dit_seq_shape=(31, 40, 22),
+    block_size=(4, 8, 8), num_blocks=120, topk=120, keep_ratio=100.0%,
+    checkpoint_mode=native, route=SDPA
+
+为验证新分流，另做了当前代码的同参 A/B 批次：
+
+| 当前批次 | 用户选择 | 实际 route | denoise | 端到端 | PSNR / dB | SSIM |
+|---|---|---|---:|---:|---:|---:|
+| 直接参考 | TORCH_SDPA | SDPA | 约 67.8 s | 74.02 s | ∞ | 1.0000 |
+| 自动分流 | FASTVIDEO_VSA, topk=120 | SDPA | 约 54.6 s | 60.41 s | 27.49 | 0.8833 |
+
+两条路径最终都调用 SDPA 数学实现，但并非 bitwise 相同：backend 构造、regional compile 图和 BF16 运算顺序存在数值扰动，并会被 30-step 迭代放大。两次都是独立进程的单次冷启动，首次编译耗时不同，因此 74.02 s 与 60.41 s 不能当作稳定的 SDPA 加速结论；它们主要证明自动分流可运行且避免了旧 VSA-120 的评分与 sparse-kernel 开销。正式性能结论应在同一进程完成 warm-up 后重复多轮并报告中位数。
+
 ## 10. 结论
 
 当前同一份 `Wan22Pipeline` 已同时支持：

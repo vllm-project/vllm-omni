@@ -737,6 +737,7 @@ class WanTransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
         vsa_dit_seq_shape: tuple[int, int, int] | None = None,
+        preserve_vsa_all_blocks: bool = False,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -760,6 +761,8 @@ class WanTransformerBlock(nn.Module):
         self_attn_extra = {}
         if vsa_dit_seq_shape is not None:
             self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
+        if preserve_vsa_all_blocks:
+            self_attn_extra["preserve_vsa_all_blocks"] = True
         self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask, extra=self_attn_extra)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
@@ -941,6 +944,9 @@ class WanTransformer3DModel(nn.Module):
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
+        # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
+        self.preserve_vsa_all_blocks = False
+
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
         # with PPMissingLayer so that weight names stay globally consistent.
@@ -1084,6 +1090,7 @@ class WanTransformer3DModel(nn.Module):
                 rotary_emb,
                 hidden_states_mask,
                 vsa_dit_seq_shape,
+                self.preserve_vsa_all_blocks,
             )
 
         if not is_pipeline_last_stage():

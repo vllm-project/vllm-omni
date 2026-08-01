@@ -170,6 +170,12 @@ def _get_gate_compress(attn_metadata: AttentionMetadata | None) -> torch.Tensor 
     return value if isinstance(value, torch.Tensor) else None
 
 
+def _preserve_vsa_all_blocks(attn_metadata: AttentionMetadata | None) -> bool:
+    if attn_metadata is None:
+        return False
+    return attn_metadata.extra.get("preserve_vsa_all_blocks") is True
+
+
 class FastVideoVSABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -322,16 +328,33 @@ class FastVideoVSAImpl(AttentionImpl):
         seq_len = query.shape[1]
         dit_seq_shape = _get_vsa_dit_seq_shape(attn_metadata)
         assert dit_seq_shape is not None
+        num_blocks = math.prod(
+            math.ceil(seq_dim / tile_dim) for seq_dim, tile_dim in zip(dit_seq_shape, self.block_size)
+        )
+        preserve_all_blocks = _preserve_vsa_all_blocks(attn_metadata)
+        use_native_sdpa = self.topk == num_blocks and not preserve_all_blocks
+        route = "SDPA" if use_native_sdpa else "VSA_ALL_BLOCKS" if self.topk == num_blocks else "VSA"
+        checkpoint_mode = "fastvideo_dmd" if preserve_all_blocks else "native"
         logger.info_once(
-            "FASTVIDEO_VSA using video_sparse_attn_bshd: seq_len=%d, dit_seq_shape=%s, heads=%d, head_size=%d, "
-            "topk=%d, block_size=%s",
+            "FASTVIDEO_VSA routing: seq_len=%d, dit_seq_shape=%s, block_size=%s, num_blocks=%d, "
+            "topk=%d, keep_ratio=%.1f%%, checkpoint_mode=%s, route=%s",
             seq_len,
             dit_seq_shape,
-            query.shape[2],
-            query.shape[3],
-            self.topk,
             self.block_size,
+            num_blocks,
+            self.topk,
+            100.0 * self.topk / num_blocks,
+            checkpoint_mode,
+            route,
         )
+        if use_native_sdpa:
+            return self._fallback(
+                query,
+                key,
+                value,
+                attn_metadata,
+                f"topk {self.topk} selects all blocks for a native checkpoint",
+            )
 
         try:
             tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index = _get_tile_metadata(
@@ -357,9 +380,7 @@ class FastVideoVSAImpl(AttentionImpl):
             if gate_compress is None:
                 gate_compress = torch.zeros_like(query)
             elif gate_compress.shape != query.shape:
-                raise ValueError(
-                    f"gate_compress shape {gate_compress.shape} must match query shape {query.shape}"
-                )
+                raise ValueError(f"gate_compress shape {gate_compress.shape} must match query shape {query.shape}")
             gate_tiled = torch.zeros_like(query_tiled)
             gate_tiled[:, non_pad_index] = gate_compress[:, tile_partition_indices]
             compress_attn_weight = gate_tiled
