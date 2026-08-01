@@ -777,6 +777,7 @@ class _FakeLogitsProcessor:
 
 
 _AUDIOGEN_START_TOKEN_ID = 131123
+_AUDIOGEN_END_TOKEN_ID = 131124
 _AUDIOTEXT_PAD_TOKEN_ID = 131122
 
 
@@ -818,11 +819,18 @@ class TestComputeLogits:
         out = M.compute_logits(logits_model, hidden)
         assert out[0, logits_model._eos_id] == float("-inf")
 
-    def test_does_not_suppress_eos_for_terminal_request(self, logits_model):
+    def test_terminal_request_forces_audiogen_end(self, logits_model):
+        """terminal must not lift all forcing: EOS stays banned and the row is
+        pinned to <longcat_audiogen_end> so the audio segment closes cleanly
+        instead of letting the whole request die via real EOS."""
         _add_audio_state(logits_model, "r0", terminal=True)
         hidden = torch.zeros(1, 4096)
         out = M.compute_logits(logits_model, hidden)
-        assert out[0, logits_model._eos_id] != float("-inf")
+        assert out[0, logits_model._eos_id] == float("-inf")
+        assert out[0, _AUDIOGEN_END_TOKEN_ID] == 0.0
+        assert (out[0, :] == float("-inf")).sum() >= self.VOCAB - 2, (
+            "terminal should force all entries to -inf except audiogen_end"
+        )
 
     def test_does_not_suppress_eos_for_request_not_in_audio_gen(self, logits_model):
         hidden = torch.zeros(1, 4096)
@@ -867,5 +875,7 @@ class TestComputeLogits:
         _add_audio_state(logits_model, "r1", terminal=False)
         hidden = torch.zeros(2, 4096)
         out = M.compute_logits(logits_model, hidden)
-        assert out[0, logits_model._eos_id] != float("-inf")  # terminal: untouched
+        # terminal: still EOS-banned, forced to audiogen_end close
+        assert out[0, logits_model._eos_id] == float("-inf")
+        assert out[0, _AUDIOGEN_END_TOKEN_ID] == 0.0
         assert out[1, logits_model._eos_id] == float("-inf")  # active: suppressed
