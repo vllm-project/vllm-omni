@@ -1898,6 +1898,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             "temperature": subtalker_params.get("temperature"),
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
+            "repetition_penalty": subtalker_params.get("repetition_penalty"),
         }
         if decode_batch_size == 1:
             if row_generators[0] is not None:

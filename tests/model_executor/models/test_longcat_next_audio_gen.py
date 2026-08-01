@@ -146,6 +146,33 @@ def test_make_omni_output_stashes_hidden_state_for_next_step():
     assert torch.equal(model._audio_gen["r0"]["last_hidden"], hidden[-1:])
 
 
+def test_make_omni_output_stashes_per_request_hidden_with_spans():
+    """With request_token_spans (aligned 1:1 with the info dicts), each active
+    gen request stashes its own hidden row instead of everyone receiving
+    model_output[-1:] from the last request (multi-request decode)."""
+    model = _model(
+        _audio_gen={"rA": {"terminal": False}},
+        _visual_gen={"rB": {"terminal": False}},
+    )
+    hidden = torch.tensor([
+        [1.0, 1.0, 1.0, 1.0],
+        [2.0, 2.0, 2.0, 2.0],
+    ])
+    buffer = [
+        {"req_id": "rA", "codes": {"audio": _frame(3)}},
+        {"req_id": "rB", "codes": {"audio": _frame(9)}},
+    ]
+
+    LongcatNextForCausalLM.make_omni_output(
+        model, hidden,
+        model_intermediate_buffer=buffer,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    assert torch.equal(model._audio_gen["rA"]["last_hidden"], hidden[0:1])
+    assert torch.equal(model._visual_gen["rB"]["last_hidden"], hidden[1:2])
+
+
 # ---------------------------------------------------------------- #
 # _advance_audio_gen
 # ---------------------------------------------------------------- #

@@ -265,6 +265,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # supply one via sampling_params.extra_args; real callers should
         # supply token_w explicitly once this path is GPU-verified.
         self._default_token_w = 37
+        self._default_token_h = 37
         # NOT pre-declared here (e.g. `= None`): nn.Module.register_buffer
         # raises KeyError("attribute already exists") if the name is already
         # a plain instance attribute, even if its value is None. It must stay
@@ -513,7 +514,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _advance_visual_gen(
         self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
-        token_w: int | None = None,
+        token_w: int | None = None, token_h: int | None = None,
     ) -> dict[str, Any]:
         """Update image-gen state based on the last emitted visible token.
 
@@ -523,24 +524,30 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         audio has. It tracks a 2D grid instead: every (token_w + 1)-th step
         is a row boundary, forced to IMAGE_NEWLINE with its sampled pixel
         discarded (output_processor.py:204-216); every other step is a real
-        pixel, forced to IMAGE_PAD. Termination is a sentinel on the
-        LEVEL-0 sampled code (checked in talker_mtp, not here), not a
-        visible-stream token -- IMAGE_END_TOKEN_ID never appears as a
-        sampled code (level-0 head output is codebook_sizes[0]+1 wide, so
-        codebook_sizes[0] itself is the end-of-image sentinel class, exactly
-        like audio's chunk-end sentinel).
+        pixel, forced to IMAGE_PAD.
+
+        Termination is the grid bound: once gen_step reaches
+        token_h * (token_w + 1), all rows are emitted, so the step is marked
+        terminal and its visible token forced to IMAGE_END (in compute_logits).
+        The reference instead terminates on ``multi_ids[0] ==
+        IMAGE_END_TOKEN_ID`` (state_machine.py:84), but that is unreachable
+        because the level-0 end-of-image sentinel class is masked out of the
+        head output (output_processor.py:312), so a request only ends when the
+        caller's max_new_tokens runs out -- the source of the image overrun.
         """
         update: dict[str, Any] = {}
         if last_token == IMG_START_TOKEN_ID:
             self._visual_gen[request_id] = {
                 "gen_step": 0,
                 "token_w": token_w or self._default_token_w,
+                "token_h": token_h or self._default_token_h,
                 "ext_id": IMG_PAD_TOKEN_ID,
                 "terminal": False,
             }
             if self._audio_debug:
-                logger.info("[longcat-image] req=%s visual_gen created (token_w=%s)",
-                            request_id, self._visual_gen[request_id]["token_w"])
+                logger.info("[longcat-image] req=%s visual_gen created (token_w=%s, token_h=%s)",
+                            request_id, self._visual_gen[request_id]["token_w"],
+                            self._visual_gen[request_id]["token_h"])
         elif last_token == IMG_END_TOKEN_ID:
             self._visual_gen.pop(request_id, None)
             if self._audio_debug:
@@ -550,13 +557,28 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if state is not None and not state["terminal"]:
             gen_step = state["gen_step"]
             state["gen_step"] = gen_step + 1
-            is_row_boundary = state["gen_step"] % (state["token_w"] + 1) == 0
-            state["ext_id"] = IMG_NEWLINE_TOKEN_ID if is_row_boundary else IMG_PAD_TOKEN_ID
-            if self._audio_debug and self._dbg_step(gen_step):
-                logger.info(
-                    "[longcat-image] req=%s advance step=%d last_token=%d ext_id=%d row_boundary=%s",
-                    request_id, gen_step, last_token, state["ext_id"], is_row_boundary,
-                )
+            token_w = state["token_w"]
+            grid_end = state["token_h"] * (token_w + 1)
+            if state["gen_step"] >= grid_end:
+                # Grid complete; this step would be a trailing row-boundary
+                # newline, so close the image instead (visible IMG_END is
+                # forced in compute_logits; the state pops next step).
+                state["terminal"] = True
+                state["ext_id"] = IMG_END_TOKEN_ID
+                if self._audio_debug:
+                    logger.info(
+                        "[longcat-image] req=%s advance step=%d GRID-END terminal "
+                        "(token_h=%d token_w=%d grid_end=%d)",
+                        request_id, gen_step, state["token_h"], token_w, grid_end,
+                    )
+            else:
+                is_row_boundary = state["gen_step"] % (token_w + 1) == 0
+                state["ext_id"] = IMG_NEWLINE_TOKEN_ID if is_row_boundary else IMG_PAD_TOKEN_ID
+                if self._audio_debug and self._dbg_step(gen_step):
+                    logger.info(
+                        "[longcat-image] req=%s advance step=%d last_token=%d ext_id=%d row_boundary=%s",
+                        request_id, gen_step, last_token, state["ext_id"], is_row_boundary,
+                    )
             last_hidden = state.get("last_hidden")
             if last_hidden is None:
                 last_hidden = torch.zeros(1, self.config.hidden_size, device=device, dtype=dtype)
@@ -607,9 +629,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if not isinstance(additional_information, dict):
             additional_information = info
         token_w = additional_information.get("token_w")
+        token_h = additional_information.get("token_h")
         update_dict.update(self._advance_visual_gen(
             request_id, last_token, device=input_ids.device, dtype=self.dtype,
-            token_w=token_w,
+            token_w=token_w, token_h=token_h,
         ))
 
         return input_ids, out.to(self.dtype), update_dict
@@ -675,19 +698,36 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if not isinstance(model_output, torch.Tensor):
             return model_output
 
-        # Stash last position hidden state for each audio/image-gen request.
-        # With max_num_seqs=1 decode, hidden_states[-1] is the single
-        # decode token. TODO: use query_start_loc for multi-request alignment.
-        if self._audio_gen or self._visual_gen:
-            # For single-request decode, the last position is the active request.
-            # Store as [1, hidden_size] for the runner's last_talker_hidden buffer.
-            for req_id in list(self._audio_gen.keys()) + list(self._visual_gen.keys()):
-                state = self._audio_gen.get(req_id) or self._visual_gen.get(req_id)
-                state["last_hidden"] = model_output[-1:].detach().clone()
-
         info_dicts = kwargs.get("model_intermediate_buffer")
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
+
+        # Stash each active request's own last-position hidden state. During
+        # decode model_output is flat [num_tokens, hidden]; the runner passes
+        # request_token_spans (aligned 1:1 with info_dicts, each carrying its
+        # req_id) so a multi-request batch gets the right row instead of
+        # everyone inheriting model_output[-1:] from the last request.
+        spans = kwargs.get("request_token_spans")
+        active_ids = list(self._audio_gen.keys()) + list(self._visual_gen.keys())
+        if active_ids and isinstance(spans, list) and len(spans) == len(info_dicts):
+            for idx, info in enumerate(info_dicts):
+                if not isinstance(info, dict):
+                    continue
+                req_id = info.get("req_id")
+                if req_id is None:
+                    continue
+                state = self._audio_gen.get(req_id) or self._visual_gen.get(req_id)
+                if state is None:
+                    continue
+                start, end = spans[idx]
+                row = model_output[start:end]
+                if row.numel():
+                    state["last_hidden"] = row[-1:].detach().clone()
+        elif active_ids:
+            # Fallback for callers without request_token_spans (e.g. tests).
+            for req_id in active_ids:
+                state = self._audio_gen.get(req_id) or self._visual_gen.get(req_id)
+                state["last_hidden"] = model_output[-1:].detach().clone()
 
         # The runner's talker_mtp_output_key is a single fixed ("codes",
         # "audio") destination (gpu_model_runner.py) regardless of which
@@ -867,8 +907,37 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         temperature: float = 0.5,
         top_k: int = 5,
         top_p: float = 0.85,
+        repetition_penalty: float = 1.0,
+        past_codes: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Sample one audio code from logits, matching generation_config defaults."""
+        """Sample one audio code from logits, matching generation_config defaults.
+
+        ``None`` sampling keys are coalesced to the defaults (the runner passes
+        explicit ``None`` when subtalker_sampling_params is unset; ``None``
+        would otherwise fall through to greedy argmax or raise on temperature).
+
+        ``repetition_penalty``/``past_codes`` implement the reference's
+        code-level penalty (output_processor.py:369-397): each code already
+        sampled for this level is penalised (score<0 * penalty, else /penalty)
+        on the raw logits, before temperature. No-op when penalty==1.0 or the
+        level has no history.
+        """
+        if do_sample is None:
+            do_sample = True
+        if temperature is None:
+            temperature = 0.5
+        if top_k is None:
+            top_k = 5
+        if top_p is None:
+            top_p = 0.85
+        if repetition_penalty is None:
+            repetition_penalty = 1.0
+        if past_codes is not None and past_codes.numel() and repetition_penalty != 1.0:
+            past = past_codes.reshape(-1)
+            scores = logits[past]
+            scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+            logits = logits.clone()
+            logits[past] = scores.to(logits.dtype)
         if do_sample and temperature > 0:
             logits = logits / temperature
             if top_k > 0:
@@ -903,6 +972,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         temperature: float,
         top_k: int,
         top_p: float,
+        repetition_penalty: float = 1.0,
+        past_codes: torch.Tensor | None = None,
+        mask_sentinel: bool = False,
     ) -> torch.Tensor:
         """Shared rank-0+broadcast depth-head sampling loop.
 
@@ -910,6 +982,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         (CasualDepthTransformerHead), same hardcoded-cuda:0 workaround, same
         autoregressive per-level accumulator. Returns the broadcast
         codes_row [num_levels], already visible on every rank.
+
+        ``repetition_penalty``/``past_codes`` are forwarded per level to
+        _sample_audio_code (each level penalises its own history, mirroring
+        the reference's ``past_multi_ids[:, :, i]``). ``mask_sentinel`` zeroes
+        the level-0 end-of-image class for the visual head only (reference
+        output_processor.py:312), so the image can never self-terminate early
+        and the grid bound in _advance_visual_gen is the sole terminator.
         """
         codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
         if rank == 0:
@@ -924,8 +1003,19 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
             for level in range(num_levels):
                 logits = head(hid, cum_ids.to(hid.device), code_embed, level)
+                level_logits = logits[0]
+                if mask_sentinel and level == 0:
+                    # codebook_sizes[0] is the end-of-image class (OmniImageHead),
+                    # masked per the reference so it can never be sampled.
+                    sentinel_idx = self.visual_codebook_sizes[0]
+                    if sentinel_idx < level_logits.shape[-1]:
+                        level_logits = level_logits.clone()
+                        level_logits[sentinel_idx] = float("-inf")
                 code = self._sample_audio_code(
-                    logits[0], do_sample=do_sample, temperature=temperature, top_k=top_k, top_p=top_p,
+                    level_logits, do_sample=do_sample, temperature=temperature,
+                    top_k=top_k, top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    past_codes=None if past_codes is None else past_codes[:, level],
                 )
                 sampled_codes.append(int(code))
                 cum_ids[0, level] = code + offset_vals[level] - base
@@ -961,11 +1051,37 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         codebook_sizes = self.audio_codebook_sizes
         num_levels = len(codebook_sizes)
 
-        # Sampling params from runner's subtalker_sampling_params
+        # Sampling params from the runner's subtalker_sampling_params.
+        # _talker_mtp_forward passes explicit None for every key when
+        # subtalker_sampling_params is unset, so `dict.get(key, default)`
+        # yields None (key present), which would fall through to greedy argmax
+        # or raise. Coalesce None to the checkpoint's generation_config
+        # defaults, per modality (audio top_k=5/top_p=0.85/rep=1.3; visual
+        # top_k=1024/top_p=0.75/rep=1.0). An explicit non-None value wins.
         do_sample = kwargs.get("do_sample", True)
         temperature = kwargs.get("temperature", 0.5)
-        top_k = kwargs.get("top_k", 5)
-        top_p = kwargs.get("top_p", 0.85)
+        audio_top_k = kwargs.get("top_k", 5)
+        audio_top_p = kwargs.get("top_p", 0.85)
+        visual_top_k = kwargs.get("top_k", 1024)
+        visual_top_p = kwargs.get("top_p", 0.75)
+        audio_rep_penalty = kwargs.get("repetition_penalty", 1.3)
+        visual_rep_penalty = kwargs.get("repetition_penalty", 1.0)
+        if do_sample is None:
+            do_sample = True
+        if temperature is None:
+            temperature = 0.5
+        if audio_top_k is None:
+            audio_top_k = 5
+        if audio_top_p is None:
+            audio_top_p = 0.85
+        if visual_top_k is None:
+            visual_top_k = 1024
+        if visual_top_p is None:
+            visual_top_p = 0.75
+        if audio_rep_penalty is None:
+            audio_rep_penalty = 1.3
+        if visual_rep_penalty is None:
+            visual_rep_penalty = 1.0
 
         # Per-row results
         all_codes = torch.full((batch_size, num_levels), -1, dtype=torch.long, device=device)
@@ -1002,9 +1118,14 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     all_codes[row] = -1
                     continue
 
+                past_codes = state.get("past_codes")
+                past_codes_t = (
+                    torch.stack(past_codes).to(device) if past_codes else None
+                )
                 codes_row = self._sample_depth_head(
                     self.audio_head, audio_code_embed, self.audio_offset_vals, num_levels,
-                    last_hidden, rank, tp_group, device, do_sample, temperature, top_k, top_p,
+                    last_hidden, rank, tp_group, device, do_sample, temperature,
+                    audio_top_k, audio_top_p, audio_rep_penalty, past_codes_t,
                 )
 
                 # Detect terminal conditions (reference state_machine.py:97-106)
@@ -1025,6 +1146,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 self._dbg_sampled += 1
                 if frame_kept:
                     self._dbg_kept += 1
+                    # Repetition-penalty history: kept frames only (the
+                    # reference filters discarded rows, output_processor.py:349).
+                    state.setdefault("past_codes", []).append(codes_row.detach().cpu())
                 if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
                     logger.info(
                         "[longcat-audio] req=%s mtp step=%d codes0=%d kept=%s "
@@ -1098,22 +1222,24 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 visual_codebook_sizes = self.visual_codebook_sizes
                 visual_num_levels = len(visual_codebook_sizes)
+                past_codes = state.get("past_codes")
+                past_codes_t = (
+                    torch.stack(past_codes).to(device) if past_codes else None
+                )
                 codes_row = self._sample_depth_head(
                     self.visual_head, visual_code_embed, self.visual_offset_vals, visual_num_levels,
-                    last_hidden, rank, tp_group, device, do_sample, temperature, top_k, top_p,
+                    last_hidden, rank, tp_group, device, do_sample, temperature,
+                    visual_top_k, visual_top_p, visual_rep_penalty, past_codes_t,
+                    mask_sentinel=True,
                 )
 
-                # Termination: level-0 head output is codebook_sizes[0]+1 wide
-                # (see OmniImageHead.heads), so codebook_sizes[0] itself is the
-                # end-of-image sentinel class -- same convention as audio's
-                # chunk-end sentinel, checked the same way (state_machine.py's
-                # GenImageStageStage.handle).
+                # The level-0 end-of-image sentinel class (codebook_sizes[0])
+                # is masked in _sample_depth_head (reference output_processor.py:312)
+                # and so never fires here; the deterministic terminator is the
+                # grid bound in _advance_visual_gen. This check is a defensive
+                # guard for any non-masked path.
                 deoff = int(codes_row[0].item())
                 eoc_terminal = deoff >= visual_codebook_sizes[0]
-                # No max_gen-style safety cap here: the reference's
-                # GenImageStageStage has no analogous "force-end" transition --
-                # a known-size grid (token_h*token_w+rows of newlines)
-                # naturally bounds the loop, unlike audio's open-ended chunks.
 
                 # A row-boundary (newline) step never carries a real pixel,
                 # regardless of what was sampled -- mirrors output_processor.py
@@ -1125,6 +1251,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 self._dbg_sampled += 1
                 if frame_kept:
                     self._dbg_kept += 1
+                    state.setdefault("past_codes", []).append(codes_row.detach().cpu())
                 if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
                     logger.info(
                         "[longcat-image] req=%s mtp step=%d codes0=%d kept=%s "
@@ -1210,13 +1337,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     logits[row, :] = float("-inf")
                     logits[row, AUDIOTEXT_PAD_TOKEN_ID] = 0.0
             elif visual_state is not None:
-                if visual_state.get("terminal"):
-                    continue
-                # Unlike audio (which frees the visible stream until
-                # text_end), image generation has no unforced phase at all --
-                # output_processor.py overwrites text_ids to IMAGE_PAD/
-                # IMAGE_NEWLINE every single GEN_IMAGE_STAGE step, from the
-                # first step after <longcat_img_start> onward.
+                # Image gen has no unforced phase: every GEN_IMAGE_STAGE step
+                # is forced (IMAGE_PAD/NEWLINE/END). The terminal grid-end step
+                # carries ext_id=IMAGE_END, closing the image with
+                # <longcat_img_end>, which pops the state next step.
                 if self._eos_id < logits.shape[-1]:
                     logits[row, self._eos_id] = float("-inf")
                 forced_id = visual_state.get("ext_id", IMG_PAD_TOKEN_ID)
