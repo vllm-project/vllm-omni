@@ -236,6 +236,29 @@ def test_max_gen_cap_marks_terminal(model):
     assert state["ext_id"] == AUDIOGEN_END_TOKEN_ID
 
 
+def test_max_gen_cap_emits_chunk_boundary_row(model):
+    """Regression: a max_gen-forced close must leave a real chunk-end MARKER
+    row (level-0 == codebook_sizes[0], matching LongcatNextAudioDecoder's
+    _split_chunks boundary check) in the returned codes, not the raw sampled
+    frame and not an all -1 discard row.
+
+    Before this fix, a max_gen close kept the row as an ordinary real frame
+    (no boundary marker at all), and a natural eoc close produced an all -1
+    row that _extract_codes_from_output strips entirely before the decoder
+    ever sees it. Either way, once the audio-termination fix let a single
+    request produce multiple audio segments (re-entering
+    <longcat_audiogen_start> after a forced close), those segments'
+    codes concatenated with no surviving boundary between them --
+    _split_chunks then treated it as one oversized chunk and overflowed the
+    checkpoint's fixed-size positional embedding table.
+    """
+    state = _state(gen_step=750)
+    _, codes = _call(model, state)
+
+    assert int(codes[0, 0]) == CODEBOOK_SIZES[0]
+    assert all(int(c) == 0 for c in codes[0, 1:].tolist())
+
+
 def test_talker_mtp_none_sampling_params_sample_not_greedy(model):
     """The runner passes explicit None sampling keys when subtalker_sampling_params
     is unset; talker_mtp must coalesce them to the checkpoint defaults. Otherwise

@@ -1215,15 +1215,42 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 eoc_terminal = audio_start and (deoff >= codebook_sizes[0])
                 # Condition 2: max_gen safety cap — force-end to prevent infinite gen
                 max_gen_terminal = audio_start and gen_step >= self.max_gen
-
-                # Keep codes: discard only for end-of-chunk markers.
-                # For max_gen, codes are valid audio frames per the reference
-                # (GenAudioStageStage checks gen_step == max_gen AFTER the
-                # code predictor has already run for this step).
-                frame_kept = audio_start and not eoc_terminal
-                all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
-
                 is_terminal = eoc_terminal or max_gen_terminal
+
+                # Every terminal row becomes an explicit chunk-end MARKER row
+                # (level-0 = codebook_sizes[0], the same value _split_chunks
+                # in modeling_longcat_next_audio_decoder.py splits on; other
+                # levels are never decoded for a boundary row, so 0 is a safe
+                # placeholder) instead of the -1 discard sentinel.
+                #
+                # -1 rows are stripped entirely by _extract_codes_from_output
+                # before reaching the decoder -- fine for a single natural
+                # eoc in isolation, but our earlier fix (forcing a clean
+                # <longcat_audiogen_end> close on BOTH eoc_terminal AND
+                # max_gen_terminal, instead of leaving the row unconstrained
+                # and letting the whole request end on real EOS) lets one
+                # request legitimately produce multiple audio segments -- the
+                # model can resume and re-enter <longcat_audiogen_start>
+                # after a max_gen-forced close. Previously a max_gen close
+                # kept the row as an ordinary real frame (reference
+                # behavior, which never continues past max_gen) and an eoc
+                # close discarded it as -1 -- neither survives as a boundary
+                # marker once _extract_codes_from_output strips negatives, so
+                # multiple segments' codes concatenate with NO surviving
+                # boundary between them. LongcatNextAudioDecoder's
+                # _split_chunks then sees one giant merged chunk instead of
+                # several bounded ones and overflows the checkpoint's
+                # fixed-size positional embedding table (observed:
+                # `tensor a (5731) != tensor b (3000)` in
+                # modular_longcat_next_audio.py's audio_decoder.forward).
+                frame_kept = audio_start and not is_terminal
+                if is_terminal:
+                    boundary_row = torch.zeros_like(codes_row)
+                    boundary_row[0] = codebook_sizes[0]
+                    all_codes[row] = boundary_row
+                else:
+                    all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
+
                 self._dbg_sampled += 1
                 if frame_kept:
                     self._dbg_kept += 1
