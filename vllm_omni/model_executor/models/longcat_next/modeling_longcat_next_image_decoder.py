@@ -119,15 +119,20 @@ class LongcatNextImageDecoder(nn.Module):
             or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            additional_info = next(
-                (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
-                {},
-            )
+            info_dicts = [
+                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
+            ]
         else:
-            additional_info = next(
-                (info for info in model_intermediate_buffer if isinstance(info, dict)),
-                {},
+            info_dicts = [
+                info for info in model_intermediate_buffer if isinstance(info, dict)
+            ]
+        if len(info_dicts) > 1:
+            logger.warning(
+                "LongcatNextImageDecoder got %d requests in one batch; only the "
+                "first is decoded (max_num_seqs should be 1 for this stage).",
+                len(info_dicts),
             )
+        additional_info = info_dicts[0] if info_dicts else {}
         visual_codes = additional_info.get("visual_token_ids")
         if not visual_codes:
             logger.warning("No visual token IDs provided for image decoder")

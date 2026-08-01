@@ -141,15 +141,24 @@ class LongcatNextAudioDecoder(nn.Module):
             or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            additional_info = next(
-                (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
-                {},
-            )
+            info_dicts = [
+                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
+            ]
         else:
-            additional_info = next(
-                (info for info in model_intermediate_buffer if isinstance(info, dict)),
-                {},
+            info_dicts = [
+                info for info in model_intermediate_buffer if isinstance(info, dict)
+            ]
+        if len(info_dicts) > 1:
+            # The decoder emits a single waveform via OmniOutput; with more
+            # than one request in the batch only the first is decoded. All
+            # shipped deploy YAMLs set max_num_seqs: 1, so this is latent --
+            # warn instead of silently dropping the other requests.
+            logger.warning(
+                "LongcatNextAudioDecoder got %d requests in one batch; only the "
+                "first is decoded (max_num_seqs should be 1 for this stage).",
+                len(info_dicts),
             )
+        additional_info = info_dicts[0] if info_dicts else {}
         audio_codes = additional_info.get("audio_token_ids")
         if not audio_codes:
             logger.warning("No audio token IDs provided for audio decoder")
@@ -176,17 +185,28 @@ class LongcatNextAudioDecoder(nn.Module):
             logger.warning("Audio decoder produced no valid chunks")
             return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
-        # Cross-fade consecutive chunks, mirroring decode_save_concat2.
+        # Cross-fade consecutive chunks, mirroring decode_save_concat2. The
+        # blended seam REPLACES both the previous chunk's tail and the next
+        # chunk's head (they cover the same audio by construction of the
+        # chunked tokenizer decode), so the seam is emitted once and each
+        # chunk's overlap margin is trimmed -- appending the full wave (as
+        # the reference's decode_save_concat does) replays the seam and
+        # stutters at every chunk boundary for long audio. We diverge.
         overlap = self.wave_concat_overlap
-        merged = [waves[0]]
+        parts: list[torch.Tensor] = []
+        prev = waves[0]
         for wave in waves[1:]:
-            prev = merged[-1]
             if prev.shape[1] > overlap and wave.shape[1] > overlap:
                 fade_out = torch.linspace(1.0, 0.0, overlap)[None, :]
                 fade_in = torch.linspace(0.0, 1.0, overlap)[None, :]
-                merged.append(prev[:, -overlap:] * fade_out + wave[:, :overlap] * fade_in)
-            merged.append(wave)
-        waveform = torch.cat(merged, dim=1) if len(merged) > 1 else merged[0]
+                parts.append(prev[:, :-overlap])
+                parts.append(prev[:, -overlap:] * fade_out + wave[:, :overlap] * fade_in)
+                prev = wave[:, overlap:]
+            else:
+                parts.append(prev)
+                prev = wave
+        parts.append(prev)
+        waveform = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
         return OmniOutput(
             text_hidden_states=None,

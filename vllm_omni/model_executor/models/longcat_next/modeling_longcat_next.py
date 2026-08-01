@@ -98,6 +98,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     has_postprocess = True
     have_multimodal_outputs = True
     talker_mtp_accepts_req_infos = True
+    # This model shares one backbone for text and audio: it emits "mtp_inputs"
+    # only while in audio-generation mode, so the runner must skip the talker
+    # decode on text-only steps (gpu_model_runner._talker_mtp_forward).
+    omits_talker_mtp_inputs_when_idle = True
     # preprocess() needs raw token ids (n-gram hashing operates on token ids,
     # not embeddings) even on the supports_mm_inputs path, where upstream
     # vLLM's _prepare_mm_inputs otherwise sets input_ids=None and passes only
@@ -1057,15 +1061,22 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # yields None (key present), which would fall through to greedy argmax
         # or raise. Coalesce None to the checkpoint's generation_config
         # defaults, per modality (audio top_k=5/top_p=0.85/rep=1.3; visual
-        # top_k=1024/top_p=0.75/rep=1.0). An explicit non-None value wins.
+        # top_k=1024/top_p=0.75/rep=1.0). Modality-specific keys
+        # (audio_top_k/visual_top_k, ...) win; the generic key applies to
+        # both only as a fallback, so an audio-tuned value can't silently
+        # override the visual default.
         do_sample = kwargs.get("do_sample", True)
         temperature = kwargs.get("temperature", 0.5)
-        audio_top_k = kwargs.get("top_k", 5)
-        audio_top_p = kwargs.get("top_p", 0.85)
-        visual_top_k = kwargs.get("top_k", 1024)
-        visual_top_p = kwargs.get("top_p", 0.75)
-        audio_rep_penalty = kwargs.get("repetition_penalty", 1.3)
-        visual_rep_penalty = kwargs.get("repetition_penalty", 1.0)
+        audio_top_k = kwargs.get("audio_top_k", kwargs.get("top_k", 5))
+        audio_top_p = kwargs.get("audio_top_p", kwargs.get("top_p", 0.85))
+        visual_top_k = kwargs.get("visual_top_k", kwargs.get("top_k", 1024))
+        visual_top_p = kwargs.get("visual_top_p", kwargs.get("top_p", 0.75))
+        audio_rep_penalty = kwargs.get(
+            "audio_repetition_penalty", kwargs.get("repetition_penalty", 1.3)
+        )
+        visual_rep_penalty = kwargs.get(
+            "visual_repetition_penalty", kwargs.get("repetition_penalty", 1.0)
+        )
         if do_sample is None:
             do_sample = True
         if temperature is None:

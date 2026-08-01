@@ -114,15 +114,20 @@ class LongcatNextMultiDecoder(nn.Module):
             or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            additional_info = next(
-                (info for info in model_intermediate_buffer.values() if isinstance(info, dict)),
-                {},
-            )
+            info_dicts = [
+                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
+            ]
         else:
-            additional_info = next(
-                (info for info in model_intermediate_buffer if isinstance(info, dict)),
-                {},
+            info_dicts = [
+                info for info in model_intermediate_buffer if isinstance(info, dict)
+            ]
+        if len(info_dicts) > 1:
+            logger.warning(
+                "LongcatNextMultiDecoder got %d requests in one batch; only the "
+                "first is decoded (max_num_seqs should be 1 for this stage).",
+                len(info_dicts),
             )
+        additional_info = info_dicts[0] if info_dicts else {}
 
         has_visual = bool(additional_info.get("visual_token_ids"))
         has_audio = bool(additional_info.get("audio_token_ids"))

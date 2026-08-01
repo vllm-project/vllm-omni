@@ -759,7 +759,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.requests = {"req-s1": request}
 
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
     scheduler.waiting = mocker.MagicMock()
@@ -844,7 +844,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
     scheduler.waiting = mocker.MagicMock()
@@ -973,7 +973,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler._pending_finish_reqs = list(pending_finish_reqs)
 
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._free_request = mocker.MagicMock(return_value=(None, None))
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = list(running)
     scheduler.waiting = mocker.MagicMock()
@@ -1029,7 +1029,7 @@ def test_deferred_finish_emits_finished_output(mocker: MockerFixture):
         running=[request],
         pending_finish_reqs=[request],
     )
-    scheduler._free_request.return_value = {"mock": "kv_params"}
+    scheduler._free_request.return_value = ({"mock": "kv_params"}, None)
 
     result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
 
