@@ -845,3 +845,71 @@ def test_audio_cursor_survives_a_turn_boundary() -> None:
     turn(260)
 
     assert seen == [100, 160], f"turn 2 must send only its own 160 samples, got {seen}"
+
+
+# --- text turns -------------------------------------------------------------
+#
+# A text turn is the same chat turn as an audio one with real token ids where
+# the audio span would be. Two things must hold or the thinker reads the turn
+# as empty and answers as if the user said nothing:
+#   * zero `<|audio_pad|>` slots are reserved, since stage 0 fills none;
+#   * no `<|audio_start|>` / `<|audio_end|>`, which tell the thinker to expect
+#     an audio span and make it treat the words as a transcription task.
+
+
+def _text_prompt(*, seq: int, turn_seq: int, final: bool = True, text: str = "hello there", ids=(41, 42)):
+    import vllm_omni.experimental.fullduplex.qwen3omni.runtime as runtime_mod
+
+    original = runtime_mod._encode_text
+    runtime_mod._encode_text = lambda value: list(ids) if value == text else []
+    try:
+        return build_duplex_prompt_token_ids(
+            runtime_config=dict(_SCAFFOLD),
+            payload=text,
+            seq=seq,
+            turn_seq=turn_seq,
+            final=final,
+        )
+    finally:
+        runtime_mod._encode_text = original
+
+
+def test_text_turn_reserves_no_audio_slots() -> None:
+    ids, _audio_offset, audio_tokens = _text_prompt(seq=1, turn_seq=1)
+    assert audio_tokens == 0
+    assert _PAD not in ids
+
+
+def test_text_turn_omits_the_audio_delimiters() -> None:
+    ids, _audio_offset, _audio_tokens = _text_prompt(seq=1, turn_seq=1)
+    assert Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID not in ids
+    assert Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID not in ids
+
+
+def test_text_turn_is_a_well_formed_first_turn() -> None:
+    ids, _audio_offset, _audio_tokens = _text_prompt(seq=1, turn_seq=1)
+    # system block, user opener, the text itself, then close-user/open-assistant
+    assert ids == [1, 2, 3, 4, 5, 41, 42, 6, 7, 8]
+
+
+def test_later_text_turn_closes_the_assistant_turn_first() -> None:
+    ids, _audio_offset, _audio_tokens = _text_prompt(seq=2, turn_seq=2)
+    assert ids == [*_CLOSE_PREV, 4, 5, 41, 42, 6, 7, 8]
+
+
+def test_text_turn_without_a_tokenizer_is_refused() -> None:
+    """Encoding to nothing must fail loudly.
+
+    Sending an empty user turn would prompt the model to answer a question the
+    user never asked, which reads to them as being ignored -- the same failure
+    mode as the unfilled-placeholder bug.
+    """
+    with pytest.raises(ValueError, match="tokenizer"):
+        _text_prompt(seq=1, turn_seq=1, ids=())
+
+
+def test_audio_turn_is_unchanged_by_the_text_path() -> None:
+    ids, audio_offset, audio_tokens = _prompt(seq=1, turn_seq=1, final=False)
+    assert audio_tokens == 13
+    assert ids[5] == Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID
+    assert audio_offset == 6

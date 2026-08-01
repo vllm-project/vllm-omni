@@ -35,6 +35,38 @@ _DEFAULT_INSTRUCTIONS = (
 _DEFAULT_TALKER_MAX_TOKENS = 8192
 
 
+#: Checkpoint tokenizer, cached when a session prepares its runtime config.
+#:
+#: Scaffolding is pre-tokenized at session open (``_scaffolding_token_ids``),
+#: but a client text turn arrives later and has to be encoded on the spot. Both
+#: run in the API server process, so the tokenizer built there is reused rather
+#: than constructed per message. Keyed by model so a mixed-model server cannot
+#: encode with the wrong vocabulary.
+_TOKENIZER_CACHE: dict[str, Any] = {}
+
+
+def _tokenizer_cache_key(model_config: Any) -> str:
+    return str(getattr(model_config, "model", None) or getattr(model_config, "served_model_name", "") or "default")
+
+
+def encode_duplex_text(text: str, *, model_key: str | None = None) -> list[int]:
+    """Encode a client text turn with the checkpoint tokenizer.
+
+    Returns ``[]`` when no tokenizer has been cached yet, which the caller must
+    treat as "cannot accept text" rather than "empty turn" -- reserving zero
+    tokens for a turn the user did type would prompt the model to answer
+    nothing, which reads to them as the model ignoring them.
+    """
+    if not text:
+        return []
+    tokenizer = _TOKENIZER_CACHE.get(model_key) if model_key else None
+    if tokenizer is None:
+        if len(_TOKENIZER_CACHE) != 1:
+            return []
+        tokenizer = next(iter(_TOKENIZER_CACHE.values()))
+    return [int(token_id) for token_id in tokenizer.encode(text)]
+
+
 class Qwen3OmniClientRuntimeConfigError(ServingRuntimeConfigError):
     """A client tried to set server-owned Qwen3-Omni duplex configuration."""
 
@@ -99,7 +131,7 @@ class Qwen3OmniNativeDuplexServingAdapter:
             requires_native_stage_role=True,
             implementation_level="model_native_duplex",
             adapter_patterns=["scheduler_data_plane"],
-            input_modes=["append_audio_chunk", "turn_commit_only"],
+            input_modes=["append_audio_chunk", "turn_commit_only", "append_tokens"],
             signal_sources=["client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=Qwen3OmniDuplexPolicy.CHUNK_PERIOD_MS,
@@ -125,6 +157,9 @@ class Qwen3OmniNativeDuplexServingAdapter:
             tokenizer = cached_tokenizer_from_config(model_config)
         except Exception:  # noqa: BLE001 - no tokenizer, fall back to no scaffolding
             return {}
+
+        # Keep it for client text turns, which cannot be pre-tokenized here.
+        _TOKENIZER_CACHE[_tokenizer_cache_key(model_config)] = tokenizer
 
         def encode(text: str) -> list[int]:
             return [int(token_id) for token_id in tokenizer.encode(text)]

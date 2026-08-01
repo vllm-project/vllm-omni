@@ -167,6 +167,14 @@ class Qwen3OmniStage0DuplexRuntime:
             isinstance(payload, dict) and payload.get(Qwen3OmniDuplexPolicy.TURN_FINAL_KEY) is True
         )
 
+        # An append that reserved no `<|audio_pad|>` slots has no audio span to
+        # fill -- a text turn, or a commit whose buffer earlier appends already
+        # drained. Return before touching the audio buffer: leftover samples
+        # from an earlier partial turn would otherwise be encoded here and
+        # spliced over token ids that are already correct.
+        if _coerce_int(duplex.get("audio_tokens")) == 0:
+            return None
+
         state = self.session(session_id, incarnation)
 
         # Idempotent replay: the scheduler may re-present the same append.

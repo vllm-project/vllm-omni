@@ -83,6 +83,8 @@
   <button id="talk" disabled>Hold to talk</button>
   <button id="bargein" disabled>Barge in</button>
   <button id="sendclip" disabled title="Send a known-good 16 kHz clip, bypassing the mic">Send test clip</button>
+  <input id="textin" disabled placeholder="…or type a message and press Enter"
+         title="Sends input.text.append: one text message is one complete user turn">
   <span id="status" class="sub">idle</span>
 </header>
 
@@ -265,6 +267,7 @@ $("connect").onclick = () => {
     ws = null; recording = false;
     $("connect").textContent = "Connect"; $("talk").disabled = true;
     $("bargein").disabled = true; $("sendclip").disabled = true;
+    $("textin").disabled = true;
     $("status").textContent = "disconnected — click Connect";
     $("k-state").textContent = "disconnected";
     ["s-mic","s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
@@ -277,7 +280,7 @@ $("connect").onclick = () => {
 
     if (t === "session.created" || t === "session.updated") {
       $("talk").disabled = false; $("bargein").disabled = false;
-      $("sendclip").disabled = false;
+      $("sendclip").disabled = false; $("textin").disabled = false;
       $("status").textContent = "ready";
       $("k-state").textContent = "open";
       if (m.session?.id || m.session_id) $("k-sid").textContent = (m.session?.id || m.session_id).slice(0, 22);
@@ -463,6 +466,23 @@ $("sendclip").onclick = async () => {
 // cases `beforeunload` does not (bfcache, mobile), so handle both.
 window.addEventListener("pagehide", closeSession);
 window.addEventListener("beforeunload", closeSession);
+
+// Text turn. Unlike audio there is no buffer and no commit: one message is one
+// complete user turn, so the server treats input.text.append as final.
+$("textin").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.shiftKey) return;
+  e.preventDefault();
+  const text = $("textin").value.trim();
+  if (!text || !ws || ws.readyState !== 1) return;
+  $("textin").value = "";
+  ["s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  setStage("s-mic", "done");
+  $("transcript").classList.add("muted"); $("transcript").textContent = "—";
+  $("status").textContent = "thinking…";
+  commitAt = performance.now();
+  ws.send(JSON.stringify({type:"input.text.append", text}));
+  log(`input.text.append ${JSON.stringify(text)}`, "life");
+});
 
 $("bargein").onclick = () => {
   if (!ws || ws.readyState !== 1) return;

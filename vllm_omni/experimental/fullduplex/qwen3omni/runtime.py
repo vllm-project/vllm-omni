@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Mapping
 from typing import Any
 
 from vllm.logger import init_logger
@@ -58,8 +59,25 @@ SUPPORTED_INPUT_MODES = frozenset(
     {
         DuplexInputMode.APPEND_AUDIO_CHUNK,
         DuplexInputMode.TURN_COMMIT_ONLY,
+        DuplexInputMode.APPEND_TOKENS,
     }
 )
+
+
+def payload_text(payload: object) -> str | None:
+    """The client text of a text turn, or ``None`` for an audio turn.
+
+    ``input.text.append`` hands the runtime a bare ``str``; the dict form is
+    accepted so a caller can attach metadata without changing this contract.
+    Empty text is not a text turn -- it carries nothing to answer.
+    """
+    if isinstance(payload, str):
+        return payload or None
+    if isinstance(payload, Mapping):
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            return text
+    return None
 
 
 def _coerce_int(value: object) -> int | None:
@@ -88,6 +106,11 @@ def duplex_audio_token_count(payload: object) -> int:
     ``Qwen3OmniStage0DuplexRuntime.expected_embedding_count`` both defer to
     ``Qwen3OmniDuplexPolicy.audio_tokens_for_samples``.
     """
+    if payload_text(payload) is not None:
+        # A text turn carries no audio. Falling through to the default chunk
+        # reservation below would reserve `<|audio_pad|>` slots that stage 0
+        # never fills, and the thinker would read the turn as empty.
+        return 0
     num_samples = _payload_num_samples(payload)
     if num_samples > 0:
         return max(1, Qwen3OmniDuplexPolicy.audio_tokens_for_samples(num_samples))
@@ -120,6 +143,17 @@ def _payload_num_samples(payload: object) -> int:
     if isinstance(audio, (bytes, bytearray)):
         return len(audio) // _BYTES_PER_SAMPLE
     return _coerce_int(payload.get("num_samples")) or 0
+
+
+def _encode_text(text: str) -> list[int]:
+    """Encode a client text turn with the checkpoint tokenizer.
+
+    Imported lazily: this module is imported by the worker, where the serving
+    layer's tokenizer cache does not exist and is not needed.
+    """
+    from vllm_omni.experimental.fullduplex.qwen3omni.adapter import encode_duplex_text
+
+    return encode_duplex_text(text)
 
 
 def _token_ids(runtime_config: dict[str, Any], key: str) -> list[int]:
@@ -187,16 +221,36 @@ def build_duplex_prompt_token_ids(
         # on the model answers generically regardless of what was said.
         prefix.append(Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID)
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.NEWLINE_IDS_KEY)
+    # A text turn is the same chat turn with real token ids where the audio
+    # span would be, and no <|audio_start|>/<|audio_end|> -- those delimiters
+    # tell the thinker to expect an audio span, so emitting them around text
+    # makes it read the words as a transcription task. Matches the checkpoint's
+    # own chat template, where a text user turn is just
+    # `<|im_start|>user\n{text}<|im_end|>\n`.
+    text = payload_text(payload)
+    body: list[int]
+    if text is not None:
+        body = _encode_text(text)
+        if not body:
+            raise ValueError(
+                "Qwen3-Omni duplex received a text turn but no tokenizer is available to encode it; "
+                "refusing to send an empty user turn"
+            )
+    else:
+        body = [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens
+
     if starts_turn:
         prefix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_PREFIX_IDS_KEY)
-        prefix.append(Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID)
+        if text is None:
+            prefix.append(Qwen3OmniDuplexPolicy.AUDIO_START_TOKEN_ID)
 
     suffix: list[int] = []
     if closes_turn:
-        suffix.append(Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID)
+        if text is None:
+            suffix.append(Qwen3OmniDuplexPolicy.AUDIO_END_TOKEN_ID)
         suffix += _token_ids(runtime_config, Qwen3OmniDuplexPolicy.TURN_SUFFIX_IDS_KEY)
 
-    prompt_token_ids = prefix + [Qwen3OmniDuplexPolicy.AUDIO_PAD_TOKEN_ID] * audio_tokens + suffix
+    prompt_token_ids = prefix + body + suffix
     logger.info(
         "[qwen3omni-duplex] plan seq=%s turn_seq=%s final=%s closes_turn=%s "
         "prefix=%d audio=%d suffix=%d total=%d scaffold_keys=%s",

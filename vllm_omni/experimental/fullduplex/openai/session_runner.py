@@ -319,6 +319,7 @@ class DuplexSessionRunnerMixin:
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
             before_append=None,
+            mode: str = "append_audio_chunk",
         ) -> asyncio.Task[bool] | None:
             if session is None:
                 return
@@ -353,7 +354,7 @@ class DuplexSessionRunnerMixin:
                         operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
                         final=final,
                         send_json=emit_event,
-                        mode="append_audio_chunk",
+                        mode=mode,
                         expected_epoch=append_epoch,
                     )
                     if append_ok:
@@ -467,7 +468,7 @@ class DuplexSessionRunnerMixin:
             actor.track_append_task(
                 task,
                 epoch=append_epoch,
-                mode="append_audio_chunk",
+                mode=mode,
                 final=final,
                 response_bound=final or precreate_response,
             )
@@ -1169,7 +1170,10 @@ class DuplexSessionRunnerMixin:
                             }
                         )
                         continue
-                    if self._uses_native_input_append(session):
+                    native_text = self._uses_native_input_append(session) and "append_tokens" in (
+                        session.capabilities.input_modes or ()
+                    )
+                    if self._uses_native_input_append(session) and not native_text:
                         await emit_event(
                             {
                                 "type": "error",
@@ -1178,8 +1182,23 @@ class DuplexSessionRunnerMixin:
                             }
                         )
                         continue
-                    else:
-                        session.append_text(text)
+                    if native_text:
+                        # A native text turn is complete as sent: no buffer to
+                        # drain and no commit to wait for, unlike the audio path
+                        # where `final` closes a stream of appends. It also has
+                        # to go through the native path rather than
+                        # `start_runtime_append`, because only that one opens
+                        # the data-plane response stream the spoken reply
+                        # arrives on.
+                        session.mark_user_input_activity()
+                        await start_native_append(
+                            text,
+                            final=True,
+                            precreate_response=True,
+                            mode="append_tokens",
+                        )
+                        continue
+                    session.append_text(text)
                     if session.capabilities.supports_input_append:
                         await start_runtime_append(text, final=False, mode="append_tokens")
                     continue
