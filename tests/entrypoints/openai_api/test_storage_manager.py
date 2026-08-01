@@ -104,6 +104,39 @@ def test_local_storage_ttl_sweeper_notifies_expired_storage_keys(tmp_path):
     assert expired_keys == ["video-expired"]
 
 
+def test_local_storage_ttl_preserves_default_callback_across_restarts(tmp_path):
+    expired_keys: list[str] = []
+
+    async def on_expire(storage_keys: list[str]) -> None:
+        expired_keys.extend(storage_keys)
+
+    storage = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "storage"),
+        max_concurrency=1,
+        ttl_seconds=1,
+        sweep_interval_seconds=60,
+        expiration_callback=on_expire,
+    )
+
+    async def restart_and_sweep_file() -> int:
+        await storage.start()
+        await storage.stop()
+        await storage.start()
+        try:
+            save_context = await storage.save(b"video-bytes", "video-after-restart")
+            file_path = storage.get_full_file_path(save_context.key)
+            expired_mtime = time.time() - 10
+            os.utime(file_path, (expired_mtime, expired_mtime))
+            return await storage._sweep_once(time.time() - 1)
+        finally:
+            await storage.stop()
+
+    deleted = asyncio.run(restart_and_sweep_file())
+
+    assert deleted == 1
+    assert expired_keys == ["video-after-restart"]
+
+
 def test_local_storage_ttl_sweeper_keeps_files_when_path_missing(tmp_path):
     storage = LocalStorageTTLManager(
         storage_path=str(tmp_path / "storage"),

@@ -136,7 +136,8 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._ttl_seconds = ttl_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._sweeper_task: asyncio.Task[None] | None = None
-        self._expiration_callback = expiration_callback
+        self._default_expiration_callback = expiration_callback
+        self._expiration_callback_override: ExpirationCallback | None = None
 
         super().__init__(*args, **kwargs)
 
@@ -176,9 +177,14 @@ class LocalStorageTTLManager(LocalStorageManager):
             except OSError:
                 logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
 
-        if deleted_keys and self._expiration_callback is not None:
+        expiration_callback = (
+            self._expiration_callback_override
+            if self._expiration_callback_override is not None
+            else self._default_expiration_callback
+        )
+        if deleted_keys and expiration_callback is not None:
             try:
-                await self._expiration_callback(deleted_keys)
+                await expiration_callback(deleted_keys)
             except Exception:
                 logger.exception("TTL expiration callback failed for storage keys %s", deleted_keys)
 
@@ -195,7 +201,7 @@ class LocalStorageTTLManager(LocalStorageManager):
 
     async def start(self, expiration_callback: ExpirationCallback | None = None) -> None:
         if expiration_callback is not None:
-            self._expiration_callback = expiration_callback
+            self._expiration_callback_override = expiration_callback
         if self._sweeper_task is None or self._sweeper_task.done():
             self._sweeper_task = asyncio.create_task(self._sweep_loop())
 
@@ -206,7 +212,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         with contextlib.suppress(asyncio.CancelledError):
             await self._sweeper_task
         self._sweeper_task = None
-        self._expiration_callback = None
+        self._expiration_callback_override = None
 
 
 def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
