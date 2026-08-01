@@ -123,55 +123,49 @@ If you are debugging something new here, still **reset before each experiment**
 nothing, so measurements taken after a wedge look like data and are not. Two of
 ours were contaminated that way.
 
-## Open: later turns answer the first question
+## Solved: later turns answered the first question
 
-Canonical reproduction, two spoken turns in one session:
+Symptoms, all one bug: later turns affirming turn 1's topic, generic greetings
+("I'm doing well, how can I assist you today"), and finally the model saying
+outright that it was being sent *a lot of empty messages*. It was: from turn 2
+on, the thinker received a span of unfilled `<|audio_pad|>` placeholders where
+the audio should have been.
 
-```
-turn 1  "What is the capital of France?"  ->  "The capital of France is Paris."   correct
-turn 2  "What is the capital of the USA?" ->  "Yes, Paris is the capital of France."
-```
+Two coordinate systems were compared directly. `audio_offset` is `len(prefix)`,
+relative to **this append's** token span; `duplex_token_offset` is
+`num_computed_tokens`, absolute within the **session**. They coincide on the
+first append (both anchored at 0), which is why turn 1 always worked. On turn 2
+the absolute offset has advanced past the whole conversation so far, so
+`take_from` became 140 into a 78-row tensor, the window came out empty, and the
+guard returned without splicing -- silently, because the model runner absorbs a
+reservation/embedding mismatch rather than raising.
 
-and every turn after that keeps affirming turn 1. So turn 1 is heard correctly
-and later turns are not heard at all -- the model is answering from context
-rather than from new audio.
+Verified by sending *different* audio on each turn (the sample clip split in
+half) and transcribing the replies with a separate Qwen3-Omni:
 
-What is already ruled out:
+| turn | audio | before | after |
+|---|---|---|---|
+| 1 | 他当时还跟线下其他的站姐吵 | 他当时还跟线下其他站姐一起吗？ | *(identical -- control)* |
+| 2 | 吵架，然后打架进局子了 | 是的，她当时还和其他站姐一起线下活动。 | 真的假的啊？打架还进去了？现在人怎么样了？ |
 
-- Turn 2's audio *does* reach the model. Instrumenting the splice showed
-  `seq=2 embeds=(52, 2048)` spliced at the right offset, the same count as
-  turn 1.
-- Not accumulated audio context. `turn_audio` now resets when a turn closes,
-  and the earlier "re-encodes the whole conversation" bug is fixed.
-- Not the unclosed assistant turn. Later turns now open with `<|im_end|>` and a
-  newline.
-- Not microphone quality. Turn 1 is transcribed correctly, and capture now runs
-  at 16 kHz natively.
+Turn 2's reply now uses 打架 and 进去了, which appear only in the second half.
 
-So fresh embeddings are spliced into a well-formed prompt and the model still
-ignores them. The next thing to check is whether those embeddings actually
-differ between turns -- log a cheap fingerprint (mean and norm) of the spliced
-span per turn. If turn 2's fingerprint matches turn 1's, stage 0 is serving
-stale audio despite the reset; if it differs, the problem is positional, and
-the resumable request's KV or position offsets for the appended span are the
-place to look.
+**Two lessons worth keeping.**
 
-## Open: generic replies
+The old ruled-out list here asserted "turn 2's audio *does* reach the model --
+instrumenting the splice showed `embeds=(52, 2048)` spliced at the right
+offset". That was false, and it cost the most time of anything in this
+investigation. The `audio embeds=` log line reports that the embeddings were
+*built*; the separate `[splice]` line reports that they were *installed*. Turn 2
+logged the first and not the second. Reading the wrong line as proof turned the
+real cause into a ruled-out branch, and sent the next three experiments at KV
+and position offsets instead.
 
-Later turns have been observed returning a generic greeting ("I'm doing well,
-how can I assist you today") regardless of what was said. The same clip has
-previously produced contextual replies, so this is not simply determinism.
-
-A generic greeting is what the model produces when the user turn carries no
-meaningful content, which points at the audio embeddings not landing for that
-turn rather than at generation. Worth checking first: whether the spliced
-embedding norm on turn 2+ matches turn 1 (instrument the splice in
-`thinker_duplex_preprocess`), since a silent or zeroed span would look exactly
-like this.
-
-Note the test clip is identical every time, so repeating it *should* give the
-same answer. Only differing spoken input producing identical replies is
-evidence of this bug.
+The proposed next step here -- fingerprint the spliced span's mean and norm per
+turn -- would not have found it either. The embeddings were fine and identical
+to turn 1's; they simply never landed. When output looks like the input was
+empty, check that the input was *installed* before checking whether it was
+*correct*.
 
 ## Troubleshooting
 

@@ -94,7 +94,13 @@ cost the most time.
   worker-side duplex branch silently no-ops.
 - **Reservation must equal produced embeddings.** The model runner absorbs a
   mismatch by truncating or padding without raising. This invariant caused
-  three separate defects here.
+  four separate defects here, the last being the splice-offset frame mismatch
+  (commit `d143f64a`): audio was produced, landed nowhere, and the request
+  still succeeded with placeholders in place. Any code path that can decline to
+  fill a reserved span must say so out loud.
+- **`audio_offset` is append-relative; `duplex_token_offset` is
+  session-absolute.** They coincide only on a session's first append. Rebase
+  with `prompt_len - append_token_count` before comparing them.
 - **Direct response and stage advancement are mutually exclusive.** Returning a
   decision from `decide_output` short-circuits forwarding
   (`orchestrator.py:1284-1295`), so you can surface stage-0 text *or* get audio,
@@ -162,6 +168,14 @@ each of these cost a measurement:
 ## Fixes that were wrong
 
 Left in history deliberately, so nobody re-runs the experiment:
+
+- A ruled-out entry in the demo README claimed turn 2's audio "*does* reach the
+  model ... spliced at the right offset". It did not. The `audio embeds=` line
+  says the embeddings were **built**; the `[splice]` line says they were
+  **installed**, and turn 2 only ever logged the first. That one misread turned
+  the actual root cause into a ruled-out branch and cost more time than any
+  other single thing on this branch. Ruled-out lists are load-bearing — an
+  entry asserted from the wrong log line is worse than no entry.
 
 - Per-chunk audio encoding was claimed lossless because 1 s aligns with the
   tower's conv chunk. The conv part is true; the 8-chunk *attention* window is
