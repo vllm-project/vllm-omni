@@ -113,30 +113,48 @@ class OmniServeCommand(CLISubcommand):
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
-        # Require a model under --omni. ``args.model`` always carries vLLM's
-        # ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent: the
-        # default text LLM is routed into the diffusion stage and startup
+        # Require an explicit model under --omni. ``args.model`` always carries
+        # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
+        # the default text LLM is routed into the diffusion stage and startup
         # crashes deep in the diffusion worker with a confusing registry error.
-        # Fail fast instead. A model can be supplied positionally
-        # (``vllm serve <model> --omni``), via ``--model``, or per-stage through
-        # ``--deploy-config`` / ``--stage-configs-path``; only error when none
-        # of these is present. See
+        # Fail fast instead.
+        #
+        # The model must come from the CLI -- positionally
+        # (``vllm serve <model> --omni``) or via ``--model``. Deploy/stage YAMLs
+        # (``--deploy-config`` / ``--stage-configs-path``) are NOT a model
+        # source: they carry per-stage engine args only, and the checkpoint is
+        # always threaded in from ``args.model`` (see
+        # ``load_and_resolve_stage_configs``, which takes ``model`` as its first
+        # argument). Treating their mere presence as "model provided" let
+        # ``vllm serve --omni --deploy-config <cfg>`` slip through with the
+        # default model and reproduce the very crash this guard prevents. See
         # https://github.com/vllm-project/vllm-omni/issues/4158.
         if getattr(args, "omni", False):
             explicit_keys = getattr(args, "explicit_keys", None) or frozenset()
-            model_provided = getattr(args, "model_tag", None) is not None or "model" in explicit_keys
-            stage_yaml_provided = (
-                getattr(args, "stage_configs_path", None) is not None
-                or getattr(args, "deploy_config", None) is not None
-            )
-            if not model_provided and not stage_yaml_provided:
+            # Resolve the model the user actually supplied on the CLI. A
+            # positional ``model_tag`` takes precedence (``cmd`` later copies it
+            # onto ``args.model``); otherwise ``--model`` counts only when it was
+            # explicitly passed. An empty/whitespace value (e.g. ``--model
+            # "$MODEL"`` with ``MODEL`` unset) is treated as "not provided" so it
+            # fails here with a clear message instead of the same confusing
+            # downstream crash.
+            model_tag = getattr(args, "model_tag", None)
+            if model_tag is not None:
+                explicit_model = model_tag
+            elif "model" in explicit_keys:
+                explicit_model = getattr(args, "model", None)
+            else:
+                explicit_model = None
+            model_provided = explicit_model is not None and str(explicit_model).strip() != ""
+            if not model_provided:
                 raise ValueError(
-                    "`vllm serve --omni` requires a model. Pass it positionally "
-                    "(`vllm serve <model> --omni`), via `--model`, or supply "
-                    "per-stage models through `--deploy-config` / "
-                    "`--stage-configs-path`. Without one, vLLM's default model "
-                    "(Qwen/Qwen3-0.6B) is selected and routed into the diffusion "
-                    "stage, which fails with a confusing diffusion-registry error."
+                    "`vllm serve --omni` requires an explicit model. Pass it "
+                    "positionally (`vllm serve <model> --omni`) or via `--model`. "
+                    "`--deploy-config` / `--stage-configs-path` carry per-stage "
+                    "engine args only and do not supply a model; without an "
+                    "explicit model, vLLM's default (Qwen/Qwen3-0.6B) is selected "
+                    "and routed into the diffusion stage, which fails with a "
+                    "confusing diffusion-registry error."
                 )
 
         # --omni-replica-address is only consulted in run_headless(); reject it

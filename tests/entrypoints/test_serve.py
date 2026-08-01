@@ -47,7 +47,37 @@ def test_omni_serve_requires_model_when_none_provided() -> None:
     """
     args = _parse_serve_args(["serve", "--omni"])
     cmd = OmniServeCommand()
-    with pytest.raises(ValueError, match="requires a model"):
+    with pytest.raises(ValueError, match="requires an explicit model"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A deploy/stage YAML supplied *without* an explicit model must still
+        # trip the guard. These YAMLs carry per-stage engine args only -- the
+        # checkpoint is always threaded in from ``args.model`` -- so their mere
+        # presence does not establish that a model was provided. Without an
+        # explicit model ``args.model`` stays at vLLM's default and the launch
+        # reproduces the issue-4158 diffusion-registry crash.
+        ["serve", "--omni", "--deploy-config", "deploy.yaml"],
+        ["serve", "--omni", "--stage-configs-path", "stages.yaml"],
+        # An empty/whitespace model must not satisfy the guard either -- this is
+        # the ``--model "$MODEL"``-with-unset-var footgun. Otherwise the empty
+        # value flows downstream and crashes with the same confusing error.
+        ["serve", "", "--omni"],  # empty positional
+        ["serve", "--omni", "--model", ""],  # empty --model
+        ["serve", "--omni", "--model", "   "],  # whitespace-only --model
+    ],
+)
+def test_omni_serve_rejects_missing_or_empty_model(argv: list[str]) -> None:
+    """Regression for review feedback on PR #4167: a deploy/stage YAML is not a
+    model source, so ``--deploy-config`` / ``--stage-configs-path`` alone must
+    not bypass the require-a-model guard; neither may an empty/whitespace
+    model value."""
+    args = _parse_serve_args(argv)
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="requires an explicit model"):
         cmd.validate(args)
 
 
@@ -56,16 +86,16 @@ def test_omni_serve_requires_model_when_none_provided() -> None:
     [
         ["serve", "fake-model", "--omni"],  # positional model
         ["serve", "--omni", "--model", "fake-model"],  # --model flag
-        ["serve", "--omni", "--stage-configs-path", "stages.yaml"],  # per-stage YAML
-        ["serve", "--omni", "--deploy-config", "deploy.yaml"],  # deploy YAML
+        # An explicit model *with* a deploy/stage YAML is the legitimate
+        # multi-stage path and must pass the guard.
+        ["serve", "fake-model", "--omni", "--deploy-config", "deploy.yaml"],
+        ["serve", "fake-model", "--omni", "--stage-configs-path", "stages.yaml"],
     ],
 )
-def test_omni_serve_accepts_model_or_stage_yaml(argv: list[str], mocker: MockerFixture) -> None:
-    """A model supplied positionally, via ``--model``, or per-stage through
-    ``--stage-configs-path`` / ``--deploy-config`` must NOT trip the
-    require-a-model guard (avoid false positives on the legitimate multi-stage
-    YAML path). Downstream validation is mocked so only the new guard is
-    exercised."""
+def test_omni_serve_accepts_explicit_model(argv: list[str], mocker: MockerFixture) -> None:
+    """A model supplied positionally or via ``--model`` -- with or without a
+    deploy/stage YAML -- must NOT trip the require-a-model guard. Downstream
+    validation is mocked so only the new guard is exercised."""
     mocker.patch(
         "vllm_omni.diffusion.utils.hf_utils.is_diffusion_model",
         return_value=False,
