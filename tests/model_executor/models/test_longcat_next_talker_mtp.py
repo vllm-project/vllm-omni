@@ -19,8 +19,10 @@ from vllm_omni.model_executor.models.longcat_next import modeling_longcat_next a
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
     AUDIOTEXT_PAD_TOKEN_ID,
     AUDIOTEXT_START_TOKEN_ID,
+    IMG_END_TOKEN_ID,
     IMG_NEWLINE_TOKEN_ID,
     IMG_PAD_TOKEN_ID,
+    IMG_START_TOKEN_ID,
 )
 
 M = mln.LongcatNextForCausalLM
@@ -669,10 +671,14 @@ class TestSampleAudioCode:
     # -- top-k truncation -------------------------------------------------- #
 
     def test_top_k_filters_outside_topk(self, model):
+        # Logits rise with index, so the k largest are indices 99..100-k.
+        # Sampling (do_sample=True) with top_k=k must only ever pick one of
+        # them; a code below 100-k means top-k filtering failed. (do_sample
+        # must be True -- the greedy argmax path skips top_k entirely.)
         logits = torch.arange(100, dtype=torch.float)
         for k in range(1, 10):
-            code = int(self._call(model, logits, do_sample=False, top_k=k, top_p=1.0))
-            assert code <= k - 1, f"top_k={k} allowed code {code}"
+            code = int(self._call(model, logits, do_sample=True, top_k=k, top_p=1.0))
+            assert code >= 100 - k, f"top_k={k} allowed code {code}"
 
     def test_top_k_clamps_to_vocab_size(self, model, logits):
         """When top_k > vocab, it should be clamped to vocab size, not error."""
@@ -708,7 +714,7 @@ class TestSampleAudioCode:
     def test_higher_temperature_increases_diversity(self, model):
         rng = torch.Generator()
         rng.manual_seed(0)
-        logits = torch.full((self.VOCAB,), 0.0, generator=rng)
+        logits = torch.zeros(self.VOCAB, generator=rng)
         logits[:10] = 1.0  # only first 10 have non-negligible prob
         cold = [
             int(self._call(model, logits.clone(), do_sample=True, temperature=0.1, top_k=0, top_p=1.0))
