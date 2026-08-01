@@ -3,6 +3,8 @@
 
 """Unit tests for DistributedAutoencoderKLLTX2Video encode parallel (CPU-only)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -245,8 +247,6 @@ class TestTiledEncodeDispatch:
     """Tests that tiled_encode wires the encode operator into the executor correctly."""
 
     def test_tiled_encode_dispatches_encode_operator_with_broadcast(self):
-        from types import SimpleNamespace
-
         from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_ltx2
 
         x = torch.zeros(1, 3, 1, 32, 48)
@@ -309,6 +309,11 @@ class TestEncodeTileMerge:
             (12, 12),  # single tile
             (28, 28),  # 3x3 grid with cropped edge tiles
             (24, 36),  # non-square grid
+            # Edge tiles not divisible by spatial_compression_ratio: drops the
+            # predicted-shape metadata, so this also covers merge equivalence on
+            # the dynamic metadata-gather fallback (blend/crop clamping on ragged
+            # edge tiles), not just the metadata omission itself.
+            (28, 26),
         ],
     )
     def test_split_exec_merge_matches_sequential_tiled_encode(self, height, width):
