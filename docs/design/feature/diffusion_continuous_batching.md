@@ -151,9 +151,15 @@ Queueing and lifecycle metadata remain in the scheduler's request state.
 
 Current native pipelines that explicitly enable step execution include
 Qwen-Image, HunyuanImage3, and Helios. Step execution alone does not imply
-continuous-batching support: Qwen-Image and HunyuanImage3 accept batched step
-states, while Helios supports only a single active step request and must use
-`max_num_seqs=1`.
+continuous-batching support: Qwen-Image accepts batched step states.
+HunyuanImage3 accepts batched step states only when its resolved self-attention
+backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
+Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
+`diffusion_attention_config.default.backend=TORCH_SDPA` when
+`max_num_seqs>1`. See the
+[HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
+for its validated configuration. Helios supports only a single active step
+request and must use `max_num_seqs=1`.
 
 ### Continuous Batching
 
@@ -161,7 +167,8 @@ When `max_num_seqs>1`, `StepScheduler` can keep multiple compatible requests
 active. The runner gathers their state into `InputBatch`, performs one batched
 denoise forward, then applies scheduler updates per request:
 
-1. Run `prepare_encode()` for newly admitted requests.
+1. Receive transferred KV payloads, then run `prepare_encode()` for newly
+   admitted requests.
 2. Build or refresh `InputBatch`.
 3. Run one batched `denoise_step(input_batch, states=states)`.
 4. Slice noise predictions back to each request.
@@ -208,7 +215,8 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
 - `request_batch_max_wait_ms` trades first-request latency for burst
   coalescing.
 - All diffusion cache backends are currently unsupported in step mode.
-- KV transfer and other request-mode extras are not wired into step mode.
+- KV transfer is supported for newly admitted step requests; some other
+  request-mode extras remain unsupported.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
 

@@ -94,8 +94,13 @@ validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
 Step execution is capability-based, not a generic switch for every diffusion
-model. Qwen-Image and HunyuanImage3 support step-wise continuous batching.
-Helios supports single-request step execution only: use
+model. Qwen-Image supports step-wise continuous batching. HunyuanImage3 also
+supports it, but only when its resolved self-attention backend is `TORCH_SDPA`;
+set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
+`diffusion_attention_config.default.backend=TORCH_SDPA` before using
+`--max-num-seqs >1`. See the
+[HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
+for its validated configuration. Helios supports single-request step execution only: use
 `--step-execution --max-num-seqs 1` for Helios. Consult the selected pipeline's
 documentation and source for the latest support status.
 
@@ -234,8 +239,9 @@ For step execution, set `step_execution: true` and remove
 - Different LoRA adapters or scales run in separate batches.
 - FIFO scheduling can cause an incompatible request to block later compatible
   requests.
-- All diffusion cache backends are unsupported in step mode. KV transfer and
-  other request-mode extras are also not wired into step mode.
+- All diffusion cache backends are unsupported in step mode. KV transfer is
+  supported for newly admitted step requests; some other request-mode extras
+  remain unsupported.
 - If request-mode startup reports that the pipeline does not support batching,
   use `--max-num-seqs 1`.
 - If step-mode startup mentions `prepare_encode()`, `denoise_step()`,
