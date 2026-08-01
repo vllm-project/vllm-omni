@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
+from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -1389,6 +1390,20 @@ class TestTTSMethods:
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_load_supported_speakers_skips_non_tts_omni_model(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        warning = mocker.patch.object(serving_speech_module.logger, "warning")
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(tts_config=SimpleNamespace())
+        )
+
+        assert speech_server._is_tts is False
+        assert speech_server._load_supported_speakers() == set()
+        warning.assert_not_called()
 
     def test_load_supported_languages_from_config(self, speech_server):
         """Languages/dialects from codec_language_id are loaded title-cased; 'Auto' is added."""

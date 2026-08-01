@@ -126,6 +126,7 @@ class OmniRequestOutput(RequestOutput):
         request_id: Unique identifier for this request
         finished: Whether generation is complete
         stage_id: Identifier of the stage that produced this output (pipeline mode)
+        replica_id: Identifier of the stage replica that produced this output
         final_output_type: Type of output ("text", "image", "audio", "latents")
         images: List of generated PIL images (diffusion mode)
         prompt: The prompt used for generation
@@ -150,6 +151,7 @@ class OmniRequestOutput(RequestOutput):
 
     # --- Pipeline stage fields ---
     stage_id: int | None = None
+    replica_id: int | None = None
     final_output_type: str = "text"
 
     # --- Diffusion model fields ---

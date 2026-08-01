@@ -18,8 +18,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
-STAGE_CONFIG = get_deploy_config_path("step_audio2_thinker_ci.yaml")
-TEST_PARAMS = [(MODEL, STAGE_CONFIG)]
+DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
+TEST_PARAMS = [(MODEL, None, {"deploy_config": DEPLOY_CONFIG, "trust_remote_code": True})]
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 

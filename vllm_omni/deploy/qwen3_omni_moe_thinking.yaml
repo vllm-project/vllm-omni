@@ -1,0 +1,21 @@
+# Deploy config for Qwen3-Omni-MoE thinker-only checkpoints.
+# Verified on 2x H100-80G GPUs.
+pipeline: qwen3_omni_moe
+distributed_executor_backend: mp
+enable_prefix_caching: true
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    async_scheduling: false
+    tensor_parallel_size: 2
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
