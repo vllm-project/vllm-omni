@@ -710,12 +710,14 @@ def _select_whisper_device() -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0, and a Whisper model resident there competes with
-        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
-        # exists; otherwise validate on CPU.
-        if n > 1:
-            device_index = n - 1
+        if n > 0:
+            target = n - 1
+            # Load Whisper on GPU only when >=16 GiB free VRAM remains.
+            # Keeps 24 GiB L4 runners on CPU (avoiding OOMs) while
+            # picking up high-VRAM single-GPU (e.g. H100, MI325X) and multi-GPU hosts.
+            target_device = current_omni_platform.get_torch_device(target)
+            if current_omni_platform.get_free_memory(target_device) >= 16 * 1024**3:
+                device_index = target
 
     if device_index is None:
         return "cpu"

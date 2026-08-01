@@ -105,6 +105,31 @@ def _reset_transcriber_singletons():
     media._WHISPER_MODELS.clear()
 
 
+@pytest.mark.parametrize(
+    ("device_count", "free_memory", "expected_device"),
+    [
+        (1, 16 * 1024**3, "cuda:0"),
+        (3, 16 * 1024**3, "cuda:2"),
+        (1, 16 * 1024**3 - 1, "cpu"),
+    ],
+)
+def test_select_whisper_device_by_available_memory(monkeypatch, device_count, free_memory, expected_device):
+    platform = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_count=lambda: device_count,
+        get_torch_device=lambda index: f"cuda:{index}",
+        get_free_memory=lambda device: free_memory,
+        set_device=lambda device: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms",
+        SimpleNamespace(current_omni_platform=platform),
+    )
+
+    assert media._select_whisper_device() == expected_device
+
+
 def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
     """Cover the two hops the tests above skip: bytes -> file -> executor.submit.
 
