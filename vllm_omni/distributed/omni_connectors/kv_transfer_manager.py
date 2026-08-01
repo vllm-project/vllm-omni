@@ -403,6 +403,7 @@ class OmniKVTransferManager:
         self._prefetch_executor: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch") if async_prefetch else None
         )
+
         self._prefetch_futures: dict[str, Any] = {}
         self._bg_copy_stream: current_omni_platform.Stream | None = None
 
@@ -414,6 +415,11 @@ class OmniKVTransferManager:
                 logger.info("Sender connector eagerly initialized")
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
+
+    @property
+    def tp_topology(self) -> KVTPTopology:
+        """Return the effective topology after config and runtime detection."""
+        return self._tp_topo
 
     @property
     def topo_config(self) -> _TransferTopoConfig:

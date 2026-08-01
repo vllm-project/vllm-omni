@@ -1,6 +1,8 @@
 """Tests for DFX runner metadata field exclusion."""
 
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -254,8 +256,9 @@ def test_benchmark_param_id_suffix_from_task_eval_phase():
     ]
 
 
-def test_create_paired_omni_benchmark_pytest_params(tmp_path):
+def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_path, monkeypatch):
     from tests.dfx.conftest import create_paired_omni_benchmark_pytest_params
+    from tests.dfx.perf.scripts import run_benchmark
 
     configs = [
         {
@@ -285,3 +288,51 @@ def test_create_paired_omni_benchmark_pytest_params(tmp_path):
     assert bench_row == ("test_tts", 0)
     assert any(m.name == "tts" for m in by_id["test_tts-p0"].marks)
     assert not any(m.name == "tts" for m in by_id["test_omni-p0"].marks)
+
+    omni_p0_server = by_id["test_omni-p0"].values[0]
+    omni_p1_server = by_id["test_omni-p1"].values[0]
+    tts_server = by_id["test_tts-p0"].values[0]
+    assert omni_p0_server == omni_p1_server
+    assert omni_p0_server != tts_server
+
+    events = []
+
+    @contextmanager
+    def fake_start(server_param):
+        events.append(("start", server_param))
+        yield object()
+        events.append(("stop", server_param))
+
+    monkeypatch.setattr(run_benchmark, "_start_omni_server", fake_start)
+    active_context = run_benchmark._SingleActiveContext()
+    try:
+        first = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=omni_p0_server),
+            active_context,
+        )
+        second = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=omni_p1_server),
+            active_context,
+        )
+        assert first is second
+        assert events == [("start", omni_p0_server)]
+
+        third = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=tts_server),
+            active_context,
+        )
+        assert third is not first
+        assert events == [
+            ("start", omni_p0_server),
+            ("stop", omni_p0_server),
+            ("start", tts_server),
+        ]
+    finally:
+        active_context.close()
+
+    assert events == [
+        ("start", omni_p0_server),
+        ("stop", omni_p0_server),
+        ("start", tts_server),
+        ("stop", tts_server),
+    ]

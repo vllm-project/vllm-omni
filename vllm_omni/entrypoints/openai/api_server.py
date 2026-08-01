@@ -98,7 +98,6 @@ from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
-    encode_image_base64,
     encode_image_base64_with_compression,
     parse_size,
     validate_layered_layers,
@@ -1731,6 +1730,39 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 # Image generation API endpoints
 
 
+def _build_image_generation_response(
+    *,
+    images: list[Image.Image],
+    request: ImageGenerationRequest,
+    stage_durations: Any,
+    peak_memory_mb: Any,
+) -> ImageGenerationResponse | StreamingResponse:
+    """Encode generated images and apply the requested response format."""
+    output_format = _choose_output_format(request.output_format or "png", None)
+    image_data = [
+        ImageData(
+            b64_json=encode_image_base64_with_compression(image, format=output_format),
+            revised_prompt=None,
+        )
+        for image in images
+    ]
+    response_kwargs: dict[str, Any] = {
+        "created": int(time.time()),
+        "data": image_data,
+        "output_format": output_format,
+        "metrics": {
+            "stage_durations": stage_durations or None,
+            "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
+        },
+    }
+    if request.size is not None:
+        response_kwargs["size"] = request.size
+    response = ImageGenerationResponse(**response_kwargs)
+    if request.response_format == ResponseFormat.FILE:
+        return response.stream_response()
+    return response
+
+
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
@@ -1832,15 +1864,11 @@ async def generate_images(
                     content=generation_result.model_dump(),
                 )
             flat_images, stage_durations, peak_memory_mb, _ = generation_result
-            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
-
-            return ImageGenerationResponse(
-                created=int(time.time()),
-                data=image_data,
-                metrics={
-                    "stage_durations": stage_durations or None,
-                    "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
-                },
+            return _build_image_generation_response(
+                images=flat_images,
+                request=request,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
             )
 
         # Build params - pass through user values directly
@@ -1928,32 +1956,14 @@ async def generate_images(
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
-        # Determine output format (default to png)
-        output_format = _choose_output_format(request.output_format or "png", None)
-
-        # Encode images to base64 with the specified format
-        image_data = [
-            ImageData(b64_json=encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
-            for img in images
-        ]
-
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
-        response_kwargs = {
-            "created": int(time.time()),
-            "data": image_data,
-            "output_format": output_format,
-            "metrics": {
-                "stage_durations": stage_durations or None,
-                "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
-            },
-        }
-        if request.size:
-            response_kwargs["size"] = size_str
-        response = ImageGenerationResponse(**response_kwargs)
-        if request.response_format != ResponseFormat.FILE:
-            return response
-        return response.stream_response()
+        return _build_image_generation_response(
+            images=images,
+            request=request,
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        )
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
