@@ -31,6 +31,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+_MIN_FREE_VRAM = 16 * 1024**3
+
 
 _synthetic_media_fallback_dir: Path | None = None
 
@@ -710,14 +712,15 @@ def _select_whisper_device() -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        if n > 0:
-            target = n - 1
-            # Load Whisper on GPU only when >=16 GiB free VRAM remains.
-            # Keeps 24 GiB L4 runners on CPU (avoiding OOMs) while
-            # picking up high-VRAM single-GPU (e.g. H100, MI325X) and multi-GPU hosts.
-            target_device = current_omni_platform.get_torch_device(target)
-            if current_omni_platform.get_free_memory(target_device) >= 16 * 1024**3:
-                device_index = target
+        # Check every visible device and use the one with the most free memory,
+        # but keep the CPU fallback when none has enough room for Whisper.
+        best_free_memory = _MIN_FREE_VRAM
+        for candidate_index in range(n):
+            candidate_device = current_omni_platform.get_torch_device(candidate_index)
+            free_memory = current_omni_platform.get_free_memory(candidate_device)
+            if free_memory >= best_free_memory:
+                device_index = candidate_index
+                best_free_memory = free_memory
 
     if device_index is None:
         return "cpu"

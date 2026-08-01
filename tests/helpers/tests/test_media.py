@@ -106,19 +106,22 @@ def _reset_transcriber_singletons():
 
 
 @pytest.mark.parametrize(
-    ("device_count", "free_memory", "expected_device"),
+    ("free_memory_by_device", "expected_device"),
     [
-        (1, 16 * 1024**3, "cuda:0"),
-        (3, 16 * 1024**3, "cuda:2"),
-        (1, 16 * 1024**3 - 1, "cpu"),
+        ([media._MIN_FREE_VRAM], "cuda:0"),
+        ([media._MIN_FREE_VRAM] * 3, "cuda:2"),
+        ([8 * 1024**3, 20 * 1024**3, 24 * 1024**3], "cuda:2"),
+        ([media._MIN_FREE_VRAM - 1], "cpu"),
+        ([20 * 1024**3, 8 * 1024**3], "cuda:0"),
+        ([8 * 1024**3, 12 * 1024**3], "cpu"),
     ],
 )
-def test_select_whisper_device_by_available_memory(monkeypatch, device_count, free_memory, expected_device):
+def test_select_whisper_device_by_available_memory(monkeypatch, free_memory_by_device, expected_device):
     platform = SimpleNamespace(
         is_available=lambda: True,
-        get_device_count=lambda: device_count,
+        get_device_count=lambda: len(free_memory_by_device),
         get_torch_device=lambda index: f"cuda:{index}",
-        get_free_memory=lambda device: free_memory,
+        get_free_memory=lambda device: free_memory_by_device[int(device.rsplit(":", 1)[1])],
         set_device=lambda device: None,
     )
     monkeypatch.setitem(
