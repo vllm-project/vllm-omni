@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | ✓ (online) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
@@ -393,6 +394,28 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 - See `qwen3_tts/end2end.py` for the prompt-length-estimation logic the Talker uses.
 
 ---
+
+## Gepard-1.0
+
+Single-stage native AR TTS at 22.05 kHz. Pipeline: `Qwen3.5 backbone → 32 FSQ codebook heads (one frame/step) → NeMo NanoCodec`. Backbone runs under vLLM paged attention; the 32-head sampling + learned embedding feedback ride the native-AR runner hooks. `enforce_eager` (CUDA graph is a perf follow-up).
+
+### Prerequisites
+```bash
+pip install nemo_toolkit[tts]   # NanoCodec decoder (NVIDIA Open Model License)
+```
+
+### Quick start (zero-shot, default voice)
+```bash
+python examples/offline_inference/text_to_speech/gepard/end2end.py \
+    --text "Hello, this is a Gepard demo."
+```
+
+### Voice cloning
+Not yet — PR1 is zero-shot only (the learned `null_prefix` default voice). Reference-audio cloning (`ref_compressor` speaker prefix) is a follow-up PR.
+
+### Notes
+- Output: 22.05 kHz mono WAV.
+- Deploy config: `vllm_omni/deploy/gepard.yaml` (auto-loaded; override with `--deploy-config`).
 
 ## VoxCPM2
 
