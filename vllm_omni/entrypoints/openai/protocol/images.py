@@ -184,7 +184,7 @@ class ImageGenerationResponse(BaseModel):
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str | None = Field(default=None, description="The output format of the image generation")
-    size: str = Field(None, description="The size of the image generated")
+    size: str | None = Field(default=None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "
