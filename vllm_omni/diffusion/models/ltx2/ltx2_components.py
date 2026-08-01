@@ -59,7 +59,6 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "scheduler",
     "latent_upsampler",
 )
-_LTX_ARTIFACTS_DIR_ENV = "VLLM_OMNI_LTX_ARTIFACTS_DIR"
 logger = logging.getLogger(__name__)
 
 
@@ -162,16 +161,17 @@ def resolve_ltx_artifact(
     model: str,
     repo_id: str,
     filename: str,
+    *,
+    override: str | None = None,
 ) -> str:
-    """Resolve an official LTX sidecar from one artifact directory or the Hub."""
-    artifacts_dir = os.getenv(_LTX_ARTIFACTS_DIR_ENV)
-    if artifacts_dir:
-        candidate = Path(artifacts_dir) / filename
+    """Resolve an official LTX sidecar from a component override or the Hub."""
+    if override:
+        override_path = Path(override)
+        candidate = override_path / filename if override_path.is_dir() else override_path
         if candidate.is_file():
             return str(candidate)
         raise FileNotFoundError(
-            f"{_LTX_ARTIFACTS_DIR_ENV}={artifacts_dir!r} does not contain required LTX artifact "
-            f"{filename!r}: {candidate}"
+            f"Configured LTX artifact override {override!r} does not resolve required file {filename!r}: {candidate}"
         )
 
     candidates = [Path(model) / filename]
@@ -185,7 +185,7 @@ def resolve_ltx_artifact(
         searched = ", ".join(str(path) for path in candidates)
         raise FileNotFoundError(
             f"Unable to resolve LTX artifact {filename!r}. Searched {searched}; "
-            f"place the file in the model root, set {_LTX_ARTIFACTS_DIR_ENV}, or make {repo_id} available."
+            f"place the file in the model root, configure its component in model_paths, or make {repo_id} available."
         ) from exc
 
 
@@ -503,13 +503,16 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
 
     if profile.latent_upsampler_cls is not None:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
-        if os.getenv(_LTX_ARTIFACTS_DIR_ENV) and profile.latent_upsampler_filename is not None:
+        model_paths = getattr(od_config, "model_paths", None) or {}
+        upsampler_override = model_paths.get("latent_upsampler")
+        if upsampler_override is not None and profile.latent_upsampler_filename is not None:
             if profile.artifact_repo_id is None:
                 raise FileNotFoundError(f"LTX latent upsampler artifact repository not configured for {profile.name}.")
             upsampler_path = resolve_ltx_artifact(
                 model,
                 profile.artifact_repo_id,
                 profile.latent_upsampler_filename,
+                override=str(upsampler_override),
             )
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
         elif os.path.isfile(upsampler_config) or not local_files_only:

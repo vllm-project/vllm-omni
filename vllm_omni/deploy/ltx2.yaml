@@ -1,0 +1,38 @@
+# LTX-2/LTX-2.3 deployment example. All public entries share this one-stage
+# Omni topology; select the recipe with model_class_name:
+#   LTX2Pipeline          - regular one-stage T2V/I2V
+#   LTX2TwoStagePipeline  - regular two-stage T2V/I2V with a distilled LoRA
+#   LTX2DistilledPipeline - full-distilled two-stage T2V/I2V
+async_chunk: false
+pipeline: ltx2
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    # Guidance parallel examples for regular pipelines:
+    #   CFG1: devices: "0"       + cfg_parallel_size: 1
+    #   CFG2: devices: "0,1"     + cfg_parallel_size: 2
+    #   CFG4: devices: "0,1,2,3" + cfg_parallel_size: 4
+    # Positive-only distilled pipelines should keep CFG1. When combined with
+    # USP, the required device count is cfg_parallel_size * ulysses_degree.
+    devices: "0"
+    cfg_parallel_size: 1
+    ulysses_degree: 1
+    max_num_seqs: 1
+    enforce_eager: true
+
+    model_class_name: LTX2TwoStagePipeline
+    enable_layerwise_offload: true
+
+    # Optional authoritative sidecar overrides. Omit a key to discover it
+    # from the model root or the matching official Lightricks repository.
+    # model_paths:
+    #   latent_upsampler: /path/to/ltx-spatial-upscaler.safetensors
+    #   distilled_lora: /path/to/ltx-distilled-lora.safetensors
+    model_paths: {}
+
+    # Used only by LTX2TwoStagePipeline. Options: layer_fused, dynamic,
+    # resident. layer_fused matches official BF16 weight-space fusion.
+    model_config:
+      phase_lora_mode: layer_fused

@@ -221,23 +221,31 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
     assert detect_ltx_model_version(str(tmp_path)) == "2"
 
 
-def test_ltx_artifact_directory_is_an_authoritative_override(tmp_path, monkeypatch):
+def test_ltx_artifact_model_path_is_an_authoritative_override(tmp_path, monkeypatch):
     artifacts_dir = tmp_path / "sidecars"
     artifacts_dir.mkdir()
     filename = "ltx-sidecar.safetensors"
     expected = artifacts_dir / filename
     expected.write_bytes(b"sidecar")
-    monkeypatch.setenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", str(artifacts_dir))
     monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
 
-    assert resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == str(expected)
+    assert resolve_ltx_artifact(
+        str(tmp_path / "model"),
+        "Lightricks/test",
+        filename,
+        override=str(artifacts_dir),
+    ) == str(expected)
 
-    with pytest.raises(FileNotFoundError, match="does not contain required LTX artifact"):
-        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", "missing.safetensors")
+    with pytest.raises(FileNotFoundError, match="does not resolve required file"):
+        resolve_ltx_artifact(
+            str(tmp_path / "model"),
+            "Lightricks/test",
+            "missing.safetensors",
+            override=str(artifacts_dir),
+        )
 
 
-def test_ltx_artifact_falls_back_to_model_root_without_override(tmp_path, monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", raising=False)
+def test_ltx_artifact_falls_back_to_model_root_without_override(tmp_path):
     filename = "ltx-sidecar.safetensors"
     expected = tmp_path / filename
     expected.write_bytes(b"sidecar")
@@ -367,13 +375,13 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
         "vllm_omni.diffusion.models.ltx2.ltx2_phase_weights.LTXResidentLoRAController",
         lambda *_args: SimpleNamespace(),
     )
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "resident")
-
     pipe = LTX2TwoStagePipeline(
         od_config=SimpleNamespace(
             model=str(tmp_path),
             enable_diffusion_pipeline_profiler=False,
             lora_path=None,
+            model_config={"phase_lora_mode": "resident"},
+            model_paths={},
         )
     )
 
@@ -1361,6 +1369,8 @@ def _make_phase_weight_factory_pipeline():
             model="unused",
             lora_path=None,
             dtype=torch.float32,
+            model_config={},
+            model_paths={},
         ),
     )
 
@@ -1368,8 +1378,14 @@ def _make_phase_weight_factory_pipeline():
 def test_ltx_phase_weight_factory_selects_resident_mode(monkeypatch):
     pipeline = _make_phase_weight_factory_pipeline()
     resident = object()
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " ReSiDeNt ")
-    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
+    pipeline.od_config.model_config = {"phase_lora_mode": " ReSiDeNt "}
+    pipeline.od_config.model_paths = {"distilled_lora": "/models/custom-lora.safetensors"}
+
+    def resolve_artifact(*_args, **kwargs):
+        assert kwargs["override"] == "/models/custom-lora.safetensors"
+        return "adapter"
+
+    monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", resolve_artifact)
     monkeypatch.setattr(ltx2_phase_weights, "LTXResidentLoRAController", lambda pipe, path: resident)
 
     assert ltx2_phase_weights.build_ltx_phase_weights(pipeline) is resident
@@ -1383,7 +1399,7 @@ def test_ltx_phase_weight_factory_selects_dynamic_mode(monkeypatch):
     manifest = object()
     installed = []
 
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", " DyNaMiC ")
+    pipeline.od_config.model_config = {"phase_lora_mode": " DyNaMiC "}
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(
         ltx2_phase_weights,
@@ -1416,10 +1432,7 @@ def test_ltx_phase_weight_factory_selects_layer_fused_mode(monkeypatch, mode):
     pipeline.od_config.quantization_config = None
     manifest = object()
     installed = []
-    if mode is None:
-        monkeypatch.delenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", mode)
+    pipeline.od_config.model_config = {} if mode is None else {"phase_lora_mode": mode}
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
     monkeypatch.setattr(
         ltx2_phase_weights,
@@ -1461,18 +1474,18 @@ def test_ltx_phase_weight_factory_rejects_unsupported_layer_fused_config(
     pipeline = _make_phase_weight_factory_pipeline()
     pipeline.od_config.dtype = dtype
     pipeline.od_config.quantization_config = quantization_config
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "layer_fused")
+    pipeline.od_config.model_config = {"phase_lora_mode": "layer_fused"}
     monkeypatch.setattr(ltx2_phase_weights, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
 
     with pytest.raises(ValueError, match=error):
         ltx2_phase_weights.build_ltx_phase_weights(pipeline)
 
 
-def test_ltx_phase_weight_factory_rejects_invalid_environment_mode(monkeypatch):
+def test_ltx_phase_weight_factory_rejects_invalid_config_mode():
     pipeline = _make_phase_weight_factory_pipeline()
-    monkeypatch.setenv("VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE", "auto")
+    pipeline.od_config.model_config = {"phase_lora_mode": "auto"}
 
-    with pytest.raises(ValueError, match="VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE"):
+    with pytest.raises(ValueError, match="model_config.phase_lora_mode"):
         ltx2_phase_weights.build_ltx_phase_weights(pipeline)
 
 

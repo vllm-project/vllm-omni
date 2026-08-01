@@ -3,6 +3,7 @@
 """Online-serving smoke tests for the public LTX-2 pipeline entries."""
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,7 @@ DISTILLED_MODEL = os.getenv("VLLM_TEST_LTX23_DISTILLED_MODEL", "diffusers/LTX-2.
 BASE_MODEL = os.getenv("VLLM_TEST_LTX23_MODEL", "diffusers/LTX-2.3-Diffusers")
 PROMPT = "A serene lake at sunset with mountains in the background."
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+LTX_TWO_STAGE_DEPLOY = Path(__file__).resolve().parents[3] / "vllm_omni/deploy/ltx2.yaml"
 
 
 def _server(
@@ -30,6 +32,16 @@ def _server(
             *extra_args,
             "--model-class-name",
             model_class_name,
+        ],
+    )
+
+
+def _two_stage_server() -> OmniServerParams:
+    return OmniServerParams(
+        model=BASE_MODEL,
+        server_args=[
+            "--deploy-config",
+            str(LTX_TWO_STAGE_DEPLOY),
         ],
     )
 
@@ -49,11 +61,7 @@ def _cases():
             marks=SINGLE_CARD_MARKS,
         ),
         pytest.param(
-            _server(
-                BASE_MODEL,
-                "LTX2TwoStagePipeline",
-                "--enable-layerwise-offload",
-            ),
+            _two_stage_server(),
             3,
             id="two_stage",
             marks=SINGLE_CARD_MARKS,

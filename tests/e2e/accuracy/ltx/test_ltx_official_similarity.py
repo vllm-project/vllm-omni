@@ -696,13 +696,6 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
     env["PYTHONUNBUFFERED"] = "1"
-    sidecars = [path for path in (spatial_upsampler, distilled_lora) if path is not None]
-    if sidecars:
-        sidecar_root = output_root / "sidecars"
-        sidecar_root.mkdir()
-        for path in sidecars:
-            (sidecar_root / path.name).symlink_to(path.resolve())
-        env["VLLM_OMNI_LTX_ARTIFACTS_DIR"] = str(sidecar_root)
     repository_root = Path(__file__).resolve().parents[4]
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -732,10 +725,7 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
     _run(official_args, env=env)
 
     omni_output = output_root / "omni"
-    omni_env = env.copy()
-    if case.two_stage_lora_mode is not None:
-        omni_env["VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE"] = case.two_stage_lora_mode
-    _run(
+    omni_args = (
         [sys.executable]
         + runner_args
         + [
@@ -747,9 +737,15 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
             str(model),
             "--model-class-name",
             case.model_class_name,
-        ],
-        env=omni_env,
+        ]
     )
+    if spatial_upsampler is not None:
+        omni_args.extend(["--spatial-upsampler", str(spatial_upsampler)])
+    if distilled_lora is not None:
+        omni_args.extend(["--distilled-lora", str(distilled_lora)])
+    if case.two_stage_lora_mode is not None:
+        omni_args.extend(["--two-stage-lora-mode", case.two_stage_lora_mode])
+    _run(omni_args, env=env)
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
     omni_metadata = json.loads((omni_output / "metadata.json").read_text())

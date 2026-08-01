@@ -27,11 +27,7 @@ then refines with the distilled LoRA. `LTX2DistilledPipeline` instead uses the
 fully merged distilled Transformer in both stages and never loads that LoRA.
 Always select the distilled class explicitly. Both entries support T2V and I2V.
 
-For local sidecars, set `VLLM_OMNI_LTX_ARTIFACTS_DIR` to a directory containing
-the required files with their original names. This is an authoritative
-override: missing files fail startup. Otherwise, the runtime searches the model
-root and the matching Lightricks repository. LTX ignores per-component
-`model_paths` overrides.
+Optional sidecar paths are configured in the bundled deploy YAML.
 
 ## Diffusion Feature Matrix
 
@@ -137,12 +133,8 @@ LTX-2.3 one-stage defaults shown above. Distilled schedules are fixed, so
 `num_inference_steps`, when supplied, must be `8`. Both entries reject custom
 sigmas and input latents.
 
-Ordinary two-stage defaults to `layer_fused`: each affected BF16 weight is
-materialized only during its Stage 2 layer call, matching official weight-space
-fusion without a second DiT. Set `VLLM_OMNI_LTX_TWO_STAGE_LORA_MODE=dynamic`
-for a quantized base; it computes `base(x) + lora_b(lora_a(x))` and is not
-bitwise-equivalent to fusion. `resident` keeps a second pre-merged DiT.
-Unsupported dtype, quantization, checkpoint format, or mode fails at startup.
+Ordinary two-stage defaults to layer-fused LoRA. Other startup choices are
+shown in the bundled deploy YAML.
 
 ## Serving
 
@@ -162,10 +154,10 @@ vllm serve rootonchair/LTX-2-19b-distilled --omni \
 # LTX-2.3 full-distilled; the v1.1 x2 upsampler is resolved when absent
 vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
   --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
-# Ordinary LTX-2.3 two-stage with local sidecars
-VLLM_OMNI_LTX_ARTIFACTS_DIR=/data/models/LTX-2.3-sidecars \
+# Ordinary LTX-2.3 two-stage
 vllm serve diffusers/LTX-2.3-Diffusers --omni \
-  --model-class-name LTX2TwoStagePipeline --stage-init-timeout 600
+  --deploy-config vllm_omni/deploy/ltx2.yaml \
+  --stage-init-timeout 600
 ```
 
 All entries handle T2V and I2V. A T2V request is:
