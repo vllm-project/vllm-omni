@@ -237,3 +237,18 @@ def test_construction_device_respects_offload_flags():
 
     # No offload -> unchanged, preserving the validated single-device path.
     assert _resolve_construction_device(no_offload, execution_device) == execution_device
+
+
+def test_distributed_layerwise_offload_is_rejected():
+    """DLO needs request-batch forward, which this pipeline does not implement."""
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (
+        LingBotVideoPipeline,
+    )
+
+    od_config = SimpleNamespace(
+        enable_distributed_layerwise_offload=True,
+        enable_layerwise_offload=False,
+        enable_cpu_offload=False,
+    )
+    with pytest.raises(ValueError, match="does not support distributed layerwise offload"):
+        LingBotVideoPipeline(od_config=od_config)

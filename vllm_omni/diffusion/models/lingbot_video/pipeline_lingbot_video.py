@@ -228,8 +228,10 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 def _resolve_construction_device(od_config: OmniDiffusionConfig, execution_device: torch.device) -> torch.device:
     """Build on host when offload is enabled so the backend manages residency.
 
-    Mirrors the load-device selection in ``DiffusionModelRunner.load_model``;
-    otherwise returns ``execution_device`` unchanged.
+    ``DiffusionModelRunner.load_model`` also selects the host for distributed
+    layerwise offload; that mode is rejected in ``__init__``, so only the two
+    supported flags are checked here. Otherwise returns ``execution_device``
+    unchanged.
     """
     if getattr(od_config, "enable_layerwise_offload", False) or getattr(od_config, "enable_cpu_offload", False):
         return torch.device("cpu")
@@ -253,6 +255,12 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            raise ValueError(
+                "LingBot-Video does not support distributed layerwise offload: the AllGather "
+                "path requires request-batch forward, which this pipeline does not implement. "
+                "Use --enable-layerwise-offload instead."
+            )
         self.od_config = od_config
         self.device = get_local_device()
         load_device = _resolve_construction_device(od_config, self.device)

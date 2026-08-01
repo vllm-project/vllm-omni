@@ -210,9 +210,10 @@ Submit the same text-to-video job as above, with
   `--vae-use-tiling` and `--vae-use-slicing` keep decode memory flat at larger
   shapes. The host holds the offloaded weights, so size host memory for the full
   BF16 checkpoint.
-- Known limitations: `--enable-cpu-offload` keeps the whole DiT resident and
-  fails on this card during startup with a CUDA out-of-memory error; use
-  `--enable-layerwise-offload` instead.
+- Known limitations: `--enable-cpu-offload` moves the complete DiT to the GPU for
+  the first denoising forward, so it fails on this card with a CUDA
+  out-of-memory error. With the default startup warmup that forward runs before
+  the server reports ready. Use `--enable-layerwise-offload` instead.
 
 ## Key Parameters
 
@@ -270,9 +271,10 @@ Local MoE offload validation on one RTX 5090 (32 GiB), serving with
 - 25 frames at `480x480` in 20 steps: `14558 MiB` (`14.2 GiB`) peak reserved GPU
   memory, `45.0s` request time.
 - Both requests returned a playable MP4 through `/v1/videos`.
-- The same server started with `--enable-cpu-offload` instead fails on this card
-  during startup with a CUDA out-of-memory error, because model-level offload
-  keeps the whole DiT resident.
+- The same server started with `--enable-cpu-offload` instead hits a CUDA
+  out-of-memory error on the first denoising forward, because model-level
+  offload moves the complete DiT to the GPU. With the default startup warmup
+  that forward is the dummy run, so the server never reports ready.
 
 The e2e coverage for both offload flags lives in
 [`tests/e2e/online_serving/test_lingbot_video_offload.py`](../../tests/e2e/online_serving/test_lingbot_video_offload.py).
@@ -340,6 +342,9 @@ bitwise correctness oracle.
 - CPU and layerwise offload are supported. Only layerwise offload brings the 30B
   checkpoint onto a 32 GiB card; model-level CPU offload keeps the DiT resident
   and still needs the `70 GiB` class card.
+- Distributed layerwise offload (`--enable-distributed-layerwise-offload`) is
+  rejected at startup: its AllGather path requires request-batch forward, which
+  this pipeline does not implement.
 - Optional Triton, SGLang, FP8, and alternative fused-expert backends from the
   upstream project are not included.
 - Only one request per LingBot pipeline batch is currently supported.
