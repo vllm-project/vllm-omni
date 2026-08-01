@@ -74,6 +74,38 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
     return {key: value for key, value in kwargs.items() if key in accepted}
 
 
+def _build_prefill_token_mask(
+    prompt_lens: list[int] | np.ndarray,
+    num_computed_tokens: list[int] | np.ndarray,
+    num_scheduled_tokens: list[int],
+    device: torch.device,
+) -> bool | torch.Tensor:
+    """Mark scheduled prompt tokens without relying on query length.
+
+    This assumes each request's scheduled tokens are a contiguous range starting
+    at ``num_computed_tokens``, as guaranteed by the current vLLM scheduler. It
+    does not support sparse/non-contiguous token scheduling; such a scheduler
+    must provide an explicit token-position-aligned prefill mask instead. This
+    restriction concerns scheduling, not sparse model architectures such as MoE.
+    """
+    token_mask: list[bool] = []
+    for prompt_len, num_computed, num_scheduled in zip(
+        prompt_lens,
+        num_computed_tokens,
+        num_scheduled_tokens,
+        strict=True,
+    ):
+        num_prefill = min(max(prompt_len - num_computed, 0), num_scheduled)
+        token_mask.extend([True] * num_prefill)
+        token_mask.extend([False] * (num_scheduled - num_prefill))
+
+    if not any(token_mask):
+        return False
+    if all(token_mask):
+        return True
+    return torch.tensor(token_mask, dtype=torch.bool, device=device)
+
+
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -85,6 +117,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._supports_prefill_token_mask = False
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -186,6 +219,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
+        self._supports_prefill_token_mask = bool(getattr(model, "supports_prefill_token_mask", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
@@ -1546,6 +1580,31 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _embed_scheduled_input_ids_with_prefill_mask(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: int,
+        multimodal_embeddings: list[torch.Tensor],
+        is_multimodal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embed the flattened scheduled tokens in input-batch request order."""
+        input_ids = self.input_ids.gpu[:num_scheduled_tokens]
+        req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        scheduled_tokens = [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in req_ids]
+        prefill_token_mask = _build_prefill_token_mask(
+            self.input_batch.num_prompt_tokens[:num_reqs],
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            scheduled_tokens,
+            input_ids.device,
+        )
+        return self.model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            prefill_token_mask=prefill_token_mask,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1582,11 +1641,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            if self._supports_prefill_token_mask:
+                inputs_embeds_scheduled = self._embed_scheduled_input_ids_with_prefill_mask(
+                    scheduler_output,
+                    num_scheduled_tokens,
+                    mm_embeds,
+                    is_mm_embed,
+                )
+            else:
+                inputs_embeds_scheduled = self.model.embed_input_ids(
+                    self.input_ids.gpu[:num_scheduled_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)

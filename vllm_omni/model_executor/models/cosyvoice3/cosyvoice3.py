@@ -59,11 +59,11 @@ logger = init_logger(__name__)
 def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
     """Prevent out-of-range ``speech_embedding`` gathers on the non-multimodal talker path.
 
-    The caller gates this to prefill steps only (see ``_is_prefill_step``); decode ids on
-    this path are codec tokens the talker sampled from its own in-range vocab and cannot be
-    out of range. It uses a single ``.any()`` host<->device sync; ``.tolist()`` only runs on
-    the error path. See issue #4721 for the full failure mode (an out-of-range id triggers a
-    CUDA device-side assert that poisons the CUDA context and kills the EngineCore).
+    The caller applies this only to tokens marked as prefill by runner request state;
+    decode ids on this path are codec tokens sampled from the talker's in-range vocab. It
+    uses a single ``.any()`` host<->device sync; ``.tolist()`` only runs on the error path.
+    See issue #4721 for the full failure mode (an out-of-range id triggers a CUDA
+    device-side assert that poisons the CUDA context and kills the EngineCore).
     """
     if input_ids.numel() == 0:
         return
@@ -75,32 +75,6 @@ def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) 
             f"got out-of-range ids {bad}. Non-multimodal text-only requests are not "
             "supported by the CosyVoice3 talker; provide the required audio prompt."
         )
-
-
-def _is_prefill_step() -> bool:
-    """Best-effort prefill detection for the talker's non-multimodal embed path.
-
-    Concurrent decode can have ``input_ids.numel() > 1`` while ``max_query_len == 1``; a
-    real prefill has ``max_query_len > 1``. Mirrors the idiom used by other omni talkers
-    (e.g. higgs_audio_v3). Fails safe to ``True`` (run the check) when the forward context
-    or attention metadata is unavailable.
-    """
-    if not is_forward_context_available():
-        return True
-    try:
-        attn_metadata = get_forward_context().attn_metadata
-        if not attn_metadata:
-            return True
-        if isinstance(attn_metadata, dict):
-            attn = next(iter(attn_metadata.values()))
-        else:
-            attn = attn_metadata
-        max_query_len = getattr(attn, "max_query_len", None)
-        if max_query_len is None:
-            return True
-        return int(max_query_len) > 1
-    except Exception:
-        return True
 
 
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
@@ -499,6 +473,7 @@ class CosyVoice3Model(
 ):
     supports_multimodal_raw_input_only = True
     supports_multimodal = True
+    supports_prefill_token_mask = True
     requires_raw_input_tokens = True
     prefer_model_sampler = True
     _sampling_eps = 1e-5
@@ -813,6 +788,7 @@ class CosyVoice3Model(
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
         is_multimodal=None,
+        prefill_token_mask: bool | torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
             if is_multimodal is not None and any(is_multimodal):
@@ -886,19 +862,31 @@ class CosyVoice3Model(
                     segments.append(multimodal_embeddings[i])
                 embed_tokens = torch.cat(segments, dim=0)
             else:
-                # This branch serves both the non-multimodal text-only prefill (the only
-                # case whose ids can be out of range) and the talker decode hot path, where
-                # ids are codec tokens the talker sampled from its own in-range vocab and so
-                # are always valid. Validate on prefill only, to avoid a per-decode-step
-                # host<->device sync.
+                # This branch serves both untrusted text-only prefill and the decode hot
+                # path. The runner supplies a token-level mask derived from request state
+                # (computed tokens vs prompt length), which remains correct for one-token
+                # prefills and mixed prefill/decode batches. Direct calls without scheduler
+                # metadata fail safe by validating all ids.
                 #
                 # Bound is the embedding row count, not config ``speech_token_size``: the
                 # table also holds the special sos/task_id/eos rows in the trailing slots
                 # that legitimate ids may reference, so the row count is the correct upper
                 # bound for what can be safely indexed here.
-                if _is_prefill_step():
+                if prefill_token_mask is not False:
+                    prefill_ids = input_ids
+                    if isinstance(prefill_token_mask, torch.Tensor):
+                        if prefill_token_mask.shape != input_ids.shape:
+                            raise ValueError(
+                                "cosyvoice3 talker: prefill_token_mask must match "
+                                f"input_ids shape; got {prefill_token_mask.shape} and {input_ids.shape}."
+                            )
+                        prefill_token_mask = prefill_token_mask.to(
+                            device=input_ids.device,
+                            dtype=torch.bool,
+                        )
+                        prefill_ids = input_ids[prefill_token_mask]
                     num_speech_tokens = self.model.speech_embedding.weight.shape[0]
-                    _validate_speech_token_ids(input_ids, num_speech_tokens)
+                    _validate_speech_token_ids(prefill_ids, num_speech_tokens)
                 embed_tokens = self.model.speech_embedding.weight[input_ids]
             return embed_tokens
         elif self.model_stage == "cosyvoice3_code2wav":

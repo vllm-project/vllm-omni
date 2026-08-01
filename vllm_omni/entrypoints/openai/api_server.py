@@ -1203,7 +1203,8 @@ def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    handler: Any | None = Omnicompletion(raw_request)
+    metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
+    handler: OpenAIServingCompletion | None = Omnicompletion(raw_request)
     if handler is None:
         return _create_unsupported_api_json_response(raw_request, "Completions API")
     try:
@@ -1219,12 +1220,19 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if isinstance(generator, ErrorResponse):
         return _error_response_to_json_response(generator)
     if isinstance(generator, Response):
+        if not isinstance(generator, StreamingResponse):
+            response_metrics_headers = metrics_header(metrics_header_format)
+            if response_metrics_headers:
+                generator.headers.update(response_metrics_headers)
         return generator
     if getattr(request, "stream", False):
         return StreamingResponse(content=generator, media_type="text/event-stream")
     if hasattr(generator, "model_dump"):
-        return JSONResponse(content=generator.model_dump(mode="json", warnings="none"))
-    return JSONResponse(content=generator)
+        return JSONResponse(
+            content=generator.model_dump(mode="json", warnings="none"),
+            headers=metrics_header(metrics_header_format),
+        )
+    return JSONResponse(content=generator, headers=metrics_header(metrics_header_format))
 
 
 @router.post(

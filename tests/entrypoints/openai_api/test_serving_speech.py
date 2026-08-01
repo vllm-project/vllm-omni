@@ -18,7 +18,7 @@ import pytest
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
@@ -361,6 +361,95 @@ def test_completion_route_forwards_supported_non_stream_request(mocker: MockerFi
     assert response.json() == {"id": "cmpl", "choices": []}
     app.state.openai_serving_completion.create_completion.assert_awaited_once()
     app.state.engine_client.generate.assert_not_called()
+
+
+def test_completion_route_preserves_endpoint_load_metrics_header(mocker: MockerFixture):
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
+
+    metrics_header_mock = mocker.patch.object(
+        api_server_module,
+        "metrics_header",
+        return_value={"x-vllm-test-load-metrics": "available"},
+    )
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    response = TestClient(app).post(
+        "/v1/completions",
+        headers={api_server_module.ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL: "json"},
+        json={"model": "generate-model", "prompt": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-vllm-test-load-metrics"] == "available"
+    metrics_header_mock.assert_called_once_with("json")
+
+
+def test_completion_route_adds_load_metrics_to_handler_response(mocker: MockerFixture):
+    handler_response = JSONResponse(
+        content={"id": "cmpl", "choices": []},
+        headers={"x-handler-header": "preserved"},
+    )
+
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value=handler_response)
+
+    metrics_header_mock = mocker.patch.object(
+        api_server_module,
+        "metrics_header",
+        return_value={"x-vllm-test-load-metrics": "available"},
+    )
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    response = TestClient(app).post(
+        "/v1/completions",
+        headers={api_server_module.ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL: "json"},
+        json={"model": "generate-model", "prompt": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-handler-header"] == "preserved"
+    assert response.headers["x-vllm-test-load-metrics"] == "available"
+    metrics_header_mock.assert_called_once_with("json")
+
+
+def test_completion_route_does_not_add_load_metrics_to_streaming_response(mocker: MockerFixture):
+    async def _stream():
+        yield b'data: {"id": "cmpl"}\n\n'
+
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(
+                return_value=StreamingResponse(_stream(), media_type="text/event-stream")
+            )
+
+    metrics_header_mock = mocker.patch.object(
+        api_server_module,
+        "metrics_header",
+        return_value={"x-vllm-test-load-metrics": "available"},
+    )
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    response = TestClient(app).post(
+        "/v1/completions",
+        headers={api_server_module.ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL: "json"},
+        json={"model": "generate-model", "prompt": "hello", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "x-vllm-test-load-metrics" not in response.headers
+    metrics_header_mock.assert_not_called()
 
 
 def test_completion_route_forwards_supported_stream_request(mocker: MockerFixture):

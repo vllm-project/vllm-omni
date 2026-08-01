@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,56 +30,78 @@ def _guard():
     return _validate_speech_token_ids
 
 
-def _prefill_detector():
-    # Defer the heavy cosyvoice3 import until a test actually runs.
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _is_prefill_step
+def _embed_input_ids(
+    input_ids: torch.Tensor,
+    prefill_token_mask: bool | torch.Tensor | None,
+) -> torch.Tensor:
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
 
-    return _is_prefill_step
+    model = SimpleNamespace(
+        model_stage="cosyvoice3_talker",
+        model=SimpleNamespace(speech_embedding=torch.nn.Embedding(10, 4)),
+    )
+    return CosyVoice3Model.embed_input_ids(
+        model,
+        input_ids,
+        is_multimodal=None,
+        prefill_token_mask=prefill_token_mask,
+    )
 
 
-def test_is_prefill_step_returns_false_for_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_single_token_prefill_rejects_out_of_range_id() -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        _embed_input_ids(torch.tensor([6562]), prefill_token_mask=True)
+
+
+def test_mixed_batch_validates_only_prefill_tokens() -> None:
+    with pytest.raises(ValueError, match="6562"):
+        _embed_input_ids(
+            torch.tensor([3, 6562]),
+            prefill_token_mask=torch.tensor([False, True]),
+        )
+
+
+def test_decode_skips_prefill_validation(mocker: MockerFixture) -> None:
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
 
-    # Decode must return False so embed_input_ids skips the OOB guard and avoids per-step sync.
-    ctx = SimpleNamespace(attn_metadata={"backend": SimpleNamespace(max_query_len=1)})
-    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: ctx)
+    guard = mocker.patch.object(cosyvoice3, "_validate_speech_token_ids")
 
-    assert _prefill_detector()() is False
+    output = _embed_input_ids(torch.tensor([3]), prefill_token_mask=False)
+
+    assert output.shape == (1, 4)
+    guard.assert_not_called()
 
 
-def test_is_prefill_step_returns_true_for_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_multimodal_prefill_skips_non_multimodal_validation(mocker: MockerFixture) -> None:
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
 
-    ctx = SimpleNamespace(attn_metadata={"backend": SimpleNamespace(max_query_len=8)})
-    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: ctx)
+    guard = mocker.patch.object(cosyvoice3, "_validate_speech_token_ids")
+    hidden_size = 4
+    model = SimpleNamespace(
+        model_stage="cosyvoice3_talker",
+        model=SimpleNamespace(
+            llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=torch.nn.Embedding(16, hidden_size))),
+            speech_embedding=torch.nn.Embedding(10, hidden_size),
+            sos=8,
+            task_id=9,
+        ),
+    )
 
-    assert _prefill_detector()() is True
+    output = cosyvoice3.CosyVoice3Model.embed_input_ids(
+        model,
+        torch.tensor([0, 1, 2, 3]),
+        multimodal_embeddings=[torch.zeros(1, hidden_size)],
+        is_multimodal=torch.tensor([True, True, True, False]),
+        prefill_token_mask=True,
+    )
+
+    assert output.shape == (4, hidden_size)
+    guard.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "exception",
-    [
-        pytest.param(AttributeError("attn metadata unavailable"), id="attribute_error"),
-        pytest.param(KeyError("metadata"), id="key_error"),
-        pytest.param(RuntimeError("backend metadata unavailable"), id="runtime_error"),
-    ],
-)
-def test_is_prefill_step_fails_safe_when_metadata_unavailable(
-    monkeypatch: pytest.MonkeyPatch, exception: Exception
-) -> None:
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
-
-    class BrokenForwardContext:
-        @property
-        def attn_metadata(self):
-            raise exception
-
-    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: BrokenForwardContext())
-
-    assert _prefill_detector()() is True
+def test_missing_prefill_metadata_fails_safe() -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        _embed_input_ids(torch.tensor([6562]), prefill_token_mask=None)
 
 
 def test_inclusive_boundaries_pass() -> None:
