@@ -294,8 +294,7 @@ class Attention(nn.Module):
 
         if query.dtype == torch.float32:
             logger.warning_once(
-                f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
-                f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
+                f"Using SDPA fallback for attention_backend='{self.backend_pref}' with dtype={query.dtype}."
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 

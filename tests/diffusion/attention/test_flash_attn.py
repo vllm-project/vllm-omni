@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -24,6 +25,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
+
+
+@pytest.mark.parametrize("impl_cls", [SDPAImpl, CuDNNAttentionImpl])
+def test_none_kv_heads_means_no_gqa(impl_cls):
+    impl = impl_cls(num_heads=4, head_size=8, softmax_scale=8**-0.5, causal=False, num_kv_heads=None)
+    assert impl.requires_gqa is False
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:

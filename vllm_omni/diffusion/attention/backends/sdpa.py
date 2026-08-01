@@ -86,6 +86,8 @@ class SDPAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.requires_gqa = num_heads != kv_heads
         if backend_kwargs:
             logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -131,8 +133,7 @@ class SDPAImpl(AttentionImpl):
             scale=self.softmax_scale,
             enable_gqa=enable_gqa,
         )
-        out = output.permute(0, 2, 1, 3)
-        return out
+        return output.permute(0, 2, 1, 3)
 
     def forward_cuda(
         self,

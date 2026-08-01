@@ -22,6 +22,8 @@ nav:
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
       - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
+      - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
+      - NAVA: user_guide/examples/offline_inference/nava.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
@@ -37,6 +39,8 @@ nav:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
+      - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
+      - NAVA: user_guide/examples/online_serving/nava.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
