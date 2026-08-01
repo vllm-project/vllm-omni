@@ -18,13 +18,15 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.55
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
     limit_mm_per_prompt:
-      video: 1
+      video:
+        count: 1
+        num_frames: 32
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -36,6 +38,7 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
+    # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
     gpu_memory_utilization: 0.15
     enforce_eager: false
     max_num_batched_tokens: 8192
@@ -72,6 +75,13 @@ stages:
       detokenize: true
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Four Talker streams need much less KV than automatic sizing.
+        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
+        kv_cache_memory_bytes: 2147483648  # 2 GiB
+
   npu:
     stages:
       - stage_id: 0

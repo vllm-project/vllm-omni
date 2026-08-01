@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -188,6 +190,34 @@ class TestOmniMasterServerAllocation:
         input_port = int(alloc.input_bind_address.split(":")[-1])
         output_port = int(alloc.output_bind_address.split(":")[-1])
         assert len({handshake_port, input_port, output_port}) == 3
+
+    def test_route_ports_remain_os_reserved_until_master_releases_them(self):
+        server = OmniMasterServer(master_address="127.0.0.1", master_port=15005, stage_ids=[0])
+        alloc = server.get_allocation(0)
+        ports = [
+            int(alloc.handshake_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.input_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.output_bind_address.rsplit(":", 1)[-1]),
+        ]
+
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.release_route_port_reservations(0, handshake=True, data=False)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", ports[0]))
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.stop()
+
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
 
     def test_get_zmq_addresses_returns_bind_addresses(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15002, stage_ids=[0])
@@ -397,6 +427,30 @@ class TestSingleStageModeDetection:
         assert engine.single_stage_mode is False
         assert engine._single_stage_id_filter is None
 
+    def test_stage_configs_path_loads_duplex_runtime_config(self, mocker: MockerFixture):
+        duplex_session = DuplexSessionRuntimeConfig(max_sessions=2)
+        get_pipeline_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
+            return_value=None,
+        )
+        load_deploy_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=duplex_session),
+        )
+
+        engine = self._make_engine_no_thread(
+            mocker,
+            stage_configs_path="/fake/duplex.yaml",
+        )
+
+        get_pipeline_config.assert_called_once_with(
+            model="fake-model",
+            trust_remote_code=False,
+            deploy_config_path="/fake/duplex.yaml",
+        )
+        load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
+        assert engine.duplex_session_config is duplex_session
+
     def test_single_stage_mode_without_stage_id_has_no_filter(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(
             mocker,
@@ -450,7 +504,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -477,7 +531,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -550,7 +604,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="llm",
@@ -609,7 +663,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="diffusion",
@@ -724,6 +778,7 @@ class TestSingleStageReplicaInitialization:
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
             omni_master_port=26000,
+            log_stats=True,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
@@ -757,10 +812,17 @@ class TestSingleStageReplicaInitialization:
         sentinel_client = SimpleNamespace()
 
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
+        client_kwargs: dict[str, Any] = {}
+
+        def _capture_make_async_mp_client(**kwargs):
+            client_kwargs.update(kwargs)
+            events.append("attach")
+            return sentinel_client
+
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
-            side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
+            side_effect=_capture_make_async_mp_client,
         )
 
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
@@ -770,6 +832,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
+        assert client_kwargs["log_stats"] is True
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
@@ -943,7 +1006,7 @@ class TestSingleStageReplicaInitialization:
         plan = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
-        mocker.patch.object(runtime_mod, "extract_stage_metadata", return_value=remote_metadata)
+        mocker.patch.object(runtime_mod, "extract_legacy_stage_metadata", return_value=remote_metadata)
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_diffusion_proc", side_effect=_fake_connect)
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",

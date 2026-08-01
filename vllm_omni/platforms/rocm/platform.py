@@ -30,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -75,7 +75,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        """Get the diffusion attention backend class path for ROCm platform.
+
+        ROCm supports FLASH_ATTN via the aiter library, and SDPA as fallback.
+
+        Args:
+            selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
+                "TORCH_SDPA"). If None, uses platform default.
+            head_size: Attention head size.
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
+        Returns:
+            Fully qualified class path of the selected backend.
+        """
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         # Check if aiter is available for Flash Attention support
@@ -144,6 +158,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     @classmethod
     def synchronize(cls) -> None:
         torch.accelerator.synchronize()
+
+    @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

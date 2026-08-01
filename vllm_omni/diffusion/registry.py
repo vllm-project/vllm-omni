@@ -71,20 +71,10 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
-    "LTX2ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX2ImageToVideoPipeline",
-    ),
-    "LTX2TwoStagesPipeline": (
+    "LTX2DistilledPipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
-        "LTX2TwoStagesPipeline",
-    ),
-    "LTX2ImageToVideoTwoStagesPipeline": (
-        "ltx2",
-        "pipeline_ltx2_two_stage",
-        "LTX2ImageToVideoTwoStagesPipeline",
+        "LTX2DistilledPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
         "ltx2",
@@ -95,16 +85,6 @@ _DIFFUSION_MODELS = {
         "ltx2",
         "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
-    ),
-    "LTX23Pipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23Pipeline",
-    ),
-    "LTX23ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -449,7 +429,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # Some pipelines have recursive
                 # modules that have the transformer
                 module = find_module_with_attr(model, attr)
                 if module is None:
@@ -519,13 +499,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
-    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
-    "LTX23Pipeline": "get_ltx2_post_process_func",
-    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
@@ -554,6 +530,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
@@ -564,6 +541,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
 }
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
