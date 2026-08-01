@@ -10,8 +10,10 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -37,8 +39,10 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         external_req_id=external_req_id or req_id,
         status=status,
         prompt_token_ids=[],
+        num_prompt_tokens=0,
         num_computed_tokens=0,
         num_output_placeholders=0,
+        prefill_stats=None,
         additional_information=None,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
@@ -483,6 +487,48 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     # AR mode now forwards the latest payload directly.
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-later-chunk", RequestStatus.WAITING, external_req_id="ext-later-chunk")
+    request.prefill_stats = PrefillStats()
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+
+    connector.get.return_value = (
+        {
+            "codes": {"audio": torch.tensor([7, 8], dtype=torch.long)},
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        },
+        8,
+    )
+    assert adapter._poll_single_request(request) is True
+    OmniGenerationScheduler._record_prefill_stats(request)
+    first_chunk_stats = request.prefill_stats
+    request.prefill_stats = None
+
+    connector.get.return_value = (
+        {
+            "codes": {"audio": torch.tensor([9, 10, 11], dtype=torch.long)},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        },
+        8,
+    )
+    assert adapter._poll_single_request(request) is True
+    assert isinstance(request.prefill_stats, PrefillStats)
+    OmniGenerationScheduler._record_prefill_stats(request)
+    second_chunk_stats = request.prefill_stats
+
+    assert first_chunk_stats is not None
+    assert first_chunk_stats.num_prompt_tokens == 2
+    assert second_chunk_stats is not None
+    assert second_chunk_stats.num_prompt_tokens == 3
+
+    prompt_token_stats = PromptTokenStats()
+    prompt_token_stats.update_from_output(first_chunk_stats)
+    prompt_token_stats.update_from_output(second_chunk_stats)
+    assert prompt_token_stats.total == 5
+    assert prompt_token_stats.computed == 5
 
 
 def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):
