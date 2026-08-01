@@ -14,6 +14,10 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.config.omni_config import (
+    OmniStageDiffusionParallelConfig,
+    OmniStageParallelConfig,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import KVPrefetchJob
 from vllm_omni.platforms import current_omni_platform
@@ -35,6 +39,12 @@ from .utils.kv_utils import (
     normalize_layer_kv,
     slice_layer_blocks,
     slice_received_rank_shard,
+)
+from .utils.parallel_plan import (
+    KVReceiveDistributionPlan,
+    KVReceiveRankInfo,
+    build_kv_parallel_rank_coord,
+    build_kv_receive_distribution_plan,
 )
 from .utils.serialization import OmniSerializer
 
@@ -91,6 +101,24 @@ class _TransferTopoConfig:
         return self.sp_size > 1
 
 
+@dataclass(frozen=True)
+class _ReceiveParallelState:
+    """Receive-side runtime ranks/groups plus the unified parallel config."""
+
+    parallel_config: OmniStageParallelConfig
+    cfg_rank: int = 0
+    cfg_group: Any | None = None
+    sp_rank: int = 0
+    sp_group: Any | None = None
+    ring_rank: int = 0
+    ulysses_rank: int = 0
+    pp_rank: int = 0
+    dp_rank: int = 0
+    ep_rank: int = 0
+    ep_group: Any | None = None
+    world: Any | None = None
+
+
 # Placeholder for the heavy primary KV in the side-payload dict; receiver swaps in the rebuilt object from the blob.
 _KV_PLACEHOLDER = "__kv_placeholder__"
 
@@ -132,6 +160,7 @@ class OmniKVCacheConfig:
     recv_timeout: float = 30.0
     from_tp: int = 1
     to_tp: int = 1
+    parallel_config: OmniStageParallelConfig | None = None
     enable_kv_async_prefetch: bool = False
     kv_prefetch_min_free_mem_ratio: float = 0.0
 
@@ -427,10 +456,21 @@ class OmniKVTransferManager:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> "OmniKVTransferManager":
+    def _create(
+        cls,
+        cfg: dict | None,
+        *,
+        async_prefetch: bool = False,
+        parallel_config: OmniStageParallelConfig | None = None,
+    ) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
-            return cls(OmniKVCacheConfig(), async_prefetch=async_prefetch)
+            return cls(
+                OmniKVCacheConfig(
+                    parallel_config=parallel_config,
+                ),
+                async_prefetch=async_prefetch,
+            )
 
         rank_mapping = cfg.get("rank_mapping", {})
         if not isinstance(rank_mapping, dict):
@@ -448,6 +488,7 @@ class OmniKVTransferManager:
                 recv_timeout=cfg.get("recv_timeout", 30.0),
                 from_tp=int(rank_mapping.get("from_tp", 1)),
                 to_tp=int(rank_mapping.get("to_tp", 1)),
+                parallel_config=parallel_config,
                 enable_kv_async_prefetch=async_prefetch,
                 kv_prefetch_min_free_mem_ratio=cfg.get("kv_prefetch_min_free_mem_ratio", 0.0),
             ),
@@ -472,12 +513,16 @@ class OmniKVTransferManager:
         return not (has_companion or cls._receiver_pool_on_device(omni_kv))
 
     @classmethod
-    def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
+    def from_od_config(cls, config: Any, vllm_config: Any | None = None) -> "OmniKVTransferManager":
         """Create from model or OmniDiffusion config."""
         omni_kv = getattr(config, "omni_kv_config", None)
         has_companion = getattr(config, "cfg_kv_collect_func", None) is not None
         async_prefetch = cls._resolve_async_prefetch(omni_kv, has_companion=has_companion)
-        return cls._create(omni_kv, async_prefetch=async_prefetch)
+        return cls._create(
+            omni_kv,
+            async_prefetch=async_prefetch,
+            parallel_config=getattr(config, "parallel_config", None) or getattr(vllm_config, "parallel_config", None),
+        )
 
     from_model_config = from_od_config
 
@@ -486,12 +531,15 @@ class OmniKVTransferManager:
         """Create from vllm config with fallback to kv_transfer_config."""
         # Primary: omni_kv_config on model_config — same shape as from_od_config.
         if isinstance(getattr(model_config, "omni_kv_config", None), dict):
-            return cls.from_od_config(model_config)
+            return cls.from_od_config(model_config, vllm_config=vllm_config)
 
         connector_cfg = cls._connector_cfg_from_kv_transfer(getattr(vllm_config, "kv_transfer_config", None))
         if connector_cfg is not None:
-            return cls._create({"connector_config": connector_cfg})
-        return cls(OmniKVCacheConfig())
+            return cls._create(
+                {"connector_config": connector_cfg},
+                parallel_config=getattr(vllm_config, "parallel_config", None),
+            )
+        return cls(OmniKVCacheConfig(parallel_config=getattr(vllm_config, "parallel_config", None)))
 
     @staticmethod
     def _connector_cfg_from_kv_transfer(kv_cfg: Any) -> dict | None:
@@ -1210,8 +1258,10 @@ class OmniKVTransferManager:
         """Kick off a background KV load (non-blocking). No-op unless prefetch enabled."""
         if not (self._async_prefetch and self.config.need_recv_cache) or not kv_prefetch_job:
             return
-        # Followers receive via collective distribute; bg pull would consume the owner's payload.
-        if self.topo_config.is_follower:
+        # Followers and replica-fanout peers receive via local collectives; a bg
+        # pull there would consume the owner's one-shot remote payload.
+        plan, _ = self._build_receive_distribution_plan()
+        if not self._should_fetch_remote_kv(plan):
             return
         rid = kv_prefetch_job.get("request_id")
         if not rid:
@@ -1608,6 +1658,144 @@ class OmniKVTransferManager:
 
         return primary_ok
 
+    @staticmethod
+    def _safe_parallel_int(getter: Callable[[], Any] | None, default: int = 1) -> int:
+        if getter is None:
+            return default
+        try:
+            return int(getter())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_parallel_group(getter: Callable[[], Any] | None) -> Any | None:
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def _receive_parallel_size(self, state: _ReceiveParallelState, name: str, default: int = 1) -> int:
+        return int(getattr(state.parallel_config, name, default))
+
+    def _configured_parallel_int(self, name: str, default: int = 1) -> int:
+        """Read a parallel size from the unified config when available."""
+        parallel_config = self.config.parallel_config
+        return int(getattr(parallel_config, name, default)) if parallel_config is not None else default
+
+    def _runtime_parallel_config(self, runtime_parallel_sizes: dict[str, int]) -> OmniStageDiffusionParallelConfig:
+        return OmniStageDiffusionParallelConfig(
+            pipeline_parallel_size=runtime_parallel_sizes["pipeline_parallel_size"],
+            data_parallel_size=runtime_parallel_sizes["data_parallel_size"],
+            tensor_parallel_size=self._tp_topo.target_tp_size,
+            ulysses_degree=runtime_parallel_sizes["ulysses_degree"],
+            ring_degree=runtime_parallel_sizes["ring_degree"],
+            cfg_parallel_size=runtime_parallel_sizes["cfg_parallel_size"],
+        )
+
+    def _collect_receive_parallel_state(self) -> _ReceiveParallelState:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_cfg_group,
+            get_classifier_free_guidance_rank,
+            get_classifier_free_guidance_world_size,
+            get_data_parallel_rank,
+            get_data_parallel_world_size,
+            get_pipeline_parallel_rank,
+            get_pipeline_parallel_world_size,
+            get_ring_parallel_rank,
+            get_ring_parallel_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_sp_group,
+            get_ulysses_parallel_rank,
+            get_ulysses_parallel_world_size,
+            get_world_group,
+        )
+
+        runtime_parallel_sizes = {
+            "cfg_parallel_size": self._safe_parallel_int(get_classifier_free_guidance_world_size),
+            "sequence_parallel_size": self._safe_parallel_int(get_sequence_parallel_world_size),
+            "ring_degree": self._safe_parallel_int(get_ring_parallel_world_size),
+            "ulysses_degree": self._safe_parallel_int(get_ulysses_parallel_world_size),
+            "pipeline_parallel_size": self._safe_parallel_int(get_pipeline_parallel_world_size),
+            "data_parallel_size": self._safe_parallel_int(get_data_parallel_world_size),
+        }
+        parallel_config = self.config.parallel_config or self._runtime_parallel_config(runtime_parallel_sizes)
+        cfg_size = int(getattr(parallel_config, "cfg_parallel_size", 1))
+        sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1))
+        ep_group = self._safe_parallel_group(get_ep_group)
+        return _ReceiveParallelState(
+            parallel_config=parallel_config,
+            cfg_rank=self._safe_parallel_int(get_classifier_free_guidance_rank, 0),
+            cfg_group=self._safe_parallel_group(get_cfg_group) if cfg_size > 1 else None,
+            sp_rank=self._safe_parallel_int(get_sequence_parallel_rank, 0),
+            sp_group=self._safe_parallel_group(get_sp_group) if sp_size > 1 else None,
+            ring_rank=self._safe_parallel_int(get_ring_parallel_rank, 0),
+            ulysses_rank=self._safe_parallel_int(get_ulysses_parallel_rank, 0),
+            pp_rank=self._safe_parallel_int(get_pipeline_parallel_rank, 0),
+            dp_rank=self._safe_parallel_int(get_data_parallel_rank, 0),
+            ep_rank=self._group_rank(ep_group),
+            ep_group=ep_group,
+            world=self._safe_parallel_group(get_world_group),
+        )
+
+    def _build_receive_distribution_plan(
+        self,
+    ) -> tuple[KVReceiveDistributionPlan, _ReceiveParallelState]:
+        state = self._collect_receive_parallel_state()
+        topo = self._tp_topo
+        coord = build_kv_parallel_rank_coord(
+            parallel_config=state.parallel_config,
+            ranks=KVReceiveRankInfo(
+                tp_rank=topo.local_rank,
+                pp_rank=state.pp_rank,
+                ring_rank=state.ring_rank,
+                ulysses_rank=state.ulysses_rank,
+                cfg_rank=state.cfg_rank,
+                sp_rank=state.sp_rank,
+                dp_rank=state.dp_rank,
+                dp_size=int(getattr(state.parallel_config, "data_parallel_size", 1)),
+                ep_rank=state.ep_rank,
+                ep_size=self._group_world_size(state.ep_group),
+            ),
+            target_tp_size=topo.target_tp_size,
+        )
+        world = state.world
+        world_size = int(getattr(world, "world_size", 1) or 1)
+        world_rank = int(getattr(world, "rank_in_group", 0) or 0)
+        return (
+            build_kv_receive_distribution_plan(
+                coord=coord,
+                world_size=world_size,
+                world_rank=world_rank,
+                source_tp_size=topo.source_tp_size,
+                target_tp_size=topo.target_tp_size,
+            ),
+            state,
+        )
+
+    def _should_fetch_remote_kv(self, plan: KVReceiveDistributionPlan) -> bool:
+        if plan.independently_receives_remote:
+            return not plan.uses_replica_fanout
+        if plan.uses_local_distribution:
+            return plan.owner_receives and not plan.uses_replica_fanout
+        return plan.owner_receives
+
+    @staticmethod
+    def _group_world_size(group: Any | None) -> int:
+        if group is None:
+            return 1
+        return int(getattr(group, "world_size", 1) or 1)
+
+    @staticmethod
+    def _group_rank(group: Any | None) -> int:
+        if group is None:
+            return 0
+        return int(getattr(group, "rank_in_group", 0) or 0)
+
     def _extract_primary_kv_obj(self, kv_payload: dict[str, Any]) -> Any | None:
         """Return the primary KV object (``SimpleNamespace(key_cache, value_cache)``)."""
         for key in ("past_key_values", "sp.past_key_values"):
@@ -1747,26 +1935,128 @@ class OmniKVTransferManager:
         combined = combined.to(device)
         return self._unpack_kv_payload(combined)
 
+    def _replica_fanout_peer_ranks(
+        self,
+        *,
+        plan: KVReceiveDistributionPlan,
+        replica_group: Any | None,
+        participates: bool,
+    ) -> tuple[int, tuple[int, ...]] | None:
+        """Return EP-group owner and peers for same-KV replica fanout."""
+        if not plan.uses_replica_fanout or replica_group is None:
+            return None
+        if self._group_world_size(replica_group) <= 1:
+            return None
+
+        rank_in_group = self._group_rank(replica_group)
+        local_identity = plan.replica_fanout_identity
+        local_member = {
+            "rank": rank_in_group,
+            "identity": local_identity,
+            "participates": participates,
+        }
+        members: list[dict[str, object] | None] = [None] * self._group_world_size(replica_group)
+        torch.distributed.all_gather_object(
+            members,
+            local_member,
+            group=replica_group.cpu_group,
+        )
+
+        peer_ranks = tuple(
+            sorted(
+                int(member["rank"])
+                for member in members
+                if member is not None
+                and bool(member.get("participates"))
+                and tuple(member.get("identity", ())) == local_identity
+            )
+        )
+        if len(peer_ranks) <= 1:
+            return None
+        return peer_ranks[0], peer_ranks
+
+    def _receive_remote_kv_payload_from_replica_fanout(
+        self,
+        *,
+        req: Any,
+        replica_group: Any | None,
+        fanout: tuple[int, tuple[int, ...]],
+        cfg_kv_collect_func: Callable | None,
+        device: torch.device,
+    ) -> dict[str, object] | None:
+        """Receive remote KV once, then share it inside replica-equivalent EP peers."""
+        owner_rank, peer_ranks = fanout
+        rank_in_group = self._group_rank(replica_group)
+        if rank_in_group == owner_rank:
+            received = self.receive_multi_kv_cache(
+                req,
+                cfg_kv_collect_func,
+                device,
+            )
+            kv_payload = self._collect_request_kv_payload(req) if received else None
+            for dst_rank in peer_ranks:
+                if dst_rank != owner_rank:
+                    self._send_kv_payload(replica_group, kv_payload, dst_rank, device)
+            return kv_payload
+
+        return self._recv_kv_payload(replica_group, owner_rank, device)
+
     def receive_multi_kv_cache_distributed(
         self,
         req: Any,
         cfg_kv_collect_func: Callable | None = None,
         target_device: torch.device | None = None,
     ) -> bool:
-        """Synchronous receive: fetch → distribute → apply (FOLLOWER skips fetch)."""
+        """Synchronous receive with plan-driven local distribution/fanout."""
+        plan, state = self._build_receive_distribution_plan()
+        if plan.mode == "single":
+            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+
         received = False
-        if not self.topo_config.is_follower:
+        if plan.independently_receives_remote and plan.uses_replica_fanout:
+            device = target_device if target_device is not None else torch.device("cpu")
+            fanout = self._replica_fanout_peer_ranks(
+                plan=plan,
+                replica_group=state.ep_group,
+                participates=True,
+            )
+            if fanout is None:
+                received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+            else:
+                kv_payload = self._receive_remote_kv_payload_from_replica_fanout(
+                    req=req,
+                    replica_group=state.ep_group,
+                    fanout=fanout,
+                    cfg_kv_collect_func=cfg_kv_collect_func,
+                    device=device,
+                )
+                if kv_payload is not None:
+                    self._apply_request_kv_payload(req, kv_payload, target_device)
+                return kv_payload is not None
+        elif plan.independently_receives_remote or plan.owner_receives:
             received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
-        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
+
+        kv_payload = self.distribute_kv_cache(
+            req,
+            target_device,
+            received=received,
+            plan=plan,
+            state=state,
+            cfg_kv_collect_func=cfg_kv_collect_func,
+        )
         if kv_payload is not None:
             self._apply_request_kv_payload(req, kv_payload, target_device)
         return received or kv_payload is not None
 
     def consume_and_distribute_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
         """Consume prefetched KV → apply → distribute; sync-receive on miss (no retry on consume-error)."""
+        plan, state = self._build_receive_distribution_plan()
+        if plan.uses_replica_fanout:
+            return self.receive_multi_kv_cache_distributed(req, None, target_device)
+
         received = False
         payload_consumed = False
-        if self._async_prefetch and not self.topo_config.is_follower:
+        if self._async_prefetch and self._should_fetch_remote_kv(plan):
             try:
                 data, _ = self.consume_prefetched_kv(req)
                 if data is not None:
@@ -1782,10 +2072,10 @@ class OmniKVTransferManager:
         # Only fall back to sync receive on miss, not when payload was
         # already consumed from the connector (sync receive would block
         # until timeout as the data is gone).
-        if not received and not self.topo_config.is_follower and not payload_consumed:
+        if not received and self._should_fetch_remote_kv(plan) and not payload_consumed:
             logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
             received = self.receive_multi_kv_cache(req, None, target_device)
-        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
+        kv_payload = self.distribute_kv_cache(req, target_device, received=received, plan=plan, state=state)
         if kv_payload is not None:
             self._apply_request_kv_payload(req, kv_payload, target_device)
         return received or kv_payload is not None
@@ -1807,45 +2097,67 @@ class OmniKVTransferManager:
                 continue
 
     def distribute_kv_cache(
-        self, req: Any, target_device: torch.device | None = None, *, received: bool = False
+        self,
+        req: Any,
+        target_device: torch.device | None = None,
+        *,
+        received: bool = False,
+        plan: KVReceiveDistributionPlan | None = None,
+        state: _ReceiveParallelState | None = None,
+        cfg_kv_collect_func: Callable | None = None,
     ) -> dict[str, Any] | None:
-        """Distribute KV LEADER→FOLLOWER. No-op for LOCAL/pure TP."""
-        pt = self.topo_config
+        """Distribute KV according to the receive distribution plan."""
+        if plan is None or state is None:
+            plan, state = self._build_receive_distribution_plan()
 
-        # LOCAL: no distribution.
-        if pt.is_local:
+        if plan.mode in ("single", "independent_remote"):
             return None
 
         device = target_device if target_device is not None else torch.device("cpu")
-        # TP + CFG/SP
-        if pt.tp_active and (pt.cfg_active or pt.sp_active):
+        if plan.uses_local_distribution:
             kv_payload: dict[str, object] | None = None
-            if pt.is_leader:
-                if pt.cfg_active:
-                    payloads = (
-                        self._build_cfg_rank_local_payloads(req, pt.cfg_size) if received else [None] * pt.cfg_size
+
+            if plan.uses_replica_fanout:
+                fanout = self._replica_fanout_peer_ranks(
+                    plan=plan,
+                    replica_group=state.ep_group,
+                    participates=plan.owner_receives,
+                )
+                if plan.owner_receives and fanout is not None:
+                    remote_kv_payload = self._receive_remote_kv_payload_from_replica_fanout(
+                        req=req,
+                        replica_group=state.ep_group,
+                        fanout=fanout,
+                        cfg_kv_collect_func=cfg_kv_collect_func,
+                        device=device,
                     )
+                    if remote_kv_payload is not None:
+                        self._apply_request_kv_payload(req, remote_kv_payload, device)
+                        received = True
+
+            if plan.owner_receives:
+                if plan.cfg_active:
+                    cfg_size = self._receive_parallel_size(state, "cfg_parallel_size")
+                    payloads = self._build_cfg_rank_local_payloads(req, cfg_size) if received else [None] * cfg_size
                     kv_payload = payloads[0]
-                    self._cfg_scatter(pt.cfg_group, payloads, pt.cfg_size, device, self._resolve_request_id(req))
-                elif pt.sp_active:
+                    if state.cfg_group is not None:
+                        self._cfg_scatter(state.cfg_group, payloads, cfg_size, device, self._resolve_request_id(req))
+                elif plan.sp_broadcast_enabled:
                     kv_payload = self._collect_request_kv_payload(req) if received else None
-                if pt.sp_active and pt.sp_group is not None:
-                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
-            elif pt.is_follower:
-                if pt.cfg_active and pt.sp_rank == 0:
-                    kv_payload = self._recv_kv_payload(pt.cfg_group, 0, device)
-                if pt.sp_active and pt.sp_group is not None:
-                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
-            else:
-                logger.error("distribute_kv_cache: unexpected role %s in TP+CFG/SP path", pt.role)
-                return None
+            elif plan.cfg_follower_receives_from_cfg_leader and state.cfg_group is not None:
+                kv_payload = self._recv_kv_payload(state.cfg_group, 0, device)
+
+            if plan.sp_broadcast_enabled and state.sp_group is not None:
+                kv_payload = self._broadcast_kv_payload(state.sp_group, kv_payload, device, src=0)
+
             return kv_payload or None
 
-        # TP inactive, world broadcast
         kv_payload = None
-        if pt.is_leader and received:
+        if plan.owner_receives and received:
             kv_payload = self._collect_request_kv_payload(req)
-        kv_payload = self._broadcast_kv_payload(pt.world, kv_payload, device, src=0)
+        if state.world is None:
+            return kv_payload
+        kv_payload = self._broadcast_kv_payload(state.world, kv_payload, device, src=0)
         return kv_payload or None
 
 

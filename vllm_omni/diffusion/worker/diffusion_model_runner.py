@@ -132,7 +132,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
-        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config, vllm_config=vllm_config)
 
         # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
         # companion KV collector is set (that KV is not backgrounded).
