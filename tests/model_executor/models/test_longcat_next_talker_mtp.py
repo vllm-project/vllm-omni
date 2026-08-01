@@ -434,6 +434,47 @@ def test_advance_visual_gen_grid_bound_terminates(model):
     assert state["terminal"] is True
 
 
+def test_advance_visual_gen_skips_advance_when_prefill(model):
+    """Regression: <longcat_img_start> written into the prompt text lands as
+    the last token of a multi-token PREFILL chunk, not a span_len==1 decode
+    step. preprocess() still calls _advance_visual_gen for that chunk (it
+    only looks at the last token), but the runner will NOT call talker_mtp
+    for a prefill step -- so advancing gen_step there (as an earlier version
+    did unconditionally) races the state machine's step counter one step
+    ahead of the number of real talker_mtp invocations, permanently losing
+    the first pixel's code (observed: 1368 kept codes vs the expected
+    37x37=1369, crashing the reference image decoder's positions_2d assert).
+
+    decode_eligible=False must make the create-on-IMG_START call a no-op
+    beyond creating the state at gen_step=0 -- no advance, no mtp_inputs --
+    so the first REAL (decode_eligible=True) call is the one that performs
+    the 0->1 transition and is the one talker_mtp actually samples for.
+    """
+    model.config = SimpleNamespace(hidden_size=HIDDEN)
+
+    # <longcat_img_start> arrives as the last token of a prefill chunk.
+    update = M._advance_visual_gen(
+        model, "r0", last_token=IMG_START_TOKEN_ID,
+        device=torch.device("cpu"), dtype=torch.float32,
+        token_w=37, token_h=37, decode_eligible=False,
+    )
+    state = model._visual_gen["r0"]
+    assert state["gen_step"] == 0, "prefill step must not advance gen_step"
+    assert "mtp_inputs" not in update, "prefill step must not trigger talker_mtp"
+    # The default ext_id (IMG_PAD) is already correct for forcing the first
+    # generated token, even without running the advance block.
+    assert state["ext_id"] == IMG_PAD_TOKEN_ID
+
+    # First real decode step: this is the one that must perform 0->1.
+    update = M._advance_visual_gen(
+        model, "r0", last_token=IMG_PAD_TOKEN_ID,
+        device=torch.device("cpu"), dtype=torch.float32,
+        decode_eligible=True,
+    )
+    assert state["gen_step"] == 1, "first real decode step must be gen_step 1"
+    assert "mtp_inputs" in update
+
+
 def test_talker_mtp_audio_repetition_penalty_changes_greedy_code(model):
     """Audio repetition penalty (default 1.3) is plumbed end-to-end: per-request
     past_codes accumulate across kept frames and the level-0 argmax flips away

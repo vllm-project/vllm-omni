@@ -168,6 +168,26 @@ class LongcatNextImageDecoder(nn.Module):
                 codes.shape[0], expected_positions, expected_positions,
             )
             codes = codes[:expected_positions]
+        elif codes.shape[0] < expected_positions:
+            # The mirror-image failure: fewer real pixel frames than the
+            # grid needs (e.g. the thinker's max_tokens cut generation short
+            # before <longcat_img_end>, or any other frame-accounting bug).
+            # VisionTransformerDecoder.forward's positions_2d assert requires
+            # EXACTLY token_h*s * token_w*s positions -- handing it a short
+            # `codes` crashes the assert, which kills this stage's whole GPU
+            # worker process (and cascades into the scheduler losing track
+            # of the request). Fail this one request cleanly instead: no
+            # image is recoverable from a short, incomplete grid, so return
+            # empty output rather than let the process die.
+            logger.warning(
+                "Image decoder got %d code frames, expected token_h*token_w=%d "
+                "-- generation was cut short before the grid completed "
+                "(e.g. max_tokens exhausted before <longcat_img_end>); "
+                "skipping image output for this request instead of crashing "
+                "the reference decoder.",
+                codes.shape[0], expected_positions,
+            )
+            return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
         self._ensure_weights()
 

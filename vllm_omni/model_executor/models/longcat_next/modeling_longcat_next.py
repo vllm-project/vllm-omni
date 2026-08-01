@@ -441,10 +441,32 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return oe_ids.long()
 
     def _advance_audio_gen(
-        self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype
+        self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
+        decode_eligible: bool = True,
     ) -> dict[str, Any]:
         """Update audio-gen state based on the last emitted visible token.
-        Returns update_dict entries for the runner."""
+        Returns update_dict entries for the runner.
+
+        ``decode_eligible`` must mirror the runner's own talker_mtp dispatch
+        gate (``span_len == 1 and not is_prefill``, gpu_model_runner.py
+        ~line 1744/1767): when ``<longcat_audiogen_start>`` lands as the
+        LAST token of a multi-token prefill chunk (e.g. it was written
+        literally into the prompt, as every debug script does), preprocess()
+        still runs and still sees last_token==AUDIOGEN_START_TOKEN_ID, but
+        the runner will NOT call talker_mtp for this same step (prefill
+        steps never go through the decode/talker_mtp path). Unconditionally
+        advancing gen_step here (as an earlier version did) desyncs the
+        state machine's step counter from the number of talker_mtp calls
+        that actually happen: gen_step race ahead by 1 for a step whose
+        code was never sampled, permanently losing that frame with no error
+        -- silently producing one fewer real frame than the reference
+        expects for the rest of the request. Guarding the whole advance
+        block on decode_eligible defers gen_step's first 0->1 transition to
+        the first REAL decode step, keeping it 1:1 with talker_mtp
+        invocations. The freshly created state's default ext_id
+        (AUDIOTEXT_PAD_TOKEN_ID) is already the correct forced token for
+        this ineligible step, so skipping the advance costs nothing.
+        """
         update: dict[str, Any] = {}
         if last_token == AUDIOGEN_START_TOKEN_ID:
             self._audio_gen[request_id] = {
@@ -464,7 +486,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 logger.info("[longcat-audio] req=%s audio_gen ended", request_id)
 
         state = self._audio_gen.get(request_id)
-        if state is not None and not state["terminal"]:
+        if state is not None and not state["terminal"] and decode_eligible:
             # 0-based index of *this* step. The reference captures gen_step
             # before advancing the state machine (output_processor.py:218) and
             # compares that pre-increment value against delay, so every
@@ -519,8 +541,23 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def _advance_visual_gen(
         self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
         token_w: int | None = None, token_h: int | None = None,
+        decode_eligible: bool = True,
     ) -> dict[str, Any]:
         """Update image-gen state based on the last emitted visible token.
+
+        ``decode_eligible`` mirrors the runner's talker_mtp dispatch gate
+        (``span_len == 1 and not is_prefill``): see _advance_audio_gen's
+        docstring for the full rationale -- the identical bug applies here.
+        When ``<longcat_img_start>`` is the last token of a multi-token
+        prefill chunk (true whenever it's written into the prompt itself,
+        as longcat_next_debug_quality.py's run_image does), advancing
+        gen_step unconditionally raced the step counter one step ahead of
+        the number of talker_mtp calls the runner actually makes, silently
+        dropping the FIRST pixel's code (observed: 1368 kept codes vs the
+        expected 37x37=1369, crashing the reference image decoder's
+        positions_2d assert). Gating the advance on decode_eligible defers
+        gen_step's 0->1 transition to the first real decode step, which is
+        exactly 1:1 with talker_mtp invocations.
 
         Mirrors _advance_audio_gen's role, but the reference's image state
         machine (state_machine.py's GenImageStageStage) is a simpler, single
@@ -558,7 +595,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 logger.info("[longcat-image] req=%s visual_gen ended", request_id)
 
         state = self._visual_gen.get(request_id)
-        if state is not None and not state["terminal"]:
+        if state is not None and not state["terminal"] and decode_eligible:
             gen_step = state["gen_step"]
             state["gen_step"] = gen_step + 1
             token_w = state["token_w"]
@@ -624,10 +661,24 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # GEN_IMAGE_STAGE as mutually exclusive), so both advance calls are
         # safe to run unconditionally -- each only creates/updates its own
         # state dict when it sees its own start/end marker.
+        #
+        # decode_eligible mirrors the runner's own talker_mtp dispatch gate
+        # (gpu_model_runner.py: `span_len == 1 and not is_prefill`, checked
+        # both before batching into decode_batch_items and again when
+        # popping "mtp_inputs"). It must be threaded into both advance calls
+        # so gen_step only advances on a step where the runner will actually
+        # invoke talker_mtp -- see _advance_audio_gen's docstring for why an
+        # unconditional advance silently drops a frame whenever
+        # <longcat_audiogen_start>/<longcat_img_start> lands as the last
+        # token of a multi-token prefill chunk (e.g. written into the
+        # prompt itself).
         update_dict: dict[str, Any] = {}
         last_token = int(input_ids[-1])
+        is_prefill = bool(info.get("_omni_is_prefill", False))
+        decode_eligible = (not is_prefill) and int(input_ids.shape[0]) == 1
         update_dict.update(self._advance_audio_gen(
             request_id, last_token, device=input_ids.device, dtype=self.dtype,
+            decode_eligible=decode_eligible,
         ))
         additional_information = info.get("additional_information")
         if not isinstance(additional_information, dict):
@@ -636,7 +687,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         token_h = additional_information.get("token_h")
         update_dict.update(self._advance_visual_gen(
             request_id, last_token, device=input_ids.device, dtype=self.dtype,
-            token_w=token_w, token_h=token_h,
+            token_w=token_w, token_h=token_h, decode_eligible=decode_eligible,
         ))
 
         return input_ids, out.to(self.dtype), update_dict
