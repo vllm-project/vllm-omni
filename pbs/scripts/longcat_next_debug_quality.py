@@ -124,7 +124,17 @@ def run_text(llm: Omni, model_path: str, out: dict) -> None:
             "<longcat_assistant>"
         )
     )
-    params = SamplingParams(max_tokens=256, temperature=0.2, top_k=20, top_p=0.85, detokenize=True)
+    # Same (temperature, top_k, top_p) profile as run_audio's thinker-stream
+    # params below, which pairs it with repetition_penalty=1.1 -- matching
+    # the reference repo's spk_syn/aud_2_aud test_cases.yaml sampling_params
+    # exactly. Omitting it here left this call on vLLM's repetition_penalty
+    # default of 1.0 (no penalty), which is why low-temperature decoding ran
+    # into a repeated-token loop (garbled text, finish_reason=length) once
+    # generation got past the first sentence.
+    params = SamplingParams(
+        max_tokens=256, temperature=0.2, top_k=20, top_p=0.85,
+        repetition_penalty=1.1, detokenize=True,
+    )
     outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
     out["num_outputs"] = len(outputs)
     thinker = _thinker_output(outputs)
