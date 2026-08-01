@@ -717,9 +717,7 @@ class TestSampleAudioCode:
     # -- temperature scaling changes distribution -------------------------- #
 
     def test_higher_temperature_increases_diversity(self, model):
-        rng = torch.Generator()
-        rng.manual_seed(0)
-        logits = torch.zeros((self.VOCAB,), generator=rng)
+        logits = torch.zeros((self.VOCAB,))
         logits[:10] = 1.0  # only first 10 have non-negligible prob
         cold = [
             int(self._call(model, logits.clone(), do_sample=True, temperature=0.1, top_k=0, top_p=1.0))
