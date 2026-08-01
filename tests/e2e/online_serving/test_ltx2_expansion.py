@@ -89,3 +89,54 @@ def test_ltx2_two_stage_hsdp(
         request_config["image_reference"] = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
     openai_client.send_video_diffusion_request(request_config)
+
+
+# Single-stage LTX2Pipeline (full Lightricks/LTX-2) exercises the distributed VAE
+# tiling parallel ENCODE + DECODE end-to-end: I2V encodes the reference image at full
+# resolution, so 1024x576 (> the 512 tile threshold) makes tiled_encode/tiled_decode
+# fan out across the HSDP group via DistributedAutoencoderKLLTX2Video.
+VAE_PARALLEL_MODEL = os.getenv("VLLM_TEST_LTX2_ONESTAGE_MODEL", "Lightricks/LTX-2")
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=VAE_PARALLEL_MODEL,
+                server_args=[
+                    *HSDP_ARGS,
+                    "--model-class-name",
+                    "LTX2Pipeline",
+                    "--vae-patch-parallel-size",
+                    "2",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="i2v_vae_patch_parallel",
+            marks=PARALLEL_MARKS,
+        )
+    ],
+    indirect=["omni_server"],
+)
+def test_ltx2_single_stage_vae_patch_parallel(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    form_data = {
+        "prompt": PROMPT,
+        "model": omni_server.model,
+        "height": 576,
+        "width": 1024,
+        "num_frames": 9,
+        "fps": 8,
+        "num_inference_steps": 4,
+        "seed": 42,
+    }
+    request_config = {
+        "model": omni_server.model,
+        "form_data": form_data,
+        "image_reference": f"data:image/jpeg;base64,{generate_synthetic_image(1024, 576)['base64']}",
+    }
+
+    openai_client.send_video_diffusion_request(request_config)
