@@ -45,6 +45,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for MUSA platform.
 
@@ -54,7 +55,8 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
                 "TORCH_SDPA"). If None, uses platform default.
             head_size: Attention head size.
-
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
         Returns:
             Fully qualified class path of the selected backend.
         """
@@ -151,6 +153,16 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     def synchronize(cls) -> None:
         """Synchronize all MUSA operations."""
         torch.musa.synchronize()
+
+    @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.musa.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record MUSA device event for cross-stream sync")
+            return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

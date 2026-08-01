@@ -25,6 +25,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
+from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -346,8 +348,12 @@ class StageMetadata:
     replica_id: int = 0
 
 
-def extract_stage_metadata(stage_config: Any) -> StageMetadata:
-    """Pure data extraction from a stage_config object."""
+def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
+    """Extract metadata through the active production legacy path.
+
+    Keep production callers on this path until RFC #4021 migrates the
+    engine-argument and stage-init consumers together.
+    """
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
@@ -366,7 +372,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_args["attention_backend"] = "TRITON_ATTN"
 
     runtime_cfg = stage_config.runtime
-    engine_input_source: list[int] = stage_config.engine_input_source
+    engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
     final_output: bool = stage_config.final_output
     final_output_type: str | None = stage_config.final_output_type
 
@@ -429,6 +435,68 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+    )
+
+
+def extract_stage_metadata(stage_config: Any) -> StageMetadata:
+    """Preserve the legacy one-argument API for external callers."""
+    return extract_legacy_stage_metadata(stage_config)
+
+
+def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
+    if not path:
+        return None
+    module_path, function_name = path.rsplit(".", 1)
+    return getattr(importlib.import_module(module_path), function_name)
+
+
+def extract_stage_metadata_from_omni_stage_config(
+    stage_config: BaseVllmOmniStageConfig,
+) -> StageMetadata:
+    """Project one typed stage config into metadata for a future cutover.
+
+    This projection is not used by production startup yet. Current replica
+    layout, engine-argument, remote-diffusion, and platform setup paths still
+    require the legacy StageConfig/OmegaConf shape.
+    """
+    stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
+    sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
+    sampling_params: OmniSamplingParams = sampling_params_cls(
+        **(stage_config.model_config.default_sampling_params or {})
+    )
+    custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
+
+    if stage_type == "diffusion":
+        return StageMetadata(
+            stage_id=stage_config.stage_id,
+            stage_type="diffusion",
+            engine_output_type=None,
+            is_comprehension=False,
+            requires_multimodal_data=False,
+            engine_input_source=stage_config.input_sources,
+            final_output=stage_config.final_output,
+            final_output_type=stage_config.final_output_type,
+            default_sampling_params=sampling_params,
+            custom_process_input_func=custom_process_input_func,
+            model_stage=stage_config.model_stage,
+            runtime_cfg=stage_config.runtime_config,
+            cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
+        )
+
+    return StageMetadata(
+        stage_id=stage_config.stage_id,
+        stage_type="llm",
+        engine_output_type=stage_config.engine_output_type,
+        is_comprehension=stage_config.is_comprehension,
+        requires_multimodal_data=stage_config.requires_multimodal_data,
+        engine_input_source=stage_config.input_sources,
+        final_output=stage_config.final_output,
+        final_output_type=stage_config.final_output_type,
+        default_sampling_params=sampling_params,
+        custom_process_input_func=custom_process_input_func,
+        model_stage=stage_config.model_stage,
+        runtime_cfg=stage_config.runtime_config,
+        prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
     )
 
 
@@ -699,11 +767,53 @@ def build_engine_args_dict(
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
+    pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    audex_stage = str(engine_args_dict.get("model_stage") or "")
+    if audex_stage == "audex_xcodec":
+        # TTA stage 1 decodes with the external XCodec1 checkpoint, not a
+        # subfolder of the Audex repo: the source comes from XCODEC1_PATH,
+        # the stage yaml's own ``model`` entry, or the default HF repo — the
+        # pipeline-level model (the Audex root) is never a valid source.
+        from vllm_omni.model_executor.models.audex.checkpoint import (
+            ensure_audex_snapshot,
+            ensure_xcodec1_snapshot,
+        )
+
+        stage_model = None if model == pipeline_model_root else model
+        model = ensure_xcodec1_snapshot(os.environ.get("XCODEC1_PATH") or stage_model)
+        if not stage_defines_tokenizer:
+            # XCodec1 ships no tokenizer files; borrow the thinker's (same
+            # workaround as the TTS decoder stage).
+            audex_root = ensure_audex_snapshot(pipeline_model_root, profile="tta")
+            engine_args_dict["tokenizer"] = os.path.join(audex_root, "checkpoint_folder_audiogen")
+            stage_defines_tokenizer = True
+    elif audex_stage.startswith("audex"):
+        # Audex users pass the HF repo ROOT; make sure the required snapshot
+        # subset exists locally BEFORE subdir resolution, otherwise the
+        # subdirs get joined onto the raw repo id on a fresh cache. The
+        # profile keeps TTS-only deployments from pulling the full-checkpoint
+        # extras.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+        if audex_stage == "audex_omni":
+            audex_profile = "full"
+        elif audex_stage == "audex_tta_thinker":
+            audex_profile = "tta"
+        else:
+            audex_profile = "tts"
+        model = ensure_audex_snapshot(model, profile=audex_profile)
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
+    if engine_args_dict.get("model_stage") in ("audex_thinker", "audex_tta_thinker"):
+        # Audex ships its thinker weights deduplicated into a sibling folder;
+        # replicate the official prepare-script symlink on first use. The TTA
+        # thinker loads the same checkpoint_folder_audiogen checkpoint.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audiogen_weights
+
+        ensure_audiogen_weights(model)
     apply_cli_tokenizer(
         engine_args_dict,
         cli_tokenizer=cli_tokenizer,
@@ -713,7 +823,7 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
+    if stage_connector_spec:
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
@@ -1054,19 +1164,17 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
+    """Return the first connector spec for a stage data-plane edge."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
-
-    if not async_chunk:
-        return {}
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
 
-    # A stage can be an async producer without consuming chunks itself. Keep
-    # its connector for save_async(), but mark it sender-only so the scheduler
-    # does not park normal orchestrator-provided inputs waiting for a chunk.
+    # A producer does not consume connector data itself. Keep its connector
+    # for both async-chunk and terminal full-payload sends, but mark it
+    # sender-only so the scheduler does not park orchestrator-provided inputs
+    # waiting for an upstream payload.
     target_stage = str(stage_id)
     for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:
@@ -1131,3 +1239,26 @@ def initialize_diffusion_stage(
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+
+
+def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
+    """Install the Audex CFG scheduler patches for CFG-configured engines.
+
+    Must run in the engine-core process BEFORE ``Scheduler`` is constructed:
+    the patch wraps ``Scheduler.__init__`` to add the pair registry, so a
+    scheduler built earlier would never become pair-aware. Gated on the
+    engine's ``logits_processors`` so non-CFG stages stay untouched.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    processors = getattr(model_config, "logits_processors", None) or []
+    if not any("AudexCFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+        return
+
+    from vllm_omni.model_executor.models.audex.cfg import apply_cfg_patches
+
+    apply_cfg_patches()
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if not getattr(Scheduler.schedule, "_audex_cfg_patched", False):
+        raise RuntimeError("Audex CFG scheduler patches failed to install before Scheduler construction")

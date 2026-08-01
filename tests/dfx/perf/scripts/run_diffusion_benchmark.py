@@ -355,6 +355,17 @@ def _kill_process_tree(pid: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_offline_model(model: str) -> str:
+    """Under HF_HUB_OFFLINE, resolve a HF repo id to its local snapshot dir."""
+    import huggingface_hub
+
+    if not model or os.path.isdir(model) or not huggingface_hub.constants.HF_HUB_OFFLINE:
+        return model
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model, local_files_only=True)
+
+
 class DiffusionServer:
     """Start a vLLM-Omni diffusion model server as a subprocess.
 
@@ -372,7 +383,7 @@ class DiffusionServer:
         port: int | None = None,
     ) -> None:
         self.server_cfg: dict[str, Any] = server_cfg
-        self.model = server_cfg["model"]
+        self.model = _resolve_offline_model(server_cfg["model"])
         self.serve_args = server_cfg["serve_args"]
         self.host = "127.0.0.1"
         self.port = port if port is not None else get_open_port(self.host)
