@@ -24,6 +24,19 @@ DEPLOY_CONFIG = modify_stage_config(
             1: {"kv_cache_memory_bytes": 512 * 1024 * 1024},
             2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
         },
+        # Platform overrides are applied after ordinary stage settings. Keep
+        # the constrained duplex test's Talker budget ahead of the base CUDA
+        # profile's single-GPU default.
+        "platforms": {
+            "cuda": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "kv_cache_memory_bytes": 512 * 1024 * 1024,
+                    }
+                ]
+            }
+        },
     },
 )
 CORE_DEPLOY_CONFIG = modify_stage_config(

@@ -2214,6 +2214,32 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+
+        # The CUDA memory budget must not leak into the existing NPU profile.
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        npu_stages = merge_pipeline_deploy(pipeline, npu)
+        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
+
+        # Multi-GPU replica profiles place Talker on dedicated devices and
+        # preserve their previous automatic KV-cache sizing.
+        for filename in (
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+        ):
+            replica = _apply_platform_overrides(
+                load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
+            )
+            replica_stages = merge_pipeline_deploy(pipeline, replica)
+            assert replica_stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
+
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         if not deploy_path.exists():
