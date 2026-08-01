@@ -119,7 +119,6 @@ class MockGenerationResult:
 
     def __init__(self, images):
         self.images = images
-        self = SimpleNamespace(images=images)
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 

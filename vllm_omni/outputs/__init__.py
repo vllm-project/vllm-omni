@@ -182,14 +182,26 @@ class OmniRequestOutput(RequestOutput):
         ``error``, ...) are intentionally not copied.
         """
         # RequestOutput attributes — guaranteed on any RequestOutput.
+        # Only copy attributes that actually exist on the source, so that
+        # duck-typed mocks can omit optional fields without overwriting the
+        # dataclass defaults (e.g. ``outputs=[]``, ``finished=True``).
         for name in _REQUEST_OUTPUT_CONTENT_ATTRS:
-            setattr(self, name, getattr(source, name))
+            if hasattr(source, name):
+                setattr(self, name, getattr(source, name))
 
         # Omni-specific fields — only present when the source is itself an
         # OmniRequestOutput (e.g. a diffusion stage inside a pipeline).
         if isinstance(source, OmniRequestOutput):
             for name in _OMNI_CONTENT_ATTRS:
-                setattr(self, name, getattr(source, name))
+                if hasattr(source, name):
+                    setattr(self, name, getattr(source, name))
+
+        # Propagate multimodal_output from duck-typed sources (e.g. test mocks
+        # that set multimodal_output directly on a non-OmniRequestOutput).
+        if not isinstance(source, OmniRequestOutput):
+            src_mm = getattr(source, "multimodal_output", None)
+            if src_mm:
+                self._multimodal_output = src_mm
 
     @classmethod
     def from_stage_output(cls, source: RequestOutput, **kwargs: Any) -> "OmniRequestOutput":
