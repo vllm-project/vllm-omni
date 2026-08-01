@@ -192,8 +192,11 @@ class ImageGenerationResponse(BaseModel):
     )
 
     def _file_extension_and_media_type(self) -> tuple[str, str]:
+        # Normalize "jpg" -> "jpeg" so the extension matches what Pillow produces.
         fmt = (self.output_format or "png").lower()
-        if fmt in ("jpg", "jpeg"):
+        if fmt == "jpg":
+            fmt = "jpeg"
+        if fmt == "jpeg":
             return fmt, "image/jpeg"
         if fmt == "webp":
             return fmt, "image/webp"

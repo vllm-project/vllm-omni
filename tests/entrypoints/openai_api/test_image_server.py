@@ -1358,7 +1358,7 @@ def test_image_file_response_format_single(test_client):
     [
         ("png", "image/png", ".png"),
         ("jpeg", "image/jpeg", ".jpeg"),
-        ("jpg", "image/jpeg", ".jpg"),
+        ("jpg", "image/jpeg", ".jpeg"),  # jpg normalized to jpeg
         ("webp", "image/webp", ".webp"),
         ("JPEG", "image/jpeg", ".jpeg"),
         (None, "image/png", ".png"),
@@ -1408,6 +1408,70 @@ def test_stream_response_zip_entries_honor_output_format(output_format, expected
 
     payload = asyncio.run(_drain())
     with zipfile.ZipFile(io.BytesIO(payload), "r") as zf:
+        names = zf.namelist()
+        assert len(names) == 2
+        assert all(name.endswith(expected_ext) for name in names)
+
+
+@pytest.mark.parametrize(
+    "output_format,expected_media_type,expected_ext",
+    [
+        ("png", "image/png", ".png"),
+        ("jpeg", "image/jpeg", ".jpeg"),
+        ("webp", "image/webp", ".webp"),
+    ],
+)
+def test_multistage_file_response_honors_output_format(
+    async_omni_test_client, output_format, expected_media_type, expected_ext
+):
+    """Regression for #5421: multi-stage (len(stage_configs) > 1) file responses
+    must honor output_format instead of always returning PNG."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 1,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    disposition = response.headers.get("content-disposition", "")
+    assert "attachment" in disposition
+    assert expected_ext in disposition
+
+    # Verify the bytes are actually encoded in the requested format.
+    img = Image.open(io.BytesIO(response.content))
+    assert img.format == expected_media_type.split("/")[1].upper()
+
+
+@pytest.mark.parametrize(
+    "output_format,expected_ext",
+    [("jpeg", ".jpeg"), ("webp", ".webp"), ("png", ".png")],
+)
+def test_multistage_file_response_zip_honors_output_format(
+    async_omni_test_client, output_format, expected_ext
+):
+    """Regression for #5421: multi-stage file responses with n>1 return a ZIP
+    whose entries are named with the requested output_format extension."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 2,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(response.content), "r") as zf:
         names = zf.namelist()
         assert len(names) == 2
         assert all(name.endswith(expected_ext) for name in names)
