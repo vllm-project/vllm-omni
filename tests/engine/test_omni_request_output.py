@@ -171,7 +171,7 @@ class TestMsgpackRoundTrip:
         decoded = decoder.decode(encoded)
 
         assert isinstance(decoded, OmniRequestOutput)
-        assert decoded.request_id == "rt-1"
+        assert decoded.request_id == "req-1"
         assert decoded.stage_id == 0
         assert decoded.final_output_type == "text"
         assert decoded.finished is True
