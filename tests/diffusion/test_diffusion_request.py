@@ -6,6 +6,7 @@ import random
 import pytest
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.utils.param_utils import resolve_guidance_scale
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -72,3 +73,28 @@ def test_tp_seed_same_across_ranks_and_varies_across_requests():
 
     # Seeds must vary across requests (non-determinism preserved).
     assert len(set(seeds)) == n_requests, f"Expected {n_requests} unique seeds but got {len(set(seeds))}: {seeds}"
+
+
+@pytest.mark.parametrize(
+    ("sampling_kwargs", "normalized_scale", "scale_provided", "expected_scale"),
+    [
+        pytest.param({}, 1.0, False, 0.0, id="omitted"),
+        pytest.param({"guidance_scale": 0.0}, 1.0, False, 0.0, id="explicit-zero"),
+        pytest.param({"guidance_scale": 3.5}, 3.5, True, 3.5, id="explicit-positive"),
+    ],
+)
+def test_guidance_scale_resolution_after_request_normalization(
+    sampling_kwargs: dict[str, float],
+    normalized_scale: float,
+    scale_provided: bool,
+    expected_scale: float,
+) -> None:
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test prompt"},
+        sampling_params=OmniDiffusionSamplingParams(**sampling_kwargs),
+        request_id="test-request",
+    )
+
+    assert request.sampling_params.guidance_scale == normalized_scale
+    assert request.sampling_params.guidance_scale_provided is scale_provided
+    assert resolve_guidance_scale(request.sampling_params, default=0.0) == expected_scale

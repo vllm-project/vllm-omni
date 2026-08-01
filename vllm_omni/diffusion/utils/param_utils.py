@@ -6,6 +6,22 @@ from __future__ import annotations
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
+def resolve_guidance_scale(
+    sampling_params: OmniDiffusionSamplingParams,
+    *,
+    default: float,
+) -> float:
+    """Resolve an explicit guidance scale or use a model-specific default.
+
+    ``OmniDiffusionRequest`` normalizes omitted and false-like scales before a
+    pipeline sees them, so consumers must use ``guidance_scale_provided`` to
+    distinguish an explicit positive value from the normalized sentinel.
+    """
+    if sampling_params.guidance_scale_provided:
+        return float(sampling_params.guidance_scale)
+    return float(default)
+
+
 def apply_declared_extra_args(
     sampling_params: OmniDiffusionSamplingParams,
     declared_params: frozenset[str],
