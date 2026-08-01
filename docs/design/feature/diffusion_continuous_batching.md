@@ -1,4 +1,4 @@
-# Diffusion Execution Modes
+# Diffusion Continuous Batching
 
 This document describes the unified diffusion execution architecture, including
 request execution, request-level batching, step execution, continuous batching,
@@ -141,7 +141,7 @@ pipeline implements four stateful operations:
 | Operation | Responsibility |
 |---|---|
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
-| `denoise_step(state_or_batch)` | Run noise prediction for the current timestep |
+| `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
 | `post_decode(state)` | Decode and postprocess a completed request or output boundary |
 
@@ -150,8 +150,10 @@ that do not belong in the shared contract should be stored in `state.extra`.
 Queueing and lifecycle metadata remain in the scheduler's request state.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, HunyuanImage3, and Helios. Support is capability-based; unsupported
-pipelines fail during initialization.
+Qwen-Image, HunyuanImage3, and Helios. Step execution alone does not imply
+continuous-batching support: Qwen-Image and HunyuanImage3 accept batched step
+states, while Helios supports only a single active step request and must use
+`max_num_seqs=1`.
 
 ### Continuous Batching
 
@@ -161,7 +163,7 @@ denoise forward, then applies scheduler updates per request:
 
 1. Run `prepare_encode()` for newly admitted requests.
 2. Build or refresh `InputBatch`.
-3. Run one batched `denoise_step()`.
+3. Run one batched `denoise_step(input_batch, states=states)`.
 4. Slice noise predictions back to each request.
 5. Run each request's `step_scheduler()`.
 6. Run `post_decode()` at a chunk boundary or request completion.
@@ -205,8 +207,8 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
 - FIFO scheduling can reduce batching opportunities.
 - `request_batch_max_wait_ms` trades first-request latency for burst
   coalescing.
-- Some cache backends, KV transfer features, and request-mode extras are not
-  available in step mode.
+- All diffusion cache backends are currently unsupported in step mode.
+- KV transfer and other request-mode extras are not wired into step mode.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
 

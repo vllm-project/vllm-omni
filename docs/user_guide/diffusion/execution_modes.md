@@ -16,7 +16,9 @@ are exposed.
 | Chunked diffusion output | `--diffusion-streaming-output` |
 
 `N` must be greater than `1` to allow batching. The selected pipeline must
-support the corresponding request-batch or step-execution capability.
+support request-level batching or batched-step execution as appropriate;
+single-request step support alone is not sufficient for step-wise continuous
+batching.
 
 ## Request Execution
 
@@ -92,9 +94,10 @@ validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
 Step execution is capability-based, not a generic switch for every diffusion
-model. Native implementations currently include Qwen-Image, HunyuanImage3, and
-Helios pipelines. Consult the selected pipeline's documentation and source for
-the latest support status.
+model. Qwen-Image and HunyuanImage3 support step-wise continuous batching.
+Helios supports single-request step execution only: use
+`--step-execution --max-num-seqs 1` for Helios. Consult the selected pipeline's
+documentation and source for the latest support status.
 
 ## Streaming Output
 
@@ -231,7 +234,8 @@ For step execution, set `step_execution: true` and remove
 - Different LoRA adapters or scales run in separate batches.
 - FIFO scheduling can cause an incompatible request to block later compatible
   requests.
-- Some cache and KV transfer features are unavailable in step mode.
+- All diffusion cache backends are unsupported in step mode. KV transfer and
+  other request-mode extras are also not wired into step mode.
 - If request-mode startup reports that the pipeline does not support batching,
   use `--max-num-seqs 1`.
 - If step-mode startup mentions `prepare_encode()`, `denoise_step()`,
@@ -239,4 +243,4 @@ For step execution, set `step_execution: true` and remove
   required step contract.
 
 For implementation details and model-author guidance, see
-[Diffusion Execution Modes](../../design/feature/diffusion_execution_modes.md).
+[Diffusion Continuous Batching](../../design/feature/diffusion_continuous_batching.md).

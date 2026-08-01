@@ -756,7 +756,7 @@ omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 ### Step Execution
 
 See the detailed
-[Diffusion Execution Modes design guide](../../design/feature/diffusion_execution_modes.md).
+[Diffusion Continuous Batching design guide](../../design/feature/diffusion_continuous_batching.md).
 
 Use this only when your pipeline can be split into stable request-scoped and
 step-scoped phases. The reference implementation is
