@@ -1831,9 +1831,27 @@ async def generate_images(
                     content=generation_result.model_dump(),
                 )
             flat_images, _, _, _ = generation_result
-            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
 
-            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+            # Determine output format (default to png) and encode with it,
+            # mirroring the single-stage path so output_format is honored.
+            output_format = _choose_output_format(request.output_format or "png", None)
+            image_data = [
+                ImageData(
+                    b64_json=encode_image_base64_with_compression(img, format=output_format),
+                    revised_prompt=None,
+                )
+                for img in flat_images
+            ]
+
+            response_kwargs = {
+                "created": int(time.time()),
+                "data": image_data,
+                "output_format": output_format,
+            }
+            response = ImageGenerationResponse(**response_kwargs)
+            if request.response_format != ResponseFormat.FILE:
+                return response
+            return response.stream_response()
 
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
@@ -2628,9 +2646,12 @@ async def _load_input_images(
 
 
 def _choose_output_format(output_format: str | None, background: str | None) -> str:
-    # Normalize and choose extension
+    # Normalize and choose extension. Pillow only recognizes "jpeg" (not "jpg"),
+    # so normalize "jpg" -> "jpeg" before it reaches the encoder.
     fmt = (output_format or "").lower()
-    if fmt in {"jpg", "png", "webp", "jpeg"}:
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt in {"png", "webp", "jpeg"}:
         return fmt
     # If transparency requested, prefer png
     if (background or "auto").lower() == "transparent":
