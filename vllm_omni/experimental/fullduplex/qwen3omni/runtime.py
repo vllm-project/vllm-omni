@@ -279,8 +279,18 @@ def build_duplex_data_plane_prompt(
                 # Where stage 0 must splice the audio embeddings, and how
                 # many. Everything outside this span is real scaffolding
                 # tokens that embed through the ordinary lookup.
+                #
+                # `audio_offset` is relative to THIS APPEND's token span, not
+                # to the session. The consumer compares it against
+                # `duplex_token_offset`, which is absolute, so it must first
+                # rebase using `append_token_count`. Emitted explicitly rather
+                # than reusing `scheduler_token_budget` (numerically equal
+                # here) because conflating "how many slots to reserve" with
+                # "how long this append is" is what made the frame mismatch
+                # invisible in the first place.
                 "audio_offset": audio_offset,
                 "audio_tokens": audio_tokens,
+                "append_token_count": len(prompt_token_ids),
             },
         },
     }

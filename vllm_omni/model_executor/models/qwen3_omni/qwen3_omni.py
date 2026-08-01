@@ -790,8 +790,31 @@ class Qwen3OmniMoeForConditionalGeneration(
             return input_ids, base_embeds, {}
 
         offset = int(token_offset) if isinstance(token_offset, int) else 0
-        audio_start = int(duplex.get("audio_offset") or 0)
         span = base_embeds.shape[0]
+
+        # `audio_offset` is relative to *this append's own* token span (it is
+        # `len(prefix)`; see `build_duplex_prompt_token_ids`), while
+        # `token_offset` is absolute within the session -- the runner sets it
+        # from `num_computed_tokens`. Convert before comparing them.
+        #
+        # On the session's first append the two frames coincide (`offset == 0`)
+        # and mixing them is harmless, which is why this only ever broke from
+        # the second turn on: `take_from` came out as the whole preceding
+        # conversation, the window sliced past the end of `audio_embeds`, and
+        # the empty-window guard below returned silently. The model then got a
+        # span of unfilled `<|audio_pad|>` placeholders and answered as though
+        # the user had said nothing -- generic replies, and eventually "it
+        # seems like you are sending a lot of empty messages".
+        #
+        # The append's absolute base is what the runner has already computed
+        # for the session minus this append, i.e. `prompt_len - append_len`.
+        # Verified against three consecutive turns: derived base 0/146/256
+        # against observed `token_offset` 0/146/256.
+        append_len = int(
+            duplex.get("append_token_count") or duplex.get("scheduler_token_budget") or (prompt_len or span)
+        )
+        append_base = max(int(prompt_len or 0) - append_len, 0)
+        audio_start = append_base + int(duplex.get("audio_offset") or 0)
 
         # Intersect the audio span with the slice of the prompt this call
         # covers; the runner may split a prompt across several calls.
@@ -799,6 +822,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         take_from = max(offset - audio_start, 0)
         window = audio_embeds[take_from : take_from + max(span - start, 0)]
         if start >= span or window.shape[0] == 0:
+            # Reaching here means audio was produced for this append but none
+            # of it landed. The runner absorbs a reservation/embedding
+            # mismatch by leaving the placeholders in place rather than
+            # raising, so this is otherwise invisible -- the request succeeds
+            # and the model silently reads an empty user turn. Say so.
+            logger.warning(
+                "[qwen3omni-duplex] audio produced but not spliced: %d embeddings dropped for "
+                "req span=%d offset=%d prompt_len=%s append_len=%d audio_start=%d "
+                "(start=%d take_from=%d). The thinker will see unfilled <|audio_pad|> "
+                "placeholders and answer as if the turn were empty.",
+                audio_embeds.shape[0], span, offset, prompt_len, append_len, audio_start, start, take_from,
+            )
             return input_ids, base_embeds, {}
 
         req_embeds = base_embeds.clone()
