@@ -7,7 +7,9 @@ The original reduced one-stage guards remain unchanged. Additional cases cover
 text-to-video and image-to-video for one-stage, full-distilled two-stage,
 ordinary two-stage with resident weights matching official fused arithmetic,
 and dedicated layer-fused two-stage variants. Select an individual case with
-its pytest parameter node ID. Both runtimes use PyTorch SDPA.
+its pytest parameter node ID. Both runtimes use PyTorch SDPA. Full-resolution
+two-stage cases use official block streaming and Omni layerwise offload so they
+remain single-H100 accuracy tests without changing the bf16 arithmetic.
 """
 
 from __future__ import annotations
@@ -101,6 +103,9 @@ class LTXAccuracyCase:
     spatial_upsampler: LTXArtifact | None = None
     distilled_lora: LTXArtifact | None = None
     two_stage_lora_mode: Literal["dynamic", "layer_fused", "resident"] | None = None
+    # Official uses block streaming; Omni uses layerwise offload. Both preserve
+    # bf16 arithmetic while keeping full-resolution two-stage cases on one H100.
+    enable_layerwise_offload: bool = False
 
 
 LTX2_REVISION = "47da56e2ad66ce4125a9922b4a8826bf407f9d0a"
@@ -344,6 +349,7 @@ _DEFAULT_CONFIG_CASES = (
         seed=10,
         stg_block=29,
         two_stage_lora_mode="resident",
+        enable_layerwise_offload=True,
         thresholds=LTXAccuracyThresholds(
             video_ssim_mean=0.95,
             video_ssim_min=0.90,
@@ -373,6 +379,7 @@ _DEFAULT_CONFIG_CASES = (
         # phase weights in memory to preserve the bf16 arithmetic; dynamic mode
         # avoids weight mutation but is not expected to be bitwise-equivalent.
         two_stage_lora_mode="resident",
+        enable_layerwise_offload=True,
         thresholds=LTXAccuracyThresholds(
             video_ssim_mean=0.95,
             video_ssim_min=0.90,
@@ -657,7 +664,7 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Path) -> None:
-    """Compare official and Omni raw AV outputs from the same E2E request."""
+    """Compare official and Omni raw AV outputs from the same single-H100 request."""
     configured_artifact_root = os.environ.get("VLLM_TEST_LTX_ARTIFACT_ROOT")
     if configured_artifact_root:
         accuracy_artifact_root = Path(configured_artifact_root)
@@ -681,7 +688,10 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
         "--pipeline-kind",
         case.pipeline_kind,
     ]
-    if os.environ.get("VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", "").lower() in {"1", "true", "yes", "on"}:
+    enable_layerwise_offload = case.enable_layerwise_offload or os.environ.get(
+        "VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", ""
+    ).lower() in {"1", "true", "yes", "on"}
+    if enable_layerwise_offload:
         runner_args.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
@@ -766,6 +776,7 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
         "spatial_upsampler_revision": (case.spatial_upsampler.revision if case.spatial_upsampler is not None else None),
         "distilled_lora_revision": case.distilled_lora.revision if case.distilled_lora is not None else None,
         "two_stage_lora_mode": case.two_stage_lora_mode,
+        "enable_layerwise_offload": enable_layerwise_offload,
         "thresholds": asdict(case.thresholds),
         "request": _request(case, image),
         "video": video_metrics,
