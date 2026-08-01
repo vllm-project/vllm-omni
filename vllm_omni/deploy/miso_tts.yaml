@@ -1,0 +1,64 @@
+# Miso TTS deploy: talker (8B+300M frame AR) → Mimi via shared-memory async_chunk.
+# Prerequisites: pip install moshi safetensors
+async_chunk: true
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 100
+      codec_left_context_frames: 50
+      initial_codec_chunk_frames: 100
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.85
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 512
+    max_model_len: 2048
+    devices: "0"
+    skip_mm_profiling: true
+    # The HF repo tokenizer is invalid; use Llama 3.2 1B tokenizer for request parsing.
+    tokenizer: meta-llama/Llama-3.2-1B
+    hf_overrides:
+      model_type: miso_tts
+      architectures:
+        - MisoTTSTalkerForConditionalGeneration
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 1125
+      seed: 42
+      detokenize: false
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    skip_mm_profiling: true
+    skip_tokenizer_init: true
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    hf_overrides:
+      model_type: miso_tts
+      architectures:
+        - MisoTTSMimiDecoder
+    default_sampling_params:
+      temperature: 0.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
