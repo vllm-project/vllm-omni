@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -827,11 +827,12 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str], *, stage_ids: Iterable[int] | None = None) -> None:
+        """Forward abort requests to stage pools, or to ``stage_ids`` only."""
         if not request_ids:
             return
-        for pool in self.stage_pools:
+        pools = self.stage_pools if stage_ids is None else [self.stage_pools[stage_id] for stage_id in stage_ids]
+        for pool in pools:
             await pool.abort_requests(request_ids)
             pool.release_bindings(request_ids)
 
@@ -1552,32 +1553,24 @@ class Orchestrator:
             )
         )
 
-        # A direct response returns without forwarding, which strands whatever
-        # `_prewarm_async_chunk_stages` already submitted downstream: those
-        # requests are waiting for chunks that will now never be sent. They sit
-        # in their stage's waiting queue as WAITING_FOR_STREAMING_REQ forever,
-        # holding a slot and — because `get_num_unfinished_requests` subtracts
-        # parked requests — making `EngineCore.has_work()` read false. The next
-        # session's request is then invisible and that stage never schedules
-        # again. Same wedge as vllm-omni#5662, reached from the direct-response
-        # path instead of the abort path.
+        # A direct response returns without forwarding, so anything
+        # `_prewarm_async_chunk_stages` already submitted downstream is left
+        # waiting for chunks that will never be sent. When the runtime says
+        # this response ends the turn, release those stages; otherwise they
+        # park forever holding a slot -- and because
+        # `get_num_unfinished_requests` subtracts requests parked for streaming
+        # input, `EngineCore.has_work()` reads false and that stage never
+        # schedules again, for this request or any later one.
         #
-        # Opt-in, because a runtime that expects its prewarmed stages to
-        # survive a direct response would be broken by this. The next stage-0
-        # submit re-prewarms, so releasing here costs only the warm slot.
+        # Opt-in, because a parked downstream stage is correct for a runtime
+        # whose direct response is *not* terminal: MiniCPM's `listen` decision
+        # reuses those same warm stages when the model later speaks, and
+        # upstream only prewarms on the initial submit, so releasing them there
+        # would leave a later speak turn with no talker.
         if decision.metadata.get("duplex_release_downstream") is True:
-            req_state = self.request_states.get(req_id)
-            final_stage_id = req_state.final_stage_id if req_state is not None else stage_id
-            for downstream_id in range(stage_id + 1, final_stage_id + 1):
-                pool = self.stage_pools[downstream_id]
-                await pool.abort_requests([req_id])
-                pool.release_bindings([req_id])
-            logger.info(
-                "[Orchestrator] released stranded downstream stages %s-%s for direct response on req=%s",
-                stage_id + 1,
-                final_stage_id,
-                req_id,
-            )
+            # Pools this request never reached have no route binding, so
+            # aborting them is a no-op; no need to know the final stage id.
+            await self._abort_request_ids([req_id], stage_ids=range(stage_id + 1, len(self.stage_pools)))
 
     @staticmethod
     def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:
