@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from vllm_omni.model_executor.models.longcat_next import modeling_longcat_next as mln
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
+    AUDIOGEN_END_TOKEN_ID,
     AUDIOTEXT_PAD_TOKEN_ID,
     AUDIOTEXT_START_TOKEN_ID,
     IMG_END_TOKEN_ID,
@@ -225,6 +226,14 @@ def test_max_gen_cap_marks_terminal(model):
     _call(model, state)
 
     assert state["terminal"] is True
+    # Regression: an earlier version left ext_id at whatever it was before
+    # termination (AUDIOTEXT_PAD), and compute_logits `continue`d entirely
+    # on a terminal row -- fully unbanning EOS with no forced replacement,
+    # so the model was free to (and observed to) end the WHOLE request via
+    # real EOS within a few tokens, instead of just closing this audio
+    # segment. terminal must force ext_id to AUDIOGEN_END_TOKEN_ID so
+    # compute_logits forces a clean <longcat_audiogen_end> close.
+    assert state["ext_id"] == AUDIOGEN_END_TOKEN_ID
 
 
 def test_talker_mtp_none_sampling_params_sample_not_greedy(model):

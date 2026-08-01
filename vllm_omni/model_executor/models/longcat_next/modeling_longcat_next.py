@@ -1270,6 +1270,21 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 if is_terminal:
                     state["terminal"] = True
+                    # Force the closing tag on the terminal step itself,
+                    # mirroring _advance_visual_gen's IMG_END forcing
+                    # (grid-bound termination). Without this, compute_logits
+                    # used to `continue` entirely once terminal -- fully
+                    # unbanning EOS with no forced closure -- so the model
+                    # was free to (and observed to) end the WHOLE request via
+                    # real EOS within a few tokens of chunk_end/max_gen,
+                    # instead of just closing this audio segment and
+                    # resuming normal generation. Setting ext_id here means
+                    # compute_logits' terminal branch (below) forces
+                    # <longcat_audiogen_end> for exactly this one step; once
+                    # the model emits it, _advance_audio_gen's
+                    # AUDIOGEN_END_TOKEN_ID branch pops the state next step,
+                    # returning full freedom only after a clean close.
+                    state["ext_id"] = AUDIOGEN_END_TOKEN_ID
 
             elif visual_state is not None:
                 state = visual_state
@@ -1391,6 +1406,23 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             visual_state = self._visual_gen.get(req_id)
             if audio_state is not None:
                 if audio_state.get("terminal"):
+                    # Force the closing tag instead of leaving this row
+                    # totally unconstrained: an earlier version `continue`d
+                    # here, unbanning EOS with no forced replacement, which
+                    # let the model end the WHOLE request via real EOS
+                    # within a few tokens of chunk_end/max_gen instead of
+                    # just closing this audio segment (observed: audio
+                    # truncating to a handful of frames, finish_reason=stop,
+                    # with generation ending only ~30 visible tokens after
+                    # <longcat_audiogen_start>). talker_mtp sets
+                    # ext_id=AUDIOGEN_END_TOKEN_ID the moment it marks
+                    # terminal (see the is_terminal branch above), so this
+                    # mirrors the visual branch's IMAGE_END forcing below.
+                    if self._eos_id < logits.shape[-1]:
+                        logits[row, self._eos_id] = float("-inf")
+                    forced_id = audio_state.get("ext_id", AUDIOGEN_END_TOKEN_ID)
+                    logits[row, :] = float("-inf")
+                    logits[row, forced_id] = 0.0
                     continue
                 # Ban EOS so it never terminates generation during audio
                 if self._eos_id < logits.shape[-1]:
