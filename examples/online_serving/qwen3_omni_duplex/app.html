@@ -69,6 +69,7 @@
   .ev.text  .ty { color:var(--live); }
   .ev.err   .ty { color:var(--err); }
   .ev.life  .ty { color:var(--warn); }
+  .ev.tool  .ty { color:#c792ea; font-weight:600; }
 
   #transcript { min-height:52px; font-size:15px; line-height:1.6; }
   .muted { color:var(--dim); }
@@ -156,6 +157,90 @@
 
 <script>
 const SR_IN = 16000, SR_OUT = 24000, CHUNK_MS = 200;
+
+// Demo tools. `schema` goes to the model as its <tools> block; `run` is the
+// canned implementation. Tools execute client-side, as they do in the OpenAI
+// Realtime API -- the server only reports the call and takes the result back
+// as an ordinary text turn.
+const TOOLS = [
+  {
+    schema: {
+      type: "function",
+      function: {
+        name: "lookup_weather",
+        description: "Get the current weather for a city.",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string", description: "City name, e.g. Paris" } },
+          required: ["city"],
+        },
+      },
+    },
+    run: ({ city }) => ({ city: city || "unknown", temperature_c: 18, conditions: "light rain", humidity_pct: 71 }),
+  },
+  {
+    schema: {
+      type: "function",
+      function: {
+        name: "check_inventory",
+        description: "Check warehouse stock for an item.",
+        parameters: {
+          type: "object",
+          properties: { item: { type: "string", description: "Item name, e.g. blue widget" } },
+          required: ["item"],
+        },
+      },
+    },
+    run: ({ item }) => ({ item: item || "unknown", in_stock: 42, warehouse: "Oakland", restock_date: "2026-08-14" }),
+  },
+];
+
+// The model replies to a tool call with `<tool_call>{...}</tool_call>` and the
+// server intercepts it before the talker can speak it, so it arrives as text
+// rather than audio. Run it and hand the result straight back as the next turn.
+let turnText = "", toolsFired = false;
+
+// Fire once per turn, as soon as a `<tool_call>` block is closed -- an
+// unterminated one means the arguments are still streaming.
+function maybeRunTools(explicit) {
+  if (toolsFired) return;
+  let calls = explicit;
+  if (!calls) {
+    if (!turnText.includes("</tool_call>")) return;
+    calls = [];
+    for (const m of turnText.matchAll(/<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g)) {
+      try { const c = JSON.parse(m[1]); if (c && c.name) calls.push({name: c.name, arguments: c.arguments || {}}); }
+      catch (e) { log(`unparseable tool call: ${m[1].slice(0, 120)}`, "err"); }
+    }
+  }
+  if (!calls.length) return;
+  toolsFired = true;
+  $("transcript").classList.remove("muted");
+  $("transcript").textContent = calls.map(c => `→ ${c.name}(${JSON.stringify(c.arguments)})`).join("\n");
+  runToolCalls(calls);
+}
+
+async function runToolCalls(calls) {
+  for (const call of calls) {
+    const tool = TOOLS.find(t => t.schema.function.name === call.name);
+    const args = call.arguments || {};
+    let result;
+    if (!tool) {
+      result = { error: `no such tool: ${call.name}` };
+      log(`tool ${call.name} — not registered`, "err");
+    } else {
+      result = tool.run(args);
+      log(`tool ${call.name}(${JSON.stringify(args)}) -> ${JSON.stringify(result)}`, "tool");
+    }
+    if (!ws || ws.readyState !== 1) return;
+    // <tool_response> is the wrapper the checkpoint's chat template uses for a
+    // tool result, carried on a user turn.
+    const payload = `<tool_response>\n${JSON.stringify(result)}\n</tool_response>`;
+    commitAt = performance.now();
+    $("status").textContent = "tool result sent…";
+    ws.send(JSON.stringify({ type: "input.text.append", text: payload }));
+  }
+}
 const MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 const $ = id => document.getElementById(id);
 
@@ -259,7 +344,10 @@ $("connect").onclick = () => {
       turn_detection: null,
       overlap_policy: "listen_only",
       playback_commit_policy: "ack_only",
-      extra_body: { auto_response: true, qwen3_omni_native_duplex: true, force_listen_count: 0 },
+      extra_body: {
+        auto_response: true, qwen3_omni_native_duplex: true, force_listen_count: 0,
+        realtime_tools: TOOLS.map(t => t.schema),
+      },
     }}));
   };
 
@@ -287,7 +375,7 @@ $("connect").onclick = () => {
       log(t, "life");
     } else if (t === "response.created") {
       turns++; $("k-turns").textContent = turns;
-      textDeltas = 0; audioDeltas = 0;
+      textDeltas = 0; audioDeltas = 0; turnText = ""; toolsFired = false;
       setStage("s-0", "live"); flow("a-0", true); flow("a-1", true);
       log(t, "life");
     } else if (t === "response.audio_transcript.delta" || t === "response.output_text.delta") {
@@ -301,6 +389,8 @@ $("connect").onclick = () => {
       textDeltas++; $("m-0").textContent = textDeltas;
       setStage("s-0", "live");
       log(t + (d ? ` ${JSON.stringify(d)}` : " (empty)"), "text");
+      turnText += d;
+      maybeRunTools();
     } else if (t === "response.audio_transcript.done") {
       if (m.transcript) {
         $("transcript").classList.remove("muted");
@@ -325,6 +415,8 @@ $("connect").onclick = () => {
       if (commitAt) { $("k-lat").textContent = ((performance.now() - commitAt) / 1000).toFixed(2) + " s"; commitAt = 0; }
       log(`${t} ${(m.delta || m.audio || "").length}b`, "audio");
     } else if (t === "response.audio.done" || t === "response.done") {
+      // The server may also report the calls structurally; either path works.
+      maybeRunTools(Array.isArray(m.tool_calls) && m.tool_calls.length ? m.tool_calls : undefined);
       setStage("s-2", "done"); setStage("s-spk", "done");
       ["a-0","a-1","a-2","a-3"].forEach(a => flow(a, false));
       $("status").textContent = "ready";

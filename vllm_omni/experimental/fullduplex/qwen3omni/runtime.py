@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,6 +27,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
     DuplexInputMode,
+    DuplexOutputAction,
     DuplexOutputDecision,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
@@ -62,6 +65,38 @@ SUPPORTED_INPUT_MODES = frozenset(
         DuplexInputMode.APPEND_TOKENS,
     }
 )
+
+
+#: Emitted by the model per the checkpoint's chat template:
+#: ``<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>``.
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def parse_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Extract completed tool calls from thinker text.
+
+    Only *closed* ``<tool_call>`` blocks count. The thinker streams, so an
+    unterminated block means the arguments are still arriving and parsing it
+    would dispatch a truncated call.
+    """
+    if not text or "</tool_call>" not in text:
+        return []
+    calls: list[dict[str, Any]] = []
+    for match in _TOOL_CALL_RE.finditer(text):
+        try:
+            call = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            logger.warning("[qwen3omni-duplex] unparseable tool call: %s", match.group(1)[:200])
+            continue
+        if isinstance(call, dict) and call.get("name"):
+            arguments = call.get("arguments")
+            calls.append(
+                {
+                    "name": str(call["name"]),
+                    "arguments": arguments if isinstance(arguments, dict) else {},
+                }
+            )
+    return calls
 
 
 def payload_text(payload: object) -> str | None:
@@ -476,5 +511,23 @@ class Qwen3OmniDuplexRuntimeExtension:
         way MiniCPM's extension does.
         """
         del segment_token_ids, segment_output_metadata, segment_finished
-        del stage_id, final_stage_id, output
-        return None
+        del final_stage_id
+
+        # ...with one exception: a tool call.
+        #
+        # Everything above is about wanting text *and* audio. A tool call is
+        # the case where text is all we want -- `<tool_call>{...}</tool_call>`
+        # is machine output, and speaking it aloud is never right. So the
+        # mutual exclusion that blocks the transcript is exactly the behaviour
+        # needed here: surface the text, do not advance to the talker.
+        if stage_id != _THINKER_STAGE_ID:
+            return None
+        tool_calls = parse_tool_calls(_completion_text(output))
+        if not tool_calls:
+            return None
+        logger.info("[qwen3omni-duplex] tool call intercepted: %s", [call.get("name") for call in tool_calls])
+        return DuplexOutputDecision(
+            action=DuplexOutputAction.DIRECT_RESPONSE,
+            metadata={"tool_calls": tool_calls},
+            final_output_type="text",
+        )

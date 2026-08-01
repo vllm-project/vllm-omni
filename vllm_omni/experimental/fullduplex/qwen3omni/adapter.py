@@ -11,6 +11,7 @@ paths on a worker's behalf.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
@@ -139,7 +140,32 @@ class Qwen3OmniNativeDuplexServingAdapter:
         )
 
     @staticmethod
-    def _scaffolding_token_ids(instructions: object, *, model_config: Any) -> dict[str, object]:
+    def _tools_preamble(tools: object) -> str:
+        """The `# Tools` system block, verbatim from the checkpoint's template.
+
+        Copied from ``chat_template.json`` rather than paraphrased: the model
+        was trained on this exact wording, and the closing paragraph is what
+        makes it emit ``<tool_call>`` instead of describing the call in prose.
+        Rendering it here (rather than calling ``apply_chat_template``) keeps
+        the duplex prompt assembled from token ids we control, which is the
+        invariant the whole stage-0 reservation depends on.
+        """
+        if not isinstance(tools, list) or not tools:
+            return ""
+        rendered = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tools)
+        return (
+            "\n\n# Tools\n\nYou may call one or more functions to assist with the user query."
+            "\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+            f"{rendered}"
+            "\n</tools>\n\nFor each function call, return a json object with function name and "
+            'arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, '
+            '"arguments": <args-json-object>}\n</tool_call>'
+        )
+
+    @classmethod
+    def _scaffolding_token_ids(
+        cls, instructions: object, *, model_config: Any, tools: object = None
+    ) -> dict[str, object]:
         """Pre-tokenize the conversation scaffolding for the worker.
 
         The thinker needs chat-template framing around the audio embeddings;
@@ -164,8 +190,12 @@ class Qwen3OmniNativeDuplexServingAdapter:
         def encode(text: str) -> list[int]:
             return [int(token_id) for token_id in tokenizer.encode(text)]
 
+        # The tools block belongs inside the system turn, before its
+        # <|im_end|> -- the template emits it that way, and a tools block in
+        # its own turn is not something the model was trained on.
+        system_body = instructions if isinstance(instructions, str) and instructions else _DEFAULT_INSTRUCTIONS
         session_prefix = Qwen3OmniDuplexPolicy.SESSION_PREFIX_TEMPLATE.format(
-            instructions=instructions if isinstance(instructions, str) and instructions else _DEFAULT_INSTRUCTIONS
+            instructions=system_body + cls._tools_preamble(tools)
         )
         return {
             Qwen3OmniDuplexPolicy.SESSION_PREFIX_IDS_KEY: encode(session_prefix),
@@ -198,9 +228,15 @@ class Qwen3OmniNativeDuplexServingAdapter:
             },
             "duplex_chunk_period_ms": Qwen3OmniDuplexPolicy.CHUNK_PERIOD_MS,
         }
-        runtime_config.update(cls._scaffolding_token_ids(instructions, model_config=model_config))
+        extra_body = getattr(config, "extra_body", None)
+        tools = extra_body.get("realtime_tools") if isinstance(extra_body, Mapping) else None
+        runtime_config.update(cls._scaffolding_token_ids(instructions, model_config=model_config, tools=tools))
         if instructions:
             runtime_config["instructions"] = instructions
+        if isinstance(tools, list) and tools:
+            # Echoed back so the engine-side extension can tell a tool-calling
+            # session from a plain one without re-reading client config.
+            runtime_config["duplex_tools"] = deepcopy(tools)
         if stage0_sampling:
             runtime_config["duplex_stage_sampling_params"] = {"0": stage0_sampling}
         return runtime_config
