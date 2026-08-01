@@ -149,6 +149,7 @@ curl -X POST http://127.0.0.1:8000/v1/audio/speech \
         "input": "Streaming PCM test on a single RTX 4090 with VoxCPM2.",
         "voice": "default",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```

@@ -75,6 +75,54 @@ def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
     assert calls["block_size"] == (4, 8, 8)
 
 
+def test_fastvideo_vsa_uses_learned_gate_when_provided(monkeypatch):
+    calls = {}
+    fake_module = types.ModuleType("fastvideo_kernel")
+
+    def fake_video_sparse_attn_bshd(
+        q,
+        k,
+        v,
+        variable_block_sizes,
+        q_variable_block_sizes,
+        compress_attn_weight,
+        topk,
+        block_size,
+    ):
+        calls["compress_sum"] = float(compress_attn_weight.detach().cpu().sum())
+        calls["compress_shape"] = tuple(compress_attn_weight.shape)
+        return q + k + v
+
+    fake_module.video_sparse_attn_bshd = fake_video_sparse_attn_bshd
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel", fake_module)
+
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        causal=False,
+        backend_kwargs={
+            "topk": 1,
+            "block_size": (4, 8, 8),
+            "min_seq_len": 1,
+            "disable_when_sp_active": False,
+        },
+    )
+    query = torch.randn(1, 300, 2, 8)
+    gate = torch.ones_like(query)
+    metadata = AttentionMetadata(
+        extra={"vsa_dit_seq_shape": (3, 10, 10), "gate_compress": gate}
+    )
+    monkeypatch.setattr(impl, "_fallback_reason", lambda *args, **kwargs: None)
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert calls["compress_shape"] == (1, 1024, 2, 8)
+    # Only the 300 real tokens carry ones; padded gate slots stay zero.
+    assert calls["compress_sum"] == gate.numel()
+
+
 def test_fastvideo_vsa_falls_back_without_dit_shape(monkeypatch):
     calls = {}
 

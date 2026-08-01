@@ -36,6 +36,7 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
 | `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
 | `HiDream-I1-Full` | 1024 x 1024 | 63.7  | 57.7 |
+| `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | 1024 (Raw) / 2048 (Turbo) | — | ~30 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
@@ -179,7 +180,6 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output flux2-dev.png
 ```
 
-
 ### HiDream-I1-Full Models
 
 The `--auxiliary-text-encoder` parameter is required when running HiDream‑I1‑Full:
@@ -197,9 +197,42 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output /output.png
 ```
 
+### Krea 2
+
+Krea 2 is published as diffusers-format checkpoints: `krea/Krea-2-Turbo` (few-step distilled) and `krea/Krea-2-Raw`.
+The pipeline class (`Krea2Pipeline`) is auto-detected from `model_index.json`. The distilled Turbo checkpoint sets
+`is_distilled=true` and is best run at 2048x2048 with few steps and guidance disabled:
+
+```bash
+# Few-step distilled (Turbo) checkpoint
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Turbo \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 8 \
+  --guidance-scale 0.0 \
+  --height 2048 --width 2048 \
+  --output krea2.png
+```
+
+For the Raw checkpoint, use more steps with CFG enabled:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Raw \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 28 \
+  --guidance-scale 4.5 \
+  --output krea2.png
+```
+
+`guidance-scale` follows the Krea 2 convention (`velocity = cond + guidance_scale * (cond - uncond)`); CFG is enabled
+whenever `guidance-scale > 0`.
+
 ### Batch Requests (Multiple Prompts)
 
-You can pass multiple prompts in a single `generate` call.
+You can pass multiple prompts in a single `Omni.generate` call. `Omni`
+submits each prompt as an independent request and returns one output per
+prompt.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -224,11 +257,10 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by
-    default, and the input list is sliced into single-item requests before feeding into the diffusion
-    pipeline. For models that do internally support batched inputs, you can
-    [modify this configuration](../../../configuration/stage_configs.md) to let the model accept a
-    longer batch of prompts.
+    For diffusion pipelines, the input list is sliced into single-item requests
+    before feeding into the diffusion pipeline. For request-level batching
+    controls such as `max_num_seqs`, see
+    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
 
 ### Negative Prompts
 

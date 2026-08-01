@@ -1,6 +1,18 @@
 [
   {
     "test_name": "test_bagel_single_device_single_stage_t2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), t2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -28,16 +40,28 @@
         "max-concurrency": 1,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.3678,
-          "latency_mean": 2.691,
-          "peak_memory_mb_max": 33083.6,
-          "peak_memory_mb_mean": 33082.5
+          "throughput_qps": 0.495,
+          "latency_mean": 2.0238,
+          "peak_memory_mb_max": 29393.4286,
+          "peak_memory_mb_mean": 29392.7143
         }
       }
     ]
   },
   {
     "test_name": "test_bagel_single_device_single_stage_i2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), i2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -66,16 +90,28 @@
         "enable-negative-prompt": true,
         "num-input-images": 1,
         "baseline": {
-          "throughput_qps": 0.3124,
-          "latency_mean": 3.1686,
-          "peak_memory_mb_max": 33448.8,
-          "peak_memory_mb_mean": 33447.7
+          "throughput_qps": 0.3451,
+          "latency_mean": 2.9031,
+          "peak_memory_mb_max": 30480.2857,
+          "peak_memory_mb_mean": 30479.2857
         }
       }
     ]
   },
   {
     "test_name": "test_bagel_single_device_multi_stage_t2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -103,16 +139,28 @@
         "max-concurrency": 1,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.3746,
-          "latency_mean": 2.6425,
-          "peak_memory_mb_max": 33077.0,
-          "peak_memory_mb_mean": 33077.0
+          "throughput_qps": 0.5048,
+          "latency_mean": 1.987,
+          "peak_memory_mb_max": 29380.0,
+          "peak_memory_mb_mean": 29380.0
         }
       }
     ]
   },
   {
     "test_name": "test_bagel_single_device_multi_stage_i2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, i2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -141,10 +189,10 @@
         "enable-negative-prompt": true,
         "num-input-images": 1,
         "baseline": {
-          "throughput_qps": 0.1349,
-          "latency_mean": 7.339,
-          "peak_memory_mb_max": 33321.2,
-          "peak_memory_mb_mean": 33321.2
+          "throughput_qps": 0.149,
+          "latency_mean": 6.7157,
+          "peak_memory_mb_max": 30574.0,
+          "peak_memory_mb_mean": 30574.0
         }
       }
     ]

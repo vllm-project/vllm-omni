@@ -14,7 +14,7 @@ import io
 import PIL.Image
 
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
-SUPPORTED_LAYERED_LAYERS_RANGE = range(3, 11)
+SUPPORTED_LAYERED_LAYERS_RANGE = range(2, 11)
 
 
 def parse_size(size_str: str) -> tuple[int, int]:

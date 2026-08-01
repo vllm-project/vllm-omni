@@ -163,6 +163,13 @@ def _get_vsa_dit_seq_shape(attn_metadata: AttentionMetadata | None) -> tuple[int
     return tuple(int(dim) for dim in value)
 
 
+def _get_gate_compress(attn_metadata: AttentionMetadata | None) -> torch.Tensor | None:
+    if attn_metadata is None:
+        return None
+    value = attn_metadata.extra.get("gate_compress")
+    return value if isinstance(value, torch.Tensor) else None
+
+
 class FastVideoVSABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -207,7 +214,6 @@ class FastVideoVSAImpl(AttentionImpl):
         self.block_size = self._parse_block_size(backend_kwargs.get("block_size", (4, 8, 8)))
         self.block_elements = self.block_size[0] * self.block_size[1] * self.block_size[2]
         self.min_seq_len = int(backend_kwargs.get("min_seq_len", self.block_elements * 2))
-        self.compress_attn_mode = str(backend_kwargs.get("compress_attn_mode", "zero"))
         self.fallback_on_error = bool(backend_kwargs.get("fallback_on_error", True))
         self.disable_when_sp_active = bool(backend_kwargs.get("disable_when_sp_active", True))
 
@@ -261,8 +267,6 @@ class FastVideoVSAImpl(AttentionImpl):
             return f"block_elements must be 256, got {self.block_elements}"
         if self.topk <= 0:
             return f"topk must be positive, got {self.topk}"
-        if self.compress_attn_mode not in ("none", "zero"):
-            return f"compress_attn_mode must be 'none' or 'zero', got {self.compress_attn_mode!r}"
         if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
             return f"expected [B, S, H, D] tensors, got {query.shape}, {key.shape}, {value.shape}"
         if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
@@ -320,14 +324,13 @@ class FastVideoVSAImpl(AttentionImpl):
         assert dit_seq_shape is not None
         logger.info_once(
             "FASTVIDEO_VSA using video_sparse_attn_bshd: seq_len=%d, dit_seq_shape=%s, heads=%d, head_size=%d, "
-            "topk=%d, block_size=%s, compress_attn_mode=%s",
+            "topk=%d, block_size=%s",
             seq_len,
             dit_seq_shape,
             query.shape[2],
             query.shape[3],
             self.topk,
             self.block_size,
-            self.compress_attn_mode,
         )
 
         try:
@@ -346,10 +349,20 @@ class FastVideoVSAImpl(AttentionImpl):
             query_tiled[:, non_pad_index] = query[:, tile_partition_indices]
             key_tiled[:, non_pad_index] = key[:, tile_partition_indices]
             value_tiled[:, non_pad_index] = value[:, tile_partition_indices]
-            if self.compress_attn_mode == "zero":
-                compress_attn_weight = torch.zeros_like(query_tiled)
-            else:
-                compress_attn_weight = query_tiled.new_empty(0)
+            # Gate behavior is checkpoint-driven, not user-configured.
+            # Wan VSA layers always provide a gate projection. Its zero
+            # initialization makes checkpoints without gate weights sparse-only;
+            # checkpoints containing to_gate_compress weights use the learned gate.
+            gate_compress = _get_gate_compress(attn_metadata)
+            if gate_compress is None:
+                gate_compress = torch.zeros_like(query)
+            elif gate_compress.shape != query.shape:
+                raise ValueError(
+                    f"gate_compress shape {gate_compress.shape} must match query shape {query.shape}"
+                )
+            gate_tiled = torch.zeros_like(query_tiled)
+            gate_tiled[:, non_pad_index] = gate_compress[:, tile_partition_indices]
+            compress_attn_weight = gate_tiled
 
             output = _fastvideo_vsa_bshd_op(
                 query_tiled.contiguous(),

@@ -419,6 +419,24 @@ class WanSelfAttention(nn.Module):
             prefix=prefix,
         )
 
+        # FastVideo VSA checkpoints may add a learned projection that gates
+        # the compressed global branch. Zero initialization makes checkpoints
+        # without these weights sparse-only, with no user-facing mode switch.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if self.attn.attn_backend.get_name() == "FASTVIDEO_VSA":
+            self.to_gate_compress = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_compress" if prefix else "to_gate_compress",
+            )
+            nn.init.zeros_(self.to_gate_compress.weight)
+            if self.to_gate_compress.bias is not None:
+                nn.init.zeros_(self.to_gate_compress.bias)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -440,6 +458,15 @@ class WanSelfAttention(nn.Module):
         query = query.unflatten(2, (self.num_heads, self.head_dim))
         key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
+
+        if self.to_gate_compress is not None:
+            gate_result = self.to_gate_compress(hidden_states)
+            gate_compress = gate_result[0] if isinstance(gate_result, tuple) else gate_result
+            gate_compress = gate_compress.unflatten(2, (self.num_heads, self.head_dim))
+            if attn_metadata is None:
+                attn_metadata = AttentionMetadata(extra={"gate_compress": gate_compress})
+            else:
+                attn_metadata.extra["gate_compress"] = gate_compress
 
         # Apply rotary embeddings
         if rotary_emb is not None:

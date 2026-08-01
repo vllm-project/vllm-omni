@@ -22,6 +22,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.moss_tts"
 
 MOSS_TTS_PIPELINE = PipelineConfig(
     model_type="moss_tts",
+    default_deploy_config_name="moss_tts.yaml",
     model_arch="MossTTSDelayModel",  # HF architectures string
     stages=(
         StagePipelineConfig(
@@ -31,7 +32,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_delay_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
             },
@@ -45,6 +46,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),
@@ -53,6 +55,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
 
 MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
     model_type="moss_tts_realtime",
+    default_deploy_config_name="moss_tts_realtime.yaml",
     model_arch="MossTTSRealtime",  # different talker class from the delay variant
     stages=(
         StagePipelineConfig(
@@ -62,7 +65,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(
@@ -74,6 +77,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),
@@ -82,6 +86,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
 
 MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
     model_type="moss_tts_local",
+    default_deploy_config_name="moss_tts_local.yaml",
     model_arch="MossTTSLocalModel",  # different talker class: GPT2-style local depth transformer
     stages=(
         StagePipelineConfig(
@@ -91,8 +96,11 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
-            sampling_constraints={"detokenize": False},
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -103,6 +111,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),

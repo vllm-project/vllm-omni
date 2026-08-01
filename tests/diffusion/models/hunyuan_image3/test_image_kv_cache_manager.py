@@ -45,6 +45,8 @@ def patched_mgr_env(sp_size=1):
     target = _TRANSFORMER_MODULE
     patches = [
         patch(f"{target}.get_sequence_parallel_world_size", return_value=sp_size),
+        patch(f"{target}.get_allgather_parallel_world_size", return_value=sp_size),
+        patch(f"{target}.get_ulysses_parallel_world_size", return_value=1, create=True),
         patch(f"{target}.get_sequence_parallel_rank", return_value=0),
         patch(f"{target}.Attention", MockAttention),
     ]

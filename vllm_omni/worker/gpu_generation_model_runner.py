@@ -18,9 +18,10 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
+from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -28,15 +29,15 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
     PerLayerAttnMetadata,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -54,6 +55,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._async_chunk = getattr(self.model_config, "async_chunk", False)
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
@@ -62,13 +64,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "MiMoAudioModel",
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
+            "AudexCode2Wav",
+            "AudexXCodec1",
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
-                vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
 
@@ -151,7 +157,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             deferred_state_corrections_fn = self._update_states(scheduler_output)
-            if not scheduler_output.total_num_scheduled_tokens:
+
+            # Notify stateful models of finished requests before the
+            # zero-token early return. Request cleanup is a model lifecycle
+            # concern and does not depend on the inter-stage transfer mode.
+            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
+                self.model.on_requests_finished(scheduler_output.finished_req_ids)
+
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if scheduler_output.total_num_scheduled_tokens <= 0:
                 return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
@@ -308,6 +322,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             )
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
+            if getattr(self.model, "requires_request_ids", False):
+                model_kwargs["request_ids"] = list(req_ids)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -418,20 +434,20 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
-        multimodal_outputs: list[dict[str, object]] = []
+        per_req_payloads: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
             assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
             assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                multimodal_outputs.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
+                per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
             assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
             for out in multimodal_outputs_raw:
-                multimodal_outputs.append(
+                per_req_payloads.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs_raw, Mapping):
@@ -450,20 +466,28 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                multimodal_outputs.append(_ensure_tensor_values(mm_payload))
+                per_req_payloads.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
+
+        if self._async_chunk:
+            inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
+        else:
+            # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
+            # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
+            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
+
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
-        if self._should_accumulate_full_payload_output():
+        if inter_stage_outputs and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
-                if req_state is not None and multimodal_outputs[i]:
-                    self.accumulate_full_payload_output(rid, multimodal_outputs[i], req_state)
+                if req_state is not None and inter_stage_outputs[i]:
+                    self.accumulate_full_payload_output(rid, inter_stage_outputs[i], req_state)
 
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -473,6 +497,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             prompt_logprobs_dict={},
             pooler_output=None,
             multimodal_outputs=multimodal_outputs,
+            inter_stage_outputs=inter_stage_outputs,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
@@ -778,6 +803,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if hasattr(self.model, "get_dummy_runtime_additional_information"):
                 runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
                 model_kwargs["runtime_additional_information"] = runtime_addi
+            # Generation-stage code2wav models split flat input_ids using this
+            # shared contract. Dummy/profile runs use padded synthetic inputs,
+            # so expose one synthetic segment covering the actual tensor length.
+            model_kwargs["seq_token_counts"] = [int(num_tokens_padded)]
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]

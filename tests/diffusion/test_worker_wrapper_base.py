@@ -161,19 +161,6 @@ class TestWorkerWrapperBaseExtension:
 class TestWorkerWrapperBaseDelegation:
     """Test WorkerWrapperBase delegation to wrapped worker."""
 
-    def test_generate_delegation(self, mocker: MockerFixture, mock_od_config):
-        """Test that generate() delegates to worker.generate()."""
-        mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
-        mock_output = mocker.Mock()
-        wrapper.worker.generate = mocker.Mock(return_value=mock_output)
-
-        mock_requests = [mocker.Mock()]
-        result = wrapper.generate(mock_requests)
-
-        wrapper.worker.generate.assert_called_once_with(mock_requests)
-        assert result == mock_output
-
     def test_execute_model_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that execute_model() delegates to worker.execute_model()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
@@ -181,24 +168,11 @@ class TestWorkerWrapperBaseDelegation:
         mock_output = mocker.Mock()
         wrapper.worker.execute_model = mocker.Mock(return_value=mock_output)
 
-        mock_reqs = [mocker.Mock()]
-        result = wrapper.execute_model(mock_reqs, mock_od_config)
+        mock_req = mocker.Mock()
+        result = wrapper.execute_model(mock_req, mock_od_config)
 
-        wrapper.worker.execute_model.assert_called_once_with(mock_reqs, mock_od_config, kv_prefetch_jobs=None)
+        wrapper.worker.execute_model.assert_called_once_with(mock_req, mock_od_config, kv_prefetch_job=None)
         assert result == mock_output
-
-    def test_load_weights_delegation(self, mocker: MockerFixture, mock_od_config):
-        """Test that load_weights() delegates to worker.load_weights()."""
-        mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
-        expected_result = {"weight1", "weight2"}
-        wrapper.worker.load_weights = mocker.Mock(return_value=expected_result)
-
-        mock_weights = [("weight1", mocker.Mock()), ("weight2", mocker.Mock())]
-        result = wrapper.load_weights(mock_weights)
-
-        wrapper.worker.load_weights.assert_called_once_with(mock_weights)
-        assert result == expected_result
 
     def test_sleep_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that sleep() delegates to worker.sleep()."""

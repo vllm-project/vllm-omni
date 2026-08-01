@@ -4,6 +4,7 @@
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
@@ -13,10 +14,11 @@ DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 @dataclass
 class OmniDiffusionRequest:
     """
-    Complete state passed through the pipeline execution.
+    Input payload for a single diffusion request.
 
-    This dataclass contains the prompts and sampling parameters for the diffusion pipeline
+    This dataclass contains the prompt and sampling parameters for the diffusion pipeline
     execution. It also contains a request_id for other components to trace this request and its outputs.
+    The runner wraps one or more requests into a DiffusionRequestBatch before pipeline execution.
     """
 
     # TODO(will): double check that args are separate from server_args
@@ -24,10 +26,10 @@ class OmniDiffusionRequest:
     # specific arguments.
     # data_type: DataType
 
-    prompts: list[OmniPromptType]  # Actually supporting str-based prompts
+    prompt: OmniPromptType
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
-    kv_sender_info: dict | None = None
+    kv_sender_info: dict[str, Any] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -50,10 +52,17 @@ class OmniDiffusionRequest:
             self.sampling_params.guidance_scale = 1.0
 
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
-        if self.sampling_params.guidance_scale > 1.0 and any(
-            (not isinstance(p, str) and p.get("negative_prompt")) for p in self.prompts
+        if self.sampling_params.guidance_scale > 1.0 and (
+            not isinstance(self.prompt, str) and self.prompt.get("negative_prompt")
         ):
             self.sampling_params.do_classifier_free_guidance = True
+
+        # Detect whether the caller explicitly provided guidance_scale_2
+        # BEFORE auto-filling it. Pipelines with a model-specific second
+        # guidance default (e.g. Boogu image_guidance_scale=1.0) must be able
+        # to tell an explicit value apart from the guidance_scale fallback.
+        if self.sampling_params.guidance_scale_2 is not None:
+            self.sampling_params.guidance_scale_2_provided = True
 
         # Auto-fill guidance_scale_2 from the (now-resolved) guidance_scale
         # so downstream code always has a valid value.

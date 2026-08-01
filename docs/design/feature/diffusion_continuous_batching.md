@@ -38,8 +38,12 @@ With continuous batching enabled:
 The current implementation is conservative:
 
 - only compatible requests are batched together
-- request-mode diffusion still runs with `max_num_seqs=1`
 - per-request progress and completion remain independent
+
+Here, "continuous batching" means the step-wise path enabled by
+`step_execution=True`. Request-mode `DiffusionRequestBatch` is static
+request-level batching for one full pipeline `forward()` call; it does not
+admit or remove requests between denoise steps.
 
 ## Enablement
 
@@ -67,12 +71,12 @@ The scheduler derives its batch capacity from `max_num_seqs` through
 `max_num_running_reqs`.
 
 Batch admission is gated by
-[`SamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py),
+[`StepBatchSamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py),
 which is built from shape-sensitive and CFG-sensitive sampling fields. This is
 the core correctness rule for batching: requests are only co-batched when they
 share the same denoise tensor contract.
 
-There are two important details:
+There are three important details:
 
 - `num_inference_steps` is not part of the key, so requests with different
   total step counts can still share a batch
@@ -88,15 +92,18 @@ key also covers LoRA identity (`lora_int_id`, `lora_scale`), so requests
 targeting different adapters or scales run in separate batches and the
 worker can activate exactly one adapter per step.
 
-The current batching unit is one `OmniDiffusionRequest`. Requests with
-multiple prompts do not participate in batching today.
+The scheduler batching unit is one logical `OmniDiffusionRequest`. In the
+step-wise path, runtime tensor batching is represented as `StepInputBatch`. For
+request-mode prompt semantics, see
+[Request-Level Batching](../../user_guide/diffusion/request_batching.md).
 
 ## Runner
 
 The runner keeps persistent per-request execution state in
-[`DiffusionRequestState`](gh-file:vllm_omni/diffusion/worker/utils.py),
-while the scheduler owns a separate lightweight request state for queueing and
-lifecycle tracking.
+[`StepRequestState`](gh-file:vllm_omni/diffusion/worker/utils.py),
+while the scheduler owns a separate lightweight
+[`SchedulerRequestState`](gh-file:vllm_omni/diffusion/sched/interface.py)
+for queueing and lifecycle tracking.
 
 For each step, the runner builds an
 [`InputBatch`](gh-file:vllm_omni/diffusion/worker/input_batch.py) from the
@@ -126,17 +133,16 @@ request-local scheduler state and outputs.
 the background loop and async add-request path needed for multiple requests to
 accumulate in the scheduler.
 
-This is supporting infrastructure, not the main design point. The batching
-behavior is defined by scheduler-side compatibility gating and runner-side
-batch packing.
+When `step_execution=True`, the engine routes work through the step-wise
+executor path. The continuous batching behavior is defined by scheduler-side
+compatibility gating and runner-side `StepInputBatch` packing.
 
 ## Current Limitations
 
-- Experimental feature; use `max_num_seqs=1` for the older conservative path.
+- Experimental feature; use `max_num_seqs=1` for the conservative single-request
+  step path.
 - Only native pipelines that already support `step_execution=True`.
-- Request-mode diffusion still clamps `max_num_seqs` back to `1`.
-- Only homogeneous batches keyed by `SamplingParamsKey` are supported.
-- Multi-prompt requests are not batched.
+- Only homogeneous batches keyed by `StepBatchSamplingParamsKey` are supported.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired
   into the batched step-wise path yet.
 - Future work can relax the current same-shape restriction with richer

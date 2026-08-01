@@ -38,21 +38,19 @@ def test_vace_preprocess_collects_reference_video_and_mask_inputs() -> None:
     frame = Image.new("RGB", (64, 64), "black")
     mask = Image.new("L", (64, 64), 255)
     request = SimpleNamespace(
-        prompts=[
-            {
-                "prompt": "p",
-                "multi_modal_data": {
-                    "image": ref,
-                    "video": [frame],
-                    "mask": mask,
-                },
-            }
-        ],
+        prompt={
+            "prompt": "p",
+            "multi_modal_data": {
+                "image": ref,
+                "video": [frame],
+                "mask": mask,
+            },
+        },
         sampling_params=SimpleNamespace(height=None, width=None),
     )
 
     result = preprocess(request)
-    additional_info = result.prompts[0]["additional_information"]
+    additional_info = result.prompt["additional_information"]
 
     assert result.sampling_params.height == 432
     assert result.sampling_params.width == 880

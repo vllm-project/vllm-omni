@@ -65,6 +65,7 @@ PY
             \"model\": \"${MODEL}\",
             \"input\": \"${TEXT}\",
             \"stream\": true,
+            \"stream_format\": \"audio\",
             \"response_format\": \"pcm\"
         }" "$STREAM_OUTPUT"
         ;;

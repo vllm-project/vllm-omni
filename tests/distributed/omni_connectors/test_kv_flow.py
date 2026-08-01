@@ -330,6 +330,31 @@ def test_normalize_layer_kv_rejects_invalid_inputs(kv_config, common_constants, 
     assert normalized is None
 
 
+def test_normalize_layer_kv_unpacks_packed_layout(common_constants):
+    """The vLLM >= 0.23 packed layout (num_blocks, n_heads, block_size,
+    2*head_dim) is unpacked into (num_blocks, block_size, n_heads, head_dim)
+    key/value blocks when block_size is provided."""
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+    num_blocks = 10
+
+    layer_kv = torch.randn(num_blocks, num_heads, block_size, 2 * head_dim)
+
+    # Without block_size the 4-D packed layout is not recognized.
+    assert normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=0) is None
+
+    normalized = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=0, block_size=block_size)
+    assert normalized is not None
+    key_blocks, value_blocks = normalized
+    assert key_blocks.shape == (num_blocks, block_size, num_heads, head_dim)
+    assert value_blocks.shape == (num_blocks, block_size, num_heads, head_dim)
+    reference = layer_kv.transpose(1, 2)
+    assert torch.equal(key_blocks, reference[..., :head_dim])
+    assert torch.equal(value_blocks, reference[..., head_dim:])
+
+
 def test_manager_reception(kv_config, mock_connector, common_constants):
     """Test reception and injection logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -370,7 +395,7 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["test_recv"],
+        prompt="test_recv",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )
@@ -414,7 +439,7 @@ def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_conf
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=parent_req_id,
     )
@@ -439,7 +464,7 @@ def test_receive_multi_kv_cache_uses_parent_request_id_for_cfg_collection(kv_con
         return {"cfg_text_kv_metadata": {"ok": True}}
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id="req-parent",
     )
@@ -500,7 +525,7 @@ def test_integration_flow(common_constants):
     receiver_manager._connector = connector
 
     req = OmniDiffusionRequest(
-        prompts=["test_integ"],
+        prompt="test_integ",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )

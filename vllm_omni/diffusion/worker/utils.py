@@ -15,8 +15,43 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
+def clear_pipeline_stage_durations(pipeline: Any) -> None:
+    clear_records = getattr(pipeline, "clear_profiler_records", None)
+    if getattr(pipeline, "enable_diffusion_pipeline_profiler", False) and callable(clear_records):
+        clear_records()
+
+
+def consume_pipeline_stage_durations(pipeline: Any) -> dict[str, float]:
+    if not getattr(pipeline, "enable_diffusion_pipeline_profiler", False):
+        return {}
+    stage_durations = getattr(pipeline, "stage_durations", None)
+    if not isinstance(stage_durations, dict):
+        return {}
+    result = {stage: float(duration) for stage, duration in stage_durations.items()}
+    clear_pipeline_stage_durations(pipeline)
+    return result
+
+
+def merge_stage_durations(
+    state: StepRequestState,
+    stage_durations: dict[str, float],
+) -> None:
+    if not stage_durations:
+        return
+    for stage, duration in stage_durations.items():
+        state.stage_durations[stage] = float(state.stage_durations.get(stage, 0.0)) + float(duration)
+
+
+def attach_stage_durations(
+    state: StepRequestState,
+    output: DiffusionOutput,
+) -> None:
+    if state.stage_durations:
+        output.stage_durations = dict(state.stage_durations)
+
+
 @dataclass
-class DiffusionRequestState:
+class StepRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
@@ -40,7 +75,8 @@ class DiffusionRequestState:
     # ── Identity / request-level inputs ──
     request_id: str
     sampling: OmniDiffusionSamplingParams
-    prompts: list[OmniPromptType] | None = None
+    prompt: OmniPromptType | None = None
+    kv_sender_info: dict | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
@@ -77,6 +113,12 @@ class DiffusionRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # ── Runner-owned profiling metadata ──
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # Peak device memory observed while this request is active in step mode.
+    peak_memory_mb: float = 0.0
 
     # ── Properties ──
 
@@ -121,12 +163,6 @@ class DiffusionRequestState:
             return self.denoise_completed
         return self.chunk_index >= self.total_chunks
 
-    @property
-    def new_request(self) -> bool:
-        # TODO: this is only an approximation for current stepwise mode.
-        # A real "new request" signal should eventually come from scheduler/runner state transitions.
-        return self.step_index == 0 or self.timesteps is None
-
 
 class BaseRunnerOutput(ABC):
     @abstractmethod
@@ -147,6 +183,7 @@ class RunnerOutput(BaseRunnerOutput):
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+    async_output_id: str | None = None
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

@@ -9,11 +9,18 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class _StubTransformer(nn.Module):
+    @property
+    def dtype(self) -> torch.dtype:
+        return torch.float32
+
+
+class _StubTextEncoder(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
         return torch.float32
@@ -40,12 +47,30 @@ def _noop_progress_bar(*args, **kwargs):
     yield _Bar()
 
 
+def _stub_encode_prompt(
+    prompt,
+    negative_prompt=None,
+    do_classifier_free_guidance=True,
+    num_videos_per_prompt=1,
+    max_sequence_length=512,
+    device=None,
+    dtype=None,
+):
+    del negative_prompt, do_classifier_free_guidance, device, dtype
+    batch_size = 1 if isinstance(prompt, str) else len(prompt)
+    n = batch_size * num_videos_per_prompt
+    hidden_size = 8
+    prompt_embeds = torch.zeros(n, max_sequence_length, hidden_size)
+    return prompt_embeds, None
+
+
 def _make_pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
+    pipeline.text_encoder = _StubTextEncoder()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
     pipeline.od_config = SimpleNamespace(flow_shift=5.0)
@@ -55,20 +80,20 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.vae_scale_factor_spatial = 8
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
+    pipeline.is_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None
     pipeline._current_timestep = None
     pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = _stub_encode_prompt  # type: ignore[method-assign]
     pipeline.prepare_latents = lambda **kwargs: torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
     pipeline.progress_bar = _noop_progress_bar
     return pipeline
 
 
-def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
+def test_forward_delegates_denoising_to_diffuse() -> None:
     pipeline = _make_pipeline()
-
-    prompt_embeds = torch.randn(1, 8)
     captured: dict[str, object] = {}
 
     def _fake_diffuse(**kwargs):
@@ -77,15 +102,16 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
 
     pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
 
-    req = SimpleNamespace(
-        prompts=["prompt"],
+    mock_req = SimpleNamespace(
+        prompt="prompt",
+        request_id="test-req",
         sampling_params=SimpleNamespace(
             height=None,
             width=None,
             num_frames=1,
             num_inference_steps=2,
-            guidance_scale_provided=False,
-            guidance_scale=None,
+            guidance_scale_provided=True,
+            guidance_scale=1.0,
             guidance_scale_2=None,
             boundary_ratio=None,
             generator=None,
@@ -93,13 +119,16 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
             num_outputs_per_prompt=1,
             max_sequence_length=32,
             latents=None,
+            output_type="latent",
             extra_args={},
         ),
     )
+    batch = DiffusionRequestBatch(requests=[mock_req])
 
-    output = pipeline.forward(req, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
+    output = pipeline.forward(batch)
 
     assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
+    assert torch.equal(captured["prompt_embeds"], torch.zeros(1, 32, 8))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
     assert captured["guidance_low"] == 1.0
     assert captured["guidance_high"] == 1.0
@@ -153,3 +182,55 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+class _StubDMDScheduler:
+    def __init__(self) -> None:
+        self.predict_clean_calls: list[tuple[float, float, float]] = []
+        self.add_noise_calls: list[tuple[float, float, float]] = []
+
+    def predict_clean(self, model_output, sample, timestep):
+        self.predict_clean_calls.append((float(model_output.mean()), float(sample.mean()), float(timestep)))
+        return sample - model_output
+
+    def add_noise(self, clean_sample, noise, timestep):
+        self.add_noise_calls.append((float(clean_sample.mean()), float(noise.mean()), float(timestep)))
+        return clean_sample + 10.0
+
+
+def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = _StubDMDScheduler()
+    latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
+    timesteps = torch.tensor([1000.0, 757.0, 522.0])
+
+    pipeline.predict_noise_maybe_with_cfg = lambda **kwargs: torch.ones_like(latents)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.randn_tensor",
+        lambda *args, **kwargs: torch.full(args[0], 2.0, dtype=kwargs["dtype"]),
+    )
+
+    result = pipeline.diffuse(
+        latents=latents,
+        timesteps=timesteps,
+        prompt_embeds=torch.zeros(1, 8),
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+        generator=torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert pipeline.scheduler.predict_clean_calls == [
+        (1.0, 0.0, 1000.0),
+        (1.0, 9.0, 757.0),
+        (1.0, 18.0, 522.0),
+    ]
+    assert pipeline.scheduler.add_noise_calls == [
+        (-1.0, 2.0, 757.0),
+        (8.0, 2.0, 522.0),
+    ]
+    torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))

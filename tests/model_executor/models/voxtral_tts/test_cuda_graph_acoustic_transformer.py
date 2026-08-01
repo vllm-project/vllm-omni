@@ -156,7 +156,7 @@ class SyntheticModel(nn.Module):
         )
 
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
-        mm_tokens = {"audio": audio_list}
+        mm_tokens = {"codes": {"audio": audio_list}}
         return fake_eos, mm_tokens
 
 
@@ -192,9 +192,9 @@ def _cfg_alpha(batch_size, value=1.2, device=DEVICE):
 
 
 def _unpack_audio_codes(result):
-    """Unpack (fake_eos, {"audio": [list of tensors]}) into (fake_eos, audio_codes)."""
+    """Unpack (fake_eos, {"codes": {"audio": [list of tensors]}}) into (fake_eos, audio_codes)."""
     fake_eos, mm_tokens = result
-    audio_list = mm_tokens["audio"]
+    audio_list = mm_tokens["codes"]["audio"]
     # Each element is (1, 1, 1+n_acoustic_codebook), concat along batch dim
     audio_codes = torch.cat(audio_list, dim=0).squeeze(1)  # (B, 1+n_acoustic)
     return fake_eos, audio_codes

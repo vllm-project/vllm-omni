@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -28,6 +29,21 @@ logger = init_logger(__name__)
 _SOULX_PROFILER_TARGETS = [
     "forward",
 ]
+
+
+def convert_soulx_audio_output_to_numpy(audio: torch.Tensor | dict[str, Any]) -> np.ndarray | dict[str, Any]:
+    if isinstance(audio, dict) and isinstance(audio.get("payload"), dict):
+        payload = dict(audio["payload"])
+        audio_payload = payload.get("audio")
+        if isinstance(audio_payload, torch.Tensor):
+            payload["audio"] = audio_payload.detach().cpu().float().numpy()
+        return {
+            "payload": payload,
+            "metadata": audio.get("metadata") or {},
+        }
+    if isinstance(audio, torch.Tensor):
+        return audio.detach().cpu().float().numpy()
+    return audio
 
 
 class FlowMatchingAudioPipeline(
@@ -326,7 +342,7 @@ class FlowMatchingAudioPipeline(
         req: OmniDiffusionRequest,
         *,
         kind: str,
-        custom_output_key: str,
+        metadata_key: str,
         infer_batch_fn: Callable[..., tuple[torch.Tensor, int]],
         prepare_extra_args: Callable[[dict[str, Any], Any], dict[str, Any]] | None = None,
     ) -> DiffusionOutput:
@@ -353,7 +369,9 @@ class FlowMatchingAudioPipeline(
             )
 
         return DiffusionOutput(
-            output=audio,
-            custom_output={custom_output_key: pitch_shift},
+            output={
+                "payload": {"audio": audio},
+                "metadata": {"audio": {metadata_key: pitch_shift}},
+            },
             stage_durations=self._profiler_stage_durations() or {},
         )

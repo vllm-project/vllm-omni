@@ -1244,7 +1244,7 @@ def test_parameter_validation():
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
-        ImageGenerationRequest(prompt="test", layers=2)
+        ImageGenerationRequest(prompt="test", layers=1)
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
@@ -1562,6 +1562,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
             "output_format": "jpeg",
             "num_inference_steps": 20,
             "guidance_scale": 8.0,
+            "guidance_scale_2": 2.0,
             "seed": 1234,
             "negative_prompt": "negative",
             "n": 2,
@@ -1576,6 +1577,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
     assert captured_prompt["negative_prompt"] == "negative"
     assert captured_sampling_params.num_inference_steps == 20
     assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.guidance_scale_2 == 2.0
     assert captured_sampling_params.seed == 1234
     assert captured_sampling_params.num_outputs_per_prompt == 2
     assert captured_sampling_params.width == 16
@@ -1663,13 +1665,13 @@ def test_image_edit_invalid_layers(async_omni_test_client):
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 2,
+            "layers": 1,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
     # Test layers above the supported range
     response = async_omni_test_client.post(
@@ -1683,7 +1685,7 @@ def test_image_edit_invalid_layers(async_omni_test_client):
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):

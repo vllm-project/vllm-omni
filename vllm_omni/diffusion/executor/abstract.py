@@ -59,7 +59,7 @@ class DiffusionExecutor(ABC):
             raise ValueError(f"Unknown distributed executor backend: {distributed_executor_backend}")
         return executor_class
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
         self._init_executor()
 
@@ -68,9 +68,20 @@ class DiffusionExecutor(ABC):
         """Initialize the executor (e.g., launch workers, setup IPC)."""
         pass
 
+    @property
+    @abstractmethod
+    def is_dead(self) -> bool:
+        """Whether the executor is shut down or has failed fatally."""
+        pass
+
     @abstractmethod
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work from a scheduler output."""
+        pass
+
+    @abstractmethod
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work through the request-batch path."""
         pass
 
     @abstractmethod

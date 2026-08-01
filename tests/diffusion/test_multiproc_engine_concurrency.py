@@ -18,10 +18,16 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
+    DiffusionSchedulerOutput,
+    NewRequestData,
+)
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -40,7 +46,7 @@ def _mock_request(tag: str):
     """Return a lightweight request object identifiable by *tag*."""
     return SimpleNamespace(
         request_id=tag,
-        prompts=[f"prompt_{tag}"],
+        prompt=f"prompt_{tag}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
     )
 
@@ -50,11 +56,9 @@ def _make_executor(num_gpus: int = 1):
 
     Returns ``(executor, request_queue, result_queue)``.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False)
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_executor", lambda self: None)
-    executor = MultiprocDiffusionExecutor(od_cfg)
-    monkeypatch.undo()
+    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False, step_execution=True)
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = od_cfg
 
     req_q: queue.Queue = queue.Queue()
     res_q: queue.Queue = queue.Queue()
@@ -67,7 +71,7 @@ def _make_executor(num_gpus: int = 1):
     executor._result_mq = mock_rmq
     executor._closed = False
     executor._processes = []
-    executor.is_failed = False
+    executor._is_failed = False
     executor._failure_callbacks = []
     return executor, req_q, res_q
 
@@ -87,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine._loop_started = False
     engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
-    engine.execute_fn = executor.execute_request
+    engine.execute_fn = executor.execute_batch
     return engine, executor, req_q, res_q
 
 
@@ -101,13 +105,24 @@ def _start_worker(req_q, res_q, count=2):
             req = req_q.get(timeout=10)
             method = req.get("method", "")
             args = req.get("args", ())
-            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_id"):
+            if method == "execute_model_batch" and args and isinstance(args[0], DiffusionSchedulerOutput):
+                sched_output = args[0]
+                runner_outputs = []
+                for nr in sched_output.scheduled_new_reqs:
+                    tag = f"result_for_{nr.request_id}"
+                    runner_outputs.append(
+                        RunnerOutput(request_id=nr.request_id, finished=True, result=_tagged_output(tag))
+                    )
+                res_q.put(BatchRunnerOutput.from_list(runner_outputs))
+            elif method in {"generate", "execute_model"} and args and hasattr(args[0], "request_id"):
                 tag = f"result_for_{args[0].request_id}"
+                res_q.put(_tagged_output(tag))
             elif args:
                 tag = f"result_for_{args[0]}"
+                res_q.put(_tagged_output(tag))
             else:
                 tag = f"result_for_{method}"
-            res_q.put(_tagged_output(tag))
+                res_q.put(_tagged_output(tag))
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -170,6 +185,64 @@ class TestConcurrentRequestExecution:
         # The bug causes them to be swapped.
         assert results["A"].error == "result_for_A"
         assert results["B"].error == "result_for_B"
+
+
+# ───────────────── request-mode dispatch (per-request vs batch) ─────────────
+
+
+def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
+    """Build a request-mode scheduler output with the given new requests."""
+    new_reqs = [
+        NewRequestData(
+            request_id=rid,
+            req=OmniDiffusionRequest(
+                prompt=f"prompt_{rid}",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_id=rid,
+            ),
+        )
+        for rid in request_ids
+    ]
+    return DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+
+class TestRequestModeDispatch:
+    """Request-batch-capable dispatch uses ``execute_batch`` for request-mode cycles."""
+
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B", "C")])
+    def test_request_batch_capable_pipeline_uses_execute_batch(self, request_ids):
+        engine, executor, _, _ = _make_engine()
+        executor.execute_request = Mock(return_value="per-request")
+        executor.execute_batch = Mock(return_value="batch")
+        engine.execute_fn = executor.execute_batch
+
+        out = engine.execute_fn(_make_sched_output(*request_ids))
+
+        executor.execute_batch.assert_called_once()
+        assert out == "batch"
+        executor.execute_request.assert_not_called()
+
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B")])
+    def test_batch_path_routes_results_through_worker(self, request_ids):
+        """End-to-end: a request-batch cycle goes out as one ``execute_model_batch``
+        RPC and comes back as a per-request-routed ``BatchRunnerOutput``."""
+        engine, executor, req_q, res_q = _make_engine()
+        engine.execute_fn = executor.execute_batch
+        wt = _start_worker(req_q, res_q, count=1)
+
+        out = engine.execute_fn(_make_sched_output(*request_ids))
+        wt.join(5)
+
+        assert isinstance(out, BatchRunnerOutput)
+        results = {ro.request_id: ro.result.error for ro in out.runner_outputs}
+        assert results == {request_id: f"result_for_{request_id}" for request_id in request_ids}
 
 
 # ───────────────── concurrent collective RPC ─────────────────
@@ -453,7 +526,7 @@ class TestWorkerProcRpcRankStatus:
 
         monkeypatch.setattr(torch.distributed, "all_gather_object", _all_gather_object)
 
-        result, should_reply = proc.execute_rpc(
+        result, should_reply = proc._execute_rpc(
             {
                 "method": "remove_lora",
                 "args": (),
@@ -476,7 +549,7 @@ class TestWorkerProcRpcRankStatus:
         proc.worker.execute_method = Mock(side_effect=RuntimeError("local boom"))
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
 
-        result, should_reply = proc.execute_rpc(
+        result, should_reply = proc._execute_rpc(
             {
                 "method": "add_lora",
                 "args": (),
@@ -502,7 +575,7 @@ class TestWorkerProcRpcRankStatus:
         proc = self._make_worker_proc()
 
         with pytest.raises(ValueError, match="collect_rank_status requires exec_all_ranks=True"):
-            proc.execute_rpc(
+            proc._execute_rpc(
                 {
                     "method": "ping",
                     "args": (),
@@ -521,7 +594,7 @@ class TestWorkerProcRpcRankStatus:
         proc.worker.execute_method = Mock(side_effect=original)
 
         with pytest.raises(ValueError) as excinfo:
-            proc.execute_rpc(
+            proc._execute_rpc(
                 {
                     "method": "bad",
                     "args": (),
@@ -543,11 +616,12 @@ class TestMultiprocExecutorRaisesEngineDeadError:
 
     def test_collective_rpc_raises_when_is_failed(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(step_execution=True)
         executor._closed = False
         executor._broadcast_mq = MagicMock()
         executor._result_mq = MagicMock()
         executor._result_mq.dequeue = MagicMock(side_effect=TimeoutError)
-        executor.is_failed = True
+        executor._is_failed = True
 
         with pytest.raises(EngineDeadError):
             executor.collective_rpc(
@@ -568,7 +642,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                executor.is_failed = True
+                executor._is_failed = True
                 raise TimeoutError
             return orig_dequeue(timeout=timeout)
 
@@ -588,7 +662,7 @@ class TestMultiprocExecutorStepStreamingOutput:
 
     def test_execute_step_allows_streaming_output_mode(self):
         executor, req_q, res_q = _make_executor()
-        executor.od_config = SimpleNamespace(streaming_output=True)  # pyright: ignore[reportAttributeAccessIssue]
+        executor.od_config = SimpleNamespace(streaming_output=True, step_execution=True)  # pyright: ignore[reportAttributeAccessIssue]
         runner_outputs = [
             RunnerOutput(
                 request_id="sched-stream",
@@ -845,7 +919,7 @@ def _make_short_lived_process() -> mp.Process:
 
 
 class TestMultiprocExecutorWorkerMonitor:
-    """Integration tests for ``start_worker_monitor``.
+    """Integration tests for ``_start_worker_monitor``.
 
     Uses real short-lived subprocesses so that OS-level sentinel fd
     readiness is exercised end-to-end.
@@ -853,19 +927,27 @@ class TestMultiprocExecutorWorkerMonitor:
 
     def test_worker_monitor_sets_is_failed_and_calls_callbacks_on_death(self):
         """When a worker process dies, the monitor thread must:
-        1. Set ``is_failed = True``
+        1. Set ``_is_failed = True``
         2. Call ``shutdown()`` (which sets ``_closed = True``)
         3. Invoke all registered failure callbacks
         """
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._closed = False
-        executor.is_failed = False
+        executor._is_failed = False
         executor._failure_callbacks = []
         executor._broadcast_mq = None
         executor._result_mq = None
-        executor.resources = None
+        executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
         executor._finalizer = lambda: None
+        # ------------------------------------------------------------------
+        # Attributes added by remove_bubble_v2 (async D2H); shutdown() iterates
+        # over them, so they need to exist even when constructed via __new__.
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
 
         proc = _make_short_lived_process()
         executor._processes = [proc]
@@ -873,35 +955,38 @@ class TestMultiprocExecutorWorkerMonitor:
         callback_called = threading.Event()
         executor.register_failure_callback(callback_called.set)
 
-        executor.start_worker_monitor()
+        executor._start_worker_monitor()
 
         # Wait for the process to exit and the monitor to react.
         proc.join(5)
-        assert _poll_flag(lambda: executor.is_failed), "is_failed was not set"
+        assert _poll_flag(lambda: executor._is_failed), "_is_failed was not set"
         assert executor._closed, "shutdown() was not called"
         assert callback_called.wait(timeout=2), "failure callback was not invoked"
+        assert executor.is_dead
 
     def test_worker_monitor_noop_when_already_closed(self):
         """If ``_closed`` is already True when the process dies (orderly
-        shutdown), the monitor must *not* set ``is_failed``."""
+        shutdown), the monitor must *not* set ``_is_failed``."""
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._closed = True  # already shut down
-        executor.is_failed = False
+        executor._is_failed = False
         executor._failure_callbacks = []
         executor._broadcast_mq = None
         executor._result_mq = None
-        executor.resources = None
+        executor._shutdown_cleaner = None
         executor._finalizer = lambda: None
 
         proc = _make_short_lived_process()
         executor._processes = [proc]
 
-        executor.start_worker_monitor()
+        executor._start_worker_monitor()
         proc.join(5)
 
         # Give the monitor thread a chance to run (it should early-return).
         time.sleep(0.3)
-        assert not executor.is_failed, "is_failed should remain False on orderly shutdown"
+        assert not executor._is_failed, "_is_failed should remain False on orderly shutdown"
+        # Orderly close still reports dead via the public accessor.
+        assert executor.is_dead
 
 
 class TestStageDiffusionClientProcMonitor:

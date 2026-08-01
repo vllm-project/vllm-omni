@@ -65,11 +65,42 @@ _MODEL_PRESETS = {
         "fps": 16,
         "output": "helios_output.mp4",
     },
+    "ltx2": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 40,
+        "fps": 24,
+        "output": "ltx2_output.mp4",
+    },
+    "ltx2_distilled": {
+        "height": 1024,
+        "width": 1536,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "fps": 24,
+        "output": "ltx2_distilled_output.mp4",
+    },
+    "ltx23": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 30,
+        "fps": 24,
+        "output": "ltx23_output.mp4",
+    },
 }
 
 
-def _detect_preset(model: str) -> dict:
+def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
+    class_lower = (model_class_name or "").lower()
+    if "distilled" in class_lower or "distilled" in model_lower:
+        return _MODEL_PRESETS["ltx2_distilled"]
+    if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
+        return _MODEL_PRESETS["ltx23"]
+    if "ltx2" in class_lower or "ltx-2" in model_lower or "ltx_2" in model_lower:
+        return _MODEL_PRESETS["ltx2"]
     if "vace" in model_lower:
         return _MODEL_PRESETS["vace"]
     if "cosmos" in model_lower:
@@ -122,10 +153,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+        help="Override model class name (e.g., LTX2Pipeline).",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument(
         "--extra-body",
         type=parse_extra_body,
@@ -227,7 +263,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -326,7 +362,7 @@ def main():
     args = parse_args()
     model_class_name = args.model_class_name
 
-    preset = _detect_preset(args.model)
+    preset = _detect_preset(args.model, model_class_name)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
@@ -375,6 +411,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if args.boundary_ratio is not None:
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
     if args.flow_shift is not None:
@@ -415,8 +453,11 @@ def main():
     print(f"{'=' * 60}\n")
 
     prompt_dict = {"prompt": args.prompt}
-    if args.negative_prompt:
+    if args.negative_prompt is not None:
         prompt_dict["negative_prompt"] = args.negative_prompt
+    elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        prompt_dict["negative_prompt"] = ""
 
     sampling_kwargs = dict(
         height=args.height,
@@ -455,6 +496,7 @@ def main():
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -465,11 +507,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -477,6 +521,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -489,6 +534,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -497,6 +543,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -611,7 +658,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(args.fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

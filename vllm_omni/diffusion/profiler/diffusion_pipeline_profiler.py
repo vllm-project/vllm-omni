@@ -14,6 +14,7 @@ logger = init_logger(__name__)
 
 def profiler(name: str, func: Callable, instance: Any) -> Callable:
     """Timing a function execution."""
+    metric_name = f"{name.rsplit('.', 1)[0]}.diffuse" if name.endswith(".denoise_step") else name
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -28,10 +29,10 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
             if current_omni_platform.is_available():
                 current_omni_platform.synchronize()
             duration = time.perf_counter() - start_time
-            logger.info(f"[DiffusionPipelineProfiler] {name} took {duration:.6f}s")
+            logger.info(f"[DiffusionPipelineProfiler] {metric_name} took {duration:.6f}s")
             # record the profiling data: duration of stages
             with instance._profiler_lock:
-                instance._stage_durations[name] = instance._stage_durations.get(name, 0.0) + duration
+                instance._stage_durations[metric_name] = instance._stage_durations.get(metric_name, 0.0) + duration
 
     return wrapper
 
@@ -93,7 +94,11 @@ class DiffusionPipelineProfilerMixin:
         self._stage_durations: dict[str, float] = {}
         targets = profiler_targets if profiler_targets is not None else self._PROFILER_TARGETS
         if not targets:
-            return
+            targets = []
+        else:
+            targets = list(targets)
+        if not profiler_targets and hasattr(self, "denoise_step"):
+            targets.append("denoise_step")
 
         targets = ["forward"] + [
             t for t in targets if t != "forward"

@@ -64,6 +64,8 @@ def build_payload(
         "stream": stream,
         "max_new_tokens": max_new_tokens,
     }
+    if stream:
+        payload["stream_format"] = "audio"
 
     # Voice cloning: ref_audio takes priority over URL.
     ref_url_stripped = ref_audio_url.strip() if ref_audio_url else ""

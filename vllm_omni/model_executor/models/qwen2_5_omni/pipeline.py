@@ -17,6 +17,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen2_5_omni"
 
 QWEN2_5_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen2_5_omni",
+    default_deploy_config_name="qwen2_5_omni.yaml",
     model_arch="Qwen2_5OmniForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -38,7 +39,6 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
             engine_output_type="latent",
-            custom_process_input_func=f"{_PROC}.thinker2talker",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
@@ -54,7 +54,6 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.talker2code2wav",
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),

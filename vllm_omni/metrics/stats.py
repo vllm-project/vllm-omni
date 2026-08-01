@@ -48,7 +48,6 @@ class StageRequestStats:
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
-    audio_rtf: float = 0.0
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
@@ -382,6 +381,7 @@ class OrchestratorAggregator:
         finished: bool,
         final_output_type: str | None,
         output_to_yield: Any | None,
+        event_cursor: int = 0,
     ) -> None:
         """Process and record stage metrics.
 
@@ -410,7 +410,7 @@ class OrchestratorAggregator:
                 return
 
             rid_key = str(req_id)
-            stage_snapshot = self._build_stage_metrics_snapshot(rid_key)
+            stage_snapshot = self._build_stage_metrics_snapshot(rid_key, event_cursor=event_cursor)
 
             # 3. Not finished yet — expose incremental per-stage snapshot for streaming clients.
             if not finished:
@@ -424,7 +424,11 @@ class OrchestratorAggregator:
             # token fields only for text stages (OpenAI-style completion token accounting).
             output_to_yield.metrics = {"stage_metrics": stage_snapshot}
             stage_event = next(
-                (evt for evt in reversed(self.stage_events.get(rid_key, [])) if evt.stage_id == stage_id),
+                (
+                    evt
+                    for evt in reversed(self.stage_events.get(rid_key, [])[event_cursor:])
+                    if evt.stage_id == stage_id
+                ),
                 None,
             )
             if stage_event is not None and stage_event.final_output_type == "text":
@@ -471,7 +475,6 @@ class OrchestratorAggregator:
                 defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
                 defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
                 f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
-                defs.AUDIO_RTF: float(evt.audio_rtf),
                 defs.IMAGE_PIXELS: int(evt.image_pixels),
                 defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
                 "output_unit_type": evt.output_unit_type,
@@ -541,16 +544,20 @@ class OrchestratorAggregator:
             0.0,
         )
         current[defs.TIME_PER_OUTPUT_UNIT_MS] = remaining_ms / float(output_count - 1) if output_count > 1 else 0.0
-        duration_s = float(current.get(f"{defs.AUDIO_DURATION}_s", 0.0))
-        current[defs.AUDIO_RTF] = defs.compute_audio_rtf(
-            float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) / 1000.0, duration_s
-        )
         return current
 
-    def _build_stage_metrics_snapshot(self, req_id: str) -> dict[str, dict[str, Any]]:
+    def stage_event_cursor(self, req_id: str) -> int:
+        return len(self.stage_events.get(str(req_id), ()))
+
+    def _build_stage_metrics_snapshot(
+        self,
+        req_id: str,
+        *,
+        event_cursor: int = 0,
+    ) -> dict[str, dict[str, Any]]:
         """Aggregate per-stage metrics for ``req_id`` (string key), for streaming/benchmark clients."""
         snapshot: dict[str, dict[str, Any]] = {}
-        for evt in self.stage_events.get(req_id, []):
+        for evt in self.stage_events.get(req_id, [])[event_cursor:]:
             sid = int(evt.stage_id) if evt.stage_id is not None else -1
             if sid < 0:
                 continue

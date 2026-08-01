@@ -13,10 +13,12 @@ Requirements:
 
 import argparse
 import asyncio
+import contextlib
 import io
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,15 +41,67 @@ HELIOS_DISTILLED_EXTRA_PARAMS = {
     "is_amplify_first_chunk": True,
 }
 
+DEFAULT_TRANSITION_CHUNKS = 3
 
-def _json_object(value: str, *, argument_name: str) -> dict[str, Any]:
+
+@dataclass(frozen=True)
+class ScheduledPromptUpdate:
+    """Client-side schedule entry for a midway text ``session.interaction``."""
+
+    at: float
+    prompt: str
+    transition_chunks: int
+
+
+def _parse_extra_params(value: str) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"{argument_name} must be valid JSON: {exc}") from exc
+        raise argparse.ArgumentTypeError(f"--extra-params must be valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError(f"{argument_name} must be a JSON object")
+        raise argparse.ArgumentTypeError("--extra-params must be a JSON object")
     return parsed
+
+
+def _parse_prompt_updates(value: str) -> list[ScheduledPromptUpdate]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--prompt-updates must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError("--prompt-updates must be a JSON array")
+
+    updates: list[ScheduledPromptUpdate] = []
+    for index, item in enumerate(parsed):
+        try:
+            at = float(item["at"])
+            prompt = item["prompt"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(
+                f"--prompt-updates[{index}] must have valid 'at' and 'prompt' fields"
+            ) from exc
+        if at < 0:
+            raise argparse.ArgumentTypeError(f"--prompt-updates[{index}].at must be >= 0")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise argparse.ArgumentTypeError(f"--prompt-updates[{index}].prompt must be a non-empty string")
+
+        try:
+            transition_chunks = item.get("transition_chunks", DEFAULT_TRANSITION_CHUNKS)
+            transition_chunks = int(transition_chunks)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"--prompt-updates[{index}].transition_chunks must be an integer") from exc
+        if transition_chunks < 0:
+            raise argparse.ArgumentTypeError(f"--prompt-updates[{index}].transition_chunks must be >= 0")
+
+        updates.append(
+            ScheduledPromptUpdate(
+                at=at,
+                prompt=prompt,
+                transition_chunks=transition_chunks,
+            )
+        )
+
+    return sorted(updates, key=lambda update: update.at)
 
 
 def _maybe_set(payload: dict[str, Any], key: str, value: Any) -> None:
@@ -86,6 +140,31 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
         payload["extra_params"] = extra_params
 
     return payload
+
+
+async def _run_prompt_update_scheduler(
+    websocket: Any,
+    updates: list[ScheduledPromptUpdate],
+    *,
+    video_started_at: float,
+    send_lock: asyncio.Lock,
+) -> None:
+    for update in updates:
+        delay = (video_started_at + update.at) - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        payload = {
+            "type": "session.interaction",
+            "interaction": {
+                "event_id": f"scheduled-{update.at:.3f}",
+                "event": {"prompt": update.prompt},
+                "transition_chunks": update.transition_chunks,
+            },
+        }
+        async with send_lock:
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
 
 
 def _count_decoded_frames(video_bytes: bytes, *, stream_format: str) -> int | None:
@@ -144,11 +223,15 @@ async def stream_video(args: argparse.Namespace) -> None:
     stream_format = "m4s"
     done = False
     ws = None
+    send_lock = asyncio.Lock()
+    prompt_update_task: asyncio.Task[None] | None = None
+    pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
-            await websocket.send(json.dumps(payload))
+            async with send_lock:
+                await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
             print(f"Sent session.start: {json.dumps(payload, ensure_ascii=False)}")
             started_at = time.perf_counter()
@@ -159,6 +242,9 @@ async def stream_video(args: argparse.Namespace) -> None:
                 now = time.perf_counter()
 
                 if isinstance(message, bytes):
+                    # Use chunk metadata just received before video chunks
+                    metadata = pending_chunk_metadata or {}
+                    pending_chunk_metadata = None
                     chunks.append(message)
                     chunk_bytes = len(message)
                     chunk_elapsed = now - last_chunk_at
@@ -176,8 +262,11 @@ async def stream_video(args: argparse.Namespace) -> None:
                     total_elapsed = now - started_at
                     print(
                         f"[chunk {len(chunks):03d}] "
+                        f"kind={metadata.get('kind', 'media')} "
                         f"bytes={chunk_bytes} "
-                        f"frames={chunk_frames} "
+                        f"frames={metadata.get('num_frames', chunk_frames)} "
+                        f"generation_chunk={metadata.get('generation_chunk_index')} "
+                        f"active_interactions={metadata.get('active_event_ids', [])} "
                         f"elapsed={chunk_elapsed:.2f}s "
                         f"total_bytes={total_bytes} "
                         f"total_frames={total_frames} "
@@ -190,9 +279,26 @@ async def stream_video(args: argparse.Namespace) -> None:
                 if msg_type == "video.start":
                     stream_format = msg.get("format") or stream_format
                     print(f"Video session started: request_id={msg.get('request_id')} format={msg.get('format')}")
+                    if args.prompt_updates and prompt_update_task is None:
+                        video_started_at = time.perf_counter()
+                        prompt_update_task = asyncio.create_task(
+                            _run_prompt_update_scheduler(
+                                websocket,
+                                args.prompt_updates,
+                                video_started_at=video_started_at,
+                                send_lock=send_lock,
+                            )
+                        )
+                elif msg_type == "video.chunk_metadata":
+                    # Save the metadata for the incoming video chunk
+                    pending_chunk_metadata = msg
+                elif msg_type == "session.interaction.queued":
+                    print(f"Interaction queued by server: event_id={msg.get('event_id')}")
                 elif msg_type == "session.done":
                     print(f"Session complete: {json.dumps(msg, ensure_ascii=False)}")
                     done = True
+                    if prompt_update_task is not None:
+                        prompt_update_task.cancel()
                     break
                 elif msg_type == "error":
                     print(f"ERROR: {msg.get('message', msg)}")
@@ -202,12 +308,17 @@ async def stream_video(args: argparse.Namespace) -> None:
         print("\nInterrupted. Asking server to stop the active session...")
         if ws is not None:
             try:
-                await ws.send(json.dumps({"type": "session.stop"}))
+                async with send_lock:
+                    await ws.send(json.dumps({"type": "session.stop"}))
                 await ws.close(code=1000, reason="client interrupted")
             except Exception:
                 pass
         raise
     finally:
+        if prompt_update_task is not None:
+            prompt_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prompt_update_task
         print(
             "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
         )
@@ -232,7 +343,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. The fish has bright blue and yellow scales with a small, distinctive orange spot on its side, its fins moving fluidly. The coral reefs are alive with a variety of marine life, including small schools of colorful fish and sea turtles gliding by. The water is crystal clear, allowing for a view of the sandy ocean floor below. The reef itself is adorned with a mix of hard and soft corals in shades of red, orange, and green. The photo captures the fish from a slightly elevated angle, emphasizing its lively movements and the vivid colors of its surroundings. A close-up shot with dynamic movement.",
+        default=(
+            "A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. "
+            "The fish has bright blue and yellow scales with a small, distinctive orange spot on its side, its fins moving fluidly. "
+            "The coral reefs are alive with a variety of marine life, including small schools of colorful fish and sea turtles gliding by. "
+            "The water is crystal clear, allowing for a view of the sandy ocean floor below. "
+            "The reef itself is adorned with a mix of hard and soft corals in shades of red, orange, and green. "
+            "The photo captures the fish from a slightly elevated angle, emphasizing its lively movements and the vivid colors of its surroundings. "
+            "A close-up shot with dynamic movement."
+        ),
         help="Text prompt for video generation",
     )
     parser.add_argument("--output", default="streaming_video_output.mp4", help="Path for the received video bytes")
@@ -241,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size", default=None, help="Video size as WIDTHxHEIGHT; alternative to width/height")
     parser.add_argument("--seconds", default=None, help="Clip duration in seconds")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second")
-    parser.add_argument("--num-frames", type=int, default=99, help="Number of generated frames")
+    parser.add_argument("--num-frames", type=int, default=429, help="Number of generated frames")
 
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Number of diffusion steps")
@@ -260,9 +379,43 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--extra-params",
-        type=lambda value: _json_object(value, argument_name="--extra-params"),
+        type=_parse_extra_params,
         default=None,
         help="JSON object merged into extra_params; overrides preset keys on conflict.",
+    )
+    parser.add_argument(
+        "--prompt-updates",
+        type=_parse_prompt_updates,
+        default=json.dumps(
+            [
+                {
+                    "at": 4,
+                    "prompt": (
+                        "An underwater tornado appears and affects the ocean floor in a dramatic and chaotic scene. "
+                        "The water is murky, swirling violently, carrying debris and marine life into the vortex. "
+                        "The tropical fish on the scene all swim in panic, trying to avoid the powerful currents. "
+                        "The camera remains stationary, capturing the intensity of the underwater tornado as it disrupts the serene ocean floor. "
+                        "Close-up shot emphasizing the turbulent motion and destruction."
+                    ),
+                },
+                {
+                    "at": 11,
+                    "prompt": (
+                        "The swirling underwater vortex now seizes a heavy, encrusted treasure chest, its lid flapping open as it is smashed onto the ocean floor. "
+                        "Gold coins and silver trinkets spill out, glittering briefly in the murky water before being swept instantly into the violent funnel. "
+                        "The heavy wooden box tumbles end over end, colliding with floating rocks and adding to the debris field. "
+                        "Swirling sediment and bubbles surround the spilling fortune, highlighting the chaotic power of the storm as it ravages the seabed. "
+                        "Close-up shot emphasizing the turbulent motion and destruction."
+                    ),
+                    # "transition_chunks": 3,
+                },
+            ]
+        ),
+        help=(
+            "JSON array of scheduled prompt updates. Each object requires "
+            "'at' (seconds after video.start) and 'prompt'. Optional "
+            f"'transition_chunks' defaults to {DEFAULT_TRANSITION_CHUNKS}."
+        ),
     )
     return parser.parse_args()
 

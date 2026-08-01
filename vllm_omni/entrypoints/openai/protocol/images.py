@@ -60,7 +60,7 @@ class ImageGenerationRequest(BaseModel):
     user: str | None = Field(default=None, description="User identifier for tracking")
     layers: int | None = Field(
         default=None,
-        description="Number of output layers for layered image models. Supported range: 3-10.",
+        description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
     @field_validator("size")
@@ -189,6 +189,10 @@ class ImageGenerationResponse(BaseModel):
         None,
         description="Chain-of-thought text output from the AR stage. "
         "Only present for image editing (IT2I) with CoT-enabled models.",
+    )
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request generation metrics.",
     )
 
     def stream_response(self) -> StreamingResponse:

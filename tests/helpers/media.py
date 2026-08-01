@@ -529,6 +529,26 @@ def decode_b64_image(b64: str):
     return img
 
 
+def concat_audio(audio_val) -> np.ndarray:
+    """Flatten a multimodal audio payload to mono float32 samples.
+
+    Engines return ``multimodal_output["audio"]`` as a tensor, a list of
+    per-chunk tensors (streaming decoders), or an array-like; concatenate
+    in order and return a 1-D ``np.float32`` array (empty when a list has
+    no tensors).
+    """
+    import torch
+
+    if isinstance(audio_val, list):
+        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
+        if not tensors:
+            return np.zeros((0,), dtype=np.float32)
+        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
+    if isinstance(audio_val, torch.Tensor):
+        return audio_val.detach().cpu().float().reshape(-1).numpy()
+    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
+
+
 def preprocess_text(text):
     import opencc
 
@@ -617,11 +637,11 @@ def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
 
 
 @contextmanager
-def _serialize_whisper_small_model_download():
-    """Serialize Whisper ``small`` cache writes across processes (Linux/Unix)."""
+def _serialize_whisper_model_download(model_size: str = "small"):
+    """Serialize Whisper cache writes across processes (Linux/Unix), per model."""
     import fcntl
 
-    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
+    lock_path = Path.home() / ".cache" / "whisper" / f".{model_size}_model_download.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     f = open(lock_path, "a+b")
     try:
@@ -632,7 +652,7 @@ def _serialize_whisper_small_model_download():
         f.close()
 
 
-def _whisper_transcribe_in_current_process(output_path: str) -> str:
+def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "small") -> str:
     import whisper
 
     device_index = None
@@ -656,8 +676,8 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
         use_accelerator = False
         device = "cpu"
 
-    with _serialize_whisper_small_model_download():
-        model = whisper.load_model("small", device=device)
+    with _serialize_whisper_model_download(model_size):
+        model = whisper.load_model(model_size, device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -674,15 +694,15 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     return text or ""
 
 
-def convert_audio_file_to_text(output_path: str) -> str:
+def convert_audio_file_to_text(output_path: str, model_size: str = "small") -> str:
     """Convert an audio file to text in an isolated subprocess."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path)
+        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size)
         return future.result()
 
 
-def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
+def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> str:
     output_fd, output_path = tempfile.mkstemp(prefix="test_", suffix=".wav")
     os.close(output_fd)
     if os.environ.get("VLLM_OMNI_KEEP_REQUEST_MEDIA", "").lower() not in ("1", "true", "yes"):
@@ -690,11 +710,12 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     print(f"audio data is saved: {output_path}")
-    return convert_audio_file_to_text(output_path)
+    return convert_audio_file_to_text(output_path, model_size)
 
 
 __all__ = [
     "_merge_base64_audio_to_segment",
+    "concat_audio",
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",

@@ -342,7 +342,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
     monkeypatch.setattr(
         runtime_mod,
-        "extract_stage_metadata",
+        "extract_legacy_stage_metadata",
         lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
     )
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
@@ -609,6 +609,29 @@ def test_build_engine_args_stage_model_overrides_parent_model():
     assert engine_args["model"] == "/stage/model"
 
 
+def test_build_engine_args_keeps_full_payload_connector_spec():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        engine_args={"async_chunk": False},
+        default_sampling_params={},
+    )
+    connector_spec = {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "sender"},
+    }
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        "/parent/model",
+        stage_connector_spec=connector_spec,
+    )
+
+    assert engine_args["stage_connector_spec"] == connector_spec
+
+
 def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
@@ -739,12 +762,13 @@ def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(m
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
     )
 
     diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
@@ -772,12 +796,13 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
     )
 
     assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
@@ -798,21 +823,22 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
+        trust_remote_code=False,
     )
 
     assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}
     assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
 
 
-def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
+def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
     """ROCm default attention logic only applies to LLM stages, not diffusion."""
-    from vllm_omni.engine.stage_init_utils import extract_stage_metadata
+    from vllm_omni.engine.stage_init_utils import extract_legacy_stage_metadata
 
     monkeypatch.setattr("vllm_omni.engine.stage_init_utils.current_omni_platform.is_rocm", lambda: True)
 
@@ -826,7 +852,7 @@ def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeyp
         final_output_type=None,
     )
 
-    metadata = extract_stage_metadata(stage_cfg)
+    metadata = extract_legacy_stage_metadata(stage_cfg)
 
     assert metadata.stage_type == "diffusion"
     assert "diffusion_attention_config" not in stage_cfg.engine_args
@@ -874,3 +900,54 @@ def test_build_engine_args_dict_uses_diffusion_attention_config_key():
 
     assert "attention_config" not in engine_args_dict
     assert engine_args_dict["diffusion_attention_config"].default.backend == "FLASH_ATTN"
+
+
+def test_omni_master_server_allocates_globally_unique_route_ports(monkeypatch):
+    """Regression: two stages must never draw the same ZMQ port.
+
+    ``get_open_ports_list`` only dedups within a single call, so per-route
+    allocation used to let a later stage reuse an earlier stage's port. The
+    second engine to ``bind()`` then died with ``zmq.error.ZMQError: Address
+    already in use`` (flaky multi-stage startup, e.g. Qwen3-Omni thinker/talker/
+    code2wav). ``OmniMasterServer`` now dedups every port it hands out.
+    """
+    import itertools
+
+    from vllm_omni.engine import stage_engine_startup as ses
+
+    # A colliding prefix (repeats + the master port 9000) followed by an endless
+    # fresh stream, so the only way to succeed is to redraw the collisions.
+    supply = itertools.chain([9000, 9000, 9001, 9001, 9000], itertools.count(9002))
+
+    def fake_get_open_ports_list(count):
+        return [next(supply) for _ in range(count)]
+
+    monkeypatch.setattr(ses, "get_open_ports_list", fake_get_open_ports_list)
+
+    server = ses.OmniMasterServer(
+        master_address="127.0.0.1",
+        master_port=9000,  # seed: a route must not reuse the registration port
+        stage_ids=[0, 1, 2],
+    )
+
+    ports = []
+    for sid in (0, 1, 2):
+        alloc = server.get_allocation(sid)
+        for addr in (
+            alloc.handshake_bind_address,
+            alloc.input_bind_address,
+            alloc.output_bind_address,
+        ):
+            ports.append(ses._port_from_zmq_address(addr))
+
+    assert len(ports) == len(set(ports)), f"duplicate route ports allocated: {ports}"
+    assert 9000 not in ports, "route reused the master registration port"
+
+
+def test_port_from_zmq_address_parsing():
+    from vllm_omni.engine.stage_engine_startup import _port_from_zmq_address
+
+    assert _port_from_zmq_address("tcp://127.0.0.1:34277") == 34277
+    assert _port_from_zmq_address(None) is None
+    assert _port_from_zmq_address("ipc:///tmp/sock") is None
+    assert _port_from_zmq_address("tcp://host:not-a-port") is None

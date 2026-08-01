@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, HunyuanVideo-1.5, or Wan2.1 VACE.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
+HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
@@ -22,10 +23,15 @@ Usage:
 
     # LTX2 image-to-video
     python image_to_video.py --model /path/to/LTX-2 \
-        --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
+
+    # LTX-2.3 image-to-video
+    python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
+        --image input.jpg --prompt "A cinematic dolly shot of a boat" \
+        --height 512 --width 768 --num-frames 121 --num-inference-steps 30 \
+        --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
 
     # HunyuanVideo-1.5 I2V (480p)
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
@@ -79,17 +85,25 @@ parse_profiler_config = functools.partial(parse_json_object, flag_name="--profil
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a video from one or more images (Wan2.2, LTX2, HunyuanVideo-1.5, or Wan2.1 VACE)."
+        description=(
+            "Generate a video from one or more images "
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+        )
     )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2, HunyuanVideo-1.5, or Wan2.1 VACE).",
+        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
     )
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline).",
+        help="Override model class name (LTX checkpoints default to LTX2Pipeline).",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
@@ -101,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to a reference image. Repeat to provide multiple references.",
     )
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -113,7 +127,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
     parser.add_argument("--num-frames", type=int, default=None, help="Number of frames. Default: model-specific.")
     parser.add_argument(
-        "--num-inference-steps", type=int, default=None, help="Sampling steps. Default: model-specific."
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Sampling steps. Default: model-specific.",
     )
     parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
@@ -206,7 +223,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -312,10 +329,11 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
-    is_ltx2 = "ltx2" in model_name or (model_class_name and "ltx2" in model_class_name.lower())
+    model_class_name_lower = (model_class_name or "").lower()
+    is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
+    is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
+    is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
-    if model_class_name is None and is_ltx2:
-        model_class_name = "LTX2ImageToVideoPipeline"
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -339,8 +357,26 @@ def main():
             1280 * 720,
             16,
         )
+    elif is_ltx2_distilled:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            None,
+            121,
+            8,
+            None,
+            1024 * 1536,
+            64,
+        )
     elif is_ltx2:
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 24, 4.0, 121, 40, 5.0, 512 * 768, 32
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            None,
+            121,
+            30 if is_ltx23 else 40,
+            None,
+            512 * 768,
+            32,
+        )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
 
@@ -420,7 +456,6 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
-        flow_shift=flow_shift,
         diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
@@ -433,6 +468,10 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    if flow_shift is not None:
+        omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
@@ -462,13 +501,17 @@ def main():
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size},"
         f" pipeline_parallel_size={args.pipeline_parallel_size}"
     )
-    print(f"  Video size: {args.width}x{args.height}")
+    print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
+    negative_prompt = args.negative_prompt
+    if negative_prompt is None and not is_ltx2:
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        negative_prompt = ""
     prompt_dict = build_image_to_video_prompt(
         model_class_name=model_class_name,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
+        negative_prompt=negative_prompt,
         media_inputs=media_inputs,
         height=height,
         width=width,
@@ -484,11 +527,10 @@ def main():
         num_inference_steps=num_inference_steps,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        extra_args={
-            "sample_solver": args.sample_solver,
-            "flow_shift": flow_shift,
-        },
+        extra_args={"sample_solver": args.sample_solver},
     )
+    if flow_shift is not None:
+        sampling_params.extra_args["flow_shift"] = flow_shift
 
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit
@@ -509,6 +551,7 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -519,11 +562,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -531,6 +576,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -543,6 +589,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -551,6 +598,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -669,7 +717,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)
