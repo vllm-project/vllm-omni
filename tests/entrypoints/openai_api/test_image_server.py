@@ -687,6 +687,11 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].num_inference_steps == 12
     assert captured[1].guidance_scale == 6.5
 
+    # The multi-stage response must propagate the requested size, matching the
+    # single-stage path (regression for size field being silently dropped).
+    payload = response.json()
+    assert payload["size"] == "128x256"
+
 
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.

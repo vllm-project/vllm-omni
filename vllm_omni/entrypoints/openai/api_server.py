@@ -1788,7 +1788,6 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                parse_size(request.size)
                 width, height = parse_size(request.size)
                 app_state_args = getattr(raw_request.app.state, "args", None)
                 _check_max_generated_image_size(app_state_args, width, height)
@@ -1843,11 +1842,15 @@ async def generate_images(
                 for img in flat_images
             ]
 
+            # Mirror the single-stage path: propagate size when requested.
+            # width/height were already parsed above when request.size is set.
             response_kwargs = {
                 "created": int(time.time()),
                 "data": image_data,
                 "output_format": output_format,
             }
+            if request.size:
+                response_kwargs["size"] = f"{width}x{height}"
             response = ImageGenerationResponse(**response_kwargs)
             if request.response_format != ResponseFormat.FILE:
                 return response
