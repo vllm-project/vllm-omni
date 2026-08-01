@@ -80,7 +80,10 @@ class LongcatNextAudioDecoder(nn.Module):
                 custom.get("wave_concat_overlap", self.wave_concat_overlap)
             )
 
-        self.chunk_end_code = int(self.hf_config.audio_config.vq_config.codebook_sizes[0])
+        self.codebook_sizes = [
+            int(s) for s in self.hf_config.audio_config.vq_config.codebook_sizes
+        ]
+        self.chunk_end_code = self.codebook_sizes[0]
 
     def _ensure_weights(self) -> None:
         if self._weights_loaded:
@@ -111,7 +114,35 @@ class LongcatNextAudioDecoder(nn.Module):
         return None
 
     def _split_chunks(self, codes: torch.Tensor) -> list[torch.Tensor]:
-        """Split [n, 8] codes into per-chunk tensors at level-0 end markers."""
+        """Split [n, 8] codes into per-chunk tensors at level-0 end markers.
+
+        Defensive: drop rows carrying a sentinel code at a level >= 1
+        (index == codebook_sizes[i]). The depth head emits ``vq_size + 1``
+        classes per level, so a non-zero-level sentinel can be sampled; only
+        level-0's sentinel is a chunk boundary, and any other level's sentinel
+        would OOB that codebook's embed lookup during decode. Level 0 is
+        excluded here: its ``codebook_sizes[0]`` value is the legitimate
+        chunk-end marker this method splits on.
+        """
+        if codes.shape[0] == 0:
+            return []
+        limit = torch.tensor(
+            self.codebook_sizes, device=codes.device, dtype=codes.dtype
+        )
+        # Only non-boundary rows are dropped: a level-0 chunk-end marker row is
+        # a split boundary whose non-zero-level codes are never decoded, so it
+        # must survive the guard (and may legitimately carry any value there).
+        is_boundary = codes[:, 0] == self.chunk_end_code
+        oob = codes >= limit
+        oob[:, 0] = False  # level-0 chunk-end marker is valid here
+        bad = oob.any(dim=1) & ~is_boundary
+        if bad.any():
+            logger.warning(
+                "LongcatNextAudioDecoder dropping %d code row(s) with a "
+                "sentinel code at a non-zero level (out-of-range codebook index)",
+                int(bad.sum()),
+            )
+            codes = codes[~bad]
         if codes.shape[0] == 0:
             return []
         if codes[-1, 0] != self.chunk_end_code:

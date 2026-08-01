@@ -1030,6 +1030,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         repetition_penalty: float = 1.0,
         past_codes: torch.Tensor | None = None,
         mask_sentinel: bool = False,
+        mask_audio_sentinels: bool = False,
     ) -> torch.Tensor:
         """Shared rank-0+broadcast depth-head sampling loop.
 
@@ -1044,6 +1045,18 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         the level-0 end-of-image class for the visual head only (reference
         output_processor.py:312), so the image can never self-terminate early
         and the grid bound in _advance_visual_gen is the sole terminator.
+
+        ``mask_audio_sentinels`` zeroes each level >= 1's own sentinel class
+        (index ``codebook_sizes[i]``). The depth head is
+        ``nn.Linear(transformer_dim, vq_size + 1)``, so EVERY level has a
+        ``+1`` sentinel class, but only level-0's is the real chunk-end marker
+        (the reference splits chunks on ``audio_ids[:, 0] == codebook_sizes[0]``
+        and its ``decode_wave_vocoder2`` truncates there). A non-zero-level
+        sentinel would leak into a kept frame and OOB the VQ codebook gather
+        (``codebook.embed[indices]``) at decode time -- the exact GPU assert
+        seen once audio-termination let generation run long. Masking levels
+        >= 1 keeps level-0's chunk-end sentinel available while guaranteeing
+        no out-of-range code is ever emitted.
         """
         codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
         if rank == 0:
@@ -1059,13 +1072,18 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             for level in range(num_levels):
                 logits = head(hid, cum_ids.to(hid.device), code_embed, level)
                 level_logits = logits[0]
+                sentinel_idx = None
                 if mask_sentinel and level == 0:
                     # codebook_sizes[0] is the end-of-image class (OmniImageHead),
                     # masked per the reference so it can never be sampled.
                     sentinel_idx = self.visual_codebook_sizes[0]
-                    if sentinel_idx < level_logits.shape[-1]:
-                        level_logits = level_logits.clone()
-                        level_logits[sentinel_idx] = float("-inf")
+                elif mask_audio_sentinels and level >= 1:
+                    # Non-zero-level sentinels are meaningless and OOB the VQ
+                    # codebook at decode; only level-0's is the chunk-end marker.
+                    sentinel_idx = self.audio_codebook_sizes[level]
+                if sentinel_idx is not None and sentinel_idx < level_logits.shape[-1]:
+                    level_logits = level_logits.clone()
+                    level_logits[sentinel_idx] = float("-inf")
                 code = self._sample_audio_code(
                     level_logits, do_sample=do_sample, temperature=temperature,
                     top_k=top_k, top_p=top_p,
@@ -1188,6 +1206,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     self.audio_head, audio_code_embed, self.audio_offset_vals, num_levels,
                     last_hidden, rank, tp_group, device, do_sample, temperature,
                     audio_top_k, audio_top_p, audio_rep_penalty, past_codes_t,
+                    mask_audio_sentinels=True,
                 )
 
                 # Detect terminal conditions (reference state_machine.py:97-106)

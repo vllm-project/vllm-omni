@@ -238,3 +238,94 @@ def test_terminal_request_stops_emitting_mtp_inputs():
     update = _advance(model, "r0", 123)
 
     assert "mtp_inputs" not in update
+
+
+# ---------------------------------------------------------------- #
+# audio decoder _split_chunks bounds guard
+# ---------------------------------------------------------------- #
+
+AUDIO_CODEBOOK_SIZES = [8192, 4096, 2048, 1024, 1024, 1024, 1024, 1024]
+
+
+def _decoder_for_split_chunks(**attrs):
+    """Bare LongcatNextAudioDecoder instance with only the attributes
+    _split_chunks touches, avoiding __init__'s checkpoint load."""
+    from vllm_omni.model_executor.models.longcat_next import (
+        modeling_longcat_next_audio_decoder,
+    )
+
+    decoder = object.__new__(modeling_longcat_next_audio_decoder.LongcatNextAudioDecoder)
+    decoder.codebook_sizes = list(AUDIO_CODEBOOK_SIZES)
+    decoder.chunk_end_code = AUDIO_CODEBOOK_SIZES[0]
+    for k, v in attrs.items():
+        setattr(decoder, k, v)
+    return decoder
+
+
+def test_split_chunks_splits_on_level0_end_marker():
+    decoder = _decoder_for_split_chunks()
+    codes = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [9, 10, 11, 12, 13, 14, 15, 16],
+            [AUDIO_CODEBOOK_SIZES[0], 0, 0, 0, 0, 0, 0, 0],  # end marker
+            [17, 18, 19, 20, 21, 22, 23, 24],
+        ],
+        dtype=torch.long,
+    )
+
+    chunks = decoder._split_chunks(codes)
+
+    assert [c.shape[0] for c in chunks] == [2, 1]
+    assert chunks[0].tolist() == codes[:2].tolist()
+    assert chunks[1].tolist() == codes[3:].tolist()
+
+
+def test_split_chunks_pads_trailing_open_chunk():
+    decoder = _decoder_for_split_chunks()
+    codes = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.long)
+
+    chunks = decoder._split_chunks(codes)
+
+    assert len(chunks) == 1
+    assert chunks[0].shape[0] == 1
+
+
+def test_split_chunks_drops_nonzero_level_sentinel_rows():
+    """A non-zero-level code == codebook_sizes[i] is a sentinel that would OOB
+    that level's VQ codebook embed at decode; the guard must drop the row while
+    keeping the level-0 chunk-end marker intact."""
+    decoder = _decoder_for_split_chunks()
+    codes = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [9, AUDIO_CODEBOOK_SIZES[1], 11, 12, 13, 14, 15, 16],  # level-1 sentinel
+            [AUDIO_CODEBOOK_SIZES[0], 0, 0, 0, 0, 0, 0, 0],  # real end marker
+            [17, 18, AUDIO_CODEBOOK_SIZES[2], 20, 21, 22, 23, 24],  # level-2 sentinel
+        ],
+        dtype=torch.long,
+    )
+
+    chunks = decoder._split_chunks(codes)
+
+    kept = torch.cat(chunks)
+    assert kept.shape[0] == 2
+    assert kept.tolist() == codes[[0, 3]].tolist()
+
+
+def test_split_chunks_keeps_level0_end_marker_row_with_sentinels_elsewhere():
+    """The chunk-end marker row itself may carry arbitrary (even sentinel)
+    codes at levels >= 1; it is a boundary, so it must NOT be dropped by the
+    guard -- it just terminates the current chunk."""
+    decoder = _decoder_for_split_chunks()
+    codes = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [AUDIO_CODEBOOK_SIZES[0], AUDIO_CODEBOOK_SIZES[1], 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    chunks = decoder._split_chunks(codes)
+
+    assert [c.shape[0] for c in chunks] == [1]

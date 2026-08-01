@@ -416,6 +416,33 @@ def test_visual_mtp_masks_end_sentinel(model):
     assert state["terminal"] is False
 
 
+def test_audio_mtp_masks_nonzero_level_sentinels(model):
+    """The depth head is ``vq_size + 1`` wide at EVERY level, so each level has
+    its own sentinel class at index ``codebook_sizes[i]``. Only level-0's is
+    the real chunk-end marker; a non-zero-level sentinel leaks into a kept
+    frame and OOBs the VQ codebook gather at decode time (the GPU assert that
+    crashed long audio runs). Levels >= 1 must be masked while level-0 stays
+    sampleable so chunks can still end -- here level-0 peaks at a normal code
+    (non-terminal kept frame), levels >= 1 peak at their sentinel which must
+    be forced down to the survivor."""
+    def rigged_head(hidden, tokens, emb_layers, level):
+        # Head emits vq_size + 1 classes.
+        logits = torch.full((1, CODEBOOK_SIZES[level] + 1), -100.0)
+        if level >= 1:
+            logits[0, CODEBOOK_SIZES[level]] = 100.0  # sentinel: must be masked
+        logits[0, 0] = 50.0                           # survivor
+        return logits
+
+    model.audio_head = rigged_head
+    _, codes = _call(model, _state())
+
+    assert int(codes[0, 0]) == 0, "level-0 samples a normal code here"
+    for level, size in enumerate(CODEBOOK_SIZES):
+        if level >= 1:
+            assert int(codes[0, level]) != size, f"level-{level} sentinel must be masked"
+            assert int(codes[0, level]) == 0, "masked sentinel must fall back to survivor"
+
+
 def test_advance_visual_gen_grid_bound_terminates(model):
     """The image must stop deterministically once the token_h x token_w grid is
     complete (token_h*(token_w+1) steps), not overrun. The final (spurious)
