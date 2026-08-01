@@ -416,16 +416,21 @@ def test_advance_visual_gen_grid_bound_terminates(model):
     M._advance_visual_gen(
         model, "r0", last_token=IMG_START_TOKEN_ID,
         device=torch.device("cpu"), dtype=torch.float32,
-        token_w=2, token_h=2,
+        token_w=2, token_h=2, decode_eligible=False,
     )
     state = model._visual_gen["r0"]
     assert state["token_w"] == 2 and state["token_h"] == 2
+    # The <longcat_img_start> lands as a prefill step (decode_eligible=False),
+    # so it must NOT advance gen_step -- the 0->1 transition belongs to the
+    # first real decode step.
+    assert state["gen_step"] == 0
 
     exts = []
     for _ in range(6):
         M._advance_visual_gen(
             model, "r0", last_token=IMG_PAD_TOKEN_ID,
             device=torch.device("cpu"), dtype=torch.float32,
+            decode_eligible=True,
         )
         exts.append(state["ext_id"])
 
@@ -714,7 +719,7 @@ class TestSampleAudioCode:
     def test_higher_temperature_increases_diversity(self, model):
         rng = torch.Generator()
         rng.manual_seed(0)
-        logits = torch.zeros(self.VOCAB, generator=rng)
+        logits = torch.zeros((self.VOCAB,), generator=rng)
         logits[:10] = 1.0  # only first 10 have non-negligible prob
         cold = [
             int(self._call(model, logits.clone(), do_sample=True, temperature=0.1, top_k=0, top_p=1.0))
