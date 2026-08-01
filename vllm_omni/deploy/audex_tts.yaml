@@ -1,0 +1,83 @@
+# Audex (Nemotron-Labs-Audex-2B) TTS deploy: thinker → code2wav via
+# shared-memory chunk streaming. Verified on 1x H100.
+#
+# Notable choices:
+#   * The code2wav decoder is a stateful streaming session per request — no
+#     left-context replay; chunks carry only new frames, so
+#     codec_left_context_frames stays 0.
+#   * codec_token_offset / codec_vocab_size mirror the checkpoint tokenizer's
+#     <speechcodec_N> block (pinned by a unit test).
+#   * Stage 0 sampling defaults follow the official TTS script
+#     (temperature 0.1, top_k 80, max_tokens 2048).
+#   * Classifier-free guidance: the stage-0 logits processor + scheduler
+#     pair patches are always installed but idle until a request carries
+#     extra_args.cfg_scale > 1.0 (serving: extra_params.cfg_scale; offline:
+#     --cfg-scale). Guided requests decode at temperature 0.05 (CFG
+#     sharpens the distribution; measured en-24 cfg1.5 CER: 6.87% at
+#     temp 0.05 vs 7.31% at the unguided 0.1 — baseline 7.24%).
+#     Every guided request adds an unconditional companion sequence in
+#     stage 0 — at max_num_seqs 8 that means at most 4 guided requests
+#     decode concurrently; raise max_num_seqs if CFG-heavy traffic needs
+#     more parallelism.
+pipeline: audex_tts
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      # Emit the first chunk early for a fast first audible sample.
+      initial_codec_chunk_frames: 1
+      codec_token_offset: 131077
+      codec_vocab_size: 65536
+      # Decoder-internal emit granularity (frames per decode call).
+      decoder_emit_chunk_frames: 5
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.4
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    dtype: bfloat16
+    devices: "0"
+    logits_processors:
+      - "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.1
+      top_k: 80
+      max_tokens: 2048
+      seed: 0
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    # Sync scheduling: with async scheduling the runner builds per-request
+    # payloads against the NEXT step's input batch, tripping the one-entry-
+    # per-request check when chunk arrival staggers requests.
+    async_scheduling: false
+    # async_chunk appends codec frames per step; max_model_len must cover the
+    # accumulated stream (max_tokens 2048 codes plus prompt headroom).
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 8192
+      seed: 0

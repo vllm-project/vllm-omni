@@ -105,11 +105,6 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     NestedTensors,
 )
-
-try:
-    from vllm.multimodal.inputs import ModalityData, MultiModalDataDict
-except ImportError:
-    from vllm.multimodal.parse import ModalityData, MultiModalDataDict
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
@@ -132,15 +127,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
-try:
-    from vllm.transformers_utils.tokenizer import encode_tokens as _vllm_encode_tokens
-except ImportError:
-    _vllm_encode_tokens = None
 
-
+# vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
+# _encode_tokens uses tokenizer.encode() as the only code path.
 def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
-    if _vllm_encode_tokens is not None:
-        return _vllm_encode_tokens(tokenizer, prompt)
     return tokenizer.encode(prompt, add_special_tokens=False)
 
 
@@ -3422,10 +3412,23 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     ) -> bool:
         return False
 
-    def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
+    def get_image_prompt_texts(
+        self,
+        image_size: ImageSize,
+        image_idx: int = 0,
+        max_slice_nums: int | None = None,
+        use_image_id: bool | None = None,
+    ) -> str:
+        # ``process_images`` forwards ``mm_processor_kwargs`` to the pixel path, so the
+        # placeholder grid must honor the same ``max_slice_nums``; otherwise a request that
+        # sets it (e.g. interleaved omni frames with max_slice_nums=1) produces fewer image
+        # features than placeholder ``<unk>`` slots. ``use_image_id`` is likewise per-request
+        # so callers can match MiniCPM-o's omni path, which emits no ``<image_id>`` prefix.
         return self.info.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
+            max_slice_nums=max_slice_nums,
+            **({} if use_image_id is None else {"use_image_id": use_image_id}),
         )
 
     def get_video_prompt_texts(self, image_size: ImageSize, num_frames: int) -> str:
@@ -3615,13 +3618,21 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
+        image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
+
         def get_image_replacement(item_idx: int):
             images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
             image_size = images.get_image_size(item_idx)
 
             return PromptUpdateDetails.select_text(
-                self.get_image_prompt_texts(image_size, item_idx),
+                self.get_image_prompt_texts(
+                    image_size,
+                    item_idx,
+                    max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
+                    use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
+                ),
                 "<unk>",
             )
 
@@ -4170,6 +4181,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         device = pixel_values[0].device
         dtype = pixel_values[0].dtype
 
+        # VPM batching bounds encoder activations below, while this padding
+        # buffer intentionally remains sized for the full input batch.
         all_pixel_values = torch.zeros((B, 3, P, L), dtype=dtype, device=device)
         for i, pixel_values_item in enumerate(pixel_values):
             L_item = pixel_values_item.shape[-1]
@@ -4183,16 +4196,29 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         for i, num_patches_item in enumerate(num_patches):
             patch_attn_mask[i, :num_patches_item] = True
 
-        vision_embedding = self.vpm(
-            all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
-            tgt_sizes=tgt_sizes,
-        )
+        patch_attn_mask = patch_attn_mask.unsqueeze(1)
 
-        if not isinstance(vision_embedding, torch.Tensor):
-            vision_embedding = vision_embedding.last_hidden_state
+        def encode_vision(start: int, end: int) -> torch.Tensor:
+            chunk_tgt_sizes = tgt_sizes[start:end]
+            vision_embedding = self.vpm(
+                all_pixel_values[start:end],
+                patch_attention_mask=patch_attn_mask[start:end],
+                tgt_sizes=chunk_tgt_sizes,
+            )
 
-        return self.resampler(vision_embedding, tgt_sizes)
+            if not isinstance(vision_embedding, torch.Tensor):
+                vision_embedding = vision_embedding.last_hidden_state
+
+            return vision_embedding
+
+        vision_batch_size = max(1, int(self.config.vision_batch_size))
+        if B <= vision_batch_size:
+            return self.resampler(encode_vision(0, B), tgt_sizes)
+
+        vision_embeddings = [
+            encode_vision(start, min(start + vision_batch_size, B)) for start in range(0, B, vision_batch_size)
+        ]
+        return self.resampler(torch.cat(vision_embeddings, dim=0), tgt_sizes)
 
     def _process_vision_input(
         self,
@@ -4309,9 +4335,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
-        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask, output_hidden_states=True).hidden_states[
-            self.audio_encoder_layer
-        ]
+        selects_final_layer = self.audio_encoder_layer == -1
+        audio_outputs = self.apm(
+            wavforms,
+            attention_mask=audio_attention_mask,
+            output_hidden_states=not selects_final_layer,
+        )
+        if selects_final_layer:
+            audio_states = audio_outputs.last_hidden_state
+        else:
+            # Whisper follows the Hugging Face hidden-state ordering: the
+            # embedding output, followed by each encoder layer output.
+            assert audio_outputs.hidden_states is not None
+            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
         audio_embeds = self.audio_projection_layer(audio_states)
 
         audio_embeds = audio_embeds.transpose(1, 2)

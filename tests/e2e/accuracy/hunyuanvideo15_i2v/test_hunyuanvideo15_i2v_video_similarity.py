@@ -236,7 +236,8 @@ def test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity(
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     image_source = _resolve_image_source(hunyuanvideo15_i2v_image_source)
-    validate_image_source(image_source)
+    # The input image was already consumed by the prerequisite generation
+    # tests. Avoid re-fetching a remote source when only comparing artifacts.
     online_path, offline_path = _artifact_paths(image_source)
     if not online_path.exists():
         pytest.skip(f"Missing online artifact from prerequisite test: {online_path}")

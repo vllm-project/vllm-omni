@@ -392,6 +392,11 @@ def test_sub_config_fields_match_rfc_scopes():
         "enable_multithread_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
+        # Per-stage checkpoint resolution for repos whose stages live in
+        # subfolders (e.g. Audex): mirrors StagePipelineConfig on the
+        # legacy engine-args path.
+        "model_subdir",
+        "tokenizer_subdir",
     }
     assert {f.name for f in fields(OmniStageLoadConfig)} == {
         "load_format",
@@ -572,9 +577,11 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.world_size == 2
 
 
-def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
-    with pytest.raises(ValidationError):
-        OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
+    cfg = OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+
+    assert cfg.cfg_parallel_size == 4
+    assert cfg.world_size == 4
 
 
 def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():

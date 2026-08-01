@@ -29,6 +29,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -462,7 +463,13 @@ def _load_wan_t5_as_umt5(
 
 
 class Wan22S2VPipeline(
-    nn.Module, SupportImageInput, SupportAudioInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    SupportImageInput,
+    SupportAudioInput,
+    CFGParallelMixin,
+    DenoiseProgressMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """
     Wan2.2 Speech-to-Video Pipeline.
@@ -993,8 +1000,9 @@ class Wan22S2VPipeline(
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
 
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                self.record_denoise_step(step_idx, t)
 
                 latent_model_input = [latents.to(device)]
                 timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)

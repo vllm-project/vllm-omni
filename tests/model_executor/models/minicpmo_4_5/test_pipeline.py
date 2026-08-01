@@ -6,7 +6,7 @@ Covers:
   - pipeline declared in the central registry
   - lazy loader returns the expected ``PipelineConfig``
   - split 3-stage topology with no fused compatibility registration
-  - stage 1 routes through ``llm2tts`` and the async Code2Wav producer
+  - stage 1 routes through ``llm2tts`` and mode-specific Code2Wav producers
   - ``hf_architectures`` covers both the shared ``MiniCPMO`` alias and the
     explicit 4.5 arch
   - ``hf_config_predicate`` selects MiniCPM-o 4.5 only and rejects 2.6
@@ -36,7 +36,6 @@ _PIPELINE_KEY = "minicpmo_4_5"
 _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
-    "minicpmo_4_5_batching.yaml": ["0", "1", "1"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
@@ -105,7 +104,9 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
-        assert talker.custom_process_next_stage_input_func is None
+        assert talker.custom_process_next_stage_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
+        )
         assert talker.async_chunk_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
         )
@@ -130,7 +131,9 @@ class TestPipelineTopology:
         assert code2wav.final_output_type == "audio"
         assert code2wav.engine_output_type == "audio"
         assert code2wav.model_arch == "MiniCPMO45Code2Wav"
-        assert code2wav.sync_process_input_func is None
+        assert code2wav.sync_process_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
+        )
 
 
 class TestDeployTopology:
@@ -156,28 +159,45 @@ class TestDeployTopology:
         assert connector["extra"]["codec_left_context_frames"] == 3
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
+        expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
-                0.65,
+            memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
+            assert memory_utilizations == [
+                0.55,
                 0.15,
                 0.15,
             ]
-        elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:
+            assert sum(memory_utilizations) <= 0.9 + 1e-6
+            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "image": 64,
+                "audio": 64,
+                "video": 1,
+            }
+        elif filename in {"minicpmo_4_5_2gpu.yaml"}:
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,
                 0.55,
                 0.35,
             ]
 
-    def test_pipeline_exposes_no_full_payload_or_token_placeholder_hooks(self) -> None:
+    def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         talker = pipeline.get_stage(1)
         code2wav = pipeline.get_stage(2)
         assert talker is not None
         assert code2wav is not None
-        assert talker.custom_process_next_stage_input_func is None
-        assert code2wav.sync_process_input_func is None
+        assert talker.custom_process_next_stage_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
+        )
+        assert talker.async_chunk_process_next_stage_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
+        )
+        assert code2wav.sync_process_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
+        )
 
 
 def test_code2wav_model_is_lazily_registered() -> None:

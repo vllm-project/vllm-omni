@@ -77,14 +77,20 @@ class Attention(nn.Module):
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
 
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+        model_class_name = getattr(config, "model_class_name", None) if config is not None else None
+        allow_trtllm_default = get_diffusion_model_metadata(model_class_name).attention_mask_free
+
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
             head_size=head_size,
             attention_config=attention_config,
             role_category=role_category,
+            allow_trtllm_default=allow_trtllm_default,
         )
         if spec is not None:
-            backend_kwargs = spec.extra or None
+            backend_kwargs = spec.backend_kwargs()
             self.backend_pref = spec.backend
             logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
@@ -99,6 +105,7 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
             qkv_layout=qkv_layout,
+            prefix=prefix,
             backend_kwargs=backend_kwargs,
         )
         # Instantiate fallback backend for float32 support
@@ -310,6 +317,13 @@ class Attention(nn.Module):
             )
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
+        skip = getattr(self.attention, "skip", None)
+        if skip is not None and getattr(skip, "configured", False):
+            raise NotImplementedError(
+                "Skip-Softmax (TRTLLM_ATTN) is not supported with ring sequence parallelism: "
+                "the ring path bypasses the backend, so the skip config would be silently ignored. "
+                "Use Ulysses SP instead, or remove the skip_softmax config."
+            )
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(

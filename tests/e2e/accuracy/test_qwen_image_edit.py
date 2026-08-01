@@ -14,6 +14,7 @@ from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
@@ -46,10 +47,9 @@ EDIT_2511_PROMPT = (
     "（帽子紧贴头顶，未贴合部分可调整帽子摆放角度达到完全贴合）， 头部与身体过渡必须自然，无拼接痕迹，"
     "无额外元素出现在头部四周，纯白背景，不要出现绿色圆圈"
 )
-EDIT_2511_ASSET_DIR = Path(__file__).resolve().parent / "assets"
 EDIT_2511_IMAGE_PATHS = [
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test1.png",
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test2.png",
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test1.png"),
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test2.png"),
 ]
 
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
