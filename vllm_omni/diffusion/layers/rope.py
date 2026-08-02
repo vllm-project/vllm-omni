@@ -37,14 +37,14 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     )
 
 
-def apply_rotary_emb_mindiesd(
+def apply_rotary_emb_torch_npu(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
     half_head_dim: bool = True,  # if true, size of sin and cos is (B, S, D/2), otherwise (B, S, D)
 ) -> torch.Tensor:
-    from mindiesd import rotary_position_embedding
+    import torch_npu
 
     if cos.dim() == 3:
         # (B, S, D/2) -> (S, D/2)
@@ -52,18 +52,16 @@ def apply_rotary_emb_mindiesd(
         sin = sin[0]
 
     if interleaved:
-        # if last dim of sin and cos is D/2, expand to (S, D) to adapt to mindiesd operators
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        return torch_npu.npu_rotary_mul(x, cos, sin, "interleave")
     else:
         if half_head_dim:
-            seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        return torch_npu.npu_rotary_mul(x, cos, sin)
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -94,7 +92,6 @@ class RotaryEmbedding(CustomOp):
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
         self.apply_rotary_emb_flash_attn = None
-        self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
         # only ``flash_attn.cute`` and no ``flash_attn.ops``. Guard the import
@@ -107,8 +104,6 @@ class RotaryEmbedding(CustomOp):
                 self.apply_rotary_emb_flash_attn = apply_rotary
             except ImportError:
                 pass
-        if find_spec("mindiesd") is not None:
-            self.has_mindie = True
 
     def forward_cuda(
         self,
@@ -161,10 +156,7 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
-        else:
-            return self.forward_native(x, cos, sin)
+        return apply_rotary_emb_torch_npu(x, cos, sin, self.interleaved)
 
     def forward_xpu(
         self,
@@ -258,13 +250,10 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.has_mindie:
-            if cos.dim() > 2:
-                cos = cos.reshape(-1, cos.shape[-1])
-                sin = sin.reshape(-1, sin.shape[-1])
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
-        else:
-            return self.forward_native(x, cos, sin)
+        if cos.dim() > 2:
+            cos = cos.reshape(-1, cos.shape[-1])
+            sin = sin.reshape(-1, sin.shape[-1])
+        return apply_rotary_emb_torch_npu(x, cos, sin, self.interleaved, self.half_head_dim)
 
     def forward_native(
         self,
