@@ -1228,6 +1228,20 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 cond_logits = head(cond_hid, cum_ids.to(cond_hid.device), code_embed, level)[0]
                 uncond_logits = head(uncond_hid, cum_ids.to(uncond_hid.device), code_embed, level)[0]
                 combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
+                if self._audio_debug and level == 0:
+                    delta = cond_logits - uncond_logits
+                    logger.info(
+                        "[longcat-cfg-logits] cfg_scale=%s level=0 "
+                        "cond[min=%.3f max=%.3f argmax=%d] "
+                        "uncond[min=%.3f max=%.3f argmax=%d] "
+                        "delta[min=%.3f max=%.3f absmax=%.3f] "
+                        "combined[min=%.3f max=%.3f argmax=%d]",
+                        cfg_scale,
+                        float(cond_logits.min()), float(cond_logits.max()), int(cond_logits.argmax()),
+                        float(uncond_logits.min()), float(uncond_logits.max()), int(uncond_logits.argmax()),
+                        float(delta.min()), float(delta.max()), float(delta.abs().max()),
+                        float(combined.min()), float(combined.max()), int(combined.argmax()),
+                    )
                 sentinel_idx = None
                 if level == 0:
                     # Level-0 end-of-image class, masked per the reference
