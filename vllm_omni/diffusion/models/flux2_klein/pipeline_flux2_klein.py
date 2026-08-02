@@ -271,6 +271,15 @@ class Flux2KleinPipeline(
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
 
+        # text_encoder_out_layers is hardcoded to (9, 18, 27) in Diffusers,
+        # but this won't necessarily work for all text encoders. We allow
+        # setting the text_encoder_out_layers in the config to allow
+        # custom text encoders
+        if hasattr(self.text_encoder.config, "text_encoder_out_layers"):
+            self.text_encoder_out_layers = self.text_encoder.config.text_encoder_out_layers
+        else:
+            self.text_encoder_out_layers = (9, 18, 27)
+
         self._guidance_scale = None
         self._attention_kwargs = None
         self._num_timesteps = None
@@ -293,10 +302,10 @@ class Flux2KleinPipeline(
         text_encoder: Qwen3ForCausalLM,
         tokenizer: Qwen2TokenizerFast,
         prompt: str | list[str],
+        hidden_states_layers: tuple[int, ...],
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         max_sequence_length: int = 512,
-        hidden_states_layers: list[int] = (9, 18, 27),
     ):
         dtype = text_encoder.dtype if dtype is None else dtype
         device = text_encoder.device if device is None else device
@@ -513,7 +522,6 @@ class Flux2KleinPipeline(
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
     ):
         device = device or self._execution_device
 
@@ -527,9 +535,9 @@ class Flux2KleinPipeline(
                 text_encoder=self.text_encoder,
                 tokenizer=self.tokenizer,
                 prompt=prompt,
+                hidden_states_layers=self.text_encoder_out_layers,
                 device=device,
                 max_sequence_length=max_sequence_length,
-                hidden_states_layers=text_encoder_out_layers,
             )
 
         batch_size, seq_len, _ = prompt_embeds.shape
@@ -795,9 +803,6 @@ class Flux2KleinPipeline(
         latents = req.sampling_params.latents
         strength = req.sampling_params.strength if req.sampling_params.strength is not None else 1.0
 
-        text_encoder_out_layers: tuple[int, ...] = req.sampling_params.extra_args.get(
-            "text_encoder_out_layers", (9, 18, 27)
-        )
         padding_mask_crop: int | None = req.sampling_params.extra_args.get("padding_mask_crop")
         attention_kwargs: dict[str, Any] | None = None
         callback_on_step_end: Callable[[int, int, dict], None] | None = None
@@ -833,7 +838,6 @@ class Flux2KleinPipeline(
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
         )
 
         if self.do_classifier_free_guidance:
@@ -846,7 +850,6 @@ class Flux2KleinPipeline(
                 device=device,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
             )
 
         # 4. process images

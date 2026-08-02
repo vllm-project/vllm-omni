@@ -12,7 +12,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -81,7 +80,6 @@ def _natural_sort_key(filepath: str) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
 
 
-MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
@@ -326,15 +324,6 @@ class DiffusersPipelineLoader:
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(
-            model_name_or_path=model_config.model,
-            subfolder=None,
-            revision=model_config.revision,
-            fall_back_to_pt=True,
-            allow_patterns_overrides=None,
-        )
-
     def load_model(
         self,
         load_device: str,
@@ -373,22 +362,48 @@ class DiffusersPipelineLoader:
                 )
             else:
                 model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
-                logger.debug("Loading weights on %s ...", load_device)
-                if load_format == "diffusers":
-                    # DiffusersAdapterPipeline.load_weights() calls
-                    # DiffusionPipeline.from_pretrained() internally; it does
-                    # not use our native customized pipeline classes.
-                    cast(DiffusersAdapterPipeline, model).load_weights()
+
+                # Skip load_weights only for DLO+AllGather when the model
+                # supports mmap loading and no online quantization is active.
+                # This condition MUST match the gate in
+                # DistributedLayerwiseOffloadBackend.enable() so that the
+                # loader skips ⟺ enable() uses mmap.
+                from vllm_omni.diffusion.offloader.offload_plan import supports_mmap_loading
+
+                _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+                _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
+                _has_online_quant = self._has_online_quant(model)
+                _supports_mmap = supports_mmap_loading(model)
+
+                _skip_load = _dist_offload and _use_ag and _supports_mmap and not _has_online_quant
+
+                if _skip_load:
+                    logger.info("DLO+AllGather active: skipping load_weights (will load via mmap in enable())")
                 else:
-                    self.load_weights(model)
-                # HSDP processes quantized weights before wrapping parameters as
-                # DTensors. The non-HSDP path can process them here as usual.
-                self._process_weights_after_loading(model, target_device)
+                    if _dist_offload and _use_ag and _has_online_quant:
+                        raise ValueError(
+                            "Online quantization is incompatible with DLO+AllGather: "
+                            "the sharding + AllGather mechanism flattens weights by "
+                            "dtype, which breaks quantized weight/scale layouts. "
+                            "Please use --dlo-no-use-allgather or disable online "
+                            "quantization."
+                        )
+                    if _dist_offload and _use_ag and not _supports_mmap:
+                        logger.info(
+                            "DLO+AllGather active but model does not support mmap: loading weights via regular loader."
+                        )
+                    logger.debug("Loading weights on %s ...", load_device)
+                    if load_format == "diffusers":
+                        cast(DiffusersAdapterPipeline, model).load_weights()
+                    else:
+                        self.load_weights(model)
+                    self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
+        self._apply_skip_softmax_calibration(model)
         return model.eval()
 
     @staticmethod
@@ -401,6 +416,14 @@ class DiffusersPipelineLoader:
             if getattr(quant_method, "uses_meta_device", False):
                 return True
         return False
+
+    def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
+        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            apply_skip_softmax_calibration,
+        )
+
+        cfg = getattr(self.od_config, "diffusion_attention_config", None)
+        apply_skip_softmax_calibration(cfg, model)
 
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.
@@ -636,7 +659,7 @@ class DiffusersPipelineLoader:
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
         # when available and falls back to well-known attribute names.
-        # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
+        # This supports nested pipelines (e.g. LTX2DistilledPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
 

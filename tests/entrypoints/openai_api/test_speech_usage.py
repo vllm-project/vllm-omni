@@ -16,6 +16,8 @@ from vllm_omni.entrypoints.openai.speech_usage import (
     qwen3_tts_input_token_details,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 # A deterministic stand-in for a real tokenizer: 1 token per whitespace word.
 def word_count(text: str) -> int:

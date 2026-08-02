@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for PipelineParallelMixin and related PP communication helpers.
+
+CPU unit tests exercise mixin logic without a process group. Distributed CPU
+tests use gloo on CPU tensors; nightly parity tests run the same checks on
+real multi-GPU NCCL collectives.
+"""
+
+from __future__ import annotations
 
 import os
 import socket
+from typing import Literal
 
 import pytest
 import torch
@@ -11,6 +20,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -22,7 +32,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.parallel]
+_L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
+_L4_THREE_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=3)
+_L4_FOUR_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=4)
+
+DeviceKind = Literal["cpu", "cuda"]
+_UNIT_MARKS = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _find_free_port() -> str:
@@ -34,6 +49,22 @@ def _find_free_port() -> str:
 def update_environment_variables(envs_dict: dict[str, str]) -> None:
     for k, v in envs_dict.items():
         os.environ[k] = v
+
+
+def _cleanup_distributed() -> None:
+    """Destroy omni distributed state and clear test-process leftovers.
+
+    ``destroy_distributed_env`` leaves ``vllm.distributed.parallel_state._PP``
+    aliased to the destroyed group. Parent-process baselines must clear that
+    dangling reference (and RANK/MASTER_* env) so later unit tests that call
+    ``vllm.distributed.initialize_model_parallel`` do not see stale state.
+    """
+    destroy_distributed_env()
+    import vllm.distributed.parallel_state as vllm_parallel_state
+
+    vllm_parallel_state._PP = None
+    for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        os.environ.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +174,7 @@ class MockPipelineParallel(PipelineParallelMixin, CFGParallelMixin):
 class TestAsyncLatents:
     """Verifies the lazy-resolution behaviour of AsyncLatents without a real process group."""
 
-    pytestmark = [pytest.mark.cpu]
+    pytestmark = _UNIT_MARKS
 
     def _make(self, tensor: torch.Tensor, handles: list | None = None, postproc: list | None = None) -> AsyncLatents:
         return AsyncLatents({"latents": tensor}, handles or [], postproc or [])
@@ -214,7 +245,7 @@ class TestAsyncLatents:
 class TestSyncPPSend:
     """Verifies PipelineParallelMixin's internal PP-send flush."""
 
-    pytestmark = [pytest.mark.cpu]
+    pytestmark = _UNIT_MARKS
 
     @staticmethod
     def _make_pipeline() -> PipelineParallelMixin:
@@ -247,7 +278,7 @@ class TestSyncPPSend:
 class TestDiffuseWrapper:
     """Verifies that PipelineParallelMixin flushes pending sends when diffuse() exits."""
 
-    pytestmark = [pytest.mark.cpu]
+    pytestmark = _UNIT_MARKS
 
     def test_diffuse_flushes_pending_sends_on_success(self):
         work = FakeWork()
@@ -289,7 +320,7 @@ class TestDiffuseWrapper:
 
 
 class TestVaeDecodeGuard:
-    pytestmark = [pytest.mark.cpu]
+    pytestmark = _UNIT_MARKS
 
     @staticmethod
     def _make_pipeline(distributed_enabled: bool = False) -> PipelineParallelMixin:
@@ -351,6 +382,8 @@ class TestVaeDecodeGuard:
         assert pipeline.vae.decode.__doc__ == "Original decode docstring."
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
 @pytest.mark.cpu
 def test_pipeline_parallel_requires_cfg_mixin():
     with pytest.raises(TypeError, match="inherits PipelineParallelMixin but not CFGParallelMixin"):
@@ -359,6 +392,8 @@ def test_pipeline_parallel_requires_cfg_mixin():
             pass
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
 @pytest.mark.cpu
 def test_pipeline_parallel_requires_mro_before_cfg_mixin():
     with pytest.raises(TypeError, match="must inherit PipelineParallelMixin before CFGParallelMixin"):
@@ -372,10 +407,22 @@ def test_pipeline_parallel_requires_mro_before_cfg_mixin():
 # ---------------------------------------------------------------------------
 
 
-def init_dist(local_rank: int, world_size: int, master_port: str) -> torch.device:
+def _worker_device(local_rank: int, device_kind: DeviceKind) -> torch.device:
+    if device_kind == "cpu":
+        return torch.device("cpu")
+    return torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+
+
+def init_dist(
+    local_rank: int,
+    world_size: int,
+    master_port: str,
+    device_kind: DeviceKind,
+) -> torch.device:
     """Initialise the distributed environment for a spawned worker."""
-    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
-    current_omni_platform.set_device(device)
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
     update_environment_variables(
         {
             "RANK": str(local_rank),
@@ -385,13 +432,31 @@ def init_dist(local_rank: int, world_size: int, master_port: str) -> torch.devic
             "MASTER_PORT": master_port,
         }
     )
-    init_distributed_environment()
+    backend = "gloo" if device_kind == "cpu" else None
+    init_distributed_environment(backend=backend)
     return device
+
+
+def _mp_backend(device_kind: DeviceKind) -> str | None:
+    """Backend for model-parallel process groups.
+
+    ``GroupCoordinator.all_gather`` always uses ``device_group``. CPU tensors
+    therefore require gloo device groups; otherwise a CUDA host's default NCCL
+    backend breaks PP+CFG CPU tests at CFG all_gather (pp2-cfg2).
+    isend/irecv of CPU tensors can already fall back to ``cpu_group``.
+    """
+    return "gloo" if device_kind == "cpu" else None
+
+
+def _seed_device(input_seed: int, device: torch.device) -> None:
+    torch.manual_seed(input_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(input_seed)
 
 
 def make_pipeline_and_inputs(
     test_config: dict, dtype: torch.dtype, device: torch.device, do_true_cfg: bool = False
-) -> tuple["MockPipelineParallel", dict, dict | None]:
+) -> tuple[MockPipelineParallel, dict, dict | None]:
     """Create a MockPipelineParallel and seeded inputs from a test_config dict.
 
     Must be called after ``initialize_model_parallel`` so that ``make_layers``
@@ -408,16 +473,12 @@ def make_pipeline_and_inputs(
         dtype=dtype,
     )
 
-    torch.manual_seed(test_config["input_seed"])
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(test_config["input_seed"])
+    _seed_device(test_config["input_seed"], device)
     pos_x = {"x": torch.randn(test_config["batch_size"], test_config["dim"], dtype=dtype, device=device)}
 
     negative_kwargs = None
     if do_true_cfg:
-        torch.manual_seed(test_config["input_seed"] + 1)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(test_config["input_seed"] + 1)
+        _seed_device(test_config["input_seed"] + 1, device)
         neg_x = torch.randn(test_config["batch_size"], test_config["dim"], dtype=dtype, device=device)
         negative_kwargs = {"x": neg_x}
 
@@ -425,19 +486,23 @@ def make_pipeline_and_inputs(
 
 
 # ---------------------------------------------------------------------------
-# 3.  isend_tensor_dict / irecv_tensor_dict  (2 GPUs)
+# 3.  isend_tensor_dict / irecv_tensor_dict
 # ---------------------------------------------------------------------------
 
 
-def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, result_queue):
-    device = init_dist(local_rank, world_size, master_port)
-    initialize_model_parallel(pipeline_parallel_size=world_size)
+def isend_irecv_worker(
+    local_rank: int,
+    world_size: int,
+    master_port: str,
+    device_kind: DeviceKind,
+    result_queue,
+):
+    device = init_dist(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(pipeline_parallel_size=world_size, backend=_mp_backend(device_kind))
     pp_group = get_pp_group()
 
     if pp_group.is_first_rank:
-        torch.manual_seed(77)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(77)
+        _seed_device(77, device)
         tensor = torch.randn(3, 5, dtype=torch.float32, device=device)
         handles = pp_group.isend_tensor_dict({"t": tensor})
         for h in handles:
@@ -449,25 +514,40 @@ def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, resul
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    destroy_distributed_env()
+    _cleanup_distributed()
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs")
-@pytest.mark.parametrize("pp_size", [2])
-def test_isend_irecv_tensor_dict(pp_size: int):
-    """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
+def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, master_port: str) -> None:
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
     q = manager.Queue()
-
-    port = _find_free_port()
-    torch.multiprocessing.spawn(isend_irecv_worker, args=(pp_size, port, q), nprocs=pp_size)
-
+    torch.multiprocessing.spawn(
+        isend_irecv_worker,
+        args=(pp_size, master_port, device_kind, q),
+        nprocs=pp_size,
+    )
     results = {label: tensor for label, tensor in [q.get(), q.get()]}
     torch.testing.assert_close(
         results["received"], results["sent"], rtol=0, atol=0, msg="isend/irecv transferred tensor incorrectly"
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("pp_size", [2])
+def test_isend_irecv_tensor_dict(pp_size: int):
+    """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
+    _run_isend_irecv(pp_size, device_kind="cpu", master_port=_find_free_port())
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize("pp_size", [pytest.param(2, marks=_L4_TWO_GPU)])
+def test_isend_irecv_tensor_dict_parity(pp_size: int):
+    """Nightly: isend/irecv on real multi-GPU NCCL."""
+    _run_isend_irecv(pp_size, device_kind="cuda", master_port=_find_free_port())
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +557,13 @@ def test_isend_irecv_tensor_dict(pp_size: int):
 _baseline_cache: dict[tuple, torch.Tensor] = {}
 
 
-def compute_single_gpu_baseline(test_config: dict, dtype: torch.dtype, do_true_cfg: bool) -> torch.Tensor:
-    """Compute expected single-GPU output using the same MockPipelineParallel.
-
-    Initializes a trivial distributed env (world_size=1) so that ``make_layers`` and the PP/CFG mixins work normally.
-    Results are cached so identical configs are only computed once.
-    """
+def compute_single_gpu_baseline(
+    test_config: dict,
+    dtype: torch.dtype,
+    do_true_cfg: bool,
+    device_kind: DeviceKind,
+) -> torch.Tensor:
+    """Compute expected single-process output using the same MockPipelineParallel."""
     key = (
         test_config["num_layers"],
         test_config["dim"],
@@ -492,27 +573,29 @@ def compute_single_gpu_baseline(test_config: dict, dtype: torch.dtype, do_true_c
         test_config["cfg_scale"],
         dtype,
         do_true_cfg,
+        device_kind,
     )
     if key in _baseline_cache:
         return _baseline_cache[key]
 
-    device = init_dist(0, 1, _find_free_port())
-    initialize_model_parallel(pipeline_parallel_size=1)
+    device = init_dist(0, 1, _find_free_port(), device_kind)
+    try:
+        initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
-    pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
-        test_config, dtype, device, do_true_cfg=do_true_cfg
-    )
-
-    with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=do_true_cfg,
-            true_cfg_scale=test_config["cfg_scale"],
-            positive_kwargs=positive_kwargs,
-            negative_kwargs=negative_kwargs,
-            cfg_normalize=False,
+        pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
+            test_config, dtype, device, do_true_cfg=do_true_cfg
         )
 
-    destroy_distributed_env()
+        with torch.inference_mode():
+            noise_pred = pipeline.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=test_config["cfg_scale"],
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
+    finally:
+        _cleanup_distributed()
 
     _baseline_cache[key] = noise_pred.cpu()
     return _baseline_cache[key]
@@ -527,11 +610,16 @@ def predict_noise_worker(
     do_true_cfg: bool,
     dtype: torch.dtype,
     test_config: dict,
+    device_kind: DeviceKind,
     result_queue,
 ):
     """Generic predict-noise worker parameterized by PP and CFG topology."""
-    device = init_dist(local_rank, world_size, master_port)
-    initialize_model_parallel(pipeline_parallel_size=pp_size, cfg_parallel_size=cfg_size)
+    device = init_dist(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(
+        pipeline_parallel_size=pp_size,
+        cfg_parallel_size=cfg_size,
+        backend=_mp_backend(device_kind),
+    )
 
     pp_group = get_pp_group()
     cfg_rank = get_classifier_free_guidance_rank()
@@ -548,8 +636,6 @@ def predict_noise_worker(
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-    # This worker exercises predict_noise_maybe_with_cfg directly, bypassing diffuse().
-    # Flush the non-last PP rank's async send before barrier / process teardown.
     pipeline._sync_pp_send()
 
     if pp_group.is_last_rank:
@@ -561,77 +647,22 @@ def predict_noise_worker(
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    destroy_distributed_env()
+    _cleanup_distributed()
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize(
-    "pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol",
-    [
-        pytest.param(
-            2,
-            1,
-            False,
-            torch.float32,
-            4,
-            100,
-            1e-5,
-            1e-5,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
-            id="pp2-no_cfg-float32",
-        ),
-        pytest.param(
-            2,
-            1,
-            False,
-            torch.bfloat16,
-            4,
-            100,
-            1e-2,
-            1e-2,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
-            id="pp2-no_cfg-bfloat16",
-        ),
-        pytest.param(
-            2,
-            1,
-            True,
-            torch.bfloat16,
-            4,
-            100,
-            1e-2,
-            1e-2,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
-            id="pp2-seq_cfg-bfloat16",
-        ),
-        pytest.param(
-            2,
-            2,
-            True,
-            torch.bfloat16,
-            4,
-            100,
-            1e-2,
-            1e-2,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 4, reason="Need at least 4 GPUs"),
-            id="pp2-cfg2-bfloat16",
-        ),
-        pytest.param(
-            3,
-            1,
-            False,
-            torch.bfloat16,
-            6,
-            100,
-            1e-2,
-            1e-2,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 3, reason="Need at least 3 GPUs"),
-            id="pp3-no_cfg-bfloat16",
-        ),
-    ],
-)
-def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol):
-    """predict_noise_maybe_with_cfg output matches the single-GPU baseline across PP / CFG topologies."""
+def _run_predict_noise(
+    *,
+    pp_size: int,
+    cfg_size: int,
+    do_true_cfg: bool,
+    dtype: torch.dtype,
+    num_layers: int,
+    input_seed: int,
+    rtol: float,
+    atol: float,
+    device_kind: DeviceKind,
+    master_port: str,
+) -> None:
     test_config = {
         "num_layers": num_layers,
         "dim": 64,
@@ -641,22 +672,20 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
         "input_seed": input_seed,
     }
 
-    baseline_out = compute_single_gpu_baseline(test_config, dtype, do_true_cfg)
+    baseline_out = compute_single_gpu_baseline(test_config, dtype, do_true_cfg, device_kind)
 
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
     pp_q = manager.Queue()
 
     world_size = pp_size * cfg_size
-    port = _find_free_port()
     torch.multiprocessing.spawn(
         predict_noise_worker,
-        args=(world_size, port, pp_size, cfg_size, do_true_cfg, dtype, test_config, pp_q),
+        args=(world_size, master_port, pp_size, cfg_size, do_true_cfg, dtype, test_config, device_kind, pp_q),
         nprocs=world_size,
     )
 
     pp_out = pp_q.get()
-
     assert baseline_out.shape == pp_out.shape
     torch.testing.assert_close(
         pp_out,
@@ -667,35 +696,157 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
     )
 
 
+_CPU_PREDICT_NOISE_CASES = [
+    pytest.param(2, 1, False, 4, 100, 1e-5, 1e-5, id="pp2-no_cfg"),
+    pytest.param(2, 1, True, 4, 100, 1e-5, 1e-5, id="pp2-seq_cfg"),
+    pytest.param(2, 2, True, 4, 100, 1e-5, 1e-5, id="pp2-cfg2"),
+    pytest.param(3, 1, False, 6, 100, 1e-5, 1e-5, id="pp3-no_cfg"),
+]
+
+_GPU_PREDICT_NOISE_CASES = [
+    pytest.param(
+        2,
+        1,
+        False,
+        torch.float32,
+        4,
+        100,
+        1e-5,
+        1e-5,
+        marks=_L4_TWO_GPU,
+        id="pp2-no_cfg-float32",
+    ),
+    pytest.param(
+        2,
+        1,
+        False,
+        torch.bfloat16,
+        4,
+        100,
+        1e-2,
+        1e-2,
+        marks=_L4_TWO_GPU,
+        id="pp2-no_cfg-bfloat16",
+    ),
+    pytest.param(
+        2,
+        1,
+        True,
+        torch.bfloat16,
+        4,
+        100,
+        1e-2,
+        1e-2,
+        marks=_L4_TWO_GPU,
+        id="pp2-seq_cfg-bfloat16",
+    ),
+    pytest.param(
+        2,
+        2,
+        True,
+        torch.bfloat16,
+        4,
+        100,
+        1e-2,
+        1e-2,
+        marks=_L4_FOUR_GPU,
+        id="pp2-cfg2-bfloat16",
+    ),
+    pytest.param(
+        3,
+        1,
+        False,
+        torch.bfloat16,
+        6,
+        100,
+        1e-2,
+        1e-2,
+        marks=_L4_THREE_GPU,
+        id="pp3-no_cfg-bfloat16",
+    ),
+]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, do_true_cfg, num_layers, input_seed, rtol, atol",
+    _CPU_PREDICT_NOISE_CASES,
+)
+def test_predict_noise(pp_size, cfg_size, do_true_cfg, num_layers, input_seed, rtol, atol):
+    """predict_noise_maybe_with_cfg output matches baseline across PP / CFG topologies."""
+    _run_predict_noise(
+        pp_size=pp_size,
+        cfg_size=cfg_size,
+        do_true_cfg=do_true_cfg,
+        dtype=torch.float32,
+        num_layers=num_layers,
+        input_seed=input_seed,
+        rtol=rtol,
+        atol=atol,
+        device_kind="cpu",
+        master_port=_find_free_port(),
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol",
+    _GPU_PREDICT_NOISE_CASES,
+)
+def test_predict_noise_parity(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol):
+    """Nightly: predict_noise parity on real multi-GPU NCCL."""
+    _run_predict_noise(
+        pp_size=pp_size,
+        cfg_size=cfg_size,
+        do_true_cfg=do_true_cfg,
+        dtype=dtype,
+        num_layers=num_layers,
+        input_seed=input_seed,
+        rtol=rtol,
+        atol=atol,
+        device_kind="cuda",
+        master_port=_find_free_port(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5.  scheduler_step_maybe_with_cfg
 # ---------------------------------------------------------------------------
 
 
-def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool) -> torch.Tensor:
-    """Single-GPU reference: predict_noise + scheduler_step."""
-    device = init_dist(0, 1, _find_free_port())
-    initialize_model_parallel(pipeline_parallel_size=1)
+def compute_scheduler_step_baseline(
+    test_config: dict,
+    do_true_cfg: bool,
+    device_kind: DeviceKind,
+) -> torch.Tensor:
+    """Single-process reference: predict_noise + scheduler_step."""
+    device = init_dist(0, 1, _find_free_port(), device_kind)
+    try:
+        initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
-    pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
-        test_config, torch.float32, device, do_true_cfg=do_true_cfg
-    )
-    latents = positive_kwargs["x"]
-    t = torch.tensor(500, device=device)
-
-    with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=do_true_cfg,
-            true_cfg_scale=test_config["cfg_scale"],
-            positive_kwargs=positive_kwargs,
-            negative_kwargs=negative_kwargs,
-            cfg_normalize=False,
+        pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
+            test_config, torch.float32, device, do_true_cfg=do_true_cfg
         )
-        result = pipeline.scheduler_step_maybe_with_cfg(
-            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
-        )
+        latents = positive_kwargs["x"]
+        t = torch.tensor(500, device=device)
 
-    destroy_distributed_env()
+        with torch.inference_mode():
+            noise_pred = pipeline.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=test_config["cfg_scale"],
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
+            result = pipeline.scheduler_step_maybe_with_cfg(
+                noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
+            )
+    finally:
+        _cleanup_distributed()
     return result.cpu()
 
 
@@ -707,10 +858,15 @@ def scheduler_step_worker(
     cfg_size: int,
     do_true_cfg: bool,
     test_config: dict,
+    device_kind: DeviceKind,
     result_queue,
 ):
-    device = init_dist(local_rank, world_size, master_port)
-    initialize_model_parallel(pipeline_parallel_size=pp_size, cfg_parallel_size=cfg_size)
+    device = init_dist(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(
+        pipeline_parallel_size=pp_size,
+        cfg_parallel_size=cfg_size,
+        backend=_mp_backend(device_kind),
+    )
 
     pp_group = get_pp_group()
     cfg_rank = get_classifier_free_guidance_rank()
@@ -732,43 +888,25 @@ def scheduler_step_worker(
         latents = pipeline.scheduler_step_maybe_with_cfg(
             noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
         )
-    # This worker exercises scheduler_step_maybe_with_cfg directly, bypassing diffuse().
-    # Flush the last PP rank's async latent send before barrier / process teardown.
     pipeline._sync_pp_send()
 
     if pp_group.is_first_rank and cfg_rank == 0:
-        resolved = latents.contiguous()
-        result_queue.put(resolved.cpu())
+        result_queue.put(latents.contiguous().cpu())
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    destroy_distributed_env()
+    _cleanup_distributed()
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize(
-    "pp_size, cfg_size, do_true_cfg, input_seed",
-    [
-        pytest.param(
-            2,
-            1,
-            False,
-            300,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
-            id="pp2-no_cfg",
-        ),
-        pytest.param(
-            2,
-            2,
-            True,
-            600,
-            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 4, reason="Need at least 4 GPUs"),
-            id="pp2-cfg2-true_cfg",
-        ),
-    ],
-)
-def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
-    """Rank 0 latents after scheduler_step match the single-GPU baseline across PP / CFG topologies."""
+def _run_scheduler_step(
+    *,
+    pp_size: int,
+    cfg_size: int,
+    do_true_cfg: bool,
+    input_seed: int,
+    device_kind: DeviceKind,
+    master_port: str,
+) -> None:
     test_config = {
         "num_layers": 4,
         "dim": 64,
@@ -778,17 +916,16 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
         "input_seed": input_seed,
     }
 
-    baseline = compute_scheduler_step_baseline(test_config, do_true_cfg)
+    baseline = compute_scheduler_step_baseline(test_config, do_true_cfg, device_kind)
 
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
     q = manager.Queue()
 
-    port = _find_free_port()
     world_size = pp_size * cfg_size
     torch.multiprocessing.spawn(
         scheduler_step_worker,
-        args=(world_size, port, pp_size, cfg_size, do_true_cfg, test_config, q),
+        args=(world_size, master_port, pp_size, cfg_size, do_true_cfg, test_config, device_kind, q),
         nprocs=world_size,
     )
 
@@ -799,4 +936,48 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
         rtol=0,
         atol=0,
         msg=f"PP={pp_size} CFG={cfg_size} scheduler step latents on rank 0 do not match single-GPU baseline",
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, do_true_cfg, input_seed",
+    [
+        pytest.param(2, 1, False, 300, id="pp2-no_cfg"),
+        pytest.param(2, 2, True, 600, id="pp2-cfg2-true_cfg"),
+    ],
+)
+def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
+    """Rank 0 latents after scheduler_step match baseline across PP / CFG topologies."""
+    _run_scheduler_step(
+        pp_size=pp_size,
+        cfg_size=cfg_size,
+        do_true_cfg=do_true_cfg,
+        input_seed=input_seed,
+        device_kind="cpu",
+        master_port=_find_free_port(),
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, do_true_cfg, input_seed",
+    [
+        pytest.param(2, 1, False, 300, marks=_L4_TWO_GPU, id="pp2-no_cfg"),
+        pytest.param(2, 2, True, 600, marks=_L4_FOUR_GPU, id="pp2-cfg2-true_cfg"),
+    ],
+)
+def test_scheduler_step_parity(pp_size, cfg_size, do_true_cfg, input_seed):
+    """Nightly: scheduler_step parity on real multi-GPU NCCL."""
+    _run_scheduler_step(
+        pp_size=pp_size,
+        cfg_size=cfg_size,
+        do_true_cfg=do_true_cfg,
+        input_seed=input_seed,
+        device_kind="cuda",
+        master_port=_find_free_port(),
     )

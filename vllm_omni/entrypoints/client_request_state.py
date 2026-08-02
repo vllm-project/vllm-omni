@@ -4,7 +4,7 @@ from vllm_omni.metrics import OrchestratorAggregator
 
 
 class ClientRequestState:
-    """Tracks the state of an individual request in the orchestrator."""
+    """Tracks one entrypoint request and its output queue."""
 
     def __init__(
         self,

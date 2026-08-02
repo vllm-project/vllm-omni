@@ -275,6 +275,7 @@ def omni() -> Generator[Omni, None, None]:
         MODEL_NAME,
         deploy_config=str(DEPLOY_CONFIG_PATH),
         mode="text-to-image",
+        trust_remote_code=True,
     ) as runner:
         yield runner.omni
 

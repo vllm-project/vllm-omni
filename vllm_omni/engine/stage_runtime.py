@@ -51,7 +51,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
-    extract_stage_metadata,
+    extract_legacy_stage_metadata,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
@@ -126,6 +126,7 @@ class StageRuntime:
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -134,6 +135,7 @@ class StageRuntime:
         self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
+        self._log_stats = log_stats
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -339,8 +341,12 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
+        # RFC #4021 transition boundary: stage planning still relies on legacy
+        # StageConfig.runtime and StageConfig.engine_args for replica and engine
+        # setup. Keep metadata extraction on the legacy path until the
+        # coordinated stage-init cutover.
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_stage_metadata(stage_cfg)
+            base_metadata = extract_legacy_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -392,11 +398,10 @@ class StageRuntime:
                 if stage_idx in replica_devices_map:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
-                replica_metadata = extract_stage_metadata(replica_cfg)
+                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
-
                 replicas.append(
                     ReplicaInitPlan(
                         replica_id=replica_id,
@@ -572,7 +577,7 @@ class StageRuntime:
                 with launch_stage_replica(
                     vllm_config=vllm_config,
                     executor_class=executor_class,
-                    log_stats=False,
+                    log_stats=self._log_stats,
                     stage_id=plan.metadata.stage_id,
                     replica_id=plan.replica_id,
                     stage_config=plan.stage_cfg,
@@ -591,6 +596,7 @@ class StageRuntime:
             stage_client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
+                log_stats=self._log_stats,
                 metadata=plan.metadata,
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
@@ -701,7 +707,11 @@ class StageRuntime:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=self._log_stats,
+                )
 
             stage_pools.append(
                 StagePool(
@@ -739,10 +749,11 @@ class DistStageRuntime(StageRuntime):
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
-        tokenizer: str | None = None,
         single_stage_id_filter: int | None,
         omni_master_address: str,
         omni_master_port: int,
+        tokenizer: str | None = None,
+        log_stats: bool = False,
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
@@ -756,6 +767,7 @@ class DistStageRuntime(StageRuntime):
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -866,8 +878,10 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
+        # Remote diffusion registration still transports the legacy mapping
+        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
         metadata = (
-            extract_stage_metadata(OmegaConf.create(registered_stage_cfg))
+            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
             if plan.metadata.stage_type == "diffusion"
             else copy.deepcopy(plan.metadata)
         )
@@ -1046,6 +1060,7 @@ class DistStageRuntime(StageRuntime):
             client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=ctx.executor_class,
+                log_stats=self._log_stats,
                 metadata=metadata,
                 client_addresses=client_addresses,
                 engine_manager=resources.manager,
@@ -1084,6 +1099,7 @@ def create_stage_runtime(
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
+    log_stats: bool = False,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1097,6 +1113,7 @@ def create_stage_runtime(
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1113,4 +1130,5 @@ def create_stage_runtime(
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        log_stats=log_stats,
     )

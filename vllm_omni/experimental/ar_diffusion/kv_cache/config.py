@@ -15,14 +15,13 @@ class ARDiffusionKVConfig:
     """
 
     enable: bool = False
-    # Persistent KV tokens materialized per AR chunk. For DreamZero this is
-    # ``num_frame_per_block * frame_seqlen``.
+    # Persistent KV tokens materialized per paged cache block.
     chunk_size: int = 0
     # Resident window in chunks. ``None`` means full attention (no eviction).
     window_chunks: int | None = None
     # Protected leading chunks (attention sink); never evicted.
     sink_chunks: int = 0
-    # DreamZero-style window reset vs. VGGT-style sliding replace.
+    # Boundary reset vs. sliding replacement.
     reset_at_boundary: bool = False
     # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
     gpu_memory_fraction: float = 0.1
