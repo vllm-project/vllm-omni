@@ -677,6 +677,21 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         request_id = str(info.get("request_id", "default"))
         num_computed = int(info.get("_omni_num_computed_tokens", 0))
 
+        # Tokenization audit: the reference HF path tokenizes text prompts
+        # with add_special_tokens=True (HF default), which prepends BOS when
+        # the tokenizer config defines one. vLLM-omni's text-only path may
+        # differ, and a 1-token shift changes every n-gram hash context --
+        # producing "coherent but generic" text (observed: reference answers
+        # properly, port emits filler). Log the first span's raw ids once per
+        # request so a pod run can compare against the reference's tokenizer
+        # output directly.
+        if self._audio_debug and num_computed == 0:
+            logger.info(
+                "[longcat-text] req=%s first-span input_ids[:16]=%s span=%d ignored_first=%d",
+                request_id, input_ids[:16].tolist(), int(input_ids.shape[0]),
+                int((input_ids[0] >= self.text_vocab_hash_size).item()) if input_ids.numel() else -1,
+            )
+
         # oe_ignored ids (all special tokens >= text_vocab_size, incl. the
         # mm pad markers) are hash-segment boundaries and take *pure* word
         # embeddings — no n-gram fusion, per the HF NgramEmbedding forward.

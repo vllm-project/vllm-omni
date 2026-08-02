@@ -50,9 +50,10 @@ stages:
     max_model_len: 65536
     default_sampling_params:
       temperature: 0.4
-      top_p: 0.9
+      top_k: 20
+      top_p: 0.85
       max_tokens: 2048
-      repetition_penalty: 1.05
+      repetition_penalty: 1.1
       detokenize: true
       ignore_eos: false
 
