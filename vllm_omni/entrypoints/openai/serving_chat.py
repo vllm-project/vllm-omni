@@ -26,6 +26,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
+    DiffusionRequestOptionSpec,
     apply_normalized_diffusion_request_extra_args,
     normalize_diffusion_request_args,
 )
@@ -343,13 +344,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         explicit_root_args = {
             key: getattr(request, key) for key in explicit if key != "extra_body" and hasattr(request, key)
         }
+        request_options = DiffusionRequestOptionSpec.from_fields(
+            serving_root_fields=self._diffusion_serving_root_fields,
+            registered_extra_fields=self._get_diffusion_extra_body_params(),
+            root_field_aliases=self._diffusion_root_field_aliases,
+        )
         return normalize_diffusion_request_args(
             root=root,
             nested=nested,
             explicit_root_args=explicit_root_args,
-            serving_root_fields=self._diffusion_serving_root_fields,
-            registered_extra_fields=self._get_diffusion_extra_body_params(),
-            root_field_aliases=self._diffusion_root_field_aliases,
+            request_options=request_options,
         )
 
     def _get_diffusion_extra_output_params(

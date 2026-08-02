@@ -16,6 +16,7 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
     get_x_to_text_model_family,
+    registry,
     should_init_extra_args_for_non_diffusion_stages,
 )
 
@@ -414,6 +415,36 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
     assert get_extra_output_params("UnknownPipeline") == frozenset()
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_model_extra_registry_accepts_typed_and_legacy_specs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        registry._EXTRA_SPECS,
+        "TypedPipeline",
+        registry.model_extra_spec(
+            extra_body_params={"known"},
+            extra_output_params={"out"},
+            init_extra_args_for_non_diffusion_stages=True,
+        ),
+    )
+    monkeypatch.setitem(
+        registry._EXTRA_SPECS,
+        "LegacyPipeline",
+        {
+            "extra_body_params": {"legacy"},
+            "extra_output_params": {"legacy_out"},
+            "init_extra_args_for_non_diffusion_stages": True,
+        },
+    )
+
+    assert get_extra_body_params("TypedPipeline") == frozenset({"known"})
+    assert get_extra_output_params("TypedPipeline") == frozenset({"out"})
+    assert should_init_extra_args_for_non_diffusion_stages("TypedPipeline") is True
+    assert get_extra_body_params("LegacyPipeline") == frozenset({"legacy"})
+    assert get_extra_output_params("LegacyPipeline") == frozenset({"legacy_out"})
+    assert should_init_extra_args_for_non_diffusion_stages("LegacyPipeline") is True
 
 
 @pytest.mark.core_model

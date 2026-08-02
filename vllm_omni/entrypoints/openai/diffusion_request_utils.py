@@ -4,12 +4,39 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
+from difflib import get_close_matches
 
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
+
+_EXTRA_ARG_CONTAINER_FIELDS = frozenset({"extra_args", "extra_params"})
+
+
+@dataclass(frozen=True)
+class DiffusionRequestOptionSpec:
+    """Typed declaration for diffusion request-option routing."""
+
+    serving_root_fields: frozenset[str] = field(default_factory=frozenset)
+    registered_extra_fields: frozenset[str] = field(default_factory=frozenset)
+    root_field_aliases: Mapping[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_fields(
+        cls,
+        *,
+        serving_root_fields: Collection[str] = (),
+        registered_extra_fields: Collection[str] = (),
+        root_field_aliases: Mapping[str, str] | None = None,
+    ) -> DiffusionRequestOptionSpec:
+        return cls(
+            serving_root_fields=frozenset(serving_root_fields),
+            registered_extra_fields=frozenset(registered_extra_fields),
+            root_field_aliases=dict(root_field_aliases or {}),
+        )
 
 
 def _request_mapping(name: str, value: object | None) -> dict[str, object]:
@@ -22,16 +49,43 @@ def _request_mapping(name: str, value: object | None) -> dict[str, object]:
     return dict(value)
 
 
+def _warn_for_close_unknown_fields(
+    args: Mapping[str, object],
+    *,
+    source: str,
+    allowed_fields: Collection[str],
+) -> None:
+    allowed = set(allowed_fields) | _EXTRA_ARG_CONTAINER_FIELDS
+    choices = sorted(allowed_fields)
+    for key in sorted(args):
+        if key in allowed:
+            continue
+        matches = get_close_matches(key, choices, n=1, cutoff=0.82)
+        if matches:
+            logger.warning(
+                "Ignoring unrecognized diffusion request field %s.%s. Did you mean %s?",
+                source,
+                key,
+                matches[0],
+            )
+
+
 def normalize_diffusion_request_args(
     *,
     root: object | None = None,
     nested: object | None = None,
     explicit_root_args: object | None = None,
+    request_options: DiffusionRequestOptionSpec | None = None,
     serving_root_fields: Collection[str] = (),
     registered_extra_fields: Collection[str] = (),
     root_field_aliases: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Validate request sources and project diffusion consumer arguments."""
+    if request_options is not None:
+        serving_root_fields = request_options.serving_root_fields
+        registered_extra_fields = request_options.registered_extra_fields
+        root_field_aliases = request_options.root_field_aliases
+
     root_args = _request_mapping("request", root)
     root_args.update(_request_mapping("explicit_root_args", explicit_root_args))
     nested_args = _request_mapping("request.extra_body", nested)
@@ -71,6 +125,18 @@ def normalize_diffusion_request_args(
         logger.warning_once(
             "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
         )
+
+    known_request_fields = consumer_fields | set(aliases.values())
+    _warn_for_close_unknown_fields(
+        root_args,
+        source="request",
+        allowed_fields=known_request_fields,
+    )
+    _warn_for_close_unknown_fields(
+        nested_args,
+        source="request.extra_body",
+        allowed_fields=known_request_fields,
+    )
 
     # Duplicate request keys were rejected above, so ordering is not precedence.
     normalized_extra_args = {

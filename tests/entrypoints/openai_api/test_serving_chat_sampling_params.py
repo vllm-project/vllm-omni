@@ -7,6 +7,7 @@ are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -131,6 +132,38 @@ def test_unknown_root_extra_does_not_claim_canonical_extra(serving_chat):
         "pipeline_option": "canonical-value",
     }
     assert "pipeline_option" not in diffusion_request_args
+
+
+def test_misspelled_declared_root_extra_warns_and_is_not_routed(serving_chat, caplog):
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        cfg_text_sclae=7.0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+
+    assert normalized_extra_args == {}
+    assert "cfg_text_sclae" not in diffusion_request_args
+    assert any("cfg_text_sclae" in record.message and "cfg_text_scale" in record.message for record in caplog.records)
+
+
+def test_unknown_extra_args_keys_still_pass_through(serving_chat, caplog):
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        extra_args={"cfg_text_sclae": 7.0},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+
+    assert normalized_extra_args == {"cfg_text_sclae": 7.0}
+    assert diffusion_request_args == {}
+    assert not any("cfg_text_sclae" in record.message for record in caplog.records)
 
 
 def test_unregistered_cfg_scale_aliases_common_true_cfg_scale(serving_chat):
