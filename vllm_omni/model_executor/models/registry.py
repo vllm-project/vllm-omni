@@ -84,6 +84,31 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "NemotronDenseForCausalLM": (
+        "audex",
+        "audex_thinker",
+        "NemotronDenseForCausalLM",
+    ),
+    "AudexCode2Wav": (
+        "audex",
+        "audex_code2wav",
+        "AudexCode2Wav",
+    ),
+    "AudexXCodec1": (
+        "audex",
+        "audex_xcodec",
+        "AudexXCodec1",
+    ),
+    "NemotronDenseAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronDenseAudexForConditionalGeneration",
+    ),
+    "NemotronHAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronHAudexForConditionalGeneration",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",
@@ -98,6 +123,16 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
     ),
     "MammothModa2DiTPipeline": (
         "mammoth_moda2",

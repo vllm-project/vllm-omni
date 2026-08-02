@@ -97,6 +97,13 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # MIOpen Conv1d cannot be invoked while vLLM captures the outer
+        # Code2Wav model graph. Keep CUDA's graph-enabled default, but run
+        # Stage 1 eager on ROCm so decoder convolutions execute normally.
+        enforce_eager: true
   npu:
     stages:
       - stage_id: 0

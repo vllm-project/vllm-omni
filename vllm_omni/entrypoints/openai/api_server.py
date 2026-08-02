@@ -98,7 +98,6 @@ from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
-    encode_image_base64,
     encode_image_base64_with_compression,
     parse_size,
     validate_layered_layers,
@@ -1572,8 +1571,9 @@ async def delete_voice(name: str, raw_request: Request):
 async def streaming_speech(websocket: WebSocket):
     """WebSocket endpoint for streaming text input TTS.
 
-    Accepts text incrementally, splits at sentence boundaries, and
-    returns audio per sentence. See serving_speech_stream.py for protocol.
+    Accepts text incrementally and returns audio for the buffered text on
+    input.done, which flushes without closing the connection. See
+    serving_speech_stream.py for protocol.
     """
     handler = getattr(websocket.app.state, "openai_streaming_speech", None)
     if handler is None:
@@ -1730,6 +1730,39 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 # Image generation API endpoints
 
 
+def _build_image_generation_response(
+    *,
+    images: list[Image.Image],
+    request: ImageGenerationRequest,
+    stage_durations: Any,
+    peak_memory_mb: Any,
+) -> ImageGenerationResponse | StreamingResponse:
+    """Encode generated images and apply the requested response format."""
+    output_format = _choose_output_format(request.output_format or "png", None)
+    image_data = [
+        ImageData(
+            b64_json=encode_image_base64_with_compression(image, format=output_format),
+            revised_prompt=None,
+        )
+        for image in images
+    ]
+    response_kwargs: dict[str, Any] = {
+        "created": int(time.time()),
+        "data": image_data,
+        "output_format": output_format,
+        "metrics": {
+            "stage_durations": stage_durations or None,
+            "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
+        },
+    }
+    if request.size is not None:
+        response_kwargs["size"] = request.size
+    response = ImageGenerationResponse(**response_kwargs)
+    if request.response_format == ResponseFormat.FILE:
+        return response.stream_response()
+    return response
+
+
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
@@ -1830,10 +1863,13 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, _, _, _ = generation_result
-            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
-
-            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+            flat_images, stage_durations, peak_memory_mb, _ = generation_result
+            return _build_image_generation_response(
+                images=flat_images,
+                request=request,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+            )
 
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
@@ -1899,7 +1935,7 @@ async def generate_images(
 
         logger.debug(f"Generating {request.n} image(s) {size_str}")
 
-        # Generate images using AsyncOmni (multi-stage mode)
+        # Generate images using AsyncOmni.
         result = await _generate_with_async_omni(
             engine_client=engine_client,
             gen_params=gen_params,
@@ -1920,26 +1956,14 @@ async def generate_images(
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
-        # Determine output format (default to png)
-        output_format = _choose_output_format(request.output_format or "png", None)
-
-        # Encode images to base64 with the specified format
-        image_data = [
-            ImageData(b64_json=encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
-            for img in images
-        ]
-
-        response_kwargs = {
-            "created": int(time.time()),
-            "data": image_data,
-            "output_format": output_format,
-        }
-        if request.size:
-            response_kwargs["size"] = size_str
-        response = ImageGenerationResponse(**response_kwargs)
-        if request.response_format != ResponseFormat.FILE:
-            return response
-        return response.stream_response()
+        stage_durations = getattr(result, "stage_durations", None)
+        peak_memory_mb = getattr(result, "peak_memory_mb", None)
+        return _build_image_generation_response(
+            images=images,
+            request=request,
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        )
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)

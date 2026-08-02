@@ -168,7 +168,7 @@ the model + orchestrator + WebUI together — point `WEBUI_DIR` at your clone.
 python examples/online_serving/joyvl_interaction/cli/run_cli_demo.py \
   path/to/video.mp4 --query "Alert me if a fire breaks out"
 
-pytest tests/fullduplex   # framework + JoyVL unit tests
+pytest tests/e2e/features/fullduplex   # framework + JoyVL unit tests
 ```
 
 ## Testing with an RTSP stream (optional)
