@@ -156,6 +156,11 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int,
         f"<longcat_img_token_size>{token_h} {token_w}</longcat_img_token_size>"
         "<longcat_img_start>"
     )
+    # Overridable via LONGCAT_CFG_SCALE for A/B testing (e.g. 1.0 collapses
+    # cfg_scale * (cond - uncond) + uncond to plain cond -- identical to
+    # having no CFG at all -- vs. the checkpoint default 3.0) without editing
+    # this file between runs.
+    cfg_scale = float(os.environ.get("LONGCAT_CFG_SCALE", 3.0))
     prompt = OmniTextPrompt(
         prompt=prompt_text,
         multi_modal_data=None,
@@ -166,10 +171,12 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int,
             # = 3.0). The thinker combines the conditional and its uncond twin
             # streams' depth-head logits with
             # cfg_scale * (cond - uncond) + uncond.
-            "cfg_scale": 3.0,
+            "cfg_scale": cfg_scale,
         },
     )
 
+    # Fixed seed so cfg_scale A/B comparisons only vary in cfg_scale, not in
+    # sampling randomness.
     sampling_params = SamplingParams(
         max_tokens=2048,
         temperature=0.4,
@@ -177,8 +184,10 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int,
         top_p=0.85,
         repetition_penalty=1.1,
         detokenize=True,
+        seed=42,
     )
     result["token_w"], result["token_h"] = token_w, token_h
+    result["cfg_scale"] = cfg_scale
 
     outputs = llm.generate([prompt], [sampling_params] + [None] * (num_stages - 1))
     result["num_outputs"] = len(outputs)
@@ -222,7 +231,7 @@ def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int,
     try:
         from PIL import Image
         pil = Image.fromarray((img_np * 255).astype("uint8")).convert("RGB")
-        out_png = os.path.join(out_dir, "image.png")
+        out_png = os.path.join(out_dir, f"image_cfg{cfg_scale:g}.png")
         pil.save(out_png)
         result["png_written"] = True
         print(f"[wired-image] wrote {out_png}")
