@@ -253,6 +253,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self._ngram_audited = False
         self._ngram_disabled = int(os.environ.get("LONGCAT_NGRAM_DISABLE", "0")) != 0
         self._logits_audited = False
+        self._layer_rms: list[tuple[int, float]] | None = None
+        self._layer_rms_audited = False
         self._max_ctx_entries = 4 * max(
             int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64
         )
@@ -267,6 +269,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # outlast a short job walltime); unset it for full-length audio.
         self.max_gen = int(os.environ.get("LONGCAT_MAX_GEN") or max_audio_seconds * 25)
         self._audio_debug = int(os.environ.get("LONGCAT_AUDIO_DEBUG", "0")) != 0
+        if self._audio_debug:
+            self._attach_layer_rms_audit()
 
         # --- image generation state (talker_mtp dispatches to this too) ---
         self._visual_gen: dict[str, dict[str, Any]] = {}
@@ -298,6 +302,44 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def _dbg_step(step: int) -> bool:
         """Log the first few steps in full, then sample, to bound log size."""
         return step < 12 or step % 100 == 0
+
+    def _attach_layer_rms_audit(self) -> None:
+        """Capture residual-stream RMS after every flash layer.
+
+        The port logs a ~0.6x compressed final-logit span vs the reference, but
+        a single head scalar would compress magnitudes while preserving rank --
+        the run also *re-ranks* the top-10, so the divergence accrues across
+        layers. Hooking each slot delivers the post-every-layer RMS curve for
+        the last step (the decode step whose logits we dump), which the pod can
+        diff against the reference HF model's per-layer RMS to localise the
+        first layer where the curves split.
+
+        Records are cleared/reset per step in _audit_layer_rms so each forward
+        overwrites the previous curve; it is read once at the first single-token
+        text decode then disabled.
+        """
+        self._layer_rms_hooks: list = []
+        self._layer_rms: list[tuple[int, float]] | None = []
+        self._layer_rms_audited = False
+
+        model = getattr(self, "model", None)
+        if model is None or not hasattr(model, "layers"):
+            return
+
+        def make_hook(idx: int):
+            def _h(module, args, output):
+                if self._layer_rms_audited or not self._audio_debug:
+                    return
+                if isinstance(output, (tuple, list)):
+                    hidden = output[0]
+                else:
+                    hidden = output
+                self._layer_rms.append((idx, float(hidden.float().pow(2).mean().sqrt())))
+
+            return _h
+
+        for idx, layer in enumerate(model.layers):
+            self._layer_rms_hooks.append(layer.register_forward_hook(make_hook(idx)))
 
     # ------------------------------------------------------------------ #
     # embeddings
@@ -1772,6 +1814,17 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             and logits.shape[0] == 1
         ):
             self._logits_audited = True
+            # Dump the per-layer steam RMS curve for this same decode step so
+            # the pod can bisect the compression: if layer-0 RMS already differs
+            # from the reference, it's upstream (embedding/rotary); if it tracks
+            # until a late layer, it's localized there.
+            if self._layer_rms is not None:
+                curve = self._layer_rms
+                self._layer_rms = None
+                logger.info(
+                    "[longcat-layers] per-slot RMS curve for first decode step: %s",
+                    [round(v, 4) for _, v in curve],
+                )
             topk_vals, topk_ids = torch.topk(logits[0], 10)
             logger.info(
                 "[longcat-logits] first decode step top10 ids=%s vals=%s "
