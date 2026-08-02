@@ -218,3 +218,264 @@ written*) with this setup, but that only validates pipeline wiring — see
 *quality* has separate, unresolved bugs (garbage text on a plain
 non-multimodal prompt, and an audio-codes accumulation bug that drops all
 but the last generated frame before it reaches the client).
+
+## 10. Quality debugging log (post-wiring)
+
+Once the pipeline ran end-to-end (§9), a second, much longer debugging pass
+went after *generation quality* — text reading as generic filler instead of
+answering the prompt, audio/image running forever or collapsing. This
+section is the log of everything tried, in order, what it ruled out, what it
+fixed, and what's still open. Read top to bottom; each subsection assumes
+the previous ones' fixes are already applied (they're committed on this
+branch — check `git log` for the commit named in each item).
+
+### Text
+
+**Fixed:**
+- `LONGCAT_NGRAM_DISABLE`/oe_ids audit added (debug tooling, not a behavior
+  change) to test whether n-gram fusion was the source of divergence.
+- Deploy YAML stage-0 `default_sampling_params` were `0.4/–/0.9/1.05`
+  (temperature/top_k/top_p/repetition_penalty); the reference's own
+  `test_cases.yaml` uses `0.4/20/0.85/1.1` for this exact text-generation
+  profile. `pbs/scripts/longcat_next_debug_quality.py`'s `run_text` had the
+  same gap — it used `0.4/20/0.85` but omitted `repetition_penalty`
+  entirely, silently falling back to vLLM's default of `1.0` (no penalty).
+  This alone was the fix for the *original* symptom (`finish_reason=length`,
+  output degenerating into a repeated-digit loop): with `repetition_penalty=1.1`
+  restored, generation now terminates cleanly (`finish_reason=stop`) after a
+  short, grammatical response.
+- **Remaining symptom after that fix**: the response is coherent Chinese but
+  *generic* — asked "请简单介绍一下你自己" (please introduce yourself), the
+  port answers "Of course, I'll help you with whatever you need" instead of
+  actually introducing itself. The reference model, given the identical
+  prompt and identical sampling params, produces a full, on-topic
+  self-introduction (name, developer, capabilities). This is the open bug
+  this whole log chases.
+
+**Ruled out, in order, each via a real on-pod comparison (not guessed):**
+1. **Tokenization** — dumped `input_ids` from both the port
+   (`[longcat-text]` log line, `LONGCAT_AUDIO_DEBUG=1`) and the reference
+   (`tok(prompt, add_special_tokens=False).input_ids` on the raw HF
+   tokenizer). Byte-for-byte identical 16-token sequence on both sides:
+   `[46, 3320, 815, 483, 20110, 18498, 237, 444, 47, 2252, 5552, 41212,
+   42446, 525, 444, 48]`. Not a prompt-construction or BOS-handling bug.
+2. **N-gram embedding fusion** — `LONGCAT_NGRAM_DISABLE=1` (bypasses
+   `_span_oe_ids`/`ngram_embeddings.embed_batched`, falls back to pure word
+   embeddings). Result: *worse*, not better — output degenerated into
+   incoherent English/Chinese word salad (`'It is beepsile岗atory的...'`).
+   This rules the n-gram path OUT: a genuinely broken fusion wouldn't
+   produce *more* coherent text when correctly applied, and disabling a
+   subtly-wrong one shouldn't make things catastrophically worse. The
+   mechanism is necessary and working as intended.
+3. **MLA/RoPE config** (`LONGCAT_CONFIG_AUDIT=1`, logs `FlashConfig`'s
+   actual loaded values from `vllm/model_executor/models/longcat_flash.py`) —
+   compared against the checkpoint's raw `config.json`. Every value matches
+   exactly, including the two most likely to silently fall back to a wrong
+   Python default: `rope_theta=10000000` (not `FlashConfig`'s default
+   `1000000.0`) and `max_position_embeddings=131072` (not the default
+   `8192`). Config loading is not the bug.
+4. **Weight loading** — reran with `VLLM_LOGGING_LEVEL=DEBUG` (the level
+   `AutoWeightsLoader` actually logs missing/unexpected keys at) and grepped
+   for `missing|unexpected key|not initialized|randomly init` — zero
+   matches across a substantial (1046-line) log. No submodule is silently
+   falling back to random init from a name/shape mismatch.
+
+**Current lead — logit-level divergence (not yet root-caused):**
+Dumped the top-10 pre-sampling logits of the first decode step
+(`[longcat-logits]` log line) and compared against the reference's raw
+`model.generate(inputs, max_new_tokens=1, do_sample=False, output_logits=True,
+return_dict_in_generate=True)` (note: the reference's `forward()` cannot be
+called directly — it needs internal `multimodal_generation_status` state that
+only `generate()` sets up; calling `model(input_ids)` raises
+`AttributeError: 'NoneType' object has no attribute 'mode'`). Also note the
+reference needs `device_map="auto"` to load across all 4 GPUs — a plain
+`.to("cuda")` OOMs on a single 80GB card.
+
+Reference top-10: `ids=[23958, 7600, 9400, 44408, 49488, 2909, 25044, 56992,
+31553, 78636]`, `vals=[25.5, 23.5, 19.5, 18.875, 18.5, 18.125, 17.75, 17.75,
+17.0, 16.75]`, range `[-19.875, 25.5]` (span ~45.4).
+Port top-10: `ids=[47454, 7600, 31553, 2909, 16707, 2620, 60059, 90310, 765,
+23220]`, `vals=[14.875, 14.375, 14.312, 14.188, 13.75, 13.625, 13.312,
+13.312, 13.125, 13.0]`, range `[-12.438, 14.875]` (span ~27.3).
+
+Only 3/10 ids overlap (`7600`, `2909`, `31553`), ranked differently, and the
+reference's dominant top-1 (`23958`, clear +2.0 margin) isn't in the port's
+top-10 at all. **This re-ranking is the key detail**: a single missing head
+scalar (a `logits_scale`/softcapping factor) would compress magnitude but
+preserve rank order — it can't explain 7/10 ids changing which class they
+even are. Divergence must accrue across layers, not live in one place at the
+head. So the bisect target is the per-layer residual-stream RMS curve, not
+a head-level scalar.
+
+**In progress (commit `9d523742`)**: forward hooks on every `FlashDecoderLayer`
+record `RMS(hidden_out)` per step; `[longcat-layers]` prints the full
+post-every-layer RMS curve for the same decode step the logits are dumped
+for. Reference-side equivalent (register a forward hook per
+`model.model.layers[i]`, record `hidden.float().pow(2).mean().sqrt()`) is
+written but **not yet run** — the pod was preempted (`EXITED`, community
+cloud) before this comparison could execute. Interpretation once both curves
+exist:
+- Curves split at layer 0 → upstream of the backbone (embedding / n-gram
+  input scale / RoPE feature scale). Since n-gram and weights are already
+  confirmed clean, this would point at embedding scale or rotary application.
+- Curves track then diverge at layer N → localized bug at that layer
+  (attention output-proj or norm); diff that layer's sub-outputs next.
+- Curves match all the way through → compression is purely at the final
+  norm + head (RMSNorm eps, `ParallelLMHead` bias/scale). This is the only
+  scenario consistent with a head-only fix, and it's the least likely given
+  the re-ranking observed in the logits.
+
+### Audio
+
+**Fixed** (all committed, see git log on this branch for exact diffs):
+- Prefill-step `decode_eligible` desync: `<longcat_audiogen_start>`/
+  `<longcat_img_start>` landing as the last token of a multi-token prefill
+  chunk (true whenever it's written directly into the prompt) advanced the
+  state machine's `gen_step` without the runner actually invoking
+  `talker_mtp` that step, silently losing the first frame's code forever.
+  Fixed by gating the advance on `decode_eligible = (not is_prefill) and
+  span_len == 1`, matching the runner's own talker_mtp dispatch condition.
+- Audio termination: `compute_logits` used to `continue` entirely once
+  `audio_state["terminal"]` was set (chunk-end or `max_gen` safety cap),
+  fully unbanning EOS with no forced replacement — the model was free to
+  (and did) end the *whole request* via real EOS within a few tokens,
+  instead of just closing that one audio segment. Fixed by forcing
+  `<longcat_audiogen_end>` on the terminal step (mirroring how the image
+  side forces `IMAGE_END`), so the model only regains full freedom after a
+  clean close.
+- Chunk-boundary marker: once the above fix let a single request produce
+  *multiple* audio segments (re-entering `<longcat_audiogen_start>` after a
+  clean close), those segments' codes concatenated with no surviving
+  boundary between them — `LongcatNextAudioDecoder._split_chunks` saw one
+  giant merged chunk instead of several bounded ones and overflowed the
+  checkpoint's fixed-size positional embedding table
+  (`positions_2d 5731 != L 3000`). Fixed by emitting an explicit chunk-end
+  marker row (`level0 = codebook_sizes[0]`) on every terminal step instead
+  of a `-1` discard row, so `_split_chunks` can actually see the boundary.
+
+**Current state**: mechanically clean — `verdict: PASS`, 89 rounds, 1433
+kept frames, decodes without crashing. **Not yet root-caused**: 108.6s of
+audio for a ~5s sentence ("明天的meeting在三楼的Conference Room举行"). The
+model re-enters `<longcat_audiogen_start>` far more than expected instead of
+speaking the sentence once and stopping — a segment-level repetition loop,
+not a token-level one. Deprioritized in favor of the text/image leads since
+those looked more tractable; the text logit-divergence investigation may
+turn out to be the same root cause (see image section below).
+
+### Image
+
+**Fixed** (committed):
+- Same prefill-step `decode_eligible` desync as audio (see above) — was
+  losing the image's first pixel frame, causing the image decoder to
+  receive one fewer code than the grid expected
+  (`positions_2d`/frame-count mismatch).
+- Grid-bound termination: image generation had no forced-termination
+  transition (unlike audio's `max_gen`), so a thinker call with a loose
+  `max_tokens` kept sampling past the intended grid (observed: 1994 codes
+  for a 1369-code 37x37 grid) until the token budget ran out. Fixed by
+  forcing `<longcat_img_end>` once `gen_step` reaches `token_h*(token_w+1)`.
+- Image decoder hardened symmetrically: truncates extra codes (already
+  existed) *and* now fails cleanly instead of crashing the reference decoder
+  when it receives fewer codes than the grid expects.
+
+**Implemented**: Visual CFG (classifier-free guidance) — an unconditional
+"twin" request (`<longcat_img_start>` prompt with the user's instruction
+string-blanked) is spawned via `prompt_expand_func`/`expand_longcat_cfg_prompts`,
+paired with the parent via `__cfg_visual` request-id suffix and
+`max_num_seqs=2` so both land in the same decode batch. Combined per-step:
+`combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits`,
+matching the reference's own formula in `output_processor.py`. Verified via
+`[longcat-cfg-logits]`/`CFG codes0=` audit log (`LONGCAT_AUDIO_DEBUG=1`):
+parent+twin combine every single step with zero desync warnings for the
+runs tested — the CFG *mechanism* itself is wired correctly.
+
+**Bug found and fixed**: `cfg_scale=1.0` (mathematically forces
+`combined = cond`, i.e. no CFG effect — a control case) produced
+"recognizable but imperfect" content (described as "some lions"); any
+`cfg_scale > 1.0` (tried `1.5` and `3.0`) collapsed to a uniform grey image,
+**not gradually** — 1.5 was just as broken as 3.0. Diagnostic
+(`[longcat-cfg-logits]`, dumps `cond`/`uncond`/`combined` logit stats)
+showed the `cond`/`uncond` delta was *small* (~0.2–0.6 out of a ~40-wide
+logit range) — ruling out "amplification blowup" as the mechanism. The real
+signature: at `cfg_scale=1.5`, the level-0 argmax was **frozen on a single
+class for every logged step**, vs. genuine per-position variation at
+`cfg_scale=1.0`. Interpretation: CFG's small perturbation doesn't flip the
+top logit, but reshapes probability mass over near-tied candidates enough to
+shift what `do_sample`/top-k/top-p actually draws; since visual sampling had
+`repetition_penalty=1.0` (no penalty) by default, an early draw that nudges
+off-distribution has nothing pulling it back and the autoregressive loop
+self-reinforces into a repeated/flat code — a discrete-autoregressive CFG
+failure mode, distinct from the continuous-diffusion CFG intuition. Fix:
+`LONGCAT_VISUAL_REP_PENALTY` env override (default stays the reference's
+`1.0`); testing with `1.5` broke the frozen-argmax pattern (verified: argmax
+now varies step to step) and produced a structured, non-grey image.
+
+**Still open — prompt adherence**: with the collapse fixed, the image is
+coherent and structured but doesn't match the prompt ("请生成一张图片，内容是
+一只猫" / "generate a picture of a cat" → user-reported result: "a painting
+with flowers and stuff", no cat). Same *shape* of symptom as the text
+finding above (coherent but generic/off-target), and the `cond`/`uncond`
+logit delta being small in the first place (weak differentiation from the
+prompt) is consistent with the same shared upstream cause suspected for
+text — likely the same backbone-level divergence the per-layer RMS bisect
+(see Text section) is chasing. Not confirmed; the two investigations hadn't
+been unified before the pod was preempted.
+
+### Environment notes learned the hard way
+
+- **Persistent shell state bites twice**: this pod's tmux session is one
+  continuous bash shell across the whole debugging pass — `export
+  LONGCAT_NGRAM_DISABLE=1` (or `LONGCAT_CFG_SCALE`, etc.) set for one A/B
+  test silently persists into the *next* command if not explicitly
+  `unset`. Caused at least one contaminated run (a logits-dump test
+  accidentally ran with ngram fusion still disabled from an earlier test).
+  Always `unset` every `LONGCAT_*` debug env var at the start of a script,
+  or `echo` them back before trusting a run's output.
+- **The reference model needs `device_map="auto"`** for any raw
+  `transformers` script — the full model does not fit on a single 80GB GPU.
+  A plain `.to("cuda")` OOMs after checkpoint loading, mid-`.to()` call.
+- **The reference's `forward()` is not directly callable** — LongCat-Next's
+  own remote code reads `multimodal_generation_status` (an object only
+  `generate()`'s internal loop constructs) even for a single forward pass.
+  Use `model.generate(..., max_new_tokens=1, output_logits=True,
+  return_dict_in_generate=True)` to get pre-sampling logits instead of
+  calling the model directly.
+- **`transformers` version conflict between vllm-omni and the raw
+  reference**: vllm/vllm-omni's own resolution pins `transformers==5.14.1`;
+  the checkpoint's remote code (`Qwen2RMSNorm` import in
+  `modular_longcat_next_visual.py`) only resolves against an older
+  `transformers`. `4.57.1` works. Two options: a separate venv just for
+  reference comparisons (safest, but needs its own `flash_attn` rebuilt —
+  slow), or temporarily swap `transformers` inside the *existing* venv
+  (fast, since `flash_attn` is already built there and isn't
+  version-sensitive to the pure-Python `transformers` package) and swap
+  back to `5.14.1` immediately after — **do not forget the swap-back**, or
+  the next vllm-omni run fails with `ImportError: Support for Transformers
+  v4 is deprecated and was removed in vLLM v0.24.0`.
+- **RunPod's SSH proxy (`ssh.runpod.io`) requires a PTY for everything** —
+  a non-interactive `ssh host 'command'` (needed for scp-style file pulls or
+  piping a heredoc via stdin) silently fails or drops to an interactive
+  shell instead of running the command; `ssh -tt` doesn't fix it either for
+  piped/redirected use. The only reliable channel found was the existing
+  interactive tmux session (`send-keys` to type commands, `capture-pane` to
+  read output). To pull a binary file (e.g. a generated PNG) back to a
+  local machine without direct scp access: `base64 -w0 file` inside the
+  tmux pane between unique start/end markers, `tmux capture-pane -p -J`
+  (the `-J` join-wrapped-lines flag is required — without it, `base64`'s
+  long single line gets fragmented across the pane's physical terminal
+  width and corrupts on decode), then locally `base64 -d`. Also increase
+  tmux's `history-limit` (`tmux set-option -g history-limit 200000`) before
+  dumping anything long — the default (found to be `50000` on this setup)
+  can silently truncate the *front* of a long base64 blob out of scrollback
+  before it's captured.
+- **A "connection to ssh.runpod.io closed" followed by a different
+  container hostname on reconnect means the pod's container was recreated**
+  (community-cloud preemption, an OOM-kill at the host level, or similar) —
+  `/workspace` (the persistent volume) survives, but `/root` (the venv,
+  `uv`'s own install, the flash-attn build) does not. Check
+  `hostname`/prompt hostname after any reconnect before assuming the venv
+  from before is still there; `uv pip list` returning nothing is the
+  fastest confirmation. Community cloud pods can also fully stop
+  (`status: EXITED` via the RunPod API) without any prompt-visible warning
+  mid-session — this is the tradeoff of choosing community over secure
+  cloud pricing.
