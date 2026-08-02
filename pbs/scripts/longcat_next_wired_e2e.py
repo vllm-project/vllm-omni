@@ -63,7 +63,7 @@ def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
 
     sampling_params = SamplingParams(
         max_tokens=2048,
-        temperature=0.2,
+        temperature=0.4,
         top_k=20,
         top_p=0.85,
         repetition_penalty=1.1,
@@ -137,25 +137,48 @@ def test_audio(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dic
     return result
 
 
-def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int) -> dict:
+def test_image(model_path: str, llm: Omni, out_dir: str, num_stages: int,
+               token_w: int = 37, token_h: int = 37) -> dict:
     result: dict = {"modality": "image"}
 
+    # Any-resolution prefix: the reference's visual_generation_config inserts
+    # "<longcat_img_token_size>{h} {w}</longcat_img_token_size>" right before
+    # <longcat_img_start> at visual entry (its `anyres_prefix` custom param),
+    # and the checkpoint's own img_gen test cases carry it in the prompt too.
+    # Without it the model never learns the requested canvas and the image
+    # content drifts from the description. token_w/token_h are ALSO threaded
+    # per-request via additional_information (the reference's per-request
+    # input_extra_infos[0]["token_w"]), since image_generation_config is None.
     prompt_text = (
         "<longcat_system>You are a helpful assistant. "
         "<longcat_user>请生成一张图片，内容是一只猫。 "
-        "<longcat_assistant><longcat_img_start>"
+        "<longcat_assistant>"
+        f"<longcat_img_token_size>{token_h} {token_w}</longcat_img_token_size>"
+        "<longcat_img_start>"
     )
     prompt = OmniTextPrompt(
         prompt=prompt_text,
         multi_modal_data=None,
+        additional_information={
+            "token_w": token_w,
+            "token_h": token_h,
+            # Visual CFG scale (generation_config.json custom_params.cfg_scale
+            # = 3.0). The thinker combines the conditional and its uncond twin
+            # streams' depth-head logits with
+            # cfg_scale * (cond - uncond) + uncond.
+            "cfg_scale": 3.0,
+        },
     )
 
     sampling_params = SamplingParams(
         max_tokens=2048,
         temperature=0.4,
-        top_p=0.9,
+        top_k=20,
+        top_p=0.85,
+        repetition_penalty=1.1,
         detokenize=True,
     )
+    result["token_w"], result["token_h"] = token_w, token_h
 
     outputs = llm.generate([prompt], [sampling_params] + [None] * (num_stages - 1))
     result["num_outputs"] = len(outputs)
@@ -217,6 +240,10 @@ def main() -> None:
     parser.add_argument("out_dir", help="Output directory")
     parser.add_argument("--modality", choices=["audio", "image"], default="audio",
                         help="Modality to test (default: audio)")
+    parser.add_argument("--img-token-w", type=int, default=37,
+                        help="Image grid width in tokens (default: 37)")
+    parser.add_argument("--img-token-h", type=int, default=37,
+                        help="Image grid height in tokens (default: 37)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -235,7 +262,10 @@ def main() -> None:
     if args.modality == "audio":
         result = test_audio(args.model_path, llm, args.out_dir, num_stages)
     else:
-        result = test_image(args.model_path, llm, args.out_dir, num_stages)
+        result = test_image(
+            args.model_path, llm, args.out_dir, num_stages,
+            token_w=args.img_token_w, token_h=args.img_token_h,
+        )
 
     print(f"\n[wired-{args.modality}] result: {json.dumps(result, indent=2)}\n")
 

@@ -61,6 +61,9 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
     infer_visual_grid,
 )
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
+
+CFG_VISUAL_SUFFIX = "__cfg_visual"
 
 
 def _ensure_list(ids: Any) -> list[int]:
@@ -69,6 +72,100 @@ def _ensure_list(ids: Any) -> list[int]:
     if hasattr(ids, "tolist"):
         return list(ids.tolist())
     return list(ids)
+
+
+def expand_longcat_cfg_prompts(
+    prompt: Any,
+    sampling_params: Any,
+) -> list[ExpandedPrompt]:
+    """Expand a LongCat-Next image prompt into an unconditional visual twin.
+
+    Visual CFG runs two parallel generation streams on the thinker: the
+    conditional (parent, the user's prompt) and an unconditional copy whose
+    user-instruction is blanked but which keeps the same
+    ``<longcat_img_token_size>{h} {w}</longcat_img_token_size>`` anyres
+    prefix and ``<longcat_img_start>`` entry, so both streams decode the same
+    fixed pixel grid. The model combines the two streams' depth-head logits
+    per step (``cfg_scale * (cond - uncond) + uncond``), mirroring the
+    reference's ``input_ids.repeat(2)`` + zeroed-text uncond copy.
+
+    The reference blanks in *token* space (it repeats the token ids and zeroes
+    the uncond copy's text ids), so token lengths stay exactly equal. We build
+    the uncond at *string* level, which cannot guarantee equal tokenization
+    length, but the model-side twin-sync (same forced visible tokens plus a
+    synced grid position/canvas, see talker_mtp's CFG path in
+    modeling_longcat_next.py) keeps the two streams in lockstep from the
+    first decode step regardless, so the combination is unaffected.
+
+    Triggered only when the prompt actually requests an image (contains
+    ``<longcat_img_start>``), so text/audio prompts expand to nothing.
+
+    Args:
+        prompt: The original user prompt (a string or a TextPrompt-like object
+            with a ``prompt`` field for LongCat-Next).
+        sampling_params: The stage-0 sampling params (inherited by the twin).
+
+    Returns:
+        A single uncond companion, or an empty list when no image is requested.
+    """
+    del sampling_params
+    prompt_str = _prompt_str(prompt)
+    if prompt_str is None:
+        return []
+    if "<longcat_img_start>" not in prompt_str:
+        return []
+
+    uncond_text = _blank_user_turn(prompt_str)
+    if uncond_text == prompt_str:
+        # No user instruction to blank (or parse failed): an identical twin
+        # would yield cond == uncond and a no-op CFG, so skip the expansion.
+        return []
+
+    return [
+        ExpandedPrompt(
+            prompt=uncond_text,
+            role="visual_uncond",
+            request_id_suffix=CFG_VISUAL_SUFFIX,
+        ),
+    ]
+
+
+def _prompt_str(prompt: Any) -> str | None:
+    """Extract the prompt text from a str or a TextPrompt-like object."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, Mapping):
+        text = prompt.get("prompt")
+        if isinstance(text, str):
+            return text
+    text = getattr(prompt, "prompt", None)
+    if isinstance(text, str):
+        return text
+    return None
+
+
+def _blank_user_turn(prompt: str) -> str:
+    """Blank the content of the ``<longcat_user>`` turn, keeping structure.
+
+    The uncond stream must not condition on the user's instruction, but it
+    must keep the system turn, the anyres prefix and the image-entry marker
+    so it decodes the same grid. Everything between ``<longcat_user>`` and
+    the following ``<longcat_assistant>`` is replaced with a single space.
+    Returns the original string when there is no user turn to blank.
+    """
+    user_marker = "<longcat_user>"
+    assistant_marker = "<longcat_assistant>"
+    user_idx = prompt.find(user_marker)
+    if user_idx < 0:
+        return prompt
+    body_start = user_idx + len(user_marker)
+    body_end = prompt.find(assistant_marker, body_start)
+    if body_end < 0:
+        return prompt
+    body = prompt[body_start:body_end]
+    if not body.strip():
+        return prompt
+    return prompt[:body_start] + " " + prompt[body_end:]
 
 
 def _generated_ids(source_output: Any) -> list[int]:

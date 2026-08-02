@@ -61,6 +61,7 @@ class _StubModel(nn.Module):
     _dbg_step = staticmethod(M._dbg_step)
     _sample_audio_code = M._sample_audio_code
     _sample_depth_head = M._sample_depth_head
+    _sample_cfg_visual_codes = M._sample_cfg_visual_codes
     _ensure_replicated_audio_code_embedding = M._ensure_replicated_audio_code_embedding
     _ensure_audio_code_embed_module = M._ensure_audio_code_embed_module
     _ensure_replicated_visual_code_embedding = M._ensure_replicated_visual_code_embedding
@@ -359,7 +360,14 @@ def test_empty_batch_short_circuits(model):
 
 
 def _visual_state(**over):
-    base = {"gen_step": 3, "token_w": 4, "ext_id": IMG_PAD_TOKEN_ID, "terminal": False}
+    base = {
+        "gen_step": 3,
+        "token_w": 4,
+        "token_h": 4,
+        "cfg_scale": 3.0,
+        "ext_id": IMG_PAD_TOKEN_ID,
+        "terminal": False,
+    }
     base.update(over)
     return base
 
@@ -437,6 +445,123 @@ def test_visual_mtp_masks_end_sentinel(model):
     assert int(codes[0, 0]) != VISUAL_CODEBOOK_SIZES[0], "sentinel must be masked"
     assert int(codes[0, 0]) == 0
     assert state["terminal"] is False
+
+
+# ------------------------------------------------------------------ #
+# talker_mtp -- visual CFG twin-stream combination
+# ------------------------------------------------------------------ #
+
+
+def _call_visual_cfg(model, parent_state=None, twin_state=None):
+    """Run talker_mtp over a parent + its ``__cfg_visual`` twin batch."""
+    if parent_state is None:
+        parent_state = _visual_state()
+    if twin_state is None:
+        twin_state = _visual_state()
+    model._visual_gen["r0"] = parent_state
+    model._visual_gen["r0__cfg_visual"] = twin_state
+    ext_id = parent_state.get("ext_id", IMG_PAD_TOKEN_ID)
+    return M.talker_mtp(
+        model,
+        input_ids=torch.tensor([ext_id, ext_id], dtype=torch.long),
+        inputs_embeds=torch.zeros(2, HIDDEN),
+        last_talker_hidden=torch.zeros(2, HIDDEN),
+        text_step=torch.zeros(2, HIDDEN),
+        req_ids=["r0", "r0__cfg_visual"],
+    )
+
+
+def test_visual_cfg_twin_shares_combined_codes(model):
+    """A parent + its uncond twin batched together must sample ONCE and give
+    both streams the same codes (lockstep), with the twin's grid state synced
+    to the parent's so both advance/terminate on the same step."""
+    parent_state = _visual_state(gen_step=3)
+    twin_state = _visual_state(gen_step=3)
+    embeds, codes = _call_visual_cfg(model, parent_state, twin_state)
+
+    assert embeds.shape == (2, HIDDEN)
+    assert codes.shape == (2, len(VISUAL_CODEBOOK_SIZES))
+    # Both streams share the combined sample.
+    assert torch.equal(codes[0], codes[1]), "cond + uncond must emit the same codes"
+    assert (codes >= 0).all(), "a real-pixel step should be kept, not -1"
+    # Twin's grid state mirrors the parent's.
+    assert twin_state["gen_step"] == parent_state["gen_step"]
+    assert twin_state["ext_id"] == parent_state["ext_id"]
+    assert twin_state["token_w"] == parent_state["token_w"]
+    assert twin_state["token_h"] == parent_state["token_h"]
+    assert twin_state["terminal"] == parent_state["terminal"]
+
+
+def test_visual_cfg_cfg_scale_combines_logits(model):
+    """cfg_scale * (cond - uncond) + uncond must steer sampling: rig cond to
+    peak at code A and uncond at code B; greedy argmax over the combined
+    logits must pick A (the conditional wins for cfg_scale > 1)."""
+    def rigged_head(hidden, tokens, emb_layers, level):
+        logits = torch.zeros(1, VISUAL_CODEBOOK_SIZES[level])
+        if level == 0:
+            # hidden.row0 == parent (cond), row1 == twin (uncond): the stub
+            # feeds both streams through the same head; distinguish by the
+            # leading scalar of the hidden vector.
+            is_cond = bool(int(hidden[0, 0] == 1.0))
+            if is_cond:
+                logits[0, 5] = 1.0  # cond peaks at code 5
+            else:
+                logits[0, 9] = 1.0  # uncond peaks at code 9
+        return logits
+
+    model.visual_head = rigged_head
+    parent_state = _visual_state(gen_step=3, cfg_scale=3.0)
+    twin_state = _visual_state(gen_step=3, cfg_scale=3.0)
+    model._visual_gen["r0"] = parent_state
+    model._visual_gen["r0__cfg_visual"] = twin_state
+    # Distinguish the two hidden rows so the rigged head can tell streams apart.
+    hidden = torch.zeros(2, HIDDEN)
+    hidden[0, 0] = 1.0  # parent (cond)
+    hidden[1, 0] = 2.0  # twin (uncond)
+    _, codes = M.talker_mtp(
+        model,
+        input_ids=torch.tensor([IMG_PAD_TOKEN_ID, IMG_PAD_TOKEN_ID], dtype=torch.long),
+        inputs_embeds=torch.zeros(2, HIDDEN),
+        last_talker_hidden=hidden,
+        text_step=torch.zeros(2, HIDDEN),
+        req_ids=["r0", "r0__cfg_visual"],
+        do_sample=False,
+    )
+    assert int(codes[0, 0]) == 5, "cfg_scale > 1 must make the conditional stream win"
+
+
+def test_visual_cfg_twin_alone_falls_back_to_independent(model):
+    """A twin in the batch without its parent (parent not yet visual, or a
+    desync) must fall back to independent sampling without crashing."""
+    twin_state = _visual_state(gen_step=3)
+    model._visual_gen["r0__cfg_visual"] = twin_state
+    embeds, codes = M.talker_mtp(
+        model,
+        input_ids=torch.tensor([IMG_PAD_TOKEN_ID], dtype=torch.long),
+        inputs_embeds=torch.zeros(1, HIDDEN),
+        last_talker_hidden=torch.zeros(1, HIDDEN),
+        text_step=torch.zeros(1, HIDDEN),
+        req_ids=["r0__cfg_visual"],
+    )
+    assert codes.shape == (1, len(VISUAL_CODEBOOK_SIZES))
+    assert (codes >= 0).all()
+
+
+def test_visual_cfg_parent_without_twin_falls_back_to_independent(model):
+    """A parent visual row with no twin in the batch must sample independently
+    (unchanged no-CFG behavior)."""
+    state = _visual_state(gen_step=3)
+    model._visual_gen["r0"] = state
+    embeds, codes = M.talker_mtp(
+        model,
+        input_ids=torch.tensor([IMG_PAD_TOKEN_ID], dtype=torch.long),
+        inputs_embeds=torch.zeros(1, HIDDEN),
+        last_talker_hidden=torch.zeros(1, HIDDEN),
+        text_step=torch.zeros(1, HIDDEN),
+        req_ids=["r0"],
+    )
+    assert codes.shape == (1, len(VISUAL_CODEBOOK_SIZES))
+    assert (codes >= 0).all()
 
 
 def test_audio_mtp_masks_nonzero_level_sentinels(model):

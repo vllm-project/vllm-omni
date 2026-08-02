@@ -34,6 +34,12 @@ LONGCAT_NEXT_PIPELINE = PipelineConfig(
             # "latent", so this field can keep its correct modality tag.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
+            # Visual CFG: expand image prompts into an unconditional twin
+            # stream on the thinker (see expand_longcat_cfg_prompts). Only
+            # fires for prompts containing <longcat_img_start>, and only when
+            # final_stage_id > 0 (multi-stage pipelines); single-stage
+            # thinker-only debugging never expands.
+            prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -88,6 +94,7 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
             # "latent", so this field can keep its correct modality tag.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
+            prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
         ),
     ),
 )
@@ -128,6 +135,7 @@ LONGCAT_NEXT_THINKER_AUDIO_PIPELINE = PipelineConfig(
             # "latent", so this field can keep its correct modality tag.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
+            prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -187,6 +195,7 @@ LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE = PipelineConfig(
             # "latent", not "audio".
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
+            prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
         ),
         StagePipelineConfig(
             stage_id=1,

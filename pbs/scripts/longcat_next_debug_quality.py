@@ -126,13 +126,14 @@ def run_text(llm: Omni, model_path: str, out: dict) -> None:
     )
     # Same (temperature, top_k, top_p) profile as run_audio's thinker-stream
     # params below, which pairs it with repetition_penalty=1.1 -- matching
-    # the reference repo's spk_syn/aud_2_aud test_cases.yaml sampling_params
-    # exactly. Omitting it here left this call on vLLM's repetition_penalty
-    # default of 1.0 (no penalty), which is why low-temperature decoding ran
-    # into a repeated-token loop (garbled text, finish_reason=length) once
-    # generation got past the first sentence.
+    # the reference model's generation_config.json text block
+    # (do_sample=true, temperature=0.4, top_k=20, top_p=0.85,
+    # repetition_penalty=1.1). Omitting repetition_penalty here left this
+    # call on vLLM's default of 1.0 (no penalty), which is why low-temperature
+    # decoding ran into a repeated-token loop (garbled text,
+    # finish_reason=length) once generation got past the first sentence.
     params = SamplingParams(
-        max_tokens=256, temperature=0.2, top_k=20, top_p=0.85,
+        max_tokens=256, temperature=0.4, top_k=20, top_p=0.85,
         repetition_penalty=1.1, detokenize=True,
     )
     outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
@@ -156,15 +157,26 @@ def run_text(llm: Omni, model_path: str, out: dict) -> None:
     print(f"[debug] text generated: {text!r}")
 
 
-def run_image(llm: Omni, model_path: str, out: dict) -> None:
+def run_image(llm: Omni, model_path: str, out: dict,
+              token_w: int = 37, token_h: int = 37) -> None:
     prompt = OmniTextPrompt(
         prompt=(
             "<longcat_system>You are a helpful assistant. "
             "<longcat_user>请生成一张图片，内容是一只猫。 "
-            "<longcat_assistant><longcat_img_start>"
-        )
+            "<longcat_assistant>"
+            f"<longcat_img_token_size>{token_h} {token_w}</longcat_img_token_size>"
+            "<longcat_img_start>"
+        ),
+        additional_information={
+            "token_w": token_w,
+            "token_h": token_h,
+            "cfg_scale": 3.0,
+        },
     )
-    params = SamplingParams(max_tokens=2048, temperature=0.4, top_p=0.9, detokenize=True)
+    params = SamplingParams(
+        max_tokens=2048, temperature=0.4, top_k=20, top_p=0.85,
+        repetition_penalty=1.1, detokenize=True,
+    )
     outputs = llm.generate([prompt], [params] + [None] * (llm.num_stages - 1))
     out["num_outputs"] = len(outputs)
     thinker = _thinker_output(outputs)
@@ -207,7 +219,7 @@ def run_audio(llm: Omni, model_path: str, out: dict) -> None:
     prompt = OmniTextPrompt(prompt=prompt_text, multi_modal_data={"audio": (audio_signal, sr)})
     params = SamplingParams(
         max_tokens=2048,
-        temperature=0.2,
+        temperature=0.4,
         top_k=20,
         top_p=0.85,
         repetition_penalty=1.1,

@@ -77,6 +77,14 @@ logger = init_logger(__name__)
 
 _DEFAULT_PAD_TOKEN_ID = 3  # generation_config.json; config.json omits it
 
+# Visual CFG twin-stream suffix: the companion request admitted by the
+# engine's CFG expansion carries request_id = f"{parent_id}__cfg_visual"
+# (see stage_input_processors/longcat_next.py::expand_longcat_cfg_prompts).
+# The model uses it to pair the unconditional stream with its parent so it can
+# combine the two depth-head logit streams per step.
+_CFG_VISUAL_SUFFIX = "__cfg_visual"
+_DEFAULT_CFG_SCALE = 3.0  # generation_config.json custom_params.cfg_scale
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     LongcatNextMultiModalProcessor,
@@ -541,6 +549,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def _advance_visual_gen(
         self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
         token_w: int | None = None, token_h: int | None = None,
+        cfg_scale: float | None = None,
         decode_eligible: bool = True,
     ) -> dict[str, Any]:
         """Update image-gen state based on the last emitted visible token.
@@ -578,10 +587,42 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         """
         update: dict[str, Any] = {}
         if last_token == IMG_START_TOKEN_ID:
+            # The checkpoint's visual_generation_config defaults to a 37x37
+            # token grid, but the real canvas is supplied per-request via
+            # additional_information (token_w/token_h) AND via the
+            # "<longcat_img_token_size>{h} {w}</longcat_img_token_size>"
+            # anyres prefix in the prompt. A missing token_w/token_h means
+            # the caller also omitted the prefix, so the model is generating
+            # without knowing its canvas -- the #1 cause of image content
+            # drifting from the description.
+            is_cfg_twin = request_id.endswith(_CFG_VISUAL_SUFFIX)
+            if token_w is None or token_h is None:
+                # The uncond CFG twin has no additional_information of its
+                # own; inherit the parent's canvas (and cfg_scale) so both
+                # streams decode the same grid. If the parent's state is not
+                # visible yet (batch ordering), the defaults below apply and
+                # talker_mtp's CFG sync corrects the twin on the first
+                # combined step anyway.
+                parent_id = request_id[: -len(_CFG_VISUAL_SUFFIX)]
+                parent_state = self._visual_gen.get(parent_id)
+                if is_cfg_twin and parent_state is not None:
+                    token_w = parent_state.get("token_w")
+                    token_h = parent_state.get("token_h")
+                    cfg_scale = parent_state.get("cfg_scale", cfg_scale)
+                if (token_w is None or token_h is None) and not is_cfg_twin:
+                    logger.warning(
+                        "[longcat-image] req=%s entered image gen WITHOUT "
+                        "token_w/token_h; falling back to %sx%s. Add "
+                        "additional_information={'token_w': ..., 'token_h': ...} "
+                        "and the <longcat_img_token_size>{h} {w}</longcat_img_token_size> "
+                        "prompt prefix to match the reference behavior.",
+                        request_id, self._default_token_w, self._default_token_h,
+                    )
             self._visual_gen[request_id] = {
                 "gen_step": 0,
                 "token_w": token_w or self._default_token_w,
                 "token_h": token_h or self._default_token_h,
+                "cfg_scale": cfg_scale if cfg_scale is not None else _DEFAULT_CFG_SCALE,
                 "ext_id": IMG_PAD_TOKEN_ID,
                 "terminal": False,
             }
@@ -685,9 +726,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             additional_information = info
         token_w = additional_information.get("token_w")
         token_h = additional_information.get("token_h")
+        cfg_scale = additional_information.get("cfg_scale")
         update_dict.update(self._advance_visual_gen(
             request_id, last_token, device=input_ids.device, dtype=self.dtype,
-            token_w=token_w, token_h=token_h, decode_eligible=decode_eligible,
+            token_w=token_w, token_h=token_h, cfg_scale=cfg_scale,
+            decode_eligible=decode_eligible,
         ))
 
         return input_ids, out.to(self.dtype), update_dict
@@ -1096,6 +1139,72 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         tp_group.broadcast(codes_row, src=0)
         return codes_row
 
+    def _sample_cfg_visual_codes(
+        self,
+        code_embed: nn.Module,
+        offset_vals: torch.Tensor,
+        num_levels: int,
+        cond_hidden: torch.Tensor,
+        uncond_hidden: torch.Tensor,
+        rank: int,
+        tp_group: Any,
+        device: torch.device,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float = 1.0,
+        past_codes: torch.Tensor | None = None,
+        cfg_scale: float = _DEFAULT_CFG_SCALE,
+    ) -> torch.Tensor:
+        """Sample visual codes with classifier-free guidance from a cond/uncond pair.
+
+        Mirrors _sample_depth_head's rank-0+broadcast structure (the
+        CasualDepthTransformerHead's hardcoded cuda:0 workaround), but drives
+        the autoregressive depth loop with the reference's CFG combination: at
+        every level,
+
+            combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
+
+        where cond_logits come from the parent's hidden state and uncond_logits
+        from the twin's (separate KV cache, so the uncond stream never attends
+        to the user instruction). Both streams share one sampled code per
+        level, keeping the two streams locked to the same pixel sequence.
+        Returns the broadcast codes_row [num_levels] visible on every rank.
+        """
+        codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
+        if rank == 0:
+            sampled_codes = []
+            base = offset_vals[0]
+            cond_hid = cond_hidden.to(dtype=self.dtype)
+            uncond_hid = uncond_hidden.to(dtype=self.dtype)
+            head = self.visual_head
+            cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
+            for level in range(num_levels):
+                cond_logits = head(cond_hid, cum_ids.to(cond_hid.device), code_embed, level)[0]
+                uncond_logits = head(uncond_hid, cum_ids.to(uncond_hid.device), code_embed, level)[0]
+                combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
+                sentinel_idx = None
+                if level == 0:
+                    # Level-0 end-of-image class, masked per the reference
+                    # (output_processor.py:312) so the image can never
+                    # self-terminate early; the grid bound is the terminator.
+                    sentinel_idx = self.visual_codebook_sizes[0]
+                if sentinel_idx is not None and sentinel_idx < combined.shape[-1]:
+                    combined = combined.clone()
+                    combined[sentinel_idx] = float("-inf")
+                code = self._sample_audio_code(
+                    combined, do_sample=do_sample, temperature=temperature,
+                    top_k=top_k, top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    past_codes=None if past_codes is None else past_codes[:, level],
+                )
+                sampled_codes.append(int(code))
+                cum_ids[0, level] = code + offset_vals[level] - base
+            codes_row = torch.tensor(sampled_codes, device=device, dtype=torch.long)
+        tp_group.broadcast(codes_row, src=0)
+        return codes_row
+
     def talker_mtp(
         self,
         input_ids: torch.Tensor,
@@ -1178,6 +1287,28 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # which modality any given row in this batch is actually using.
         audio_code_embed = self._ensure_audio_code_embed_module(device)
         visual_code_embed = self._ensure_visual_code_embed_module(device)
+
+        # Visual CFG twin pairing. The engine's prompt expansion admits one
+        # unconditional companion per image request with
+        # request_id = f"{parent_id}__cfg_visual" (see
+        # expand_longcat_cfg_prompts). The two streams share the same batch
+        # (admitted with affinity), each with its OWN KV cache / hidden state,
+        # so when both are in visual-gen state in this step we can combine
+        # their depth-head logits per the reference's CFG formula. All ranks
+        # derive the same pairing from the same req_ids/states, keeping the
+        # rank-0 broadcast counts aligned.
+        row_of: dict[str, int] = {}
+        for i, rid in enumerate(req_ids):
+            if i < batch_size:
+                row_of[rid] = i
+        cfg_parent_of_twin: dict[str, str] = {}
+        for rid in req_ids:
+            if rid.endswith(_CFG_VISUAL_SUFFIX):
+                cfg_parent_of_twin[rid[: -len(_CFG_VISUAL_SUFFIX)]] = rid
+
+        # Rows whose all_codes/all_embeds were written by a parent's combined
+        # CFG iteration (both the parent and its twin rows).
+        cfg_handled_rows: set[int] = set()
 
         for row in range(batch_size):
             req_id = req_ids[row] if row < len(req_ids) else f"row_{row}"
@@ -1345,6 +1476,144 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 visual_codebook_sizes = self.visual_codebook_sizes
                 visual_num_levels = len(visual_codebook_sizes)
+
+                # This row's codes/embedding were already written by its
+                # parent's combined CFG iteration.
+                if row in cfg_handled_rows:
+                    continue
+
+                # Resolve the (parent, twin) pair this visual row belongs to,
+                # if any. Only combine when BOTH streams are present in this
+                # batch AND both are non-terminal visual-gen rows; otherwise
+                # fall back to independent sampling (identical to the
+                # no-CFG path).
+                parent_req_id: str | None = None
+                twin_req_id: str | None = None
+                if req_id in cfg_parent_of_twin:
+                    parent_req_id, twin_req_id = req_id, cfg_parent_of_twin[req_id]
+                elif req_id.endswith(_CFG_VISUAL_SUFFIX):
+                    parent_req_id, twin_req_id = req_id[: -len(_CFG_VISUAL_SUFFIX)], req_id
+
+                p_row: int | None = None
+                t_row: int | None = None
+                if parent_req_id is not None and twin_req_id is not None:
+                    p_row = row_of.get(parent_req_id)
+                    t_row = row_of.get(twin_req_id)
+                p_state = self._visual_gen.get(parent_req_id) if parent_req_id is not None else None
+                t_state = self._visual_gen.get(twin_req_id) if twin_req_id is not None else None
+                both_visual_active = (
+                    parent_req_id is not None
+                    and p_row is not None and t_row is not None
+                    and p_state is not None and t_state is not None
+                    and not bool(p_state.get("terminal", False))
+                    and not bool(t_state.get("terminal", False))
+                )
+
+                # Diagnostic for CFG desync: this row belongs to a cond/uncond
+                # pair, but the two streams aren't both active this step, so
+                # the code below falls back to independent (non-CFG) sampling
+                # for whichever side IS present. That fallback is intentional
+                # (the parent/twin are two independently-scheduled engine
+                # requests linked only by affinity to the same replica, not a
+                # hard same-step scheduling guarantee like the reference's
+                # own group_size=2 batching contract -- see
+                # expand_longcat_cfg_prompts's docstring), but it was
+                # previously silent: nothing distinguished "CFG combined
+                # every step" from "CFG never actually combined" short of
+                # noticing degraded image quality. Logged unconditionally
+                # (not gated behind _audio_debug) since it only fires on an
+                # actual desync, not every step -- a real anomaly signal for
+                # any CFG-enabled request, not per-step noise.
+                if parent_req_id is not None and not both_visual_active:
+                    logger.warning(
+                        "[longcat-image] CFG desync: req=%s parent=%s(row=%s,state=%s,terminal=%s) "
+                        "twin=%s(row=%s,state=%s,terminal=%s) -- falling back to independent "
+                        "(non-CFG) sampling for this step",
+                        req_id,
+                        parent_req_id, p_row, p_state is not None,
+                        bool(p_state.get("terminal", False)) if p_state is not None else None,
+                        twin_req_id, t_row, t_state is not None,
+                        bool(t_state.get("terminal", False)) if t_state is not None else None,
+                    )
+
+                if both_visual_active and row == p_row:
+                    # ---- combined CFG path (drives both streams) ----
+                    p_last_hidden = (
+                        last_talker_hidden[p_row:p_row + 1]
+                        if p_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
+                    )
+                    t_last_hidden = (
+                        last_talker_hidden[t_row:t_row + 1]
+                        if t_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
+                    )
+                    p_past = p_state.get("past_codes")
+                    p_past_t = torch.stack(p_past).to(device) if p_past else None
+                    cfg_scale = float(p_state.get("cfg_scale", _DEFAULT_CFG_SCALE))
+                    codes_row = self._sample_cfg_visual_codes(
+                        visual_code_embed, self.visual_offset_vals, visual_num_levels,
+                        p_last_hidden, t_last_hidden, rank, tp_group, device,
+                        do_sample, temperature, visual_top_k, visual_top_p,
+                        visual_rep_penalty, p_past_t, cfg_scale,
+                    )
+
+                    deoff = int(codes_row[0].item())
+                    eoc_terminal = deoff >= visual_codebook_sizes[0]
+                    frame_kept = not is_row_boundary and not eoc_terminal
+                    is_terminal = eoc_terminal
+                    self._dbg_sampled += 1
+                    if frame_kept:
+                        self._dbg_kept += 1
+                        p_state.setdefault("past_codes", []).append(codes_row.detach().cpu())
+                    if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
+                        logger.info(
+                            "[longcat-image] req=%s mtp step=%d CFG codes0=%d kept=%s "
+                            "(row_boundary=%s eoc=%s) codes=%s sampled=%d kept_total=%d",
+                            req_id, gen_step, deoff, frame_kept, is_row_boundary,
+                            eoc_terminal, codes_row.tolist(), self._dbg_sampled, self._dbg_kept,
+                        )
+
+                    # Both streams share the combined sample (lockstep) and the
+                    # twin's grid state mirrors the parent's so both terminate
+                    # on the same step and compute_logits forces the same
+                    # visible token on both rows. Keys present on the parent's
+                    # state are copied over (defensive: production states
+                    # always carry all of these, but a desynced/older state
+                    # must not crash the sync).
+                    for _sync_key in ("gen_step", "ext_id", "token_w", "token_h"):
+                        if _sync_key in p_state:
+                            t_state[_sync_key] = p_state[_sync_key]
+                    t_state["terminal"] = bool(is_terminal or p_state.get("terminal", False))
+
+                    for rr in (p_row, t_row):
+                        all_codes[rr] = codes_row if frame_kept else torch.full_like(codes_row, -1)
+
+                    # 2-stream next-step embedding, built once from the shared
+                    # codes and applied to both rows (the twin's visible token
+                    # is forced to the same value as the parent's, so reusing
+                    # the parent's text token keeps both streams aligned).
+                    text_tok = input_ids[p_row:p_row + 1]
+                    text_emb = self.model.embed_tokens(text_tok)
+                    if frame_kept and deoff != 0:
+                        offset_codes = (codes_row + self.visual_offset_vals[:visual_num_levels].to(device)).unsqueeze(0)
+                        vision_emb = self._code_embeddings(offset_codes)
+                        vision_emb = self.visual_tokenizer.visual_embedding_layer(vision_emb.to(self.dtype))
+                        next_emb = vision_emb
+                    else:
+                        next_emb = text_emb
+                    for rr in (p_row, t_row):
+                        all_embeds[rr:rr + 1] = next_emb.to(dtype=self.dtype)
+
+                    if is_terminal:
+                        p_state["terminal"] = True
+                    cfg_handled_rows.update({p_row, t_row})
+                    continue
+
+                if both_visual_active and row == t_row:
+                    # Twin processed before its parent in this batch: defer to
+                    # the parent's combined iteration, which writes this row.
+                    cfg_handled_rows.add(t_row)
+                    continue
+
                 past_codes = state.get("past_codes")
                 past_codes_t = (
                     torch.stack(past_codes).to(device) if past_codes else None

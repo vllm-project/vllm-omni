@@ -34,7 +34,13 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    # >= 2 so a request's visual-CFG unconditional twin (admitted with
+    # affinity to its parent) can be batched in the SAME decode step as the
+    # parent -- the model combines the two streams' depth-head logits per
+    # step, which requires both rows in one talker_mtp call. With
+    # max_num_seqs=1 the twin would decode in separate steps and CFG would
+    # silently no-op (twin output is discarded either way).
+    max_num_seqs: 2
     tensor_parallel_size: 4
     devices: "0,1,2,3"
     trust_remote_code: true
