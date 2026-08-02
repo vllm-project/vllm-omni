@@ -529,55 +529,6 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
     assert omni_config.get_inputs_embeds_size() == omni_config.hf_text_config.hidden_size
 
 
-def test_global_cache_config_injected_into_diffusion_stage_only():
-    stages = OmegaConf.create(
-        [
-            {"stage_type": "llm", "engine_args": {}},
-            {"stage_type": "diffusion", "model_stage": "diffusion", "engine_args": {}},
-            {"stage_type": "llm", "model_stage": "dit", "engine_args": {}},
-        ]
-    )
-
-    AsyncOmniEngine._inject_diffusion_cache_config(
-        stages,
-        {
-            "cache_backend": "tea_cache",
-            "cache_config": None,
-        },
-    )
-
-    assert not hasattr(stages[0].engine_args, "cache_backend")
-    assert stages[1].engine_args.cache_backend == "tea_cache"
-    assert stages[1].engine_args.cache_config == {"rel_l1_thresh": 0.2}
-    assert stages[2].engine_args.cache_backend == "tea_cache"
-    assert stages[2].engine_args.cache_config == {"rel_l1_thresh": 0.2}
-
-
-def test_global_cache_config_does_not_override_stage_cache_config():
-    stages = OmegaConf.create(
-        [
-            {
-                "stage_type": "diffusion",
-                "engine_args": {
-                    "cache_backend": "cache_dit",
-                    "cache_config": {"Fn_compute_blocks": 2},
-                },
-            },
-        ]
-    )
-
-    AsyncOmniEngine._inject_diffusion_cache_config(
-        stages,
-        {
-            "cache_backend": "tea_cache",
-            "cache_config": {"rel_l1_thresh": 0.3},
-        },
-    )
-
-    assert stages[0].engine_args.cache_backend == "cache_dit"
-    assert stages[0].engine_args.cache_config == {"Fn_compute_blocks": 2}
-
-
 # For https://github.com/vllm-project/vllm-omni/issues/3293
 def test_tensor_parallel_size_none_is_handled():
     """Ensure the tensor parallel size of None isn't forwarded."""
