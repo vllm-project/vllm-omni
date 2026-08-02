@@ -250,6 +250,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self._ctx_len = self._ngram_n - 1
         self._eos_id = int(getattr(hf, "eos_token_id", 2))
         self._ngram_ctx: dict[str, torch.Tensor] = {}
+        self._ngram_audited = False
+        self._ngram_disabled = int(os.environ.get("LONGCAT_NGRAM_DISABLE", "0")) != 0
         self._max_ctx_entries = 4 * max(
             int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64
         )
@@ -446,6 +448,23 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if len(self._ngram_ctx) > self._max_ctx_entries:
             for stale in list(self._ngram_ctx)[: len(self._ngram_ctx) - self._max_ctx_entries]:
                 self._ngram_ctx.pop(stale, None)
+
+        # n-gram audit: the reference runs the SAME kernel over the full
+        # prompt in one call; this port streams it span-by-span with a rolling
+        # _ctx_len left context. A mismatch in that streaming (fresh ctx
+        # init, _neg_eos sign convention, or span boundaries) would shift the
+        # fused embedding for every token and produce "coherent but generic"
+        # text even with identical input_ids. Log the first span's computed
+        # oe_ids (token x num_embedders) so a pod run can diff them against
+        # the reference kernel's output for the same prompt.
+        if self._audio_debug and fresh and not self._ngram_audited:
+            self._ngram_audited = True
+            logger.info(
+                "[longcat-ngram] req=%s first-span oe_ids[:4]=%s ngram_n=%d ctx_len=%d "
+                "num_embedders=%d",
+                request_id, oe_ids[:4].tolist(), self._ngram_n, self._ctx_len,
+                int(oe_ids.shape[1]),
+            )
         return oe_ids.long()
 
     def _advance_audio_gen(
@@ -700,10 +719,19 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         boundary = ignored | (input_ids == 0)
         table_ids = torch.where(boundary, torch.full_like(input_ids, -1), input_ids)
 
-        oe_ids = self._span_oe_ids(request_id, table_ids, fresh=num_computed == 0)
-        fused = self.model.ngram_embeddings.embed_batched(input_ids, oe_ids)
-        word = self.model.embed_tokens(input_ids)
-        out = torch.where(ignored.unsqueeze(-1), word, fused)
+        # A/B bypass (LONGCAT_NGRAM_DISABLE=1): pure word embeddings for every
+        # token, no n-gram fusion. If the port-with-ngram matches the
+        # reference-with-ngram and only the *with-ngram* variant drifts, the
+        # divergence is in this fused path (hashing or streaming), not in
+        # attention/MLA. Compare against a reference run with its own ngram
+        # disabled; matching outputs there isolates the fused path as the bug.
+        if self._ngram_disabled:
+            out = self.model.embed_tokens(input_ids)
+        else:
+            oe_ids = self._span_oe_ids(request_id, table_ids, fresh=num_computed == 0)
+            fused = self.model.ngram_embeddings.embed_batched(input_ids, oe_ids)
+            word = self.model.embed_tokens(input_ids)
+            out = torch.where(ignored.unsqueeze(-1), word, fused)
 
         # Placeholder positions carry the multimodal embeddings already merged
         # into input_embeds by the runner's standard mm path.
