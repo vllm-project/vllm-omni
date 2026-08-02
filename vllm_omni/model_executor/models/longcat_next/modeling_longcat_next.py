@@ -252,6 +252,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self._ngram_ctx: dict[str, torch.Tensor] = {}
         self._ngram_audited = False
         self._ngram_disabled = int(os.environ.get("LONGCAT_NGRAM_DISABLE", "0")) != 0
+        self._logits_audited = False
         self._max_ctx_entries = 4 * max(
             int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64
         )
@@ -1741,6 +1742,31 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        # Logits audit: capture the first single-token decode step's top-k for
+        # a pure-text request (no audio/visual gen active). All the cheap
+        # checks pass (tokenization, ngram, MLA/RoPE config, weights), so the
+        # divergence must live in the forward pass or the sampler. Dumping the
+        # raw pre-sampling logits lets a pod run diff them directly against
+        # the reference HF model's logits for the identical input_ids -- the
+        # two possibilities are (a) logits differ -> forward-pass bug, or (b)
+        # logits match but samples diverge -> sampler-param application.
+        if (
+            self._audio_debug
+            and not self._logits_audited
+            and not (self._audio_gen or self._visual_gen)
+            and logits is not None
+            and logits.shape[0] == 1
+        ):
+            self._logits_audited = True
+            topk_vals, topk_ids = torch.topk(logits[0], 10)
+            logger.info(
+                "[longcat-logits] first decode step top10 ids=%s vals=%s "
+                "eos=%s logits_range=[%.3f, %.3f]",
+                topk_ids.tolist(),
+                [round(float(v), 3) for v in topk_vals],
+                self._eos_id,
+                float(logits[0].min()), float(logits[0].max()),
+            )
         if logits is None or not (self._audio_gen or self._visual_gen):
             return logits
         # During audio/image-gen mode, suppress EOS and force visible tokens
