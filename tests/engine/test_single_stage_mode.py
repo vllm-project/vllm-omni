@@ -12,6 +12,7 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
@@ -477,6 +478,89 @@ class TestSingleStageModeDetection:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint-restriction resolution vs. tri-state trust_remote_code (#5495)
+# ---------------------------------------------------------------------------
+
+
+class TestEndpointRestrictionsTrustRemoteCode:
+    """Regression tests for issue #5495.
+
+    ``AsyncOmniEngine.__init__`` takes ``trust_remote_code: bool | None`` where
+    ``None`` means "not specified" (the CLI default, since ``--trust-remote-code``
+    is ``store_true`` and its absence is mapped to ``None``). Endpoint-restriction
+    resolution eagerly loads the HF config via vLLM's ``get_config``, which does
+    ``trust_remote_code |= ...`` internally and raises ``TypeError`` on ``None``.
+    That used to be swallowed, leaving ``endpoint_restrictions`` empty so
+    ``/v1/completions`` was never shut down and the request crashed stage-1.
+
+    ``__init__`` must collapse the ``None`` "not specified" case to ``False`` at
+    the ``get_pipeline_config`` call site so the restriction is still computed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_config_factory_caches(self):
+        """Isolate the process-wide ``functools.cache`` on StageConfigFactory.
+
+        ``get_hf_config`` / ``try_infer_model_type`` cache per-model results for
+        the whole process. These tests patch ``get_config`` with a synthetic
+        Qwen3-Omni config for ``"fake-model"``; without clearing on teardown the
+        synthetic entry would leak to later tests in the same worker (after the
+        mock is restored), making the suite order-dependent. Clear both before
+        and after.
+        """
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+        yield
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
+    def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
+        mocker.patch.object(
+            AsyncOmniEngine,
+            "_resolve_stage_configs",
+            return_value=("/fake/path", [_make_stage_cfg(0)]),
+        )
+        mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
+        mocker.patch("threading.Thread")
+        mocker.patch("concurrent.futures.Future")
+        return AsyncOmniEngine(model="fake-model", **kwargs)
+
+    @staticmethod
+    def _install_qwen3_omni_config(mocker: MockerFixture) -> None:
+        """Patch get_config to a thinker+talker config, mirroring vLLM's
+        ``trust_remote_code |= ...`` (raises TypeError on None)."""
+        from transformers import Qwen3OmniMoeConfig
+
+        def fake_get_config(model, trust_remote_code, **_):
+            trust_remote_code |= False  # TypeError if None reaches here
+            return Qwen3OmniMoeConfig(enable_audio_output=True)
+
+        mocker.patch("vllm_omni.config.config_factory.get_config", side_effect=fake_get_config)
+
+    @pytest.mark.parametrize("trc_kwargs", [{}, {"trust_remote_code": False}, {"trust_remote_code": True}])
+    def test_completions_restriction_survives(self, mocker: MockerFixture, trc_kwargs: dict):
+        """COMPLETIONS restriction is computed regardless of how (or whether)
+        trust_remote_code is passed — including the unset case that resolves to
+        the engine's ``None`` default."""
+        from vllm_omni.config.endpoint_policy import OmniServingCapability
+
+        self._install_qwen3_omni_config(mocker)
+        engine = self._make_engine_no_thread(mocker, **trc_kwargs)
+        assert any(r.capability is OmniServingCapability.COMPLETIONS for r in engine.endpoint_restrictions), (
+            f"COMPLETIONS restriction dropped for {trc_kwargs or 'unset (None default)'}"
+        )
+
+    def test_unset_trust_remote_code_defaults_to_none(self, mocker: MockerFixture):
+        """Guard the tri-state premise: the engine keeps ``None`` (not ``False``)
+        when trust_remote_code is not passed, so the call-site coercion is what
+        prevents the crash."""
+        import inspect
+
+        default = inspect.signature(AsyncOmniEngine.__init__).parameters["trust_remote_code"].default
+        assert default is None
+
+
+# ---------------------------------------------------------------------------
 # AsyncOmniEngine single-stage initialization paths
 # ---------------------------------------------------------------------------
 
@@ -778,6 +862,7 @@ class TestSingleStageReplicaInitialization:
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
             omni_master_port=26000,
+            log_stats=True,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
@@ -811,10 +896,17 @@ class TestSingleStageReplicaInitialization:
         sentinel_client = SimpleNamespace()
 
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
+        client_kwargs: dict[str, Any] = {}
+
+        def _capture_make_async_mp_client(**kwargs):
+            client_kwargs.update(kwargs)
+            events.append("attach")
+            return sentinel_client
+
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
-            side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
+            side_effect=_capture_make_async_mp_client,
         )
 
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
@@ -824,6 +916,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
+        assert client_kwargs["log_stats"] is True
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
