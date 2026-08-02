@@ -1371,6 +1371,17 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             audio_rep_penalty = 1.3
         if visual_rep_penalty is None:
             visual_rep_penalty = 1.0
+        # Diagnostic override: the reference's own default is 1.0 (no
+        # penalty), so this is NOT a claim that visual generation should
+        # normally use a penalty -- it's to test the hypothesis that the
+        # visual CFG collapse (argmax frozen on one class for the whole
+        # image once cfg_scale != 1.0, see [longcat-cfg-logits] audit) is an
+        # autoregressive trajectory-divergence issue that a repetition
+        # penalty could interrupt, since nothing currently discourages
+        # repeating the same code once a collapsed loop starts.
+        _visual_rep_override = os.environ.get("LONGCAT_VISUAL_REP_PENALTY")
+        if _visual_rep_override:
+            visual_rep_penalty = float(_visual_rep_override)
 
         # Per-row results
         all_codes = torch.full((batch_size, num_levels), -1, dtype=torch.long, device=device)
