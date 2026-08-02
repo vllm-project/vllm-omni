@@ -264,10 +264,12 @@ class _RequestState:
     decode_step_count: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
+    is_last_prefill_chunk: bool = False
     prompt_cache: dict | None = None
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
+    prefill_embeds: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -2054,7 +2056,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
             if is_prefill:
                 flush_decode_fsq_batch()
-                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev)
+                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev, req_pos)
             elif state.prefill_completed:
                 if (
                     self._enable_batched_fsq_fusion
@@ -2141,7 +2143,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     offset += n
 
                     if is_prefill:
-                        prefill_batch.append((state, meta, res_out))
+                        if state.is_last_prefill_chunk:
+                            prefill_batch.append((state, meta, res_out))
                     else:
                         self._finish_decode(state, meta, res_out)
                         decoded_states.append(state)
@@ -2152,20 +2155,28 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     for state, meta, res_out in prefill_batch:
                         self._finish_prefill(state, meta, res_out, dev)
 
-                collect_states = [state for state, _, _ in req_metas]
-                self._precompute_stop_flags_for_audio_collect(collect_states)
-                ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
-                audio_by_req = self._collect_audio_batch(
-                    collect_states,
-                    initial_delayed_chunks_by_req={
-                        state.request_id: ready_audio_by_req.get(state.request_id)
-                        for state, is_prefill, _ in req_metas
-                        if not is_prefill
-                    },
-                )
+                collect_states = [
+                    state for state, is_prefill, _ in req_metas if not is_prefill or state.is_last_prefill_chunk
+                ]
+                audio_by_req: dict[str, torch.Tensor | None] = {}
+                if collect_states:
+                    self._precompute_stop_flags_for_audio_collect(collect_states)
+                    ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
+                    audio_by_req = self._collect_audio_batch(
+                        collect_states,
+                        initial_delayed_chunks_by_req={
+                            state.request_id: ready_audio_by_req.get(state.request_id)
+                            for state, is_prefill, _ in req_metas
+                            if not is_prefill
+                        },
+                    )
                 for state, is_prefill, _ in req_metas:
-                    self._results_queue.append((state.request_id, state.precomputed_stop_logits))
-                    self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+                    if is_prefill and not state.is_last_prefill_chunk:
+                        self._results_queue.append((state.request_id, None))
+                        self._audio_queue.append((state.request_id, None))
+                    else:
+                        self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+                        self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
 
         self._pending_requests.clear()
         self._flush_deferred_cleanup()
@@ -2179,11 +2190,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state: _RequestState,
         base_lm_out: torch.Tensor,
         dev: torch.device,
+        req_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, _PrefillResidualMeta]:
         tts = self.tts
         text_mask, feat_mask, feat, feat_embed = state.prefill_masks
-        state.prefill_masks = None
-
+        text_mask = text_mask[:, req_pos]
+        feat_mask = feat_mask[:, req_pos]
+        feat = feat[:, req_pos]
+        feat_embed = feat_embed[:, req_pos]
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
         assert scaffold_len == tts_len, (
@@ -2424,6 +2438,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.decode_step_count = 0
             state.request_start_time = time.perf_counter()
             state.prefill_completed = True
+            state.prefill_masks = None
+            state.prefill_embeds = None
+            state.prompt_cache = None
 
         self._perf.stop("prefill_tail_batch")
         if self._enable_profiling:
@@ -2465,6 +2482,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.decode_step_count = 0
         state.request_start_time = time.perf_counter()
         state.prefill_completed = True
+        state.prefill_embeds = None
+        state.prefill_masks = None
+        state.prompt_cache = None
         self._perf.stop("prefill_tail")
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -3033,7 +3053,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         dev = input_ids.device
         req_id = info_dict.get("request_id", "default")
-        is_prefill = span_len > 1
+        is_prefill = bool(info_dict.get("_omni_is_prefill", span_len > 1))
 
         if is_prefill:
             # Do not evict state here: _pending_requests is a per-step prefix,
@@ -3056,22 +3076,29 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 token_ids = token_ids[1:]
 
             state = self._get_or_create_state(req_id)
-            state.decode_pad = None
-            state.prefill_completed = False
-            state.decode_step_count = 0
-            state.precomputed_stop_logits = None
-            state.precomputed_is_stopping = None
-            state.last_audio_patch_gpu = None
-            if not hasattr(state, "pending_audio_chunks_gpu"):
-                state.pending_audio_chunks_gpu = []
-            if not hasattr(state, "pending_audio_copies"):
-                state.pending_audio_copies = []
-            state.pending_audio_chunks_gpu.clear()
-            state.pending_audio_copies.clear()
-            state.curr_embed_for_next = None
-            state.prev_feat_embed = None
-            state.curr_prefix_feat_cond = None
-            state.is_stopping = False
+            num_computed_tokens = int(info_dict.get("_omni_num_computed_tokens", 0))
+            is_first_prefill_chunk = num_computed_tokens == 0
+            if is_first_prefill_chunk:
+                state.decode_pad = None
+                state.prefill_completed = False
+                state.is_last_prefill_chunk = False
+                state.decode_step_count = 0
+                state.precomputed_stop_logits = None
+                state.precomputed_is_stopping = None
+                state.last_audio_patch_gpu = None
+                if not hasattr(state, "pending_audio_chunks_gpu"):
+                    state.pending_audio_chunks_gpu = []
+                if not hasattr(state, "pending_audio_copies"):
+                    state.pending_audio_copies = []
+                state.pending_audio_chunks_gpu.clear()
+                state.pending_audio_copies.clear()
+                state.curr_embed_for_next = None
+                state.prev_feat_embed = None
+                state.curr_prefix_feat_cond = None
+                state.is_stopping = False
+                state.prompt_cache = None
+                state.prefill_embeds = None
+                state.prefill_masks = None
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
@@ -3088,13 +3115,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 voice_profile = voice_profile[0] if voice_profile else None
             requires_precomputed_cache = isinstance(voice_profile, dict)
 
-            state.prompt_cache = None
             voice_name = info_dict.get("voice_name")
             if isinstance(voice_name, list):
                 voice_name = voice_name[0] if voice_name else None
             _created_at = int(info_dict.get("voice_created_at") or 0)
 
-            if voice_name:
+            if state.prompt_cache is None and voice_name:
                 _cache_key = self._speaker_cache.make_cache_key(
                     voice_name, model_type="voxcpm2", created_at=_created_at
                 )
@@ -3131,14 +3157,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     _key = self._speaker_cache.make_cache_key(voice_name, model_type="voxcpm2", created_at=_created_at)
                     self._speaker_cache.put(_key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()})
                     logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
-
-            inputs = self._build_prefill_inputs(token_ids, dev, req_id)
-            tts = self.tts
-            feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs.audio_feat))
-            text_embed = self.model.embed_input_ids(inputs.text_token.to(dev))
-            text_mask, feat_mask = inputs.text_mask, inputs.audio_mask
-            embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
-            state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
+            if state.prefill_embeds is None or state.prefill_masks is None:
+                inputs = self._build_prefill_inputs(token_ids, dev, req_id)
+                tts = self.tts
+                feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs.audio_feat))
+                text_embed = self.model.embed_input_ids(inputs.text_token.to(dev))
+                text_mask, feat_mask = inputs.text_mask, inputs.audio_mask
+                embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
+                state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
+                state.prefill_embeds = embeds
+            chunk_end = num_computed_tokens + span_len
+            state.is_last_prefill_chunk = chunk_end == state.prefill_embeds.shape[0]
+            if chunk_end > state.prefill_embeds.shape[0]:
+                raise ValueError(
+                    "VoxCPM2 chunked prefill exceeds the constructed prompt: "
+                    f"request_id={req_id} start={num_computed_tokens} end={chunk_end} "
+                    f"prompt_len={state.prefill_embeds.shape[0]}"
+                )
+            embeds = state.prefill_embeds[num_computed_tokens:chunk_end]
         else:
             state = self._active_states.get(req_id)
             curr = state.curr_embed_for_next if state else None

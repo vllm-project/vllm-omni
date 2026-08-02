@@ -163,12 +163,19 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+            memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
+            assert memory_utilizations == [
                 0.55,
-                0.22,
-                0.22,
+                0.15,
+                0.15,
             ]
-            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"video": {"count": 1, "num_frames": 32}}
+            assert sum(memory_utilizations) <= 0.9 + 1e-6
+            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "image": 64,
+                "audio": 64,
+                "video": 1,
+            }
         elif filename in {"minicpmo_4_5_2gpu.yaml"}:
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,

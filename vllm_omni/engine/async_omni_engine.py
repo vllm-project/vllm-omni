@@ -213,6 +213,12 @@ class AsyncOmniEngine:
         # beforehand. The stage CLI exposes the same deploy YAML through
         # stage_configs_path.
         deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
+        # specified" so stage-config resolution can defer to the deploy yaml's
+        # per-stage value (see ``with_trust_remote_code_override``). The
+        # restriction path below loads the top-level HF config via vLLM's
+        # ``get_config``, which needs a real bool, so collapse ``None`` to the
+        # default ``False`` here (#5495).
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
             trust_remote_code=bool(trust_remote_code),
@@ -331,6 +337,7 @@ class AsyncOmniEngine:
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
+            log_stats=self._log_stats,
         )
         self._runtime.initialize()
 
@@ -797,11 +804,9 @@ class AsyncOmniEngine:
                 supported_tasks=self.supported_tasks,
             )
             request.external_req_id = cid
-            # Companions are stage-0-final: without this worker-visible tag
-            # the AR runner would still emit downstream connector payloads
-            # for them (the orchestrator-side final_stage_id=0 registration
-            # alone does not reach the worker).
-            request = apply_omni_final_stage_metadata(request, 0)
+            # Companions are stage-0-final for ordinary downstream payloads,
+            # but diffusion still needs their CFG KV caches.
+            request = apply_omni_final_stage_metadata(request, 0, force_kv_transfer=True)
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
