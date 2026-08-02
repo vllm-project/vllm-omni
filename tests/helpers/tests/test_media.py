@@ -106,22 +106,31 @@ def _reset_transcriber_singletons():
 
 
 @pytest.mark.parametrize(
-    ("free_memory_by_device", "expected_device"),
+    ("free_memory_by_device", "expected_device", "expected_probe_order"),
     [
-        ([media._MIN_FREE_VRAM], "cuda:0"),
-        ([media._MIN_FREE_VRAM] * 3, "cuda:2"),
-        ([8 * 1024**3, 20 * 1024**3, 24 * 1024**3], "cuda:2"),
-        ([media._MIN_FREE_VRAM - 1], "cpu"),
-        ([20 * 1024**3, 8 * 1024**3], "cuda:0"),
-        ([8 * 1024**3, 12 * 1024**3], "cpu"),
+        ([media._MIN_FREE_VRAM], "cuda:0", [0]),
+        ([media._MIN_FREE_VRAM] * 3, "cuda:2", [2]),
+        ([8 * 1024**3, 20 * 1024**3, 24 * 1024**3], "cuda:2", [2]),
+        ([media._MIN_FREE_VRAM - 1], "cpu", [0]),
+        ([20 * 1024**3, 8 * 1024**3], "cuda:0", [1, 0]),
+        ([8 * 1024**3, 12 * 1024**3], "cpu", [1, 0]),
     ],
 )
-def test_select_whisper_device_by_available_memory(monkeypatch, free_memory_by_device, expected_device):
+def test_select_whisper_device_by_available_memory(
+    monkeypatch, free_memory_by_device, expected_device, expected_probe_order
+):
+    probed_devices = []
+
+    def get_free_memory(device):
+        index = int(device.rsplit(":", 1)[1])
+        probed_devices.append(index)
+        return free_memory_by_device[index]
+
     platform = SimpleNamespace(
         is_available=lambda: True,
         get_device_count=lambda: len(free_memory_by_device),
         get_torch_device=lambda index: f"cuda:{index}",
-        get_free_memory=lambda device: free_memory_by_device[int(device.rsplit(":", 1)[1])],
+        get_free_memory=get_free_memory,
         set_device=lambda device: None,
     )
     monkeypatch.setitem(
@@ -131,6 +140,7 @@ def test_select_whisper_device_by_available_memory(monkeypatch, free_memory_by_d
     )
 
     assert media._select_whisper_device() == expected_device
+    assert probed_devices == expected_probe_order
 
 
 def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
