@@ -712,15 +712,16 @@ def _select_whisper_device() -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        # Check every visible device and use the one with the most free memory,
-        # but keep the CPU fallback when none has enough room for Whisper.
-        best_free_memory = _MIN_FREE_VRAM
-        for candidate_index in range(n):
+        # Prefer the highest-index device with enough room for Whisper. The
+        # 16 GiB floor protects low-memory single-GPU runners such as the L4
+        # nightly, where the model server already occupies device 0, from the
+        # server-plus-Whisper OOM fixed in #3822. Keep the CPU fallback when no
+        # device has enough room.
+        for candidate_index in range(n - 1, -1, -1):
             candidate_device = current_omni_platform.get_torch_device(candidate_index)
-            free_memory = current_omni_platform.get_free_memory(candidate_device)
-            if free_memory >= best_free_memory:
+            if current_omni_platform.get_free_memory(candidate_device) >= _MIN_FREE_VRAM:
                 device_index = candidate_index
-                best_free_memory = free_memory
+                break
 
     if device_index is None:
         return "cpu"
