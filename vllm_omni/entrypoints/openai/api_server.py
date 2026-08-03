@@ -11,6 +11,7 @@ import os
 
 # Image generation API imports
 import random
+import tempfile
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
@@ -2856,6 +2857,18 @@ async def _cleanup_video(video_id: str):
         logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
+def _cleanup_video_references(
+    reference_video: ReferenceVideo | None,
+    reference_audio: ReferenceAudio | None,
+) -> None:
+    if reference_video is not None:
+        for path in reference_video.cleanup_paths:
+            if os.path.exists(path):
+                os.unlink(path)
+    if reference_audio is not None and os.path.exists(reference_audio.path):
+        os.unlink(reference_audio.path)
+
+
 async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -2936,17 +2949,37 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        if reference_audio is not None and os.path.exists(reference_audio.path):
-            os.unlink(reference_audio.path)
+        _cleanup_video_references(reference_video, reference_audio)
 
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+
+
+async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
+    paths: list[str] = []
+    try:
+        for upload in uploads:
+            suffix = Path(upload.filename or "").suffix.lower()
+            if suffix not in {".mkv", ".mov", ".mp4", ".webm"}:
+                suffix = ".mp4"
+            fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
+            paths.append(path)
+            with os.fdopen(fd, "wb") as output:
+                while chunk := await upload.read(1024 * 1024):
+                    output.write(chunk)
+    except Exception:
+        for path in paths:
+            if os.path.exists(path):
+                os.unlink(path)
+        raise
+    return paths
 
 
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
+    input_references: list[UploadFile] | None = File(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
     audio_reference: str | None = Form(default=None),
@@ -2987,11 +3020,19 @@ async def _parse_video_form(
 
     Used by both ``POST /v1/videos`` (async) and ``POST /v1/videos/sync``.
     """
+    input_references = input_references or []
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
     parsed_audio_reference = _parse_form_json(audio_reference)
 
+    if input_references and any(
+        item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
+    ):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Provide input_references alone, without input_reference, image_reference, or video_reference.",
+        )
     provided_references = sum(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
     )
@@ -3063,32 +3104,39 @@ async def _parse_video_form(
         )
 
     decode_spec = ReferenceVideoDecodeSpec()
-    if parsed_video_reference is not None or input_reference_bytes is not None:
+    if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
         stage_configs = (
             handler.stage_configs
             or app_stage_configs
             or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
         )
         decode_spec = _reference_video_decode_spec(request, stage_configs)
-    try:
-        media_data = await decode_input_reference(
-            request.image_reference,
-            request.video_reference,
-            input_reference_bytes,
-            max_video_frames=decode_spec.max_frames,
-            video_keep=decode_spec.keep,
-        )
-    except InvalidInputReferenceError as exc:
-        raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+    reference_image = None
+    reference_video = None
+    if input_references:
+        paths = await _persist_uploaded_video_references(input_references)
+        reference_video = ReferenceVideo(data=paths, cleanup_paths=tuple(paths))
+    else:
+        try:
+            media_data = await decode_input_reference(
+                request.image_reference,
+                request.video_reference,
+                input_reference_bytes,
+                max_video_frames=decode_spec.max_frames,
+                video_keep=decode_spec.keep,
+            )
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
 
-    reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
-    reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
+        reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
+        reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
         try:
             audio_path = await decode_audio_url(request.audio_reference.audio_url)
         except InvalidInputReferenceError as exc:
+            _cleanup_video_references(reference_video, None)
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)
 
@@ -3201,8 +3249,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        if reference_audio is not None and os.path.exists(reference_audio.path):
-            os.unlink(reference_audio.path)
+        _cleanup_video_references(reference_video, reference_audio)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

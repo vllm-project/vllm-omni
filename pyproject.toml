@@ -96,6 +96,12 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
+# the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
+fa4 = [
+    "flash-attn-4[cu13]==4.0.0b18",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",

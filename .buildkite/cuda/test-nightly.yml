@@ -457,13 +457,19 @@ steps:
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Diffusion · Distributed Test"
+      - label: ":full_moon: Diffusion · Distributed Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda' --run-level "full_model"
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_4
+
+      - label: ":full_moon: Diffusion · Distributed Test with H100"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100' --run-level "full_model"
+        mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion · Offloader Test"
         timeout_in_minutes: 60

@@ -36,6 +36,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
     ),
+    "MiniMaxH3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+    ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
