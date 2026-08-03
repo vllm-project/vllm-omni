@@ -247,6 +247,7 @@ class SequenceParallelSplitHook(ModelHook):
 
         output_list = [output] if is_tensor else list(output)
         actually_sharded = False
+        equal_rank_seq_lens = True
 
         for index, spm in self.metadata.items():
             if not isinstance(index, int):
@@ -260,10 +261,13 @@ class SequenceParallelSplitHook(ModelHook):
             output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
             if output_list[index] is not original:
                 actually_sharded = True
+                equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
 
         # Mark SP as active only if at least one tensor was actually sharded
         if actually_sharded and is_forward_context_available():
-            get_forward_context()._sp_shard_depth += 1
+            ctx = get_forward_context()
+            ctx._sp_shard_depth += 1
+            ctx._sp_equal_pad_stack.append(equal_rank_seq_lens)
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
@@ -530,6 +534,8 @@ class SequenceParallelGatherHook(ModelHook):
         if actually_gathered and is_forward_context_available():
             ctx = get_forward_context()
             ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
+            if ctx._sp_equal_pad_stack:
+                ctx._sp_equal_pad_stack.pop()
 
         return output[0] if is_tensor else type(output)(output)
 
