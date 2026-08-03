@@ -481,8 +481,6 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         "overlap_short_ack_ms": args.short_ack_ms,
         "playback_commit_policy": "ack_only",
         "extra_body": {
-            "auto_response": True,
-            "minicpmo45_native_duplex": True,
             "force_listen_count": 0,
         },
     }

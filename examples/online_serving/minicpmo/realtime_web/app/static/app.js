@@ -86,7 +86,6 @@
     url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', config.model || 'openbmb/MiniCPM-o-4_5');
-    url.searchParams.set('minicpmo45_native_duplex', '1');
     url.searchParams.set('autostart', '0');
     return url.toString();
   }
@@ -456,10 +455,7 @@
       let settled = false;
       socket.onopen = () => {
         settled = true;
-        const extraBody = {
-          auto_response: true,
-          minicpmo45_native_duplex: true,
-        };
+        const extraBody = {};
         const session = {
           modalities: ['audio', 'text'],
           voice: 'default',

@@ -47,7 +47,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
 
     @classmethod
     def is_enabled(cls, config: DuplexSessionConfig) -> bool:
-        return config.extra_body.get("minicpmo45_native_duplex") is True
+        return True
 
     @classmethod
     def validate_client_config(cls, config: DuplexSessionConfig) -> None:

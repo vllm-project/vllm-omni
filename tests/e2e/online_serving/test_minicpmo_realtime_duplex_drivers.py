@@ -707,8 +707,7 @@ def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect()
         "openbmb/MiniCPM-o-4_5",
     )
 
-    query = parse_qs(urlsplit(url).query)
-    assert query["minicpmo45_native_duplex"] == ["1"]
+    _query = parse_qs(urlsplit(url).query)
 
 
 def test_realtime_duplex_demo_explicit_session_id_reaches_autostart_query():
@@ -739,7 +738,6 @@ def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
     assert event["type"] == "session.update"
     assert "session_id" not in event
     assert event["session"]["session_id"] == "reopen-e2e"
-    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
 
 
 def test_realtime_duplex_demo_response_required_uses_deterministic_sampling():

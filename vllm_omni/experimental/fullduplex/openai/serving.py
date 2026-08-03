@@ -1202,23 +1202,24 @@ class OmniDuplexSessionHandler(
 
     @staticmethod
     def _session_auto_responds(session: DuplexSession) -> bool:
-        """Model-driven turn detection (server_vad).
+        """Model-driven turn detection (server_vad with create_response).
 
         When set, the server runs per-chunk speak-generation continuously
         instead of waiting for an explicit ``response.create``: each
         ~chunk_period of appended audio is fed to the stage0 stream so the
-        model itself decides to speak or listen.  Resolved from the spec's
-        ``turn_detection`` configuration by ``_resolve_turn_detection``.
+        model itself decides to speak or listen.
         """
         extra = getattr(session.config, "extra_body", None)
         if not isinstance(extra, dict):
             return False
-        return extra.get("auto_response") is True
+        td = extra.get("realtime_turn_detection")
+        if not isinstance(td, dict):
+            return False
+        return td.get("type") == "server_vad" and td.get("create_response") is True
 
-    # TODO(vraiti) This can likely be simplified by aligning internal configurations with OpenAI spec conventions
     @staticmethod
     def _resolve_turn_detection(session: DuplexSession) -> dict[str, object] | None:
-        """Resolve turn_detection config into the internal auto_response flag.
+        """Resolve turn_detection config into realtime_turn_detection.
 
         Called after session capabilities are set.  Returns an error event
         dict if the requested turn_detection is incompatible with the model,
@@ -1235,14 +1236,11 @@ class OmniDuplexSessionHandler(
                     "create_response": True,
                     "interrupt_response": True,
                 }
-                extra["auto_response"] = True
             else:
                 extra["realtime_turn_detection"] = None
-                extra["auto_response"] = False
             return None
 
         if td_raw is None:
-            extra["auto_response"] = False
             return None
 
         if not isinstance(td_raw, dict):
@@ -1288,7 +1286,6 @@ class OmniDuplexSessionHandler(
                 if td_raw.get(key) is not None:
                     td_config[key] = td_raw[key]
             extra["realtime_turn_detection"] = td_config
-            extra["auto_response"] = bool(create_response)
             return None
 
         return {

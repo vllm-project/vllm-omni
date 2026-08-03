@@ -77,7 +77,6 @@ def build_realtime_url(
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.setdefault("duplex", "1")
     query.setdefault("model", model)
-    query.setdefault("minicpmo45_native_duplex", "1")
     if autostart is not None:
         query.setdefault("autostart", "1" if autostart else "0")
     if session_id:
@@ -344,7 +343,6 @@ class RealtimeDuplexClient:
             "overlap_policy": "listen_only",
             "playback_commit_policy": "ack_only",
             "extra_body": {
-                "minicpmo45_native_duplex": True,
                 "force_listen_count": 0,
             },
         }
