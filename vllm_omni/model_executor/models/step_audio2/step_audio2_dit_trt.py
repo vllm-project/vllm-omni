@@ -129,17 +129,26 @@ def export_dit_chunk_onnx(
         "new_att_cache": {1: "b", 3: "l_out"},
     }
     logger.info("Exporting DiT chunk ONNX to %s", onnx_path)
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            sample,
-            str(onnx_path),
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            opset_version=17,
-            dynamo=False,
-        )
+    onnx_path = Path(onnx_path)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    # Process-unique temp name + atomic rename, so concurrent first builds on
+    # a shared cache dir never see (or clobber) a partially written file.
+    tmp = onnx_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                sample,
+                str(tmp),
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=17,
+                dynamo=False,
+            )
+        os.replace(tmp, onnx_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def convert_onnx_to_trt(
@@ -147,15 +156,18 @@ def convert_onnx_to_trt(
     plan_path: str | Path,
     dims: dict[str, int],
     *,
-    dtype: torch.dtype = torch.float16,
     max_batch: int = 16,
     max_len: int = 3000,
     max_cache_len: int = 1000,
 ) -> None:
-    """Build a TRT engine from the exported ONNX (fused-in from upstream tools)."""
+    """Build a TRT engine from the exported ONNX (fused-in from upstream tools).
+
+    Engine precision is strongly typed from the ONNX graph itself — export
+    the graph in the desired dtype (TRT 11 removed ``BuilderFlag.FP16``).
+    """
     import tensorrt as trt
 
-    logger.info("Building DiT TRT engine (%s) at %s — this can take a few minutes", dtype, plan_path)
+    logger.info("Building DiT TRT engine at %s — this can take a few minutes", plan_path)
     trt_logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(trt_logger)
     # TRT >= 10 removed EXPLICIT_BATCH (networks are always explicit-batch).
@@ -168,9 +180,6 @@ def convert_onnx_to_trt(
             raise ValueError(f"failed to parse {onnx_path}: {errors}")
 
     config = builder.create_builder_config()
-    # Precision is strongly typed from the exported ONNX graph; no builder
-    # flags or I/O dtype overrides (removed in TRT 11).
-    del dtype
 
     depth, mel, spk = dims["depth"], dims["mel"], dims["spk"]
     heads, att_dim = dims["heads"], dims["att_dim"]
@@ -203,10 +212,16 @@ def convert_onnx_to_trt(
         raise RuntimeError("TensorRT engine build failed")
     plan_path = Path(plan_path)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = plan_path.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
-        f.write(engine_bytes)
-    os.replace(tmp, plan_path)
+    # Process-unique temp name: concurrent first builds (multiple ranks on a
+    # shared cache dir) must not clobber each other's partial writes; the
+    # final os.replace stays atomic and last-writer-wins with equal content.
+    tmp = plan_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(engine_bytes)
+        os.replace(tmp, plan_path)
+    finally:
+        tmp.unlink(missing_ok=True)
     logger.info("DiT TRT engine written to %s", plan_path)
 
 
@@ -218,12 +233,28 @@ class TrtDiTStepper:
     ordering makes explicit synchronization unnecessary.
     """
 
-    def __init__(self, plan_path: str | Path, dims: dict[str, int], device: torch.device, dtype: torch.dtype):
+    def __init__(
+        self,
+        plan_path: str | Path,
+        dims: dict[str, int],
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        max_batch: int = 16,
+        max_len: int = 3000,
+        max_cache_len: int = 1000,
+    ):
         import tensorrt as trt
 
         self.dims = dims
         self.device = device
         self.dtype = dtype
+        # Optimization-profile bounds the engine was built with; step() checks
+        # them so an out-of-profile call fails with a readable error instead
+        # of an opaque execute_async_v3 failure.
+        self.max_batch = int(max_batch)
+        self.max_len = int(max_len)
+        self.max_cache_len = int(max_cache_len)
         with open(plan_path, "rb") as f:
             self.engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
         if self.engine is None:
@@ -251,6 +282,14 @@ class TrtDiTStepper:
         dims = self.dims
         batch = int(x.shape[0])
         chunk = int(x.shape[2])
+        cache_frames = int(att_cache.shape[3]) if att_cache is not None else 0
+        if batch > self.max_batch or chunk > self.max_len or cache_frames > self.max_cache_len:
+            raise ValueError(
+                f"DiT TRT engine profile exceeded: batch={batch} (max {self.max_batch}, "
+                f"= token2wav_trt_max_batch, CFG included), chunk={chunk} frames "
+                f"(max {self.max_len}), att cache={cache_frames} frames (max {self.max_cache_len}). "
+                "Rebuild the engine with a larger token2wav_trt_max_batch or disable token2wav_trt."
+            )
         if cnn_cache is None:
             cnn_cache = torch.zeros(
                 (dims["depth"], batch, dims["cnn_ch"], dims["cnn_w"]), device=self.device, dtype=self.dtype
@@ -311,7 +350,9 @@ def build_dit_trt_stepper(
     """Export (if needed), build (if needed) and load the DiT TRT engine.
 
     Artifacts are cached under ``cache_dir`` (default: ``$MINICPMO_TOKEN2WAV_TRT_CACHE``
-    or ``$HF_HOME/vllm_omni/token2wav_trt``), keyed by dtype/batch/TRT version.
+    or ``$HF_HOME/vllm_omni/token2wav_trt``), keyed by dtype/batch/TRT
+    version/GPU architecture — serialized plans are SM-specific, so a cache
+    shared across heterogeneous machines must not reuse another arch's plan.
     """
     import tensorrt as trt
 
@@ -320,13 +361,15 @@ def build_dit_trt_stepper(
     cache = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
     dtype_tag = str(dtype).replace("torch.", "")
+    major, minor = torch.cuda.get_device_capability(device)
+    sm_tag = f"sm{major}{minor}"
     onnx_path = cache / f"dit_chunk.d{dims['depth']}.{dtype_tag}.onnx"
-    plan_path = cache / f"dit_chunk.d{dims['depth']}.{dtype_tag}.b{max_batch}.trt{trt.__version__}.plan"
+    plan_path = cache / (f"dit_chunk.d{dims['depth']}.{dtype_tag}.b{max_batch}.{sm_tag}.trt{trt.__version__}.plan")
 
     if not plan_path.is_file() or plan_path.stat().st_size == 0:
         if not onnx_path.is_file() or onnx_path.stat().st_size == 0:
             export_dit_chunk_onnx(dit, onnx_path, device, dtype)
-        convert_onnx_to_trt(onnx_path, plan_path, dims, dtype=dtype, max_batch=max_batch)
+        convert_onnx_to_trt(onnx_path, plan_path, dims, max_batch=max_batch)
     else:
         logger.info("Reusing cached DiT TRT engine %s", plan_path)
-    return TrtDiTStepper(plan_path, dims, device, dtype)
+    return TrtDiTStepper(plan_path, dims, device, dtype, max_batch=max_batch)
