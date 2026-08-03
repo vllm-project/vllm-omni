@@ -30,6 +30,14 @@ class FakeHub:
         self.closed = True
 
 
+async def _wait_until(predicate, timeout=1):
+    async def _poll():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
 class FakePool:
     def __init__(self, stage_id: int):
         self.stage_id = stage_id
@@ -407,6 +415,168 @@ async def test_watcher_reconciles_replica_that_disappears_during_registration(mo
         assert controller._remote_replica_keys_by_input_addr == {}
     finally:
         release_factory.set()
+        controller.shutdown()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await controller.drain_tasks(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_attached_replica_survives_until_hub_observes_it_up(monkeypatch):
+    class EmptyHub:
+        def __init__(self):
+            self.polls = 0
+
+        def get_replica_list(self):
+            self.polls += 1
+            return SimpleNamespace(replicas=[], timestamp=0.0)
+
+        def close(self):
+            pass
+
+    input_addr = "tcp://stage-0-replica-8"
+    pool = StagePool(0, [])
+    shutdown_calls = []
+    hub = EmptyHub()
+
+    def _factory(stage_id, replica_id):
+        return SimpleNamespace(
+            client_addresses={"input_address": input_addr},
+            shutdown=lambda: shutdown_calls.append((stage_id, replica_id)),
+        )
+
+    controller = _controller(monkeypatch, pool, hub, remote_replica_factory=_factory)
+    controller.WATCH_INTERVAL_S = 0.001
+
+    await controller.handle_register(0, 8)
+    await controller.drain_tasks(timeout=1)
+    assert pool.live_num_replicas == 1
+
+    watcher = controller.start()
+    try:
+        await _wait_until(lambda: hub.polls >= 3)
+
+        assert shutdown_calls == []
+        assert pool.live_num_replicas == 1
+    finally:
+        controller.shutdown()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await controller.drain_tasks(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_up_observed_before_attach_does_not_qualify_attachment(monkeypatch):
+    import vllm_omni.engine.membership_controller as membership_mod
+
+    input_addr = "tcp://stage-0-replica-10"
+    pool = StagePool(0, [])
+    hub = FakeHub(
+        snapshots=[
+            _snapshot(_replica(0, input_addr)),
+            _snapshot(),
+        ]
+    )
+    shutdown_calls = []
+    sleep_gates = asyncio.Queue()
+
+    async def _controlled_sleep(_delay):
+        gate = asyncio.Event()
+        await sleep_gates.put(gate)
+        await gate.wait()
+
+    monkeypatch.setattr(membership_mod.asyncio, "sleep", _controlled_sleep)
+
+    def _factory(stage_id, replica_id):
+        return SimpleNamespace(
+            client_addresses={"input_address": input_addr},
+            shutdown=lambda: shutdown_calls.append((stage_id, replica_id)),
+        )
+
+    controller = _controller(monkeypatch, pool, hub, remote_replica_factory=_factory)
+    watcher = controller.start()
+
+    try:
+        first_sleep = await asyncio.wait_for(sleep_gates.get(), timeout=1)
+        await controller.handle_register(0, 10)
+        await controller.drain_tasks(timeout=1)
+        assert pool.live_num_replicas == 1
+
+        first_sleep.set()
+        await asyncio.wait_for(sleep_gates.get(), timeout=1)
+        await controller.drain_tasks(timeout=1)
+
+        assert shutdown_calls == []
+        assert pool.live_num_replicas == 1
+    finally:
+        controller.shutdown()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await controller.drain_tasks(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_reattached_address_requires_a_fresh_up_observation(monkeypatch):
+    class MutableHub:
+        def __init__(self, input_addr):
+            self.input_addr = input_addr
+            self.up = True
+            self.polls = 0
+
+        def get_replica_list(self):
+            self.polls += 1
+            replicas = [_replica(0, self.input_addr)] if self.up else []
+            return _snapshot(*replicas)
+
+        def close(self):
+            pass
+
+    class Client:
+        def __init__(self, input_addr):
+            self.client_addresses = {"input_address": input_addr}
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    input_addr = "tcp://stage-0-replica-9"
+    pool = StagePool(0, [])
+    hub = MutableHub(input_addr)
+    clients = []
+
+    def _factory(_stage_id, _replica_id):
+        client = Client(input_addr)
+        clients.append(client)
+        return client
+
+    controller = _controller(monkeypatch, pool, hub, remote_replica_factory=_factory)
+    controller.WATCH_INTERVAL_S = 0.001
+
+    await controller.handle_register(0, 9)
+    await controller.drain_tasks(timeout=1)
+    watcher = controller.start()
+
+    try:
+        await _wait_until(lambda: hub.polls >= 2)
+        hub.up = False
+        await _wait_until(lambda: clients[0].shutdown_calls == 1)
+        assert pool.live_num_replicas == 0
+
+        await controller.handle_register(0, 9)
+        await controller.drain_tasks(timeout=1)
+        polls_after_reattach = hub.polls
+        await _wait_until(lambda: hub.polls >= polls_after_reattach + 3)
+
+        assert len(clients) == 2
+        assert clients[1].shutdown_calls == 0
+        assert pool.live_num_replicas == 1
+    finally:
         controller.shutdown()
         try:
             await watcher

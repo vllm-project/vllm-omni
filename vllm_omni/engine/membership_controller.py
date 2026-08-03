@@ -52,6 +52,10 @@ class MembershipController:
         self._attaching_remote_replicas: set[tuple[int, int]] = set()
         self._attached_remote_replicas: set[tuple[int, int]] = set()
         self._remote_replica_keys_by_input_addr: dict[str, tuple[int, int]] = {}
+        self._watch_generation = 0
+        self._attach_start_generation: dict[tuple[int, int], int] = {}
+        self._up_generation_by_input_addr: dict[tuple[int, str], int] = {}
+        self._observed_up_attached_addrs: set[tuple[int, str]] = set()
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
@@ -95,6 +99,7 @@ class MembershipController:
             return
 
         self._attaching_remote_replicas.add(key)
+        self._attach_start_generation[key] = self._watch_generation
         self._spawn_task(
             self._register_once(stage_id, replica_id),
             label=f"register-s{stage_id}-r{replica_id}",
@@ -159,12 +164,24 @@ class MembershipController:
         while not self._shutdown_event.is_set():
             try:
                 snap = self._hub.get_replica_list()
+                self._watch_generation += 1
                 current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
                 attached = {
                     (stage_id, input_addr)
                     for input_addr, (stage_id, _replica_id) in self._remote_replica_keys_by_input_addr.items()
                 }
-                for stage_id, addr in (last_up | attached) - current:
+                self._observed_up_attached_addrs.update(attached & current)
+                attaching_stages = {stage_id for stage_id, _replica_id in self._attaching_remote_replicas}
+                for addr_key in current:
+                    if addr_key[0] in attaching_stages:
+                        self._up_generation_by_input_addr[addr_key] = self._watch_generation
+
+                # Preserve watcher cleanup for untracked/static clients. A
+                # controller-attached client is eligible only after this
+                # attachment has been observed UP at least once.
+                untracked_disappeared = (last_up - current) - attached
+                confirmed_attached_disappeared = self._observed_up_attached_addrs - current
+                for stage_id, addr in untracked_disappeared | confirmed_attached_disappeared:
                     self._spawn_task(
                         self.handle_unregister(stage_id, addr),
                         label=f"unregister-s{stage_id}",
@@ -182,14 +199,25 @@ class MembershipController:
 
     async def _register_once(self, stage_id: int, replica_id: int) -> None:
         key = (stage_id, replica_id)
+        attach_start_generation = self._attach_start_generation[key]
         try:
             input_addr = await self._do_register(stage_id, replica_id)
             if input_addr is None:
                 return
             self._attached_remote_replicas.add(key)
             self._remote_replica_keys_by_input_addr[input_addr] = key
+            addr_key = (stage_id, input_addr)
+            if self._up_generation_by_input_addr.get(addr_key, -1) > attach_start_generation:
+                self._observed_up_attached_addrs.add(addr_key)
         finally:
             self._attaching_remote_replicas.discard(key)
+            self._attach_start_generation.pop(key, None)
+            if not any(attaching_stage_id == stage_id for attaching_stage_id, _ in self._attaching_remote_replicas):
+                self._up_generation_by_input_addr = {
+                    addr_key: generation
+                    for addr_key, generation in self._up_generation_by_input_addr.items()
+                    if addr_key[0] != stage_id
+                }
 
     async def _do_register(self, stage_id: int, replica_id: int) -> str | None:
         pool = self._pool_for_stage_id(stage_id)
@@ -237,6 +265,7 @@ class MembershipController:
         if key is not None:
             self._attached_remote_replicas.discard(key)
             self._attaching_remote_replicas.discard(key)
+            self._observed_up_attached_addrs.discard((stage_id, input_addr))
         pool = self._pool_for_stage_id(stage_id)
         if pool is None:
             return
