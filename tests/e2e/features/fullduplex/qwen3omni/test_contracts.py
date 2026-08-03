@@ -964,8 +964,32 @@ def test_a_tool_call_is_reported_once_even_as_text_accumulates() -> None:
 def test_a_genuinely_new_call_is_still_reported() -> None:
     extension = Qwen3OmniDuplexRuntimeExtension()
     extension._new_tool_calls(_StageOutput(_CALL))
-    later = extension._new_tool_calls(_StageOutput(f"{_CALL}It is 18 degrees.{_CALL2}"))
+    later = extension._new_tool_calls(_StageOutput(f"{_CALL}{_CALL2}"))
     assert [call["name"] for call in later] == ["check_inventory"]
+
+
+def test_a_turn_carrying_speech_is_not_a_tool_call() -> None:
+    """Speaking wins when the turn has something to say.
+
+    Claiming the turn produces a direct response, which suppresses its audio --
+    right for a bare tool call, fatal when the model appends a redundant call to
+    a real answer. Observed live: after a tool result the model replied "The
+    weather in Barcelona is 18C with light rain." *and* re-emitted the same
+    call. Intercepting that threw away the answer and dead-ended the
+    conversation in silence, because the client rightly refuses to re-run a call
+    it has already run.
+    """
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    mixed = extension._new_tool_calls(_StageOutput(f"The weather in Barcelona is 18C.{_CALL}"))
+    assert mixed == []
+
+
+def test_an_ignored_mixed_call_is_not_re_examined_later() -> None:
+    """A call skipped for carrying speech must still advance the cursor."""
+    extension = Qwen3OmniDuplexRuntimeExtension()
+    extension._new_tool_calls(_StageOutput(f"Some spoken answer.{_CALL}"))
+    again = extension._new_tool_calls(_StageOutput(f"Some spoken answer.{_CALL} and more"))
+    assert again == []
 
 
 def test_a_partially_streamed_call_is_not_skipped() -> None:

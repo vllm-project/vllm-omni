@@ -505,6 +505,32 @@ class Qwen3OmniDuplexRuntimeExtension:
         if not matches:
             self._tool_scan_pos[request_id] = (start, len(text))
             return []
+
+        # Only claim the turn when the tool call is *all* of it.
+        #
+        # Intercepting produces a direct response, which suppresses this turn's
+        # audio -- that is the point for a bare tool call, since reading JSON
+        # aloud is never right. But the model also emits a redundant call
+        # alongside a real answer: after a tool result it replies
+        #
+        #   "The weather in Barcelona is 18C with light rain."
+        #   <tool_call>{"name": "lookup_weather", ...}</tool_call>
+        #
+        # Treating that as a tool call threw away the spoken answer the user was
+        # waiting for and dead-ended the conversation in silence -- the client
+        # correctly refuses to re-dispatch a call it has already run, so nothing
+        # further happened. Speaking wins whenever there is something to speak;
+        # the duplicate call is left for the client to ignore.
+        spoken = _TOOL_CALL_RE.sub("", text[start:]).strip()
+        if spoken:
+            # Advance past these calls anyway: they have been seen, and not
+            # advancing would re-examine them on every later output.
+            self._tool_scan_pos[request_id] = (matches[-1].end(), len(text))
+            logger.info(
+                "[qwen3omni-duplex] tool call ignored: turn also carries speech (%d chars)", len(spoken)
+            )
+            return []
+
         self._tool_scan_pos[request_id] = (matches[-1].end(), len(text))
         calls: list[dict[str, Any]] = []
         for match in matches:
