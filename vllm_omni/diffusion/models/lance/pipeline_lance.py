@@ -62,7 +62,7 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-from vllm_omni.utils.video import normalize_decoded_video_frames
+from vllm_omni.model_executor.models.utils import normalize_decoded_video_frames
 
 from .lance_transformer import (
     LanceBagel,
