@@ -48,6 +48,28 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["audio"] is None
 
 
+def test_float_frames_are_converted_without_stacking_full_video(monkeypatch):
+    frame = np.array(
+        [
+            [[0.0, 0.5, 1.0, 0.2], [1.5, -0.5, 0.5, 0.8]],
+        ],
+        dtype=np.float32,
+    )
+    original = frame.copy()
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("float video conversion must not stack all frames")
+
+    monkeypatch.setattr(video_api_utils.np, "stack", fail_stack)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames([frame, frame])
+
+    expected = np.array([[[128, 191, 255], [255, 64, 191]]], dtype=np.uint8)
+    assert frames.flags.c_contiguous
+    np.testing.assert_array_equal(frames, np.array([expected, expected]))
+    np.testing.assert_array_equal(frame, original)
+
+
 @pytest.mark.parametrize("frame_count", [3, 4])
 def test_channel_last_video_tensor_preserves_channel_sized_frame_count(frame_count):
     video = torch.arange(frame_count * 2 * 5 * 3, dtype=torch.uint8).reshape(frame_count, 2, 5, 3)
