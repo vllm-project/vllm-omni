@@ -312,6 +312,104 @@ def test_video_vae_encode_uses_configured_parallel_tiling():
     assert shape == (2, 2, 2)
 
 
+def test_video_vae_small_canvas_falls_back_from_parallel_tiling():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        MiniMaxH3VideoVAE,
+    )
+
+    class FakeModel:
+        parallel_tiling = True
+
+        @staticmethod
+        def split_tiles(_length, _is_decoder):
+            return [0], [1], []
+
+    video_vae = object.__new__(MiniMaxH3VideoVAE)
+    object.__setattr__(video_vae, "model", FakeModel())
+    object.__setattr__(video_vae, "parallel_size", 4)
+
+    with pytest.raises(RuntimeError, match="restore"):
+        with video_vae._parallel_tiling_for_canvas(
+            height=256,
+            width=448,
+            is_decoder=True,
+        ):
+            assert not video_vae.model.parallel_tiling
+            raise RuntimeError("restore")
+
+    assert video_vae.model.parallel_tiling
+
+
+def test_video_vae_parallel_tiling_kept_when_every_rank_has_a_tile():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        MiniMaxH3VideoVAE,
+    )
+
+    class FakeModel:
+        parallel_tiling = True
+
+        @staticmethod
+        def split_tiles(_length, _is_decoder):
+            return [0, 1], [1, 1], [0]
+
+    video_vae = object.__new__(MiniMaxH3VideoVAE)
+    object.__setattr__(video_vae, "model", FakeModel())
+    object.__setattr__(video_vae, "parallel_size", 4)
+
+    with video_vae._parallel_tiling_for_canvas(
+        height=768,
+        width=1344,
+        is_decoder=True,
+    ):
+        assert video_vae.model.parallel_tiling
+
+    assert video_vae.model.parallel_tiling
+
+
+def test_video_vae_decode_applies_small_canvas_parallel_fallback():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        MiniMaxH3VideoVAE,
+    )
+
+    class FakeProcessor:
+        @staticmethod
+        def revert_tensor(decoded):
+            return decoded
+
+    class FakeModel(torch.nn.Module):
+        vae_ratio = 16
+
+        def __init__(self):
+            super().__init__()
+            self.parallel_tiling = True
+            self.parallel_states = []
+            self.processor = FakeProcessor()
+
+        @staticmethod
+        def split_tiles(_length, _is_decoder):
+            return [0], [1], []
+
+        def decode_base(self, latent):
+            self.parallel_states.append(self.parallel_tiling)
+            return latent
+
+    video_vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(video_vae)
+    video_vae.model = FakeModel()
+    video_vae.parallel_size = 4
+    video_vae.config_dict = {
+        "latent_channels": 1,
+        "latents_mean": [0.0],
+        "latents_std": [1.0],
+    }
+
+    output = video_vae.decode_latent(torch.zeros(1, 1, 1, 16, 28))
+
+    assert output.shape == (1, 1, 1, 16, 28)
+    assert video_vae.model.parallel_states == [False]
+    assert video_vae.model.parallel_tiling
+
+
 def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import (
