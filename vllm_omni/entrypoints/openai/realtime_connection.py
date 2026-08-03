@@ -33,6 +33,16 @@ logger = init_logger(__name__)
 _TOOL_RESULT_POLL_S = 0.5
 
 
+def _text_of(contents: list[dict[str, Any]]) -> str:
+    """Join the text parts of an OpenAI-Realtime content list.
+
+    Accepts `input_text` as well as `text`: OpenAI's Realtime API uses `input_text`
+    on a USER message and `text` on an assistant one, and callers port either way
+    round. Mirrors the existing `input_audio`/`audio` tolerance next to it.
+    """
+    return " ".join(c.get("text") or "" for c in contents if c.get("type") in ("text", "input_text")).strip()
+
+
 @dataclass
 class _PendingToolCall:
     """A tool call being accumulated from the model's streamed output."""
@@ -122,8 +132,9 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._speaker: str | None = None
         self._instructions: str | None = None
         # Prior conversation as an ordered message list, replayed into every
-        # subsequent prompt. Entries are {"role": ..., "audio": np.ndarray} for the
-        # user's spoken turns and {"role": ..., "content": str} otherwise. A flat
+        # subsequent prompt. Entries are {"role": ..., "audio": np.ndarray} for a
+        # user turn replayed as speech, and {"role": ..., "content": str} for
+        # everything else (assistant, tool, or a user turn given as text). A flat
         # message list (rather than user/assistant pairs) is what lets a completed
         # TOOL turn be replayed in full - assistant `<tool_call>`, the
         # `<tool_response>` result, then the spoken answer - which the model needs
@@ -142,6 +153,11 @@ class RealtimeConnection(VllmRealtimeConnection):
 
             {"type": "message", "role": "user",
              "content": [{"type": "input_audio", "audio": "<b64 pcm16>"}]}
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "..."}]}
+            {"type": "message", "role": "user",                   # both is fine too
+             "content": [{"type": "input_audio", "audio": "..."},
+                         {"type": "input_text", "text": "..."}]}
             {"type": "message", "role": "assistant",
              "content": [{"type": "text", "text": "..."}]}
             {"type": "message", "role": "tool",
@@ -163,12 +179,26 @@ class RealtimeConnection(VllmRealtimeConnection):
                 (c.get("audio") for c in contents if c.get("type") in ("input_audio", "audio") and c.get("audio")),
                 None,
             )
-            if audio_b64 is None:
-                await self.send_error("history user message needs input_audio content", "invalid_history_item")
+            text = _text_of(contents)
+            if audio_b64 is None and not text:
+                await self.send_error(
+                    "history user message needs input_audio or text content",
+                    "invalid_history_item",
+                )
                 return
-            self._history.append({"role": "user", "audio": self._decode_pcm16(audio_b64)})
+            # Keep whichever parts were given, including both: a user turn may
+            # legitimately be audio PLUS text (the spoken part and a written
+            # instruction about it), which is what /v1/chat/completions already
+            # supports for this checkpoint. Audio alone is the shape a live turn has;
+            # text alone is what a caller with a transcript and no audio can offer.
+            past: dict[str, Any] = {"role": "user"}
+            if audio_b64 is not None:
+                past["audio"] = self._decode_pcm16(audio_b64)
+            if text:
+                past["content"] = text
+            self._history.append(past)
         elif role in ("assistant", "tool"):
-            text = " ".join(c.get("text") or "" for c in contents if c.get("type") == "text").strip()
+            text = _text_of(contents)
             if not text:
                 await self.send_error(f"history {role} message needs text content", "invalid_history_item")
                 return

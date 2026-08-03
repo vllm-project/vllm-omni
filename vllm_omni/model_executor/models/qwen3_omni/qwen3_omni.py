@@ -73,6 +73,45 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _replay_messages(
+    history: list[dict[str, Any]],
+    audio_placeholder: str,
+    instructions: str | None,
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Build the replayed chat messages and the audio that backs them.
+
+    Returned as a pair on purpose: the audio placeholders in `messages` are matched
+    POSITIONALLY against this audio list when it becomes `multi_modal_data`, so any
+    drift between the two silently misattributes one turn's audio to another. Emitting
+    both from one loop makes that drift impossible by construction.
+
+    A user turn may carry audio, text, or both:
+      * audio    -> one placeholder, the shape a live turn has. Preferred when that is
+                    all there is, since this endpoint returns no transcript of the
+                    user's speech and audio keeps prosody a transcript loses.
+      * text     -> the text, no placeholder. What a caller with an existing transcript
+                    (ASR elsewhere, or a migrated text conversation) can offer, at a
+                    small fraction of the tokens and bytes.
+      * both     -> placeholder followed by the text, in one message. Content here is a
+                    plain string rather than a content-part list, so this is simply
+                    concatenation - the same rendering the chat template produces for a
+                    mixed audio+text user turn on /v1/chat/completions.
+    """
+    messages: list[dict[str, Any]] = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    past_audio: list[Any] = []
+    for past in history:
+        role = past.get("role") or "assistant"
+        text = past.get("content") or ""
+        if role == "user" and past.get("audio") is not None:
+            messages.append({"role": "user", "content": audio_placeholder + text})
+            past_audio.append(past["audio"])
+        else:
+            messages.append({"role": role, "content": text})
+    return messages, past_audio
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -260,6 +299,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         while history and history[-1].get("role") == "user":
             history.pop()
 
+        # Audio for the replayed user turns, in placeholder order. Filled by
+        # _replay_messages so it cannot drift from the placeholders it emits;
+        # stays empty when the chat-template branch below is skipped.
+        past_audio: list[np.ndarray] = []
+
         if tools or instructions or history:
             # Render through the model's own chat template (rather than the
             # hardcoded f-string below) so the thinker gets the <tools>...</tools>
@@ -291,17 +335,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             from vllm.renderers.hf import safe_apply_chat_template
 
             # Replay the prior messages verbatim, then the turn being spoken now.
-            # Each replayed user turn becomes an audio placeholder; the placeholders
-            # are matched POSITIONALLY against the multi_modal_data audio list below,
-            # so the two MUST stay in the same order and count.
-            messages: list[dict[str, Any]] = []
-            if instructions:
-                messages.append({"role": "system", "content": instructions})
-            for past in history:
-                if past.get("role") == "user":
-                    messages.append({"role": "user", "content": audio_placeholder})
-                else:
-                    messages.append({"role": past.get("role") or "assistant", "content": past.get("content") or ""})
+            messages, past_audio = _replay_messages(history, audio_placeholder, instructions)
             messages.append({"role": "user", "content": audio_placeholder})
 
             prompt_template = safe_apply_chat_template(
@@ -329,9 +363,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         # talker to emit duplicate audio. Defer all audio to the final
         # flush so the thinker sees one complete prompt.
         async_chunk = getattr(model_config, "async_chunk", False)
-
-        # Same order as the replayed user placeholders above.
-        past_audio = [p["audio"] for p in history if p.get("role") == "user" and p.get("audio") is not None]
 
         def _mm(current: np.ndarray) -> dict[str, Any]:
             # Prior turns first, current turn last - same order as the audio

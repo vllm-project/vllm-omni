@@ -18,6 +18,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection, _PendingToolCall
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import _replay_messages
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -677,9 +678,10 @@ class TestRenderPromptPropagatesAdditionalInformation:
 
 
 class TestConversationHistory:
-    """Audio conversation history. The endpoint is audio-in and returns only the
-    assistant's own reply text (no ASR of the user), so prior turns are replayed as
-    the user's ORIGINAL AUDIO plus text for everything else.
+    """Conversation history. The endpoint is audio-in and returns only the
+    assistant's own reply text (no ASR of the user), so a user turn is normally
+    replayed as its ORIGINAL AUDIO; text is accepted too for callers that have a
+    transcript instead. Everything else is text.
 
     A completed TOOL turn must be replayed in full - assistant `<tool_call>`, the
     `tool` result, then the spoken answer. Replaying only the answer makes the
@@ -737,13 +739,57 @@ class TestConversationHistory:
         assert conn._history == [{"role": "tool", "content": "12 units in stock"}]
         conn.send_error.assert_not_awaited()
 
-    def test_user_without_audio_is_rejected(self) -> None:
+    def test_user_text_is_accepted(self) -> None:
+        """A caller with a text transcript and no audio (ASR elsewhere, or a
+        migrated text conversation) can still seed history. Text costs a fraction
+        of the tokens and bytes that replayed audio does."""
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._msg("user", "my name is Nathan")))
+        assert conn._history == [{"role": "user", "content": "my name is Nathan"}]
+        conn.send_error.assert_not_awaited()
+
+    def test_user_input_text_is_accepted(self) -> None:
+        """OpenAI's Realtime API uses `input_text` on a user message (and `text` on
+        an assistant one), so both spellings are honoured - same tolerance the
+        audio side already has for `input_audio`/`audio`."""
         conn = self._conn()
         asyncio.run(
             conn._handle_history_item(
-                {"type": "message", "role": "user", "content": [{"type": "text", "text": "no audio"}]}
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "my name is Nathan"}]}
             )
         )
+        assert conn._history == [{"role": "user", "content": "my name is Nathan"}]
+        conn.send_error.assert_not_awaited()
+
+    def test_user_audio_and_text_are_both_kept(self) -> None:
+        """A user turn may be audio PLUS text - the spoken part and a written
+        instruction about it - which /v1/chat/completions already supports for this
+        checkpoint. Neither part is discarded."""
+        conn = self._conn()
+        asyncio.run(
+            conn._handle_history_item(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_audio", "audio": self._pcm_b64([16384])},
+                        {"type": "input_text", "text": "translate that"},
+                    ],
+                }
+            )
+        )
+        assert conn._history[0]["content"] == "translate that"
+        np.testing.assert_allclose(conn._history[0]["audio"], [0.5], rtol=1e-6)
+
+    def test_user_with_neither_audio_nor_text_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item({"type": "message", "role": "user", "content": []}))
+        assert conn._history == []
+        conn.send_error.assert_awaited_once()
+
+    def test_user_with_blank_text_is_rejected(self) -> None:
+        conn = self._conn()
+        asyncio.run(conn._handle_history_item(self._msg("user", "   ")))
         assert conn._history == []
         conn.send_error.assert_awaited_once()
 
@@ -762,3 +808,101 @@ class TestConversationHistory:
     def test_decode_matches_base_class_pcm16_conversion(self) -> None:
         out = RealtimeConnection._decode_pcm16(self._pcm_b64([0, 16384, -16384]))
         np.testing.assert_allclose(out, [0.0, 0.5, -0.5], rtol=1e-6)
+
+
+class TestReplayMessagePairing:
+    """`_replay_messages` emits the chat messages and the audio list together
+    because they are matched POSITIONALLY: the Nth audio placeholder in the prompt
+    binds to the Nth entry of multi_modal_data. If the two ever disagree the model
+    attributes one turn's audio to a different turn - silently, with no error - so
+    the count/order invariant is asserted directly here."""
+
+    PH = "<|audio_start|><|audio_pad|><|audio_end|>"
+
+    @staticmethod
+    def _audio(n=8):
+        return np.zeros(n, dtype=np.float32)
+
+    def test_audio_turn_emits_placeholder_and_audio(self) -> None:
+        msgs, audio = _replay_messages([{"role": "user", "audio": self._audio()}], self.PH, None)
+        assert [m["content"] for m in msgs] == [self.PH]
+        assert len(audio) == 1
+
+    def test_text_user_turn_emits_text_and_no_audio(self) -> None:
+        msgs, audio = _replay_messages([{"role": "user", "content": "my name is Nathan"}], self.PH, None)
+        assert msgs == [{"role": "user", "content": "my name is Nathan"}]
+        assert audio == []
+
+    def test_mixed_audio_and_text_turn_renders_both(self) -> None:
+        """Content is a plain string here, so a mixed turn is just concatenation -
+        one placeholder (so one audio entry) followed by the text."""
+        msgs, audio = _replay_messages(
+            [{"role": "user", "audio": self._audio(), "content": "translate that"}], self.PH, None
+        )
+        assert msgs == [{"role": "user", "content": self.PH + "translate that"}]
+        assert len(audio) == 1
+
+    def test_placeholder_count_always_equals_audio_count(self) -> None:
+        """The invariant, over a mixed history: audio user turns, text user turns,
+        assistant and tool turns interleaved."""
+        history = [
+            {"role": "user", "content": "text one"},
+            {"role": "assistant", "content": "reply one"},
+            {"role": "user", "audio": self._audio()},
+            {"role": "assistant", "content": "reply two"},
+            {"role": "tool", "content": "sunny and 72"},
+            {"role": "user", "audio": self._audio()},
+            {"role": "user", "content": "text two"},
+            {"role": "user", "audio": self._audio(), "content": "and this"},
+        ]
+        msgs, audio = _replay_messages(history, self.PH, None)
+        assert len(msgs) == len(history)
+        assert sum(1 for m in msgs if m["content"].startswith(self.PH)) == len(audio) == 3
+
+    def test_order_is_preserved(self) -> None:
+        history = [
+            {"role": "user", "audio": np.full(4, 0.25, dtype=np.float32)},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "audio": np.full(4, 0.75, dtype=np.float32)},
+        ]
+        _, audio = _replay_messages(history, self.PH, None)
+        assert [float(a[0]) for a in audio] == [0.25, 0.75]
+
+    def test_instructions_lead_and_add_no_audio(self) -> None:
+        msgs, audio = _replay_messages([{"role": "user", "audio": self._audio()}], self.PH, "be brief")
+        assert msgs[0] == {"role": "system", "content": "be brief"}
+        assert len(audio) == 1
+
+    def test_empty_history_is_empty(self) -> None:
+        assert _replay_messages([], self.PH, None) == ([], [])
+
+    def test_unknown_role_defaults_to_assistant(self) -> None:
+        msgs, audio = _replay_messages([{"content": "x"}], self.PH, None)
+        assert msgs == [{"role": "assistant", "content": "x"}]
+        assert audio == []
+
+
+class TestModelStaysRegisteredAsMultimodal:
+    """Guard for a real mistake: a module-level helper was added between
+    `@MULTIMODAL_REGISTRY.register_processor(...)` and the model class, so the
+    decorator registered the HELPER instead of the model. The file still parsed
+    and every other unit test still passed - a decorator may legally decorate a
+    function - but at runtime the renderer no longer saw the model as multimodal
+    and every request died with `'HfRenderer' object has no attribute
+    '_mm_req_counter'`. Assert the decorator is attached to the class."""
+
+    def test_register_processor_decorates_the_model_class(self) -> None:
+        import inspect
+
+        from vllm_omni.model_executor.models.qwen3_omni import qwen3_omni as mod
+
+        src = inspect.getsource(mod)
+        idx = src.index("@MULTIMODAL_REGISTRY.register_processor(")
+        after = src[idx:]
+        # The next top-level statement after the decorator block must be the class.
+        following = [ln for ln in after.splitlines()[1:] if ln and not ln[0].isspace() and not ln.startswith(")")]
+        assert following, "nothing follows the decorator"
+        assert following[0].startswith("class Qwen3OmniMoeForConditionalGeneration"), (
+            f"@MULTIMODAL_REGISTRY.register_processor decorates {following[0]!r}, "
+            "not the model class - the model will not be treated as multimodal"
+        )
