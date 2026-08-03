@@ -12,6 +12,7 @@ from vllm_omni.model_extras import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
     build_text_to_image_prompt,
+    build_text_to_video_prompt,
     build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
@@ -617,3 +618,161 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "visual_token_end_id": [168456],
         },
     }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_extra_registry_declares_request_and_response_params() -> None:
+    # LancePipeline.forward handles the video / edit / x2t paths and then falls
+    # through to BagelPipeline.forward for t2i, so the declared set is the union
+    # of both classes' extra_args reads. `think` / `think_text` come from the
+    # inherited Bagel path and would be filtered out if omitted here.
+    assert get_extra_body_params("LancePipeline") == frozenset(
+        {
+            "cfg_text_scale",
+            "cfg_img_scale",
+            "cfg_interval",
+            "cfg_renorm_type",
+            "cfg_renorm_min",
+            "negative_prompt",
+            "timestep_shift",
+            "think",
+            "max_think_tokens",
+            "do_sample",
+            "text_temperature",
+            "system_prompt",
+            "user_text",
+            "num_frames",
+            "video_height",
+            "video_width",
+            "origin_fps",
+        }
+    )
+    assert get_extra_output_params("LancePipeline") == frozenset({"text_output", "think_text"})
+    # Lance is single-stage, so there are no non-diffusion stages to seed.
+    assert should_init_extra_args_for_non_diffusion_stages("LancePipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_text_to_image_prompt_builder() -> None:
+    # Lance requires the Qwen chat template with its task system prompt; a bare
+    # prompt string silently degrades output quality.
+    assert build_text_to_image_prompt(
+        "LancePipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": (
+            "<|im_start|>system\n"
+            "Describe the image by detailing the color, quantity, text, shape, "
+            "size, texture, spatial relationships of the objects and background:"
+            "<|im_end|>\n<|im_start|>user\na cat<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        "modalities": ["image"],
+        "negative_prompt": "blurry",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_image_to_image_prompt_builder_uses_img2img_key() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_image_prompt(
+        "LancePipeline",
+        prompt="make it red",
+        negative_prompt=None,
+        input_image=dummy_image,
+    )
+    # `img2img` is what routes the request to _forward_image_edit.
+    assert result["multi_modal_data"] == {"img2img": dummy_image}
+    assert result["modalities"] == ["image"]
+    assert "<|vision_start|><|video_pad|><|vision_end|>make it red" in result["prompt"]
+    assert "negative_prompt" not in result
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_text_to_video_prompt_builder_injects_video_shape() -> None:
+    # _forward_t2v reads num_frames / video_height / video_width from
+    # extra_args, not from sampling_params, so the builder must inject them.
+    result = build_text_to_video_prompt(
+        "LancePipeline",
+        prompt="a dog running",
+        negative_prompt=None,
+        height=480,
+        width=768,
+        num_frames=25,
+    )
+    assert result["modalities"] == ["video"]
+    assert result["extra_args"] == {
+        "num_frames": 25,
+        "video_height": 480,
+        "video_width": 768,
+    }
+    assert result["prompt"].startswith("<|im_start|>system\nDescribe the video")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_text_to_video_prompt_builder_falls_back_to_defaults() -> None:
+    result = build_text_to_video_prompt(
+        "LancePipeline",
+        prompt="a dog running",
+        negative_prompt=None,
+    )
+    assert result["extra_args"] == {
+        "num_frames": 25,
+        "video_height": 480,
+        "video_width": 768,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_image_to_video_prompt_builder_uses_first_frame_key() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_video_prompt(
+        "LancePipeline",
+        prompt="pan across the scene",
+        negative_prompt=None,
+        media_inputs={"image": dummy_image},
+        height=480,
+        width=768,
+        num_frames=25,
+    )
+    # `first_frame` is what routes the request to _forward_i2v; using the plain
+    # `image` key would silently fall through to a different forward path.
+    assert result["multi_modal_data"] == {"first_frame": dummy_image}
+    assert result["modalities"] == ["video"]
+    assert result["extra_args"]["num_frames"] == 25
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_image_to_video_rejects_unsupported_media_inputs() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    with pytest.raises(ValueError, match="single --image"):
+        build_image_to_video_prompt(
+            "LancePipeline",
+            prompt="pan",
+            negative_prompt=None,
+            media_inputs={"image": dummy_image, "last_image": dummy_image},
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_unknown_pipeline_uses_default_text_to_video_prompt() -> None:
+    # Models without a declaration must keep the plain prompt form.
+    assert build_text_to_video_prompt(
+        "UnknownPipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=480,
+        width=768,
+        num_frames=16,
+    ) == {"prompt": "a cat", "negative_prompt": "blurry"}
+    assert build_text_to_video_prompt("UnknownPipeline", prompt="a cat", negative_prompt=None) == {"prompt": "a cat"}

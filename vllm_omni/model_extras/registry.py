@@ -36,6 +36,22 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.lance import (
+    LANCE_EXTRA_BODY_PARAMS,
+    LANCE_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.lance import (
+    build_image_to_image_prompt as build_lance_image_to_image_prompt,
+)
+from vllm_omni.model_extras.lance import (
+    build_image_to_video_prompt as build_lance_image_to_video_prompt,
+)
+from vllm_omni.model_extras.lance import (
+    build_text_to_image_prompt as build_lance_text_to_image_prompt,
+)
+from vllm_omni.model_extras.lance import (
+    build_text_to_video_prompt as build_lance_text_to_video_prompt,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
@@ -96,6 +112,10 @@ ImageToVideoPromptBuilder = Callable[
     dict[str, Any],
 ]
 XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
+TextToVideoPromptBuilder = Callable[
+    [str, str | None, int | None, int | None, int | None],
+    dict[str, Any],
+]
 
 
 def default_x_to_text_prompt(
@@ -169,6 +189,20 @@ def default_image_to_image_prompt(
     return result
 
 
+def default_text_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    del height, width, num_frames
+    result: dict[str, Any] = {"prompt": prompt}
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
 def default_image_to_video_prompt(
     prompt: str,
     negative_prompt: str | None,
@@ -208,6 +242,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
         "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
+    },
+    "LancePipeline": {
+        "extra_body_params": LANCE_EXTRA_BODY_PARAMS,
+        "extra_output_params": LANCE_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_lance_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_lance_image_to_image_prompt,
+        "text_to_video_prompt_builder": build_lance_text_to_video_prompt,
+        "image_to_video_prompt_builder": build_lance_image_to_video_prompt,
     },
     "MagiHumanPipeline": {
         "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
@@ -326,6 +368,23 @@ def build_image_to_image_prompt(
         else default_image_to_image_prompt
     )
     return builder(prompt, negative_prompt, input_image, height, width)
+
+
+def build_text_to_video_prompt(
+    model_class_name: str | None,
+    prompt: str,
+    negative_prompt: str | None,
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    spec = _get_spec(model_class_name)
+    builder: TextToVideoPromptBuilder = (
+        spec.get("text_to_video_prompt_builder", default_text_to_video_prompt)
+        if spec is not None
+        else default_text_to_video_prompt
+    )
+    return builder(prompt, negative_prompt, height, width, num_frames)
 
 
 def build_image_to_video_prompt(

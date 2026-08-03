@@ -161,6 +161,30 @@ python text_to_image.py \
   --seed 42
 ```
 
+### Lance
+
+Lance needs `--deploy-config` to select its pipeline, and takes its
+model-specific knobs through `--extra-body` (declared in
+[`vllm_omni/model_extras/lance.py`](../../../vllm_omni/model_extras/lance.py)).
+The Qwen chat template Lance expects is applied automatically — pass a plain
+prompt:
+
+```bash
+python text_to_image.py \
+  --model bytedance-research/Lance \
+  --deploy-config vllm_omni/deploy/lance.yaml \
+  --prompt "a corgi astronaut on the moon, cinematic" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 30 \
+  --extra-body '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}' \
+  --output lance_output.png \
+  --seed 42
+```
+
+See [`recipes/ByteDance/Lance.md`](../../../recipes/ByteDance/Lance.md) for the
+full knob list and the other Lance tasks.
+
 ### FLUX.2-dev Models
 
 To run FLUX.2-dev on a single GPU, `--enable-cpu-offload` is required because the model weights exceed 80 GiB:

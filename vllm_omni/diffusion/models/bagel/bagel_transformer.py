@@ -2426,7 +2426,13 @@ class Bagel(CFGParallelMixin, nn.Module):
 
             batched_sequence = packed_sequence.repeat(num_branches, 1)
             batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
-            batched_position_ids = torch.cat(cfg_branch_pids)
+            # Concatenate CFG-branch position ids along the sequence axis, not
+            # the default dim 0. For BAGEL's 1-D scalar position ids (S,) this is
+            # unchanged (dim -1 == dim 0 -> (num_branches*S,)). For Lance's 3-axis
+            # mrope position ids (3, S), the default dim 0 wrongly stacked the
+            # axes into (6, S), which then failed the mrope RoPE that expects
+            # (B, 3, S); dim -1 gives the correct (3, num_branches*S).
+            batched_position_ids = torch.cat(cfg_branch_pids, dim=-1)
             batched_seqlens = packed_seqlens.repeat(num_branches)
             merged_cache = NaiveCache.merge(cfg_branch_caches)
 

@@ -2,6 +2,12 @@
 
 OpenAI-compatible chat completions API for Lance, served by `vllm-omni`.
 
+> Lance's model-specific generation knobs are declared in
+> [`vllm_omni/model_extras/lance.py`](../../../vllm_omni/model_extras/lance.py)
+> and are passed in the request's `extra_body`. Undeclared keys are silently
+> dropped. See [`recipes/ByteDance/Lance.md`](../../../recipes/ByteDance/Lance.md)
+> for the full list and for the shared task-example equivalents.
+
 ## Start the server
 
 ```bash

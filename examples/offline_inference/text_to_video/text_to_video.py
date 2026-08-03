@@ -14,7 +14,11 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+from vllm_omni.model_extras import (
+    build_text_to_video_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -469,12 +473,25 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
-    prompt_dict = {"prompt": args.prompt}
+    # Model-specific prompt shaping (e.g. Lance's chat-template rendering) is
+    # declared in vllm_omni/model_extras/; models without a declaration fall
+    # back to the plain {"prompt": ...} form. Negative-prompt handling keeps the
+    # LTX preset special-casing: LTX omits an unset negative prompt, other
+    # presets pass an explicit empty string.
     if args.negative_prompt is not None:
-        prompt_dict["negative_prompt"] = args.negative_prompt
+        negative_prompt = args.negative_prompt
     elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
-        # Preserve the historical empty-prompt behavior for non-LTX examples.
-        prompt_dict["negative_prompt"] = ""
+        negative_prompt = ""
+    else:
+        negative_prompt = None
+    prompt_dict = build_text_to_video_prompt(
+        model_class_name,
+        prompt=args.prompt,
+        negative_prompt=negative_prompt,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+    )
 
     sampling_kwargs = dict(
         height=args.height,
