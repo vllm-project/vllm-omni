@@ -39,6 +39,8 @@ from __future__ import annotations
 import re
 import warnings
 
+import pytest
+
 # ====================================================================
 # Copy of the relevant production code from front.py & common.py
 # ====================================================================
@@ -211,8 +213,6 @@ def split_segments_by_token(
 # ====================================================================
 # TESTS
 # ====================================================================
-
-import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
