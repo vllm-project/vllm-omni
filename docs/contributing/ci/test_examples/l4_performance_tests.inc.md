@@ -44,9 +44,11 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
             "ignore_eos": true,
             "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
             "baseline": {
-                "mean_ttft_ms": [500, 800],
-                "mean_audio_ttfp_ms": [2000, 3500],
-                "mean_audio_rtf": [0.25, 0.35]
+                "H100": {
+                    "mean_ttft_ms": [500, 800],
+                    "mean_audio_ttfp_ms": [2000, 3500],
+                    "mean_audio_rtf": [0.25, 0.35]
+                }
             }
         }
     ]
@@ -142,10 +144,6 @@ pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
-
-# Optional baseline assertion (default off)
-pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline \
-  --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 ```
 
 See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
@@ -202,4 +200,4 @@ You can add any benchmark running parameters you need here. For all optional par
 | num_prompts     | int / array | Yes      | 10,[10, 20, 30] | Number of requests. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of qps or max_concurrency, e.g., [10,10,10]. If an array is used, its length must match the number of qps or max_concurrency. |
 | request_rate    | float / array | No  | 0.5, [0.5, 1, inf] | Queries per second. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of num_prompts, e.g., [1,1,1]. If an array is used, its length must match the number of num_prompts.                          |
 | max_concurrency | int / array | No       | 1, [1, 2, 3]    | Maximum concurrent in-flight requests. Same array / expansion rules as `request_rate` (mutually exclusive with QPS mode).                                                                                                                                                                                                             |
-| baseline        | object      | No       | see above       | Optional per-metric thresholds; keys must match benchmark output fields. Scalar, list (per sweep step), or object (keyed by concurrency or QPS string).  
+| baseline        | object      | No       | see below       | Optional thresholds. Prefer hardware-nested form: `{"H100": {"throughput_qps": …}, "A3": {…}}` (selected via runtime hardware label). Legacy flat `{metric: threshold}` still works. Per metric: scalar, list (sweep step), or object keyed by concurrency / QPS.  
