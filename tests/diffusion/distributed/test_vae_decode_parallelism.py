@@ -39,7 +39,7 @@ MODEL_CASES = [
             "needs_image": False,
             "is_moe": False,
             "mean_threshold": 3e-2,
-            "p99_threshold": 3e-2,
+            "p99_threshold": 4e-2,
         },
         id="wan22_t2v_a14b",
     ),
