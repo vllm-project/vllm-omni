@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
@@ -271,6 +273,7 @@ def _run_attention_case(
     split_sizes: list[int] | None = None,
     sdp_kernel_mode: str = "math",
     num_kv_heads: int | None = None,
+    mask_layout: str | None = None,
 ) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
@@ -314,9 +317,11 @@ def _run_attention_case(
             q_full = torch.from_numpy(payload["q"]).to(device=device)
             k_full = torch.from_numpy(payload["k"]).to(device=device)
             v_full = torch.from_numpy(payload["v"]).to(device=device)
+            mask_full = torch.from_numpy(payload["mask"]).to(device=device) if "mask" in payload else None
 
         if world_size == 1:
             q, k, v = q_full, k_full, v_full
+            mask = mask_full
         else:
             if split_sizes is None:
                 # NOTE: torch.chunk may return fewer than `world_size` chunks for some
@@ -336,6 +341,12 @@ def _run_attention_case(
                 q = torch.split(q_full, split_sizes, dim=1)[local_rank].contiguous()
                 k = torch.split(k_full, split_sizes, dim=1)[local_rank].contiguous()
                 v = torch.split(v_full, split_sizes, dim=1)[local_rank].contiguous()
+            if mask_full is None:
+                mask = None
+            elif mask_layout == "global":
+                mask = mask_full
+            else:
+                raise ValueError("mask_layout must be 'global' when a mask is provided.")
             # The Attention layer only enables SP communication when ForwardContext.sp_active is True.
             # In production this is managed by SequenceParallelSplitHook/GatherHook, but here we
             # shard manually for testing.
@@ -349,7 +360,8 @@ def _run_attention_case(
             raise ValueError(f"Invalid sdp_kernel_mode: {sdp_kernel_mode!r}")
 
         with sdp_ctx:
-            out_local = attn(q, k, v).contiguous()
+            attn_metadata = AttentionMetadata(attn_mask=mask) if mask is not None else None
+            out_local = attn(q, k, v, attn_metadata).contiguous()
 
         if world_size == 1:
             out_full = out_local
@@ -531,6 +543,101 @@ def test_ulysses_uaa_gqa_matches_baseline(
         sp_t = torch.from_numpy(np.load(sp_file, allow_pickle=False))
         assert baseline_t.shape == sp_t.shape
         torch.testing.assert_close(sp_t, baseline_t, atol=1e-5, rtol=1e-5)
+    finally:
+        for path in (input_file, baseline_file, sp_file):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("mask_layout", ["global"])
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_ulysses_uaa_2d_mask_layout_matches_baseline(
+    mask_layout: str,
+) -> None:
+    world_size = 2
+    batch_size = 2
+    seq_len = 5
+    split_sizes = [2, 3]
+    num_heads = 3
+    head_size = 8
+
+    base_port = _find_free_port()
+    sp_port = _find_free_port()
+    while sp_port == base_port:
+        sp_port = _find_free_port()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
+        input_file = f_in.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
+        baseline_file = f_base.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_sp:
+        sp_file = f_sp.name
+
+    try:
+        torch.manual_seed(0)
+        q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
+        mask = torch.tensor(
+            [
+                [True, True, True, True, False],
+                [True, True, True, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        np.savez(
+            input_file,
+            q=q.numpy(),
+            k=k.numpy(),
+            v=v.numpy(),
+            mask=mask.numpy(),
+        )
+
+        torch.multiprocessing.spawn(
+            _run_attention_case,
+            args=(
+                1,
+                base_port,
+                input_file,
+                baseline_file,
+                num_heads,
+                head_size,
+                1,
+                "strict",
+                1,
+                None,
+                "math",
+                None,
+                "global",
+            ),
+            nprocs=1,
+        )
+        torch.multiprocessing.spawn(
+            _run_attention_case,
+            args=(
+                world_size,
+                sp_port,
+                input_file,
+                sp_file,
+                num_heads,
+                head_size,
+                world_size,
+                "advanced_uaa",
+                1,
+                split_sizes,
+                "math",
+                None,
+                mask_layout,
+            ),
+            nprocs=world_size,
+        )
+
+        baseline = torch.from_numpy(np.load(baseline_file, allow_pickle=False))
+        sp = torch.from_numpy(np.load(sp_file, allow_pickle=False))
+        torch.testing.assert_close(sp, baseline, atol=1e-5, rtol=1e-5)
     finally:
         for path in (input_file, baseline_file, sp_file):
             try:

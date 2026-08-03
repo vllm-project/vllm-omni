@@ -34,6 +34,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.models.boogu_image.sp_layout import ShardLayout
 
 logger = init_logger(__name__)
 
@@ -341,12 +346,16 @@ def _concat_instruction_image_features(
     assert len(img_tensors) == len(instruct_tensors)
 
     batch_size = img_tensors[0].shape[0]
-    max_seq_len = max(seq_lengths)
+    joint_capacity = instruct_tensors[0].shape[1] + img_tensors[0].shape[1]
 
     concatenated_list = []
     for img_tensor, instruct_tensor in zip(img_tensors, instruct_tensors):
         feature_dim = img_tensor.shape[-1]
-        concatenated = img_tensor.new_zeros(batch_size, max_seq_len, feature_dim)
+        concatenated = img_tensor.new_zeros(
+            batch_size,
+            joint_capacity,
+            feature_dim,
+        )
         for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
             concatenated[i, :encoder_seq_len] = instruct_tensor[i, :encoder_seq_len]
             concatenated[i, encoder_seq_len:seq_len] = img_tensor[i, : seq_len - encoder_seq_len]
@@ -359,16 +368,24 @@ def _split_instruction_image_features(
     hidden_states: torch.Tensor,
     encoder_seq_lengths: list[int],
     seq_lengths: list[int],
+    *,
+    instruct_capacity: int,
+    img_capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unpack a joint sequence back into (instruction, image) streams."""
     batch_size = hidden_states.shape[0]
     feature_dim = hidden_states.shape[-1]
 
-    max_instruct_len = max(encoder_seq_lengths)
-    max_img_len = max(seq_len - encoder_seq_len for seq_len, encoder_seq_len in zip(seq_lengths, encoder_seq_lengths))
-
-    instruct_hidden_states = hidden_states.new_zeros(batch_size, max_instruct_len, feature_dim)
-    img_hidden_states = hidden_states.new_zeros(batch_size, max_img_len, feature_dim)
+    instruct_hidden_states = hidden_states.new_zeros(
+        batch_size,
+        instruct_capacity,
+        feature_dim,
+    )
+    img_hidden_states = hidden_states.new_zeros(
+        batch_size,
+        img_capacity,
+        feature_dim,
+    )
 
     for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
         img_len = seq_len - encoder_seq_len
@@ -529,7 +546,11 @@ class BooguImageJointAttention(nn.Module):
         attn_output = attn_output.flatten(2, 3).to(dtype)
 
         instruct_attn_out, img_attn_out = _split_instruction_image_features(
-            attn_output, encoder_seq_lengths, seq_lengths
+            attn_output,
+            encoder_seq_lengths,
+            seq_lengths,
+            instruct_capacity=instruct_hidden_states.shape[1],
+            img_capacity=img_hidden_states.shape[1],
         )
         instruct_projected, _ = self.instruct_out(instruct_attn_out)
         img_projected, _ = self.img_out(img_attn_out)
@@ -800,6 +821,20 @@ def _cal_preprocessed_instruction_feat_dim(instruction_feature_configs: dict) ->
         raise ValueError(f"Invalid reduce_type: {reduce_type}")
 
 
+class _BooguImageSPBoundary(nn.Module):
+    """Identity module used by framework SP split hooks."""
+
+    def forward(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tensors
+
+
+class _BooguImageSPGather(nn.Module):
+    """Identity module used by the framework SP gather hook."""
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+
 class BooguImageTransformer2DModel(nn.Module):
     """Boogu-Image transformer with mixed stream topology.
 
@@ -817,6 +852,40 @@ class BooguImageTransformer2DModel(nn.Module):
         "BooguImageSingleStreamTransformerBlock",
     ]
     _layerwise_offload_blocks_attrs = ["single_stream_layers", "double_stream_layers"]
+    # Boundary outputs are hidden states, masks, and RoPE; each triplet is in
+    # image/reference/context order so tensors sharing a sequence reuse metadata.
+    _sp_plan = {
+        "sp_shard_boundary": {
+            index: SequenceParallelInput(
+                split_dim=1,
+                expected_dims=dims,
+                split_output=True,
+                auto_pad=True,
+                shard_group=shard_group,
+            )
+            for index, (dims, shard_group) in enumerate(
+                zip(
+                    (3, 3, 3, 2, 2, 2, 3, 3, 3),
+                    (
+                        "image",
+                        "reference",
+                        "context",
+                        "image",
+                        "reference",
+                        "context",
+                        "image",
+                        "reference",
+                        "context",
+                    ),
+                )
+            )
+        },
+        "sp_gather_boundary": SequenceParallelOutput(
+            gather_dim=1,
+            expected_dims=3,
+            shard_group="image",
+        ),
+    }
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         super().__init__()
@@ -878,6 +947,8 @@ class BooguImageTransformer2DModel(nn.Module):
             axes_lens=axes_lens,
             patch_size=patch_size,
         )
+        self.sp_shard_boundary = _BooguImageSPBoundary()
+        self.sp_gather_boundary = _BooguImageSPGather()
 
         self.x_embedder = nn.Linear(
             in_features=patch_size * patch_size * in_channels,
@@ -1112,6 +1183,7 @@ class BooguImageTransformer2DModel(nn.Module):
         l_effective_ref_img_len,
         l_effective_img_len,
         temb,
+        per_rank_ref_lengths: list[list[list[int]]] | None = None,
     ):
         """Embed image patches and run the refiner blocks.
 
@@ -1121,9 +1193,7 @@ class BooguImageTransformer2DModel(nn.Module):
         avoiding a degenerate zero-length attention.
         """
         batch_size = len(hidden_states)
-        max_combined_img_len = max(
-            img_len + sum(ref_img_len) for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len)
-        )
+        max_combined_img_len = hidden_states.shape[1] + ref_image_hidden_states.shape[1]
 
         hidden_states = self.x_embedder(hidden_states)
         ref_image_hidden_states = self.ref_image_patch_embedder(ref_image_hidden_states)
@@ -1142,6 +1212,14 @@ class BooguImageTransformer2DModel(nn.Module):
         flat_l_effective_ref_img_len = list(itertools.chain(*l_effective_ref_img_len))
         num_ref_images = len(flat_l_effective_ref_img_len)
         max_ref_img_len = max(flat_l_effective_ref_img_len)
+        sp_sharded = per_rank_ref_lengths is not None and len(per_rank_ref_lengths) > 1
+        if sp_sharded:
+            # Keep the packed reference batch at the padded local capacity so
+            # every SP rank retains the equal-length contract.
+            max_ref_img_len = max(
+                max_ref_img_len,
+                padded_ref_img_mask.shape[1],
+            )
 
         if max_ref_img_len > 0:
             batch_ref_img_mask = ref_image_hidden_states.new_zeros(num_ref_images, max_ref_img_len, dtype=torch.bool)
@@ -1167,9 +1245,27 @@ class BooguImageTransformer2DModel(nn.Module):
                     shift += ref_img_len
                     idx += 1
 
+            if sp_sharded:
+                # Ulysses will concatenate each rank's packed reference batch,
+                # so the mask must cover all ranks' segments.
+                ref_attention_mask = self._rank_concat_mask_or_none(
+                    [list(itertools.chain(*rank_lengths)) for rank_lengths in per_rank_ref_lengths],
+                    max_ref_img_len,
+                    like=batch_ref_img_mask,
+                )
+            else:
+                ref_attention_mask = (
+                    batch_ref_img_mask
+                    if any(length != max_ref_img_len for length in flat_l_effective_ref_img_len)
+                    else None
+                )
+
             for layer in self.ref_image_refiner:
                 batch_ref_image_hidden_states = layer(
-                    batch_ref_image_hidden_states, batch_ref_img_mask, batch_ref_img_rotary_emb, batch_temb
+                    batch_ref_image_hidden_states,
+                    ref_attention_mask,
+                    batch_ref_img_rotary_emb,
+                    batch_temb,
                 )
 
             # Restore reference-image sequence layout.
@@ -1189,6 +1285,96 @@ class BooguImageTransformer2DModel(nn.Module):
             combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
 
         return combined_img_hidden_states
+
+    @staticmethod
+    def _rank_concat_mask_or_none(
+        per_rank_lengths: list[list[int]],
+        capacity: int,
+        *,
+        like: torch.Tensor,
+        required: bool = False,
+    ) -> torch.Tensor | None:
+        """Mask over the rank-concatenated sequence Ulysses builds post all-to-all.
+
+        `per_rank_lengths[r][i]` is sample `i`'s valid length inside rank `r`'s
+        shard, and every shard has the same `capacity` (guaranteed by auto_pad),
+        so the global sequence is `world_size * capacity` long. Returns None for
+        an all-valid mask unless a padding contract requires one.
+        """
+        if not required and all(int(length) == capacity for lengths in per_rank_lengths for length in lengths):
+            return None
+
+        batch_size = len(per_rank_lengths[0])
+        mask = like.new_zeros(batch_size, len(per_rank_lengths) * capacity, dtype=torch.bool)
+        for rank, lengths in enumerate(per_rank_lengths):
+            base = rank * capacity
+            for i, length in enumerate(lengths):
+                mask[i, base : base + int(length)] = True
+        return mask
+
+    @staticmethod
+    def _pack_local_rotary(
+        context_rotary_emb: torch.Tensor,
+        ref_img_rotary_emb: torch.Tensor,
+        noise_rotary_emb: torch.Tensor,
+        encoder_seq_lengths: list[int],
+        ref_img_seq_lengths: list[list[int]],
+        img_seq_lengths: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
+        """Pack local RoPE as [context, references, noise].
+
+        Capacities stay equal across ranks; returned lengths exclude padding.
+        """
+        batch_size = context_rotary_emb.shape[0]
+        rotary_dim = context_rotary_emb.shape[-1]
+        combined_img_seq_lengths = [
+            sum(ref_lengths) + img_length
+            for ref_lengths, img_length in zip(
+                ref_img_seq_lengths,
+                img_seq_lengths,
+            )
+        ]
+        seq_lengths = [
+            context_length + combined_length
+            for context_length, combined_length in zip(
+                encoder_seq_lengths,
+                combined_img_seq_lengths,
+            )
+        ]
+        combined_img_capacity = ref_img_rotary_emb.shape[1] + noise_rotary_emb.shape[1]
+        combined_img_rotary_emb = context_rotary_emb.new_zeros(
+            batch_size,
+            combined_img_capacity,
+            rotary_dim,
+        )
+        rotary_emb = context_rotary_emb.new_zeros(
+            batch_size,
+            context_rotary_emb.shape[1] + combined_img_capacity,
+            rotary_dim,
+        )
+
+        for i, (context_length, ref_lengths, img_length) in enumerate(
+            zip(
+                encoder_seq_lengths,
+                ref_img_seq_lengths,
+                img_seq_lengths,
+            )
+        ):
+            ref_length = sum(ref_lengths)
+            combined_length = ref_length + img_length
+            combined_img_rotary_emb[i, :ref_length] = ref_img_rotary_emb[i, :ref_length]
+            combined_img_rotary_emb[i, ref_length:combined_length] = noise_rotary_emb[i, :img_length]
+            rotary_emb[i, :context_length] = context_rotary_emb[i, :context_length]
+            rotary_emb[i, context_length : context_length + combined_length] = combined_img_rotary_emb[
+                i, :combined_length
+            ]
+
+        return (
+            rotary_emb,
+            combined_img_rotary_emb,
+            seq_lengths,
+            combined_img_seq_lengths,
+        )
 
     def forward(
         self,
@@ -1237,11 +1423,11 @@ class BooguImageTransformer2DModel(nn.Module):
             context_rotary_emb,
             ref_img_rotary_emb,
             noise_rotary_emb,
-            rotary_emb,
-            encoder_seq_lengths,
-            seq_lengths,
-            combined_img_rotary_emb,
-            combined_img_seq_lengths,
+            _,
+            global_encoder_seq_lengths,
+            _,
+            _,
+            _,
         ) = self.rope_embedder(
             freqs_cis,
             instruction_attention_mask,
@@ -1252,38 +1438,133 @@ class BooguImageTransformer2DModel(nn.Module):
             device,
         )
 
+        (
+            hidden_states,
+            ref_image_hidden_states,
+            instruction_hidden_states,
+            img_mask,
+            ref_img_mask,
+            instruction_attention_mask,
+            noise_rotary_emb,
+            ref_img_rotary_emb,
+            context_rotary_emb,
+        ) = self.sp_shard_boundary(
+            hidden_states,
+            ref_image_hidden_states,
+            instruction_hidden_states,
+            img_mask,
+            ref_img_mask,
+            instruction_attention_mask,
+            noise_rotary_emb,
+            ref_img_rotary_emb,
+            context_rotary_emb,
+        )
+
+        image_layout = ShardLayout.resolve("image", local_seq_len=img_mask.shape[1])
+        reference_layout = ShardLayout.resolve("reference", local_seq_len=ref_img_mask.shape[1])
+        context_layout = ShardLayout.resolve("context", local_seq_len=instruction_attention_mask.shape[1])
+        sp_world_size = image_layout.world_size
+        sp_rank = image_layout.rank
+
+        context_mask_required = context_layout.padding_size > 0 or any(
+            length != context_layout.original_seq_len for length in global_encoder_seq_lengths
+        )
+        noise_mask_required = image_layout.padding_size > 0 or any(
+            length != image_layout.original_seq_len for length in l_effective_img_len
+        )
+        ref_mask_required = reference_layout.padding_size > 0 or any(
+            sum(lengths) != reference_layout.original_seq_len for lengths in l_effective_ref_img_len
+        )
+
+        global_img_lengths = list(l_effective_img_len)
+        # Ulysses concatenates the rank-local sequences after its all-to-all, so
+        # attention masks must describe that rank-concatenated layout. Every
+        # rank's shard bounds are pure arithmetic over the global lengths, so
+        # each rank derives all ranks' segments without any communication.
+        ranks = range(sp_world_size)
+        per_rank_img_lengths = [image_layout.valid_lengths(global_img_lengths, rank=r) for r in ranks]
+        per_rank_ref_lengths = [reference_layout.segment_lengths(l_effective_ref_img_len, rank=r) for r in ranks]
+        per_rank_encoder_lengths = [context_layout.valid_lengths(global_encoder_seq_lengths, rank=r) for r in ranks]
+
+        local_img_lengths = per_rank_img_lengths[sp_rank]
+        local_ref_lengths = per_rank_ref_lengths[sp_rank]
+        local_encoder_lengths = per_rank_encoder_lengths[sp_rank]
+        (
+            rotary_emb,
+            combined_img_rotary_emb,
+            seq_lengths,
+            combined_img_seq_lengths,
+        ) = self._pack_local_rotary(
+            context_rotary_emb,
+            ref_img_rotary_emb,
+            noise_rotary_emb,
+            local_encoder_lengths,
+            local_ref_lengths,
+            local_img_lengths,
+        )
+
+        context_attention_mask = self._rank_concat_mask_or_none(
+            per_rank_encoder_lengths,
+            context_layout.local_seq_len,
+            like=instruction_attention_mask,
+            required=context_mask_required,
+        )
+        noise_attention_mask = self._rank_concat_mask_or_none(
+            per_rank_img_lengths,
+            image_layout.local_seq_len,
+            like=img_mask,
+            required=noise_mask_required,
+        )
+
         # Context refinement.
         for layer in self.context_refiner:
-            instruction_hidden_states = layer(instruction_hidden_states, instruction_attention_mask, context_rotary_emb)
+            instruction_hidden_states = layer(
+                instruction_hidden_states,
+                context_attention_mask,
+                context_rotary_emb,
+            )
 
         # Image patch embedding and refinement.
         combined_img_hidden_states = self.img_patch_embed_and_refine(
             hidden_states,
             ref_image_hidden_states,
-            img_mask,
+            noise_attention_mask,
             ref_img_mask,
             noise_rotary_emb,
             ref_img_rotary_emb,
-            l_effective_ref_img_len,
-            l_effective_img_len,
+            local_ref_lengths,
+            local_img_lengths,
             temb,
+            per_rank_ref_lengths=per_rank_ref_lengths,
         )
 
         instruct_hidden_states = instruction_hidden_states
         img_hidden_states = combined_img_hidden_states
 
-        # Joint mask for [instruct + image].
-        max_seq_len = max(seq_lengths)
-        joint_attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
-        for i, seq_len in enumerate(seq_lengths):
-            joint_attention_mask[i, :seq_len] = True
+        # Joint mask for [instruct + image], over the rank-concatenated sequence.
+        per_rank_combined_img_lengths = [
+            [sum(ref_lengths) + img_length for ref_lengths, img_length in zip(ref_per_sample, img_per_sample)]
+            for ref_per_sample, img_per_sample in zip(per_rank_ref_lengths, per_rank_img_lengths)
+        ]
+        per_rank_seq_lengths = [
+            [encoder_length + combined_length for encoder_length, combined_length in zip(enc_per_sample, comb)]
+            for enc_per_sample, comb in zip(per_rank_encoder_lengths, per_rank_combined_img_lengths)
+        ]
+        joint_attention_mask = self._rank_concat_mask_or_none(
+            per_rank_seq_lengths,
+            rotary_emb.shape[1],
+            like=hidden_states,
+            required=(context_mask_required or noise_mask_required or ref_mask_required),
+        )
 
         # Dual-stream (double-stream) stage.
         if self.num_double_stream_layers > 0:
-            max_img_len = max(combined_img_seq_lengths)
-            img_attention_mask = hidden_states.new_zeros(batch_size, max_img_len, dtype=torch.bool)
-            for i, img_seq_len in enumerate(combined_img_seq_lengths):
-                img_attention_mask[i, :img_seq_len] = True
+            img_attention_mask = self._rank_concat_mask_or_none(
+                per_rank_combined_img_lengths,
+                combined_img_rotary_emb.shape[1],
+                like=hidden_states,
+                required=noise_mask_required or ref_mask_required,
+            )
 
             for layer in self.double_stream_layers:
                 img_hidden_states, instruct_hidden_states = layer(
@@ -1294,13 +1575,17 @@ class BooguImageTransformer2DModel(nn.Module):
                     combined_img_rotary_emb,
                     rotary_emb,
                     temb,
-                    encoder_seq_lengths,
+                    local_encoder_lengths,
                     seq_lengths,
                 )
 
         # Fuse streams to joint sequence.
-        joint_hidden_states = hidden_states.new_zeros(batch_size, max(seq_lengths), self.hidden_size)
-        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        joint_hidden_states = hidden_states.new_zeros(
+            batch_size,
+            rotary_emb.shape[1],
+            self.hidden_size,
+        )
+        for i, (encoder_seq_len, seq_len) in enumerate(zip(local_encoder_lengths, seq_lengths)):
             joint_hidden_states[i, :encoder_seq_len] = instruct_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len:seq_len] = img_hidden_states[i, : seq_len - encoder_seq_len]
 
@@ -1312,12 +1597,23 @@ class BooguImageTransformer2DModel(nn.Module):
         # Output projection.
         hidden_states = self.norm_out(hidden_states, temb)
 
+        # Extract this rank's noise-image shard and gather it once.
+        local_img_output = hidden_states.new_zeros(
+            batch_size,
+            img_mask.shape[1],
+            hidden_states.shape[-1],
+        )
+        for i, (img_len, seq_len) in enumerate(zip(local_img_lengths, seq_lengths)):
+            local_img_output[i, :img_len] = hidden_states[i, seq_len - img_len : seq_len]
+
+        image_tokens = self.sp_gather_boundary(local_img_output)
+
         # Reshape back to image format.
         p = self.patch_size
         output = []
-        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
+        for i, (img_size, img_len) in enumerate(zip(img_sizes, global_img_lengths)):
             height, width = img_size
-            img_tokens = hidden_states[i][seq_len - img_len : seq_len]
+            img_tokens = image_tokens[i, :img_len]
             img_output = rearrange(
                 img_tokens,
                 "(h w) (p1 p2 c) -> c (h p1) (w p2)",

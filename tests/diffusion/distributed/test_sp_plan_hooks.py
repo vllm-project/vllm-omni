@@ -114,6 +114,47 @@ class TestSequenceParallelPlanValidation:
         with pytest.raises(ValueError, match="split_output=True"):
             validate_sp_plan(plan)
 
+    def test_keyed_metadata_requires_auto_pad(self):
+        plan = {
+            "prepare": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    shard_group="image",
+                ),
+            },
+            "output": SequenceParallelOutput(
+                gather_dim=1,
+                shard_group="image",
+            ),
+        }
+
+        with pytest.raises(ValueError, match="requires auto_pad=True"):
+            validate_sp_plan(plan)
+
+    def test_shard_group_is_scoped_to_one_split_boundary(self):
+        plan = {
+            "prepare_image": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                ),
+            },
+            "prepare_rope": {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                ),
+            },
+        }
+
+        with pytest.raises(ValueError, match="multiple split boundaries"):
+            validate_sp_plan(plan)
+
 
 @pytest.mark.cpu
 class TestGetSpPlanFromModel:
@@ -1140,6 +1181,158 @@ class TestEqualPadContract:
             assert ctx._sp_shard_depth == 1
             assert ctx._sp_equal_pad_stack == [False]
             assert not ctx.sp_rank_local_seq_lens_equal
+
+
+@pytest.mark.cpu
+class TestKeyedShardMetadata:
+    """Per-shard_group padding metadata, for models with several sequences.
+
+    A model that splits image, reference and context tokens at one boundary
+    needs each one's pre-padding global length to rebuild masks; the singleton
+    sp_original_seq_len can only describe one of them.
+    """
+
+    def test_auto_pad_records_the_global_length_under_its_key(self, monkeypatch):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            get_sp_shard_original_seq_len,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
+
+        class MaskBackend:
+            supports_attention_mask = True
+
+            @staticmethod
+            def get_name():
+                return "test"
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 1)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(selector, "get_attn_backend_for_role", lambda **_: (MaskBackend(), None))
+
+        hook = SequenceParallelSplitHook(
+            {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    expected_dims=3,
+                    split_output=True,
+                    auto_pad=True,
+                    shard_group="image",
+                )
+            },
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        hook.initialize_hook(nn.Identity())
+
+        with set_forward_context():
+            hook.pre_forward(nn.Identity())
+            shard = hook.post_forward(nn.Identity(), torch.arange(5).reshape(1, 5, 1))
+            ctx = get_forward_context()
+
+            assert shard.shape[1] == 3
+            # The *pre*-padding length, which is what a mask has to clip to.
+            assert ctx.sp_shard_metadata["image"] == 5
+            assert get_sp_shard_original_seq_len("image") == 5
+            assert get_sp_shard_original_seq_len("context") is None
+
+    def test_gather_trims_to_its_key_and_leaves_other_groups(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
+
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_gather",
+            lambda tensor, dim, validate: torch.cat([tensor, tensor], dim=dim),
+        )
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(gather_dim=1, expected_dims=3, shard_group="image"),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+
+        with set_forward_context():
+            ctx = get_forward_context()
+            ctx.sp_shard_metadata["image"] = 5
+            ctx.sp_shard_metadata["context"] = 7
+            ctx._sp_shard_depth = 1
+            output = hook.post_forward(nn.Identity(), torch.zeros(1, 3, 4))
+
+            # 2x3 gathered, trimmed back to "image"'s recorded 5.
+            assert output.shape == (1, 5, 4)
+            # A concurrent group is untouched.
+            assert ctx.sp_shard_metadata == {"context": 7}
+
+    def test_gather_without_registered_metadata_is_an_error(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
+
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_gather",
+            lambda tensor, dim, validate: torch.cat([tensor, tensor], dim=dim),
+        )
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(gather_dim=1, expected_dims=3, shard_group="image"),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+
+        with set_forward_context(), pytest.raises(RuntimeError, match="shard_group='image'"):
+            hook.post_forward(nn.Identity(), torch.zeros(1, 3, 4))
+
+    def test_conflicting_lengths_in_one_group_are_rejected(self, monkeypatch):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
+
+        class MaskBackend:
+            supports_attention_mask = True
+
+            @staticmethod
+            def get_name():
+                return "test"
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 1)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(selector, "get_attn_backend_for_role", lambda **_: (MaskBackend(), None))
+
+        spm = SequenceParallelInput(
+            split_dim=1,
+            expected_dims=3,
+            split_output=True,
+            auto_pad=True,
+            shard_group="image",
+        )
+        hook = SequenceParallelSplitHook({0: spm, 1: spm}, SequenceParallelConfig(ulysses_degree=2))
+        hook.initialize_hook(nn.Identity())
+
+        with set_forward_context(), pytest.raises(ValueError, match="same global sequence length"):
+            hook.pre_forward(nn.Identity())
+            hook.post_forward(
+                nn.Identity(),
+                (torch.arange(5).reshape(1, 5, 1), torch.arange(6).reshape(1, 6, 1)),
+            )
 
 
 @pytest.mark.cpu
