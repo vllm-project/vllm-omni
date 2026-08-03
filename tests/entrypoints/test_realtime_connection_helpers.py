@@ -906,3 +906,99 @@ class TestModelStaysRegisteredAsMultimodal:
             f"@MULTIMODAL_REGISTRY.register_processor decorates {following[0]!r}, "
             "not the model class - the model will not be treated as multimodal"
         )
+
+
+class TestResponseCancel:
+    """`response.cancel` stops the turn in flight and keeps the session.
+
+    Closing the connection was previously the only way to stop server-side work,
+    because closing is what runs the engine-side abort. That also discards the
+    per-connection tools/voice/instructions/history, so a client whose user
+    interrupts routinely paid a full reseed every time."""
+
+    def _conn(self, mocker, *, in_flight=True, parked=False):
+        conn = RealtimeConnection.__new__(RealtimeConnection)
+        conn._is_connected = True
+        conn._cancelling = False
+        conn._pending_tool_calls = {0: _PendingToolCall(call_id="call_x", name="get_weather")}
+        conn._tool_result_queue = asyncio.Queue()
+        conn._tool_result_queue.put_nowait({"call_id": "stale"})
+        conn._tool_rounds = 3
+        conn.audio_queue = asyncio.Queue()
+        conn.audio_queue.put_nowait(b"pcm")
+        conn.engine = mocker.Mock()
+        conn.engine.abort = mocker.AsyncMock()
+        conn.send_json = mocker.AsyncMock()
+        conn.send_error = mocker.AsyncMock()
+        conn._active_request_id = "rt-abc-1" if in_flight else None
+        conn.generation_task = None
+        conn._parked = parked
+        return conn
+
+    @staticmethod
+    async def _park():
+        await asyncio.Event().wait()  # never completes, like waiting on a tool result
+
+    def test_aborts_engine_and_reports_cancelled(self, mocker) -> None:
+        conn = self._conn(mocker)
+
+        async def run():
+            conn.generation_task = asyncio.create_task(self._park())
+            await asyncio.sleep(0)
+            await conn._cancel_active_generation()
+
+        asyncio.run(run())
+
+        conn.engine.abort.assert_awaited_once_with("rt-abc-1")
+        sent = [c.args[0] for c in conn.send_json.await_args_list]
+        assert {"type": "response.done", "response": {"status": "cancelled"}} in sent
+        conn.send_error.assert_not_awaited()
+
+    def test_unblocks_a_task_parked_on_a_tool_result(self, mocker) -> None:
+        """Aborting the engine alone does not reach a task waiting on a tool
+        result rather than on the result generator, so the task is cancelled too."""
+        conn = self._conn(mocker)
+
+        async def run():
+            task = asyncio.create_task(self._park())
+            conn.generation_task = task
+            await asyncio.sleep(0)
+            # Hold our own reference: _cancel_active_generation clears the field.
+            await asyncio.wait_for(conn._cancel_active_generation(), timeout=5)
+            return task
+
+        task = asyncio.run(run())
+        assert task.cancelled()
+
+    def test_clears_turn_debris(self, mocker) -> None:
+        """A cancelled turn leaves what a finished one would, and start_generation
+        only clears it on the NEXT commit - so cancel clears it now."""
+        conn = self._conn(mocker)
+        asyncio.run(conn._cancel_active_generation())
+        assert conn._pending_tool_calls == {}
+        assert conn._tool_result_queue.empty()
+        assert conn.audio_queue.empty()
+        assert conn._tool_rounds == 0
+        assert conn._active_request_id is None
+        assert conn.generation_task is None
+
+    def test_cancel_with_nothing_in_flight_errors(self, mocker) -> None:
+        conn = self._conn(mocker, in_flight=False)
+        asyncio.run(conn._cancel_active_generation())
+        conn.send_error.assert_awaited_once()
+        assert conn.send_error.await_args.args[1] == "no_active_response"
+        conn.engine.abort.assert_not_awaited()
+
+    def test_cancelling_flag_is_cleared_even_if_abort_raises(self, mocker) -> None:
+        """The flag suppresses _run_generation's terminal event; leaking it true
+        would silence the terminal event for every later turn on this connection."""
+        conn = self._conn(mocker)
+        conn.engine.abort = mocker.AsyncMock(side_effect=RuntimeError("engine gone"))
+        asyncio.run(conn._cancel_active_generation())
+        assert conn._cancelling is False
+
+    def test_routed_from_handle_event(self, mocker) -> None:
+        conn = self._conn(mocker)
+        cancel = mocker.patch.object(conn, "_cancel_active_generation", new_callable=mocker.AsyncMock)
+        asyncio.run(conn.handle_event({"type": "response.cancel"}))
+        cancel.assert_awaited_once()

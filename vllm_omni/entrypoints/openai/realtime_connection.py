@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
@@ -93,6 +94,11 @@ class RealtimeConnection(VllmRealtimeConnection):
     (system prompt), mirroring OpenAI's Realtime API. Previously there was
     no way to set a system prompt at all for /v1/realtime.
 
+    Cancellation: `response.cancel` aborts the turn in flight and replies with
+    `response.done` (status "cancelled"), keeping the session. Previously the only
+    way to stop server-side work was to close the connection, which also discarded
+    the per-connection tools/voice/instructions/history.
+
     Scope and limitations of the tool-calling path:
 
     - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
@@ -140,6 +146,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         # `<tool_response>` result, then the spoken answer - which the model needs
         # in order to keep calling tools on later turns. See _handle_history_item.
         self._history: list[dict[str, Any]] = []
+        # Engine request id of the turn in flight, so response.cancel can abort the
+        # stages directly instead of relying on connection teardown.
+        self._active_request_id: str | None = None
+        # Set while a cancel is being serviced, so _run_generation's terminal-event
+        # path stays quiet and the client sees one `response.done` instead of a
+        # spurious `response.audio.done` for a turn that never finished.
+        self._cancelling = False
 
     @staticmethod
     def _decode_pcm16(b64_audio: str) -> np.ndarray:
@@ -237,6 +250,8 @@ class RealtimeConnection(VllmRealtimeConnection):
             if instructions is not None:
                 self._instructions = instructions
             await super().handle_event(event)
+        elif event_type == "response.cancel":
+            await self._cancel_active_generation()
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
             item_type = item.get("type")
@@ -301,6 +316,60 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
         streaming_input_gen = self._buffer_realtime_audio_with_tools(audio_stream, input_stream)
         self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
+
+    async def _cancel_active_generation(self) -> None:
+        """Abort the turn in flight without dropping the session.
+
+        Until this event the only way to stop server-side work was to close the
+        connection - closing is what runs the engine-side abort in
+        `_run_generation`'s finally - and that discards everything the connection
+        holds (tools, voice, instructions, history), forcing a full reseed on the
+        next turn. For a voice client where the user interrupts routinely, that made
+        the common case the expensive one.
+
+        The engine request is aborted FIRST so the three stages stop even if the
+        reader task takes a moment to unwind; the task is then cancelled, since it
+        may be parked in `_await_tool_results_and_continue` waiting on a tool result
+        rather than inside the result generator, where an abort alone would not
+        reach it.
+        """
+        task = self.generation_task
+        request_id = self._active_request_id
+        if (task is None or task.done()) and request_id is None:
+            await self.send_error("No active response to cancel", "no_active_response")
+            return
+
+        self._cancelling = True
+        try:
+            if request_id is not None:
+                try:
+                    await self.engine.abort(request_id)
+                except Exception:
+                    logger.exception("Failed to abort engine request %s", request_id)
+            if task is not None and not task.done():
+                task.cancel()
+                # We raised this CancelledError, so swallow it rather than letting it
+                # propagate out of the event handler and tear down the connection.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            self._cancelling = False
+
+        self.generation_task = None
+        self._active_request_id = None
+        # A cancelled turn leaves the same debris a finished one would, and
+        # start_generation only clears it on the NEXT commit: drop it now so a
+        # cancel followed by a disconnect cannot strand it.
+        self._pending_tool_calls.clear()
+        while not self._tool_result_queue.empty():
+            self._tool_result_queue.get_nowait()
+        self._tool_rounds = 0
+        while not self.audio_queue.empty():
+            self.audio_queue.get_nowait()
+
+        logger.info("realtime: cancelled in-flight generation (request_id=%s)", request_id)
+        if self._is_connected:
+            await self.send_json({"type": "response.done", "response": {"status": "cancelled"}})
 
     async def _render_prompt(self, prompt: PromptType) -> StreamingInput:
         model_config = self.serving.model_config
@@ -480,6 +549,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ):
         request_id = f"rt-{self.connection_id}-{uuid4()}"
+        self._active_request_id = request_id
         sent_audio = False
         audio_done_sent = False
         full_text = ""
@@ -592,8 +662,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                     await result_gen.aclose()
                 except Exception:
                     logger.exception("Failed to close realtime result generator")
-            # Always send terminal event so clients don't hang forever.
-            if self._is_connected and not audio_done_sent and not tool_state.has_tool_calls():
+            self._active_request_id = None
+            # Always send terminal event so clients don't hang forever - except when
+            # a cancel is in flight, which sends its own `response.done`.
+            if self._is_connected and not self._cancelling and not audio_done_sent and not tool_state.has_tool_calls():
                 try:
                     await self.send_json({"type": "response.audio.done", "has_audio": sent_audio})
                 except Exception:
