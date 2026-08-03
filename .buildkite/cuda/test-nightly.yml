@@ -427,6 +427,12 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · MiniMax H3 T2VA Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_t2va_similarity.py -m full_model --run-level full_model
+        mirror_hardwares: h100_4
+
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
         timeout_in_minutes: 180
         commands:
