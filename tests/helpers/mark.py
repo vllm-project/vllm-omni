@@ -21,13 +21,7 @@ def cuda_marks(*, res: str, num_cards: int):
         return marks
     test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
 
-    if not current_platform.is_cuda():
-        return marks + [test_distributed]
-    test_skipif = pytest.mark.skipif(
-        current_platform.device_count() < num_cards,
-        reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
-    )
-    return marks + [test_distributed, test_skipif]
+    return marks + [test_distributed]
 
 
 def rocm_marks(*, res: str, num_cards: int):
