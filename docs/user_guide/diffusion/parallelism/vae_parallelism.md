@@ -104,6 +104,15 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
     --vae-use-tiling
 ```
 
+!!! warning "Use the dedicated VAE CLI options"
+    `--additional-config` is forwarded to the platform plugin through
+    `VllmConfig.additional_config`; it is not merged into Omni's
+    `DiffusionParallelConfig`. Putting `vae_patch_parallel_size` or
+    `vae_parallel_mode` under `additional_config.parallel_config`, or putting
+    `vae_use_tiling` in `additional_config`, therefore does not configure the
+    VAE. Use `--vae-patch-parallel-size`, `--vae-parallel-mode`, and
+    `--vae-use-tiling` as shown above.
+
 ---
 
 ## Configuration Parameters
