@@ -218,15 +218,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    def _drop_aborted_queued_requests(self) -> None:
+        """Drop ``FINISHED_ABORTED`` requests from every queue ``schedule()`` reads.
+
+        Upstream ``Scheduler.schedule()`` raises ``RuntimeError: Invalid
+        request status`` for any request it admits that is neither ``WAITING``
+        nor ``PREEMPTED``, and it admits from ``skipped_waiting`` as readily as
+        from ``waiting``: it loops while either queue is non-empty and
+        ``_select_waiting_queue_for_scheduling`` returns either one.
+
+        Omni can leave an aborted request in ``skipped_waiting`` because
+        ``OmniChunkTransferAdapter.finish_requests`` restores a stale
+        ``requests_origin_status`` of ``RUNNING`` onto a request parked there,
+        so upstream ``Scheduler.finish_requests`` takes its running-removal
+        branch and never touches the waiting queues. The next ``schedule()``
+        then re-selects the request and kills the stage's engine core.
+        """
+        for queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
+            if aborted:
+                # ``PriorityRequestQueue`` implements no ``remove``; both
+                # queue policies implement ``remove_requests``.
+                queue.remove_requests(aborted)
+        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
-        # them. Upstream vllm raises RuntimeError on this status; omni allows
-        # async abort (e.g. client disconnect during TTS streaming) to leave
-        # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
-            for req in list(queue):
-                if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+        self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
 
         original_waiting = None
