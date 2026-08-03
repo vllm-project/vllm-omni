@@ -260,10 +260,57 @@ def sample_reference_video_frames(
     }
 
 
+def _soundfile_to_waveform(path: str) -> tuple[torch.Tensor, int]:
+    import soundfile as sf
+
+    data, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    # soundfile is (samples, channels); torchaudio.load is (channels, samples).
+    waveform = torch.from_numpy(data).t().contiguous()
+    return waveform, int(sample_rate)
+
+
+def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
+    """Load an audio file as ``(waveform[C, T] float32, sample_rate)``.
+
+    torchaudio 2.6+ routes ``load`` through TorchCodec, whose wheels do not load
+    on aarch64 with a CPU-only torch (they link CUDA libraries that are absent).
+    Fall back to soundfile; if the container is not libsndfile-readable (e.g.
+    mp3/m4a/mp4), demux to wav with ffmpeg first so any ffmpeg-supported input
+    works at its native sample rate.
+    """
+    try:
+        import torchaudio
+
+        return torchaudio.load(path)
+    except (ImportError, RuntimeError, OSError):
+        pass
+    try:
+        return _soundfile_to_waveform(path)
+    except Exception:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="minimax_h3_audio_") as tmpdir:
+            wav = str(Path(tmpdir) / "audio.wav")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    path,
+                    "-vn",
+                    "-f",
+                    "wav",
+                    wav,
+                ],
+                check=True,
+            )
+            return _soundfile_to_waveform(wav)
+
+
 def load_video_audio(path: str) -> tuple[torch.Tensor, int]:
     import tempfile
-
-    import torchaudio
 
     with tempfile.TemporaryDirectory(prefix="minimax_h3_video_audio_") as tmpdir:
         output = str(Path(tmpdir) / "audio.wav")
@@ -286,10 +333,11 @@ def load_video_audio(path: str) -> tuple[torch.Tensor, int]:
             ],
             check=True,
         )
-        return torchaudio.load(output)
+        return load_audio_file(output)
 
 
 __all__ = [
+    "load_audio_file",
     "load_video_audio",
     "load_video_frames",
     "prepare_reference_videos",
