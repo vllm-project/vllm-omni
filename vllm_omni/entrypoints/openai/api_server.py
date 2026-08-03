@@ -76,7 +76,6 @@ from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -123,7 +122,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -1112,12 +1110,6 @@ async def omni_init_app_state(
         if state.openai_serving_chat is not None
         else None
     )
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
-        request_logger=request_logger,
-    )
-
     state.openai_serving_video = OmniOpenAIServingVideo(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
@@ -1612,26 +1604,18 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
+    from vllm_omni.experimental.fullduplex.omni.transport import (
+        DuplexRealtimeHandler,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_chat", None)
     if serving is None:
         await websocket.accept()
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
         await websocket.close()
         return
-
-    args = websocket.app.state.args
-    if getattr(args, "realtime_fullduplex", False):
-        from vllm_omni.experimental.fullduplex.omni.transport import (
-            DuplexRealtimeHandler,
-        )
-
-        engine = serving.engine_client
-        handler = DuplexRealtimeHandler(websocket, engine, serving)
-        await handler.handle_connection()
-        return
-
-    connection = RealtimeConnection(websocket, serving)
-    await connection.handle_connection()
+    handler = DuplexRealtimeHandler(websocket, serving.engine_client, serving)
+    await handler.handle_connection()
 
 
 @router.websocket("/v1/realtime/robot/openpi")

@@ -743,13 +743,6 @@ class OmniServeCommand(CLISubcommand):
             help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
         )
 
-        omni_config_group.add_argument(
-            "--realtime-fullduplex",
-            action="store_true",
-            default=False,
-            help="Enable full-duplex mode for /v1/realtime WebSocket endpoint.",
-        )
-
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
