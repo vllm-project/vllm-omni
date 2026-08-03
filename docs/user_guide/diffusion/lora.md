@@ -56,6 +56,35 @@ outputs = omni.generate(
 !!! note "Server-side Path Requirement"
     The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
 
+## Merge-on-Load
+
+`lora_merge_on_load=True` folds the active adapter into the base weights at
+activation time instead of computing the LoRA delta on every forward pass.
+This removes all per-forward LoRA cost — the delta matmuls in eager pipelines,
+and the torch.compile graph fragmentation that installed LoRA wrappers cause
+in compiled pipelines. Switching or deactivating an adapter restores the
+original weights exactly.
+
+```python
+omni = Omni(
+    model="stabilityai/stable-diffusion-3.5-medium",
+    lora_path=lora_path,
+    lora_merge_on_load=True,
+)
+```
+
+Best suited to workloads that keep one adapter active for many generations
+(a static style adapter, or RL rollout where the adapter is re-synced per
+training step). Constraints:
+
+- Target layers must be unquantized; otherwise standard LoRA wrappers are
+  installed instead (with a warning).
+- Incompatible with `enable_layerwise_offload` (falls back to wrappers).
+  Plain `enable_cpu_offload` is safe.
+- A pristine copy of every targeted weight is kept for the lifetime of the
+  process (roughly the size of the adapter's target layers), so switching
+  adapters is exact.
+
 ## Wan2.2 LightX2V Offline Assembly
 
 This workflow is LoRA-adjacent: it uses external LightX2V conversion plus

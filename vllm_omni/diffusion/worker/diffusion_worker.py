@@ -385,6 +385,17 @@ class DiffusionWorker:
         """Initialize the LoRA manager for this worker."""
         if self.model_runner.pipeline is None:
             return
+        merge_on_load = self.od_config.lora_merge_on_load
+        if merge_on_load and self.od_config.enable_layerwise_offload:
+            # Layerwise offload re-copies its CPU master weights into the GPU
+            # on every block forward, which would silently wipe the merged
+            # delta. (Plain enable_cpu_offload is safe: device moves preserve
+            # values.)
+            logger.warning(
+                "lora_merge_on_load is incompatible with enable_layerwise_offload; "
+                "falling back to standard LoRA wrappers."
+            )
+            merge_on_load = False
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.model_runner.pipeline,
             device=self.device,
@@ -392,6 +403,7 @@ class DiffusionWorker:
             max_cached_adapters=self.od_config.max_cpu_loras,
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
+            merge_on_load=merge_on_load,
         )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:

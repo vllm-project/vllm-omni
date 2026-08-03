@@ -20,7 +20,11 @@ from vllm.lora.utils import (
     get_supported_lora_modules,
     replace_submodule,
 )
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    UnquantizedLinearMethod,
+)
 
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
@@ -51,6 +55,7 @@ class DiffusionLoRAManager:
         max_cached_adapters: int = 1,
         lora_path: str | None = None,
         lora_scale: float = 1.0,
+        merge_on_load: bool = False,
     ):
         """
         Initialize the DiffusionLoRAManager.
@@ -59,6 +64,16 @@ class DiffusionLoRAManager:
             max_cached_adapters: Maximum number of LoRA adapters to keep in the
                 CPU-side cache (LRU). This mirrors vLLM's `max_cpu_loras` and is
                 exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
+            merge_on_load: Fold the active adapter's ΔW = B·A into the base
+                weights at activation time instead of computing the LoRA delta
+                every forward. Wrappers are kept as shadow objects (created for
+                their TP-slicing/packed set_lora logic, never installed), so
+                the module tree — and any torch.compile'd graph over it — is
+                identical to the non-LoRA case. Pristine copies of touched
+                weights make deactivate/switch exact (no drift). Requires
+                unquantized base layers (falls back to installing standard
+                wrappers); base weights must not be externally modified while
+                an adapter is merged.
         """
         self.pipeline = pipeline
         self.device = device
@@ -92,6 +107,21 @@ class DiffusionLoRAManager:
         self._lora_modules: dict[str, BaseLayerWithLoRA] = {}
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
+
+        # Merge-on-load state (see __init__ docstring). `merge_on_load` keeps
+        # the user's request; `_merge_enabled` is the effective mode, cleared
+        # if ineligible target layers force a fallback to installed wrappers.
+        # `_pristine_weights` holds copies of base weights taken just before
+        # the first merge into that layer; unmerge restores from these
+        # bitwise-exactly.
+        self.merge_on_load = merge_on_load
+        self._merge_enabled: bool = merge_on_load
+        self._merged: bool = False
+        self._pristine_weights: dict[str, torch.Tensor] = {}
+        # True once wrappers have been installed into the module tree the
+        # standard way; merge mode keeps them as shadow objects instead, and
+        # the two modes are never mixed.
+        self._wrappers_installed: bool = False
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -380,16 +410,20 @@ class DiffusionLoRAManager:
             "unet",
         )
         extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
+
+        # Collect replacements across *all* components first: it avoids
+        # mutating the module tree while iterating over named_modules(), and
+        # the shadow-vs-install decision below must be made once globally
+        # (mixing shadow and installed wrappers would leave shadow layers
+        # silently inactive after a fallback).
+        pending_replacements: list[tuple[nn.Module, str, str, nn.Module, list[str]]] = []
+
         for component_name in (*default_components, *extra_components):
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
             if not isinstance(component, nn.Module):
                 continue
-
-            # Collect replacements first to avoid mutating the module tree
-            # while iterating over named_modules().
-            pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
 
             for module_name, module in component.named_modules(remove_duplicate=False):
                 # Don't recurse into already-replaced LoRA wrappers. Their
@@ -419,21 +453,50 @@ class DiffusionLoRAManager:
                     if not should_replace:
                         continue
 
-                pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
+                pending_replacements.append((component, module_name, full_module_name, module, packed_modules_list))
 
-            for module_name, full_module_name, module, packed_modules_list in pending_replacements:
-                lora_layer = from_layer_diffusion(
-                    layer=module,
-                    max_loras=1,
-                    lora_config=lora_config,
-                    packed_modules_list=packed_modules_list,
-                    model_config=None,
+        # Create wrappers without installing; only actually-wrapped modules
+        # vote on the shadow-vs-install decision (with no target filter,
+        # pending_replacements also contains weightless non-linear modules).
+        created: list[tuple[nn.Module, str, str, nn.Module]] = []
+        for component, module_name, full_module_name, module, packed_modules_list in pending_replacements:
+            lora_layer = from_layer_diffusion(
+                layer=module,
+                max_loras=1,
+                lora_config=lora_config,
+                packed_modules_list=packed_modules_list,
+                model_config=None,
+            )
+            if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                created.append((component, module_name, full_module_name, lora_layer))
+
+        # Shadow mode: keep wrappers uninstalled so the module tree stays
+        # identical to the non-LoRA case (installed wrappers fragment
+        # torch.compile'd graphs, costing far more than the LoRA matmuls).
+        install = self._wrappers_installed or not self._merge_enabled
+        if not install:
+            ineligible = [name for _, _, name, w in created if not self._layer_merge_eligible(w)]
+            if ineligible:
+                logger.warning(
+                    "merge_on_load disabled: %d target layer(s) do not support weight merging (e.g. %s); "
+                    "installing standard LoRA wrappers instead.",
+                    len(ineligible),
+                    ineligible[0],
                 )
+                self._merge_enabled = False
+                install = True
 
-                if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
-                    replace_submodule(component, module_name, lora_layer)
-                    self._lora_modules[full_module_name] = lora_layer
-                    logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+        for component, module_name, full_module_name, lora_layer in created:
+            if install:
+                replace_submodule(component, module_name, lora_layer)
+                self._wrappers_installed = True
+            self._lora_modules[full_module_name] = lora_layer
+            logger.debug(
+                "%s layer: %s -> %s",
+                "Replaced" if install else "Shadow-wrapped",
+                full_module_name,
+                type(lora_layer).__name__,
+            )
 
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
@@ -521,6 +584,8 @@ class DiffusionLoRAManager:
             return
 
         logger.info("Activating adapter: id=%d", adapter_id)
+        # The new adapter's delta must be merged against unmerged weights.
+        self._unmerge_active_adapter()
         lora_model = self._registered_adapters[adapter_id]
 
         # activate weights in each LoRA layer
@@ -631,10 +696,106 @@ class DiffusionLoRAManager:
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
 
+        if self._merge_enabled:
+            self._merge_active_adapter()
+
+    def _module_merge_eligible(self, base_layer: nn.Module | None) -> bool:
+        """Weight merging needs a plain floating-point base weight tensor."""
+        weight = getattr(base_layer, "weight", None)
+        if not isinstance(weight, torch.Tensor) or not weight.dtype.is_floating_point:
+            return False
+        quant_method = getattr(base_layer, "quant_method", None)
+        return quant_method is None or isinstance(quant_method, UnquantizedLinearMethod)
+
+    def _layer_merge_eligible(self, lora_layer: nn.Module) -> bool:
+        return self._module_merge_eligible(getattr(lora_layer, "base_layer", None))
+
+    def _compute_layer_delta(self, lora_layer: nn.Module) -> torch.Tensor | None:
+        """ΔW from the wrapper's stacked buffers, honoring active slices.
+
+        Mirrors the slice semantics of DiffusionBaseLinearLayerWithLoRA.apply():
+        scaling is already folded into lora_b (optimize() + external scale at
+        set_lora time), so ΔW_slice = B·A. Accumulated in fp32 for accuracy.
+        Returns None if no slice is active for this layer.
+        """
+        lora_a_stacked = getattr(lora_layer, "lora_a_stacked", None)
+        lora_b_stacked = getattr(lora_layer, "lora_b_stacked", None)
+        if not lora_a_stacked or not lora_b_stacked:
+            return None
+        active_slices = getattr(lora_layer, "_diffusion_lora_active_slices", None)
+        if active_slices is not None and not any(active_slices):
+            return None
+
+        weight = lora_layer.base_layer.weight
+        output_slices = getattr(lora_layer, "output_slices", None) or tuple(
+            lora_b.shape[2] for lora_b in lora_b_stacked
+        )
+
+        delta: torch.Tensor | None = None
+        offset = 0
+        for slice_idx, slice_size in enumerate(output_slices):
+            if active_slices is not None and slice_idx < len(active_slices) and not active_slices[slice_idx]:
+                offset += slice_size
+                continue
+            A = lora_a_stacked[slice_idx][0, 0, :, :]
+            B = lora_b_stacked[slice_idx][0, 0, :, :]
+            if A.numel() == 0 or B.numel() == 0:
+                offset += slice_size
+                continue
+            if delta is None:
+                delta = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+            delta[offset : offset + slice_size] += B.to(torch.float32) @ A.to(torch.float32)
+            offset += slice_size
+        return delta
+
+    def _merge_active_adapter(self) -> None:
+        """Fold the currently-set LoRA buffers into base weights and reset them.
+
+        Under tensor parallelism no communication is needed: lora_a/lora_b are
+        already sharded per rank, so ΔW is exactly the local weight shard's
+        delta for both column- and row-parallel layers.
+        """
+        ineligible = [name for name, layer in self._lora_modules.items() if not self._layer_merge_eligible(layer)]
+        if ineligible:
+            # Merging only runs in shadow mode (creation-time fallback installs
+            # wrappers and clears _merge_enabled), so there is nothing to fall
+            # back to; failing loudly beats silently dropping the adapter.
+            raise RuntimeError(
+                f"merge_on_load: {len(ineligible)} layer(s) cannot be weight-merged (e.g. {ineligible[0]})"
+            )
+
+        merged_layers = 0
+        for full_module_name, lora_layer in self._lora_modules.items():
+            delta = self._compute_layer_delta(lora_layer)
+            if delta is None:
+                continue
+            weight = lora_layer.base_layer.weight
+            if full_module_name not in self._pristine_weights:
+                self._pristine_weights[full_module_name] = weight.detach().clone()
+            weight.data.add_(delta.to(weight.dtype))
+            # Buffers are consumed; reset so apply() takes the inactive fast path.
+            lora_layer.reset_lora(0)
+            merged_layers += 1
+
+        self._merged = merged_layers > 0
+        logger.debug("Merged active LoRA into base weights: %d layers", merged_layers)
+
+    def _unmerge_active_adapter(self) -> None:
+        """Restore pristine base weights for all previously merged layers."""
+        if not self._merged:
+            return
+        for full_module_name, pristine in self._pristine_weights.items():
+            lora_layer = self._lora_modules.get(full_module_name)
+            if lora_layer is not None:
+                lora_layer.base_layer.weight.data.copy_(pristine)
+        self._merged = False
+        logger.debug("Restored pristine base weights for %d layers", len(self._pristine_weights))
+
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
+        self._unmerge_active_adapter()
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)

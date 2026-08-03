@@ -664,6 +664,9 @@ class OmniDiffusionConfig:
     lora_path: str | None = None
     lora_scale: float = 1.0
     max_cpu_loras: int | None = None
+    # Fold the active adapter into base weights at activation, removing all
+    # per-forward LoRA cost. See DiffusionLoRAManager for constraints.
+    lora_merge_on_load: bool = False
 
     output_type: str = "pil"
 
