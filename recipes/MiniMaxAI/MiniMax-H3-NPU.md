@@ -20,7 +20,7 @@ environments. Differences from the GPU path:
 - Audio loading does **not** require TorchCodec (whose aarch64 wheels are
   built against CUDA torch and fail to load on CPU-only builds). vLLM-Omni
   automatically falls back to soundfile / ffmpeg for wav/mp3/m4a/mp4 audio
-  inputs. 
+  inputs.
 
 ## Prerequisites
 
@@ -40,8 +40,8 @@ hf download MiniMaxAI/MiniMax-H3 --local-dir "${MODEL_ROOT}"
 - CANN toolkit: 9.0.1
 - Python: 3.12
 - PyTorch: 2.10.0+cpu
-- TorchNpu: 2.10.0.post2
-- vLLM-Omni 安装：
+- torch_npu: 2.10.0.post2
+- Install vLLM-Omni from a checkout with MiniMax H3 support:
 
 ```bash
 uv venv
@@ -49,10 +49,12 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-- `ffmpeg` / `ffprobe` 必须在 `PATH` 上（参考视频准备与 MP4 输出使用）。
-- `decord` 
-- 音频输入无需 TorchCodec：wav/mp3/m4a/mp4 均通过 soundfile / ffmpeg
-  fallback 以原生采样率加载。
+- `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
+  reference-video preparation and MP4 output.
+- Reference-video decoding uses `decord` when available and falls back to
+  PyAV otherwise.
+- Audio inputs do not require TorchCodec: wav/mp3/m4a/mp4 files are loaded
+  at native sample rate through the soundfile / ffmpeg fallback.
 
 ## Start a server
 
@@ -61,8 +63,12 @@ and FL2VA requests, or to `Ref2VA` for Ref2VA requests.
 
 ### Multi-NPU: 768P validated configuration
 
+Validated on eight NPUs of an Atlas 800I A3 server with Ulysses sequence
+parallelism degree 8, text-encoder tensor parallelism degree 8, native tiled
+VAE patch parallelism degree 8, and layerwise offload:
+
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PORT=9098
 export MODEL="${MODEL_ROOT}/FL2VA"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -87,6 +93,10 @@ vllm serve "${MODEL}" \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
+Do not add `--enforce-eager`. The first request includes regional
+compilation; warm the server once before measuring steady-state latency.
+H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
+
 To serve Ref2VA, stop the FL2VA server and restart with:
 
 ```bash
@@ -95,43 +105,44 @@ export MODEL="${MODEL_ROOT}/Ref2VA"
 
 ## HTTP API examples
 
-请求方式与 GPU 版完全一致，见
-[MiniMax-H3.md § HTTP API examples](MiniMax-H3.md#http-api-examples)。
-注意在 NPU 环境下使用 **768P 规格**（如 `width=1344 height=768`）。
+The request format is identical to the GPU recipe; see
+[MiniMax-H3.md § HTTP API examples](MiniMax-H3.md#http-api-examples).
+Use the validated 768P shapes (e.g. `width=1344 height=768`) on NPU.
 
 ## Key parameters
 
-与 GPU 版一致，见 [MiniMax-H3.md § Key parameters](MiniMax-H3.md#key-parameters)。
-NPU 环境额外约束：
-
-| Parameter | Recommended value | Notes |
-|-----------|-------------------|-------|
-| `width`, `height` | 短边 ≤ 768（如 1344x768） | 2K 分辨率当前会 OOM |
+Same as the GPU recipe; see
+[MiniMax-H3.md § Key parameters](MiniMax-H3.md#key-parameters).
+The validated resolution on NPU is 768P (e.g. 1344x768).
 
 ## Validated NPU evidence
 
+Measured on an Atlas 800I A3 server (8x NPU) with CANN 9.0.1,
+PyTorch 2.10.0+cpu, and torch_npu 2.10.0.post2, using the multi-NPU
+configuration above:
+
 | Workload | Configuration | Observed result |
 |----------|---------------|-----------------|
-| T2VA, 209, 1344x768 | Text Encoder TP8, Dit offload + U8, VPP8 tile, regional compile | 480s |
-| Ref2VA（prompt+video）, 124, 1344x768 | Text Encoder TP8, Dit offload + U8, VPP8 tile, regional compile | 980s |
+| T2VA, 209 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile | 480 s end-to-end request latency |
+| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile | 980 s end-to-end request latency |
 
-- 验证环境：800I A3 x 8，CANN 9.0.1 /torch 2.10.0+cpu /torch_npu 2.10.0.post2
+These measurements describe the validated shapes rather than a general
+throughput guarantee.
 
 ## Known limitations
 
 - Each server process loads only one checkpoint partition.
 - H3 currently executes one generation request per diffusion batch.
-- The first regional-compile request is a warmup and should not be included in
-  steady-state performance measurements.
+- The first regional-compile request is a warmup and should not be included
+  in steady-state performance measurements.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
-- VAE patch parallelism requires size 1 or the full DiT group size and supports
-  the H3 native `tile` mode only.
-
+- Video Ref2VA accepts one or more video files, but not an additional
+  standalone audio reference.
+- VAE patch parallelism requires size 1 or the full DiT group size and
+  supports the H3 native `tile` mode only.
 
 ## Additional resources
 
-- [MiniMax-H3.md](MiniMax-H3.md)（GPU 版完整指南）
+- [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
