@@ -9,53 +9,13 @@ import torch
 import torch_npu
 from vllm.logger import init_logger
 
+from vllm_omni.platforms.npu.layers.rotary_embedding import (
+    npu_rotary_mul_with_bsnd_fallback,
+)
+
 logger = init_logger(__name__)
 
 _PATCHED = False
-
-
-def _bnsd_rotary_shape_is_supported(hidden_states: torch.Tensor) -> bool:
-    """Return whether the fused half-mode BNSD RoPE tiler supports this shape.
-
-    Qwen3-TTS uses ``[batch, heads, seq_len, head_dim]`` tensors.  For the
-    aligned-head-dimension branch used by its 64-wide heads, CANN requires
-    ``batch * heads <= seq_len * 8``.  Treat other alignments conservatively
-    and use the BSND layout, which does not have this short-sequence limit.
-    """
-    if hidden_states.ndim != 4:
-        return False
-
-    batch_size, num_heads, seq_len, head_dim = hidden_states.shape
-    element_size = hidden_states.element_size()
-    if head_dim % 2 != 0 or element_size <= 0 or 32 % element_size != 0:
-        return False
-
-    half_dim_alignment = 32 // element_size
-    return head_dim // 2 % half_dim_alignment == 0 and batch_size * num_heads <= seq_len * 8
-
-
-def _rotary_mul_npu(
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int,
-) -> torch.Tensor:
-    if unsqueeze_dim != 1 or _bnsd_rotary_shape_is_supported(hidden_states):
-        return torch_npu.npu_rotary_mul(
-            hidden_states,
-            cos.unsqueeze(unsqueeze_dim),
-            sin.unsqueeze(unsqueeze_dim),
-        )
-
-    hidden_states_bsnd = hidden_states.transpose(1, 2)
-    if not hidden_states_bsnd.is_contiguous():
-        hidden_states_bsnd = hidden_states_bsnd.contiguous()
-    output_bsnd = torch_npu.npu_rotary_mul(
-        hidden_states_bsnd,
-        cos.unsqueeze(2),
-        sin.unsqueeze(2),
-    )
-    return output_bsnd.transpose(1, 2)
 
 
 def _apply_rotary_pos_emb_npu(
@@ -68,8 +28,8 @@ def _apply_rotary_pos_emb_npu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del position_ids
     return (
-        _rotary_mul_npu(q, cos, sin, unsqueeze_dim),
-        _rotary_mul_npu(k, cos, sin, unsqueeze_dim),
+        npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim),
+        npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim),
     )
 
 
