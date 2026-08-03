@@ -141,7 +141,7 @@ async def _run_realtime_audio_roundtrip(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type == "response.output_audio.delta":
                 delta_events += 1
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
@@ -161,7 +161,7 @@ async def _run_realtime_audio_roundtrip(
                 final_text = event.get("text", "") or "".join(text_chunks)
                 continue
 
-            if event_type == "response.audio.done":
+            if event_type == "response.output_audio.done":
                 break
 
             if event_type == "error":

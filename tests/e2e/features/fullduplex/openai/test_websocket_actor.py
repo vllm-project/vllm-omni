@@ -122,12 +122,12 @@ async def test_stale_fence_payload_is_dropped_before_websocket_send():
     actor = DuplexWebSocketActor(websocket, current_epoch=lambda: 2)
     writer = asyncio.create_task(actor.writer_loop())
 
-    await actor.send_json({"type": "response.audio.delta", "epoch": 1})
-    await actor.send_json({"type": "response.audio.delta", "epoch": 2})
+    await actor.send_json({"type": "response.output_audio.delta", "epoch": 1})
+    await actor.send_json({"type": "response.output_audio.delta", "epoch": 2})
     await actor.close_writer()
     await writer
 
-    assert websocket.sent == [{"type": "response.audio.delta", "epoch": 2}]
+    assert websocket.sent == [{"type": "response.output_audio.delta", "epoch": 2}]
     assert actor.stale_output_dropped == 1
 
 

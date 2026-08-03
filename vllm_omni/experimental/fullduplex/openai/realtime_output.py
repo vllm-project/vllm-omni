@@ -158,7 +158,7 @@ class RealtimeOutputProjector:
                     )
                 )
             return payloads
-        if event_type == "response.text.delta":
+        if event_type == "response.output_text.delta":
             response_id = event.get("response_id")
             text = event.get("delta", "")
             state = self._response_state(response_id)
@@ -246,7 +246,10 @@ class RealtimeOutputProjector:
                 if item.get("status") == "completed":
                     payloads.append(self._conversation_item_done_event(item))
                 return payloads
-            return [{"type": "conversation.item.created", "item": item, "event": event}]
+            return [
+                {"type": "conversation.item.added", "item": item, "event": event},
+                {"type": "conversation.item.created", "item": item, "event": event},
+            ]
         if event_type == "conversation.item.deleted":
             item_id = event.get("item_id")
             if isinstance(item_id, str):

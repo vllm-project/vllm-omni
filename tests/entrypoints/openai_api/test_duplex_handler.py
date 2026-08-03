@@ -990,9 +990,11 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
     )
 
     audio_events = [
-        payload for payload in payloads if payload["type"] in {"response.output_audio.delta", "response.audio.delta"}
+        payload
+        for payload in payloads
+        if payload["type"] in {"response.output_audio.delta", "response.output_audio.delta"}
     ]
-    assert {payload["type"] for payload in audio_events} == {"response.audio.delta"}
+    assert {payload["type"] for payload in audio_events} == {"response.output_audio.delta"}
     assert {payload["format"] for payload in audio_events} == {"pcm16"}
     assert {payload["sample_rate_hz"] for payload in audio_events} == {24000}
 
@@ -1020,16 +1022,14 @@ def test_native_realtime_protocol_ignores_removed_legacy_event_switches():
     )
 
     event_types = {payload["type"] for payload in payloads}
-    assert "response.audio.delta" in event_types
-    assert "response.audio.done" in event_types
-    assert "response.audio_transcript.delta" in event_types
-    assert "response.audio_transcript.done" in event_types
-    assert "response.output_audio.delta" not in event_types
-    assert "response.output_audio.done" not in event_types
-    assert "response.output_audio_transcript.delta" not in event_types
-    assert "response.output_audio_transcript.done" not in event_types
-    assert "response.output_item.created" not in event_types
-    assert "response.text.delta" not in event_types
+    assert "response.output_audio.delta" in event_types
+    assert "response.output_audio.done" in event_types
+    assert "response.output_audio_transcript.delta" in event_types
+    assert "response.output_audio_transcript.done" in event_types
+    assert "response.audio.delta" not in event_types
+    assert "response.audio.done" not in event_types
+    assert "response.audio_transcript.delta" not in event_types
+    assert "response.audio_transcript.done" not in event_types
 
 
 def test_native_realtime_protocol_emits_terminal_audio_transcript_events():
@@ -1049,9 +1049,9 @@ def test_native_realtime_protocol_emits_terminal_audio_transcript_events():
     )
 
     by_type = {payload["type"]: payload for payload in payloads}
-    assert "response.audio.done" in by_type
-    assert "response.audio_transcript.delta" in by_type
-    assert "response.audio_transcript.done" in by_type
+    assert "response.output_audio.done" in by_type
+    assert "response.output_audio_transcript.delta" in by_type
+    assert "response.output_audio_transcript.done" in by_type
     assert by_type["response.content_part.done"]["part"]["transcript"] == "hello"
     assert by_type["response.output_item.done"]["item"]["object"] == "realtime.item"
     assert by_type["response.done"]["response"]["output"][0]["object"] == "realtime.item"
@@ -1077,8 +1077,10 @@ def test_native_realtime_protocol_terminal_transcript_equals_joined_deltas():
             )
         )
 
-    transcript = "".join(str(event["delta"]) for event in events if event["type"] == "response.audio_transcript.delta")
-    done = [str(event["transcript"]) for event in events if event["type"] == "response.audio_transcript.done"]
+    transcript = "".join(
+        str(event["delta"]) for event in events if event["type"] == "response.output_audio_transcript.delta"
+    )
+    done = [str(event["transcript"]) for event in events if event["type"] == "response.output_audio_transcript.done"]
 
     assert transcript == "It's Canberra. Next question."
     assert done == [transcript]
@@ -1167,7 +1169,7 @@ def test_native_realtime_protocol_response_done_emits_audio_done_before_terminal
     payloads = protocol._from_duplex_event({"type": "response.done", "response_id": "resp-done"})
     event_types = [payload["type"] for payload in payloads]
 
-    assert event_types.index("response.audio.done") < event_types.index("response.content_part.done")
+    assert event_types.index("response.output_audio.done") < event_types.index("response.content_part.done")
     assert event_types.index("response.content_part.done") < event_types.index("response.output_item.done")
     assert event_types.index("conversation.item.done") < event_types.index("response.done")
     assert event_types.index("response.output_item.done") < event_types.index("response.done")
@@ -1928,7 +1930,7 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
 
     def commit_overlap_after_first_response(ws: TimedWebSocket, data: dict[str, Any]) -> None:
         nonlocal overlap_sent
-        if data.get("type") != "response.audio.delta" or overlap_sent:
+        if data.get("type") != "response.output_audio.delta" or overlap_sent:
             return
         overlap_sent = True
         chunk = {
@@ -6698,7 +6700,7 @@ async def test_minicpmo_native_duplex_uses_segment_text_metadata_for_transcript_
     protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
     realtime_events = [event for payload in sent for event in protocol._from_duplex_event(payload)]
     transcript_deltas = [
-        m for m in realtime_events if m.get("type") == "response.audio_transcript.delta" and m.get("delta")
+        m for m in realtime_events if m.get("type") == "response.output_audio_transcript.delta" and m.get("delta")
     ]
     assert len(created) == 2
     assert len(done) == 2

@@ -44,14 +44,14 @@ class _StreamingOutputWriter:
     def handle(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         if event_type in {
-            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
         }:
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 print(delta, end="", file=sys.stderr, flush=True)
             return
-        if event_type != "response.audio.delta":
+        if event_type != "response.output_audio.delta":
             return
 
         delta = event.get("delta") or event.get("audio")
@@ -245,12 +245,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
 
         audio = client.events.audio_bytes()
         first_text_at_s = client.events.first_received_at(
-            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
             after_s=commit_sent_at_s,
         )
         first_audio_at_s = client.events.first_received_at(
-            "response.audio.delta",
+            "response.output_audio.delta",
             after_s=commit_sent_at_s,
         )
         response_created_at_s = client.events.first_received_at(
@@ -272,7 +272,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             for event in client.events.events
             if event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
             }
         ]

@@ -232,7 +232,7 @@ class ChatFallbackProjectorMixin:
                     session.append_assistant_text(content)
                     await send_json(
                         {
-                            "type": "response.text.delta",
+                            "type": "response.output_text.delta",
                             "session_id": session.session_id,
                             "response_id": response_id,
                             "epoch": epoch,

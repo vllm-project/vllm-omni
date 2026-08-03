@@ -39,8 +39,8 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     assert "input_audio_buffer.commit" not in source
     assert "playback.ack" in source
     assert "event.event || event" in source
-    assert "response.audio.delta" in source
-    assert "response.audio_transcript.delta" in source
+    assert "response.output_audio.delta" in source
+    assert "response.output_audio_transcript.delta" in source
     assert "conversation.item.input_audio_transcription" in source
     assert "force_barge_in" not in source
     assert "server_vad" not in source

@@ -140,7 +140,7 @@ async def run_client(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type == "response.output_audio.delta":
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
                     output_sample_rate = sr
@@ -176,7 +176,7 @@ async def run_client(
                     print(f"{log_prefix}text usage: {usage}")
                 continue
 
-            if event_type == "response.audio.done":
+            if event_type == "response.output_audio.done":
                 break
 
             if event_type == "error":

@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
-AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
+AUDIO_DELTA_EVENTS = {"response.output_audio.delta", "response.output_audio.delta"}
 
 
 def _canonical_path(path: str) -> Path:
