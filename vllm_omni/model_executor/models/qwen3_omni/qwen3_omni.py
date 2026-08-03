@@ -146,6 +146,28 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            # Experimental full-duplex: audio appended mid-session cannot
+            # travel as multi_modal_data (the duplex submit path drops it, see
+            # experimental/fullduplex/qwen3omni/stage0.py), so the thinker
+            # needs a preprocess hook to turn appended PCM into embeddings.
+            # Safe for the normal path: the thinker is a multimodal stage, so
+            # the runner already routes it through inputs_embeds
+            # (gpu_model_runner.py:1569) rather than the token-id fast path;
+            # has_preprocess only adds the dispatch, and
+            # thinker_duplex_preprocess is a pass-through without a duplex
+            # payload. Mirrors minicpmo_4_5_omni.py:140.
+            self.has_preprocess = True
+            self.set_custom_preprocess(self.thinker_duplex_preprocess)
+            # `talker_mtp` is an unconditional method on this class, so
+            # `GPUModelRunner._init_talker_mtp` would set has_talker_mtp=True
+            # even for the thinker. That was inert while the thinker had no
+            # preprocess hook, but the custom-preprocess path then requires
+            # every decode step to return `mtp_inputs`
+            # (gpu_model_runner.py:1787-1788) -- a talker-only contract the
+            # thinker cannot satisfy, producing KeyError: 'mtp_inputs'.
+            # Multi-token prediction belongs to the talker stage; shadow the
+            # method so this stage does not advertise it.
+            self.talker_mtp = None
             self.tts_tokens = torch.tensor(
                 [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
                 device=self._module_device(self.thinker),
@@ -685,6 +707,163 @@ class Qwen3OmniMoeForConditionalGeneration(
         Postprocess the talker hidden states.
         """
         return {"hidden_states": {"last": hidden_states[-1, :].detach()}}
+
+    # ==================== Experimental full-duplex (thinker) ====================
+
+    def _duplex_stage0_runtime(self):
+        """Lazily build the stage-0 duplex helper off this model instance.
+
+        No registry: the model owns its helper, mirroring
+        ``minicpmo_4_5_omni.py:455-465``.
+        """
+        helper = getattr(self, "_qwen3omni_duplex_stage0", None)
+        if helper is None:
+            from vllm_omni.experimental.fullduplex.qwen3omni.stage0 import (
+                Qwen3OmniStage0DuplexRuntime,
+            )
+
+            helper = Qwen3OmniStage0DuplexRuntime(
+                self,
+                model_path=getattr(getattr(self.vllm_config, "model_config", None), "model", None),
+                device=str(self._module_device(self.thinker)),
+            )
+            self._qwen3omni_duplex_stage0 = helper
+        return helper
+
+    def _thinker_input_embeds(self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None) -> torch.Tensor:
+        if input_embeds is not None:
+            return input_embeds
+        return self.thinker.get_input_embeddings(input_ids)
+
+    def thinker_duplex_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+        **info_dict: object,
+    ):
+        """Model-runner hook turning a duplex audio append into embeddings.
+
+        Pass-through unless this request carries a duplex data-plane payload,
+        so the ordinary Qwen3-Omni thinker path is unchanged.
+
+        The scheduler owns the request, block table, attention metadata, KV
+        and sampler; this only supplies the prompt embeddings for the
+        appended audio.
+        """
+        duplex = info_dict.get("duplex")
+        logger.info(
+            "[qwen3omni-duplex] thinker preprocess: span=%s duplex=%s offset=%s prompt_len=%s",
+            tuple(input_ids.shape),
+            bool(isinstance(duplex, dict) and duplex.get("data_plane") is True),
+            info_dict.get("duplex_token_offset"),
+            info_dict.get("duplex_prompt_len"),
+        )
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return input_ids, self._thinker_input_embeds(input_ids, input_embeds), {}
+
+        prompt_len = info_dict.get("duplex_prompt_len")
+        token_offset = info_dict.get("duplex_token_offset", 0)
+        if isinstance(prompt_len, int) and isinstance(token_offset, int) and token_offset >= prompt_len:
+            # Decode step of the resumable duplex request: input_ids are the
+            # runner-sampled tokens, so the ordinary embedding lookup is
+            # correct. Slicing the prompt-only duplex embeddings here would
+            # come up empty and pad-fill over generated tokens.
+            return input_ids, self._thinker_input_embeds(input_ids, input_embeds), {}
+
+        # Scaffolding positions (system block, turn openers, the assistant
+        # generation prompt) hold real token ids, so the ordinary embedding
+        # lookup is already correct for them. Only the `<|audio_pad|>` span
+        # needs replacing.
+        base_embeds = self._thinker_input_embeds(input_ids, input_embeds)
+        audio_embeds = self._duplex_stage0_runtime().build_append_embeddings(
+            duplex=duplex,
+            token_offset=int(token_offset) if isinstance(token_offset, int) else 0,
+            prompt_len=int(prompt_len) if isinstance(prompt_len, int) else 0,
+        )
+        logger.info(
+            "[qwen3omni-duplex] audio embeds=%s audio_offset=%s",
+            None if audio_embeds is None else tuple(audio_embeds.shape),
+            duplex.get("audio_offset"),
+        )
+        if audio_embeds is None:
+            # Append did not complete a whole chunk; nothing to splice.
+            return input_ids, base_embeds, {}
+
+        offset = int(token_offset) if isinstance(token_offset, int) else 0
+        span = base_embeds.shape[0]
+
+        # `audio_offset` is relative to *this append's own* token span (it is
+        # `len(prefix)`; see `build_duplex_prompt_token_ids`), while
+        # `token_offset` is absolute within the session -- the runner sets it
+        # from `num_computed_tokens`. Convert before comparing them.
+        #
+        # On the session's first append the two frames coincide (`offset == 0`)
+        # and mixing them is harmless, which is why this only ever broke from
+        # the second turn on: `take_from` came out as the whole preceding
+        # conversation, the window sliced past the end of `audio_embeds`, and
+        # the empty-window guard below returned silently. The model then got a
+        # span of unfilled `<|audio_pad|>` placeholders and answered as though
+        # the user had said nothing -- generic replies, and eventually "it
+        # seems like you are sending a lot of empty messages".
+        #
+        # The append's absolute base is what the runner has already computed
+        # for the session minus this append, i.e. `prompt_len - append_len`.
+        # Verified against three consecutive turns: derived base 0/146/256
+        # against observed `token_offset` 0/146/256.
+        append_len = int(
+            duplex.get("append_token_count") or duplex.get("scheduler_token_budget") or (prompt_len or span)
+        )
+        append_base = max(int(prompt_len or 0) - append_len, 0)
+        audio_start = append_base + int(duplex.get("audio_offset") or 0)
+
+        # Intersect the audio span with the slice of the prompt this call
+        # covers; the runner may split a prompt across several calls.
+        start = max(audio_start - offset, 0)
+        take_from = max(offset - audio_start, 0)
+        window = audio_embeds[take_from : take_from + max(span - start, 0)]
+        if start >= span or window.shape[0] == 0:
+            # Reaching here means audio was produced for this append but none
+            # of it landed. The runner absorbs a reservation/embedding
+            # mismatch by leaving the placeholders in place rather than
+            # raising, so this is otherwise invisible -- the request succeeds
+            # and the model silently reads an empty user turn. Say so.
+            logger.warning(
+                "[qwen3omni-duplex] audio produced but not spliced: %d embeddings dropped for "
+                "req span=%d offset=%d prompt_len=%s append_len=%d audio_start=%d "
+                "(start=%d take_from=%d). The thinker will see unfilled <|audio_pad|> "
+                "placeholders and answer as if the turn were empty.",
+                audio_embeds.shape[0], span, offset, prompt_len, append_len, audio_start, start, take_from,
+            )
+            return input_ids, base_embeds, {}
+
+        req_embeds = base_embeds.clone()
+        req_embeds[start : start + window.shape[0]] = window.to(
+            device=base_embeds.device,
+            dtype=base_embeds.dtype,
+        )
+        logger.info(
+            "[splice] span=%d audio_off=%s start=%d win=%s | pad_norm=%.4f audio_norm=%.4f "
+            "changed=%s ids[start]=%s dtype=%s/%s",
+            span, duplex.get("audio_offset"), start, tuple(window.shape),
+            float(base_embeds[start].norm()) if start < span else -1.0,
+            float(window[0].norm()),
+            not torch.equal(req_embeds, base_embeds),
+            int(input_ids[start]) if start < input_ids.numel() else -1,
+            base_embeds.dtype, window.dtype,
+        )
+        return (
+            input_ids,
+            req_embeds,
+            {
+                "duplex": {
+                    "duplex_audio_embed_count": int(audio_embeds.shape[0]),
+                    "duplex_epoch": duplex.get("epoch"),
+                    "duplex_turn_id": duplex.get("turn_id"),
+                }
+            },
+        )
+
+    # ============================================================================
 
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         """

@@ -23,6 +23,19 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
     default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
+    # Experimental full-duplex integration. Scope: client-signalled barge-in
+    # over a persistent session. Qwen3-Omni has no learned listen/speak
+    # control token, so there is no model-owned turn policy here (unlike
+    # MiniCPM-o 4.5).
+    #
+    # The duplex endpoint additionally requires the client to opt in per
+    # session via extra_body["qwen3_omni_native_duplex"], so enabling the
+    # control plane here does not change behaviour for ordinary requests.
+    duplex_runtime_extension=("vllm_omni.experimental.fullduplex.qwen3omni.runtime.Qwen3OmniDuplexRuntimeExtension"),
+    duplex_serving_adapter=(
+        "vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter.Qwen3OmniServingRuntimeAdapter"
+    ),
+    duplex_control_enabled=True,
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,

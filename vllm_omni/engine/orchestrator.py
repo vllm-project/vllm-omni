@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -306,12 +306,23 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
-            if self._async_chunk and context.stage_id == 0:
-                await self._prewarm_async_chunk_stages(
-                    context.request_id,
-                    request,
-                    request_state,
-                )
+        # Re-arm the downstream async-chunk stages on every stage-0 submit,
+        # not only the first.
+        #
+        # A downstream stage stops polling the connector once its segment
+        # finishes (`is_done_receiving_chunks` covers
+        # `segment_finished_requests`), and its marker is only cleared when it
+        # receives a streaming update. Prewarming just the initial submit left
+        # a second turn deadlocked: stage 0 generated and marked its segment
+        # finished, while stage 1 was still parked from the previous turn and
+        # never read the new chunks. Observed as turn 1 answering normally and
+        # every later turn producing nothing, with stage 1 and stage 2 idle.
+        if self._async_chunk and context.stage_id == 0:
+            await self._prewarm_async_chunk_stages(
+                context.request_id,
+                request,
+                request_state,
+            )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
@@ -820,11 +831,12 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str], *, stage_ids: Iterable[int] | None = None) -> None:
+        """Forward abort requests to stage pools, or to ``stage_ids`` only."""
         if not request_ids:
             return
-        for pool in self.stage_pools:
+        pools = self.stage_pools if stage_ids is None else [self.stage_pools[stage_id] for stage_id in stage_ids]
+        for pool in pools:
             await pool.abort_requests(request_ids)
             pool.release_bindings(request_ids)
 
@@ -1542,6 +1554,25 @@ class Orchestrator:
                 stage_submit_ts=submit_ts,
             )
         )
+
+        # A direct response returns without forwarding, so anything
+        # `_prewarm_async_chunk_stages` already submitted downstream is left
+        # waiting for chunks that will never be sent. When the runtime says
+        # this response ends the turn, release those stages; otherwise they
+        # park forever holding a slot -- and because
+        # `get_num_unfinished_requests` subtracts requests parked for streaming
+        # input, `EngineCore.has_work()` reads false and that stage never
+        # schedules again, for this request or any later one.
+        #
+        # Opt-in, because a parked downstream stage is correct for a runtime
+        # whose direct response is *not* terminal: MiniCPM's `listen` decision
+        # reuses those same warm stages when the model later speaks, and
+        # upstream only prewarms on the initial submit, so releasing them there
+        # would leave a later speak turn with no talker.
+        if decision.metadata.get("duplex_release_downstream") is True:
+            # Pools this request never reached have no route binding, so
+            # aborting them is a no-op; no need to know the final stage id.
+            await self._abort_request_ids([req_id], stage_ids=range(stage_id + 1, len(self.stage_pools)))
 
     @staticmethod
     def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:

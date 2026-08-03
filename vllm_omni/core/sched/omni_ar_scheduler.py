@@ -243,15 +243,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
-        # them. Upstream vllm raises RuntimeError on this status; omni allows
-        # async abort (e.g. client disconnect during TTS streaming) to leave
-        # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
+    def _drop_aborted_queued_requests(self) -> None:
+        """Evict FINISHED_ABORTED requests from the scheduler queues.
+
+        Upstream vllm raises ``RuntimeError: Invalid request status`` when it
+        dequeues one (``scheduler.py``); omni allows async abort -- client
+        disconnect during TTS streaming, or a duplex barge-in / session close
+        -- to leave requests queued briefly.
+        """
+        # All three queues upstream's `schedule()` reads from. `skipped_waiting`
+        # matters as much as the other two: upstream parks requests there mid
+        # schedule and prepends them back onto `waiting`, so an aborted entry
+        # left in it reappears and raises on the very next attempt -- which made
+        # retrying look useless. Missing it is why ten concurrent session closes
+        # could still kill the stage.
+        for queue in (self.waiting, self.running, getattr(self, "skipped_waiting", None)):
+            if queue is None:
+                continue
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._drop_aborted_queued_requests()
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
@@ -259,13 +273,59 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
 
+        # The three calls above re-enqueue requests -- notably
+        # `process_pending_chunks`, which wakes a downstream stage when its
+        # next chunk lands. If that request was aborted in the meantime it
+        # goes back into `waiting` after the first sweep, and the upstream
+        # scheduler then dequeues it and raises, killing the engine core.
+        # Observed on a Qwen3-Omni duplex session close: stage 1 died with
+        # "Invalid request status: FINISHED_ABORTED", taking the orchestrator
+        # with it. Sweep again immediately before handing over.
+        self._drop_aborted_queued_requests()
+
+        # `process_pending_chunks` above rewrites `request.status` when it parks
+        # and un-parks requests, which can move a request out of
+        # WAITING_FOR_STREAMING_REQ without unwinding upstream's counter. Restate
+        # it from queue membership while `self.waiting` is still the real queue
+        # (the deferred-admission dance below swaps in an empty one).
+        self._resync_streaming_input_counter()
+
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
         try:
-            scheduler_output = super().schedule(throttle_prefills)
+            # Upstream raises on dequeueing a FINISHED_ABORTED request. It
+            # appends to `self.running` *before* checking status, so the entry
+            # is only observable once the exception is in flight -- sweeping the
+            # queues beforehand cannot prevent it, as the request is still
+            # schedulable at that point and is aborted while the call is in
+            # progress.
+            #
+            # Observed on Qwen3-Omni duplex session close: stage 1 raised
+            # "Invalid request status: FINISHED_ABORTED" and killed its engine
+            # core, taking the orchestrator down with it, so every session ended
+            # by tearing down the server.
+            #
+            # Recover instead of prevent: drop the aborted residue and retry.
+            # Each attempt can only surface one aborted request, so a single
+            # retry is not enough when several abort at once -- ten concurrent
+            # duplex sessions closing together exhausted a one-shot retry and
+            # killed the stage. Retry once per queued request at most, which
+            # bounds the loop by construction, since every recovery removes at
+            # least the entry that raised.
+            attempts_left = len(self.waiting) + len(self.running) + 1
+            while True:
+                try:
+                    scheduler_output = super().schedule(throttle_prefills)
+                    break
+                except RuntimeError as exc:
+                    attempts_left -= 1
+                    if "Invalid request status" not in str(exc) or attempts_left <= 0:
+                        raise
+                    logger.warning("Recovering from aborted request during schedule: %s", exc)
+                    self._drop_aborted_queued_requests()
         finally:
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
@@ -763,6 +823,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ``input_batch`` slot never pins a freed request and starves
         # new admissions. See ``OmniSchedulerMixin._purge_finished_from_running``.
         self._purge_finished_from_running()
+
+        # An abort is the one leak that is never recoverable on its own: the
+        # engine only calls `schedule()` when `has_work()` is true, and an
+        # inflated `num_waiting_for_streaming_input` is precisely what makes
+        # `has_work()` false. Resync here, on the path that removes the
+        # request, or the next request to arrive at this stage is masked and
+        # the engine parks in `input_queue.get()` forever.
+        self._resync_streaming_input_counter()
 
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:

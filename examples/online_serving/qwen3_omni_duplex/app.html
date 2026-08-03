@@ -1,0 +1,622 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: Copyright contributors to the vLLM project -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Qwen3-Omni full duplex</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#252a34; --txt:#e6e9ef; --dim:#8b93a7;
+    --idle:#2a3040; --live:#4ea1ff; --done:#38d39f; --warn:#ffb454; --err:#ff6b6b;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.2px; }
+  .sub { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns:1fr 380px; gap:0; height:calc(100vh - 59px); }
+  @media (max-width:1000px){ main { grid-template-columns:1fr; height:auto; } }
+  #left { padding:20px; overflow:auto; }
+  #right { border-left:1px solid var(--line); padding:16px 18px; overflow:auto; background:#12151b; }
+
+  button { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+           padding:8px 16px; border-radius:7px; cursor:pointer; font-size:13px; }
+  button:hover:not(:disabled) { border-color:var(--live); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.primary { background:var(--live); border-color:var(--live); color:#05204a; font-weight:600; }
+  button.rec { background:var(--err); border-color:var(--err); color:#fff; font-weight:600; }
+  input { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+          padding:7px 10px; border-radius:6px; font-size:12px; width:270px; }
+
+  .pipe { display:flex; align-items:stretch; gap:0; margin:8px 0 26px; flex-wrap:wrap; }
+  .stage { flex:1; min-width:150px; background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; position:relative; transition:all .18s; }
+  .stage.live { border-color:var(--live); box-shadow:0 0 0 1px var(--live),0 0 22px -6px var(--live); }
+  .stage.done { border-color:var(--done); }
+  .stage h3 { margin:0 0 3px; font-size:13px; }
+  .stage .role { color:var(--dim); font-size:11px; margin-bottom:9px; }
+  .stage .metric { font-variant-numeric:tabular-nums; font-size:19px; font-weight:600; }
+  .stage .unit { color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+  .dot { position:absolute; top:12px; right:12px; width:8px; height:8px; border-radius:50%;
+         background:var(--idle); transition:background .18s; }
+  .stage.live .dot { background:var(--live); animation:pulse 1s infinite; }
+  .stage.done .dot { background:var(--done); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  .arrow { display:flex; align-items:center; padding:0 10px; color:var(--dim);
+           font-size:11px; flex-direction:column; justify-content:center; min-width:74px; }
+  .arrow .t { font-size:9px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; }
+  .arrow.flow { color:var(--live); }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; margin-bottom:16px; }
+  .card h2 { font-size:12px; margin:0 0 10px; color:var(--dim); text-transform:uppercase;
+             letter-spacing:.07em; font-weight:600; }
+  .kv { display:flex; justify-content:space-between; padding:3px 0; font-size:12px; }
+  .kv span:first-child { color:var(--dim); }
+  .kv span:last-child { font-variant-numeric:tabular-nums; }
+
+  #meter { height:5px; background:var(--idle); border-radius:3px; overflow:hidden; margin-top:9px; }
+  #meterBar { height:100%; width:0%; background:var(--done); transition:width .06s; }
+
+  #events { font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .ev { padding:2px 0; border-bottom:1px solid #1b1f27; display:flex; gap:8px; }
+  .ev .ts { color:#5a6478; min-width:52px; }
+  .ev .ty { flex:1; word-break:break-all; }
+  .ev.audio .ty { color:var(--done); }
+  .ev.text  .ty { color:var(--live); }
+  .ev.err   .ty { color:var(--err); }
+  .ev.life  .ty { color:var(--warn); }
+  .ev.tool  .ty { color:#c792ea; font-weight:600; }
+
+  #transcript { min-height:52px; font-size:15px; line-height:1.6; }
+  .muted { color:var(--dim); }
+  code { background:#0b0d12; padding:1px 5px; border-radius:4px; font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwen3-Omni <span class="sub">full duplex</span></h1>
+  <input id="url" value="ws://127.0.0.1:8099/v1/realtime">
+  <button id="connect" class="primary">Connect</button>
+  <button id="talk" disabled>Hold to talk</button>
+  <button id="bargein" disabled>Barge in</button>
+  <button id="sendclip" disabled title="Send a known-good 16 kHz clip, bypassing the mic">Send test clip</button>
+  <input id="textin" disabled placeholder="…or type a message and press Enter"
+         title="Sends input.text.append: one text message is one complete user turn">
+  <span id="status" class="sub">idle</span>
+</header>
+
+<main>
+<div id="left">
+  <div class="pipe">
+    <div class="stage" id="s-mic">
+      <div class="dot"></div><h3>Your mic</h3><div class="role">pcm16 · 16 kHz</div>
+      <div class="metric" id="m-mic">0.0</div><div class="unit">seconds sent</div>
+      <div id="meter"><div id="meterBar"></div></div>
+    </div>
+    <div class="arrow" id="a-0"><div>&#8594;</div><div class="t">ws append</div></div>
+    <div class="stage" id="s-0">
+      <div class="dot"></div><h3>Stage 0 · Thinker</h3><div class="role">audio &#8594; text</div>
+      <div class="metric" id="m-0">0</div><div class="unit">text deltas</div>
+    </div>
+    <div class="arrow" id="a-1"><div>&#8594;</div><div class="t">hidden states</div></div>
+    <div class="stage" id="s-1">
+      <div class="dot"></div><h3>Stage 1 · Talker</h3><div class="role">text &#8594; codec</div>
+      <div class="metric" id="m-1">&#8212;</div><div class="unit">codec (internal)</div>
+    </div>
+    <div class="arrow" id="a-2"><div>&#8594;</div><div class="t">shared memory</div></div>
+    <div class="stage" id="s-2">
+      <div class="dot"></div><h3>Stage 2 · Code2Wav</h3><div class="role">codec &#8594; audio</div>
+      <div class="metric" id="m-2">0</div><div class="unit">audio deltas</div>
+    </div>
+    <div class="arrow" id="a-3"><div>&#8594;</div><div class="t">ws audio</div></div>
+    <div class="stage" id="s-spk">
+      <div class="dot"></div><h3>Playback</h3><div class="role">pcm16 · 24 kHz</div>
+      <div class="metric" id="m-spk">0.0</div><div class="unit">seconds received</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Assistant said</h2>
+    <div id="transcript" class="muted">&#8212;</div>
+  </div>
+
+  <div class="card">
+    <h2>How a turn flows</h2>
+    <div style="font-size:12.5px;color:#b9c0d0">
+      <p style="margin:0 0 8px">Hold <b>talk</b> and speak. Audio streams to the server as
+      <code>input_audio_buffer.append</code> at 200&nbsp;ms. On release the client sends
+      <code>input_audio_buffer.commit</code>.</p>
+      <p style="margin:0 0 8px">This adapter <b>holds audio until commit</b>, then hands the
+      thinker one complete turn. Qwen3-Omni has no learned listen/speak token, so it cannot
+      decide mid-utterance whether you have finished &mdash; the client decides.</p>
+      <p style="margin:0"><b>Barge in</b> cancels the in-flight response and bumps the session
+      epoch. Stale audio is dropped, the session and its KV survive.</p>
+    </div>
+  </div>
+</div>
+
+<div id="right">
+  <div class="card">
+    <h2>Session</h2>
+    <div class="kv"><span>state</span><span id="k-state">disconnected</span></div>
+    <div class="kv"><span>session id</span><span id="k-sid">&#8212;</span></div>
+    <div class="kv"><span>epoch</span><span id="k-epoch">&#8212;</span></div>
+    <div class="kv"><span>turns</span><span id="k-turns">0</span></div>
+    <div class="kv"><span>reply latency</span><span id="k-lat">&#8212;</span></div>
+  </div>
+  <div class="card">
+    <h2>Events</h2>
+    <div id="events"></div>
+  </div>
+</div>
+</main>
+
+<script>
+const SR_IN = 16000, SR_OUT = 24000, CHUNK_MS = 200;
+
+// Demo tools. `schema` goes to the model as its <tools> block; `run` is the
+// canned implementation. Tools execute client-side, as they do in the OpenAI
+// Realtime API -- the server only reports the call and takes the result back
+// as an ordinary text turn.
+const TOOLS = [
+  {
+    schema: {
+      type: "function",
+      function: {
+        name: "lookup_weather",
+        description: "Get the current weather for a city.",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string", description: "City name, e.g. Paris" } },
+          required: ["city"],
+        },
+      },
+    },
+    run: ({ city }) => ({ city: city || "unknown", temperature_c: 18, conditions: "light rain", humidity_pct: 71 }),
+  },
+  {
+    schema: {
+      type: "function",
+      function: {
+        name: "check_inventory",
+        description: "Check warehouse stock for an item.",
+        parameters: {
+          type: "object",
+          properties: { item: { type: "string", description: "Item name, e.g. blue widget" } },
+          required: ["item"],
+        },
+      },
+    },
+    run: ({ item }) => ({ item: item || "unknown", in_stock: 42, warehouse: "Oakland", restock_date: "2026-08-14" }),
+  },
+];
+
+// The model replies to a tool call with `<tool_call>{...}</tool_call>` and the
+// server intercepts it before the talker can speak it, so it arrives as text
+// rather than audio. Run it and hand the result straight back as the next turn.
+let turnText = "", toolsFired = false;
+// Every tool call already dispatched this session, by signature.
+//
+// A tool result is itself a turn, so re-dispatching one is self-sustaining: it
+// produces a reply, which is scanned, which dispatches again. That ran away
+// once for real (1204 turns, 105 s of audio repeating a single sentence) when
+// the server was replaying cumulative text. The server no longer does that,
+// but this is the client's own brake -- a loop here costs GPU on every
+// iteration, so it should not depend on the server being correct.
+const dispatched = new Set();
+const MAX_TOOL_DISPATCHES = 8;
+
+// Fire once per turn, as soon as a `<tool_call>` block is closed -- an
+// unterminated one means the arguments are still streaming.
+function maybeRunTools(explicit) {
+  if (toolsFired) return;
+  let calls = explicit;
+  if (!calls) {
+    if (!turnText.includes("</tool_call>")) return;
+    calls = [];
+    for (const m of turnText.matchAll(/<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g)) {
+      try { const c = JSON.parse(m[1]); if (c && c.name) calls.push({name: c.name, arguments: c.arguments || {}}); }
+      catch (e) { log(`unparseable tool call: ${m[1].slice(0, 120)}`, "err"); }
+    }
+  }
+  calls = calls.filter(c => {
+    const sig = `${c.name}:${JSON.stringify(c.arguments || {})}`;
+    if (dispatched.has(sig)) { log(`tool ${c.name} already dispatched — ignoring repeat`, "warn"); return false; }
+    if (dispatched.size >= MAX_TOOL_DISPATCHES) { log(`tool dispatch cap (${MAX_TOOL_DISPATCHES}) hit — ignoring`, "err"); return false; }
+    dispatched.add(sig);
+    return true;
+  });
+  if (!calls.length) return;
+  toolsFired = true;
+  stopPlayback();
+  $("transcript").classList.remove("muted");
+  $("transcript").textContent = calls.map(c => `→ ${c.name}(${JSON.stringify(c.arguments)})`).join("\n");
+  runToolCalls(calls);
+}
+
+async function runToolCalls(calls) {
+  for (const call of calls) {
+    const tool = TOOLS.find(t => t.schema.function.name === call.name);
+    const args = call.arguments || {};
+    let result;
+    if (!tool) {
+      result = { error: `no such tool: ${call.name}` };
+      log(`tool ${call.name} — not registered`, "err");
+    } else {
+      result = tool.run(args);
+      log(`tool ${call.name}(${JSON.stringify(args)}) -> ${JSON.stringify(result)}`, "tool");
+    }
+    if (!ws || ws.readyState !== 1) return;
+    // <tool_response> is the wrapper the checkpoint's chat template uses for a
+    // tool result, carried on a user turn.
+    const payload = `<tool_response>\n${JSON.stringify(result)}\n</tool_response>`;
+    commitAt = performance.now();
+    $("status").textContent = "tool result sent…";
+    ws.send(JSON.stringify({ type: "input.text.append", text: payload }));
+  }
+}
+const MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
+const $ = id => document.getElementById(id);
+
+let ws, audioCtx, micStream, micNode, playCtx, playAt = 0, scheduled = [];
+let sentMs = 0, recvBytes = 0, turns = 0, textDeltas = 0, audioDeltas = 0;
+let commitAt = 0, recording = false, buf = [];
+
+const setStage = (id, cls) => {
+  const el = $(id); el.classList.remove("live", "done");
+  if (cls) el.classList.add(cls);
+};
+const flow = (id, on) => $(id).classList.toggle("flow", on);
+
+function log(type, cls) {
+  const d = document.createElement("div");
+  d.className = "ev " + (cls || "");
+  const t = new Date().toLocaleTimeString("en-GB", {hour12:false});
+  d.innerHTML = `<span class="ts">${t}</span><span class="ty"></span>`;
+  d.querySelector(".ty").textContent = type;
+  $("events").prepend(d);
+  while ($("events").children.length > 250) $("events").lastChild.remove();
+}
+
+function resample(f32, from, to) {
+  if (from === to) return f32;
+  const ratio = from / to;
+  // Fallback only -- used when the browser will not give a 16 kHz context.
+  // Box-average over the source span before picking a sample, which is a
+  // crude but real low-pass; plain interpolation aliases badly at 3:1.
+  const span = Math.max(1, Math.round(ratio));
+  const out = new Float32Array(Math.floor(f32.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const start = Math.floor(i * ratio);
+    let acc = 0, n = 0;
+    for (let k = 0; k < span && start + k < f32.length; k++) { acc += f32[start + k]; n++; }
+    out[i] = n ? acc / n : 0;
+  }
+  return out;
+}
+const toPcm16 = f32 => {
+  const b = new ArrayBuffer(f32.length * 2), v = new DataView(b);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return b;
+};
+const b64 = ab => {
+  let s = "", u = new Uint8Array(ab);
+  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  return btoa(s);
+};
+const unb64 = s => {
+  const bin = atob(s), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+};
+
+function playPcm16(u8, sr) {
+  if (!playCtx) playCtx = new AudioContext();
+  const n = u8.byteLength / 2, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = dv.getInt16(i * 2, true) / 32768;
+  const b = playCtx.createBuffer(1, n, sr);
+  b.getChannelData(0).set(f);
+  const src = playCtx.createBufferSource();
+  src.buffer = b; src.connect(playCtx.destination);
+  const now = playCtx.currentTime;
+  playAt = Math.max(playAt, now + 0.03);
+  src.start(playAt); playAt += b.duration;
+  scheduled.push(src);
+  src.onended = () => { const i = scheduled.indexOf(src); if (i >= 0) scheduled.splice(i, 1); };
+}
+
+// Audio already scheduled for the current response, so it can be cut short.
+//
+// A tool call is spoken before it can be intercepted: under async_chunk the
+// talker consumes the thinker's tokens as they stream, so by the time
+// `</tool_call>` closes, the audio for it already exists. Nothing server-side
+// can unmake it -- measured at 6-9 s of the model reading JSON aloud
+// ("Cough name check inventory argument item spoons"). The client hears it
+// only if it plays it, so on detecting a tool call, drop what is queued.
+function stopPlayback() {
+  for (const src of scheduled.splice(0)) { try { src.stop(); } catch (e) { /* already ended */ } }
+  playAt = 0;
+}
+
+function closeSession() {
+  // A duplex session outlives the socket: dropping the transport alone leaves
+  // the session holding its stage-0 slot until it is reaped. With one slot per
+  // session and a small max_num_seqs, a few reloads exhaust the pipeline and
+  // every later turn silently produces nothing. Always tell the server.
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({type:"session.close"})); } catch (e) { /* closing anyway */ }
+  }
+}
+
+$("connect").onclick = () => {
+  if (ws) { closeSession(); ws.close(); return; }
+  const url = `${$("url").value}?duplex=1&model=${encodeURIComponent(MODEL)}`
+            + `&qwen3_omni_native_duplex=1&autostart=0`;
+  ws = new WebSocket(url);
+  $("status").textContent = "connecting…";
+
+  ws.onopen = () => {
+    dispatched.clear(); turnText = ""; toolsFired = false;
+    $("connect").textContent = "Disconnect";
+    $("k-state").textContent = "handshaking";
+    // Shapes from vllm_omni/experimental/fullduplex/client.py, with the
+    // Qwen3-Omni opt-in. auto_response is the master switch: without it the
+    // server never starts a response on commit.
+    ws.send(JSON.stringify({type:"session.update", session:{
+      model: MODEL,
+      modalities: ["audio","text"],
+      input_audio_format: "pcm16",
+      output_audio_format: "pcm16",
+      turn_detection: null,
+      overlap_policy: "listen_only",
+      playback_commit_policy: "ack_only",
+      extra_body: {
+        auto_response: true, qwen3_omni_native_duplex: true, force_listen_count: 0,
+        realtime_tools: TOOLS.map(t => t.schema),
+      },
+    }}));
+  };
+
+  ws.onclose = () => {
+    ws = null; recording = false;
+    $("connect").textContent = "Connect"; $("talk").disabled = true;
+    $("bargein").disabled = true; $("sendclip").disabled = true;
+    $("textin").disabled = true;
+    $("status").textContent = "disconnected — click Connect";
+    $("k-state").textContent = "disconnected";
+    ["s-mic","s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  };
+  ws.onerror = () => log("websocket error", "err");
+
+  ws.onmessage = ev => {
+    if (typeof ev.data !== "string") return;
+    const m = JSON.parse(ev.data), t = m.type;
+
+    if (t === "session.created" || t === "session.updated") {
+      $("talk").disabled = false; $("bargein").disabled = false;
+      $("sendclip").disabled = false; $("textin").disabled = false;
+      $("status").textContent = "ready";
+      $("k-state").textContent = "open";
+      if (m.session?.id || m.session_id) $("k-sid").textContent = (m.session?.id || m.session_id).slice(0, 22);
+      log(t, "life");
+    } else if (t === "response.created") {
+      turns++; $("k-turns").textContent = turns;
+      textDeltas = 0; audioDeltas = 0; turnText = ""; toolsFired = false;
+      setStage("s-0", "live"); flow("a-0", true); flow("a-1", true);
+      log(t, "life");
+    } else if (t === "response.audio_transcript.delta" || t === "response.output_text.delta") {
+      const d = m.delta || "";
+      if (d) {
+        if ($("transcript").classList.contains("muted")) {
+          $("transcript").classList.remove("muted"); $("transcript").textContent = "";
+        }
+        $("transcript").textContent += d;
+      }
+      textDeltas++; $("m-0").textContent = textDeltas;
+      setStage("s-0", "live");
+      log(t + (d ? ` ${JSON.stringify(d)}` : " (empty)"), "text");
+      turnText += d;
+      maybeRunTools();
+    } else if (t === "response.audio_transcript.done") {
+      if (m.transcript) {
+        $("transcript").classList.remove("muted");
+        $("transcript").textContent = m.transcript;
+      }
+      log(t, "text");
+    } else if (t === "response.speak") {
+      setStage("s-0", "done"); setStage("s-1", "live"); flow("a-2", true);
+      log(t, "life");
+    } else if (t === "response.audio.delta") {
+      const data = m.delta || m.audio;
+      if (data) {
+        const u8 = unb64(data);
+        recvBytes += u8.byteLength;
+        playPcm16(u8, m.sample_rate_hz || SR_OUT);
+        $("m-spk").textContent = (recvBytes / 2 / (m.sample_rate_hz || SR_OUT)).toFixed(1);
+      }
+      audioDeltas++; $("m-2").textContent = audioDeltas;
+      $("m-1").textContent = "flowing";
+      setStage("s-1", "done"); setStage("s-2", "live"); setStage("s-spk", "live");
+      flow("a-3", true);
+      if (commitAt) { $("k-lat").textContent = ((performance.now() - commitAt) / 1000).toFixed(2) + " s"; commitAt = 0; }
+      log(`${t} ${(m.delta || m.audio || "").length}b`, "audio");
+    } else if (t === "response.audio.done" || t === "response.done") {
+      // The server may also report the calls structurally; either path works.
+      maybeRunTools(Array.isArray(m.tool_calls) && m.tool_calls.length ? m.tool_calls : undefined);
+      setStage("s-2", "done"); setStage("s-spk", "done");
+      ["a-0","a-1","a-2","a-3"].forEach(a => flow(a, false));
+      $("status").textContent = "ready";
+      log(t, "life");
+    } else if (t === "error") {
+      log("ERROR " + JSON.stringify(m.error || m.code || m), "err");
+      $("status").textContent = "error";
+    } else if (t === "audio.cancelled" || t === "input.cancelled") {
+      log(t + " (barge-in)", "warn");
+      playAt = 0;
+    } else {
+      if (m.epoch !== undefined) $("k-epoch").textContent = m.epoch;
+      log(t);
+    }
+    if (m.epoch !== undefined) $("k-epoch").textContent = m.epoch;
+  };
+};
+
+async function startMic() {
+  // Request the capture context at the model's rate. Browsers resample
+  // properly (with anti-aliasing); the hand-rolled 3:1 decimation this
+  // replaces had no low-pass, so everything above 8 kHz aliased back into the
+  // speech band and the model heard mush -- it answered with a generic
+  // greeting because the turn carried no intelligible content.
+  if (!audioCtx) {
+    try {
+      audioCtx = new AudioContext({sampleRate: SR_IN});
+    } catch (e) {
+      audioCtx = new AudioContext();
+    }
+  }
+  if (audioCtx.sampleRate !== SR_IN) {
+    log(`mic context is ${audioCtx.sampleRate} Hz, resampling to ${SR_IN}`, "life");
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,
+    echoCancellation:true, noiseSuppression:true}});
+  const src = audioCtx.createMediaStreamSource(micStream);
+  micNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  const need = Math.floor(SR_IN * CHUNK_MS / 1000);
+  micNode.onaudioprocess = e => {
+    if (!recording || !ws || ws.readyState !== 1) return;
+    const raw = e.inputBuffer.getChannelData(0);
+    let peak = 0; for (let i = 0; i < raw.length; i++) peak = Math.max(peak, Math.abs(raw[i]));
+    $("meterBar").style.width = Math.min(100, peak * 160) + "%";
+    const rs = resample(raw, audioCtx.sampleRate, SR_IN);
+    for (let i = 0; i < rs.length; i++) buf.push(rs[i]);
+    while (buf.length >= need) {
+      const slice = Float32Array.from(buf.splice(0, need));
+      sentMs += CHUNK_MS;
+      ws.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: b64(toPcm16(slice)),
+        input_audio_format: "pcm16",
+        sample_rate_hz: SR_IN,
+        duration_ms: CHUNK_MS,
+        audio_end_ms: sentMs,
+        // Push-to-talk is itself the speech assertion. Without this the
+        // server falls back to an RMS heuristic and a quiet or slow-starting
+        // utterance is treated as silence, which never starts a response
+        // (commit_policy: auto_responds AND speech_since_commit).
+        is_speech: true,
+      }));
+      $("m-mic").textContent = (sentMs / 1000).toFixed(1);
+    }
+  };
+  src.connect(micNode); micNode.connect(audioCtx.destination);
+}
+
+const beginTalk = async e => {
+  e.preventDefault();
+  if (!ws || ws.readyState !== 1 || recording) return;
+  if (!micNode) await startMic();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  recording = true; buf = [];
+  $("talk").classList.add("rec"); $("talk").textContent = "Listening… release to send";
+  $("status").textContent = "listening";
+  setStage("s-mic", "live");
+  ["s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  $("transcript").classList.add("muted"); $("transcript").textContent = "—";
+  log("recording started", "life");
+};
+
+const endTalk = e => {
+  e.preventDefault();
+  if (!recording) return;
+  recording = false;
+  $("talk").classList.remove("rec"); $("talk").textContent = "Hold to talk";
+  $("meterBar").style.width = "0%";
+  setStage("s-mic", "done");
+  $("status").textContent = "thinking…";
+  commitAt = performance.now();
+  // No response.create: that routes to the chat fallback. The commit plus
+  // extra_body.auto_response is what starts the reply.
+  ws.send(JSON.stringify({type:"input_audio_buffer.commit", final:true}));
+  log("input_audio_buffer.commit", "life");
+};
+
+$("talk").addEventListener("mousedown", beginTalk);
+$("talk").addEventListener("touchstart", beginTalk, {passive:false});
+window.addEventListener("mouseup", endTalk);
+window.addEventListener("touchend", endTalk);
+
+$("sendclip").onclick = async () => {
+  if (!ws || ws.readyState !== 1) { log("not connected", "err"); return; }
+  $("sendclip").disabled = true;
+  $("status").textContent = "sending test clip…";
+  ["s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  setStage("s-mic", "live");
+  $("transcript").classList.add("muted"); $("transcript").textContent = "—";
+  try {
+    const wav = await (await fetch("sample_16k.wav")).arrayBuffer();
+    // 44-byte canonical WAV header, then 16-bit mono LE samples.
+    const pcm = new Uint8Array(wav, 44);
+    const bytesPerChunk = SR_IN * 2 * CHUNK_MS / 1000;
+    for (let off = 0; off + bytesPerChunk <= pcm.byteLength; off += bytesPerChunk) {
+      sentMs += CHUNK_MS;
+      ws.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: b64(pcm.slice(off, off + bytesPerChunk).buffer),
+        input_audio_format: "pcm16", sample_rate_hz: SR_IN,
+        duration_ms: CHUNK_MS, audio_end_ms: sentMs, is_speech: true,
+      }));
+      $("m-mic").textContent = (sentMs / 1000).toFixed(1);
+      await new Promise(r => setTimeout(r, 10));
+    }
+    setStage("s-mic", "done");
+    commitAt = performance.now();
+    ws.send(JSON.stringify({type:"input_audio_buffer.commit", final:true}));
+    log("test clip sent + commit", "life");
+    $("status").textContent = "thinking…";
+  } catch (err) {
+    log("test clip failed: " + err, "err");
+  } finally {
+    setTimeout(() => { $("sendclip").disabled = false; }, 1500);
+  }
+};
+
+// A refresh or tab close must release the session too. `pagehide` fires in
+// cases `beforeunload` does not (bfcache, mobile), so handle both.
+window.addEventListener("pagehide", closeSession);
+window.addEventListener("beforeunload", closeSession);
+
+// Text turn. Unlike audio there is no buffer and no commit: one message is one
+// complete user turn, so the server treats input.text.append as final.
+$("textin").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.shiftKey) return;
+  e.preventDefault();
+  const text = $("textin").value.trim();
+  if (!text || !ws || ws.readyState !== 1) return;
+  $("textin").value = "";
+  ["s-0","s-1","s-2","s-spk"].forEach(s => setStage(s, null));
+  setStage("s-mic", "done");
+  $("transcript").classList.add("muted"); $("transcript").textContent = "—";
+  $("status").textContent = "thinking…";
+  commitAt = performance.now();
+  ws.send(JSON.stringify({type:"input.text.append", text}));
+  log(`input.text.append ${JSON.stringify(text)}`, "life");
+});
+
+$("bargein").onclick = () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({type:"input.cancel", scope:"current"}));
+  playAt = 0;
+  log("input.cancel sent (barge-in)", "warn");
+  $("status").textContent = "cancelled";
+};
+</script>
+</body>
+</html>
