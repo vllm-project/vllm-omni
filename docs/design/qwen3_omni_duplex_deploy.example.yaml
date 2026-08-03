@@ -2,7 +2,10 @@
 # Derived from the production 2-GPU config; adds session_mode: duplex.
 async_chunk: true
 session_mode: duplex
-active_stream_window: 1
+# 0 = unbounded: every session's stream is schedulable, so vLLM batches
+# them. At 1 only one stream is ever active, which serialises the server --
+# 12 concurrent sessions took 100 s instead of 9.6 s.
+active_stream_window: 0
 
 duplex_session:
   idle_ttl_s: 300

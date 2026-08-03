@@ -251,7 +251,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         disconnect during TTS streaming, or a duplex barge-in / session close
         -- to leave requests queued briefly.
         """
-        for queue in (self.waiting, self.running):
+        # All three queues upstream's `schedule()` reads from. `skipped_waiting`
+        # matters as much as the other two: upstream parks requests there mid
+        # schedule and prepends them back onto `waiting`, so an aborted entry
+        # left in it reappears and raises on the very next attempt -- which made
+        # retrying look useless. Missing it is why ten concurrent session closes
+        # could still kill the stage.
+        for queue in (self.waiting, self.running, getattr(self, "skipped_waiting", None)):
+            if queue is None:
+                continue
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
@@ -288,29 +296,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.waiting = create_request_queue(self.policy)
 
         try:
-            try:
-                scheduler_output = super().schedule(throttle_prefills)
-            except RuntimeError as exc:
-                # Upstream raises on dequeueing a FINISHED_ABORTED request. It
-                # appends to `self.running` *before* checking status, so the
-                # entry is only observable once the exception is in flight --
-                # sweeping the queues beforehand cannot prevent it, as the
-                # request is still schedulable at that point and is aborted
-                # while the call is in progress.
-                #
-                # Observed on Qwen3-Omni duplex session close: stage 1 raised
-                # "Invalid request status: FINISHED_ABORTED" and killed its
-                # engine core, taking the orchestrator down with it, so every
-                # session ended by tearing down the server.
-                #
-                # Drop the aborted residue and retry once. The retry sees a
-                # clean queue; a second failure is a different fault and
-                # propagates.
-                if "Invalid request status" not in str(exc):
-                    raise
-                logger.warning("Recovering from aborted request during schedule: %s", exc)
-                self._drop_aborted_queued_requests()
-                scheduler_output = super().schedule(throttle_prefills)
+            # Upstream raises on dequeueing a FINISHED_ABORTED request. It
+            # appends to `self.running` *before* checking status, so the entry
+            # is only observable once the exception is in flight -- sweeping the
+            # queues beforehand cannot prevent it, as the request is still
+            # schedulable at that point and is aborted while the call is in
+            # progress.
+            #
+            # Observed on Qwen3-Omni duplex session close: stage 1 raised
+            # "Invalid request status: FINISHED_ABORTED" and killed its engine
+            # core, taking the orchestrator down with it, so every session ended
+            # by tearing down the server.
+            #
+            # Recover instead of prevent: drop the aborted residue and retry.
+            # Each attempt can only surface one aborted request, so a single
+            # retry is not enough when several abort at once -- ten concurrent
+            # duplex sessions closing together exhausted a one-shot retry and
+            # killed the stage. Retry once per queued request at most, which
+            # bounds the loop by construction, since every recovery removes at
+            # least the entry that raised.
+            attempts_left = len(self.waiting) + len(self.running) + 1
+            while True:
+                try:
+                    scheduler_output = super().schedule(throttle_prefills)
+                    break
+                except RuntimeError as exc:
+                    attempts_left -= 1
+                    if "Invalid request status" not in str(exc) or attempts_left <= 0:
+                        raise
+                    logger.warning("Recovering from aborted request during schedule: %s", exc)
+                    self._drop_aborted_queued_requests()
         finally:
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
