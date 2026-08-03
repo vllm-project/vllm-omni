@@ -344,15 +344,33 @@ class OmniBase(PDDisaggregationMixin):
         )
 
     def _compute_final_output_stage_ids(self, output_modalities: list[str] | None) -> list[int]:
+        supported_modalities = {m for m in self.output_modalities if isinstance(m, str)}
         requested_modalities = output_modalities or self.output_modalities
-        requested_modalities = [m for m in requested_modalities if m in self.output_modalities]
+        requested_modalities = [m for m in requested_modalities if isinstance(m, str) and m in supported_modalities]
         if not requested_modalities:
-            requested_modalities = self.output_modalities
-        return [
-            sid
-            for sid, stage in enumerate(self._stage_meta_list)
-            if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
-        ]
+            requested_modalities = [m for m in self.output_modalities if isinstance(m, str)]
+
+        # A linear pipeline can expose the same modality at multiple stages
+        # (for example AURA has ASR text at stage 0 and assistant text at
+        # stage 1). The request-level finish gate should wait for the latest
+        # requested output for each modality; earlier outputs may still be
+        # yielded, but they must not be required for request completion.
+        latest_stage_by_modality: dict[str, int] = {}
+        for sid, stage in enumerate(self._stage_meta_list):
+            output_type = getattr(stage, "final_output_type", None)
+            if getattr(stage, "final_output", False) and output_type in requested_modalities:
+                latest_stage_by_modality[output_type] = sid
+
+        final_output_stage_ids: list[int] = []
+        seen_modalities: set[str] = set()
+        for modality in requested_modalities:
+            if modality in seen_modalities:
+                continue
+            seen_modalities.add(modality)
+            stage_id = latest_stage_by_modality.get(modality)
+            if stage_id is not None:
+                final_output_stage_ids.append(stage_id)
+        return final_output_stage_ids
 
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
         req_id = msg.request_id

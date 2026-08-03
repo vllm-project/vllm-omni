@@ -159,6 +159,20 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    emitted_frames_by_req = getattr(transfer_manager, "_qwen3_tts_emitted_frames", None)
+    if emitted_frames_by_req is None:
+        emitted_frames_by_req = {}
+        transfer_manager._qwen3_tts_emitted_frames = emitted_frames_by_req
+    emitted_frames = int(emitted_frames_by_req.get(request_id, 0) or 0)
+    if emitted_frames > length:
+        logger.warning(
+            "[talker2code2wav_async_chunk] req=%s emitted_frames=%d > frames_buffered=%d; resetting cursor",
+            request_id,
+            emitted_frames,
+            length,
+        )
+        emitted_frames = 0
+        emitted_frames_by_req[request_id] = 0
 
     if length <= 0:
         if finished:
@@ -178,24 +192,27 @@ def talker2code2wav_async_chunk(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
             )
+        end_index = min(length, left_context_size_config + context_length)
+        left_context_size = max(0, end_index - context_length)
+        window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
     else:
+        new_frames = length - emitted_frames
+        if new_frames <= 0:
+            if finished:
+                return OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                    meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                )
+            return None
+
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+        target_new_frames = initial_chunk_size if emitted_frames == 0 and use_first_chunk else chunk_size
+        if not finished and new_frames < target_new_frames:
+            return None
 
-        if use_first_chunk and length <= initial_chunk_size:
-            if not finished and length < initial_chunk_size:
-                return None
-            context_length = length if finished and length < initial_chunk_size else initial_chunk_size
-        else:
-            initial_coverage = initial_chunk_size if use_first_chunk else 0
-            adjusted = length - initial_coverage
-            if not finished and adjusted % chunk_size != 0:
-                return None
-            chunk_length = adjusted % chunk_size
-            context_length = chunk_length if chunk_length != 0 else chunk_size
-
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+        context_start = max(0, emitted_frames - left_context_size_config)
+        left_context_size = emitted_frames - context_start
+        window_frames = transfer_manager.code_prompt_token_ids[request_id][context_start:length]
 
     # Prepend the bounded ref_code tail to the first emitted chunk so Code2Wav
     # can cache the same reference context that mainline would otherwise send on
@@ -254,6 +271,8 @@ def talker2code2wav_async_chunk(
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
+
+    emitted_frames_by_req[request_id] = length
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),

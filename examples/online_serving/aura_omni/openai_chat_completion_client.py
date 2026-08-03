@@ -100,10 +100,11 @@ def save_response(response, output_dir: str) -> None:
         message = choice.message
         if message.content:
             out_txt = os.path.join(output_dir, f"choice_{idx}.txt")
+            content = str(message.content).strip()
             with open(out_txt, "w", encoding="utf-8") as f:
-                f.write(str(message.content).strip() + "\n")
+                f.write(content + "\n")
             print(f"Text saved to {out_txt}")
-            print(message.content)
+            print(" ".join(content.split()))
         if getattr(message, "audio", None):
             audio_bytes = base64.b64decode(message.audio.data)
             audio_np, sample_rate = sf.read(io.BytesIO(audio_bytes))
@@ -156,7 +157,7 @@ def parse_args():
     parser.add_argument("--video-path", default=None, help="Video file, URL, or data URL.")
     parser.add_argument(
         "--prompt",
-        default="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
+        default="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly.",
     )
     parser.add_argument("--modalities", default="text,audio")
     parser.add_argument("--output-dir", default="output_aura_omni_online")
@@ -164,7 +165,7 @@ def parse_args():
         "--aura-system-prompt",
         default=(
             "You are receiving a live video stream where the final frame is the present moment. "
-            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
+            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
         ),
     )
     parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"])

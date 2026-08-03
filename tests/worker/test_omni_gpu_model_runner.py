@@ -467,6 +467,41 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+def test_fresh_chunk_payload_replaces_intermediate_buffer():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"prefill": "stale"},
+        "hidden_states": {"trailing_text": "stale"},
+        "codes": {"audio": [1]},
+        "generated_len": 131,
+        "task_type": ["Base"],
+    }
+    payload = {
+        "precomputed_text_id": [[1, 2, 3]],
+        "prompt_token_ids": [0, 0],
+        "task_type": ["Base"],
+        "meta": {"finished": torch.tensor(False)},
+    }
+    OmniGPUModelRunner._set_or_update_intermediate_buffer(runner, "r1", payload)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf["precomputed_text_id"] == [[1, 2, 3]]
+    assert buf["task_type"] == ["Base"]
+    assert "embed" not in buf
+    assert "hidden_states" not in buf
+    assert "codes" not in buf
+    assert "generated_len" not in buf
+
+
+def test_set_or_update_intermediate_buffer_skips_none_payload():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_intermediate_buffer["r1"] = {"hidden_states": {"last": torch.tensor([1.0])}}
+
+    OmniGPUModelRunner._set_or_update_intermediate_buffer(runner, "r1", None)
+
+    assert "hidden_states" in runner.model_intermediate_buffer["r1"]
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)

@@ -44,6 +44,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,
+        resumable=False,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
 
@@ -198,6 +199,60 @@ def test_load_poll(build_adapter):
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_poll_ar_replaces_prewarm_prompt_from_full_payload(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="external-aura")
+    request.prompt_token_ids = [0, 0, 0]
+    request.num_prompt_tokens = 3
+    request._all_token_ids = [0, 0, 0]
+    request._output_token_ids = []
+    request.block_hashes = []
+    request.update_block_hashes = lambda: None
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [10, 20, 30, 40],
+        "ids": {"prompt": [10, 20, 30, 40]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [10, 20, 30, 40]
+    assert request.num_prompt_tokens == 4
+    assert request._all_token_ids == [10, 20, 30, 40]
+    assert request.omni_stage_payload == payload
+    assert request.additional_information == payload
+
+
+def test_send_single_request_dict_payload_adds_meta_and_goes_on_wire(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-dict", RequestStatus.RUNNING, external_req_id="ext-dict")
+    adapter.put_req_chunk["ext-dict"] = 0
+    adapter.ramp_chunk_count["ext-dict"] = 0
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "prompt_token_ids": [1, 2, 3],
+        "ids": {"prompt": [1, 2, 3]},
+    }
+    connector.put.return_value = (True, 8, {})
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {},
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert connector.put.called
+    sent = connector.put.call_args.kwargs["data"]
+    assert isinstance(sent, dict)
+    assert sent["prompt_token_ids"] == [1, 2, 3]
+    assert sent["meta"]["finished"].item() is True
+    assert sent["meta"]["is_segment_finished"].item() is False
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):

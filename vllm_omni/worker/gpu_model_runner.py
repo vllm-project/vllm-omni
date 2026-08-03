@@ -1489,11 +1489,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         for new_req in scheduler_output.scheduled_new_reqs:
             model_buffer = getattr(new_req, "model_intermediate_buffer", None)
             if isinstance(model_buffer, dict) and model_buffer:
-                self._update_intermediate_buffer(new_req.req_id, model_buffer)
+                self._set_or_update_intermediate_buffer(new_req.req_id, model_buffer)
             payload_info = getattr(new_req, "additional_information", None)
             decoded_info = deserialize_additional_information(payload_info)
             if decoded_info:
-                self._update_intermediate_buffer(new_req.req_id, decoded_info)
+                self._set_or_update_intermediate_buffer(new_req.req_id, decoded_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
@@ -1501,7 +1501,28 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     decoded_info = deserialize_additional_information(req_infos)
                     if decoded_info:
-                        self._update_intermediate_buffer(req_id, decoded_info)
+                        self._set_or_update_intermediate_buffer(req_id, decoded_info)
+
+    @staticmethod
+    def _is_fresh_chunk_payload(payload_info: Any) -> bool:
+        # Async chunk payloads are new model inputs. They must replace the
+        # prior per-request runtime buffer; merging would leak decode state
+        # such as embed/hidden_states/codes/generated_len into the next chunk.
+        if not isinstance(payload_info, dict):
+            return False
+        return "prompt_token_ids" in payload_info
+
+    def _set_or_update_intermediate_buffer(self, req_id: str, payload_info: Any) -> None:
+        if not isinstance(payload_info, dict) or not payload_info:
+            return
+        if self._is_fresh_chunk_payload(payload_info):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                return
+            self.model_intermediate_buffer[req_id] = {}
+            self._update_intermediate_buffer(req_id, payload_info)
+            return
+        self._update_intermediate_buffer(req_id, payload_info)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,

@@ -69,6 +69,22 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
 
 
 @pytest.mark.cpu
+def test_compute_final_output_stage_ids_uses_latest_stage_per_modality():
+    omni = object.__new__(AsyncOmni)
+    omni.output_modalities = ["text", "text", None, "audio"]
+    omni._stage_meta_list = [
+        SimpleNamespace(final_output=True, final_output_type="text"),
+        SimpleNamespace(final_output=True, final_output_type="text"),
+        SimpleNamespace(final_output=False, final_output_type=None),
+        SimpleNamespace(final_output=True, final_output_type="audio"),
+    ]
+
+    assert omni._compute_final_output_stage_ids(["text", "audio"]) == [1, 3]
+    assert omni._compute_final_output_stage_ids(["text"]) == [1]
+    assert omni._compute_final_output_stage_ids(["audio"]) == [3]
+
+
+@pytest.mark.cpu
 def test_generate_submits_randomized_id_to_engine():
     """Ensure the engine receives a UUID-suffixed ID, not the raw request ID"""
 

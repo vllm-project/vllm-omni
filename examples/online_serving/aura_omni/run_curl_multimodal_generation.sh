@@ -25,7 +25,7 @@ request_body=$(cat <<EOF
     {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "max_tokens": 65536, "seed": 42, "repetition_penalty": 1.0}
   ],
   "additional_information": {
-    "aura_system_prompt": "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English.",
+    "aura_system_prompt": "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese.",
     "tts_task_type": "Base",
     "tts_ref_audio": "file://${CLONE_REF_AUDIO}",
     "tts_ref_text": "${CLONE_REF_TEXT}",
@@ -39,7 +39,7 @@ request_body=$(cat <<EOF
     "content": [
       {"type": "audio_url", "audio_url": {"url": "$MARY_HAD_LAMB_AUDIO_URL"}},
       {"type": "video_url", "video_url": {"url": "$SAMPLE_VIDEO_URL"}},
-      {"type": "text", "text": "Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English."}
+      {"type": "text", "text": "Use the audio and video together to decide whether a reply is needed. If needed, respond briefly."}
     ]
   }]
 }
