@@ -353,7 +353,7 @@ class FlowMatchingAudioPipeline(
             sampling_params.extra_args = extra_args
 
         num_inference_steps = sampling_params.num_inference_steps or 32
-        guidance_scale = sampling_params.guidance_scale or 3.0
+        guidance_scale = sampling_params.guidance_scale if sampling_params.guidance_scale_provided else 3.0
         generator = self._resolve_diffusion_generator(sampling_params)
 
         with self._stage_timer("consume_payload"):

@@ -652,7 +652,9 @@ def _serialize_whisper_model_download(model_size: str = "small"):
         f.close()
 
 
-def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "small") -> str:
+def _whisper_transcribe_in_current_process(
+    output_path: str, model_size: str = "small", language: str | None = None
+) -> str:
     import whisper
 
     device_index = None
@@ -684,6 +686,9 @@ def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "
             temperature=0.0,
             word_timestamps=True,
             condition_on_previous_text=False,
+            # None keeps whisper's auto-detection. Do not default this to a
+            # language: callers include non-English audio tests.
+            language=language,
         )["text"]
     finally:
         del model
@@ -694,15 +699,15 @@ def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "
     return text or ""
 
 
-def convert_audio_file_to_text(output_path: str, model_size: str = "small") -> str:
+def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
     """Convert an audio file to text in an isolated subprocess."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size)
+        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language)
         return future.result()
 
 
-def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> str:
+def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", language: str | None = None) -> str:
     output_fd, output_path = tempfile.mkstemp(prefix="test_", suffix=".wav")
     os.close(output_fd)
     if os.environ.get("VLLM_OMNI_KEEP_REQUEST_MEDIA", "").lower() not in ("1", "true", "yes"):
@@ -710,7 +715,7 @@ def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> 
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     print(f"audio data is saved: {output_path}")
-    return convert_audio_file_to_text(output_path, model_size)
+    return convert_audio_file_to_text(output_path, model_size, language)
 
 
 __all__ = [

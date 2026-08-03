@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -27,16 +28,9 @@
             "async_chunk": false,
             "trust_remote_code": true,
             "connectors": {
-              "rdma_connector": {
-                "name": "MooncakeTransferEngineConnector",
-                "extra": {
-                  "host": "auto",
-                  "zmq_port": 50051,
-                  "protocol": "rdma",
-                  "device_name": "",
-                  "memory_pool_size": 17179869184,
-                  "memory_pool_device": "cpu"
-                }
+              "shared_mem_connector": {
+                "name": "SharedMemoryConnector",
+                "extra": {}
               }
             },
             "stages": [
@@ -66,7 +60,7 @@
                   "need_send_cache": true
                 },
                 "output_connectors": {
-                  "to_stage_1": "rdma_connector"
+                  "to_stage_1": "shared_mem_connector"
                 },
                 "default_sampling_params": {
                   "temperature": 0.0,
@@ -96,7 +90,7 @@
                 },
                 "vae_use_tiling": true,
                 "input_connectors": {
-                  "from_stage_0": "rdma_connector"
+                  "from_stage_0": "shared_mem_connector"
                 },
                 "default_sampling_params": {
                   "num_inference_steps": 50,

@@ -114,7 +114,7 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
             )
         )
     )
-    assert result["ok"] is True
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["audio_delta_count"] > 0
     assert result["done_count"] == 1
     assert result["error_count"] == 0
@@ -137,7 +137,7 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str,
             )
         )
     )
-    assert result["ok"] is True
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["session_count"] == 2
     assert result["resume"]["ok"] is True
     assert result["takeover"]["ok"] is True

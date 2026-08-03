@@ -612,6 +612,7 @@ class OmniBase(PDDisaggregationMixin):
             request_id=req_id or "",
             finished=finished,
             stage_id=stage_id,
+            replica_id=result.replica_id,
             final_output_type=output_type,
             request_output=engine_outputs,
             images=images,

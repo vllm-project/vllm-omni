@@ -56,6 +56,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
+    @staticmethod
+    def _record_prefill_stats(request: Request) -> None:
+        """Mirror upstream first-prefill prompt accounting for generation stages.
+
+        Async-chunk generation stages can grow ``prompt_token_ids`` after the
+        first schedule; until this path tracks final chunk lengths, this records
+        the first scheduled prompt snapshot. Keep this in sync with vLLM
+        Scheduler.schedule() if this fast path gains prefix-cache or external-KV
+        accounting.
+        """
+        if request.prefill_stats is None:
+            return
+        request.prefill_stats.set(
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_local_cached_tokens=0,
+            num_external_cached_tokens=0,
+        )
+
     def _handle_stopped_request(self, request: Request) -> bool:
         if (
             request.resumable
@@ -147,6 +165,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if num_computed_tokens == 0:
+                self._record_prefill_stats(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
@@ -213,6 +233,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if request.num_computed_tokens == 0:
+                self._record_prefill_stats(request)
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens

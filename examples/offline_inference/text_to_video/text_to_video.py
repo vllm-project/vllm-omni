@@ -56,6 +56,19 @@ _MODEL_PRESETS = {
         "flow_shift": 10.0,
         "output": "cosmos3_t2v_output.mp4",
     },
+    # Cosmos3-Edge is a compact checkpoint with its own native resolution / guidance /
+    # flow_shift. It must NOT inherit the Nano/Super "cosmos" numbers above (720p / gs 6.0 /
+    # flow_shift 10.0), which produce degenerate output on Edge.
+    "cosmos3_edge": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 189,
+        "num_inference_steps": 35,
+        "guidance_scale": 5.0,
+        "fps": 24,
+        "flow_shift": 3.0,
+        "output": "cosmos3_edge_t2v_output.mp4",
+    },
     "helios": {
         "height": 384,
         "width": 640,
@@ -103,6 +116,10 @@ def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
         return _MODEL_PRESETS["ltx2"]
     if "vace" in model_lower:
         return _MODEL_PRESETS["vace"]
+    # Edge must be matched before the generic cosmos branch (its "cosmos" substring would
+    # otherwise pick up the Nano/Super 720p / gs 6.0 / flow_shift 10.0 preset).
+    if ("cosmos" in model_lower or "cosmos" in class_lower) and ("edge" in model_lower or "edge" in class_lower):
+        return _MODEL_PRESETS["cosmos3_edge"]
     if "cosmos" in model_lower:
         return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
