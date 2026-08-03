@@ -17,6 +17,7 @@ DISTILLED_MODEL = os.getenv("VLLM_TEST_LTX23_DISTILLED_MODEL", "diffusers/LTX-2.
 BASE_MODEL = os.getenv("VLLM_TEST_LTX23_MODEL", "diffusers/LTX-2.3-Diffusers")
 PROMPT = "A serene lake at sunset with mountains in the background."
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+HSDP_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 LTX_TWO_STAGE_DEPLOY = Path(__file__).resolve().parents[3] / "vllm_omni/deploy/ltx2.yaml"
 
 
@@ -59,6 +60,18 @@ def _cases():
             8,
             id="distilled",
             marks=SINGLE_CARD_MARKS,
+        ),
+        pytest.param(
+            _server(
+                DISTILLED_MODEL,
+                "LTX2DistilledPipeline",
+                "--use-hsdp",
+                "--hsdp-shard-size",
+                "2",
+            ),
+            8,
+            id="distilled_hsdp2",
+            marks=HSDP_MARKS,
         ),
         pytest.param(
             _two_stage_server(),
