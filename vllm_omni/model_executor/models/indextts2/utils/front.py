@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 import re
 import warnings
 from typing import overload
 
-from sentencepiece import SentencePieceProcessor
-
 from vllm_omni.model_executor.models.indextts2.utils.common import (
     de_tokenized_by_CJK_char,
-    tokenize_by_CJK_char,
 )
-
 
 # Chinese punctuation → ASCII punctuation mapping used by the official
 # IndexTTS-2 inference pipeline (indextts/utils/front.py).  The BPE
@@ -63,7 +58,6 @@ def normalize_text(text: str) -> str:
 
 
 class TextTokenizer:
-
     @property
     def vocab_size(self):
         return self.sp_model.GetPieceSize()

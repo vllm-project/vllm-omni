@@ -143,9 +143,7 @@ def split_segments_by_token(
         token = tokenized_str[i]
         current_segment.append(token)
         current_segment_tokens_len += 1
-        if not ("," in split_tokens or "▁," in split_tokens) and (
-            "," in current_segment or "▁," in current_segment
-        ):
+        if not ("," in split_tokens or "▁," in split_tokens) and ("," in current_segment or "▁," in current_segment):
             sub_segments = split_segments_by_token(
                 current_segment,
                 [",", "▁,"],
@@ -174,7 +172,7 @@ def split_segments_by_token(
             sub_segments = []
             for j in range(0, len(current_segment), max_text_tokens_per_segment):
                 if j + max_text_tokens_per_segment < len(current_segment):
-                    sub_segments.append(current_segment[j: j + max_text_tokens_per_segment])
+                    sub_segments.append(current_segment[j : j + max_text_tokens_per_segment])
                 else:
                     sub_segments.append(current_segment[j:])
             warnings.warn(
@@ -249,8 +247,7 @@ class TestNormalizeText:
         }
         for chinese, expected in cases.items():
             assert normalize_text(chinese) == expected, (
-                f"{chinese!r} (U+{ord(chinese):04X}) -> {expected!r}, "
-                f"got {normalize_text(chinese)!r}"
+                f"{chinese!r} (U+{ord(chinese):04X}) -> {expected!r}, got {normalize_text(chinese)!r}"
             )
 
     def test_newline_replaced_with_space(self):
@@ -261,8 +258,7 @@ class TestNormalizeText:
         assert normalize_text(text) == text
 
     def test_mixed_chinese_ascii(self):
-        assert normalize_text("你好，今天天气真好！你吃饭了吗？") == \
-            "你好,今天天气真好!你吃饭了吗?"
+        assert normalize_text("你好，今天天气真好！你吃饭了吗？") == "你好,今天天气真好!你吃饭了吗?"
 
     def test_empty_string(self):
         assert normalize_text("") == ""
@@ -271,14 +267,9 @@ class TestNormalizeText:
         """After normalisation, no original Chinese punctuation chars remain."""
         text = "，。！？：；“”‘’（）【】《》——～·"
         result = normalize_text(text)
-        all_cjk_punc = (
-            "\u3002\uff01\uff1f\uff0c"
-            "\u201c\u201d\u2018\u2019\u300a\u300b\u3010\u3011\u2014\uff5e\u00b7"
-        )
+        all_cjk_punc = "\u3002\uff01\uff1f\uff0c\u201c\u201d\u2018\u2019\u300a\u300b\u3010\u3011\u2014\uff5e\u00b7"
         for ch in all_cjk_punc:
-            assert ch not in result, (
-                f"{ch!r} (U+{ord(ch):04X}) should have been replaced"
-            )
+            assert ch not in result, f"{ch!r} (U+{ord(ch):04X}) should have been replaced"
 
     def test_book_title_marks(self):
         assert normalize_text("《红楼梦》") == "'红楼梦'"
@@ -343,9 +334,7 @@ class TestLongTextWarning:
         and trigger a RuntimeWarning."""
         long_tokens: list[str] = list("hello" + "。world" * 121)
         with pytest.warns(RuntimeWarning, match="exceeds limit"):
-            split_segments_by_token(
-                long_tokens, punctuation_marks_tokens, 120
-            )
+            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
 
     def test_ascii_period_no_warning(self):
         """The same sequence with ASCII periods (.) splits properly
@@ -353,13 +342,10 @@ class TestLongTextWarning:
         long_tokens: list[str] = list("hello" + ".world" * 121)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            split_segments_by_token(
-                long_tokens, punctuation_marks_tokens, 120
+            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
+            assert not any("exceeds limit" in str(msg.message).lower() for msg in w), (
+                "ASCII periods should split fine without warning"
             )
-            assert not any(
-                "exceeds limit" in str(msg.message).lower()
-                for msg in w
-            ), "ASCII periods should split fine without warning"
 
     def test_normalized_text_no_warning(self):
         """After ``normalize_text``, ``。`` becomes ``.`` so the same
@@ -369,13 +355,10 @@ class TestLongTextWarning:
         long_tokens: list[str] = list("hello" + ".world" * 121)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            split_segments_by_token(
-                long_tokens, punctuation_marks_tokens, 120
+            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
+            assert not any("exceeds limit" in str(msg.message).lower() for msg in w), (
+                "Normalised (。→.) text should split fine"
             )
-            assert not any(
-                "exceeds limit" in str(msg.message).lower()
-                for msg in w
-            ), "Normalised (。→.) text should split fine"
 
 
 # ---- 5. End-to-end pipeline simulation ----
@@ -385,16 +368,12 @@ class TestEndToEndPipeline:
     """Simulate the full text-processing pipeline
     (normalize → CJK tokenize → split) to verify the fix."""
 
-    def _simulate(
-        self, text: str, use_normalize: bool = True
-    ) -> list[list[str]]:
+    def _simulate(self, text: str, use_normalize: bool = True) -> list[list[str]]:
         if use_normalize:
             text = normalize_text(text)
         cjk_tok = tokenize_by_CJK_char(text)
         tokens = cjk_tok.split()
-        return split_segments_by_token(
-            tokens, punctuation_marks_tokens, 120
-        )
+        return split_segments_by_token(tokens, punctuation_marks_tokens, 120)
 
     def test_normalized_long_text_within_limit(self):
         """With normalisation enabled, a long Chinese text with ``。``
@@ -402,9 +381,7 @@ class TestEndToEndPipeline:
         text = "今天天气真好。" + "好" * 119 + "再见。"
         segments = self._simulate(text, use_normalize=True)
         for i, seg in enumerate(segments):
-            assert len(seg) <= 120, (
-                f"Segment {i} exceeds limit: {len(seg)} tokens"
-            )
+            assert len(seg) <= 120, f"Segment {i} exceeds limit: {len(seg)} tokens"
 
     def test_raw_long_text_triggers_warning(self):
         """Without normalisation, the same text triggers RuntimeWarning."""
