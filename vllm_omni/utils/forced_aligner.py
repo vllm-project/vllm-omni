@@ -102,11 +102,41 @@ class ForcedAlignerLoadError(RuntimeError):
 # threads at once (concurrent WebSocket sessions otherwise race the engine).
 _lock = threading.Lock()
 _encode_lock = asyncio.Lock()
+# Separate from _encode_lock on purpose: see the note in align().
+_load_lock = asyncio.Lock()
 _llm: Any = None
 _classify_num: int | None = None
 _timestamp_token_id: int | None = None
 _timestamp_segment_time_ms: float | None = None
 _loaded_config: ForcedAlignerConfig | None = None
+
+# --- Dynamic batching ---
+# ``_encode_lock`` makes callers strictly serial, so the aligner runs at batch
+# size 1 forever. Measured on H100 with 30s clips a batch costs roughly
+# ``25 + 8.1N`` ms: 30 ms for one clip, but only 8.5 ms/clip at 64. Batch 1 is
+# therefore ~75% fixed overhead, and paying it per request is what makes
+# alignment expensive -- not the model.
+#
+# The worker drains whatever is already queued and runs it as one ``encode``
+# (which already takes a list), then repeats. Deliberately *no* linger: waiting
+# for stragglers adds latency to every request and measurably lost throughput
+# when tried. Requests instead accumulate while the previous batch executes, so
+# batch size rises on its own with load and collapses back to 1 when idle.
+_ALIGNER_MAX_BATCH = int(os.getenv("VLLM_OMNI_ALIGNER_MAX_BATCH", "32"))
+_ALIGNER_STATS_EVERY = 100
+
+_batch_queue: asyncio.Queue | None = None
+_batch_worker_task: asyncio.Task | None = None
+_batch_loop: asyncio.AbstractEventLoop | None = None
+
+
+@dataclass(slots=True)
+class _AlignJob:
+    audio: bytes
+    text: str
+    sample_rate: int
+    language: str | None
+    future: asyncio.Future
 
 
 async def align(
@@ -140,68 +170,162 @@ async def align(
             permanent until restart, so callers surface it once instead of
             degrading every request to ``None``.
     """
-    async with _encode_lock:
+    # Load outside the batcher so a load failure reaches this caller instead of
+    # dissolving into a batch of per-request ``None`` results.
+    #
+    # This must NOT take _encode_lock. The batch worker holds that for the whole
+    # encode, so gating the (idempotent, almost always already-done) load on it
+    # would block callers here until the in-flight batch finished -- meaning
+    # nothing could enqueue while a batch ran, the queue would be empty at every
+    # drain, and batch size would be pinned at 1. Fast-path the loaded case and
+    # use a dedicated lock for the one-time load.
+    if _llm is None:
+        async with _load_lock:
+            if _llm is None:
+                try:
+                    await asyncio.to_thread(_ensure_loaded, config)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Forced aligner failed to load")
+                    raise ForcedAlignerLoadError(str(exc)) from exc
+
+    job = _AlignJob(
+        audio=audio,
+        text=text,
+        sample_rate=sample_rate,
+        language=language,
+        future=asyncio.get_running_loop().create_future(),
+    )
+    _ensure_batch_worker(config).put_nowait(job)
+    return await job.future
+
+
+def _ensure_batch_worker(config: ForcedAlignerConfig) -> asyncio.Queue:
+    """Start the batching worker on first use; idempotent per event loop.
+
+    Tracks the loop the worker belongs to. A task left over from a previous
+    loop is not ``done()`` -- it is simply dead -- so keying only on ``done()``
+    would hand back a queue nothing is draining and every future would hang.
+    """
+    global _batch_queue, _batch_worker_task, _batch_loop
+
+    loop = asyncio.get_running_loop()
+    stale = _batch_queue is None or _batch_worker_task is None or _batch_loop is not loop or _batch_worker_task.done()
+    if stale:
+        _batch_loop = loop
+        _batch_queue = asyncio.Queue()
+        _batch_worker_task = loop.create_task(_batch_worker(_batch_queue, config))
+    return _batch_queue
+
+
+async def _batch_worker(queue: asyncio.Queue, config: ForcedAlignerConfig) -> None:
+    """Drain the queue into ``encode`` calls, one batch at a time."""
+    n_batches = 0
+    n_jobs = 0
+    biggest = 0
+    while True:
+        jobs = [await queue.get()]
+        # Take everything already waiting, but never wait for more.
+        while len(jobs) < _ALIGNER_MAX_BATCH:
+            try:
+                jobs.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        n_batches += 1
+        n_jobs += len(jobs)
+        biggest = max(biggest, len(jobs))
+        if n_batches % _ALIGNER_STATS_EVERY == 0:
+            # Mean batch size is the health metric: if it sits at 1.0 under
+            # load, something upstream is serializing enqueue and the aligner
+            # is paying full fixed overhead per clip.
+            logger.info(
+                "Forced aligner: %d batches, mean size %.2f, max %d",
+                n_batches,
+                n_jobs / n_batches,
+                biggest,
+            )
+
         try:
-            await asyncio.to_thread(_ensure_loaded, config)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Forced aligner failed to load")
-            raise ForcedAlignerLoadError(str(exc)) from exc
-        try:
-            return await asyncio.to_thread(_align_sync, audio, text, sample_rate, config, language)
+            async with _encode_lock:
+                results = await asyncio.to_thread(_align_batch_sync, jobs, config)
+        # Broad on purpose: this is the worker's top level. An escaping
+        # exception kills the task, and every future already queued behind it
+        # would then never resolve -- a hung WebSocket turn for TTS, a hung
+        # request for transcription. Degrade the batch to per-job None (the
+        # documented failure value) and keep serving.
         except Exception:  # noqa: BLE001
-            logger.exception("Forced aligner failed for text=%r", text)
-            return None
+            logger.exception("Forced aligner batch of %d failed", len(jobs))
+            results = [None] * len(jobs)
+
+        for job, result in zip(jobs, results, strict=True):
+            if not job.future.done():
+                job.future.set_result(result)
 
 
-def _align_sync(
-    audio: bytes,
-    text: str,
-    sample_rate: int,
+def _align_batch_sync(
+    jobs: list[_AlignJob],
     config: ForcedAlignerConfig,
-    language: str | None = None,
-) -> list[WordTimestamp]:
-    # Precondition: align() has already run _ensure_loaded(config) under
-    # _encode_lock and owns the load-failure -> ForcedAlignerLoadError mapping.
-    # Don't reload here, so a load error can't be swallowed as a per-request None.
-    audio_arr = _pcm_bytes_to_float32(audio)
-    if audio_arr.size == 0:
-        return []
-    audio_duration_ms = (audio_arr.size / sample_rate) * 1000.0
+) -> list[list[WordTimestamp] | None]:
+    """One ``encode`` for many jobs; per-item prep and decode stay per item.
 
-    # Segment once and reuse for both the prompt and the decode: the word
-    # units MUST match between the two or the markers drift out of sync.
-    words = _processor.segment_words(text, language)
-    prompt = _processor.build_prompt(words)
-    request = {
-        "prompt": prompt,
-        "multi_modal_data": {"audio": (audio_arr, sample_rate)},
-    }
-
+    A job that fails to prepare or decode yields ``None`` for that entry alone,
+    matching the single-shot contract, so one bad input cannot fail its batch.
+    """
     from vllm.pooling_params import PoolingParams
 
+    requests: list[dict[str, Any]] = []
+    prepared: list[tuple[int, list[str], float]] = []
+    results: list[list[WordTimestamp] | None] = [None] * len(jobs)
+
+    for idx, job in enumerate(jobs):
+        try:
+            audio_arr = _pcm_bytes_to_float32(job.audio)
+            if audio_arr.size == 0:
+                results[idx] = []
+                continue
+            # Segment once and reuse for both the prompt and the decode: the
+            # word units MUST match or the markers drift out of sync.
+            words = _processor.segment_words(job.text, job.language)
+            requests.append(
+                {
+                    "prompt": _processor.build_prompt(words),
+                    "multi_modal_data": {"audio": (audio_arr, job.sample_rate)},
+                }
+            )
+            prepared.append((idx, words, (audio_arr.size / job.sample_rate) * 1000.0))
+        # Per-item boundary: one malformed job must not fail the whole batch.
+        except Exception:  # noqa: BLE001
+            logger.exception("Forced aligner could not prepare text=%r", job.text)
+
+    if not requests:
+        return results
+
     outputs = _llm.encode(  # type: ignore[union-attr]
-        [request],
+        requests,
         pooling_params=PoolingParams(),
         pooling_task=config.pooling_task or "token_classify",
         use_tqdm=False,
     )
-    if not outputs:
-        return []
 
-    result = outputs[0]
-    logits = result.outputs.data  # [n_token, classify_num]
-    prompt_token_ids = list(result.prompt_token_ids)
-    timestamp_positions = [i for i, tid in enumerate(prompt_token_ids) if tid == _timestamp_token_id]
+    for (idx, words, audio_duration_ms), output in zip(prepared, outputs, strict=True):
+        try:
+            results[idx] = _decode_aligner_output(output, words, audio_duration_ms)
+        # Per-item boundary, as above; this job yields None, its peers stand.
+        except Exception:  # noqa: BLE001
+            logger.exception("Forced aligner failed to decode text=%r", jobs[idx].text)
+
+    return results
+
+
+def _decode_aligner_output(output: Any, words: list[str], audio_duration_ms: float) -> list[WordTimestamp]:
+    """Turn one pooling output into word timestamps."""
+    timestamp_positions = [i for i, tid in enumerate(output.prompt_token_ids) if tid == _timestamp_token_id]
     if not timestamp_positions:
-        logger.warning(
-            "No <|timestamp|> tokens found in prompt for text=%r; aligner returned %d rows.",
-            text,
-            logits.shape[0] if hasattr(logits, "shape") else len(logits),
-        )
+        logger.warning("No <|timestamp|> tokens found in prompt for words=%r", words[:8])
         return []
 
     return _decode_timestamps(
-        logits=logits,
+        logits=output.outputs.data,  # [n_token, classify_num]
         words=words,
         timestamp_positions=timestamp_positions,
         classify_num=_classify_num,
@@ -390,6 +514,13 @@ def _decode_timestamps(
 def _reset_for_tests() -> None:
     """Drop the cached aligner state so the next call reloads."""
     global _llm, _classify_num, _timestamp_token_id, _timestamp_segment_time_ms, _loaded_config
+    global _batch_queue, _batch_worker_task, _batch_loop
+
+    if _batch_worker_task is not None and not _batch_worker_task.done():
+        _batch_worker_task.cancel()
+    _batch_queue = None
+    _batch_worker_task = None
+    _batch_loop = None
     with _lock:
         _llm = None
         _classify_num = None
