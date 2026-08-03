@@ -2,13 +2,14 @@ import argparse
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
@@ -128,7 +129,7 @@ class OmniEngineArgs(EngineArgs):
         custom_process_next_stage_input_func: Optional path to a custom function for processing
             inputs from previous stages
             If None, default processing is used.
-        stage_connector_spec: Extra configuration for stage connector
+        stage_connector_plan: Independent inbound and outbound stage connectors.
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
@@ -156,7 +157,7 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_spec: dict[str, Any] = field(default_factory=dict)
+    stage_connector_plan: StageConnectorPlan | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
     retains_state_across_chunks: bool = False
@@ -250,12 +251,9 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec
-        stage_connector_config = {
-            "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
-            "extra": self.stage_connector_spec.get("extra", {}).copy(),
-        }
-        stage_connector_config["extra"]["stage_id"] = self.stage_id
+        from vllm_omni.distributed.omni_connectors.utils.initialization import default_stage_connector_plan
+
+        connector_plan = self.stage_connector_plan or default_stage_connector_plan(self.stage_id)
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
@@ -350,7 +348,7 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
-            stage_connector_config=stage_connector_config,
+            stage_connector_plan=connector_plan,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,

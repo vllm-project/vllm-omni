@@ -1,4 +1,4 @@
-from dataclasses import MISSING, field
+from dataclasses import MISSING
 from typing import Any
 
 from pydantic import ConfigDict, TypeAdapter
@@ -14,6 +14,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan, StageConnectorSpec
 
 logger = init_logger(__name__)
 
@@ -99,8 +100,7 @@ class OmniModelConfig(ModelConfig):
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
              "audio", "latents"). If None, output type is inferred.
-         stage_connector_config: Stage connector configuration dictionary.
-             Contains "name" (connector name), "extra" (extra connector config).
+         stage_connector_plan: Independent inbound and outbound stage connectors.
          task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
              If not specified, will be inferred from model path.
 
@@ -128,12 +128,7 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_config: dict[str, Any] = field(
-        default_factory=lambda: {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-    )
+    stage_connector_plan: StageConnectorPlan | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
@@ -144,6 +139,42 @@ class OmniModelConfig(ModelConfig):
     @property
     def registry(self):
         return me_models.OmniModelRegistry
+
+    def _connector_config(self, edge: StageConnectorSpec | None) -> dict[str, Any] | None:
+        if edge is None:
+            return None
+        extra = dict(edge.spec.extra)
+        extra.update(
+            stage_id=self.stage_id,
+            from_stage=edge.from_stage,
+            to_stage=edge.to_stage,
+        )
+        return {"name": edge.spec.name, "extra": extra}
+
+    @property
+    def stage_input_connector_config(self) -> dict[str, Any] | None:
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return self._connector_config(plan.inbound)
+
+    @property
+    def stage_output_connector_config(self) -> dict[str, Any] | None:
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return self._connector_config(plan.outbound)
+
+    @property
+    def stage_connector_config(self) -> dict[str, Any] | None:
+        """Compatibility view for model code that only needs connector extras.
+
+        Ambiguous on a stage with both an inbound and an outbound edge (a
+        middle/dual stage): this always prefers the inbound config. Producer-side
+        readers on such a stage must use ``stage_output_connector_config`` explicitly
+        instead of this property.
+        """
+        return self.stage_input_connector_config or self.stage_output_connector_config
 
     @property
     def architectures(self) -> list[str]:

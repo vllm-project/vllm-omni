@@ -11,7 +11,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    ConnectorEndpoint,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -34,6 +39,7 @@ class OmniRequest(Request):
         prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
+        sender_info: ConnectorEndpoint | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         **kwargs,
@@ -47,6 +53,7 @@ class OmniRequest(Request):
         )
         # Optional external request ID for tracking
         self.external_req_id: str | None = external_req_id
+        self.sender_info = sender_info
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
@@ -83,6 +90,7 @@ class OmniRequest(Request):
             request_id=request.request_id,
             # Optional external request ID for tracking
             external_req_id=request.external_req_id,
+            sender_info=request.sender_info,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,

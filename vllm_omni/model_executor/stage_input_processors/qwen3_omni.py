@@ -111,9 +111,9 @@ def _ensure_list(x):
 
 def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
+        return value.detach()
     if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-        return value[0].detach().cpu()
+        return value[0].detach()
     return None
 
 
@@ -283,8 +283,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach().cpu()
+    emb = thinker_emb.detach()
+    hid = thinker_hid.detach()
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -293,8 +293,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             new_prompt_len = thinker_emb.shape[0]
             payload = OmniPayloadStruct(
                 meta=MetaStruct(finished=finished),
-                embed=EmbeddingsStruct(prefill=emb_cpu),
-                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                embed=EmbeddingsStruct(prefill=emb),
+                hidden_states=HiddenStatesStruct(output=hid),
                 ids=IdsStruct(
                     all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
                     prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
@@ -312,8 +312,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 if isinstance(saved_prefill, torch.Tensor) and isinstance(saved_output, torch.Tensor):
                     return OmniPayloadStruct(
                         meta=MetaStruct(finished=finished),
-                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb_cpu), dim=0)),
-                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid_cpu), dim=0)),
+                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb), dim=0)),
+                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid), dim=0)),
                         ids=IdsStruct(
                             all=save_payload.get("ids", {}).get("all"),
                             prompt=save_payload.get("ids", {}).get("prompt"),
@@ -325,8 +325,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 meta=MetaStruct(
                     finished=finished,
                 ),
-                embed=EmbeddingsStruct(decode=emb_cpu),
-                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                embed=EmbeddingsStruct(decode=emb),
+                hidden_states=HiddenStatesStruct(output=hid),
                 ids=IdsStruct(output=output_token_ids),
                 speaker=speaker,
                 language=language,
@@ -337,8 +337,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             return None
         return OmniPayloadStruct(
             meta=MetaStruct(finished=finished),
-            embed=EmbeddingsStruct(decode=emb_cpu),
-            hidden_states=HiddenStatesStruct(output=hid_cpu),
+            embed=EmbeddingsStruct(decode=emb),
+            hidden_states=HiddenStatesStruct(output=hid),
             speaker=speaker,
             language=language,
         )
@@ -467,20 +467,20 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+    def _maybe_detach(t: Any) -> torch.Tensor | None:
+        return t.detach() if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                prefill=thinker_emb.detach(),
+                tts_bos=_maybe_detach(thinker_embed.get("tts_bos")),
+                tts_eos=_maybe_detach(thinker_embed.get("tts_eos")),
+                tts_pad=_maybe_detach(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            hidden_states=HiddenStatesStruct(output=thinker_hid.detach()),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -520,7 +520,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            embed=EmbeddingsStruct(decode=thinker_emb.detach()),
             speaker=speaker,
             language=language,
         )
@@ -595,15 +595,21 @@ def thinker2talker_full_payload(
 
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb_prefill.detach().cpu(),
+            "prefill": thinker_emb_prefill.detach(),
             "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
             "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
             "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
         },
-        "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
+        "hidden_states": {"output": thinker_hid_prefill.detach()},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
+    # Scheduler hint for the talker's placeholder prompt allocation, same
+    # computation the async path uses for its own local placeholder sizing
+    # (thinker2talker_token_only) — the full-payload path must ship it too so
+    # the downstream scheduler can size the talker's KV allocation.
+    info_for_len = {"ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)}}
+    payload["next_stage_prompt_len"] = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
     speaker = extract_speaker_from_request(request)
     if speaker is not None:
         payload["speaker"] = speaker

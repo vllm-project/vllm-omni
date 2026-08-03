@@ -2,6 +2,8 @@
 Engine components for vLLM-Omni.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import msgspec
@@ -11,6 +13,22 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+
+class ConnectorEndpoint(msgspec.Struct, frozen=True):
+    """Network endpoint of the producer bound to a request."""
+
+    host: str
+    zmq_port: int
+
+    def __post_init__(self) -> None:
+        if not self.host:
+            raise ValueError("Connector endpoint host must not be empty")
+        if not 0 < self.zmq_port <= 65535:
+            raise ValueError(f"Connector endpoint port must be in 1..65535, got {self.zmq_port}")
+
+    def as_metadata(self) -> dict[str, str | int]:
+        return {"source_host": self.host, "source_port": self.zmq_port}
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -79,6 +97,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
+    # Endpoint of the upstream producer replica selected for this request.
+    sender_info: ConnectorEndpoint | None = None
 
     @classmethod
     def from_request(
@@ -88,7 +108,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
-    ) -> "OmniEngineCoreRequest":
+        sender_info: ConnectorEndpoint | None = None,
+    ) -> OmniEngineCoreRequest:
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
         if prompt_embeds is None:
@@ -97,6 +118,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information = getattr(request, "additional_information", None)
         if model_intermediate_buffer is None:
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
+        if sender_info is None:
+            sender_info = getattr(request, "sender_info", None)
 
         return cls(
             request_id=request.request_id,
@@ -121,6 +144,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
+            sender_info=sender_info,
         )
 
 

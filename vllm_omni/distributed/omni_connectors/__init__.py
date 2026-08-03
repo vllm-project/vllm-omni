@@ -22,15 +22,17 @@ try:
     from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
 except ImportError:
     MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
-from .factory import OmniConnectorFactory
-from .utils.config import ConnectorSpec, OmniTransferConfig
+from .factory import OmniConnectorFactory, StageConnectorSet
+from .utils.config import ConnectorSpec, OmniTransferConfig, StageConnectorPlan, StageConnectorSpec
 from .utils.initialization import (
     build_stage_connectors,
+    default_stage_connector_plan,
     get_connectors_config_for_stage,
     get_stage_connector_config,
     initialize_connectors_from_config,
     initialize_orchestrator_connectors,
     load_omni_transfer_config,
+    resolve_stage_connector_plan,
 )
 
 # Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
@@ -41,10 +43,13 @@ __all__ = [
     # Config
     "ConnectorSpec",
     "OmniTransferConfig",
+    "StageConnectorPlan",
+    "StageConnectorSpec",
     # Base classes and implementations
     "OmniConnectorBase",
     # Factory
     "OmniConnectorFactory",
+    "StageConnectorSet",
     # Specific implementations
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",
@@ -57,6 +62,8 @@ __all__ = [
     "load_omni_transfer_config",
     "initialize_connectors_from_config",
     "get_connectors_config_for_stage",
+    "default_stage_connector_plan",
+    "resolve_stage_connector_plan",
     # Manager helpers
     "initialize_orchestrator_connectors",
     "get_stage_connector_config",

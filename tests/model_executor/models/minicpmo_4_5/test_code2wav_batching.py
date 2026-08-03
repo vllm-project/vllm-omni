@@ -139,7 +139,7 @@ def _config(minimum: int = 1):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
-            stage_connector_config={
+            stage_input_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
                     "prompt_cache_id": "shared",

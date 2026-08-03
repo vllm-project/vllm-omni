@@ -8,6 +8,11 @@ import types
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -116,7 +121,7 @@ def _make_llm_plan(
                     final_output_type=final_output_type,
                     is_comprehension=is_comprehension and replica_id == 0,
                 ),
-                stage_connector_spec={},
+                stage_connector_plan=StageConnectorPlan(),
                 omni_kv_connector=(None, None, None),
                 stage_vllm_config=vllm_config,
                 executor_class=object,
@@ -150,7 +155,7 @@ def _make_diffusion_plan(
                 launch_mode="local",
                 stage_cfg=stage_cfg,
                 metadata=_make_diffusion_metadata(stage_id, replica_id=replica_id),
-                stage_connector_spec={},
+                stage_connector_plan=StageConnectorPlan(),
                 omni_kv_connector=(None, None, None),
             )
         )
@@ -412,7 +417,7 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     monkeypatch.setattr(
         runtime_mod.StageEngineCoreClientBase,
         "make_async_mp_client",
-        lambda **kwargs: (captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client),
+        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
     )
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
@@ -495,7 +500,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         "extract_legacy_stage_metadata",
         lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
     )
-    monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(runtime_mod, "get_stage_connector_plan", lambda **_: StageConnectorPlan())
     monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
     monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(
@@ -677,7 +682,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         launch_mode="local",
         stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="0")),
         metadata=types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": "0"}),
-        stage_connector_spec={},
+        stage_connector_plan=StageConnectorPlan(),
         omni_kv_connector=(None, None, None),
         stage_vllm_config=fake_vllm_config,
         executor_class=object,
@@ -769,18 +774,21 @@ def test_build_engine_args_keeps_full_payload_connector_spec():
         engine_args={"async_chunk": False},
         default_sampling_params={},
     )
-    connector_spec = {
-        "name": "SharedMemoryConnector",
-        "extra": {"role": "sender"},
-    }
+    connector_plan = StageConnectorPlan(
+        outbound=StageConnectorSpec(
+            1,
+            2,
+            ConnectorSpec("SharedMemoryConnector"),
+        )
+    )
 
     engine_args = build_engine_args_dict(
         stage_cfg,
         "/parent/model",
-        stage_connector_spec=connector_spec,
+        stage_connector_plan=connector_plan,
     )
 
-    assert engine_args["stage_connector_spec"] == connector_spec
+    assert engine_args["stage_connector_plan"] == connector_plan
 
 
 def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):

@@ -7,8 +7,10 @@ from pytest_mock import MockerFixture
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector, try_send_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
-from vllm_omni.distributed.omni_connectors.utils.initialization import get_connectors_config_for_stage
-from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    get_connectors_config_for_stage,
+    resolve_stage_connector_plan,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -201,16 +203,12 @@ def test_get_connectors_for_stage():
 
     # Get config for Stage 1
     # Stage 1 receives from 0 (input) and sends to 2 (output)
-    # get_connectors_config_for_stage ONLY returns INPUT connectors for the worker to initialize
-
     stage_config = get_connectors_config_for_stage(config, stage_id=1)
 
-    # Should contain "from_stage_0"
     assert "from_stage_0" in stage_config
     assert stage_config["from_stage_0"]["spec"]["name"] == "C1"
-
-    # Should NOT contain "from_stage_1" or related to output
-    assert "from_stage_1" not in stage_config
+    assert "to_stage_2" in stage_config
+    assert stage_config["to_stage_2"]["spec"]["name"] == "C2"
 
     # Verify Stage 2
     stage_2_config = get_connectors_config_for_stage(config, stage_id=2)
@@ -218,8 +216,7 @@ def test_get_connectors_for_stage():
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
 
 
-@pytest.mark.parametrize("async_chunk", [False, True])
-def test_outgoing_stage_uses_sender_connector_spec(async_chunk: bool):
+def test_outgoing_stage_uses_outbound_connector_spec():
     config = OmniTransferConfig(
         connectors={
             ("1", "2"): ConnectorSpec(
@@ -229,10 +226,11 @@ def test_outgoing_stage_uses_sender_connector_spec(async_chunk: bool):
         }
     )
 
-    spec = get_stage_connector_spec(config, stage_id=1, async_chunk=async_chunk)
+    plan = resolve_stage_connector_plan(config, stage_id=1)
 
-    assert spec["name"] == "SharedMemoryConnector"
-    assert spec["extra"] == {"codec_chunk_frames": 25, "role": "sender"}
+    assert plan.outbound is not None
+    assert plan.outbound.spec.name == "SharedMemoryConnector"
+    assert plan.outbound.spec.extra == {"codec_chunk_frames": 25}
 
 
 def test_full_payload_consumer_uses_receiver_connector_spec():
@@ -245,10 +243,11 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
         }
     )
 
-    spec = get_stage_connector_spec(config, stage_id=2, async_chunk=False)
+    plan = resolve_stage_connector_plan(config, stage_id=2)
 
-    assert spec["name"] == "SharedMemoryConnector"
-    assert spec["extra"] == {"codec_chunk_frames": 25, "role": "receiver"}
+    assert plan.inbound is not None
+    assert plan.inbound.spec.name == "SharedMemoryConnector"
+    assert plan.inbound.spec.extra == {"codec_chunk_frames": 25}
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

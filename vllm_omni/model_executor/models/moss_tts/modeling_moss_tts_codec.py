@@ -626,7 +626,7 @@ class MossTTSCodecDecoder(nn.Module):
 
     def _connector_int(self, name: str, default: int = 0) -> int:
         model_cfg = getattr(self.vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        connector_cfg = getattr(model_cfg, "stage_input_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
         else:
@@ -838,7 +838,7 @@ class MossTTSCodecDecoder(nn.Module):
         # codec_chunk_frames values used in moss_tts.yaml.
         capture_sizes: list[int] = [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
         model_cfg = getattr(self.vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        connector_cfg = getattr(model_cfg, "stage_input_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
         else:

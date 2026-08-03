@@ -19,14 +19,17 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
+from vllm_omni.distributed.omni_connectors.utils.env import AUTO_HOST_VALUES
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
+    connector_plan_from_model_config,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import ConnectorEndpoint, OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -148,10 +151,14 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
-        self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        self._stage_connector_plan = connector_plan_from_model_config(model_config)
+        self._omni_kv_config = getattr(model_config, "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
+        self._payload_sender_info: ConnectorEndpoint | None = None
+        self._payload_sender_info_initialized = False
 
         client_name = self.__class__.__name__
         logger.info(
@@ -270,7 +277,7 @@ class StageEngineCoreClientBase(StageClientBase):
             if not address:
                 continue
             host = urlparse(address).hostname
-            if host in {None, "", "*", "0.0.0.0", "::"}:
+            if host is None or host in AUTO_HOST_VALUES:
                 continue
             if host in {"localhost", "127.0.0.1"}:
                 detected = self._detect_local_ip()
@@ -291,7 +298,7 @@ class StageEngineCoreClientBase(StageClientBase):
 
     def _resolve_sender_host_from_config(self, connector_config: dict[str, Any]) -> str | None:
         host = connector_config.get("sender_host") or connector_config.get("host")
-        if host in {None, "", "auto", "*", "0.0.0.0", "::"}:
+        if host is None or host in AUTO_HOST_VALUES:
             return self._resolve_contact_host()
         return str(host)
 
@@ -377,6 +384,33 @@ class StageEngineCoreClientBase(StageClientBase):
                 replica_id=self.replica_id,
             ),
         }
+
+    def get_payload_sender_info(self) -> ConnectorEndpoint | None:
+        """Return this replica's transfer-engine endpoint, if it has one."""
+        if getattr(self, "_payload_sender_info_initialized", False):
+            return getattr(self, "_payload_sender_info", None)
+
+        output = self._stage_connector_plan.outbound
+        if output is None or output.spec.name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            self._payload_sender_info_initialized = True
+            return None
+
+        spec = OmniConnectorFactory.materialize_connector_spec(
+            output,
+            "sender",
+            int(self.stage_id),
+            local_rank=0,
+            replica_id=int(self.replica_id),
+        )
+        assert spec is not None
+        host = spec.extra.get("host")
+        if host is None or host in AUTO_HOST_VALUES:
+            host = self._resolve_contact_host()
+        if host is None:
+            raise RuntimeError(f"Stage-{self.stage_id} replica-{self.replica_id} has no routable payload sender host")
+        self._payload_sender_info = ConnectorEndpoint(host=str(host), zmq_port=int(spec.extra["zmq_port"]))
+        self._payload_sender_info_initialized = True
+        return self._payload_sender_info
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set engine outputs (called by orchestrator)."""

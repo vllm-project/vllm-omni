@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import os
 import threading
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any
@@ -25,7 +24,17 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
+from vllm_omni.distributed.omni_connectors.utils.initialization import connector_plan_from_model_config
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
+    KVTPTopology,
+    get_kv_source_ranks,
+    get_kv_target_ranks,
+    get_local_tp_rank,
+    get_omni_replica_id,
+    validate_kv_tp_topology,
+)
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -96,7 +105,6 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -106,38 +114,55 @@ class OmniConnectorModelRunnerMixin:
             stage_id = int(stage_id)
         self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
 
+        local_tp_rank = get_local_tp_rank()
+        connector_plan = connector_plan_from_model_config(model_config)
+        self._previous_stage_id = connector_plan.inbound.from_stage if connector_plan.inbound is not None else None
+        self._next_stage_id = connector_plan.outbound.to_stage if connector_plan.outbound is not None else None
+        runtime_plan = StageConnectorPlan() if self._async_chunk else connector_plan
+        self._connectors = OmniConnectorFactory.create_stage_connectors(
+            runtime_plan,
+            stage_id=self._stage_id,
+            local_rank=local_tp_rank,
+            replica_id=get_omni_replica_id(),
+        )
+
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.debug(
-            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
+            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
+            "recv_connector=%s, send_connector=%s, dual=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
-            type(self._omni_connector).__name__ if self._omni_connector else None,
+            type(self._connectors.receive).__name__ if self._connectors.receive else None,
+            type(self._connectors.send).__name__ if self._connectors.send else None,
+            self._connectors.receive is not None and self._connectors.receive is self._connectors.send,
             self._custom_process_func_path,
         )
 
-        # -- next stage ID (from connector config or default stage_id + 1) --
-        self._next_stage_id: int = self._resolve_next_stage_id(model_config)
-
         # -- heterogeneous TP rank support --
-        rank_cfg = self._parse_rank_mapping(model_config)
+        self._recv_topology, self._send_topology = self._resolve_parallel_topologies(
+            connector_plan,
+            local_tp_rank,
+        )
+        self._local_rank = local_tp_rank
         if self._kv_transfer_manager is not None:
-            topology = getattr(self._kv_transfer_manager, "tp_topology", None)
+            kv_topology = getattr(self._kv_transfer_manager, "tp_topology", None)
             effective_mapping = (
-                getattr(topology, "source_tp_size", None),
-                getattr(topology, "target_tp_size", None),
-                getattr(topology, "local_rank", None),
+                getattr(kv_topology, "source_tp_size", None),
+                getattr(kv_topology, "target_tp_size", None),
+                getattr(kv_topology, "local_rank", None),
             )
             if all(isinstance(value, int) for value in effective_mapping):
-                rank_cfg = {
-                    "from_tp": effective_mapping[0],
-                    "to_tp": effective_mapping[1],
-                    "local_rank": effective_mapping[2],
-                }
-        self._from_tp: int = rank_cfg["from_tp"]
-        self._to_tp: int = rank_cfg["to_tp"]
-        self._local_rank: int = rank_cfg["local_rank"]
+                override_topology = KVTPTopology(*effective_mapping)
+                validate_kv_tp_topology(override_topology)
+                self._recv_topology = override_topology
+                self._send_topology = override_topology
+                self._local_rank = effective_mapping[2]
+        self._recv_from_tp = self._recv_topology.source_tp_size
+        self._recv_to_tp = self._recv_topology.target_tp_size
+        self._send_from_tp = self._send_topology.source_tp_size
+        self._send_to_tp = self._send_topology.target_tp_size
         if self._kv_transfer_manager is not None:
             self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
             self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
@@ -209,16 +234,16 @@ class OmniConnectorModelRunnerMixin:
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
 
-        # Start background threads only when there's a connector
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
-        if self._omni_connector is not None:
+        if self._connectors.receive is not None:
             self._recv_thread = threading.Thread(
                 target=self._recv_loop,
                 daemon=True,
                 name="omni-mixin-recv",
             )
             self._recv_thread.start()
+        if self._connectors.send is not None:
             self._save_thread = threading.Thread(
                 target=self._save_loop,
                 daemon=True,
@@ -235,16 +260,16 @@ class OmniConnectorModelRunnerMixin:
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
-        self._stop_event.set()
-        if self._recv_thread is not None:
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        if getattr(self, "_recv_thread", None) is not None:
             self._recv_thread.join(timeout=5)
-        if self._save_thread is not None:
+        if getattr(self, "_save_thread", None) is not None:
             self._save_thread.join(timeout=5)
-        if self._omni_connector is not None:
-            try:
-                self._omni_connector.close()
-            except Exception:
-                pass
+        connectors = getattr(self, "_connectors", None)
+        if connectors is not None:
+            connectors.close()
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -574,14 +599,16 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        sender_info: ConnectorEndpoint | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
+        metadata = sender_info.as_metadata() if sender_info is not None else None
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return connector.get(from_stage, to_stage, connector_get_key)
+            return connector.get(from_stage, to_stage, connector_get_key, metadata=metadata)
         if not self.is_data_transfer_rank():
             return None
-        return connector.get(from_stage, to_stage, connector_get_key)
+        return connector.get(from_stage, to_stage, connector_get_key, metadata=metadata)
 
     def _recv_full_payload_result(
         self,
@@ -589,6 +616,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        sender_info: ConnectorEndpoint | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -596,6 +624,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            sender_info,
         )
 
     def _recv_async_chunk_result(
@@ -604,6 +633,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        sender_info: ConnectorEndpoint | None = None,
     ) -> Any:
         """Receive one ordinary async chunk on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -611,6 +641,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            sender_info,
         )
 
     @staticmethod
@@ -746,6 +777,165 @@ class OmniConnectorModelRunnerMixin:
             return model_config
         return getattr(getattr(self, "vllm_config", None), "model_config", None)
 
+    @staticmethod
+    def _coerce_connector_payload_dict(payload_data: Any) -> dict[str, Any] | None:
+        if isinstance(payload_data, dict):
+            return payload_data
+        to_dict_fn = getattr(payload_data, "to_dict", None)
+        if callable(to_dict_fn):
+            coerced = to_dict_fn()
+            return coerced if isinstance(coerced, dict) else None
+        try:
+            from vllm_omni.data_entry_keys import to_dict
+
+            coerced = to_dict(payload_data)
+            return coerced if isinstance(coerced, dict) else None
+        except Exception:
+            return None
+
+    def _connector_supports_raw_for_edge(self, *, for_recv: bool) -> bool:
+        """Whether this stage's connector can move raw tensors on this edge."""
+        connectors = getattr(self, "_connectors", None)
+        connector = (connectors.receive if for_recv else connectors.send) if connectors is not None else None
+        if connector is None:
+            return False
+        if for_recv:
+            return bool(connector.supports_raw_get())
+        return bool(connector.supports_raw_put())
+
+    def _should_use_qwen3_packet_path(
+        self,
+        *,
+        for_recv: bool = False,
+        transfer_mode: str | None = None,
+    ) -> bool:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+            MODE_NON_ASYNC_FULL_PAYLOAD,
+            should_use_qwen3_packet_path,
+        )
+
+        connectors = getattr(self, "_connectors", None)
+        relevant_connector = (connectors.receive if for_recv else connectors.send) if connectors is not None else None
+        if relevant_connector is None:
+            return False
+        model_config = self._get_model_config()
+        if for_recv:
+            from_stage_id = self._previous_stage_id
+            to_stage_id = self._stage_id
+        else:
+            from_stage_id = self._stage_id
+            to_stage_id = self._next_stage_id
+        if transfer_mode is None:
+            transfer_mode = MODE_ASYNC_CHUNK if self._async_chunk else MODE_NON_ASYNC_FULL_PAYLOAD
+        return should_use_qwen3_packet_path(
+            async_chunk=self._async_chunk,
+            supports_raw_data=self._connector_supports_raw_for_edge(for_recv=for_recv),
+            model_arch=getattr(model_config, "model_arch", None) if model_config is not None else None,
+            from_stage_id=from_stage_id,
+            to_stage_id=to_stage_id,
+            transfer_mode=transfer_mode,
+        )
+
+    def _enqueue_full_payload_packet_send(
+        self,
+        *,
+        req_id: str,
+        external_req_id: str,
+        connector_put_key: str,
+        payload: dict[str, Any],
+        next_stage_id: int,
+        chunk_id: int,
+        packet_mode: str | None = None,
+    ) -> None:
+        """Enqueue an unpacked payload; packing runs on the save thread.
+
+        Keeps ``pack_qwen3_full_payload`` (tensor memcpy into one buffer) off the
+        model / scheduler thread. The save thread expands this into packed-buffer
+        put + sidecar put before the receiver can see the sidecar.
+        """
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+        )
+
+        task = {
+            "packet": True,
+            "stage_id": self._stage_id,
+            "next_stage_id": next_stage_id,
+            "put_key": connector_put_key,
+            "data": payload,
+            "request_id": req_id,
+            "external_req_id": external_req_id,
+            "chunk_id": chunk_id,
+            "packet_mode": packet_mode or MODE_ASYNC_CHUNK,
+        }
+        with self._lock:
+            self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+            self._pending_save_counts[req_id] += 1
+
+    def _expand_packet_send_task(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pack a deferred packet task into put tasks (bg-thread only)."""
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            pack_qwen3_full_payload,
+        )
+
+        payload = task.get("data")
+        if not isinstance(payload, dict):
+            raise TypeError(f"packet send task missing payload dict: {type(payload)!r}")
+
+        packed, sidecar = pack_qwen3_full_payload(
+            payload,
+            request_id=str(task["request_id"]),
+            external_req_id=str(task["external_req_id"]),
+            from_stage_id=int(task["stage_id"]),
+            to_stage_id=int(task["next_stage_id"]),
+            chunk_id=int(task["chunk_id"]),
+            mode=str(task.get("packet_mode") or "async_chunk"),
+        )
+        # Packed buffer first, then sidecar. Once the receiver sees the sidecar,
+        # the packed buffer must already be available to pull.
+        puts: list[dict[str, Any]] = []
+        if packed is not None:
+            puts.append(
+                {
+                    "stage_id": task["stage_id"],
+                    "next_stage_id": task["next_stage_id"],
+                    "put_key": sidecar["packed_key"],
+                    "data": packed,
+                    "request_id": task["request_id"],
+                }
+            )
+        puts.append(
+            {
+                "stage_id": task["stage_id"],
+                "next_stage_id": task["next_stage_id"],
+                "put_key": task["put_key"],
+                "data": sidecar,
+                "request_id": task["request_id"],
+            }
+        )
+        return puts
+
+    def _reconstruct_qwen3_packet_payload(
+        self,
+        connector: OmniConnectorBase,
+        sidecar: dict[str, Any],
+        from_stage: str,
+        to_stage: str,
+    ) -> dict[str, Any]:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            reconstruct_qwen3_full_payload,
+        )
+
+        def get_packed(packed_key: str) -> Any:
+            result = connector.get(from_stage, to_stage, packed_key)
+            if result is None:
+                return None
+            data, _size = result
+            return data
+
+        return reconstruct_qwen3_full_payload(sidecar, get_packed)
+
     def _should_accumulate_full_payload_output(self) -> bool:
         """Gate send-side full-payload output accumulation only.
 
@@ -753,27 +943,6 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if getattr(self, "_omni_connector", None) is None:
-            # No connector at all: send_full_payload_outputs would no-op.
-            # Skip the per-step accumulator+build that would otherwise be
-            # silently discarded.  Defends against a terminal stage whose
-            # custom_process_input_func has a *_full_payload derivative in
-            # the same module (e.g. dynin stage 2 token2image_to_token2audio
-            # in pipelines that don't configure any connector at all).
-            #
-            # Known limitation: a *terminal-consumer* stage that has a
-            # connector configured for receiving upstream input is NOT
-            # caught here -- ``_omni_connector`` is non-None for it, and
-            # ``_load_custom_func`` may still resolve a ``*_full_payload``
-            # derivative from this stage's ``custom_process_input_func``.
-            # In that case the accumulator builds payloads that
-            # ``send_full_payload_outputs`` later drops via its own
-            # connector-side checks (wasted CPU, not a functional bug).
-            # A topology-aware gate (explicit producer field or pipeline
-            # is_terminal info) would close the gap; that change is out
-            # of scope for this PR.
-            self._should_accumulate_full_payload_output_cached = False
-            return False
         cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
         if cached is not None:
             return cached
@@ -966,7 +1135,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._omni_connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -1027,16 +1197,45 @@ class OmniConnectorModelRunnerMixin:
                 connector_put_key,
                 next_stage_id,
             )
-            task = {
-                "stage_id": self._stage_id,
-                "next_stage_id": next_stage_id,
-                "put_key": connector_put_key,
-                "data": payload,
-                "request_id": req_id,
-            }
-            with self._lock:
-                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                self._pending_save_counts[req_id] += 1
+            payload_dict = self._coerce_connector_payload_dict(payload)
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+                payload_has_packet_tensors,
+            )
+
+            use_packet = (
+                payload_dict is not None
+                and payload_has_packet_tensors(payload_dict)
+                and self._should_use_qwen3_packet_path(
+                    transfer_mode="non_async_full_payload",
+                )
+            )
+            if use_packet:
+                self._enqueue_full_payload_packet_send(
+                    req_id=req_id,
+                    external_req_id=external_req_id,
+                    connector_put_key=connector_put_key,
+                    payload=payload_dict,
+                    next_stage_id=next_stage_id,
+                    chunk_id=chunk_id,
+                    packet_mode="non_async_full_payload",
+                )
+                logger.debug(
+                    "[Stage-%s] send_full_payload_outputs: packet_put req=%s key=%s mode=non_async_full_payload",
+                    self._stage_id,
+                    req_id,
+                    connector_put_key,
+                )
+            else:
+                task = {
+                    "stage_id": self._stage_id,
+                    "next_stage_id": next_stage_id,
+                    "put_key": connector_put_key,
+                    "data": payload,
+                    "request_id": req_id,
+                }
+                with self._lock:
+                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                    self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1113,7 +1312,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._omni_connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1147,24 +1347,47 @@ class OmniConnectorModelRunnerMixin:
         next_stage_id = self._next_stage_id
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
-        if chunk_id == 0:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            payload_has_packet_tensors,
+        )
+
+        payload_dict = self._coerce_connector_payload_dict(payload_data)
+        use_packet = (
+            payload_dict is not None
+            and self._should_use_qwen3_packet_path()
+            and payload_has_packet_tensors(payload_dict)
+        )
+        if chunk_id == 0 or use_packet:
             logger.debug(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
+                "[Stage-%s] send_chunk: enqueue req=%s key=%s chunk=%s packet=%s",
                 self._stage_id,
                 request_id,
                 connector_put_key,
+                chunk_id,
+                use_packet,
             )
 
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
+        if use_packet:
+            assert payload_dict is not None
+            self._enqueue_full_payload_packet_send(
+                req_id=request_id,
+                external_req_id=request_id,
+                connector_put_key=connector_put_key,
+                payload=payload_dict,
+                next_stage_id=next_stage_id,
+                chunk_id=chunk_id,
+            )
+        else:
+            task = {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": payload_data,
+                "request_id": request_id,
+            }
+            with self._lock:
+                self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+                self._pending_save_counts[request_id] += 1
         self._work_available.set()
         return True
 
@@ -1288,7 +1511,7 @@ class OmniConnectorModelRunnerMixin:
         For heterogeneous TP receive, the local rank is the target rank and must
         fetch one or more source-rank shards keyed as ``from_rank -> to_rank``.
         """
-        if self._from_tp <= 1 and self._to_tp <= 1:
+        if self._recv_from_tp <= 1 and self._recv_to_tp <= 1:
             resolved_to_stage = self._next_stage_id if to_stage is None else to_stage
             return [f"omni_{from_stage}_to_{resolved_to_stage}_kv_cache_{req_id}"]
 
@@ -1306,15 +1529,7 @@ class OmniConnectorModelRunnerMixin:
 
     def get_kv_target_ranks_for_send(self) -> list[int]:
         """Determine which target ranks this local rank should send KV shards to."""
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
-            return [self._local_rank]
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
-            return [self._local_rank // tp_ratio]
-        tp_ratio = self._to_tp // self._from_tp
-        base_rank = self._local_rank * tp_ratio
-        return [base_rank + i for i in range(tp_ratio)]
+        return get_kv_target_ranks(self._send_topology)
 
     def get_rank_aware_kv_send_keys(
         self,
@@ -1324,7 +1539,7 @@ class OmniConnectorModelRunnerMixin:
         chunk_id: int = 0,
     ) -> list[str]:
         """Build send-side connector keys for this rank's KV shard(s)."""
-        if self._from_tp <= 1 and self._to_tp <= 1:
+        if self._send_from_tp <= 1 and self._send_to_tp <= 1:
             resolved_to_stage = self._next_stage_id if to_stage is None else to_stage
             return [f"omni_{from_stage}_to_{resolved_to_stage}_kv_cache_{req_id}"]
 
@@ -1380,10 +1595,10 @@ class OmniConnectorModelRunnerMixin:
 
     def _slice_rank_sharded_kv_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
         """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases."""
-        if payload is None or self._from_tp >= self._to_tp:
+        if payload is None or self._recv_from_tp >= self._recv_to_tp:
             return payload
 
-        tp_ratio = self._to_tp // self._from_tp
+        tp_ratio = self._recv_to_tp // self._recv_from_tp
         shard_index = self._local_rank % tp_ratio
         layer_blocks = payload.get("layer_blocks") if isinstance(payload, dict) else None
         if not isinstance(layer_blocks, dict):
@@ -1430,8 +1645,8 @@ class OmniConnectorModelRunnerMixin:
         the TP topology without re-parsing model config.
         """
         return {
-            "from_tp": self._from_tp,
-            "to_tp": self._to_tp,
+            "recv": {"from_tp": self._recv_from_tp, "to_tp": self._recv_to_tp},
+            "send": {"from_tp": self._send_from_tp, "to_tp": self._send_to_tp},
             "local_rank": self._local_rank,
             "remote_ranks": self.get_kv_remote_ranks(),
             "is_data_transfer_rank": self.is_data_transfer_rank(),
@@ -1629,7 +1844,9 @@ class OmniConnectorModelRunnerMixin:
 
     @property
     def connector(self) -> Any | None:
-        return self._omni_connector
+        """Backward-compatible single-connector view."""
+        connectors = getattr(self, "_connectors", None)
+        return connectors.connector if connectors is not None else None
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1734,7 +1951,8 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._omni_connector
+        connectors = getattr(self, "_connectors", None)
+        connector = connectors.receive if connectors is not None else None
         if connector is None:
             return False
 
@@ -1751,9 +1969,16 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        target_stage_id = self._stage_id - 1
+        # Test doubles and legacy embedders may install a receive connector
+        # without populating the connector plan. In that case retain the
+        # historical adjacent-stage fallback; a missing receive connector
+        # was handled above as an uninitialized/no-inbound path.
+        target_stage_id = getattr(self, "_previous_stage_id", self._stage_id - 1)
+        if target_stage_id is None:
+            target_stage_id = self._stage_id - 1
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
+        sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         if self._async_chunk:
@@ -1762,6 +1987,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                sender_info,
             )
         else:
             result = self._recv_full_payload_result(
@@ -1769,6 +1995,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                sender_info,
             )
 
         if result is None:
@@ -1777,6 +2004,28 @@ class OmniConnectorModelRunnerMixin:
         payload_data, _size = result
         if not payload_data:
             return False
+
+        if isinstance(payload_data, dict) and self._should_use_qwen3_packet_path(for_recv=True):
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import is_packet_sidecar
+
+            if is_packet_sidecar(payload_data):
+                try:
+                    payload_data = self._reconstruct_qwen3_packet_payload(
+                        connector,
+                        payload_data,
+                        str(target_stage_id),
+                        str(self._stage_id),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[Stage-%s] failed to reconstruct Qwen3 packet payload for req=%s key=%s",
+                        self._stage_id,
+                        req_id,
+                        connector_get_key,
+                        exc_info=True,
+                    )
+                    return False
+
         if isinstance(payload_data, dict):
             logger.debug(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
@@ -1942,40 +2191,50 @@ class OmniConnectorModelRunnerMixin:
     def _send_single_request(self, task: dict) -> bool:
         """Send one queued task via connector.put().
 
+        Packet tasks are packed here (save thread), then issued as
+        packed-buffer put followed by sidecar put.
+
         Returns True on success.  On failure (put() raises or returns
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        connectors = getattr(self, "_connectors", None)
+        connector = connectors.send if connectors is not None else None
         if connector is None:
             return True
 
+        if task.get("packet"):
+            put_tasks = self._expand_packet_send_task(task)
+        else:
+            put_tasks = [task]
+
         request_id = task.get("request_id")
-        payload_data = task.get("data")
-        if payload_data is None and task.get("request") is not None:
-            payload_data = self._build_custom_process_payload(
-                request_id=request_id,
-                request=task.get("request"),
-                pooling_output=task.get("pooling_output"),
+        for put_task in put_tasks:
+            payload_data = put_task.get("data")
+            if payload_data is None and put_task.get("request") is not None:
+                payload_data = self._build_custom_process_payload(
+                    request_id=request_id,
+                    request=put_task.get("request"),
+                    pooling_output=put_task.get("pooling_output"),
+                )
+            put_key = put_task.get("put_key")
+
+            success, _size, _metadata = connector.put(
+                from_stage=str(put_task["stage_id"]),
+                to_stage=str(put_task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
             )
-        put_key = task.get("put_key")
-
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
-        logger.debug(
-            "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
-            task["stage_id"],
-            put_key,
-            success,
-            _size,
-        )
-
-        if not success:
-            return False
+            logger.debug(
+                "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s packet=%s",
+                put_task["stage_id"],
+                put_key,
+                success,
+                _size,
+                bool(task.get("packet")),
+            )
+            if not success:
+                return False
 
         self._decrement_pending_save_count(request_id)
         return True
@@ -2082,34 +2341,22 @@ class OmniConnectorModelRunnerMixin:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _create_connector(model_config: Any) -> OmniConnectorBase | None:
-        """Create a connector from model_config, or None if unconfigured."""
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is None:
-            return None
+    def _resolve_parallel_topologies(
+        plan: StageConnectorPlan,
+        local_rank: int,
+    ) -> tuple[KVTPTopology, KVTPTopology]:
+        def topology(edge: Any | None) -> KVTPTopology:
+            mapping = edge.spec.extra.get("rank_mapping") if edge is not None else None
+            mapping = mapping if isinstance(mapping, dict) else {}
+            result = KVTPTopology(
+                source_tp_size=int(mapping.get("from_tp", 1)),
+                target_tp_size=int(mapping.get("to_tp", 1)),
+                local_rank=local_rank,
+            )
+            validate_kv_tp_topology(result)
+            return result
 
-        if not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", None),
-            }
-
-        name = connector_config.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("Invalid stage connector config: missing connector name")
-        name = name.strip()
-
-        extra = connector_config.get("extra")
-        if extra is None:
-            extra = {}
-        elif not isinstance(extra, dict):
-            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
-
-        spec = ConnectorSpec(name=name, extra=extra)
-        try:
-            return OmniConnectorFactory.create_connector(spec)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create connector {name}") from exc
+        return topology(plan.inbound), topology(plan.outbound)
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
@@ -2206,83 +2453,13 @@ class OmniConnectorModelRunnerMixin:
                 return ext
         return fallback_req_id
 
-    def _resolve_next_stage_id(self, model_config: Any) -> int:
-        """Determine the downstream stage ID from connector config.
-
-        Falls back to ``stage_id + 1`` when the config does not specify
-        a ``to_stage`` explicitly.
-        """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None:
-            if isinstance(connector_config, dict):
-                to_stage = connector_config.get("to_stage")
-            else:
-                to_stage = getattr(connector_config, "to_stage", None)
-            if isinstance(to_stage, int):
-                return to_stage
-            if isinstance(to_stage, str) and to_stage.strip():
-                return int(to_stage)
-        return self._stage_id + 1
-
-    @staticmethod
-    def _parse_rank_mapping(model_config: Any) -> dict[str, int]:
-        """Parse rank_mapping from connector config (optional).
-
-        Returns ``{"from_tp": int, "to_tp": int, "local_rank": int}``.
-        When ``rank_mapping`` is absent, assumes 1:1 homogeneous mapping.
-        """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None and not isinstance(connector_config, dict):
-            connector_config = getattr(connector_config, "__dict__", {})
-
-        rank_mapping: dict = {}
-        if isinstance(connector_config, dict):
-            rank_mapping = connector_config.get("rank_mapping", {})
-
-        from_tp = int(rank_mapping.get("from_tp", 1))
-        to_tp = int(rank_mapping.get("to_tp", 1))
-
-        local_rank = 0
-        try:
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        except (ValueError, TypeError):
-            pass
-
-        return {"from_tp": from_tp, "to_tp": to_tp, "local_rank": local_rank}
-
     # ------------------------------------------------------------------ #
     #  Heterogeneous TP rank support
     # ------------------------------------------------------------------ #
 
-    def _validate_kv_tp_topology(self) -> None:
-        """Reject heterogeneous TP mappings that cannot be routed losslessly."""
-        if self._from_tp <= 0 or self._to_tp <= 0:
-            raise ValueError(f"Invalid KV TP mapping: from_tp={self._from_tp}, to_tp={self._to_tp}")
-        larger = max(self._from_tp, self._to_tp)
-        smaller = min(self._from_tp, self._to_tp)
-        if larger % smaller != 0:
-            raise ValueError(
-                f"KV TP mapping must be divisible for rank-aware routing: from_tp={self._from_tp}, to_tp={self._to_tp}"
-            )
-
     def get_kv_remote_ranks(self) -> list[int]:
-        """Determine which remote ranks this local rank exchanges KV with.
-
-        Follows vLLM's ``TpKVTopology.get_target_remote_ranks()`` pattern:
-        - ``from_tp > to_tp``: each to-rank reads from multiple from-ranks
-        - ``from_tp < to_tp``: multiple to-ranks read from the same from-rank
-        - ``from_tp == to_tp``: 1:1 mapping
-        """
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
-            return [self._local_rank]
-
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
-            return [self._local_rank * tp_ratio + i for i in range(tp_ratio)]
-        else:
-            tp_ratio = self._to_tp // self._from_tp
-            return [self._local_rank // tp_ratio]
+        """Return the source ranks used by this stage's inbound KV edge."""
+        return get_kv_source_ranks(self._recv_topology)
 
     def is_data_transfer_rank(self) -> bool:
         """Whether this rank should participate in data (non-KV) transfer.

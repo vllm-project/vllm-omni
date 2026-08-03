@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationPayload, ConnectorEndpoint
 
 
 @dataclass
@@ -80,16 +80,12 @@ class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
-    The runner's ``register_chunk_recv`` only consumes ``request_id`` and
-    ``external_req_id`` from each pending request, so we ship just those
-    two fields instead of the full Request object.  Concrete typing
-    keeps msgspec serialization deterministic across IPC (default,
-    PD-disagg, multi-node executor variants) and avoids the
-    ``list[Any]`` fallback path.
+    Carries only the fields needed to register an inbound transfer.
     """
 
     request_id: str
     external_req_id: str | None = None
+    sender_info: ConnectorEndpoint | None = None
 
 
 @dataclass

@@ -16,11 +16,11 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory, StageConnectorSet
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -128,12 +128,13 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 
         monkeypatch.setattr(OmniTransferAdapterBase, "__init__", _fake_base_init)
         monkeypatch.setattr(
-            OmniChunkTransferAdapter,
-            "create_connector",
-            classmethod(lambda cls, _model_config: connector),
+            OmniConnectorFactory,
+            "create_stage_connectors",
+            lambda *_args, **_kwargs: StageConnectorSet(receive=connector, send=connector),
         )
 
         model_config = SimpleNamespace(
+            stage_id=stage_id,
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
@@ -149,35 +150,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         return adapter, connector
 
     return _build
-
-
-@pytest.mark.parametrize(
-    ("raw_cfg", "expected_name", "expected_extra"),
-    [
-        (None, "SharedMemoryConnector", {}),
-        (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),
-    ],
-)
-def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, expected_extra):
-    captured = {}
-
-    def _fake_create(spec):
-        captured["spec"] = spec
-        return "ok"
-
-    monkeypatch.setattr(
-        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
-        ".OmniConnectorFactory.create_connector",
-        _fake_create,
-    )
-
-    model_config = SimpleNamespace(stage_connector_config=raw_cfg) if raw_cfg is not None else SimpleNamespace()
-    connector = OmniChunkTransferAdapter.create_connector(model_config)
-
-    assert connector == "ok"
-    assert isinstance(captured["spec"], ConnectorSpec)
-    assert captured["spec"].name == expected_name
-    assert captured["spec"].extra == expected_extra
 
 
 def test_load_poll(build_adapter):

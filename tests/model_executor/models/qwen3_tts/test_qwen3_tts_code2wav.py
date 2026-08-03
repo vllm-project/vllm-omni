@@ -91,7 +91,7 @@ def _fake_dec_config():
 
 def _make_model(
     *,
-    stage_connector_config=None,
+    stage_input_connector_config=None,
     async_chunk: bool = False,
     device: torch.device | None = None,
 ) -> Qwen3TTSCode2Wav:
@@ -116,7 +116,7 @@ def _make_model(
                 model_config=SimpleNamespace(
                     model="unused",
                     revision=None,
-                    stage_connector_config=stage_connector_config,
+                    stage_input_connector_config=stage_input_connector_config,
                     async_chunk=async_chunk,
                 ),
                 device_config=SimpleNamespace(device=device or torch.device("cpu")),
@@ -316,7 +316,7 @@ def test_ref_context_cache_evicts_to_byte_cap():
 def test_connector_codec_chunking_does_not_override_decode_chunking():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "codec_chunk_frames": 25,
                 "codec_left_context_frames": 72,
@@ -345,7 +345,7 @@ def test_connector_codec_chunking_does_not_override_decode_chunking():
 def test_decode_chunking_can_be_overridden_separately():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "codec_chunk_frames": 25,
                 "codec_left_context_frames": 72,
@@ -550,7 +550,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "codec_chunk_frames": 25,
                 "codec_left_context_frames": 72,
@@ -579,7 +579,7 @@ def test_cudagraph_capture_shapes_can_be_configured():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "decode_cudagraph_capture_sizes": "97,325",
                 "decode_cudagraph_batch_sizes": [1, 2, 4, 8],
@@ -600,7 +600,7 @@ def test_decode_compile_shapes_can_be_configured():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "decode_compile_shapes": ["1:325", [1, 73]],
             }
@@ -624,7 +624,7 @@ def test_decode_tf32_can_be_configured():
         model = _make_model(
             async_chunk=True,
             device=torch.device("cuda"),
-            stage_connector_config={
+            stage_input_connector_config={
                 "extra": {
                     "decode_enable_tf32": "true",
                 }
@@ -645,7 +645,7 @@ def test_decode_tf32_can_be_configured():
 def test_decode_batch_bucket_frames_can_be_configured():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "decode_batch_bucket_frames": "73,169",
                 "decode_batch_max_size": 10,
@@ -664,7 +664,7 @@ def test_decode_batch_bucket_frames_can_be_configured():
 def test_invalid_decode_batch_max_size_is_rejected():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "decode_batch_max_size": -1,
             }
@@ -678,7 +678,7 @@ def test_invalid_decode_batch_max_size_is_rejected():
 def test_invalid_decode_chunking_is_rejected():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
+        stage_input_connector_config={
             "extra": {
                 "decode_chunk_frames": 0,
             }

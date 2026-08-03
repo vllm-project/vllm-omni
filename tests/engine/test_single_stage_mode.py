@@ -14,6 +14,7 @@ from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -77,7 +78,7 @@ def _make_llm_plan(
                 launch_mode=launch_mode,
                 stage_cfg=stage_cfg,
                 metadata=metadata,
-                stage_connector_spec={},
+                stage_connector_plan=StageConnectorPlan(),
                 omni_kv_connector=(None, None, None),
                 stage_vllm_config=vllm_config
                 or SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)),
@@ -118,7 +119,7 @@ def _make_diffusion_plan(
                 launch_mode=launch_mode,
                 stage_cfg=stage_cfg,
                 metadata=metadata,
-                stage_connector_spec={},
+                stage_connector_plan=StageConnectorPlan(),
                 omni_kv_connector=(None, None, None),
             )
         ],
@@ -596,7 +597,7 @@ class TestSingleStageInitialization:
                 runtime_cfg={},
             ),
         )
-        monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+        monkeypatch.setattr(runtime_mod, "get_stage_connector_plan", lambda **_: StageConnectorPlan())
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
         monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
@@ -696,7 +697,7 @@ class TestSingleStageInitialization:
                 runtime_cfg={"devices": "0"},
             ),
         )
-        monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+        monkeypatch.setattr(runtime_mod, "get_stage_connector_plan", lambda **_: StageConnectorPlan())
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
         monkeypatch.setattr(
@@ -762,7 +763,7 @@ class TestSingleStageInitialization:
                 replica_id=0,
             ),
         )
-        monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+        monkeypatch.setattr(runtime_mod, "get_stage_connector_plan", lambda **_: StageConnectorPlan())
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [2], {0: ["0", "1"]})

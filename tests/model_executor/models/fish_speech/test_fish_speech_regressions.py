@@ -214,7 +214,7 @@ def test_dac_decoder_dtype_can_be_configured():
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             model="unused",
-            stage_connector_config={"extra": {"fish_speech_dac_dtype": "fp16"}},
+            stage_input_connector_config={"extra": {"fish_speech_dac_dtype": "fp16"}},
         )
     )
 

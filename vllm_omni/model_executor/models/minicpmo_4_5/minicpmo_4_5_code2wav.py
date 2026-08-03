@@ -164,7 +164,7 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
+        connector = getattr(model_config, "stage_input_connector_config", None)
         if isinstance(connector, Mapping):
             extra = connector.get("extra", connector)
         else:

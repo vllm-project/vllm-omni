@@ -17,6 +17,14 @@ class OmniConnectorBase(ABC):
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
 
+    def supports_raw_put(self) -> bool:
+        """Whether ``put`` can accept raw tensor/bytes without serialization."""
+        return bool(self.supports_raw_data)
+
+    def supports_raw_get(self) -> bool:
+        """Whether ``get`` can return raw tensor/bytes without serialization."""
+        return bool(self.supports_raw_data)
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.

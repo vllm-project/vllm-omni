@@ -88,11 +88,12 @@ def test_default_all_values_are_initialized():
 
     # Test a primitive
     assert cfg.model_stage == "thinker"
-    # Test a field initialized with a default factory
+    assert cfg.stage_connector_plan is None
     assert cfg.stage_connector_config == {
         "name": "SharedMemoryConnector",
         "extra": {},
     }
+    assert cfg.stage_output_connector_config == cfg.stage_connector_config
 
     # Ensure that hf_config is initialized on model_config in the vLLM by ModelConfig's
     # __post_init__, and that the hf_config is copied over to the OmniModelConfig;

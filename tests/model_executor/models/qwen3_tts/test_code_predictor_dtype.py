@@ -562,7 +562,7 @@ class TestCodePredictorWrapperConfig:
 
         cp_config, _ = _make_tiny_config(loaded_target_classes)
         vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
-        vllm_config.model_config.stage_connector_config = {
+        vllm_config.model_config.stage_input_connector_config = {
             "extra": {
                 "code_predictor_prefix_graphs": True,
                 "code_predictor_prefix_graph_buckets": [2],

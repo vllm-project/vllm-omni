@@ -137,6 +137,30 @@ def test_get_invalid_metadata(shm_connector):
     assert result is None
 
 
+def test_mori_resolves_partial_metadata_at_request_sender(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mori_transfer_engine_connector as mori_module
+
+    connector = object.__new__(mori_module.MoriTransferEngineConnector)
+    connector.sender_host = "default-host"
+    connector.sender_zmq_port = 50051
+    resolved = {
+        "source_host": "replica-host",
+        "source_port": 51075,
+        "data_size": 16,
+        "is_fast_path": False,
+    }
+    connector._query_metadata_at = mocker.Mock(return_value=resolved)
+
+    assert (
+        connector._resolve_metadata(
+            "request-key",
+            {"source_host": "replica-host", "source_port": 51075},
+        )
+        == resolved
+    )
+    connector._query_metadata_at.assert_called_once_with("request-key", "replica-host", 51075)
+
+
 def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: pytest.MonkeyPatch):
     import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
 
@@ -185,6 +209,7 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         {
             "zmq_port": 50051,
             "memory_pool_size": 4096,
+            "role": "sender",
         }
     )
     try:

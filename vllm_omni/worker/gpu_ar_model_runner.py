@@ -1037,7 +1037,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             request_id_resolver=self._resolve_global_request_id,
         )
 
-        if hasattr(self, "_omni_connector"):
+        if getattr(self, "_omni_connector_initialized", False):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)

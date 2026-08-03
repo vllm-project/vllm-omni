@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..factory import OmniConnectorFactory
-from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
+from .config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+    ConnectorSpec,
+    OmniTransferConfig,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from .env import expand_env_int
 from .local_rank import get_connector_local_rank
 from .logging import get_connector_logger
@@ -143,46 +149,139 @@ def create_connectors_from_config(
     return connectors
 
 
-def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
-    """
-    Extract connector configurations relevant for a specific stage worker.
+def _stage_id(value: str | int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Stage id must be an integer, got {value!r}") from exc
 
-    Returns a dict compatible with worker initialization:
-    {
-        "from_stage_X": {
-            "spec": {
-                "name": "ConnectorName",
-                "extra": {...}
-            }
-        },
-        ...
-    }
+
+def _stage_edge_spec(
+    from_stage: str,
+    to_stage: str,
+    spec: ConnectorSpec,
+    *,
+    inbound: bool,
+) -> StageConnectorSpec:
+    """Copy one edge config and resolve its stage-level transfer-engine ports."""
+    source = _stage_id(from_stage)
+    target = _stage_id(to_stage)
+    extra = dict(spec.extra or {})
+    if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+        from .kv_utils import kv_zmq_port
+
+        base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
+        if inbound:
+            extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+            extra["sender_zmq_port"] = expand_env_int(
+                extra.get("sender_zmq_port", kv_zmq_port(base_port, source)),
+                "sender_zmq_port",
+            )
+        else:
+            # Keep the configured value as the base port. The factory adds
+            # the local rank/replica portion when materializing this worker.
+            extra["zmq_port"] = base_port
+    return StageConnectorSpec(
+        from_stage=source,
+        to_stage=target,
+        spec=ConnectorSpec(name=spec.name, extra=extra),
+    )
+
+
+def default_stage_connector_plan(stage_id: str | int) -> StageConnectorPlan:
+    """Preserve the no-config SHM behavior as an explicit two-way plan."""
+    stage = _stage_id(stage_id)
+    return StageConnectorPlan(
+        inbound=StageConnectorSpec(stage - 1, stage, ConnectorSpec("SharedMemoryConnector")),
+        outbound=StageConnectorSpec(stage, stage + 1, ConnectorSpec("SharedMemoryConnector")),
+    )
+
+
+def connector_plan_from_model_config(model_config: Any) -> StageConnectorPlan:
+    """Read the typed plan, with one compatibility path for legacy configs."""
+    plan = getattr(model_config, "stage_connector_plan", None)
+    if isinstance(plan, StageConnectorPlan):
+        return plan
+
+    stage = _stage_id(getattr(model_config, "stage_id", 0))
+    missing = object()
+    raw = getattr(model_config, "stage_connector_config", missing)
+    if raw is missing:
+        return default_stage_connector_plan(stage)
+    if raw is None:
+        return StageConnectorPlan()
+
+    if not isinstance(raw, dict):
+        raise TypeError(f"Invalid stage_connector_config: expected dict, got {type(raw).__name__}")
+    name = raw.get("name")
+    extra = raw.get("extra") or {}
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Invalid stage_connector_config: missing connector name")
+    if not isinstance(extra, dict):
+        raise TypeError(f"Invalid connector extra: expected dict, got {type(extra).__name__}")
+
+    role = extra.get("role")
+    connector = ConnectorSpec(name, dict(extra))
+    inbound = None
+    outbound = None
+    if role != "sender":
+        inbound = StageConnectorSpec(stage - 1, stage, connector)
+    if role != "receiver":
+        outbound = StageConnectorSpec(stage, stage + 1, connector)
+    return StageConnectorPlan(inbound=inbound, outbound=outbound)
+
+
+def resolve_stage_connector_plan(
+    transfer_config: OmniTransferConfig | None,
+    stage_id: str | int,
+) -> StageConnectorPlan:
+    """Resolve at most one inbound and one outbound edge for a stage."""
+    if transfer_config is None:
+        return default_stage_connector_plan(stage_id)
+
+    stage = _stage_id(stage_id)
+    inbound = None
+    outbound = None
+    for (from_stage, to_stage), spec in transfer_config.connectors.items():
+        if _stage_id(to_stage) == stage:
+            if inbound is not None:
+                raise ValueError(f"Fan-in is not supported for stage {stage}")
+            inbound = _stage_edge_spec(from_stage, to_stage, spec, inbound=True)
+        if _stage_id(from_stage) == stage:
+            if outbound is not None:
+                raise ValueError(f"Fan-out is not supported for stage {stage}")
+            outbound = _stage_edge_spec(from_stage, to_stage, spec, inbound=False)
+    return StageConnectorPlan(inbound=inbound, outbound=outbound)
+
+
+def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
+    """Return the legacy dict view of a resolved stage connector plan.
+
+    Emits both directions when present (``from_stage_*`` for the inbound edge,
+    ``to_stage_*`` for the outbound edge), unlike the pre-dual-connector
+    version of this function, which only ever returned the inbound edge.
     """
-    if not transfer_config:
+    if transfer_config is None:
         return {}
 
-    stage_connectors_config = {}
-    target_stage = str(stage_id)
-
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
-    for (from_stage, to_stage), spec in transfer_config.connectors.items():
-        if to_stage == target_stage:
-            # Incoming edge → this stage is the receiver
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "receiver")
-            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-        elif from_stage == target_stage and target_stage == "0":
-            # Outgoing edge for stage 0 — included for async_chunk spec
-            # extraction (omni_stage.py), NOT for connector instantiation.
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "sender")
-            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-
-    return stage_connectors_config
+    plan = resolve_stage_connector_plan(transfer_config, stage_id)
+    result: dict[str, Any] = {}
+    for edge, role, key in (
+        (plan.inbound, "receiver", "from_stage"),
+        (plan.outbound, "sender", "to_stage"),
+    ):
+        if edge is None:
+            continue
+        extra = dict(edge.spec.extra)
+        extra["role"] = role
+        peer = edge.from_stage if role == "receiver" else edge.to_stage
+        result[f"{key}_{peer}"] = {
+            "spec": {
+                "name": edge.spec.name,
+                "extra": extra,
+            }
+        }
+    return result
 
 
 def load_omni_transfer_config(

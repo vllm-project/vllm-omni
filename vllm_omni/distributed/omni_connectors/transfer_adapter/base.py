@@ -19,8 +19,6 @@ class OmniTransferAdapterBase:
 
     def __init__(self, config: Any):
         self.config = config
-        if not hasattr(self, "connector"):
-            self.connector = None
         # Requests that are waiting to be polled
         self._pending_load_reqs = deque()
         # Requests that have successfully retrieved data
@@ -36,15 +34,15 @@ class OmniTransferAdapterBase:
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
 
-        self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
-        self.recv_thread.start()
+        self.recv_thread: threading.Thread | None = None
+        if self._connectors.receive is not None:
+            self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
+            self.recv_thread.start()
 
-        self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
-        self.save_thread.start()
-
-    @classmethod
-    def create_connector(cls, model_config: Any):
-        raise NotImplementedError
+        self.save_thread: threading.Thread | None = None
+        if self._connectors.send is not None:
+            self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
+            self.save_thread.start()
 
     def recv_loop(self):
         """Loop to poll for incoming data.
@@ -133,8 +131,8 @@ class OmniTransferAdapterBase:
             self._recv_cond.notify_all()
         with self._save_cond:
             self._save_cond.notify_all()
-        if self.connector is not None:
-            try:
-                self.connector.close()
-            except Exception:
-                pass
+        if self.recv_thread is not None:
+            self.recv_thread.join(timeout=5)
+        if self.save_thread is not None:
+            self.save_thread.join(timeout=5)
+        self._connectors.close()

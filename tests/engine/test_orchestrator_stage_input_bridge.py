@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
@@ -105,11 +106,16 @@ class FakeInputProcessor:
 class FakePrewarmPool:
     stage_type = "llm"
 
-    def __init__(self, role: str) -> None:
+    def __init__(self, role: str, stage_id: int) -> None:
+        self.stage_client = self
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=64,
-                stage_connector_config={"extra": {"role": role}},
+                stage_id=stage_id,
+                stage_connector_config={
+                    "name": "SharedMemoryConnector",
+                    "extra": {"role": role},
+                },
             )
         )
         self.submitted: list[Any] = []
@@ -120,6 +126,12 @@ class FakePrewarmPool:
 
     def get_bound_replica_id(self, _request_id):
         return 0
+
+    def get_bound_client(self, _request_id):
+        return self
+
+    def get_payload_sender_info(self):
+        return None
 
 
 def _duplex_stage_port_submission():
@@ -182,6 +194,23 @@ def _request_output(request_id: str) -> RequestOutput:
     )
 
 
+def test_payload_sender_info_comes_from_the_bound_producer_replica() -> None:
+    expected = ConnectorEndpoint(host="10.0.0.9", zmq_port=52000)
+    bound_client = SimpleNamespace(get_payload_sender_info=lambda: expected)
+    fallback_client = SimpleNamespace(
+        get_payload_sender_info=lambda: ConnectorEndpoint(host="10.0.0.1", zmq_port=51000)
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_client=fallback_client,
+            get_bound_client=lambda request_id: bound_client if request_id == "req-1" else None,
+        )
+    ]
+
+    assert orchestrator._build_payload_sender_info(0, "req-1") is expected
+
+
 @pytest.mark.asyncio
 async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     class SourceTokenizer:
@@ -242,9 +271,9 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 @pytest.mark.asyncio
 async def test_async_prewarm_skips_outgoing_only_stage() -> None:
     orchestrator = object.__new__(Orchestrator)
-    stage0 = FakePrewarmPool("sender")
-    stage1 = FakePrewarmPool("sender")
-    stage2 = FakePrewarmPool("receiver")
+    stage0 = FakePrewarmPool("sender", 0)
+    stage1 = FakePrewarmPool("sender", 1)
+    stage2 = FakePrewarmPool("receiver", 2)
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._record_duplex_stage_submission = MagicMock()
@@ -295,7 +324,7 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
         has_companions=lambda _request_id: False,
     )
     stage0 = SimpleNamespace(final_output=False)
-    stage1 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("sender", 1)
     orchestrator.stage_pools = [stage0, stage1]
     orchestrator._forward_to_next_stage = AsyncMock()
     req_state = OrchestratorRequestState(

@@ -1,0 +1,186 @@
+# Qwen3-Omni-MoE hybrid cross-node deploy: Mooncake for thinker→talker (0→1),
+# SharedMemory for colocated talker→code2wav (1→2 on the worker node).
+# Topology, sampling params, GPU layout, and async_chunk gating match
+# ``qwen3_omni_moe.yaml``.
+#
+# Layout: 2 nodes (stage 0 on node 0, stages 1+2 on node 1).
+# Mooncake also supports cross-node stage placement when RDMA (or TCP fallback)
+# is available between hosts.
+#
+# Dependencies: mooncake-transfer-engine-cuda13 for CUDA 13+ base images
+# (``pip install mooncake-transfer-engine-cuda13``; do not use mooncake-transfer-engine),
+# RDMA drivers for ``protocol: rdma`` (set ``protocol: tcp`` for bring-up without
+# RDMA hardware).  Optional: ``RDMA_DEVICE_NAME`` env var to pin the NIC.
+#
+# Usage:
+# Start node 0 first.
+#
+# Node 0 (thinker + orchestrator) run command
+# vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+#   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
+#   --port 8091 \
+#   --stage-id 0 \
+#   --omni-master-address NODE0_ADDR \
+#   --omni-master-port 26000
+#
+# Node 1 (talker) run command
+# vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+#   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
+#   --stage-id 1 \
+#   --headless \
+#   --omni-master-address NODE0_ADDR \
+#   --omni-master-port 26000 \
+#   --omni-replica-address NODE1_ADDR
+#
+# Node 1 (code2wav) run command
+# vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+#   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
+#   --stage-id 2 \
+#   --headless \
+#   --omni-master-address NODE0_ADDR \
+#   --omni-master-port 26000 \
+#   --omni-replica-address NODE1_ADDR
+
+# Async chunk mode is not currently supported for this cross-node Mooncake path.
+async_chunk: false
+
+# zmq_port is a *base* port.  At runtime each stage that puts listens on
+# base+stage_id (stage0→50051, stage1→50052).  Receivers query
+# sender_host:base+upstream_stage_id unless sender_zmq_port is set explicitly.
+connectors:
+  thinker2talker_mooncake:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      # Stage 1 (receiver) queries thinker on node 0.
+      # "auto" works in single-node mode.
+      # For cross-node setups, set this to point to your stage 0 node.
+      sender_host: "auto"
+      protocol: "rdma"
+      device_name: "mlx5_0"
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"
+
+  talker2code2wav_mooncake:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      # Stage 2 (receiver) queries talker on node 1 (colocated with stage 2).
+      # "auto" works in single-node mode.
+      # For cross-node setups, set this to point to your stage 1 node.
+      sender_host: "auto"
+      protocol: "rdma"
+      device_name: "mlx5_0"
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"
+
+  # Hybrid Mooncake + SHM setup is often more suitable for production, if stages
+  # 1 and 2 are on the same node. Select talker2code2wav_shm in the stage config
+  # to enable.
+  talker2code2wav_shm:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.9
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: thinker2talker_mooncake
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "1"
+    input_connectors:
+      from_stage_0: thinker2talker_mooncake
+    output_connectors:
+      to_stage_2: talker2code2wav_shm
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.1
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "1"
+    input_connectors:
+      from_stage_1: talker2code2wav_shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.6
+        tensor_parallel_size: 2
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE   # Qwen3-Omni not FULL-cudagraph-safe on NPU
+        devices: "0,1"
+      - stage_id: 1
+        gpu_memory_utilization: 0.6
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE   # code_predictor MaskedSelect / inner NPU graph replay
+        devices: "2"
+      - stage_id: 2
+        gpu_memory_utilization: 0.3
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+        devices: "2"
+
+  # Code2Wav decode uses UpSample1d, which calls F.conv_transpose1d.
+  # On ROCm this routes through MIOpen and is not capture-safe during
+  # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
+  # graph-capture failures.
+  rocm:
+    stages:
+      - stage_id: 2
+        enforce_eager: true
+
+  xpu:
+    stages:
+      - stage_id: 0
+        tensor_parallel_size: 4
+        enforce_eager: true
+        max_cudagraph_capture_size: 0
+        devices: "0,1,2,3"
+      - stage_id: 1
+        enforce_eager: true
+        max_cudagraph_capture_size: 0
+        devices: "4"
+      - stage_id: 2
+        gpu_memory_utilization: 0.3
+        max_cudagraph_capture_size: 0
+        devices: "4"

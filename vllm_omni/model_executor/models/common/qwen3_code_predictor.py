@@ -611,7 +611,9 @@ class CodePredictorWrapper(nn.Module):
     @staticmethod
     def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
         model_cfg = getattr(vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        connector_cfg = getattr(model_cfg, "stage_input_connector_config", None)
+        if connector_cfg is None:
+            connector_cfg = getattr(model_cfg, "stage_output_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra_cfg = connector_cfg.get("extra", connector_cfg)
         else:
