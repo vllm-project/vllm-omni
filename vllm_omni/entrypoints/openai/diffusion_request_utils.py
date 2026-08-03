@@ -56,7 +56,7 @@ def _warn_for_close_unknown_fields(
     allowed_fields: Collection[str],
 ) -> None:
     allowed = set(allowed_fields) | _EXTRA_ARG_CONTAINER_FIELDS
-    choices = sorted(allowed_fields)
+    choices = sorted(allowed)
     for key in sorted(args):
         if key in allowed:
             continue

@@ -166,6 +166,22 @@ def test_unknown_extra_args_keys_still_pass_through(serving_chat, caplog):
     assert not any("cfg_text_sclae" in record.message for record in caplog.records)
 
 
+def test_misspelled_extra_args_container_warns(serving_chat, caplog):
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        extra_args={"solver": "euler"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+
+    assert normalized_extra_args == {}
+    assert diffusion_request_args == {}
+    assert any("extra_args" in record.message and "extra_args" in record.message for record in caplog.records)
+
+
 def test_unregistered_cfg_scale_aliases_common_true_cfg_scale(serving_chat):
     serving_chat._diffusion_extra_body_params = frozenset()
     request = ChatCompletionRequest(
