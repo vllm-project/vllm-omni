@@ -512,10 +512,8 @@ The stable API server inspects the deployment `session_mode` before importing or
 constructing the experimental duplex handler. Ordinary deployments do not load
 the full-duplex serving package or create its registries and background state.
 For an enabled deployment, the client still selects the Realtime duplex route
-with `?duplex=1` (or an equivalent explicit true value). Model-name matching is
-not used for routing or native-runtime activation. MiniCPM clients explicitly
-set `extra_body.minicpmo45_native_duplex=true`; repository demos do so in their
-session payloads.
+with `?duplex=1` (or an equivalent explicit true value). The native duplex
+runtime is activated automatically based on the model's pipeline configuration.
 
 `DuplexRequestClient` derives the data-plane request identity from the accepted
 fence and preregisters a resumable `ClientRequestState` before the append crosses

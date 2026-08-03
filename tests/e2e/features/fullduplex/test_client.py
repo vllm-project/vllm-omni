@@ -27,7 +27,6 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "minicpmo45_native_duplex": ["1"],
         "session_id": ["session-a"],
     }
 
@@ -41,7 +40,6 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
 
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
-    assert query["minicpmo45_native_duplex"] == ["1"]
 
 
 @pytest.mark.asyncio

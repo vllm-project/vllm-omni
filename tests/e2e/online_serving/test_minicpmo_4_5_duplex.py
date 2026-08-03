@@ -67,7 +67,7 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
                         "model": model,
                         "modalities": ["audio", "text"],
                         "ref_audio": _ref_audio_data_url(str(ref_audio)),
-                        "extra_body": {"minicpmo45_native_duplex": True},
+                        "extra_body": {},
                     },
                 }
             )
