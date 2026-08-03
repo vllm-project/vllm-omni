@@ -334,7 +334,17 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     hidden = output[0]
                 else:
                     hidden = output
-                self._layer_rms.append((idx, float(hidden.float().pow(2).mean().sqrt())))
+                hidden_f = hidden.float()
+                # Diagnostic for the zero-RMS anomaly: dump shape + max-abs
+                # alongside the RMS itself so a degenerate (e.g. warmup/dummy,
+                # or wrongly-indexed) capture is visible instead of silently
+                # producing a 0.0 that reads as a real (implausible) value.
+                logger.info(
+                    "[longcat-layers] layer=%d shape=%s max_abs=%.6f rms=%.6f",
+                    idx, tuple(hidden_f.shape), float(hidden_f.abs().max()),
+                    float(hidden_f.pow(2).mean().sqrt()),
+                )
+                self._layer_rms.append((idx, float(hidden_f.pow(2).mean().sqrt())))
 
             return _h
 
@@ -1832,6 +1842,15 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if self._layer_rms is not None:
                 curve = self._layer_rms
                 self._layer_rms = None
+                # Fix: this used to only null out _layer_rms without ever
+                # setting _layer_rms_audited, so the hooks' guard
+                # (`if self._layer_rms_audited or not self._audio_debug`)
+                # never short-circuited -- the very next layer-forward call
+                # hit `self._layer_rms.append(...)` on a None and crashed
+                # every TP worker with AttributeError: 'NoneType' object has
+                # no attribute 'append'. Must be set here, alongside nulling
+                # the list, so the hooks actually stop after the one read.
+                self._layer_rms_audited = True
                 logger.info(
                     "[longcat-layers] per-slot RMS curve for first decode step: %s",
                     [round(v, 4) for _, v in curve],
