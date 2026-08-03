@@ -88,6 +88,12 @@ MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 
 
+def _resolve_component_quant_config(quant_config, component: str):
+    if hasattr(quant_config, "resolve"):
+        return quant_config.resolve(component)
+    return quant_config
+
+
 def _minimax_h3_post_process(output, output_type: str = "np"):
     """Convert the joint video/audio output without capturing worker state.
 
@@ -293,9 +299,13 @@ class MiniMaxH3Pipeline(
                 fall_back_to_pt=False,
             )
         ]
+        transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformer",
+        )
         self.transformer = MiniMaxH3DiTModel(
             od_config,
-            quant_config=od_config.quantization_config,
+            quant_config=transformer_quant_config,
         )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
