@@ -49,6 +49,20 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
+Install the **mindie-sd** operator library to enable Ascend-optimized fused
+operators (`adalayernorm`, etc.):
+
+```bash
+git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD
+
+# Comment out the tik_ops build step (not needed for this use case)
+sed -i 's|^\(\s*\)source ${current_script_dir}/build_tik_ops.sh|\1# source ${current_script_dir}/build_tik_ops.sh|' build/build_ops.sh
+
+python setup.py bdist_wheel
+cd dist
+pip install mindiesd-*.whl
+```
+
 - `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
   reference-video preparation and MP4 output.
 - Reference-video decoding uses `decord` when available and falls back to
@@ -121,10 +135,10 @@ Measured on an Atlas 800I A3 server (8x NPU) with CANN 9.0.1,
 PyTorch 2.10.0+cpu, and torch_npu 2.10.0.post2, using the multi-NPU
 configuration above:
 
-| Workload | Configuration | Observed result |
-|----------|---------------|-----------------|
-| T2VA, 209 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile | 480 s end-to-end request latency |
-| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile | 980 s end-to-end request latency |
+| Workload | Configuration |
+|----------|---------------|
+| T2VA, 209 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
+| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
 
 These measurements describe the validated shapes rather than a general
 throughput guarantee.
