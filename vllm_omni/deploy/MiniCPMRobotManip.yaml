@@ -1,0 +1,42 @@
+# MiniCPM-RobotManip deploy: single diffusion stage.
+#
+# Topology is declared in
+# vllm_omni/model_executor/models/minicpm_robot/pipeline.py.
+# This default uses one GPU with TP=1 and supports only a single
+# concurrent request (max_num_seqs: 1).
+#
+# Usage:
+#   vllm serve openbmb/MiniCPM-RobotManip --omni \
+#     --stage-configs-path vllm_omni/deploy/MiniCPMRobotManip.yaml \
+#     --trust-remote-code
+#
+# The pipeline loads the complete HF VLA model via AutoModel.from_pretrained
+# (embodiment_id=0, bfloat16).  Inference is stateless; each step expects
+# robot_obs (images, state, language) in sampling_params.extra_args.
+#
+# Optional model_config overrides:
+#   embodiment_id:   embodiment slot (default 0; 0-31)
+#   processor_path:  alternate path for AutoProcessor
+#                    (default: same as model directory)
+#   prompt_template: override the LIBERO Franka default,
+#                    e.g. for RoboTwin2 ALOHA-AgileX
+
+pipeline: MiniCPMRobotManip
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: MiniCPMRobotManipPipeline
+    model_config:
+      embodiment_id: 0
+      # OpenPI client handshake — model-specific values for MiniCPM-RobotManip.
+      # Sent verbatim to the client; the pipeline validates consistency against
+      # the loaded model's config on startup.
+      policy_server_config:
+        image_resolution: [448, 448]
+        needs_session_id: false
+        action_horizon: 30
+        action_dim: 80
+        state_dim: 80

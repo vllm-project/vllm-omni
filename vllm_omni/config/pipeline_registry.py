@@ -78,6 +78,9 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_MOE_PIPELINE,
     MING_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.minicpm_robot.pipeline import (
+    MINICPM_ROBOT_MANIP_PIPELINE,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
@@ -124,6 +127,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "MiniCPMRobotManip": MINICPM_ROBOT_MANIP_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,

@@ -589,6 +589,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
         return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    if model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
+        return "Gr00tN1d7Pipeline"
+    if model_type == "minicpm_vla" or "MiniCPMV_VLA" in architectures:
+        return "MiniCPMRobotManipPipeline"
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1251,6 +1255,10 @@ class OmniDiffusionConfig:
                     self.update_multimodal_support()
                 elif model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
                     self.model_class_name = "Gr00tN1d7Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif model_type == "minicpm_vla" or "MiniCPMV_VLA" in architectures:
+                    self.model_class_name = "MiniCPMRobotManipPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "vla":

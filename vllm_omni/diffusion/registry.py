@@ -151,6 +151,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "MiniCPMRobotManipPipeline": (
+        "minicpm_robot",
+        "pipeline_minicpm_robot",
+        "MiniCPMRobotManipPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
