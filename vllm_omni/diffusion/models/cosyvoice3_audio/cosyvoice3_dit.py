@@ -15,8 +15,8 @@ from torch import nn
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
-from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+from vllm_omni.model_executor.models.cosyvoice3.utils import add_optional_chunk_mask
 
 logger = init_logger(__name__)
 
@@ -69,10 +69,12 @@ class FeedForward(nn.Module):
 
 
 class DiTAttention(nn.Module):
-    """Attention module using diffusion infrastructure for optimized backends.
+    """DiT self-attention aligned with CosyVoice3_split ``AttnProcessor``.
 
-    This replaces the original Attention class to leverage FlashAttention,
-    SageAttention, or SDPA backends automatically.
+    Uses ``scaled_dot_product_attention`` with an explicit attention mask so
+    streaming chunk masks actually constrain who can attend to whom. The previous
+    DiffusionAttention path ignored the mask inside softmax and only zeroed
+    outputs afterward, which breaks CosyVoice3 streaming semantics.
     """
 
     def __init__(
@@ -83,6 +85,8 @@ class DiTAttention(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("DiTAttention requires PyTorch 2.0+ for SDPA.")
         self.dim = dim
         self.heads = heads
         self.dim_head = dim_head
@@ -90,21 +94,10 @@ class DiTAttention(nn.Module):
         self.dropout = dropout
         self.scale = 1.0 / math.sqrt(dim_head)
 
-        # Q/K/V projections
         self.to_q = nn.Linear(dim, self.inner_dim)
         self.to_k = nn.Linear(dim, self.inner_dim)
         self.to_v = nn.Linear(dim, self.inner_dim)
-
-        # Output projection
         self.to_out = nn.Sequential(nn.Linear(self.inner_dim, dim), nn.Dropout(dropout))
-
-        # Diffusion attention backend (Flash/Sage/SDPA)
-        self.attn = DiffusionAttention(
-            num_heads=heads,
-            head_size=dim_head,
-            softmax_scale=self.scale,
-            causal=False,
-        )
 
     def forward(
         self,
@@ -112,44 +105,44 @@ class DiTAttention(nn.Module):
         mask: torch.Tensor | None = None,
         rope=None,
     ) -> torch.Tensor:
-        batch_size, seq_len = x.shape[0], x.shape[1]
+        batch_size = x.shape[0]
 
-        # Project to Q, K, V
         query = self.to_q(x)
         key = self.to_k(x)
         value = self.to_v(x)
 
-        # Apply rotary position embedding
         if rope is not None:
             freqs, xpos_scale = rope
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
             query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
             key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
-        # Reshape for attention: (batch, seq, heads, head_dim)
-        query = query.view(batch_size, seq_len, self.heads, self.dim_head)
-        key = key.view(batch_size, seq_len, self.heads, self.dim_head)
-        value = value.view(batch_size, seq_len, self.heads, self.dim_head)
+        # (B, H, L, D) — same layout as CosyVoice3_split AttnProcessor
+        query = query.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
+        key = key.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
+        value = value.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
 
-        # Use diffusion attention backend
-        # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-        out = self.attn(query, key, value, attn_metadata=None)
+        attn_mask = None
+        if mask is not None:
+            attn_mask = mask
+            if attn_mask.dim() == 2:
+                # (B, L) pad mask -> (B, H, L, L)
+                attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
+                attn_mask = attn_mask.expand(batch_size, self.heads, query.shape[-2], key.shape[-2])
 
-        # Some attention backends return a non-contiguous layout.
-        out = out.reshape(batch_size, seq_len, self.inner_dim)
+        out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(batch_size, -1, self.inner_dim)
         out = out.to(query.dtype)
-
-        # Output projection
         out = self.to_out(out)
 
-        # Apply mask if provided
+        # Zero padded / invalid query rows (CosyVoice post-attention hygiene).
         if mask is not None:
             if mask.dim() == 2:
-                mask = mask.unsqueeze(-1)
-            elif mask.dim() == 4:
-                # (batch, heads, seq, seq) -> use last dim
-                mask = mask[:, 0, -1].unsqueeze(-1)
-            out = out.masked_fill(~mask.bool(), 0.0)
+                out_mask = mask.unsqueeze(-1)
+            else:
+                # (B, 1, L, L) or (B, H, L, L) -> validity of last query row keys
+                out_mask = mask[:, 0, -1].unsqueeze(-1)
+            out = out.masked_fill(~out_mask.bool(), 0.0)
 
         return out
 
@@ -384,7 +377,13 @@ class DiT(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None):
+    def forward(self, x, mask, mu, t, spks=None, cond=None, streaming: bool = False):
+        """Forward aligned with CosyVoice3_split ``flow/DiT/dit.py``.
+
+        When ``streaming=True``, attention uses a static chunk mask
+        (``static_chunk_size``) so each frame only attends within the allowed
+        causal chunk window — required for CosyVoice3 streaming flow matching.
+        """
         x = x.transpose(1, 2)
         mu = mu.transpose(1, 2)
         cond = cond.transpose(1, 2)
@@ -402,7 +401,15 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = x
 
-        attn_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
+        # Match CosyVoice3_split DiT.forward mask construction exactly.
+        if streaming is True:
+            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, self.static_chunk_size, -1).unsqueeze(
+                dim=1
+            )
+        else:
+            attn_mask = (
+                add_optional_chunk_mask(x, mask.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1).unsqueeze(dim=1)
+            )
 
         for block in self.transformer_blocks:
             x = block(x, t, mask=attn_mask.bool(), rope=rope)
