@@ -141,6 +141,46 @@ class FlashAttentionImpl(AttentionImpl):
         out_unpad = self._unwrap_flash_output(out_unpad)
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
+    def _forward_varlen_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Run FlashAttention directly on an already packed sequence.
+
+        Some diffusion transformers already maintain exact packed-document
+        boundaries. Reusing those boundaries avoids rebuilding boolean masks
+        and gathering/scattering Q/K/V in every attention layer.
+        """
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
+        if flash_attn_varlen_func is None:
+            raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
+        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError("Packed variable-length attention currently requires batch size 1")
+
+        out = flash_attn_varlen_func(
+            q=query.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        out = self._unwrap_flash_output(out)
+        return out.reshape_as(query)
+
     def _forward_varlen_dense(
         self,
         query: torch.Tensor,
@@ -206,6 +246,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        extra = attn_metadata.extra if attn_metadata is not None else {}
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -231,6 +272,22 @@ class FlashAttentionImpl(AttentionImpl):
                 self.softmax_scale,
                 attn_func,
                 query_ranges=attn_metadata.query_ranges,
+            )
+
+        packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+        present_packed_keys = [key for key in packed_keys if key in extra]
+        if present_packed_keys:
+            if len(present_packed_keys) != len(packed_keys):
+                missing = sorted(set(packed_keys) - set(present_packed_keys))
+                raise ValueError(f"Incomplete packed FlashAttention metadata; missing {missing}")
+            return self._forward_varlen_packed(
+                query,
+                key,
+                value,
+                cu_seqlens_q=extra["cu_seqlens_q"],
+                cu_seqlens_k=extra["cu_seqlens_k"],
+                max_seqlen_q=extra["max_seqlen_q"],
+                max_seqlen_k=extra["max_seqlen_k"],
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

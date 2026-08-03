@@ -150,7 +150,16 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": messages,
+        "modalities": ["text", "audio"],
         "stream": True,
+        # Delimit the assistant answer with the TTS template so the Talker
+        # does not spend its codec-token budget speaking hidden reasoning.
+        "extra_body": {
+            "chat_template_kwargs": {
+                "use_tts_template": True,
+                "enable_thinking": False,
+            }
+        },
         "key_words": {"audio": ["Beijing"]},
     }
 

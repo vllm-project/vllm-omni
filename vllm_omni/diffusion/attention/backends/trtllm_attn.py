@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import inspect
 import math
 from dataclasses import dataclass, replace
 
@@ -83,6 +85,66 @@ except Exception as e:  # pragma: no cover - import guard
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _sage_kernel_available() -> bool:
+    if not HAS_FLASHINFER:
+        return False
+    try:
+        return "sage_attn_sfs" in inspect.signature(trtllm_ragged_attention_deepseek).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _sage_quantize_fn():
+    try:
+        from flashinfer import trtllm_sage_attention_quantize
+
+        return trtllm_sage_attention_quantize
+    except Exception:  # pragma: no cover
+        return None
+
+
+_QK_QUANT_DTYPES = {
+    "int8": torch.int8,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
+
+
+@dataclass(frozen=True)
+class QuantConfig:
+    dtype_qk: str | None = None
+    q_block_size: int = 1
+    k_block_size: int = 16
+
+    @classmethod
+    def from_backend_kwargs(cls, backend_kwargs: dict | None) -> "QuantConfig":
+        q = (backend_kwargs or {}).get("quant") or {}
+        return cls(
+            dtype_qk=q.get("dtype_qk"),
+            q_block_size=int(q.get("q_block_size", 1) or 1),
+            k_block_size=int(q.get("k_block_size", 16) or 16),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.dtype_qk is not None
+
+    def quantize(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, quantize_fn):
+        qk_quant_dtype = _QK_QUANT_DTYPES[self.dtype_qk]
+        q_q, k_q, v_q, q_sfs, k_sfs, v_sfs = quantize_fn(
+            q,
+            k,
+            v,
+            q_block_size=self.q_block_size,
+            k_block_size=self.k_block_size,
+            qk_quant_dtype=qk_quant_dtype,
+        )
+        sage_attn_sfs = (q_sfs, k_sfs, None, v_sfs)
+        num_elts_per_sage_attn_blk = (self.q_block_size, self.k_block_size, 0, 1)
+        return q_q, k_q, v_q, sage_attn_sfs, num_elts_per_sage_attn_blk
+
+
 def _workspace_bytes() -> int:
     import vllm.envs as envs
 
@@ -128,6 +190,30 @@ class TrtllmAttentionImpl(AttentionImpl):
 
         self.skip = SkipSoftmaxConfig.from_backend_kwargs(backend_kwargs)
         self._warned_missing_timestep = False
+
+        self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
+        # Resolve the SAGE quantize fn once at init so the compiled forward path never calls the
+        # lru_cache-wrapped getter (which triggers a Dynamo graph break every step).
+        self._sage_quantize_fn = None
+        if self.quant.enabled:
+            if self.quant.dtype_qk not in _QK_QUANT_DTYPES:
+                raise RuntimeError(
+                    f"TRTLLM_ATTN quant (SAGE) supports dtype_qk in {sorted(_QK_QUANT_DTYPES)}, got "
+                    f"{self.quant.dtype_qk!r}. FLASHINFER_ATTN dtypes (float16/bfloat16) are not SAGE."
+                )
+            if not _sage_kernel_available():
+                raise RuntimeError(
+                    "TRTLLM_ATTN quant (SAGE) was requested but this FlashInfer build does not "
+                    "expose the trtllm-gen sage_attn_sfs kernel path. Install a FlashInfer build "
+                    "that provides it, or remove the quant config."
+                )
+            self._sage_quantize_fn = _sage_quantize_fn()
+            if self._sage_quantize_fn is None:
+                raise RuntimeError(
+                    "TRTLLM_ATTN quant (SAGE) was requested but this FlashInfer build lacks "
+                    "trtllm_sage_attention_quantize (added in flashinfer >= 0.6.16rc1). Upgrade "
+                    "FlashInfer, or remove the quant config."
+                )
 
     def set_layer_calibration(self, a: float, b: float) -> None:
         self.skip = replace(self.skip, a=a, b=b)
@@ -203,6 +289,15 @@ class TrtllmAttentionImpl(AttentionImpl):
 
         _skip_factor = self._resolve_skip_factor(kv_len)
 
+        # SAGE kwargs are only understood by newer FlashInfer builds; pass them exclusively when
+        # SAGE quant is active (which already requires the kernel, checked at init) so the dense
+        # path stays compatible with older builds that lack these parameters.
+        sage_kwargs: dict = {}
+        if self.quant.enabled:
+            q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
+            sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
+            sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
+
         out = trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -222,5 +317,6 @@ class TrtllmAttentionImpl(AttentionImpl):
             is_causal=self.causal,
             return_lse=False,
             skip_softmax_threshold_scale_factor=_skip_factor,
+            **sage_kwargs,
         )
         return out.reshape(batch, q_len, num_q_heads, head_dim)

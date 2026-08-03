@@ -75,6 +75,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
     coordinator = FakeInputCoordinator()
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.input_coordinator = coordinator
+    scheduler.chunk_transfer_adapter = None
     scheduler._omits_kv_transfer_cache = {"req-free": True}
     scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
     scheduler.finished_req_ids = set()

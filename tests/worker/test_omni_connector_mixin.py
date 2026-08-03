@@ -17,6 +17,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -1196,6 +1199,38 @@ class TestRankAwareKVRouting(unittest.TestCase):
             host.get_rank_aware_kv_keys("req", from_stage=0),
             ["req_0_0_2_1", "req_0_0_3_1"],
         )
+        host.shutdown_omni_connectors()
+
+    def test_single_rank_hooks_use_default_manager_key(self):
+        host = self._make_host(from_tp=1, to_tp=1, local_rank=0)
+        expected = ["omni_0_to_1_kv_cache_req"]
+
+        self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_rank_aware_kv_keys("req", from_stage=0, to_stage=1), expected)
+        host.shutdown_omni_connectors()
+
+    def test_init_uses_effective_manager_tp2_topology(self):
+        model_config = _make_model_config(stage_id=0)
+        model_config.omni_kv_config = {
+            "need_send_cache": True,
+            "omni_from_stage": "0",
+            "omni_to_stage": "1",
+            "rank_mapping": {"from_tp": 2, "to_tp": 2},
+        }
+        with patch(
+            "vllm_omni.distributed.omni_connectors.kv_transfer_manager.get_local_tp_rank",
+            return_value=1,
+        ):
+            manager = OmniKVTransferManager.from_model_config(model_config)
+
+        host = MixinHost()
+        host.init_omni_connectors(model_config=model_config, kv_transfer_manager=manager)
+
+        expected = ["req_0_0_1_1"]
+        self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_rank_aware_kv_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_kv_rank_mapping()["from_tp"], 2)
+        self.assertEqual(host.get_kv_rank_mapping()["to_tp"], 2)
         host.shutdown_omni_connectors()
 
     def test_send_keys_route_from_rank_gt_to_rank(self):
