@@ -55,6 +55,7 @@ def _ulysses_all_to_all_any_qkv(
     *,
     seq_lens: list[int],
     use_sync: bool,
+    padded_head_cnt: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     """UAA forward all-to-all: (B, S_local, H, D) -> (B, S_global, H_local, D).
 
@@ -67,7 +68,12 @@ def _ulysses_all_to_all_any_qkv(
 
     bsz, s_local, head_cnt, head_dim = x.shape
     orig_head_cnt = int(head_cnt)
-    padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt is None:
+        padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt < orig_head_cnt or padded_head_cnt % world_size != 0:
+        raise ValueError(
+            f"Invalid padded head count {padded_head_cnt} for original heads={orig_head_cnt}, world_size={world_size}."
+        )
     head_pad = padded_head_cnt - orig_head_cnt
     if head_pad:
         x = F.pad(x, (0, 0, 0, head_pad))
@@ -311,11 +317,43 @@ class UlyssesParallelAttention:
                         "This typically means the input sequence was not evenly shardable across the ring. "
                         "Try setting ring_degree=1, or choose a sequence length divisible by ring_degree."
                     )
+
+            # Pad KV to a world_size multiple, then scale Q by the GQA ratio so
+            # the ratio survives the head-dim split (e.g. 28Q/7KV at SP2 becomes
+            # 32/8, i.e. 16/4 per rank -- padding each independently would give
+            # 14/4, which is not a valid GQA shape).
+            query_head_cnt = int(query.shape[2])
+            kv_head_cnt = int(key.shape[2])
+            if key.shape[2] != value.shape[2] or query_head_cnt % kv_head_cnt != 0:
+                raise ValueError(
+                    "Ulysses GQA requires equal K/V head counts and query heads "
+                    f"to be a multiple of KV heads, got Q={query_head_cnt}, "
+                    f"K={kv_head_cnt}, V={int(value.shape[2])}."
+                )
+            padded_kv_head_cnt = _ceil_div(kv_head_cnt, ulysses_world_size) * ulysses_world_size
+            padded_query_head_cnt = padded_kv_head_cnt * (query_head_cnt // kv_head_cnt)
+
             query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg, query, seq_lens=seq_lens, use_sync=self._use_sync
+                self._ulysses_pg,
+                query,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_query_head_cnt,
             )
-            key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
-            value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
+            key, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                key,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
+            value, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                value,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
