@@ -55,6 +55,13 @@ background output path
 This allows payload construction for step `N` to overlap with GPU decode work
 for step `N + 1`. It does not change model computation or generated output.
 
+!!! note "Platform scope"
+    This design currently applies to the CUDA and ROCm AR runners, which use
+    `GPUARModelRunner`. Ascend NPU uses a separate `NPUARModelRunner` path that
+    still constructs `OmniModelRunnerOutput` and drains connector output
+    synchronously before wrapping the result as an asynchronous runner output.
+    XPU and MUSA are not currently covered or validated by this design.
+
 <p align="center">
   <img
     alt="Decode step gap before and after async output materialization"
@@ -67,7 +74,7 @@ for step `N + 1`. It does not change model computation or generated output.
   <em>
     Figure 1: Moving payload construction off the decode path reduces the
     observed gap between consecutive Talker steps from about 2.8 ms to 41 µs.
-    Source:
+    Adapted from the
     <a href="https://vllm.ai/blog/2026-07-01-qwen3-omni-optimization">
       Qwen3-Omni optimization blog
     </a>.
@@ -158,7 +165,7 @@ next decode step                                +-- accumulate full payloads
 ### Safe State Snapshots
 
 The next scheduler step can mutate runner state while the background builder is
-still active. The builder therefore consumes snapshots rather than live fields.
+still active. Most step-local builder inputs are therefore detached snapshots.
 The snapshotted state includes:
 
 - scheduler token counts and speculative-token metadata
@@ -166,12 +173,30 @@ The snapshotted state includes:
 - sampled token IDs, logprobs, and prompt logprobs
 - query start locations and scheduled-token spans
 - hidden states and multimodal output tensors
-- KV, encoder-cache, and Omni connector output state
+- KV-connector and encoder-cache outputs captured for the step
 
 CUDA tensor cloning is required because CUDA Graph and model output buffers can
 be reused by the next forward pass. The dedicated copy stream and pinned host
 buffers make the D2H transfer asynchronous; the snapshot retains its cloned
 CUDA sources until the transfer event completes.
+
+### Live Runner State and Ownership
+
+The complete builder input is not a detached snapshot. Two parts deliberately
+remain runner-owned:
+
+- Full-payload accumulation looks up each request in `self.requests` and
+  updates the runner's pending full-payload accumulator.
+- `get_omni_connector_output()` drains live, per-cycle connector signals after
+  payload accumulation. Connector output state itself is not snapshotted.
+
+Correctness therefore depends on the output lifecycle: request entries and the
+full-payload accumulator must remain valid until the background builder
+finishes, and that builder must be the only consumer that drains connector
+signals for its output cycle. Receive-side connector state written by the
+background receiver is coordinated by the connector mixin's `_lock`.
+`OmniAsyncGPUModelRunnerOutput.get_output()` joins the builder and is the
+completion and exception boundary before the materialized output is consumed.
 
 ### Output Builder
 
@@ -182,7 +207,7 @@ The background builder performs the work that previously ran inline:
 - applies model-specific payload processing
 - accumulates full payloads when required
 - creates the tensor-only `multimodal_outputs` wire payload
-- reads connector readiness after payload accumulation
+- drains live connector readiness signals after payload accumulation
 - constructs the final `OmniModelRunnerOutput`
 
 Input-side connector operations remain synchronous with model execution. In
@@ -206,8 +231,9 @@ uses the normal generation-stage path.
 
 There is no separate `async_omni_output` command-line or YAML option. The
 feature is selected automatically for model stages that opt in when the runtime
-conditions are safe. For the supported Qwen3-Omni and Qwen3-TTS pipelines,
-using the bundled deployment profile is enough to turn it on.
+conditions are safe. On CUDA and ROCm, using the bundled deployment profile is
+enough to turn it on for the supported Qwen3-Omni and Qwen3-TTS pipelines. The
+same profile does not enable background Omni materialization on Ascend NPU.
 
 ### Example 1: Qwen3-Omni
 
@@ -294,6 +320,7 @@ The async output path is used only when all of the following conditions hold:
 
 | Requirement | Reason |
 |---|---|
+| The platform uses the CUDA or ROCm `GPUARModelRunner` path | Ascend NPU materializes the Omni output synchronously; XPU and MUSA are not covered or validated by this design |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -302,9 +329,12 @@ The async output path is used only when all of the following conditions hold:
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
 | Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns |
 
-These checks are evaluated per stage. An unsupported combination does not
-prevent serving; it only falls back to synchronous output construction for that
-stage.
+On CUDA and ROCm, these checks are evaluated per stage. An unsupported
+combination does not prevent serving; it only falls back to synchronous output
+construction for that stage. On Ascend NPU, `NPUARModelRunner.sample_tokens()`
+fully constructs `OmniModelRunnerOutput`, calls
+`get_omni_connector_output()`, and only then creates the asynchronous wrapper,
+so Omni payload materialization remains synchronous.
 
 !!! note
     `use_async_omni_output`,
@@ -316,6 +346,8 @@ stage.
 
 - `vllm_omni/worker/gpu_ar_model_runner.py`: Async output object, safe tensor
   snapshots, compatibility guards, and deferred Omni output builder.
+- `vllm_omni/platforms/npu/worker/npu_ar_model_runner.py`: Separate Ascend NPU
+  runner, where Omni output materialization remains synchronous.
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py`: Thinker and
   Talker opt-in behavior.
 - `vllm_omni/deploy/qwen3_omni_moe.yaml`: Default Qwen3-Omni deployment

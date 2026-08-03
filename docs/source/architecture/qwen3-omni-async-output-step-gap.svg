@@ -18,12 +18,16 @@
       .phase { font: 700 16px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1f2937; }
       .phase-sub { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
       .row-label { font: 600 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #374151; }
+      .block-label { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .payload-label { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
       .axis { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #9ca3af; }
       .dimtext { font: 700 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
       .zoom-cap { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6b7280; }
       .zoom-gap { font: 700 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
-      .zoom-step { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .zoom-step { font: 600 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
       .gpu { fill: #22c55e; }
+      .sync-payload { fill: #f97316; }
+      .async-payload { fill: #3b82f6; }
       .before-box { fill: #eaf1fb; stroke: #c7dbf6; }
       .after-box { fill: #eafaf0; stroke: #bfe7cf; }
       .dim { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#dim); }
@@ -31,6 +35,7 @@
       .guide { stroke: #e5e7eb; stroke-width: 1; }
       .guide-red { stroke: #f0a8a8; stroke-width: 1; stroke-dasharray: 4 3; }
       .lead { stroke: #b91c1c; stroke-width: 1.3; stroke-dasharray: 4 3; fill: none; }
+      .handoff { stroke: #3b82f6; stroke-width: 1.2; stroke-dasharray: 3 2; fill: none; }
       .zoom-box { fill: #fdf6f6; stroke: #f0c9c9; }
       .stat-blue { fill: #eef4ff; stroke: #c7dbf6; }
       .stat-green { fill: #eafaf0; stroke: #bfe7cf; }
@@ -43,79 +48,93 @@
 
   <rect x="14" y="14" width="996" height="572" rx="14" class="card"/>
 
-  <text x="44" y="52" class="title">Async output: decode step gap before and after</text>
-  <text x="44" y="74" class="subtitle">Torch profiler trace &#183; consecutive Talker decode steps in a fixed window</text>
+  <text x="44" y="52" class="title">Async output: Talker decode step gap before and after</text>
+  <text x="44" y="74" class="subtitle">GPU decode and Omni payload materialization &#183; fixed profiler window</text>
 
   <!-- ===================== BEFORE ===================== -->
-  <rect x="44" y="94" width="158" height="88" rx="10" class="before-box"/>
+  <rect x="44" y="94" width="158" height="98" rx="10" class="before-box"/>
   <text x="60" y="120" class="phase">Before</text>
   <text x="60" y="138" class="phase-sub">sync payload</text>
   <text x="60" y="154" class="phase-sub">construction</text>
 
-  <text x="224" y="120" class="row-label">GPU kernels</text>
+  <text x="224" y="124" class="row-label">Decode path</text>
 
   <line x1="330" y1="88" x2="330" y2="200" class="guide"/>
 
-  <g class="gpu">
-    <rect x="330" y="116" width="135" height="28" rx="3"/>
-    <rect x="510" y="116" width="135" height="28" rx="3"/>
-    <rect x="666" y="116" width="135" height="28" rx="3"/>
-  </g>
+  <rect x="330" y="106" width="140" height="32" rx="3" class="gpu"/>
+  <rect x="470" y="106" width="88" height="32" rx="3" class="sync-payload"/>
+  <rect x="558" y="106" width="140" height="32" rx="3" class="gpu"/>
+  <rect x="698" y="106" width="88" height="32" rx="3" class="sync-payload"/>
+  <rect x="786" y="106" width="140" height="32" rx="3" class="gpu"/>
+  <text x="400" y="126" text-anchor="middle" class="block-label">Talker decode N</text>
+  <text x="514" y="126" text-anchor="middle" class="payload-label">Omni payload N</text>
+  <text x="628" y="126" text-anchor="middle" class="block-label">Talker decode N+1</text>
+  <text x="742" y="126" text-anchor="middle" class="payload-label">Omni payload N+1</text>
+  <text x="856" y="126" text-anchor="middle" class="block-label">Talker decode N+2</text>
 
-  <line x1="465" y1="116" x2="465" y2="144" class="guide-red"/>
-  <line x1="510" y1="116" x2="510" y2="144" class="guide-red"/>
-  <line x1="465" y1="154" x2="510" y2="154" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
-  <text x="488" y="176" text-anchor="middle" class="dimtext">~2.8 ms idle</text>
+  <line x1="470" y1="106" x2="470" y2="148" class="guide-red"/>
+  <line x1="558" y1="106" x2="558" y2="148" class="guide-red"/>
+  <line x1="470" y1="154" x2="558" y2="154" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
+  <text x="514" y="176" text-anchor="middle" class="dimtext">~2.8 ms gap</text>
 
   <!-- ===================== AFTER ===================== -->
-  <rect x="44" y="204" width="158" height="88" rx="10" class="after-box"/>
+  <rect x="44" y="204" width="158" height="112" rx="10" class="after-box"/>
   <text x="60" y="230" class="phase">After</text>
   <text x="60" y="248" class="phase-sub">async output</text>
   <text x="60" y="264" class="phase-sub">(off decode path)</text>
 
-  <text x="224" y="230" class="row-label">GPU kernels</text>
+  <text x="224" y="239" class="row-label">Talker GPU</text>
+  <text x="224" y="281" class="row-label">Output builder</text>
 
-  <line x1="330" y1="198" x2="330" y2="308" class="guide"/>
+  <line x1="330" y1="198" x2="330" y2="322" class="guide"/>
 
-  <g class="gpu">
-    <rect x="330" y="226" width="135" height="28" rx="2"/>
-    <rect x="469" y="226" width="135" height="28" rx="2"/>
-    <rect x="608" y="226" width="135" height="28" rx="2"/>
-  </g>
+  <rect x="330" y="218" width="140" height="32" rx="3" class="gpu"/>
+  <rect x="474" y="218" width="140" height="32" rx="3" class="gpu"/>
+  <rect x="618" y="218" width="140" height="32" rx="3" class="gpu"/>
+  <text x="400" y="238" text-anchor="middle" class="block-label">Talker decode N</text>
+  <text x="544" y="238" text-anchor="middle" class="block-label">Talker decode N+1</text>
+  <text x="688" y="238" text-anchor="middle" class="block-label">Talker decode N+2</text>
 
-  <line x1="330" y1="290" x2="760" y2="290" class="dim"/>
-  <text x="752" y="306" text-anchor="end" class="axis">time</text>
+  <path d="M 470 250 L 478 264" class="handoff"/>
+  <path d="M 614 250 L 622 264" class="handoff"/>
+  <rect x="478" y="264" width="132" height="24" rx="3" class="async-payload"/>
+  <rect x="622" y="264" width="132" height="24" rx="3" class="async-payload"/>
+  <text x="544" y="280" text-anchor="middle" class="payload-label">D2H + build N</text>
+  <text x="688" y="280" text-anchor="middle" class="payload-label">D2H + build N+1</text>
+
+  <line x1="330" y1="308" x2="790" y2="308" class="dim"/>
+  <text x="782" y="324" text-anchor="end" class="axis">time</text>
 
   <!-- leads: left vertical, right diagonal into widened zoom gap -->
-  <line x1="465" y1="254" x2="465" y2="402" class="lead"/>
-  <line x1="469" y1="254" x2="513" y2="322" class="lead"/>
-  <line x1="513" y1="322" x2="513" y2="402" class="lead"/>
+  <line x1="470" y1="250" x2="470" y2="414" class="lead"/>
+  <line x1="474" y1="250" x2="513" y2="334" class="lead"/>
+  <line x1="513" y1="334" x2="513" y2="414" class="lead"/>
 
   <!-- ===================== ZOOM: 41 µs gap (magnified) ===================== -->
-  <rect x="310" y="322" width="358" height="112" rx="10" class="zoom-box"/>
-  <text x="326" y="340" class="zoom-cap">Zoom &#183; one inter-step gap (GPU kernels)</text>
+  <rect x="310" y="334" width="358" height="112" rx="10" class="zoom-box"/>
+  <text x="326" y="352" class="zoom-cap">Zoom &#183; one Talker decode boundary</text>
 
-  <rect x="330" y="354" width="135" height="32" rx="4" class="gpu"/>
-  <rect x="513" y="354" width="135" height="32" rx="4" class="gpu"/>
-  <text x="398" y="375" text-anchor="middle" class="zoom-step">step N</text>
-  <text x="581" y="375" text-anchor="middle" class="zoom-step">step N+1</text>
+  <rect x="330" y="366" width="140" height="32" rx="4" class="gpu"/>
+  <rect x="513" y="366" width="135" height="32" rx="4" class="gpu"/>
+  <text x="400" y="387" text-anchor="middle" class="zoom-step">Talker decode N</text>
+  <text x="581" y="387" text-anchor="middle" class="zoom-step">Talker decode N+1</text>
 
-  <line x1="465" y1="400" x2="513" y2="400" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
-  <text x="489" y="416" text-anchor="middle" class="zoom-gap">~41 &#181;s</text>
+  <line x1="470" y1="414" x2="513" y2="414" class="dimred-sm" marker-start="url(#dimrstart-sm)" marker-end="url(#dimr-sm)"/>
+  <text x="491" y="430" text-anchor="middle" class="zoom-gap">~41 &#181;s</text>
 
   <!-- ===================== STAT CARDS ===================== -->
-  <rect x="44" y="452" width="296" height="76" rx="9" class="stat-blue"/>
-  <text x="60" y="472" class="stat-cap">Step-to-step gap</text>
-  <text x="60" y="496" class="stat-big">2.8 ms &#8594; 41 &#181;s</text>
-  <text x="60" y="514" class="stat-sub">~68&#215; tighter</text>
+  <rect x="44" y="464" width="296" height="76" rx="9" class="stat-blue"/>
+  <text x="60" y="484" class="stat-cap">Step-to-step gap</text>
+  <text x="60" y="508" class="stat-big">2.8 ms &#8594; 41 &#181;s</text>
+  <text x="60" y="526" class="stat-sub">~68&#215; tighter</text>
 
-  <rect x="356" y="452" width="296" height="76" rx="9" class="stat-green"/>
-  <text x="372" y="472" class="stat-cap">GPU idle between steps</text>
-  <text x="372" y="496" class="stat-big">eliminated</text>
-  <text x="372" y="514" class="stat-sub">decode workers stay busy</text>
+  <rect x="356" y="464" width="296" height="76" rx="9" class="stat-green"/>
+  <text x="372" y="484" class="stat-cap">GPU idle between steps</text>
+  <text x="372" y="508" class="stat-big">eliminated</text>
+  <text x="372" y="526" class="stat-sub">decode workers stay busy</text>
 
-  <rect x="668" y="452" width="312" height="76" rx="9" class="stat-gray"/>
-  <text x="684" y="472" class="stat-cap">Mechanism</text>
-  <text x="684" y="496" class="stat-big">async output</text>
-  <text x="684" y="514" class="stat-sub">payload build off decode path</text>
+  <rect x="668" y="464" width="312" height="76" rx="9" class="stat-gray"/>
+  <text x="684" y="484" class="stat-cap">Mechanism</text>
+  <text x="684" y="508" class="stat-big">async output</text>
+  <text x="684" y="526" class="stat-sub">D2H and payload build overlap decode</text>
 </svg>
