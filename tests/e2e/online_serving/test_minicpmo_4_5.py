@@ -140,6 +140,13 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["Beijing"]},
+        "modalities": ["text", "audio"],
+        "extra_body": {
+            "chat_template_kwargs": {
+                "use_tts_template": True,
+                "enable_thinking": False,
+            }
+        },
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
