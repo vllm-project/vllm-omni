@@ -92,6 +92,15 @@ class TestHiggsAudioV2OnlineHappyPath:
         higgs_audio_v2.yaml pins ``codec_streaming: true`` + ``async_chunk: false``,
         so the only streaming surface exposed to clients is the WAV/PCM bytes
         served chunk-by-chunk from Stage 1 — exercise it directly.
+
+        NOTE: ``min_hnr_db=-3.0`` keeps the check as a catastrophic-codec-failure
+        guard (white noise / sample scramble measure around -10 dB) while
+        tolerating Higgs sampling variance: legitimate speech for this prompt
+        measured -1.03 dB on L4 (weekly CI, issue #5045) and 1.34 dB on H100, so
+        the default 1.0 dB threshold flakes on hardware-dependent tail samples.
+        Same rationale as the higgs_audio_v3 streaming thresholds (issue #4411);
+        content correctness is separately guarded by the full_model transcript
+        check.
         """
         openai_client.send_audio_speech_request(
             {
@@ -102,6 +111,7 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "min_hnr_db": -3.0,
             }
         )
 

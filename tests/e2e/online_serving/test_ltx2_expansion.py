@@ -4,8 +4,7 @@
 Expansion tests for LTX-2 two-stage pipelines.
 
 Coverage:
-- HSDP with LTX2TwoStagesPipeline (text-to-video)
-- HSDP with LTX2ImageToVideoTwoStagesPipeline (image-to-video)
+- HSDP with LTX2DistilledPipeline (text-to-video and image-to-video)
 """
 
 import os
@@ -27,7 +26,6 @@ HSDP_ARGS = ["--use-hsdp", "--hsdp-shard-size", "2"]
 def _cases():
     cases = []
 
-    # T2V: LTX2TwoStagesPipeline
     cases.append(
         pytest.param(
             OmniServerParams(
@@ -35,15 +33,15 @@ def _cases():
                 server_args=[
                     *HSDP_ARGS,
                     "--model-class-name",
-                    "LTX2TwoStagesPipeline",
+                    "LTX2DistilledPipeline",
                 ],
             ),
+            False,
             id="t2v_hsdp",
             marks=PARALLEL_MARKS,
         )
     )
 
-    # I2V: LTX2ImageToVideoTwoStagesPipeline
     cases.append(
         pytest.param(
             OmniServerParams(
@@ -51,9 +49,10 @@ def _cases():
                 server_args=[
                     *HSDP_ARGS,
                     "--model-class-name",
-                    "LTX2ImageToVideoTwoStagesPipeline",
+                    "LTX2DistilledPipeline",
                 ],
             ),
+            True,
             id="i2v_hsdp",
             marks=PARALLEL_MARKS,
         )
@@ -62,25 +61,22 @@ def _cases():
     return cases
 
 
-@pytest.mark.parametrize("omni_server", _cases(), indirect=True)
+@pytest.mark.parametrize(("omni_server", "is_i2v"), _cases(), indirect=["omni_server"])
 def test_ltx2_two_stage_hsdp(
     omni_server: OmniServer,
+    is_i2v: bool,
     openai_client: OpenAIClientHandler,
 ):
-    is_i2v = any("ImageToVideo" in arg for arg in omni_server.serve_args)
-
-    # The two-stage pipeline generates at the requested resolution then 2x
-    # upsamples via LTX2LatentUpsamplerModel, so output dimensions differ
-    # from the request.  Omit height/width from form_data so the assertion
-    # helper skips the dimension check (it only asserts when the key is
-    # present).  The pipeline falls back to its own defaults.
+    # Keep CI small while exercising the fixed 8+3-step distilled recipe.
+    # Height and width describe the final output; Stage 1 runs at half size.
     form_data = {
         "prompt": PROMPT,
         "model": omni_server.model,
+        "height": 128,
+        "width": 128,
         "num_frames": 9,
         "fps": 8,
-        "num_inference_steps": 2,
-        "guidance_scale": 1.0,
+        "num_inference_steps": 8,
         "seed": 42,
     }
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -9,10 +10,14 @@ import pytest
 import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
+from vllm.v1.metrics.stats import IterationStats, PrefillStats
 
-from vllm_omni.outputs.output_modality import OutputModalityNames
-from vllm_omni.outputs.output_processor import OmniRequestState
+from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.outputs import output_processor
+from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -56,10 +61,73 @@ def _make_state(output_kind: RequestOutputKind):
     return OmniRequestState(**_DEFAULT_STATE_KWARGS, output_kind=output_kind)
 
 
+def test_output_modality_name_uses_string_value():
+    assert str(OutputModalityNames.AUDIO) == "audio"
+
+
 def test_init_empty_dict():
     """Ensure mm_accumulated is initially empty."""
     assert _make_state(RequestOutputKind.CUMULATIVE).mm_accumulated == {}
     assert _make_state(RequestOutputKind.DELTA).mm_accumulated == {}
+
+
+def test_streaming_update_resets_native_text_metrics_for_next_segment():
+    state = _make_state(RequestOutputKind.DELTA)
+    state.native_text_stats.num_generation_tokens = 12
+    state.native_text_stats.first_token_ts = 10.0
+    state.native_text_stats.last_token_ts = 10.2
+
+    state.apply_streaming_update(
+        SimpleNamespace(
+            final=False,
+            prompt=None,
+            prompt_token_ids=[],
+            arrival_time=20.0,
+        )
+    )
+
+    assert state.native_text_stats.arrival_time == 20.0
+    assert state.native_text_stats.num_generation_tokens == 0
+    assert state.native_text_stats.first_token_ts == 0.0
+    assert state.native_text_stats.last_token_ts == 0.0
+
+
+def test_native_text_tpot_snapshot_matches_vllm_finished_metric_definition():
+    calculate = getattr(output_processor, "_mean_time_per_output_token_ms", None)
+    assert calculate is not None
+    stats = SimpleNamespace(
+        num_generation_tokens=4,
+        first_token_ts=10.0,
+        last_token_ts=10.045,
+    )
+
+    assert calculate(stats) == pytest.approx(15.0)
+
+
+def test_native_text_metrics_include_segment_generation_token_count(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    state.is_prefilling = False
+    iteration_stats = MagicMock()
+
+    def update_native_stats(_output, _timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 27
+        native_stats.first_token_ts = 10.0
+        native_stats.last_token_ts = 10.26
+
+    iteration_stats.update_from_output.side_effect = update_native_stats
+
+    processor._update_stats_from_output(
+        state,
+        SimpleNamespace(),
+        10.26,
+        iteration_stats,
+    )
+
+    assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
 
 
 def test_delta_drains_output_modality_per_step():
@@ -172,6 +240,145 @@ def test_finish_consolidation_drains_mm_delta():
     assert AUDIO not in s.mm_accumulated  # drained
 
 
+def test_delta_drains_audio_chunk_metadata_per_step():
+    s = _make_state(RequestOutputKind.DELTA)
+    segment_text = "你好"
+    segment_utf8 = torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8)
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result1 = s.make_request_output([1], None, FinishReason.STOP, None)
+    assert result1 is not None and not isinstance(result1, PoolingRequestOutput)
+    meta1 = result1.outputs[0].multimodal_output["meta"]
+    assert bytes(meta1["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result2 = s.make_request_output([2], None, FinishReason.STOP, None)
+
+    assert result2 is not None and not isinstance(result2, PoolingRequestOutput)
+    meta2 = result2.outputs[0].multimodal_output["meta"]
+    assert bytes(meta2["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+    assert meta2["audio_text_total_chars"].tolist() == [len(segment_text)]
+    assert meta2["duplex_epoch"].tolist() == [8]
+    assert meta2["duplex_turn_id"].tolist() == [2]
+
+
+def test_cumulative_audio_replaces_chunk_metadata_per_step():
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    segment_text = "你好"
+    segment_utf8 = torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8)
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result1 = s.make_request_output([1], None, None, None)
+    assert result1 is not None and not isinstance(result1, PoolingRequestOutput)
+    assert result1.outputs[0].multimodal_output["audio"].shape[0] == 5
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result2 = s.make_request_output([2], None, None, None)
+
+    assert result2 is not None and not isinstance(result2, PoolingRequestOutput)
+    output = result2.outputs[0].multimodal_output
+    assert output["audio"].shape[0] == 8
+    meta = output["meta"]
+    assert bytes(meta["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+    assert meta["audio_text_total_chars"].tolist() == [len(segment_text)]
+    assert meta["duplex_epoch"].tolist() == [8]
+    assert meta["duplex_turn_id"].tolist() == [2]
+    assert meta["tts_is_last_chunk"].tolist() == [1]
+
+
+def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.tts_is_last_chunk": torch.tensor([0]),
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([1], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is False
+    assert result.outputs[0].finish_reason is None
+    assert result.outputs[0].multimodal_output["meta"]["tts_is_last_chunk"].tolist() == [0]
+    assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
+
+
+def test_delta_audio_final_tts_chunk_keeps_finish():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.tts_is_last_chunk": torch.tensor([1]),
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([151645], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is True
+    assert result.outputs[0].finish_reason == "stop"
+
+
+def test_delta_audio_non_final_tts_chunk_accepts_nested_meta():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            AUDIO: torch.ones(5),
+            "meta": {"tts_is_last_chunk": torch.tensor([0])},
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([1], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is False
+    assert result.outputs[0].multimodal_output["meta"]["tts_is_last_chunk"].tolist() == [0]
+
+
 @pytest.mark.parametrize("mm_type", [AUDIO, "hidden"])
 def test_final_only_consolidates_drainable_keys(mm_type):
     """FINAL_ONLY never drains per-step, so modality keys and hidden state
@@ -251,6 +458,127 @@ def test_no_detokenizer_make_request_output():
     assert AUDIO in result.outputs[0].multimodal_output
 
 
+def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypatch):
+    """Generation-stage MM-only chunks must reach the orchestrator.
+
+    StagePool registers generation requests without a per-request collector,
+    so the processor return value is the only path from Stage2 to
+    Orchestrator._handle_processed_outputs().
+    """
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.AUDIO
+    processor.request_states = {"r": state}
+    upstream_result = SimpleNamespace(request_outputs=[], reqs_to_abort=[])
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: upstream_result,
+    )
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output={
+            "model_outputs": torch.arange(8, dtype=torch.float32),
+            "sr": torch.tensor(24000, dtype=torch.int32),
+        },
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=None,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+    )
+
+    result = processor.process_outputs([engine_output])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].request_id == "r"
+    assert AUDIO in result.request_outputs[0].outputs[0].multimodal_output
+
+
+def _make_mm_only_output_processor(monkeypatch):
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.AUDIO
+    processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            request_outputs=[],
+            reqs_to_abort=[],
+        ),
+    )
+
+    def finish_request(req_state):
+        processor.request_states.pop(req_state.request_id, None)
+
+    processor._finish_request = finish_request
+    return processor
+
+
+def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
+    return SimpleNamespace(
+        request_id="r",
+        multimodal_output={
+            "model_outputs": torch.arange(8, dtype=torch.float32),
+            "meta.tts_is_last_chunk": torch.tensor([int(is_last_chunk)]),
+        },
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=FinishReason.STOP,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+        is_segment_finished=is_segment_finished,
+    )
+
+
+def test_mm_only_segment_finish_retains_request_state_for_next_audio_chunk(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    first = processor.process_outputs([_audio_engine_output(is_segment_finished=True, is_last_chunk=False)])
+
+    assert "r" in processor.request_states
+    assert len(first.request_outputs) == 1
+    assert first.request_outputs[0].finished is False
+
+    second = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(second.request_outputs) == 1
+    assert second.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
+def test_mm_only_nonfinal_audio_retains_state_without_segment_marker(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    first = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=False)])
+
+    assert "r" in processor.request_states
+    assert len(first.request_outputs) == 1
+    assert first.request_outputs[0].finished is False
+
+    second = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(second.request_outputs) == 1
+    assert second.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
+def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    result = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
     output channel (_process_mm_only_outputs) passes positionally, and attaches
@@ -290,3 +618,48 @@ def test_no_detokenizer_final_only():
     result = s.make_request_output([], None, FinishReason.STOP, None)
     assert result is not None
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_mm_only_outputs_update_iteration_stats():
+    processor = MultimodalOutputProcessor(
+        tokenizer=None,
+        log_stats=True,
+        engine_core_output_type=AUDIO,
+    )
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+
+    prefill_stats = PrefillStats()
+    prefill_stats.set(
+        num_prompt_tokens=4,
+        num_local_cached_tokens=0,
+        num_external_cached_tokens=0,
+    )
+    output = OmniEngineCoreOutput(
+        request_id=state.request_id,
+        new_token_ids=[10, 11],
+        finish_reason=FinishReason.STOP,
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.0),
+        ],
+        prefill_stats=prefill_stats,
+        multimodal_output={AUDIO: torch.ones(1, 8)},
+    )
+    iteration_stats = IterationStats()
+
+    processor.process_outputs(
+        [output],
+        engine_core_timestamp=3.0,
+        iteration_stats=iteration_stats,
+    )
+
+    assert iteration_stats.num_prompt_tokens == 4
+    assert iteration_stats.num_generation_tokens == 2
+    assert len(iteration_stats.time_to_first_tokens_iter) == 1
+    assert len(iteration_stats.finished_requests) == 1
+    finished = iteration_stats.finished_requests[0]
+    assert finished.finish_reason == FinishReason.STOP
+    assert finished.num_prompt_tokens == state.prompt_len
+    assert finished.num_generation_tokens == 2

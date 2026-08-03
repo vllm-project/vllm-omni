@@ -12,7 +12,9 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
@@ -103,12 +105,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
             return True
         return isinstance(
             value,
-            (
-                types.FunctionType,
-                types.MethodType,
-                types.BuiltinFunctionType,
-                types.BuiltinMethodType,
-            ),
+            types.FunctionType | types.MethodType | types.BuiltinFunctionType | types.BuiltinMethodType,
         )
 
     result = {}
@@ -193,10 +190,10 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if callable(obj):
         return None
     # Handle lists and tuples (recurse into items)
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return type(obj)(_convert_dataclasses_to_dict(item) for item in obj if not callable(item))
     # Try to convert any dict-like object (has keys/values methods) to dict
-    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
+    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, str | bytes):
         try:
             return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError):
@@ -231,22 +228,49 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
-def resolve_model_config_path(model: str) -> str:
-    """Resolve the stage config file path from the model name.
+def _registry_default_deploy_path(model: str) -> str | None:
+    """Return the registered pipeline's default deploy YAML path, if any.
 
-    Resolves stage configuration path based on the model type and device type.
-    First tries to find a device-specific YAML file from stage_configs/{device_type}/
-    directory. If not found, falls back to the default config file.
+    A checkpoint's HF ``model_type`` is not always the registered Omni pipeline
+    key. MiniCPM-o 4.5, for example, reports ``minicpmo`` while its
+    predicate-selected pipeline is ``minicpmo_4_5``. Stage construction already
+    loads that pipeline's default deploy config, so connector discovery must
+    resolve the same path.
+    """
+    pipeline_config = StageConfigFactory.get_pipeline_config(
+        model=model,
+        trust_remote_code=True,
+    )
+    if pipeline_config is None or pipeline_config.default_deploy_config_name is None:
+        return None
+    default_deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+    if default_deploy_path.is_file():
+        return str(default_deploy_path)
+    return None
+
+
+def resolve_model_config_path(model: str) -> str | None:
+    """Resolve the stage/deploy config file path from the model name.
+
+    Resolves configuration path based on the model type and device type.
+    Order:
+    1. Device-specific stage config under ``stage_configs/{device_type}/``
+    2. If HF ``model_type`` is not an ``OMNI_PIPELINES`` key, the registered
+       pipeline's ``default_deploy_config_name`` (keeps connectors aligned with
+       stage construction when HF type and pipeline key differ)
+    3. ``deploy/{model_type}.yaml``
+    4. Legacy ``stage_configs/{model_type}.yaml``
+    5. Registered pipeline default deploy config (final fallthrough)
 
     Args:
         model: Model name or path (used to determine model_type)
 
     Returns:
-        String path to the stage configuration file
+        String path to the stage/deploy configuration file, or ``None`` if no
+        matching config file exists.
 
     Raises:
         ValueError: If model_type cannot be determined
-        FileNotFoundError: If no stage config file exists for the model type
     """
     # Try to get config from standard transformers format first
     try:
@@ -301,21 +325,30 @@ def resolve_model_config_path(model: str) -> str:
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    deploy_config_path = PROJECT_ROOT / "vllm_omni" / "deploy" / model_type_str
+    # Prefer the registry default before deploy/<hf_model_type>.yaml when the
+    # HF type is not itself a pipeline key. Otherwise a future
+    # deploy/minicpmo.yaml would desync connectors from stages for MiniCPM-o 4.5.
+    if normalized_model_type not in OMNI_PIPELINES:
+        registry_path = _registry_default_deploy_path(model)
+        if registry_path is not None:
+            return registry_path
+
+    deploy_config_path = _DEPLOY_DIR / model_type_str
     if os.path.exists(deploy_config_path):
         return str(deploy_config_path)
 
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
-    if not os.path.exists(stage_config_path):
-        return None
-    return str(stage_config_path)
+    if os.path.exists(stage_config_path):
+        return str(stage_config_path)
+
+    return _registry_default_deploy_path(model)
 
 
 def load_stage_configs_from_model(
     model: str,
     *,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -349,7 +382,12 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
-    cli_overrides["trust_remote_code"] = trust_remote_code
+    # A False inherited from the engine-args dump is the store_true flag's
+    # default, not an explicit choice — drop it so only the tri-state
+    # parameter below decides (see with_trust_remote_code_override).
+    if not cli_overrides.get("trust_remote_code"):
+        cli_overrides.pop("trust_remote_code", None)
+    cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
@@ -559,7 +597,7 @@ def load_and_resolve_stage_configs(
     stage_configs_path: str | None,
     kwargs: dict | None,
     *,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -728,7 +766,7 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
         if origin in (list, tuple, set):
             args = get_args(annotation)
             inner = args[0] if args else None
-            if isinstance(value, (list, tuple, set)):
+            if isinstance(value, list | tuple | set):
                 return type(value)(_filter_value(v, inner) for v in value)
             return value
 

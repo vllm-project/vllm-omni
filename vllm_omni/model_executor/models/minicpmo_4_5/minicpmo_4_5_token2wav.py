@@ -6,8 +6,8 @@
 ``from stepaudio2 import Token2wav`` entry point (``stepaudio2-minicpmo``).
 That package hard-codes ``.cuda()`` and duplicates the flow/HiFT stack that
 vLLM-Omni already vendors for Step-Audio2 (which also carries the Ascend/NPU
-fixes: CPU HiFT, DiT mask expand, MATH SDPA, compile disable, PE buffer
-extension).
+fixes: HiFT linear downsample, DiT mask expand, MATH SDPA, compile disable,
+PE buffer extension).
 
 This module exposes the same call surface MiniCPM expects
 (``__call__`` / ``set_stream_cache`` / ``stream``) while delegating the
@@ -81,6 +81,44 @@ class MiniCPMO45Token2wav:
         # Mutable streaming fields expected by MiniCPM's long-form path.
         self.stream_cache: Any | None = None
         self.hift_cache_dict: dict[str, torch.Tensor] = {}
+
+        # The external ``stepaudio2.Token2wav`` class builds ``speech_window``
+        # eagerly in ``__init__``. ``StepAudio2Token2WavCore`` only creates it
+        # lazily inside ``setup_stream_for``, so materialize it here: the
+        # 3-stage ``BatchedToken2Wav`` wrapper clones it at construction time.
+        if self._core.speech_window is None:
+            self._core.speech_window = torch.from_numpy(np.hamming(2 * self._core.source_cache_len)).to(
+                device=self.device, dtype=torch.float32
+            )
+
+    # --- Surface expected by ``BatchedToken2Wav`` (3-stage Code2Wav) ---------
+    # ``BatchedToken2Wav`` wraps this object as a one-time asset loader and
+    # module holder; it never calls ``__call__`` / ``stream`` / ``set_stream_cache``.
+    # Expose the same attributes the upstream ``stepaudio2.Token2wav`` provides.
+
+    @property
+    def flow(self) -> torch.nn.Module:
+        return self._core.flow
+
+    @property
+    def hift(self) -> torch.nn.Module:
+        return self._core.hift
+
+    @property
+    def mel_cache_len(self) -> int:
+        return self._core.mel_cache_len
+
+    @property
+    def source_cache_len(self) -> int:
+        return self._core.source_cache_len
+
+    @property
+    def speech_window(self) -> torch.Tensor:
+        return self._core.speech_window
+
+    def _prepare_prompt(self, prompt_wav: str):
+        """Delegate prompt feature extraction to the wrapped core."""
+        return self._core._prepare_prompt(prompt_wav)
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""

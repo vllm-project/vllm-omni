@@ -17,7 +17,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -27,6 +26,13 @@ connectors:
       codec_left_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
+      # Chunk ramp (opt-in): gradual size increase for first N chunks to
+      # eliminate the IC→steady cliff (1→25). Uncomment to enable.
+      # Each entry is the size of that chunk index; indices past the table
+      # fall back to codec_chunk_frames. When enabled, ramp overrides
+      # initial_codec_chunk_frames (including the per-request API field).
+      # Example:
+      #   codec_chunk_ramp: [4, 4, 8, 16, 25]
       # Common Stage1 decode buckets:
           #   no-ref first/steady chunks: 25 / 97 frames
           #   Base ref-context first/steady chunks: 73 / 169 frames
@@ -91,6 +97,13 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # MIOpen Conv1d cannot be invoked while vLLM captures the outer
+        # Code2Wav model graph. Keep CUDA's graph-enabled default, but run
+        # Stage 1 eager on ROCm so decoder convolutions execute normally.
+        enforce_eager: true
   npu:
     stages:
       - stage_id: 0

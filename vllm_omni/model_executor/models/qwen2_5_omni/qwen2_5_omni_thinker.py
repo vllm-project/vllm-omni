@@ -1,5 +1,6 @@
 """Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker with minimal overrides."""
 
+import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Any
@@ -16,6 +17,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 )
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
+from vllm.inputs import MultiModalHashes
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -555,26 +557,98 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 
         return mm_processed_data
 
+    def _get_audio_in_video_pairs(
+        self,
+        mm_data_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> list[tuple[int, int]]:
+        """``(video_idx, audio_idx)`` pairs the HF processor handles as one
+        indivisible unit when the audio track is interleaved into the video.
+
+        Pairing follows omni's per-video mask convention: the j-th video with
+        ``use_audio_in_video=True`` pairs with ``audio[j]``.
+        """
+        num_videos = mm_data_items.get_count("video", strict=False)
+        num_audios = mm_data_items.get_count("audio", strict=False)
+        if num_videos == 0 or num_audios == 0:
+            return []
+
+        video_use_audio_in_video = _get_request_video_use_audio_in_video(
+            hf_processor_mm_kwargs,
+            num_videos,
+        )
+        videos_using_audio = [video_idx for video_idx, uses_audio in enumerate(video_use_audio_in_video) if uses_audio]
+        return list(zip(videos_using_audio, range(num_audios)))
+
+    @staticmethod
+    def _paired_cache_keys(
+        mm_hashes: MultiModalHashes,
+        aiv_pairs: list[tuple[int, int]],
+    ) -> MultiModalHashes:
+        """Processor-cache keys in which each paired video/audio key
+        incorporates the hash of both members, so a pair is reused only when
+        both match and any change misses the pair together. Semantic
+        ``mm_hashes`` are left untouched.
+        """
+        if not aiv_pairs:
+            return mm_hashes
+
+        mm_cache_keys = {modality: list(hashes) for modality, hashes in mm_hashes.items()}
+        for video_idx, audio_idx in aiv_pairs:
+            video_hash = mm_hashes["video"][video_idx]
+            audio_hash = mm_hashes["audio"][audio_idx]
+            pair_token = hashlib.sha256(f"{video_hash}\0{audio_hash}".encode()).hexdigest()[:16]
+            mm_cache_keys["video"][video_idx] = f"{video_hash}-aiv-{pair_token}"
+            mm_cache_keys["audio"][audio_idx] = f"{audio_hash}-aiv-{pair_token}"
+        return mm_cache_keys
+
     def _cached_apply_hf_processor(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
     ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
+        """Cache-aware: processes video/audio pairs as units,
+        using pair-specific cache keys. Falls back to standard cache if no pairs."""
+
         cache = self.cache
 
         _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
         if cache is None or passthrough_data:
             return self._apply_hf_processor(inputs, timing_ctx)
 
+        aiv_pairs = self._get_audio_in_video_pairs(
+            inputs.mm_data_items,
+            inputs.hf_processor_mm_kwargs,
+        )
+
         with timing_ctx.record("get_mm_hashes"):
             mm_hashes = inputs.get_mm_hashes(self.info.model_id)
 
+        mm_cache_keys = self._paired_cache_keys(mm_hashes, aiv_pairs)
+
         with timing_ctx.record("get_cache_missing_items"):
-            mm_is_cached, mm_missing_data_items = self._get_cache_missing_items(
-                cache=cache,
-                mm_data_items=inputs.mm_data_items,
-                mm_hashes=mm_hashes,
-            )
+            mm_is_cached = {modality: list(cache.is_cached(keys)) for modality, keys in mm_cache_keys.items()}
+            # A pair is one HF processing unit: if either member misses the
+            # cache (including LRU evicting just one), reprocess both.
+            for video_idx, audio_idx in aiv_pairs:
+                if not (mm_is_cached["video"][video_idx] and mm_is_cached["audio"][audio_idx]):
+                    mm_is_cached["video"][video_idx] = False
+                    mm_is_cached["audio"][audio_idx] = False
+
+            # TODO: Inlined from BaseMultiModalProcessor._get_cache_missing_items
+            # (pair expansion must run after is_cached); keep in sync with vLLM.
+            mm_missing_data = {}
+            for modality, items_is_cached in mm_is_cached.items():
+                missing_modality_data = []
+                for idx, item_is_cached in enumerate(items_is_cached):
+                    if item_is_cached:
+                        continue
+                    data = inputs.mm_data_items[modality][idx]
+                    if data is None:
+                        raise ValueError(f"Cache miss for {modality} at index {idx} but data is not provided.")
+                    missing_modality_data.append(data)
+                mm_missing_data[modality] = missing_modality_data
+            mm_missing_data_items = self.info.parse_mm_data(mm_missing_data, validate=False)
 
         hf_processor_mm_kwargs = _filter_video_use_audio_in_video_for_uncached_items(
             inputs.hf_processor_mm_kwargs,
@@ -611,7 +685,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         with timing_ctx.record("merge_mm_kwargs"):
             mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
                 cache,
-                mm_hashes=mm_hashes,
+                mm_hashes=mm_cache_keys,
                 mm_is_cached=mm_is_cached,
                 mm_missing_kwargs=mm_missing_kwargs,
                 mm_missing_prompt_updates=mm_missing_prompt_updates,
@@ -1268,8 +1342,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 is_video,
                 is_audio,
                 is_multimodal,
-                num_video,
-                num_audio,
             )
 
         # Default: standard merge (no interleaving), same as parent class

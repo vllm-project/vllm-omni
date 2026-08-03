@@ -21,8 +21,6 @@ set -euo pipefail
 
 MODEL="${MODEL:-Lightricks/LTX-2}"
 PORT="${PORT:-8098}"
-FLOW_SHIFT="${FLOW_SHIFT:-1.0}"
-BOUNDARY_RATIO="${BOUNDARY_RATIO:-1.0}"
 
 PRESET="${1:-baseline}"
 
@@ -66,19 +64,13 @@ case "$PRESET" in
         echo "Environment variables:"
         echo "  MODEL           - Model path (default: Lightricks/LTX-2)"
         echo "  PORT            - Server port (default: 8098)"
-        echo "  FLOW_SHIFT      - Scheduler flow shift (default: 1.0)"
-        echo "  BOUNDARY_RATIO  - Boundary ratio (default: 1.0)"
         exit 1
         ;;
 esac
 
 echo "Model: $MODEL"
 echo "Port: $PORT"
-echo "Flow shift: $FLOW_SHIFT"
-echo "Boundary ratio: $BOUNDARY_RATIO"
 
 vllm serve "$MODEL" --omni \
     --port "$PORT" \
-    --flow-shift "$FLOW_SHIFT" \
-    --boundary-ratio "$BOUNDARY_RATIO" \
     "${EXTRA_ARGS[@]}"

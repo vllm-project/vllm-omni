@@ -89,7 +89,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class _RotaryEmbedding(CustomOp):
-    """RoPE with HuggingFace-compatible CPU/CUDA math and cached NPU tables."""
+    """RoPE with cached cos/sin tables; ``forward_native`` keeps the HF on-the-fly math."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -101,25 +101,34 @@ class _RotaryEmbedding(CustomOp):
         rope_theta = getattr(config, "rope_theta", 10000.0)
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        if current_omni_platform.is_npu():
-            max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
-            positions = torch.arange(max_seq, dtype=torch.float32)
-            freqs = torch.outer(positions, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.register_buffer("cos_cached", emb.cos(), persistent=False)
-            self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+        # Build the cos/sin lookup tables once.  ``num_code_groups + 1``
+        # positions cover every re-prefill step of the code predictor.  Compute
+        # in float32 (matching HF) and cast per-call in forward.
+        max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def _lookup(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # position_ids: [batch, seq_len] -> cos/sin: [batch, seq_len, head_dim]
+        cos = self.cos_cached[position_ids]
+        sin = self.sin_cached[position_ids]
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
     def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
+        return self._lookup(x, position_ids)
 
     def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, position_ids)
+        return self._lookup(x, position_ids)
 
     def forward_xpu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, position_ids)
+        return self._lookup(x, position_ids)
 
     def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # position_ids: [batch, seq_len]
+        # HuggingFace on-the-fly computation, kept as a numeric reference.
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 

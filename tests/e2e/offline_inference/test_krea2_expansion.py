@@ -31,7 +31,7 @@ LORA_PROMPT = f"a fox in the snow, {LORA_TRIGGER}"
 
 pytestmark = [
     pytest.mark.diffusion,
-    pytest.mark.full_model,
+    pytest.mark.slow,
 ]
 
 
