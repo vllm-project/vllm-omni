@@ -1110,8 +1110,47 @@ def build_engine_args_dict_from_omni_stage_config(
         has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
         sampling_extra_args_keys=_sampling_extra_args_keys(stage_config.model_config.default_sampling_params),
     )
+def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+    """Fail early when a stage's world size cannot fit its assigned ``devices``.
 
+    Re-runs :func:`check_device_layout` (normally only reached on the
+    ``--strategy-config`` path) against the fully resolved per-stage layout, so
+    an inconsistent ``tensor_parallel_size`` vs ``devices`` (issue #5003) is
+    reported here with a clear message instead of surfacing later as an opaque
+    worker-side ``local rank ... out of bounds`` assertion.
+    """
+    from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
 
+    runtime = getattr(stage_config, "runtime", None)
+    devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
+    if devices is None:
+        # No explicit placement -> vLLM assigns devices itself; nothing to check.
+        return
+
+    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    stage_id = getattr(stage_config, "stage_id", "?")
+    try:
+        check_device_layout(
+            devices,
+            tensor_parallel_size=int(engine_args_dict.get("tensor_parallel_size", 1) or 1),
+            data_parallel_size=int(engine_args_dict.get("data_parallel_size", 1) or 1),
+            pipeline_parallel_size=int(engine_args_dict.get("pipeline_parallel_size", 1) or 1),
+            num_replicas=int(num_replicas or 1),
+            role=f"stage-{stage_id}",
+        )
+    except StrategyApplyError as e:
+        raise ValueError(
+            f"Stage {stage_id}: device layout is inconsistent — {e} "
+            "A top-level --tensor-parallel-size is applied to every stage, but each "
+            "stage's `devices` is not adjusted automatically. Pass --stage-overrides "
+            "to set tensor_parallel_size and devices together on every stage, so "
+            "single-GPU stages get tensor_parallel_size=1, e.g. "
+            '\'{"0": {"tensor_parallel_size": 4, "devices": "0,1,2,3"}, '
+            '"1": {"tensor_parallel_size": 1, "devices": "0"}, '
+            '"2": {"tensor_parallel_size": 1, "devices": "1"}}\'. '
+            "Or omit the top-level --tensor-parallel-size and set it only in "
+            "stage-0's override."
+        ) from e
 def build_vllm_config(
     stage_config: Any,
     model: str,
@@ -1146,6 +1185,16 @@ def build_vllm_config(
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # Guard against a per-stage world size that its assigned ``devices`` cannot
+    # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
+    # to every stage, but ``devices`` is not, so a stage can end up with e.g.
+    # tensor_parallel_size=4 while still holding a single-GPU deploy default.
+    # Without --strategy-config the strategy-path device check never runs, so
+    # the mismatch used to surface only as an opaque worker-side assertion
+    # ("DP adjusted local rank N is out of bounds for M devices."). Re-run the
+    # same check here, before workers spawn, to fail early with a clear message.
+    _check_stage_device_layout(stage_config, filtered_engine_args_dict)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
     # larger than HF max_position_embeddings by design. vLLM's validator
