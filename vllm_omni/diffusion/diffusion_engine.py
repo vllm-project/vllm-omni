@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import math
+import os
 import queue
 import threading
 import time
@@ -55,7 +57,31 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+
+def _get_async_output_timeout() -> float:
+    """Resolve the timeout for background D2H/shared-memory output transfer."""
+    raw_timeout = os.environ.get(
+        "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT",
+        os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "30"),
+    )
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT (or fallback "
+            "VLLM_OMNI_VIDEO_SYNC_TIMEOUT) must be a positive finite number, "
+            f"got {raw_timeout!r}."
+        ) from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT (or fallback "
+            "VLLM_OMNI_VIDEO_SYNC_TIMEOUT) must be a positive finite number, "
+            f"got {raw_timeout!r}."
+        )
+    return timeout
+
+
+_ASYNC_OUTPUT_TIMEOUT = _get_async_output_timeout()
 
 __all__ = [
     "DiffusionEngine",

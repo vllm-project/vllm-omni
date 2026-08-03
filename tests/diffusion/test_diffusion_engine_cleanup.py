@@ -45,6 +45,35 @@ def _make_engine() -> DiffusionEngine:
     return engine
 
 
+def test_async_output_timeout_uses_video_sync_timeout_as_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "1800")
+
+    assert diffusion_engine_module._get_async_output_timeout() == 1800.0
+
+
+def test_async_output_timeout_prefers_specific_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "1800")
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", "45.5")
+
+    assert diffusion_engine_module._get_async_output_timeout() == 45.5
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "inf", "nan"])
+def test_async_output_timeout_rejects_nonpositive_or_nonfinite_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", value)
+
+    with pytest.raises(ValueError, match="positive finite"):
+        diffusion_engine_module._get_async_output_timeout()
+
+
 def test_close_completes_pending_output_streams() -> None:
     engine = _make_engine()
     event_loop = asyncio.new_event_loop()
