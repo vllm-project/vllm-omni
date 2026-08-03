@@ -282,7 +282,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            if key == "meta" and sk == "finished" and not payload_finished:
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub

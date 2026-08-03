@@ -91,6 +91,11 @@ Defensive fail-safe: if `transfer_emitter` or `replica_resolver` is missing, or 
 
 The Orchestrator instantiates `OmniPrometheusStatLogger` (a thin subclass of upstream `vllm.v1.metrics.loggers.PrometheusStatLogger`) and feeds it scheduler stats and iteration stats after processing each batch of engine outputs. This populates the standard ~37 vLLM metric families (TTFT, ITL, TPOT, KV cache usage, etc.) using the same upstream code path — but with the `engine` label reshaped into `stage` + `replica` so multi-replica deployments produce distinct series per replica. See the next section for the wrap mechanics.
 
+After stage workers finish warmup, the orchestrator requests an optional
+allocator snapshot once over the worker control-plane RPC and records it before
+frontend readiness. The snapshot never enters model-runner, request, or API
+output. Code2Wav currently supplies this post-warmup snapshot.
+
 ### Shared State Between Threads
 
 The Orchestrator runs in a background thread. The API server (OmniBase) runs in the asyncio event loop thread. `OmniRequestCounter` bridges them — a plain Python object with an `int` field. The Orchestrator increments/decrements it; the entrypoint reads it for gauge updates. No lock is needed because the counter is advisory (a stale read by one Prometheus scrape interval is acceptable). It is created by `AsyncOmniEngine.__init__()` and passed to the Orchestrator at construction time.
@@ -138,7 +143,7 @@ Behavior with `--log-stats=off` (default):
 - `OmniPrometheusStatLogger` is not constructed in `_init_metrics_state`, so the ~65 upstream `vllm:*` wrap families are not registered in the default registry at all.
 - The engine core's `Scheduler.make_stats()` also short-circuits inside upstream (`if not self.log_stats: return None`), so no `SchedulerStats` is produced per step — the per-iteration cost is bounded by the existing upstream gate.
 
-Behavior with `--log-stats=on`: all metric paths fire normally; the orchestrator's per-replica recording is bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
+Behavior with `--log-stats=on`: the post-warmup memory snapshot is published once at readiness; request-time metric paths fire normally, with orchestrator recording bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
 
 The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omni-30B single replica (30 sequential audio requests) showed a mean latency delta of +0.6% (Welch's t = 0.318, n=30, not statistically significant at α=0.05); the `/metrics` line count drops from 1358 to 124 lines when the flag is off.
 
@@ -146,7 +151,7 @@ The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omn
 
 Upstream vLLM's `Scheduler.make_stats()` runs on every AR generation step, returning a SchedulerStats object for the orchestrator. Under vLLM's architecture, this is fine. But since vLLM-Omni requires that the object be serialized and transferred over ZMQ, receiving a SchedulerStats object on every step can introduce unacceptable overhead to the system.
 
-`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step overhead.
+`OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step serialization overhead.
 
 The orchestrator side does not add its own throttle on top. Scheduler gauges are
 recorded when `raw_outputs.scheduler_stats is not None` (i.e. this replica's
@@ -191,6 +196,18 @@ Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 | `vllm:omni_transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
 | `vllm:omni_transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
 | `vllm:omni_transfer_in_flight_s` | Histogram | Network in-flight time (TX done → RX recv start) |
+
+### Generation-stage post-warmup memory (2)
+
+Labels: `{model_name, stage, replica}`. These `vllm_omni:` gauges are emitted
+at stage readiness when statistics are enabled and rank 0 supplies a memory
+snapshot. Values describe that worker's device and are not aggregated across
+tensor- or pipeline-parallel ranks.
+
+| Metric | Description |
+|---|---|
+| `vllm_omni:stage_post_warmup_memory_allocated_bytes` | CUDA allocator bytes allocated after decoder CUDA-graph warmup |
+| `vllm_omni:stage_post_warmup_memory_reserved_bytes` | CUDA allocator bytes reserved after decoder CUDA-graph warmup |
 
 ### LLM stage-level (wrapped `vllm:*`)
 

@@ -144,6 +144,13 @@ TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 
 
 # ============================================================================
+# Generation-stage post-warmup memory family (per-stage + per-replica)
+# ============================================================================
+STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_allocated_bytes"
+STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_reserved_bytes"
+
+
+# ============================================================================
 # Label sets
 # ============================================================================
 PIPELINE_LABELS = ("model_name",)

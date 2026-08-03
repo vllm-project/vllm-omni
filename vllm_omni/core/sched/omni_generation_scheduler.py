@@ -720,18 +720,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # were sent.
             for client_index, finished_set in finished_req_ids.items():
                 # Set finished request set in EngineCoreOutputs for this client.
-                if (eco := engine_core_outputs.get(client_index)) is not None:
+                eco = engine_core_outputs.get(client_index)
+                if eco is not None:
                     eco.finished_requests = finished_set
                 else:
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
+        stats = self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)
+        if stats is not None:
             # Return stats to only one of the front-ends.
-            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+            eco = next(iter(engine_core_outputs.values()), None)
+            if eco is None:
                 # We must return the stats even if there are no request
                 # outputs this step.
-                engine_core_outputs[0] = eco = EngineCoreOutputs()
+                eco = EngineCoreOutputs()
+                engine_core_outputs[0] = eco
             eco.scheduler_stats = stats
 
         self._capture_omni_connector_output(model_runner_output)

@@ -45,6 +45,23 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
+        if self.rank != 0:
+            return None
+        model = self.model_runner.get_model()
+        get_stats = getattr(model, "get_stage_post_warmup_memory_stats", None)
+        if get_stats is None:
+            return None
+
+        stats = get_stats()
+        if stats is None:
+            return None
+
+        return {
+            "allocated_bytes": stats.allocated_bytes,
+            "reserved_bytes": stats.reserved_bytes,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

@@ -264,7 +264,7 @@ def test_forward_fails_fast_when_ref_context_cache_is_missing():
         )
 
 
-def test_ref_context_cache_evicts_lru_entries_when_requests_abort():
+def test_ref_context_cache_evicts_lru_entries_at_entry_cap():
     model = _make_model()
     model._ref_context_cache_max_entries = 2
 
@@ -286,6 +286,17 @@ def test_ref_context_cache_evicts_lru_entries_when_requests_abort():
 
     assert list(model._ref_context_cache) == ["b", "c"]
     assert model._ref_context_cache_bytes == sum(model._tensor_nbytes(t) for t in model._ref_context_cache.values())
+
+
+def test_finished_request_cleanup_removes_cached_context():
+    model = _make_model()
+    model._cache_ref_context("a", torch.ones(4))
+    model._cache_ref_context("b", torch.ones(8))
+
+    model.on_requests_finished({"a"})
+
+    assert list(model._ref_context_cache) == ["b"]
+    assert model._ref_context_cache_bytes == 32
 
 
 def test_ref_context_cache_evicts_to_byte_cap():
@@ -311,6 +322,23 @@ def test_ref_context_cache_evicts_to_byte_cap():
 
     assert list(model._ref_context_cache) == ["b"]
     assert model._ref_context_cache_bytes == 32
+
+
+def test_stage_post_warmup_memory_stats_reads_retained_wrapper():
+    model = _make_model()
+    model.decoder._cudagraph_wrapper = SimpleNamespace(post_warmup_memory_stats=(17, 23))
+
+    stats = model.get_stage_post_warmup_memory_stats()
+
+    assert stats is not None
+    assert stats.allocated_bytes == 17
+    assert stats.reserved_bytes == 23
+
+
+def test_stage_post_warmup_memory_stats_omits_missing_snapshot():
+    model = _make_model()
+
+    assert model.get_stage_post_warmup_memory_stats() is None
 
 
 def test_connector_codec_chunking_does_not_override_decode_chunking():

@@ -1,4 +1,5 @@
 import contextlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +7,7 @@ import torch
 from vllm.config import CacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
-import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
+import vllm_omni.worker.gpu_generation_model_runner as generation_runner
 from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
@@ -47,6 +48,7 @@ def _make_runner(multimodal_outputs):
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner._async_chunk = False
+    runner.model = SimpleNamespace()
     return runner
 
 
@@ -92,6 +94,39 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+def test_zero_token_cleanup_notifies_model(monkeypatch):
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.execute_model_state = None
+    runner.routed_experts_initialized = False
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.synchronize_input_prep = nullcontext
+    runner._update_states = lambda _: None
+    runner.attach_omni_connector_output = lambda output: output
+
+    cache_entries = 1
+
+    def on_requests_finished(_):
+        nonlocal cache_entries
+        cache_entries = 0
+
+    raw_model = SimpleNamespace(
+        on_requests_finished=on_requests_finished,
+    )
+    runner.model = SimpleNamespace()
+    runner.get_model = lambda: raw_model
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0,
+        num_scheduled_tokens={},
+        finished_req_ids={"req-1"},
+    )
+    monkeypatch.setattr(generation_runner, "has_kv_transfer_group", lambda: False)
+
+    GPUGenerationModelRunner.execute_model(runner, scheduler_output)
+
+    assert cache_entries == 0
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens
@@ -121,7 +156,7 @@ def _make_guard_runner():
 def test_execute_model_skips_non_positive_scheduled_span(monkeypatch, total):
     """#5196: a negative span is truthy, so it used to reach `_prepare_inputs`,
     whose `assert total_num_scheduled_tokens > 0` killed the stage EngineCore."""
-    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(generation_runner, "has_kv_transfer_group", lambda: False)
     runner = _make_guard_runner()
 
     output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(total))

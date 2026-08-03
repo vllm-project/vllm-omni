@@ -10,6 +10,14 @@ from vllm_omni.inputs.data import OmniPromptType
 
 
 @dataclass
+class StagePostWarmupMemoryStats:
+    """Model-owned allocator snapshot captured after stage warmup."""
+
+    allocated_bytes: int
+    reserved_bytes: int
+
+
+@dataclass
 class OmniConnectorOutput:
     """Communication results from Model Runner to Scheduler.
 

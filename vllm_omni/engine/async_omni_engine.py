@@ -330,6 +330,7 @@ class AsyncOmniEngine:
             diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            log_stats=self._log_stats,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,
@@ -337,7 +338,6 @@ class AsyncOmniEngine:
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
-            log_stats=self._log_stats,
         )
         self._runtime.initialize()
 
@@ -426,6 +426,7 @@ class AsyncOmniEngine:
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
             )
+            await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()

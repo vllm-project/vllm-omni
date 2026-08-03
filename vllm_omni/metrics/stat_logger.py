@@ -20,12 +20,18 @@ Contents:
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+from threading import Lock
+from weakref import WeakKeyDictionary
+
+from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.perf import PerfMetricsProm
 from vllm.v1.spec_decode.metrics import SpecDecodingProm
+
+from vllm_omni.metrics import definitions as defs
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
 # Keys are flat engine_idx values (as upstream PrometheusStatLogger sees them);
@@ -36,6 +42,31 @@ from vllm.v1.spec_decode.metrics import SpecDecodingProm
 # StatLogger that owns them. vLLM runs a single Orchestrator/StatLogger per
 # process, so a module global is safe; tests isolate by .clear()ing first.
 _ENGINE_INDEX_MAP: dict[int, tuple[str, str]] = {}
+_STAGE_POST_WARMUP_MEMORY_FAMILIES: WeakKeyDictionary[CollectorRegistry, tuple[Gauge, Gauge]] = WeakKeyDictionary()
+_STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK = Lock()
+
+
+def _get_stage_post_warmup_memory_families(registry: CollectorRegistry) -> tuple[Gauge, Gauge]:
+    with _STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK:
+        families = _STAGE_POST_WARMUP_MEMORY_FAMILIES.get(registry)
+        if families is None:
+            labels = list(defs.STAGE_LABELS)
+            families = (
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES,
+                    "Rank-0 worker CUDA allocator bytes allocated after decoder CUDA-graph warmup.",
+                    labelnames=labels,
+                    registry=registry,
+                ),
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES,
+                    "Rank-0 worker CUDA allocator bytes reserved after decoder CUDA-graph warmup.",
+                    labelnames=labels,
+                    registry=registry,
+                ),
+            )
+            _STAGE_POST_WARMUP_MEMORY_FAMILIES[registry] = families
+        return families
 
 
 def _rewrite_labelnames(labelnames):
@@ -221,6 +252,12 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
             vllm_config=vllm_config,
             engine_indexes=list(stage_replica_map.keys()),
         )
+        self._init_stage_post_warmup_memory_families()
+
+    def _init_stage_post_warmup_memory_families(self, registry: CollectorRegistry = REGISTRY) -> None:
+        self._stage_post_warmup_memory_allocated_family, self._stage_post_warmup_memory_reserved_family = (
+            _get_stage_post_warmup_memory_families(registry)
+        )
 
     @property
     def stage_replica_map(self) -> dict[int, tuple[str, str]]:
@@ -241,3 +278,14 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
             stage, replica = self._stage_replica_map[idx]
             rewritten[idx] = [model_name, stage, replica]
         self._omni_per_engine_labelvalues = rewritten
+
+    def record_stage_post_warmup_memory(
+        self,
+        stats: StagePostWarmupMemoryStats,
+        *,
+        engine_idx: int,
+    ) -> None:
+        model_name, stage, replica = self.per_engine_labelvalues[engine_idx]
+        labels = (model_name, stage, replica)
+        self._stage_post_warmup_memory_allocated_family.labels(*labels).set(stats.allocated_bytes)
+        self._stage_post_warmup_memory_reserved_family.labels(*labels).set(stats.reserved_bytes)

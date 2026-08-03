@@ -1076,8 +1076,6 @@ class StagePool:
             return await self.pick(request_id, affinity_request_id=affinity_request_id)
         return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
-    # ---- Stage-local polling ----
-
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
         outputs = await client.get_output_async()

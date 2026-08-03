@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
     OmniPrometheusStatLogger,
@@ -15,6 +19,7 @@ from vllm_omni.metrics.stat_logger import (
     _RelabelHistogram,
     _rewrite_labelnames,
 )
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -366,6 +371,77 @@ class TestOmniPrometheusStatLogger:
 
         assert dict(_ENGINE_INDEX_MAP) == srm
         assert 99 not in _ENGINE_INDEX_MAP  # old entry was cleared
+
+    def test_record_stage_post_warmup_memory_updates_values(self, registry):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._omni_per_engine_labelvalues = {3: ["m", "1", "0"]}
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(
+                allocated_bytes=11,
+                reserved_bytes=13,
+            ),
+            engine_idx=3,
+        )
+
+        labels = {"model_name": "m", "stage": "1", "replica": "0"}
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, labels) == 11
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES, labels) == 13
+
+    def test_stage_post_warmup_memory_families_register_only_with_logger(self, registry):
+        metric_name = defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES
+        assert metric_name not in generate_latest(registry).decode()
+
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        assert f"# HELP {metric_name}" in generate_latest(registry).decode()
+
+    def test_stage_post_warmup_memory_families_reused_on_logger_recreation(self, monkeypatch, registry):
+        init_families = OmniPrometheusStatLogger._init_stage_post_warmup_memory_families
+        monkeypatch.setattr(
+            OmniPrometheusStatLogger,
+            "_init_stage_post_warmup_memory_families",
+            lambda self: init_families(self, registry),
+        )
+
+        def init_upstream(self, vllm_config, engine_indexes):
+            self.per_engine_labelvalues = {idx: ["m", str(idx)] for idx in engine_indexes}
+
+        monkeypatch.setattr(PrometheusStatLogger, "__init__", init_upstream)
+        stage_replica_map = {0: ("1", "0")}
+
+        first = OmniPrometheusStatLogger(SimpleNamespace(), stage_replica_map)
+        second = OmniPrometheusStatLogger(SimpleNamespace(), stage_replica_map)
+
+        assert first._stage_post_warmup_memory_allocated_family is second._stage_post_warmup_memory_allocated_family
+
+    def test_record_stage_post_warmup_memory_preserves_replica_values(self, registry):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._omni_per_engine_labelvalues = {
+            0: ["m", "1", "0"],
+            1: ["m", "1", "1"],
+        }
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=12),
+            engine_idx=0,
+        )
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=13, reserved_bytes=14),
+            engine_idx=0,
+        )
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=17, reserved_bytes=18),
+            engine_idx=1,
+        )
+
+        replica_0 = {"model_name": "m", "stage": "1", "replica": "0"}
+        replica_1 = {"model_name": "m", "stage": "1", "replica": "1"}
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, replica_0) == 13
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, replica_1) == 17
 
 
 # ---------------------------------------------------------------------------

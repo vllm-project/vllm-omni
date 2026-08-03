@@ -1091,6 +1091,7 @@ def create_stage_runtime(
     diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
+    log_stats: bool = False,
     # Distributed-only params:
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
@@ -1099,7 +1100,6 @@ def create_stage_runtime(
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
-    log_stats: bool = False,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:

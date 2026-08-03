@@ -653,7 +653,8 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     assert captured_cleanup == [[initialized_client]]
 
 
-def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
+@pytest.mark.parametrize("log_stats", [False, True])
+def test_initialize_local_llm_replica_passes_launch_options(monkeypatch, log_stats):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
@@ -664,12 +665,14 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         stage_init_timeout=1,
         diffusion_batch_size=1,
         async_chunk=False,
+        log_stats=log_stats,
     )
     stage_init_timeout = 302
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
+    captured_log_stats: bool | None = None
 
     plan = ReplicaInitPlan(
         replica_id=0,
@@ -698,7 +701,9 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     @contextlib.contextmanager
-    def _fake_launch_stage_replica(**_kwargs):
+    def _fake_launch_stage_replica(**kwargs):
+        nonlocal captured_log_stats
+        captured_log_stats = kwargs["log_stats"]
         yield StageReplicaResources(
             manager=types.SimpleNamespace(shutdown=lambda: None),
             addresses=fake_addresses,
@@ -720,6 +725,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == stage_init_timeout
+    assert captured_log_stats is log_stats
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):

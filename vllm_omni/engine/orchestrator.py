@@ -53,7 +53,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 
 logger = init_logger(__name__)
 
@@ -578,6 +578,49 @@ class Orchestrator:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def publish_stage_post_warmup_memory(self) -> None:
+        if self._stat_logger is None:
+            return
+
+        targets = [
+            (pool.stage_id, replica_id, pool)
+            for pool in self.stage_pools
+            if pool.stage_vllm_config is not None
+            for replica_id in pool.live_replica_ids()
+        ]
+        results = await asyncio.gather(
+            *(
+                pool.collective_rpc(
+                    replica_id=replica_id,
+                    method="get_stage_post_warmup_memory_stats",
+                )
+                for _, replica_id, pool in targets
+            )
+        )
+
+        for (stage_id, replica_id, _), worker_results in zip(targets, results):
+            if not isinstance(worker_results, list):
+                continue
+            snapshot = next(
+                (
+                    result
+                    for result in worker_results
+                    if isinstance(result, dict)
+                    and result.get("allocated_bytes") is not None
+                    and result.get("reserved_bytes") is not None
+                ),
+                None,
+            )
+            if snapshot is None:
+                continue
+            self._stat_logger.record_stage_post_warmup_memory(
+                StagePostWarmupMemoryStats(
+                    allocated_bytes=snapshot["allocated_bytes"],
+                    reserved_bytes=snapshot["reserved_bytes"],
+                ),
+                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+            )
 
     # ---- Request handling ----
 

@@ -187,6 +187,7 @@ class CUDAGraphDecoderWrapper:
 
         self._warmed_up = False
         self._device = None
+        self.post_warmup_memory_stats: tuple[int, int] | None = None
         self._stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "").lower() in (
             "1",
             "true",
@@ -357,6 +358,8 @@ class CUDAGraphDecoderWrapper:
         self._warmed_up = True
         warmup_ms = (time.perf_counter() - warmup_start_s) * 1000.0
         mem_after = self._get_cuda_memory_stats(device)
+        if mem_after is not None:
+            self.post_warmup_memory_stats = mem_after[:2]
         logger.info(
             "CUDA Graph warmup complete: %d/%d captured in %.1f ms%s",
             len(self.graphs),

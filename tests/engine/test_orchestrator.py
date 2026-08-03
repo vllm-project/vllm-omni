@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import janus
 import pytest
@@ -17,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.engine import OmniEngineCoreOutputs
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -49,7 +51,7 @@ from vllm_omni.experimental.fullduplex.engine.messages import (
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -146,7 +148,7 @@ class FakeStageClient:
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[], scheduler_stats=None, finished_requests=None)
+            return OmniEngineCoreOutputs()
 
     def get_diffusion_output_nowait(self):
         try:
@@ -2287,6 +2289,44 @@ async def test_stage_pool_preserves_none_iteration_stats() -> None:
     await pool.process_llm_raw_outputs(0, raw_outputs, iteration_stats=None)
 
     assert processor.process_calls[0][0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_preserves_scheduler_stats_only_outputs():
+    pool = object.__new__(StagePool)
+    stats_outputs = OmniEngineCoreOutputs(scheduler_stats=SimpleNamespace())
+    client = SimpleNamespace(get_output_async=AsyncMock(return_value=stats_outputs))
+
+    assert await pool._poll_stage_raw(client) is stats_outputs
+
+    client.get_output_async.return_value = OmniEngineCoreOutputs()
+    assert await pool._poll_stage_raw(client) is None
+
+
+@pytest.mark.asyncio
+async def test_publish_stage_post_warmup_memory_records_initialized_replica():
+    logger = SimpleNamespace(record_stage_post_warmup_memory=Mock())
+    pool = SimpleNamespace(
+        stage_id=1,
+        stage_vllm_config=SimpleNamespace(),
+        live_replica_ids=lambda: [0],
+        collective_rpc=AsyncMock(return_value=[None, {"allocated_bytes": 11, "reserved_bytes": 13}]),
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._stat_logger = logger
+    orchestrator.stage_pools = [pool]
+    orchestrator._stage_replica_to_engine_idx = {(1, 0): 4}
+
+    await orchestrator.publish_stage_post_warmup_memory()
+
+    pool.collective_rpc.assert_awaited_once_with(
+        replica_id=0,
+        method="get_stage_post_warmup_memory_stats",
+    )
+    logger.record_stage_post_warmup_memory.assert_called_once_with(
+        StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=13),
+        engine_idx=4,
+    )
 
 
 @pytest.mark.asyncio

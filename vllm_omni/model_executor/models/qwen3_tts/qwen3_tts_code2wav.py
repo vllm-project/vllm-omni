@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -234,6 +235,14 @@ class Qwen3TTSCode2Wav(nn.Module):
                 self._ref_context_cache_bytes,
             )
 
+    def get_stage_post_warmup_memory_stats(self) -> StagePostWarmupMemoryStats | None:
+        """Return the allocator snapshot retained after decoder warmup."""
+        wrapper = getattr(self.decoder, "_cudagraph_wrapper", None)
+        memory_stats = getattr(wrapper, "post_warmup_memory_stats", None)
+        if memory_stats is None:
+            return None
+        return StagePostWarmupMemoryStats(*memory_stats)
+
     def _cache_ref_context(self, request_id: str, tensor: torch.Tensor) -> None:
         previous = self._ref_context_cache.pop(request_id, None)
         if previous is not None:
@@ -254,6 +263,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         cached = self._ref_context_cache.pop(request_id, None)
         if cached is not None:
             self._ref_context_cache_bytes -= self._tensor_nbytes(cached)
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        for request_id in finished_req_ids:
+            self._pop_ref_context(request_id)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
