@@ -1952,47 +1952,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         ("audio_head.", "audio_head"),
     )
 
-    def _apply_mla_scale_fold(self) -> None:
-        """Fold LongCat MLA input scales into q_b_proj / kv_b_proj weights.
-
-        Only the backbone's flash layers use DeepSeekV2MLAAttention; the
-        encoder/decoder side modules have their own projected attention and
-        must not be touched. Folding is idempotent and only valid on the first
-        weight load.
-        """
-        hf = getattr(self.config, "hidden_size", None) or 3072
-        q_lora = int(getattr(self.config, "q_lora_rank", 0))
-        kv_lora = int(getattr(self.config, "kv_lora_rank", 0))
-        if not q_lora or not kv_lora:
-            return
-        scale_q = (hf / q_lora) ** 0.5
-        scale_kv = (hf / kv_lora) ** 0.5
-        model = getattr(self, "model", None)
-        layers = getattr(model, "layers", None)
-        if layers is None:
-            return
-        scaled = 0
-        for layer in layers:
-            attns = getattr(layer, "self_attn", None)
-            if attns is None:
-                continue
-            for attn in attns:
-                qb = getattr(attn, "q_b_proj", None)
-                if qb is not None and getattr(qb, "weight", None) is not None:
-                    with torch.no_grad():
-                        qb.weight.mul_(scale_q)
-                    scaled += 1
-                kvb = getattr(attn, "kv_b_proj", None)
-                if kvb is not None and getattr(kvb, "weight", None) is not None:
-                    with torch.no_grad():
-                        kvb.weight.mul_(scale_kv)
-                    scaled += 1
-        logger.info(
-            "[longcat-mla-scale] folded q_scale=%.4f kv_scale=%.4f across %d "
-            "attention projections (hidden=%s q_lora=%s kv_lora=%s)",
-            scale_q, scale_kv, scaled, hf, q_lora, kv_lora,
-        )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         side_state: dict[str, dict[str, torch.Tensor]] = {
             attr: {} for _, attr in self._SIDE_MODULE_PREFIXES
@@ -2014,18 +1973,12 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         )
         loaded = loader.load_weights(split(weights))
 
-        # Fold the LongCat-specific MLA input scales that vLLM's generic
-        # DeepseekV2MLAAttention does not apply. HF's LongcatFlashMLA does:
-        #   q_pass *= mla_scale_q_lora ; q_rot *= mla_scale_q_lora
-        #   k_pass *= mla_scale_kv_lora  (before kv_b_proj -> scales k_nope & v)
-        # with mla_scale_q_lora = (hidden/q_lora_rank)^0.5 and
-        #      mla_scale_kv_lora = (hidden/kv_lora_rank)^0.5.
-        # vLLM's attention omits these entirely, which re-weights each head's
-        # nope and rope score terms differently -> re-ranks logits AND
-        # compresses their span vs the reference. They are constant scalars, so
-        # folding them into the projection weights is mathematically exact and
-        # needs no vLLM kernel change.
-        self._apply_mla_scale_fold()
+        # Note: the LongCat-specific MLA input scales (mla_scale_q_lora,
+        # mla_scale_kv_lora) are already applied by the vllm fork's
+        # FlashModel.load_weights (longcat_flash.py), which scales
+        # q_a_layernorm.weight / kv_a_layernorm.weight in place, gated on the
+        # same config flags and idempotency-guarded via
+        # _mla_q_lora_scaled/_mla_kv_lora_scaled. Do not re-apply here.
 
         device = next(self.model.parameters()).device
         for ckpt_prefix, attr in self._SIDE_MODULE_PREFIXES:
