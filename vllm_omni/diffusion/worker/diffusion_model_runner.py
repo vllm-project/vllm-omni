@@ -63,6 +63,7 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.startup_timing import log_startup_duration
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 if TYPE_CHECKING:
@@ -274,6 +275,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             time_after_load - time_before_load,
         )
         logger.info("Model runner: Model loaded successfully.")
+        runtime_setup_started = time.perf_counter()
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -362,6 +364,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 model_tag=self.od_config.model_class_name,
             )
 
+        log_startup_duration(
+            logger,
+            "model.runtime_setup",
+            time.perf_counter() - runtime_setup_started,
+            model=self.od_config.model_class_name,
+        )
         logger.info("Model runner: Initialization complete.")
 
     def clear_prompt_embed_cache(self) -> None:

@@ -4,6 +4,7 @@
 import asyncio
 import queue
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -964,12 +965,21 @@ class TestDiffusionEngine:
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = mocker.Mock()
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(output=None))
+        phases = []
+
+        @contextmanager
+        def _record_span(_logger, phase, **_labels):
+            phases.append(phase)
+            yield
+
+        mocker.patch("vllm_omni.diffusion.diffusion_engine.startup_span", side_effect=_record_span)
 
         engine._dummy_run()
 
         engine.pre_process_func.assert_not_called()
         admitted_request = engine.add_req_and_wait_for_response.call_args.args[0]
         assert admitted_request.request_id == "dummy_req_id"
+        assert phases == ["engine.dummy_warmup", "engine.dummy_request"]
 
 
 class TestStepScheduler:

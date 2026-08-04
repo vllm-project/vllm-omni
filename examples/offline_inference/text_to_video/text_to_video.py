@@ -591,6 +591,10 @@ def main():
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
+    profiled_output = frames[0] if isinstance(frames, list) and frames else frames
+    if args.enable_diffusion_pipeline_profiler and isinstance(profiled_output, OmniRequestOutput):
+        print(f"Pipeline stage durations: {json.dumps(profiled_output.stage_durations, sort_keys=True)}")
+
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
@@ -598,6 +602,7 @@ def main():
     if peak_mb:
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
+    output_processing_start = time.perf_counter()
     audio = None
     audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
@@ -766,6 +771,7 @@ def main():
     else:
         export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
+    print(f"Output processing time: {time.perf_counter() - output_processing_start:.4f} seconds")
 
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")
