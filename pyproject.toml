@@ -109,6 +109,7 @@ docs = [
     "mkdocstrings-python",
     "mkdocs-gen-files",
     "mkdocs-awesome-nav",
+    "mkdocs-redirects",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
