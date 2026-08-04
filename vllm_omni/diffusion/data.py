@@ -469,6 +469,11 @@ class DiffusionCacheConfig:
     inter_request_clip_threshold: float = 0.75
     inter_request_clip_min_skip: int = 5
     inter_request_clip_max_skip_ratio: float = 0.5
+    # Max number of step latents to store per cache entry. Only the first N
+    # denoising steps are cached; semantic-hit resume beyond N is clamped to N.
+    # This drastically reduces per-entry size (e.g. 10 steps instead of 40).
+    # 0 = store all steps (original behaviour).
+    inter_request_max_stored_steps: int = 0
     inter_request_use_t2i_penalty: bool = True
 
     # step_cache parameters [step_cache only] — DreamZero velocity schedule

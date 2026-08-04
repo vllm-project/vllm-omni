@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -67,39 +68,55 @@ class InterRequestCacheBackend(CacheBackend):
             from lmcache.v1.config import LMCacheEngineConfig
             from lmcache.v1.cache_engine import LMCacheMetadata
 
-            lc_config = LMCacheEngineConfig.from_defaults(
-                local_cpu=True,
-                max_local_cpu_size=getattr(config, "inter_request_lmcache_max_cpu_gb", 5.0),
-                local_disk=lmcache_disk_dir,
-                max_local_disk_size=getattr(config, "inter_request_lmcache_max_disk_gb", 100.0),
-                save_decode_cache=True,
-            )
+            cpu_gb = getattr(config, "inter_request_lmcache_max_cpu_gb", 5.0)
+            disk_gb = getattr(config, "inter_request_lmcache_max_disk_gb", 100.0)
+
             lc_metadata = LMCacheMetadata(
                 model_name="vllm_omni_diffusion",
-                world_size=1,
-                local_world_size=1,
-                worker_id=0,
-                local_worker_id=0,
+                world_size=1, local_world_size=1,
+                worker_id=0, local_worker_id=0,
                 kv_dtype=_torch.float32,
-                kv_shape=(1, 1, 1, 1, 1),  # unused by ECCacheEngine
+                kv_shape=(1, 1, 1, 1, 1),
             )
+
+            # Single LMCache engine for step latents only (8MB each).
+            # Final latent (185MB) is stored via direct torch.save to avoid
+            # LMCache CPU pool pressure and LRU-eviction-before-write data loss.
+            steps_dir = os.path.join(lmcache_disk_dir, "steps")
+            os.makedirs(steps_dir, exist_ok=True)
+
             self._lmcache_engine = ECCacheEngine(
-                config=lc_config,
+                config=LMCacheEngineConfig.from_defaults(
+                    local_cpu=True, max_local_cpu_size=cpu_gb,
+                    local_disk=steps_dir, max_local_disk_size=disk_gb,
+                    save_decode_cache=True,
+                ),
                 metadata=lc_metadata,
                 encoder_dtype=_torch.float32,
             )
+            self._lmcache_steps_engine = self._lmcache_engine
             logger.info(
-                "LMCache ECCacheEngine initialized: disk_dir=%s, cpu_gb=%.1f",
-                lmcache_disk_dir,
-                lc_config.max_local_cpu_size,
+                "LMCache ECCacheEngine initialized for step latents: "
+                "steps_dir=%s, cpu_gb=%.1f",
+                steps_dir, cpu_gb,
             )
         else:
             self._lmcache_engine = None
+            self._lmcache_steps_engine = None
+
+        # Final latent directory (torch.save direct to disk, bypasses LMCache)
+        final_disk_dir = None
+        if lmcache_disk_dir:
+            final_disk_dir = os.path.join(lmcache_disk_dir, "final_direct")
+            os.makedirs(final_disk_dir, exist_ok=True)
 
         self._cache_store = DiTCacheStore(
             max_entries=max_entries,
             max_memory_gb=max_memory_gb,
             lmcache_engine=self._lmcache_engine,
+            lmcache_steps_engine=self._lmcache_steps_engine,
+            max_stored_steps=getattr(config, "inter_request_max_stored_steps", 0),
+            final_disk_dir=final_disk_dir,
         )
         self._pipeline = None
 
@@ -323,6 +340,14 @@ class InterRequestCacheBackend(CacheBackend):
         ratio = min(max(ratio, 0.0), 1.0)
 
         skip = self._clip_min_skip + int(ratio * (max_skip - self._clip_min_skip))
+
+        # Clamp to max_stored_steps: if we only stored the first N step latents,
+        # resume beyond step N is impossible. Clamp to N so the runner can find
+        # the step latent at index N-1.
+        max_stored = self._cache_store._max_stored_steps
+        if max_stored > 0 and skip > max_stored:
+            skip = max_stored
+
         return skip
 
     @property
@@ -341,6 +366,10 @@ class InterRequestCacheBackend(CacheBackend):
         # Close LMCache engine (flushes async writes + stops background workers).
         if self._lmcache_engine is not None:
             self._lmcache_engine.close()
+            logger.info("LMCache ECCacheEngine closed")
+        # Flush pending final latent disk writes
+        if hasattr(self._cache_store, "_final_write_executor"):
+            self._cache_store._final_write_executor.shutdown(wait=True)
             logger.info("LMCache ECCacheEngine closed")
 
         # Persist hot (in-CPU) entries to persistent_cache_dir for cross-process

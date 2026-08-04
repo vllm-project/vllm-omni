@@ -4,7 +4,9 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,6 +81,9 @@ class DiTCacheStore:
         max_entries: int = 100,
         max_memory_gb: float = 4.0,
         lmcache_engine: Any | None = None,
+        lmcache_steps_engine: Any | None = None,
+        max_stored_steps: int = 0,
+        final_disk_dir: str | None = None,
     ):
         self._store: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_entries = max_entries
@@ -97,7 +102,28 @@ class DiTCacheStore:
         # manages CPU→Disk tiering + LRU internally). On CPU eviction the entry's
         # latents are set to None (lightweight shell kept for semantic_search);
         # a subsequent get() recovers them from LMCache via engine.get().
-        self._lmcache = lmcache_engine
+        self._lmcache = lmcache_engine           # for step latents (8MB each)
+        self._lmcache_steps = lmcache_steps_engine  # same as _lmcache (backward compat)
+
+        # Final latent (185MB) uses direct torch.save to disk (async thread)
+        # instead of LMCache. This avoids LMCache CPU pool pressure and
+        # LRU-eviction-before-disk-write data loss.
+        self._final_disk_dir = Path(final_disk_dir) if final_disk_dir else None
+        if self._final_disk_dir:
+            self._final_disk_dir.mkdir(parents=True, exist_ok=True)
+        self._final_write_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="final-disk")
+
+        # Monkey-patch ECCacheEngine.put to use busy_loop=True.
+        # LMCache's put() hardcodes busy_loop=False, which means allocate()
+        # gives up immediately on pool pressure instead of waiting for LRU
+        # eviction to free space. With busy_loop=True, allocate() retries
+        # every 0.1s until eviction succeeds — preventing data loss.
+        self._patch_lmcache_busy_loop(self._lmcache)
+        self._patch_lmcache_busy_loop(self._lmcache_steps)
+
+        # Max number of step latents to store (0 = all steps).
+        # Limits per-entry size; semantic-hit resume beyond this is clamped.
+        self._max_stored_steps = max_stored_steps
 
         # ---- Pre-stacked embedding matrices for fast vectorized retrieval ----
         # Instead of torch.stack()-ing all embeddings on every semantic_search()
@@ -225,10 +251,11 @@ class DiTCacheStore:
                     oldest_entry = entry
                     break
             if oldest_key is None:
-                # All entries are shells (latents=None). If still over budget,
-                # purge the oldest shell entirely (frees its embedding bytes).
-                # This handles the "max_memory_gb < total embedding bytes" edge case.
-                if len(self._store) > 0:
+                # All entries are shells. If still over budget, purge the oldest
+                # shell entirely (frees its embedding bytes). But always keep at
+                # least max_entries shells (or all if fewer) so that exact-hit
+                # lookups can still find entries whose latents are in LMCache.
+                if len(self._store) > self._max_entries:
                     purge_key = next(iter(self._store))
                     purged = self._store.pop(purge_key)
                     self._current_memory_bytes -= self._estimate_entry_bytes(purged)
@@ -274,11 +301,15 @@ class DiTCacheStore:
         clip_embedding: torch.Tensor | None = None,
     ):
         key_hash = key.to_hash()
-        # Full entry bytes including embeddings, so _current_memory_bytes
-        # stays consistent with _estimate_entry_bytes used in evict.
+        # Compute bytes from the ACTUAL latents passed in (before truncation)
+        # — this overestimates slightly when max_stored_steps truncates, but
+        # _estimate_entry_bytes on the stored entry will be accurate.
         tensor_bytes = self._estimate_tensor_bytes(latents)
         if step_latents is not None:
-            tensor_bytes += self._estimate_step_latents_bytes(step_latents)
+            stored_steps = step_latents
+            if max_stored_steps := getattr(self, "_max_stored_steps", 0):
+                stored_steps = step_latents[:max_stored_steps]
+            tensor_bytes += self._estimate_step_latents_bytes(stored_steps)
         if clip_embedding is not None:
             tensor_bytes += self._estimate_tensor_bytes(clip_embedding)
 
@@ -292,33 +323,46 @@ class DiTCacheStore:
             cached_latents = latents.detach().clone().cpu()
             cached_step_latents = None
             if step_latents is not None:
+                # Limit number of step latents stored (0 = all).
+                steps_to_store = step_latents
+                if self._max_stored_steps > 0:
+                    steps_to_store = step_latents[: self._max_stored_steps]
                 cached_step_latents = [
                     StepLatentData(
                         step_index=s.step_index,
                         timestep=s.timestep,
                         latent=s.latent.detach().clone().cpu(),
                     )
-                    for s in step_latents
+                    for s in steps_to_store
                 ]
             cached_clip = clip_embedding.detach().clone().cpu() if clip_embedding is not None else None
 
-            # Persist to LMCache BEFORE inserting into OrderedDict, so that data
-            # is safely on disk even if CPU eviction immediately clears it.
-            if self._lmcache is not None:
-                self._lmcache.put(f"{key_hash}:final", cached_latents)
+            # Persist latents BEFORE inserting into OrderedDict.
+            # Final latent (185MB): direct torch.save to disk (async thread),
+            #   bypasses LMCache to avoid pool pressure + LRU data loss.
+            # Step latents (8MB each): LMCache (small data, fast async write).
+            if self._final_disk_dir is not None:
+                # Async write final latent to disk
+                self._final_write_executor.submit(
+                    self._save_final_to_disk, key_hash, cached_latents
+                )
+            if self._lmcache is not None or self._lmcache_steps is not None:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    time.sleep(dist.get_rank() * 0.5)
+                # Step latents go to LMCache (small 8MB tensors)
+                steps_engine = self._lmcache_steps if self._lmcache_steps is not None else self._lmcache
+                meta_pairs = None
                 if cached_step_latents:
-                    # Store step latents individually + a meta tensor carrying
-                    # [step_index, timestep] pairs so recovery preserves the
-                    # real diffusion timesteps (not just the step index).
                     meta_pairs = torch.tensor(
                         [[s.step_index, s.timestep] for s in cached_step_latents],
                         dtype=torch.float32,
                     )
-                    self._lmcache.put(f"{key_hash}:steps_meta", meta_pairs)
-                    for s in cached_step_latents:
-                        self._lmcache.put(
-                            f"{key_hash}:step_{s.step_index:04d}", s.latent
-                        )
+                if steps_engine is not None:
+                    self._lmcache_put_entry_with_lock(
+                        key_hash, cached_latents, cached_step_latents, meta_pairs,
+                        final_engine=None, steps_engine=steps_engine,
+                    )
 
             self._evict_if_needed(tensor_bytes)
 
@@ -350,15 +394,69 @@ class DiTCacheStore:
                 len(self._store),
             )
 
+    def _lmcache_put_entry_with_lock(
+        self, key_hash: str, final_latent: torch.Tensor,
+        step_latents: list[StepLatentData] | None,
+        meta_pairs: torch.Tensor | None,
+        final_engine: Any | None = None,
+        steps_engine: Any | None = None,
+    ) -> None:
+        """Write a complete cache entry to LMCache with retry on failure.
+
+        Uses two separate engines to avoid fragmentation:
+        - final_engine: stores the 185MB final latent (uniform large blocks)
+        - steps_engine: stores 8MB step latents + meta (uniform small blocks)
+        If only one engine is provided, all data goes to it (backward compat).
+        """
+        max_retries = 5
+        backoff = 1.0
+
+        def _put_with_retry(engine, key: str, tensor: torch.Tensor) -> bool:
+            for attempt in range(max_retries):
+                if engine.put(key, tensor):
+                    return True
+                logger.info(
+                    "LMCache put retry %d/%d for %s (waiting %.1fs)",
+                    attempt + 1, max_retries, key[:24], backoff,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            logger.warning("LMCache put failed after %d retries for %s", max_retries, key[:24])
+            return False
+
+        # Write final latent to final_engine (only if explicitly provided).
+        # If final_engine is None, final was already saved via torch.save.
+        if final_engine is not None:
+            _put_with_retry(final_engine, f"{key_hash}:final", final_latent)
+
+        # Write step latents to steps_engine (or final_engine if only one).
+        se = steps_engine if steps_engine is not None else final_engine
+        if se is not None:
+            if meta_pairs is not None:
+                _put_with_retry(se, f"{key_hash}:steps_meta", meta_pairs)
+            if step_latents:
+                for s in step_latents:
+                    _put_with_retry(se, f"{key_hash}:step_{s.step_index:04d}", s.latent)
+
     def _recover_latents_from_lmcache(self, entry: CacheEntry, key_hash: str) -> bool:
-        """Recover entry.latents from LMCache if it was evicted to None.
-        Called inside self._lock. Returns True if latents are now available
-        (either recovered or were already present), False if LMCache miss."""
+        """Recover entry.latents if it was evicted to None.
+        Called inside self._lock. Returns True if latents are now available."""
         if entry.latents is not None:
             return True
-        if self._lmcache is None:
+        # Try disk first (final latent saved via torch.save)
+        if self._final_disk_dir is not None:
+            path = self._final_disk_dir / f"{key_hash}.pt"
+            if path.exists():
+                recovered = torch.load(path, map_location="cpu", weights_only=True)
+                entry.latents = recovered
+                self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
+                logger.debug("Recovered %s final latent from disk", key_hash[:8])
+                return True
+        # Fallback to LMCache
+        engine = self._lmcache if self._lmcache is not None else self._lmcache_steps
+        if engine is None:
             return False
-        recovered = self._lmcache.get(f"{key_hash}:final", device="cpu")
+        recovered = engine.get(f"{key_hash}:final", device="cpu")
         if recovered is None:
             return False
         entry.latents = recovered
@@ -626,19 +724,21 @@ class DiTCacheStore:
                 return None
 
             # LMCache recovery: if step_latents were evicted from CPU, recover.
-            if entry.step_latents is None and self._lmcache is not None:
+            if entry.step_latents is None:
+                steps_engine = self._lmcache_steps if self._lmcache_steps is not None else self._lmcache
+                if steps_engine is None:
+                    return None
                 # Recover final latent first (to ensure entry is warm).
                 self._recover_latents_from_lmcache(entry, key_hash)
-                # Recover step latents using the meta tensor that carries
-                # [step_index, timestep] pairs (preserves real diffusion timesteps).
-                meta = self._lmcache.get(f"{key_hash}:steps_meta", device="cpu")
+                # Recover step latents from steps_engine using the meta tensor.
+                meta = steps_engine.get(f"{key_hash}:steps_meta", device="cpu")
                 if meta is None:
                     return None
                 recovered_steps = []
                 for row in meta:
                     si = int(row[0].item())
                     ts = float(row[1].item())
-                    latent = self._lmcache.get(f"{key_hash}:step_{si:04d}", device="cpu")
+                    latent = steps_engine.get(f"{key_hash}:step_{si:04d}", device="cpu")
                     if latent is None:
                         break
                     recovered_steps.append(StepLatentData(step_index=si, timestep=ts, latent=latent))
@@ -976,6 +1076,42 @@ class DiTCacheStore:
             self._current_memory_bytes / _MB,
         )
         return loaded_count
+
+    def _save_final_to_disk(self, key_hash: str, latent: torch.Tensor) -> None:
+        """Background thread: save final latent to disk via torch.save."""
+        try:
+            path = self._final_disk_dir / f"{key_hash}.pt"
+            torch.save(latent.cpu(), path)
+            logger.debug("Saved final latent %s to disk (%.1f MB)", key_hash[:8], latent.nelement() * latent.element_size() / _MB)
+        except Exception as e:
+            logger.warning("Failed to save final latent %s: %s", key_hash[:8], e)
+
+    @staticmethod
+    def _patch_lmcache_busy_loop(engine):
+        """Patch LMCache allocator to use busy_loop=True everywhere.
+
+        LMCache hardcodes busy_loop=False in two places:
+        1. ECCacheEngine.put() → allocate()
+        2. StorageManager.batched_put() → allocate_and_copy_objects() → allocate()
+        Both give up immediately on pool pressure. We patch the allocator
+        backend's allocate() method itself to always use busy_loop=True,
+        covering both call sites.
+        """
+        if engine is None:
+            return
+        alloc_backend = engine._storage_manager.allocator_backend
+        original_allocate = alloc_backend.allocate
+
+        def patched_allocate(shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
+            return original_allocate(shapes, dtypes, fmt, eviction=eviction, busy_loop=True)
+
+        alloc_backend.allocate = patched_allocate
+
+    @staticmethod
+    def _is_rank0() -> bool:
+        """Check if this process is rank 0 (or single-process)."""
+        import torch.distributed as dist
+        return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def build_cache_key_from_request(

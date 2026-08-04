@@ -144,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
     parser.add_argument("--lmcache-max-disk-gb", type=float, default=100.0)
+    parser.add_argument("--max-stored-steps", type=int, default=0, help="Max step latents to store per entry (0=all)")
     parser.add_argument(
         "--max-entries",
         type=int,
@@ -440,6 +441,7 @@ def main():
             cache_config["inter_request_lmcache_disk_dir"] = args.lmcache_disk_dir
             cache_config["inter_request_lmcache_max_cpu_gb"] = args.lmcache_max_cpu_gb
             cache_config["inter_request_lmcache_max_disk_gb"] = args.lmcache_max_disk_gb
+            cache_config["inter_request_max_stored_steps"] = args.max_stored_steps
         if args.clip_model_path:
             cache_config["inter_request_clip_model_path"] = args.clip_model_path
             cache_config["inter_request_clip_threshold"] = args.clip_threshold
