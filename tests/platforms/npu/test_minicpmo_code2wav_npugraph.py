@@ -13,8 +13,9 @@ from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
-    _prepare_npu_graph_runtime,
+from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+    prepare_code2wav_graph_runtime,
 )
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
     npu_token2wav_sdpa_context,
@@ -46,7 +47,7 @@ class _Token2Wav:
 
 def test_minicpmo_cfm_estimator_npugraph_matches_eager():
     decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
-    _prepare_npu_graph_runtime()
+    prepare_code2wav_graph_runtime()
 
     estimator = (
         decoder_dit.DiT(
@@ -61,11 +62,8 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .npu()
         .eval()
     )
-    adapter = BatchedToken2Wav(
-        _Token2Wav(estimator),
-        enable_npu_graphs=True,
-        max_npu_graphs=4,
-    )
+    graph_runner = NPUExactGraphRunner(max_graphs=4)
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), graph_runner=graph_runner)
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -99,21 +97,28 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
 
     with torch.inference_mode(), npu_token2wav_sdpa_context(require_math=True):
         warm_inputs = inputs(11)
-        warm_outputs = compute(*warm_inputs)
-
-        uncached_graph = adapter._capture_npu_graph(
+        warm_outputs = graph_runner.run(
+            "cfm_estimator",
             warm_inputs,
+            (False,),
             lambda *values: compute(*values),
         )
         replay_inputs = inputs(13)
         expected = compute(*replay_inputs)
-        actual = uncached_graph.replay(replay_inputs)
+        actual = graph_runner.run(
+            "cfm_estimator",
+            replay_inputs,
+            (False,),
+            lambda *values: compute(*values),
+        )
         for eager, replayed in zip(expected, actual, strict=True):
             torch.testing.assert_close(replayed, eager, rtol=1e-3, atol=1e-3)
 
         cached_inputs = (*inputs(17), warm_outputs[1], warm_outputs[2])
-        cached_graph = adapter._capture_npu_graph(
+        graph_runner.run(
+            "cfm_estimator",
             cached_inputs,
+            (True,),
             lambda *values: compute(*values[:5], caches=(values[5], values[6])),
         )
         replay_cached_inputs = (
@@ -125,6 +130,12 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
             *replay_cached_inputs[:5],
             caches=(replay_cached_inputs[5], replay_cached_inputs[6]),
         )
-        actual_cached = cached_graph.replay(replay_cached_inputs)
+        actual_cached = graph_runner.run(
+            "cfm_estimator",
+            replay_cached_inputs,
+            (True,),
+            lambda *values: compute(*values[:5], caches=(values[5], values[6])),
+        )
         for eager, replayed in zip(expected_cached, actual_cached, strict=True):
             torch.testing.assert_close(replayed, eager, rtol=1e-3, atol=1e-3)
+        assert graph_runner.stats == {"captures": 2, "failed": 0, "hits": 2}

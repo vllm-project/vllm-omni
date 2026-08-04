@@ -92,9 +92,10 @@ to 32 entries by default, after which unseen shapes run eagerly.
 An ACL graph capture failure is fatal to that Stage-2 process because older
 torch-npu releases can leave allocator and RNG capture state invalid. Restart
 the service after a capture failure. To run without capture, set
-`code2wav_enable_npu_graph: false` before startup. Tune the cache limit with
-`code2wav_max_npu_graphs` in the connector `extra` config. Graph mode also
-requires `ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
+`code2wav_enable_npu_graph: false` under the Stage-2
+`platforms.npu.stages[].additional_config` block before startup. Tune the cache
+limit there with `code2wav_max_npu_graphs`. Graph mode also requires
+`ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
 
 The inner NPUGraph is independent of the outer runner setting, so do not use a
 global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.

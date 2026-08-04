@@ -11,6 +11,7 @@ steps:
         commands:
           - >-
             pytest -s -v
+            tests/platforms/npu/test_graph_tools.py
             tests/platforms/npu/test_minicpmo_code2wav_npugraph.py
             tests/e2e/offline_inference/test_minicpmo_4_5.py
             tests/e2e/online_serving/test_minicpmo_4_5.py
