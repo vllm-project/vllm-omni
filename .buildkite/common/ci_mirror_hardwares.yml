@@ -8,8 +8,7 @@
 # NPU naming: {queue}_{resource_class}
 #   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
 #   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
-#   a3_npu_1    — ascend-a3, resource_class npu-1 (A3 CI image tag …:$BUILDKITE_COMMIT-a3)
-#   a3_npu_2    — ascend-a3, resource_class npu-2
+#   a3_npu_2    — ascend-a3, resource_class npu-2 (A3 CI image tag …:$BUILDKITE_COMMIT-a3)
 
 x-npu-k8s-plugins: &npu_k8s_plugins
   - kubernetes:
@@ -209,13 +208,6 @@ mirror_hardwares:
       queue: "ascend-a2b3"
       resource_class: "npu-8"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
-    plugins: *npu_k8s_plugins
-
-  a3_npu_1:
-    agents:
-      queue: "ascend-a3"
-      resource_class: "npu-1"
-    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
     plugins: *npu_k8s_plugins
 
   a3_npu_2:

@@ -53,7 +53,11 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+# CUDA-only for now: this contract asserts the model speaks while the user is
+# still talking, which only holds when the duplex pipeline sustains real-time
+# throughput. The current NPU stack runs several times slower than real time,
+# so it never reaches a mid-stream decision point.
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
     input_wav = validated_soft_interrupt_wav()

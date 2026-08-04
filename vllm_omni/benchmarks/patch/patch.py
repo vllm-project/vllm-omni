@@ -14,6 +14,7 @@ import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -38,7 +39,13 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
+    DailyOmniDataset,
+    DailyOmniSampleRequest,
+    daily_omni_local_qa_json,
+    daily_omni_local_videos_dir,
+    resolve_daily_omni_local_root,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -282,6 +289,26 @@ def get_samples(args, tokenizer):
         if isinstance(qa_json, str):
             qa_json = qa_json.strip() or None
 
+        # A local mirror of the dataset repo (plain directory or HF hub cache dir) is used
+        # directly: no Hub round-trip, so offline / air-gapped runs work without extra flags.
+        local_root: Path | None = None
+        if qa_json is None:
+            local_root = resolve_daily_omni_local_root(getattr(args, "dataset_path", None)) or (
+                resolve_daily_omni_local_root(getattr(args, "hf_name", None))
+            )
+            if local_root is not None:
+                local_qa = daily_omni_local_qa_json(local_root)
+                if local_qa is not None:
+                    qa_json = str(local_qa)
+                    if video_dir is None:
+                        video_dir = daily_omni_local_videos_dir(local_root)
+                    logger.info("Using local Daily-Omni mirror: root=%s", local_root)
+                else:
+                    logger.info(
+                        "Local Daily-Omni path %s has no qa.json; loading it with `datasets` instead",
+                        local_root,
+                    )
+
         if qa_json is not None:
             logger.info(
                 "Loading Daily-Omni dataset: qa_json=%s, video_dir=%s (Hub not used for QA)",
@@ -304,7 +331,8 @@ def get_samples(args, tokenizer):
             repo_id = _daily_omni_repo_from_args(args)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
-                    repo_id = _DEFAULT_DAILY_OMNI_REPO
+                    # Prefer an on-disk copy over the Hub id so offline runs keep working.
+                    repo_id = str(local_root) if local_root is not None else _DEFAULT_DAILY_OMNI_REPO
             elif repo_id is None:
                 raise ValueError(
                     "Daily-Omni with --dataset-name hf requires "
@@ -700,6 +728,29 @@ def _image_generation_ms_from_content(content: Any) -> float:
     return 0.0
 
 
+#: Non-200 responses are otherwise silent (only ``reason`` was kept), which turns a fully failed
+#: run into "Successful requests: 0" with no cause. Log the first few bodies, keep all of them on
+#: ``output.error`` for ``--save-detailed``.
+_HTTP_ERROR_LOG_BUDGET = 5
+_http_error_logged = 0
+
+
+async def _record_http_error(output: "MixRequestFuncOutput", response: aiohttp.ClientResponse, context: str) -> None:
+    """Store status + response body on ``output.error`` and log the first few occurrences."""
+    global _http_error_logged
+
+    try:
+        body = (await response.text())[:512]
+    except Exception:
+        body = ""
+    detail = f"HTTP {response.status} {response.reason or ''}".strip()
+    output.error = f"{detail}: {body}" if body else detail
+    output.success = False
+    if _http_error_logged < _HTTP_ERROR_LOG_BUDGET:
+        _http_error_logged += 1
+        logger.warning("%s request failed: %s", context, output.error)
+
+
 async def async_request_openai_chat_omni_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -997,8 +1048,7 @@ async def async_request_openai_chat_omni_completions(
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = True
                 else:
-                    output.error = response.reason or ""
-                    output.success = False
+                    await _record_http_error(output, response, "openai-chat-omni")
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
@@ -1272,8 +1322,7 @@ async def async_request_openai_audio_speech(
                     )
                 output.success = True
             else:
-                output.error = response.reason or ""
-                output.success = False
+                await _record_http_error(output, response, "openai-audio-speech")
     except Exception:
         output.success = False
         output.error = traceback.format_exc()

@@ -41,7 +41,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Test"
-        mirror_hardwares: a3_npu_1
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
@@ -50,21 +50,27 @@ steps:
           - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5_expansion.py -m 'full_model' --run-level 'full_model'
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Test"
         timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_1
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
+          # NPU has no merge-level pipeline, so advanced_model duplex coverage
+          # rides on nightly alongside full_model.
+          #
+          # test_duplex_soft_interrupt is CUDA-only and carries no npu mark, so
+          # the marker filter below drops it: it needs real-time duplex
+          # throughput that the current NPU stack does not reach.
           - >-
             pytest -s -v
             tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
             tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
-            -m "npu and A3 and omni"
+            -m "(full_model or advanced_model) and npu and A3 and omni"
             --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_1
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
@@ -72,7 +78,39 @@ steps:
         commands:
           - |
             set +e
-            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu" --run-level full_model
+            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT

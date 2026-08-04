@@ -74,9 +74,11 @@ def validated_soft_interrupt_wav() -> Path:
 
 
 def resolve_ref_audio(model_prefix: str) -> Path:
-    if model_prefix:
-        model_root = Path(model_prefix) / MODEL
-    else:
+    # ``MODEL`` may be a local checkpoint directory instead of a Hub repo id
+    # (``Path("/prefix") / "/abs/path"`` collapses to the absolute path), so only
+    # fall back to the Hub cache when no such directory exists on disk.
+    model_root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
+    if not model_root.is_dir():
         model_root = Path(snapshot_download(MODEL, local_files_only=True))
     ref_audio = model_root / REF_AUDIO_RELATIVE_PATH
     if not ref_audio.is_file():
