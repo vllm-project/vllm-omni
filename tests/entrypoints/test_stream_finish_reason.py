@@ -23,7 +23,11 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponseStreamChoice,
 )
+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.outputs import CompletionOutput, RequestOutput
 
 from tests.helpers.serving_chat import (
     build_serving_chat,
@@ -31,6 +35,8 @@ from tests.helpers.serving_chat import (
     make_request,
     make_text_omni_output,
 )
+from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
