@@ -151,12 +151,12 @@ class OmniServingTranscription(OpenAIServingTranscription):
         self._reuse_hits = 0
         self._reuse_misses = 0
 
-        # Audio decode is GIL-bound: measured ~40 decodes/s for a 30s 48 kHz
-        # stereo mp3 no matter how many *threads* upstream's preprocess pool
-        # gets (it plateaus past ~4). That ceiling sits below what the GPU can
-        # consume, so the server ends up decode-bound rather than GPU-bound.
+        # Audio decode is GIL-bound: ~40 decodes/s for a 30s 48 kHz stereo mp3
+        # no matter how many *threads* upstream's preprocess pool gets (it
+        # plateaus past ~4), which lands below what the GPU can consume.
         # Processes escape the GIL; the decoded array comes back over IPC
         # (~0.4 ms for 30s @ 16 kHz float32), cheap next to the ~75 ms saved.
+        # Measured 19.9 -> 52.6 req/s at concurrency 384 with this on.
         #
         # Opt-in: 0 keeps upstream's thread pool. Under --omni this is the only
         # lever available, since vllm-omni rejects --api-server-count.

@@ -31,9 +31,12 @@
 pipeline: qwen3_asr
 
 # Audio decode is GIL-bound (~40 clips/s per process for a 30s 48kHz stereo
-# mp3, flat past ~4 threads), which caps the server below what the GPU can
-# consume. >0 moves decode to that many worker processes. 0 keeps upstream's
-# thread pool.
+# mp3, flat past ~4 threads), so without this it serialises and caps the server
+# below what the GPU can consume. Measured on this profile at concurrency 384,
+# 3 runs median: 0 gives 19.9 req/s, 16 gives 52.6 req/s.
+#
+# A client sending 16 kHz mono reaches the same place by a different route
+# (~1.1 ms to decode against ~56 ms), and the two do not compound.
 audio_decode_procs: 16
 
 stages:
