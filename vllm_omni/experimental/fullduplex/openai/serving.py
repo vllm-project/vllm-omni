@@ -1241,6 +1241,19 @@ class OmniDuplexSessionHandler(
             return None
 
         if td_raw is None:
+            if session.capabilities.supports_model_native_turn_policy:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "unsupported_turn_detection",
+                    "error": {
+                        "type": "unsupported_turn_detection",
+                        "message": (
+                            "This model requires model-native turn detection "
+                            "(server_vad); turn_detection cannot be set to null."
+                        ),
+                    },
+                }
             return None
 
         if not isinstance(td_raw, dict):
