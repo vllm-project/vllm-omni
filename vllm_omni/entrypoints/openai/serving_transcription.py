@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import os
+import multiprocessing
 import threading
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
@@ -54,6 +54,10 @@ ALIGNER_SAMPLE_RATE = 16000
 
 #: How often to log decode-reuse hit/miss stats.
 _REUSE_STATS_EVERY = 50
+
+#: Recycle a decode worker after this many clips, to bound any per-decode leak
+#: in the audio stack. High enough that respawn cost is noise.
+_DECODE_WORKER_MAX_TASKS = 512
 
 
 def _float32_to_int16_pcm(pcm: np.ndarray) -> bytes:
@@ -126,7 +130,13 @@ class OmniServingTranscription(OpenAIServingTranscription):
     #: between decode and pickup.
     _MAX_PENDING_DECODES = 256
 
-    def __init__(self, *args: Any, forced_aligner_config: ForcedAlignerConfig | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        forced_aligner_config: ForcedAlignerConfig | None = None,
+        audio_decode_procs: int = 0,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.forced_aligner_config = forced_aligner_config
         self._decoded: OrderedDict[bytes, list[tuple[np.ndarray, float]]] = OrderedDict()
@@ -140,17 +150,28 @@ class OmniServingTranscription(OpenAIServingTranscription):
         # gets (it plateaus past ~4). That ceiling sits below what the GPU can
         # consume, so the server ends up decode-bound rather than GPU-bound.
         # Processes escape the GIL; the decoded array comes back over IPC
-        # (~1.9 MB for 30s @ 16 kHz float32), which is cheap next to the ~75 ms
-        # of CPU it saves.
+        # (~0.4 ms for 30s @ 16 kHz float32), cheap next to the ~75 ms saved.
         #
         # Opt-in: 0 keeps upstream's thread pool. Under --omni this is the only
         # lever available, since vllm-omni rejects --api-server-count.
-        n_procs = int(os.getenv("VLLM_OMNI_AUDIO_DECODE_PROCS", "0"))
         self._decode_pool: ProcessPoolExecutor | None = None
-        if n_procs > 0:
-            self._decode_pool = ProcessPoolExecutor(max_workers=n_procs)
+        if audio_decode_procs > 0:
+            # forkserver, not the default fork: this process has CUDA
+            # initialized (the in-process aligner lives here), and forking a
+            # CUDA-initialized process leaves the child with an unusable
+            # context. The workers touch no CUDA today, so fork happens to
+            # survive, but it is not a property worth depending on.
+            #
+            # max_tasks_per_child bounds any per-decode leak in the audio
+            # stack; the pool is built here rather than on first use so a
+            # misconfiguration fails at startup.
+            self._decode_pool = ProcessPoolExecutor(
+                max_workers=audio_decode_procs,
+                mp_context=multiprocessing.get_context("forkserver"),
+                max_tasks_per_child=_DECODE_WORKER_MAX_TASKS,
+            )
             self._decode_and_chunk_speech_async = self._decode_and_chunk_speech_in_proc
-            logger.info("Audio decode: using %d worker processes (GIL-free)", n_procs)
+            logger.info("Audio decode: %d worker processes (forkserver)", audio_decode_procs)
 
     async def _decode_and_chunk_speech_in_proc(self, audio_data: bytes) -> tuple[list[np.ndarray], float]:
         """Process-pool replacement for upstream's thread-pool decode.

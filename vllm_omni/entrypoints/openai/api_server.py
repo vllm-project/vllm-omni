@@ -1037,6 +1037,7 @@ async def omni_init_app_state(
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
             forced_aligner_config=build_forced_aligner_config(args),
+            audio_decode_procs=getattr(engine_client, "audio_decode_procs", 0),
         )
         if "transcription" in supported_tasks
         else None

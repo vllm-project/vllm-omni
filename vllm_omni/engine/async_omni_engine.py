@@ -233,8 +233,13 @@ class AsyncOmniEngine:
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
+        # Frontend audio-decode parallelism is pipeline-wide, not per stage: it
+        # governs work the API server does before the engine sees a request.
+        self.audio_decode_procs: int = 0
         if deploy_config_path is not None:
-            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+            _deploy = load_deploy_config(deploy_config_path)
+            self.duplex_session_config = _deploy.duplex_session
+            self.audio_decode_procs = _deploy.audio_decode_procs
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a

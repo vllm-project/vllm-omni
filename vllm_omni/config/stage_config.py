@@ -491,6 +491,11 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+    # Frontend audio-decode parallelism. Decoding an uploaded clip is
+    # GIL-bound, so it caps a speech-to-text deployment below what the GPU can
+    # consume; >0 moves it to that many worker processes. A resource knob, so
+    # it lives with the other resource knobs rather than in the environment.
+    audio_decode_procs: int = 0
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -671,6 +676,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "audio_decode_procs": int(raw_dict.get("audio_decode_procs", 0) or 0),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
