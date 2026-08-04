@@ -431,6 +431,8 @@ def _free_gpu_memory():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
     from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
     from vllm_omni.outputs import OmniRequestOutput

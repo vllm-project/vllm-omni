@@ -37,7 +37,7 @@ from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,24 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_guidance_scales(
+    sampling_params: OmniDiffusionSamplingParams,
+    default_guidance_scale: float,
+) -> tuple[float, float]:
+    guidance_scale = (
+        sampling_params.guidance_scale if sampling_params.guidance_scale_provided else default_guidance_scale
+    )
+    guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
+    guidance_high = (
+        sampling_params.guidance_scale_2
+        if sampling_params.guidance_scale_2_provided and sampling_params.guidance_scale_2 is not None
+        else (
+            guidance_scale[1] if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1 else guidance_low
+        )
+    )
+    return guidance_low, guidance_high
 
 
 def retrieve_latents(
@@ -571,25 +589,10 @@ class Wan22Pipeline(
         width = (width // mod_value) * mod_value
         num_steps = 40 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
 
-        # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        else:
-            guidance_scale = 4.0
-
         output_type = req.sampling_params.output_type or "np"
         attention_kwargs: dict | None = None
 
-        guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
-        guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
-            else (
-                guidance_scale[1]
-                if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
-                else guidance_low
-            )
-        )
+        guidance_low, guidance_high = resolve_wan_guidance_scales(req.sampling_params, default_guidance_scale=4.0)
 
         # record guidance for properties
         self._guidance_scale = guidance_low

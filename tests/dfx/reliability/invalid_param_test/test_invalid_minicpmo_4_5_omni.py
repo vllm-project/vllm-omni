@@ -14,15 +14,17 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni, pytest.mark.full_model]
 
-_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 _MINICPMO_SERVER = [
     pytest.param(
         OmniServerParams(
             model="openbmb/MiniCPM-o-4_5",
             stage_config_path=_MINICPMO_DEPLOY,
-            use_stage_cli=True,
-            server_args=["--trust-remote-code"],
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+            ],
         ),
         id="minicpmo_4_5",
     )
@@ -48,7 +50,7 @@ def _prompt() -> str:
     return "What is the capital of China? Answer in 20 words."
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _MINICPMO_SERVER, indirect=True)
 def test_invalid_audio_format_rejected(omni_server: OmniServerParams, openai_client: OpenAIClientHandler) -> None:
     """

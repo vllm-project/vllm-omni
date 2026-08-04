@@ -17,7 +17,7 @@
 #     measured 0.79% here. The serving layer currently injects 0.05 for
 #     guided requests on all sizes; acceptable (still within the anchor
 #     +2pp standing gate) but a size-aware refinement is a known follow-up.
-# ALWAYS pass this yaml explicitly (--stage-configs-path): bare serve of the
+# ALWAYS pass this yaml explicitly (--deploy-config): bare serve of the
 # 30B repo auto-detects the shared model_type and lands on the 2B-tuned yaml.
 pipeline: audex_tts
 async_chunk: true

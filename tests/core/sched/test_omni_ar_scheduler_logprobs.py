@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from types import SimpleNamespace
+from collections.abc import Callable
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,8 +13,21 @@ from vllm.v1.outputs import LogprobsLists
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _slice_sampled_logprobs
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Shared update_from_output helpers moved onto OmniSchedulerMixin; bind them on
+# the lightweight stub so direct method calls still exercise the real paths.
+_MIXIN_UPDATE_HELPERS = (
+    "_remove_stopped_requests_from_queues",
+    "_handle_failed_kv_load_outputs",
+    "_aggregate_kv_connector_stats",
+    "_publish_kv_cache_events",
+    "_attach_finished_request_sets",
+    "_attach_scheduler_stats",
+    "_capture_omni_connector_output",
+)
 
 
 def _logprobs(
@@ -105,16 +119,14 @@ class _RequestQueue(list):
                 self.remove(request)
 
 
-def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
-    """A bad runner response must not bring down unrelated batch requests."""
-    bad = _Request("bad")
-    good = _Request("good")
+def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
+    """Build a minimal stub for OmniARScheduler.update_from_output()."""
     scheduler = SimpleNamespace(
         perf_metrics=None,
         connector=None,
         chunk_transfer_adapter=None,
-        requests={bad.request_id: bad, good.request_id: good},
-        running=[bad, good],
+        requests={request.request_id: request for request in requests},
+        running=list(requests),
         waiting=_RequestQueue(),
         skipped_waiting=_RequestQueue(),
         structured_output_manager=SimpleNamespace(should_advance=lambda _request: False),
@@ -127,13 +139,22 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
+        recompute_kv_load_failures=False,
     )
-    update_calls: list[str] = []
+    for name in _MIXIN_UPDATE_HELPERS:
+        setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
+    scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
+    scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
+    scheduler.make_stats = lambda *args, **kwargs: None
+    return scheduler
 
-    def update_request(request, token_ids):
-        update_calls.append(request.request_id)
-        return token_ids, False
 
+def _bind_request_lifecycle(
+    scheduler: SimpleNamespace,
+    *,
+    update_request: Callable,
+    handle_stopped: Callable | None = None,
+) -> None:
     def free_request(request):
         scheduler.requests.pop(request.request_id, None)
         scheduler.finished_req_ids.add(request.request_id)
@@ -143,11 +164,73 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
 
     scheduler._update_request_with_output = update_request
     scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
-    scheduler._handle_stopped_request = lambda _request: True
+    scheduler._handle_stopped_request = handle_stopped or (lambda _request: True)
     scheduler._free_request = free_request
-    scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
-    scheduler.make_stats = lambda *args, **kwargs: None
-    scheduler._capture_omni_connector_output = lambda _output: None
+
+
+def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
+    """Spec decode can sample tokens past a stop; the trailing tokens are
+    trimmed by _update_request_with_output, and the emitted logprob rows must
+    be trimmed with them (upstream slices logprobs after the trim)."""
+    request = _Request("req")
+    request.num_computed_tokens = 8
+    scheduler = _make_scheduler_stub([request])
+
+    def update_request_trimming(req, token_ids):
+        # Mirror vllm Scheduler._update_request_with_output: the first sampled
+        # token hits EOS, so the spec-accepted tokens behind it are trimmed
+        # in place and the request stops.
+        del token_ids[1:]
+        req.status = RequestStatus.FINISHED_STOPPED
+        return token_ids, True
+
+    _bind_request_lifecycle(scheduler, update_request=update_request_trimming)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 3},
+        scheduled_spec_decode_tokens={"req": [8, 9]},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[[7, 8, 9]],
+        logprobs=_logprobs(
+            [[7, 1], [8, 2], [9, 3]],
+            [[-0.7, -1.0], [-0.8, -1.1], [-0.9, -1.2]],
+            cumulative_rows=[0],
+        ),
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req": 0},
+        routed_experts=None,
+    )
+
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+    (output,) = outputs[0].outputs
+
+    assert output.new_token_ids == [7]
+    assert output.finish_reason is FinishReason.STOP
+    token_rows = np.asarray(output.new_logprobs.logprob_token_ids)
+    value_rows = np.asarray(output.new_logprobs.logprobs)
+    assert token_rows.shape[0] == len(output.new_token_ids)
+    assert value_rows.shape[0] == len(output.new_token_ids)
+    np.testing.assert_array_equal(token_rows[:, 0], [7])
+
+
+def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
+    """A bad runner response must not bring down unrelated batch requests."""
+    bad = _Request("bad")
+    good = _Request("good")
+    scheduler = _make_scheduler_stub([bad, good])
+    update_calls: list[str] = []
+
+    def update_request(request, token_ids):
+        update_calls.append(request.request_id)
+        return token_ids, False
+
+    _bind_request_lifecycle(scheduler, update_request=update_request)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"bad": 1, "good": 1},

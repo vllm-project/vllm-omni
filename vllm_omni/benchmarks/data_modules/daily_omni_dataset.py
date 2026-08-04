@@ -52,11 +52,14 @@ Usage:
 """
 
 import base64
+import io
 import json
 import logging
+import math
 import os
 import shutil
 import tarfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -76,6 +79,10 @@ except ImportError:
     load_dataset = None
 
 logger = logging.getLogger(__name__)
+
+# Official MiniCPM ``get_video_frame_audio_segments`` default (env ``MAX_NUM_FRAMES``).
+_MINICPM_MAX_NUM_FRAMES = int(os.environ.get("MAX_NUM_FRAMES", "64"))
+_MINICPM_AUDIO_SR = 16000
 
 
 def _daily_omni_hf_cache_root() -> Path:
@@ -203,11 +210,61 @@ class _ListDatasetIterator:
 # Aligns with Lliar-liar/Daily-Omni CLI ``--input_mode`` (test_model/*/testmodel.py).
 DailyOmniInputMode = Literal["all", "visual", "audio"]
 
+# How multimodal parts are packed into OpenAI chat messages:
+# - ``qwen``: one ``video_url`` + one ``audio_url`` (upstream Daily-Omni / Qwen protocol).
+# - ``minicpm-interleave``: 1fps ``[image_i, audio_i, ...]`` matching OpenBMB MiniCPM-o
+#   ``get_video_frame_audio_segments`` + interleaved omni contents (paper ~80% recipe).
+DailyOmniPackMode = Literal["qwen", "minicpm-interleave"]
+
 # ``build_conversation()`` in Daily-Omni ``test_model/Qwen2.5-Omni/testmodel.py`` (verbatim).
 DAILY_OMNI_SYSTEM_TEXT = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
     "capable of perceiving auditory and visual inputs, as well as generating text and speech."
 )
+
+# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string
+# (still sent as role=system; see ``_build_daily_omni_openai_messages``).
+MINICPM_OMNI_SYSTEM_TEXT = ""
+
+
+def _uniform_sample_indices(n: int, k: int) -> list[int]:
+    """Evenly pick ``k`` indices from ``0..n-1`` (OpenBMB ``uniform_sample`` midpoint bins).
+
+    Matches OmniEvalKit / MiniCPM ``uniform_sample``: midpoint of each equal-width bin,
+    not ``np.linspace`` endpoints. See
+    https://github.com/OpenBMB/OmniEvalKit/blob/1adac0577258d539efc03f16d8a0f4b3f7df6c19/o_e_Kit/utils/utils.py#L50-L54
+    """
+    if k <= 0:
+        return []
+    if n <= k:
+        return list(range(n))
+    gap = n / k
+    return [int(i * gap + gap / 2) for i in range(k)]
+
+
+def _numpy_to_wav_bytes(audio_np: Any, sample_rate: int = _MINICPM_AUDIO_SR) -> bytes:
+    """Encode a mono float/int numpy waveform as 16-bit PCM WAV bytes."""
+    import numpy as np
+
+    arr = np.asarray(audio_np)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    if arr.dtype != np.int16:
+        arr = np.clip(arr.astype(np.float64), -1.0, 1.0)
+        arr = (arr * 32767.0).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(arr.tobytes())
+    return buf.getvalue()
+
+
+def _pil_to_jpeg_bytes(image: Any, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 @dataclass
@@ -262,6 +319,11 @@ class DailyOmniDataset(BenchmarkDataset):
             ``all`` — video + WAV (default; official audio-visual protocol);
             ``visual`` — video only;
             ``audio`` — extracted WAV only (requires ``{video_id}/{video_id}_audio.wav`` under ``video_dir``).
+        pack_mode: Multimodal packing recipe:
+            ``qwen`` — one ``video_url`` + optional ``audio_url`` (default; Daily-Omni/Qwen);
+            ``minicpm-interleave`` — MiniCPM-o paper recipe: 1fps frames interleaved with
+            matching 1s audio segments as ``image_url``/``audio_url`` pairs (required to approach
+            OpenBMB ~80% Daily-Omni; needs local video+WAV under ``video_dir``).
         max_duration_seconds: Reserved for future ffprobe-based filtering; currently **not applied**
             when building requests (metadata ``video_duration`` is still passed through for eval).
         dataset_subset: Optional HuggingFace subset name (``load_dataset(..., name=...)``); used by bench
@@ -270,7 +332,8 @@ class DailyOmniDataset(BenchmarkDataset):
         inline_local_video: If True, embed local MP4 as ``data:video/mp4;base64,...`` in requests so
             the API server does not need ``--allowed-local-media-path`` (large JSON; use for small runs).
             When ``input_mode`` is ``audio`` or ``all``, local WAV is embedded the same way
-            (``data:audio/wav;base64,...``).
+            (``data:audio/wav;base64,...``). For ``minicpm-interleave``, embeds JPEG/WAV segment
+            data URLs instead of the raw MP4.
         trust_remote_code: Whether to trust remote code when loading HuggingFace dataset
             (online mode only).
     """
@@ -291,6 +354,7 @@ class DailyOmniDataset(BenchmarkDataset):
         random_seed: int = 0,
         video_dir: str | None = None,
         input_mode: DailyOmniInputMode = "all",
+        pack_mode: DailyOmniPackMode = "qwen",
         inline_local_video: bool = False,
         trust_remote_code: bool = False,
         max_duration_seconds: float | None = None,
@@ -300,6 +364,8 @@ class DailyOmniDataset(BenchmarkDataset):
     ) -> None:
         if input_mode not in ("all", "visual", "audio"):
             raise ValueError(f"input_mode must be 'all', 'visual', or 'audio', got {input_mode!r}")
+        if pack_mode not in ("qwen", "minicpm-interleave"):
+            raise ValueError(f"pack_mode must be 'qwen' or 'minicpm-interleave', got {pack_mode!r}")
 
         # Validate arguments: need either local JSON or HF path
         if qa_json_path is None and dataset_path is None:
@@ -318,11 +384,14 @@ class DailyOmniDataset(BenchmarkDataset):
         self.video_dir = Path(video_dir) if video_dir else None
         self.inline_local_video = inline_local_video
         self.input_mode: DailyOmniInputMode = input_mode
+        self.pack_mode: DailyOmniPackMode = pack_mode
         self.max_duration_seconds = max_duration_seconds
         self.trust_remote_code = trust_remote_code
 
         #: In-process cache of ffprobe durations only (no disk persistence).
         self._video_durations: dict[str, float] = {}
+        #: Cache of MiniCPM 1fps interleaved expansions: video_id -> content parts.
+        self._minicpm_interleave_cache: dict[str, list[dict[str, Any]]] = {}
 
         # Initialize parent BenchmarkDataset
         super().__init__(
@@ -336,11 +405,13 @@ class DailyOmniDataset(BenchmarkDataset):
 
         # Verify dataset info
         logger.info(
-            "Loaded Daily-Omni dataset: mode=%s, source=%s, random_seed=%d, input_mode=%s, max_duration=%s",
+            "Loaded Daily-Omni dataset: mode=%s, source=%s, random_seed=%d, "
+            "input_mode=%s, pack_mode=%s, max_duration=%s",
             "local_json" if self.qa_json_path else "huggingface",
             str(self.qa_json_path) if self.qa_json_path else f"{dataset_path}/{dataset_split}",
             random_seed,
             input_mode,
+            pack_mode,
             f"{max_duration_seconds}s" if max_duration_seconds else "unlimited",
         )
 
@@ -575,7 +646,8 @@ class DailyOmniDataset(BenchmarkDataset):
         messages = self._build_daily_omni_openai_messages(mm_payload, question, choice)
         user_text = self._official_daily_omni_user_prompt(question, choice)
         # Text-only length estimate (same as before: no MM token count in bench).
-        prompt_len = len(tokenizer.encode(f"{DAILY_OMNI_SYSTEM_TEXT}\n{user_text}"))
+        system_text = self._system_text_for_pack_mode()
+        prompt_len = len(tokenizer.encode(f"{system_text}\n{user_text}" if system_text else user_text))
 
         return DailyOmniSampleRequest(
             prompt=user_text,
@@ -766,10 +838,11 @@ class DailyOmniDataset(BenchmarkDataset):
         video_id: str,
         video_url: str | None,
     ) -> tuple[dict[str, Any] | list[dict[str, Any]] | None, dict[str, Any] | None, Literal["first", "last"]]:
-        """Build ``multi_modal_data`` and request extras for the active ``input_mode``.
+        """Build multimodal OpenAI content parts and request extras for the active modes."""
+        if self.pack_mode == "minicpm-interleave":
+            return self._compose_minicpm_interleaved_multimodal(video_id, video_url)
 
-        Mirrors upstream Daily-Omni: separate video + WAV with ``use_audio_in_video=False``.
-        """
+        # Qwen / upstream Daily-Omni: separate video + WAV with ``use_audio_in_video=False``.
         extra: dict[str, Any] = {"mm_processor_kwargs": {"use_audio_in_video": False}}
         mode = self.input_mode
 
@@ -786,6 +859,219 @@ class DailyOmniDataset(BenchmarkDataset):
         if not v or not a:
             return None, None, "first"
         return [v, a], extra, "first"
+
+    def _compose_minicpm_interleaved_multimodal(
+        self,
+        video_id: str,
+        video_url: str | None,
+    ) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None, Literal["first", "last"]]:
+        """Pack media like MiniCPM-o official omni chat: 1fps ``[frame_i, audio_i, ...]``.
+
+        OpenBMB's HF / utils path expands ``video_url`` with ``use_audio=True`` into interleaved
+        PIL frames and 1s audio ndarrays. vLLM-Omni does not implement that expansion, so the
+        bench client builds ordered ``image_url`` / ``audio_url`` parts instead. MiniCPM-o 5.0's
+        OpenAI chat template preserves content-part order, so placeholders stay time-aligned.
+
+        ``max_slice_nums=1`` and ``use_image_id=False`` mirror MiniCPM-o's omni path
+        (``modeling_minicpmo.py`` passes both for interleaved frames): slicing every frame with
+        the config default of 9 would blow past ``max_model_len``, and ``<image_id>N</image_id>``
+        prefixes would label each frame as a separate picture instead of a video timeline.
+        """
+        del video_url  # Hub HTTP URLs are not used; local extract is required.
+        extra: dict[str, Any] = {
+            "mm_processor_kwargs": {
+                "use_audio_in_video": False,
+                "max_slice_nums": 1,
+                "use_image_id": False,
+            }
+        }
+        mode = self.input_mode
+        if mode == "audio":
+            # Fall back to whole-WAV for audio-only ablations.
+            a = self._get_audio_content(video_id)
+            return ([a] if a else None), extra, "first"
+
+        parts = self._get_minicpm_interleaved_parts(video_id, include_audio=(mode == "all"))
+        if not parts:
+            return None, None, "first"
+        return parts, extra, "first"
+
+    def _get_minicpm_interleaved_parts(
+        self,
+        video_id: str,
+        *,
+        include_audio: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Return cached or freshly extracted MiniCPM-style interleaved OpenAI content parts."""
+        cache_key = f"{video_id}|audio={int(include_audio)}|inline={int(self.inline_local_video)}"
+        cached = self._minicpm_interleave_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self._lazy_ensure_hub_media_dir()
+        video_path = self._resolve_local_video_path(video_id)
+        if video_path is None:
+            logger.warning(
+                "MiniCPM interleave pack requires local video under video_dir=%s for video_id=%r",
+                self.video_dir,
+                video_id,
+            )
+            return None
+        audio_path = self._resolve_local_audio_path(video_id) if include_audio else None
+        if include_audio and audio_path is None:
+            logger.warning(
+                "MiniCPM interleave pack (input_mode=all) missing WAV for video_id=%r under %s",
+                video_id,
+                self.video_dir,
+            )
+            return None
+
+        try:
+            frames, audio_segments = self._extract_minicpm_frame_audio_segments(
+                video_path,
+                audio_path=audio_path,
+                include_audio=include_audio,
+            )
+        except Exception:
+            logger.exception(
+                "Failed MiniCPM 1fps extract for video_id=%r path=%s",
+                video_id,
+                video_path,
+            )
+            return None
+
+        if not frames:
+            logger.warning("No frames extracted for video_id=%r", video_id)
+            return None
+        if include_audio and len(audio_segments) != len(frames):
+            logger.warning(
+                "Frame/audio length mismatch for video_id=%r: frames=%d audios=%d",
+                video_id,
+                len(frames),
+                len(audio_segments),
+            )
+            n = min(len(frames), len(audio_segments))
+            frames = frames[:n]
+            audio_segments = audio_segments[:n]
+
+        cache_root: Path | None = None
+        if not self.inline_local_video:
+            assert self.video_dir is not None
+            cache_root = self.video_dir / ".minicpm_daily_omni_interleave" / video_id
+            cache_root.mkdir(parents=True, exist_ok=True)
+
+        parts: list[dict[str, Any]] = []
+        for i, frame in enumerate(frames):
+            jpeg = _pil_to_jpeg_bytes(frame)
+            if self.inline_local_video:
+                b64 = base64.b64encode(jpeg).decode("ascii")
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    }
+                )
+            else:
+                assert cache_root is not None
+                frame_path = cache_root / f"frame_{i:04d}.jpg"
+                if not frame_path.is_file() or frame_path.stat().st_size == 0:
+                    frame_path.write_bytes(jpeg)
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": frame_path.expanduser().resolve().as_uri()},
+                    }
+                )
+
+            if include_audio:
+                wav = _numpy_to_wav_bytes(audio_segments[i])
+                if self.inline_local_video:
+                    b64 = base64.b64encode(wav).decode("ascii")
+                    parts.append(
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": f"data:audio/wav;base64,{b64}"},
+                        }
+                    )
+                else:
+                    assert cache_root is not None
+                    audio_seg_path = cache_root / f"audio_{i:04d}.wav"
+                    if not audio_seg_path.is_file() or audio_seg_path.stat().st_size == 0:
+                        audio_seg_path.write_bytes(wav)
+                    parts.append(
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": audio_seg_path.expanduser().resolve().as_uri()},
+                        }
+                    )
+
+        # File URLs are tiny; cache them so repeated QA on the same video skips re-extract.
+        # Inline base64 must not be retained: ~700 Daily-Omni videos would pin GBs of RSS.
+        if not self.inline_local_video:
+            self._minicpm_interleave_cache[cache_key] = parts
+        logger.debug(
+            "MiniCPM interleave packed video_id=%r frames=%d include_audio=%s parts=%d",
+            video_id,
+            len(frames),
+            include_audio,
+            len(parts),
+        )
+        return parts
+
+    @staticmethod
+    def _extract_minicpm_frame_audio_segments(
+        video_path: Path,
+        *,
+        audio_path: Path | None,
+        include_audio: bool,
+        max_num_frames: int = _MINICPM_MAX_NUM_FRAMES,
+    ) -> tuple[list[Any], list[Any]]:
+        """Port of MiniCPM ``get_video_frame_audio_segments`` (stack_frames=1, 1fps)."""
+        import numpy as np
+        from decord import VideoReader, cpu
+        from PIL import Image
+        from vllm.multimodal.media.audio import load_audio
+
+        vr = VideoReader(str(video_path), ctx=cpu(0))
+        avg_fps = float(vr.get_avg_fps()) or 1.0
+        duration = len(vr) / avg_fps
+        num_seconds = max(1, int(math.ceil(duration)))
+        second_timestamps = list(range(num_seconds))
+
+        if duration > max_num_frames:
+            timestamps = [round(i * 0.1, 1) for i in range(int(duration / 0.1))]
+            frame_idx = [min(int(ts * avg_fps), len(vr) - 1) for ts in timestamps]
+            pick = _uniform_sample_indices(len(frame_idx), max_num_frames)
+            frame_idx = [frame_idx[i] for i in pick]
+            timestamps = [timestamps[i] for i in pick]
+        else:
+            frame_idx = [min(int(i * avg_fps), len(vr) - 1) for i in range(num_seconds)]
+            timestamps = second_timestamps
+
+        video = vr.get_batch(frame_idx).asnumpy()
+        frames = [Image.fromarray(v.astype("uint8")).convert("RGB") for v in video]
+
+        audio_segments: list[Any] = []
+        if include_audio:
+            load_path = str(audio_path) if audio_path is not None else str(video_path)
+            audio_np, sr = load_audio(load_path, sr=_MINICPM_AUDIO_SR, mono=True)
+            for i, start_time in enumerate(timestamps):
+                end_time = timestamps[i + 1] if i < len(timestamps) - 1 else duration
+                start_sample = int(start_time * sr)
+                end_sample = int(end_time * sr)
+                segment = audio_np[start_sample:end_sample]
+                if i == len(timestamps) - 1 and len(segment) < 1600:
+                    segment = np.concatenate([segment, np.zeros(1600 - len(segment), dtype=segment.dtype)])
+                if len(segment) == 0:
+                    segment = np.zeros(1600, dtype=np.float32)
+                audio_segments.append(segment)
+
+        return frames, audio_segments
+
+    def _system_text_for_pack_mode(self) -> str:
+        if self.pack_mode == "minicpm-interleave":
+            return MINICPM_OMNI_SYSTEM_TEXT
+        return DAILY_OMNI_SYSTEM_TEXT
 
     @staticmethod
     def _media_desc_for_official_prompt(mode: DailyOmniInputMode) -> str:
@@ -835,14 +1121,19 @@ class DailyOmniDataset(BenchmarkDataset):
         question: str,
         choice: Any,
     ) -> list[dict[str, Any]]:
-        """Map upstream conversation to OpenAI Chat Completions ``messages`` (video_url / audio_url parts)."""
+        """Map upstream conversation to OpenAI Chat Completions ``messages``."""
         user_text = self._official_daily_omni_user_prompt(question, choice)
         mm_list: list[dict[str, Any]] = mm_payload if isinstance(mm_payload, list) else [mm_payload]
         user_content: list[dict[str, Any]] = [*mm_list, {"type": "text", "text": user_text}]
-        return [
-            {"role": "system", "content": [{"type": "text", "text": DAILY_OMNI_SYSTEM_TEXT}]},
-            {"role": "user", "content": user_content},
-        ]
+        system_text = self._system_text_for_pack_mode()
+        messages: list[dict[str, Any]] = []
+        # MiniCPM-o ``get_sys_prompt(mode="omni")`` still emits role=system with empty
+        # content (no ref-audio). Truthiness would drop that role and change chat-template
+        # control tokens; keep the empty system message for minicpm-interleave.
+        if self.pack_mode == "minicpm-interleave" or system_text:
+            messages.append({"role": "system", "content": [{"type": "text", "text": system_text}]})
+        messages.append({"role": "user", "content": user_content})
+        return messages
 
     def sample_by_task_type(
         self,
@@ -900,6 +1191,7 @@ class DailyOmniDataset(BenchmarkDataset):
             f"dataset_split={self.dataset_split!r}, "
             f"video_dir={self.video_dir!r}, "
             f"input_mode={self.input_mode!r}, "
+            f"pack_mode={self.pack_mode!r}, "
             f"inline_local_video={self.inline_local_video!r}, "
             f"max_duration_seconds={self.max_duration_seconds}, "
             f"random_seed={self.random_seed}"

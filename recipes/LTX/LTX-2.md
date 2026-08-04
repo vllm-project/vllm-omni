@@ -165,6 +165,40 @@ Pass these fields in online `extra_params` or offline `--extra-body`:
 --extra-body '{"video_cfg_scale":3.0,"audio_cfg_scale":7.0}'
 ```
 
+### Guidance Parallelism
+
+For LTX, `cfg_parallel_size` is the number of ranks used to execute the
+complete guidance plan in parallel. Despite the legacy `cfg` name, it covers
+text CFG, STG, and cross-modality guidance passes; guidance rescaling is
+applied after all pass predictions are gathered.
+
+The default one-stage recipe has four Transformer passes per denoise step:
+`cond`, `uncond`, `ptb` (STG), and `mod` (cross-modality). The useful balanced
+configurations are therefore:
+
+| `--cfg-parallel-size` | Passes per rank | Guidance-slot utilization | Notes |
+|---:|---:|---:|---|
+| `1` | 4 | 100% | Single-rank fused guidance batch |
+| `2` | 2 | 100% | Recommended two-rank configuration |
+| `4` | 1 | 100% | One guidance pass per rank |
+
+Other positive sizes are accepted. When the pass count is not divisible by
+`cfg_parallel_size`, ranks are padded to an equal number of execution slots
+and LTX emits a warning with the expected utilization. For example, four
+passes on three ranks use six slots and have 66.7% guidance-slot utilization.
+
+Start an LTX-2.3 server with two-way guidance parallelism:
+
+```bash
+vllm serve diffusers/LTX-2.3-Diffusers --omni \
+  --cfg-parallel-size 2 --stage-init-timeout 600
+```
+
+The total device count is the product of `cfg_parallel_size` and the other
+configured parallel dimensions. Distilled pipelines use positive-only
+guidance, so `cfg_parallel_size > 1` does not provide guidance speedup for
+them.
+
 ### Python API
 
 Normal per-request values belong in `OmniDiffusionSamplingParams`. Pass the
@@ -273,8 +307,8 @@ bundled offline CLI do not currently expose `sigmas`.
 - Fused one-stage requests must resolve to identical LTX guidance and sigma
   schedules. Keep concurrent requests guidance-homogeneous or use
   `--max-num-seqs 1`.
-- `--cfg-parallel-size 2` supports only the CFG-only plan: disable STG and
-  modality guidance and set both rescale fields to `0.0`.
+- `--cfg-parallel-size` shards the complete LTX guidance plan, including STG,
+  modality guidance, and rescale-compatible prediction gathering.
 
 ## Operational Notes
 

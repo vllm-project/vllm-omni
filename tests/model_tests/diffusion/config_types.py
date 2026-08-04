@@ -3,7 +3,7 @@ Common definitions for controlling what tests run where.
 """
 
 from collections.abc import Callable
-from enum import StrEnum, auto
+from enum import Enum
 from typing import NamedTuple, TypeAlias
 
 from pytest import MarkDecorator
@@ -15,26 +15,27 @@ from vllm_omni.entrypoints.omni import Omni
 TinyDiffusionBuilder: TypeAlias = Callable[[], str]
 
 
-class DiffusionAccs(StrEnum):
+class DiffusionAccs(str, Enum):
     """Supported acceleration types / test settings for Diffusion Models."""
 
-    HSDP = auto()
-    TEA_CACHE = auto()
-    CACHE_DIT = auto()
-    SEQUENCE_PARALLEL = auto()
-    CFG_PARALLEL = auto()
-    TENSOR_PARALLEL = auto()
-    CPU_OFFLOAD = auto()
-    LAYERWISE_OFFLOAD = auto()
-    VAE_PATCH_PARALLEL = auto()
+    HSDP = "hsdp"
+    TEA_CACHE = "tea_cache"
+    CACHE_DIT = "cache_dit"
+    SEQUENCE_PARALLEL = "sequence_parallel"
+    CFG_PARALLEL = "cfg_parallel"
+    TENSOR_PARALLEL = "tensor_parallel"
+    CPU_OFFLOAD = "cpu_offload"
+    LAYERWISE_OFFLOAD = "layerwise_offload"
+    VAE_PATCH_PARALLEL = "vae_patch_parallel"
 
 
-class DiffusionTasks(StrEnum):
+class DiffusionTasks(str, Enum):
     """Supported tasks for Diffusion Models."""
 
-    TEXT_TO_IMAGE = auto()
-    IMAGE_TO_IMAGE = auto()
-    TEXT_TO_VIDEO = auto()
+    TEXT_TO_IMAGE = "text_to_image"
+    IMAGE_TO_IMAGE = "image_to_image"
+    TEXT_TO_VIDEO = "text_to_video"
+    IMAGE_TO_VIDEO = "image_to_video"
     # Text to audio, etc should be added here as needed
 
 

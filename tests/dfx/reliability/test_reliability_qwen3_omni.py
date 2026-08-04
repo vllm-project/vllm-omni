@@ -241,12 +241,12 @@ def _fault_keywords_match_response(*, status: int, body: bytes) -> bool:
     return any(key in text for key in body_fault_hints)
 
 
-def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
+def _deploy_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
     args: list[str] = omni_server.serve_args
     for i, arg in enumerate(args):
-        if arg == "--stage-configs-path" and i + 1 < len(args):
+        if arg == "--deploy-config" and i + 1 < len(args):
             return args[i + 1]
-        if arg.startswith("--stage-configs-path="):
+        if arg.startswith("--deploy-config="):
             return arg.split("=", 1)[1]
     return None
 
@@ -331,7 +331,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     """
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -394,7 +394,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -437,7 +437,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -791,7 +791,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     """
     device_spec = resolve_oom_device_spec(
         OOM_RECOVER_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,

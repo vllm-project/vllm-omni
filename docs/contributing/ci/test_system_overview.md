@@ -56,7 +56,11 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>/</td>
       <td><code>core_model and cpu</code></td>
       <td rowspan="2">&lt;15min</td>
-      <td>/tests/{component_name}/test_xxx</td>
+      <td>
+        <code>tests/{component}/…</code> mirroring <code>vllm_omni/{component}/</code><br>
+        (e.g. <code>tests/diffusion/</code>, <code>tests/engine/</code>, <code>tests/entrypoints/</code>)<br>
+        Do <strong>not</strong> add new top-level <code>tests/</code> dirs unrelated to a component.
+      </td>
       <td>
         <a href="test_writing_guide.md#l1--l2-level-testing-unit-testing-and-basic-end-to-end-verification">L1 &amp; L2</a><br>
         Section 1 L1&amp;L2: Purpose, Test Content, Directory Location, Example
@@ -68,16 +72,18 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
       <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
       <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
-      <td>High-priority features (using random lightweight models)</td>
+      <td>High-priority features and component tests that require launching instances</td>
       <td>High-priority interfaces (using random lightweight models)</td>
       <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}.py</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        (e.g. <code>fullduplex/</code>, <code>custom_pipeline/</code>, <code>rlhf_test/</code>)<br>
+        <strong>Component / interface Test (GPU):</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l1--l2-level-testing-unit-testing-and-basic-end-to-end-verification">L1 &amp; L2</a><br>
@@ -90,18 +96,19 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
       <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
-      <td>Medium-priority features (using random lightweight models)</td>
+      <td>Medium-priority features and component tests that require launching instances</td>
       <td>Medium-priority interfaces (using random lightweight models)</td>
       <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;30min</td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}.py</code><br>
+        <code>tests/e2e/accuracy/</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        <strong>Component / interface Test:</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l3-level-testing-core-integration-performance-and-accuracy-verification">L3</a><br>
@@ -114,26 +121,23 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
       <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
       <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
-      <td>Low-priority features (using real weights)</td>
+      <td>Low-priority features and component tests that require launching instances</td>
       <td>Low-priority interfaces (using real weights)</td>
       <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx<br>
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}_expansion.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}_expansion.py</code><br>
+        <code>tests/e2e/accuracy/test_{model}.py</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        <strong>Component / interface Test:</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code><br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test_qwen3_omni_*.json (Omni), test_tts.json (TTS),<br>
-        test_voxcpm2.json, test_higgs_audio_v3.json, and<br>
-        /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
-        <strong>Doc Test:</strong><br>
-        tests/examples/online_serving/test_{model_name}.py<br>
-        tests/examples/offline_inference/test_{model_name}.py<br>
-        <strong>Accuracy Test:</strong><br>
-        /tests/e2e/accuracy/test_{model_name}.py
+        <code>tests/dfx/perf/tests/</code><br>
+        <strong>Doc examples:</strong><br>
+        <code>tests/examples/online_serving/</code>, <code>tests/examples/offline_inference/</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l4-level-testing-full-functionality-performance-and-documentation-testing">L4</a><br>
@@ -152,11 +156,9 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>
-        /tests/dfx/stability/tests/test_qwen3_omni.json<br>
-        /tests/dfx/stability/tests/test_wan22.json<br>
+        <code>tests/dfx/stability/tests/</code><br>
         <strong>Reliability:</strong><br>
-        tests/dfx/reliability/test_reliability_{model_key}.py<br>
-        (e.g. <code>test_reliability_qwen3_omni.py</code>, <code>test_reliability_wan22.py</code>, <code>test_reliability_hunyuan_image.py</code>, <code>test_reliability_voxcpm2.py</code>)
+        <code>tests/dfx/reliability/test_reliability_{model}.py</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l5-level-testing-stability-and-reliability-testing">L5</a><br>
@@ -168,7 +170,9 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
   </tbody>
 </table>
 
-For per-level test authoring (directories, markers, examples), see [Test Writing Guide](./test_writing_guide.md).
+**Test Dir placement (summary):** component / unit under `tests/{component}/` mirroring `vllm_omni/`; model E2E under `tests/e2e/online_serving/`, `tests/e2e/offline_inference/`, and `tests/e2e/accuracy/`; feature integration under `tests/e2e/features/<feature>/`; doc example tests under `tests/examples/online_serving/` and `tests/examples/offline_inference/`; performance under `tests/dfx/perf/`; stability under `tests/dfx/stability/`; reliability under `tests/dfx/reliability/`. Do **not** add new top-level directories under `tests/` that are unrelated to a `vllm_omni` component (or to the established `e2e` / `dfx` / `helpers` / `examples` / `buildkite` layout).
+
+For per-level test authoring (markers, examples), see [Test Writing Guide](./test_writing_guide.md).
 
 ## Common Specifications
 

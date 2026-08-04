@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for SeqAllToAll4D and SeqAllToAll5D communication primitives."""
+"""Tests for SeqAllToAll4D, SeqAllToAll5D, and RingComm communication primitives.
+
+CPU tests use gloo on CPU tensors (no GPU). Nightly parity tests run the same
+checks on real multi-GPU NCCL collectives.
+"""
+
+from __future__ import annotations
 
 import os
+from typing import Literal
 
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -16,56 +24,51 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+_L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
+_L4_FOUR_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 
-def update_environment_variables(envs_dict: dict[str, str]):
-    """Update multiple environment variables with logging."""
-    for k, v in envs_dict.items():
-        os.environ[k] = v
+DeviceKind = Literal["cpu", "cuda"]
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [2])
-@pytest.mark.parametrize("seq_len_per_rank", [8])
-@pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize("head_size", [32])
-@pytest.mark.parametrize("use_sync", [False, True])
-def test_4d_identity(
+def _update_environment_variables(envs_dict: dict[str, str]) -> None:
+    for key, value in envs_dict.items():
+        os.environ[key] = value
+
+
+def _worker_device(local_rank: int, device_kind: DeviceKind) -> torch.device:
+    if device_kind == "cpu":
+        return torch.device("cpu")
+    return torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+
+
+def _init_worker(
+    local_rank: int,
     world_size: int,
-    dtype: torch.dtype,
-    batch_size: int,
-    seq_len_per_rank: int,
-    num_heads: int,
-    head_size: int,
-    use_sync: bool,
-):
-    """Test that two consecutive all-to-all operations return the original input."""
-    # Skip if not enough GPUs available
-    available_gpus = current_omni_platform.get_device_count()
-    if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
-
-    # Ensure num_heads is divisible by world_size
-    if num_heads % world_size != 0:
-        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
-
-    # Run test with multiprocessing spawn
-    torch.multiprocessing.spawn(
-        _test_4d_identity_worker,
-        args=(
-            world_size,
-            dtype,
-            batch_size,
-            seq_len_per_rank,
-            num_heads,
-            head_size,
-            use_sync,
-        ),
-        nprocs=world_size,
+    master_port: int,
+    device_kind: DeviceKind,
+) -> None:
+    _update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": str(master_port),
+        }
     )
+    backend = "gloo" if device_kind == "cpu" else None
+    init_distributed_environment(backend=backend)
 
 
-def _test_4d_identity_worker(
+def _close_tolerance(dtype: torch.dtype) -> tuple[float, float]:
+    if dtype == torch.bfloat16:
+        return 1e-3, 1e-3
+    if dtype == torch.float16:
+        return 1e-3, 1e-3
+    return 1e-5, 1e-5
+
+
+def _run_4d_identity(
     local_rank: int,
     world_size: int,
     dtype: torch.dtype,
@@ -74,29 +77,17 @@ def _test_4d_identity_worker(
     num_heads: int,
     head_size: int,
     use_sync: bool,
-):
-    """Worker function for test_4d_identity."""
-    # Set device
-    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
-    current_omni_platform.set_device(device)
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
 
-    # Set environment variables for distributed training
-    update_environment_variables(
-        {
-            "RANK": str(local_rank),
-            "LOCAL_RANK": str(local_rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29500",
-        }
-    )
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
 
-    # Initialize distributed environment
-    init_distributed_environment()
-    initialize_model_parallel(ulysses_degree=world_size)  # test ulysses sp by default
-    sp_group = get_sp_group().ulysses_group  # get ulysses sp group not ring sp group
-
-    # Create input tensor: (bs, seqlen/P, hc, hs)
     torch.manual_seed(42 + local_rank)
     input_tensor = torch.randn(
         batch_size,
@@ -106,100 +97,36 @@ def _test_4d_identity_worker(
         dtype=dtype,
         device=device,
     )
-
-    # Save original input for comparison
     original_input = input_tensor.clone()
 
-    # First all-to-all: (bs, seqlen/P, hc, hs) -> (bs, seqlen, hc/P, hs)
-    intermediate = SeqAllToAll4D.apply(
-        sp_group,
-        input_tensor,
-        2,  # scatter head dimension
-        1,  # gather sequence dimension
-        use_sync,
-    )
-
-    # Verify intermediate shape
-    expected_shape = (
+    intermediate = SeqAllToAll4D.apply(sp_group, input_tensor, 2, 1, use_sync)
+    expected_intermediate_shape = (
         batch_size,
         seq_len_per_rank * world_size,
         num_heads // world_size,
         head_size,
     )
-    assert intermediate.shape == expected_shape, (
-        f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
+    assert intermediate.shape == expected_intermediate_shape, (
+        f"Intermediate shape mismatch: expected {expected_intermediate_shape}, got {intermediate.shape}"
     )
 
-    # Second all-to-all: (bs, seqlen, hc/P, hs) -> (bs, seqlen/P, hc, hs)
-    output = SeqAllToAll4D.apply(
-        sp_group,
-        intermediate,
-        1,  # scatter sequence dimension
-        2,  # gather head dimension
-        use_sync,
-    )
-
-    # Verify output shape matches input
+    output = SeqAllToAll4D.apply(sp_group, intermediate, 1, 2, use_sync)
     assert output.shape == original_input.shape, (
         f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
     )
 
-    # Verify output matches original input
+    rtol, atol = _close_tolerance(dtype)
     torch.testing.assert_close(
         output,
         original_input,
-        rtol=1e-5,
-        atol=1e-5,
+        rtol=rtol,
+        atol=atol,
         msg="Output does not match original input after two all-to-all operations",
     )
-
-    # Cleanup distributed environment
     destroy_distributed_env()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [2])
-@pytest.mark.parametrize("seq_len_per_rank", [8])
-@pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize("head_size", [32])
-@pytest.mark.parametrize("use_sync", [False, True])
-def test_5d_identity(
-    world_size: int,
-    dtype: torch.dtype,
-    batch_size: int,
-    seq_len_per_rank: int,
-    num_heads: int,
-    head_size: int,
-    use_sync: bool,
-):
-    """Test that two consecutive all-to-all operations return the original input."""
-    # Skip if not enough GPUs available
-    available_gpus = current_omni_platform.get_device_count()
-    if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
-
-    # Ensure num_heads is divisible by world_size
-    if num_heads % world_size != 0:
-        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
-
-    # Run test with multiprocessing spawn
-    torch.multiprocessing.spawn(
-        _test_5d_identity_worker,
-        args=(
-            world_size,
-            dtype,
-            batch_size,
-            seq_len_per_rank,
-            num_heads,
-            head_size,
-            use_sync,
-        ),
-        nprocs=world_size,
-    )
-
-
-def _test_5d_identity_worker(
+def _run_5d_identity(
     local_rank: int,
     world_size: int,
     dtype: torch.dtype,
@@ -208,199 +135,329 @@ def _test_5d_identity_worker(
     num_heads: int,
     head_size: int,
     use_sync: bool,
-):
-    """Worker function for test_5d_identity."""
-    # Set device
-    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
-    current_omni_platform.set_device(device)
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
 
-    # Set environment variables for distributed training
-    update_environment_variables(
-        {
-            "RANK": str(local_rank),
-            "LOCAL_RANK": str(local_rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29500",
-        }
-    )
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
 
-    # Initialize distributed environment
-    init_distributed_environment()
-    initialize_model_parallel(ulysses_degree=world_size)  # test ulysses sp by default
-    sp_group = get_sp_group().ulysses_group  # get ulysses sp group not ring sp group
-
-    # Create input tensor: (bs, seqlen/P, 3, hc, hs)
-    # The '3' dimension is for Q, K, V
     torch.manual_seed(42 + local_rank)
     input_tensor = torch.randn(
         batch_size,
         seq_len_per_rank,
-        3,  # Q, K, V
+        3,
         num_heads,
         head_size,
         dtype=dtype,
         device=device,
     )
-
-    # Save original input for comparison
     original_input = input_tensor.clone()
 
-    # First all-to-all: (bs, seqlen/P, 3, hc, hs) -> (bs, seqlen, 3, hc/P, hs)
-    intermediate = SeqAllToAll5D.apply(
-        sp_group,
-        input_tensor,
-        3,  # scatter head dimension
-        1,  # gather sequence dimension
-        use_sync,
-    )
-
-    # Verify intermediate shape
-    expected_shape = (
+    intermediate = SeqAllToAll5D.apply(sp_group, input_tensor, 3, 1, use_sync)
+    expected_intermediate_shape = (
         batch_size,
         seq_len_per_rank * world_size,
         3,
         num_heads // world_size,
         head_size,
     )
-    assert intermediate.shape == expected_shape, (
-        f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
+    assert intermediate.shape == expected_intermediate_shape, (
+        f"Intermediate shape mismatch: expected {expected_intermediate_shape}, got {intermediate.shape}"
     )
 
-    # Second all-to-all: (bs, seqlen, 3, hc/P, hs) -> (bs, seqlen/P, 3, hc, hs)
-    output = SeqAllToAll5D.apply(
-        sp_group,
-        intermediate,
-        1,  # scatter sequence dimension
-        3,  # gather head dimension
-        use_sync,
-    )
-
-    # Verify output shape matches input
+    output = SeqAllToAll5D.apply(sp_group, intermediate, 1, 3, use_sync)
     assert output.shape == original_input.shape, (
         f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
     )
 
-    # Verify output matches original input
+    rtol, atol = _close_tolerance(dtype)
     torch.testing.assert_close(
         output,
         original_input,
-        rtol=1e-5,
-        atol=1e-5,
+        rtol=rtol,
+        atol=atol,
         msg="Output does not match original input after two all-to-all operations",
     )
-
-    # Cleanup distributed environment
     destroy_distributed_env()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [2])
-@pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize("head_size", [128])
-def test_ring_p2p(
-    world_size: int,
-    dtype: torch.dtype,
-    batch_size: int,
-    num_heads: int,
-    head_size: int,
-):
-    """Test Ring P2P communication (send_recv)."""
-    # Skip if not enough GPUs available
-    available_gpus = current_omni_platform.get_device_count()
-    if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
-
-    torch.multiprocessing.spawn(
-        _test_ring_p2p_worker,
-        args=(world_size, dtype, batch_size, num_heads, head_size),
-        nprocs=world_size,
-    )
-
-
-def _test_ring_p2p_worker(
+def _run_ring_p2p(
     local_rank: int,
     world_size: int,
     dtype: torch.dtype,
     batch_size: int,
     num_heads: int,
     head_size: int,
-):
-    """Worker for Ring P2P test."""
-    import sys
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
 
-    # Set device
-    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
-    current_omni_platform.set_device(device)
-
-    # Set env vars
-    # Use a different port to avoid conflict with other tests if run in parallel
-    update_environment_variables(
-        {
-            "RANK": str(local_rank),
-            "LOCAL_RANK": str(local_rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29501",
-        }
-    )
-
-    # Init distributed
     try:
-        init_distributed_environment()
-        # Ring degree = world_size to test ring group
+        _init_worker(local_rank, world_size, master_port, device_kind)
         initialize_model_parallel(ring_degree=world_size)
         sp_group = get_sp_group()
-
-        print(f"[Rank {local_rank}] Initialized. Ring group size: {sp_group.ring_group.size()}")
-        sys.stdout.flush()
-
-        # Create RingComm
         comm = RingComm(sp_group.ring_group)
 
-        # Create tensor: rank-specific data
-        # (batch, num_heads, head_size)
-        # Fill with rank value + 1 to avoid 0 and make verification easy
         input_tensor = torch.full(
-            (batch_size, num_heads, head_size), fill_value=float(local_rank + 1), dtype=dtype, device=device
+            (batch_size, num_heads, head_size),
+            fill_value=float(local_rank + 1),
+            dtype=dtype,
+            device=device,
         )
-
-        print(f"[Rank {local_rank}] Input sum: {input_tensor.sum().item()}")
-        sys.stdout.flush()
-
-        # Send input, receive from prev
-        # RingComm.send_recv sends to next, receives from prev
-        t0 = __import__("time").time()
         recv_tensor = comm.send_recv(input_tensor)
         comm.commit()
         comm.wait()
-        t1 = __import__("time").time()
 
-        print(f"[Rank {local_rank}] Communication done in {t1 - t0:.4f}s")
-
-        # Verify
-        # Expected value: from (rank - 1) % world_size
         prev_rank = (local_rank - 1 + world_size) % world_size
         expected_value = float(prev_rank + 1)
-
-        recv_sum = recv_tensor.sum().item()
-        print(f"[Rank {local_rank}] Received sum: {recv_sum}, Expected value: {expected_value}")
-        sys.stdout.flush()
-
         expected_tensor = torch.full_like(recv_tensor, fill_value=expected_value)
-
-        # Use a slightly loose tolerance for bfloat16
+        rtol, atol = _close_tolerance(dtype)
         torch.testing.assert_close(
-            recv_tensor, expected_tensor, rtol=1e-3, atol=1e-3, msg=f"[Rank {local_rank}] Data mismatch!"
+            recv_tensor,
+            expected_tensor,
+            rtol=rtol,
+            atol=atol,
+            msg=f"[Rank {local_rank}] Ring P2P data mismatch",
         )
-        print(f"[Rank {local_rank}] Verification PASSED")
-
-    except Exception as e:
-        print(f"[Rank {local_rank}] FAILED with error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        raise e
     finally:
         destroy_distributed_env()
+
+
+def _spawn_4d_identity(
+    *,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+    use_sync: bool,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    torch.multiprocessing.spawn(
+        _run_4d_identity,
+        args=(
+            world_size,
+            dtype,
+            batch_size,
+            seq_len_per_rank,
+            num_heads,
+            head_size,
+            use_sync,
+            device_kind,
+            master_port,
+        ),
+        nprocs=world_size,
+    )
+
+
+def _spawn_5d_identity(
+    *,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+    use_sync: bool,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    torch.multiprocessing.spawn(
+        _run_5d_identity,
+        args=(
+            world_size,
+            dtype,
+            batch_size,
+            seq_len_per_rank,
+            num_heads,
+            head_size,
+            use_sync,
+            device_kind,
+            master_port,
+        ),
+        nprocs=world_size,
+    )
+
+
+def _spawn_ring_p2p(
+    *,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    torch.multiprocessing.spawn(
+        _run_ring_p2p,
+        args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, master_port),
+        nprocs=world_size,
+    )
+
+
+def _require_heads_divisible(num_heads: int, world_size: int) -> None:
+    if num_heads % world_size != 0:
+        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
+
+
+def _require_gpus(world_size: int) -> None:
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
+
+# ---------------------------------------------------------------------------
+# CPU: gloo collectives on CPU tensors (no GPU)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("use_sync", [False, True])
+def test_4d_identity(world_size: int, use_sync: bool):
+    _require_heads_divisible(8, world_size)
+    _spawn_4d_identity(
+        world_size=world_size,
+        dtype=torch.float32,
+        batch_size=2,
+        seq_len_per_rank=8,
+        num_heads=8,
+        head_size=32,
+        use_sync=use_sync,
+        device_kind="cpu",
+        master_port=29610,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("use_sync", [False, True])
+def test_5d_identity(world_size: int, use_sync: bool):
+    _require_heads_divisible(8, world_size)
+    _spawn_5d_identity(
+        world_size=world_size,
+        dtype=torch.float32,
+        batch_size=2,
+        seq_len_per_rank=8,
+        num_heads=8,
+        head_size=32,
+        use_sync=use_sync,
+        device_kind="cpu",
+        master_port=29611,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_ring_p2p(world_size: int):
+    _spawn_ring_p2p(
+        world_size=world_size,
+        dtype=torch.float32,
+        batch_size=2,
+        num_heads=8,
+        head_size=128,
+        device_kind="cpu",
+        master_port=29612,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Nightly: same checks on real multi-GPU NCCL collectives
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(2, marks=_L4_TWO_GPU),
+        pytest.param(4, marks=_L4_FOUR_GPU),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_sync", [False, True])
+def test_4d_identity_parity(world_size: int, dtype: torch.dtype, use_sync: bool):
+    _require_gpus(world_size)
+    _require_heads_divisible(8, world_size)
+    _spawn_4d_identity(
+        world_size=world_size,
+        dtype=dtype,
+        batch_size=2,
+        seq_len_per_rank=8,
+        num_heads=8,
+        head_size=32,
+        use_sync=use_sync,
+        device_kind="cuda",
+        master_port=29500,
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(2, marks=_L4_TWO_GPU),
+        pytest.param(4, marks=_L4_FOUR_GPU),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_sync", [False, True])
+def test_5d_identity_parity(world_size: int, dtype: torch.dtype, use_sync: bool):
+    _require_gpus(world_size)
+    _require_heads_divisible(8, world_size)
+    _spawn_5d_identity(
+        world_size=world_size,
+        dtype=dtype,
+        batch_size=2,
+        seq_len_per_rank=8,
+        num_heads=8,
+        head_size=32,
+        use_sync=use_sync,
+        device_kind="cuda",
+        master_port=29502,
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(2, marks=_L4_TWO_GPU),
+        pytest.param(4, marks=_L4_FOUR_GPU),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ring_p2p_parity(world_size: int, dtype: torch.dtype):
+    _require_gpus(world_size)
+    _spawn_ring_p2p(
+        world_size=world_size,
+        dtype=dtype,
+        batch_size=2,
+        num_heads=8,
+        head_size=128,
+        device_kind="cuda",
+        master_port=29501,
+    )
