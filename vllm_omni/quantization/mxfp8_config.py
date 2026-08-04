@@ -34,6 +34,7 @@ Extending to a new MX precision with a different calling convention (e.g. dual-s
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -62,6 +63,24 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _is_layer_or_child_skipped(
+    prefix: str,
+    ignored_layers: list[str],
+    fused_mapping: Mapping[str, list[str]],
+) -> bool:
+    if is_layer_skipped(
+        prefix=prefix,
+        ignored_layers=ignored_layers,
+        fused_mapping=fused_mapping,
+    ):
+        return True
+    prefix_without_model = prefix.removeprefix("model.")
+    return any(
+        prefix_without_model.startswith(f"{ignored_layer.removeprefix('model.')}.") for ignored_layer in ignored_layers
+    )
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -85,6 +104,7 @@ class DiffusionMXFP8Config(QuantizationConfig):
         super().__init__()
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
         self.ignored_layers = ignored_layers or []
+        self.quant_description = {"group_size": 32}
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -122,11 +142,33 @@ class DiffusionMXFP8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        if current_omni_platform.is_npu() and self.is_checkpoint_mxfp8_serialized:
+            from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+            if isinstance(layer, RoutedExperts):
+                if _is_layer_or_child_skipped(
+                    prefix,
+                    self.ignored_layers,
+                    self.packed_modules_mapping,
+                ):
+                    return None
+                from vllm_ascend.quantization.method_adapters import (
+                    AscendFusedMoEMethod,
+                )
+                from vllm_ascend.quantization.methods.w8a8_mxfp8 import (
+                    AscendW8A8MXFP8DynamicFusedMoEMethod,
+                )
+
+                scheme = AscendW8A8MXFP8DynamicFusedMoEMethod()
+                return AscendFusedMoEMethod(
+                    scheme,
+                    layer.moe_config,
+                )
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
+            if _is_layer_or_child_skipped(
+                prefix,
+                self.ignored_layers,
+                self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_npu():
