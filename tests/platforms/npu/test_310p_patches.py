@@ -414,6 +414,21 @@ def test_qwen3_tts_code_predictor_forward_uses_projected_embedding_and_sampling(
     assert sample_calls == [{0: generator}]
 
 
+def test_310p_attention_forward_uses_fused_qkv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fused code predictor dropped q_proj/k_proj/v_proj in favor of a single
+    ``qkv_proj`` (+ ``_split_qkv``). The 310P attention override must follow
+    suit, otherwise its NPU flash-attention path raises AttributeError on 310P.
+    The NPU path itself cannot run in CPU CI, so guard the contract statically."""
+    import inspect
+
+    module, _ = _load_qwen3_tts_patch(monkeypatch)
+    source = inspect.getsource(module._Qwen3CodePredictorAttention310P.forward)
+    assert "qkv_proj" in source and "_split_qkv" in source
+    assert "self.q_proj" not in source
+    assert "self.k_proj" not in source
+    assert "self.v_proj" not in source
+
+
 def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
     talker = module._Qwen3TTSTalker310P(vllm_config=object())

@@ -136,6 +136,12 @@ def _resolve_minimax_h3_model_root(
     )
 
 
+def _resolve_component_quant_config(quant_config, component: str):
+    if hasattr(quant_config, "resolve"):
+        return quant_config.resolve(component)
+    return quant_config
+
+
 def _minimax_h3_post_process(output, output_type: str = "np"):
     """Convert the joint video/audio output without capturing worker state.
 
@@ -378,14 +384,18 @@ class MiniMaxH3Pipeline(
                 )
             )
             self._dit_modules.append("transformer_2")
+        transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformer",
+        )
         self.transformer = MiniMaxH3DiTModel(
             od_config,
-            quant_config=od_config.quantization_config,
+            quant_config=transformer_quant_config,
         )
         if ref2va_model_path is not None:
             self.transformer_2 = MiniMaxH3DiTModel(
                 od_config,
-                quant_config=od_config.quantization_config,
+                quant_config=transformer_quant_config,
             )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(

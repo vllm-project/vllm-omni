@@ -118,6 +118,7 @@ nav:
       - design/feature/teacache.md
       - design/feature/skip_softmax.md
       - design/feature/async_chunk.md
+      - design/feature/omni_async_output_materialization.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
       - design/feature/diffusion_request_level_batching.md
