@@ -28,26 +28,26 @@ def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], m
 def _transfer_manager(
     *,
     chunk_frames: int = 2,
+    initial_chunk_frames: int = 0,
     pre_lookahead_frames: int = 0,
     stream_scale_factor: int = 1,
     max_chunk_frames: int | None = None,
 ):
     if max_chunk_frames is None:
         max_chunk_frames = chunk_frames
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_pre_lookahead_frames": pre_lookahead_frames,
+        "codec_max_chunk_frames": max_chunk_frames,
+        "codec_stream_scale_factor": stream_scale_factor,
+        "codec_vocab_size": 6561,
+    }
+    if initial_chunk_frames > 0:
+        extra["initial_codec_chunk_frames"] = initial_chunk_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_pre_lookahead_frames": pre_lookahead_frames,
-                    "codec_max_chunk_frames": max_chunk_frames,
-                    "codec_stream_scale_factor": stream_scale_factor,
-                    "codec_vocab_size": 6561,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -294,6 +294,73 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
     assert payload_ready is not None
     assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
     assert payload_ready.meta.left_context_size == 0
+
+
+def test_talker2code2wav_async_chunk_uses_initial_codec_chunk_frames_for_first_emit():
+    transfer_manager = _transfer_manager(
+        chunk_frames=4,
+        initial_chunk_frames=1,
+        pre_lookahead_frames=0,
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-ic",
+        output_token_ids=[1],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    payload_one = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+    request.output_token_ids = [1, 2, 3, 4, 5]
+    payload_second = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+    request.output_token_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    payload_third = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload_one is not None
+    assert payload_one.codes.audio.tolist() == [1]
+    assert payload_one.meta.left_context_size == 0
+    assert payload_second is not None
+    assert payload_second.codes.audio.tolist() == [1, 2, 3, 4, 5]
+    assert payload_second.meta.left_context_size == 1
+    assert payload_third is not None
+    assert payload_third.codes.audio.tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert payload_third.meta.left_context_size == 5
+
+
+def test_talker2code2wav_async_chunk_honors_per_request_initial_codec_chunk_frames():
+    transfer_manager = _transfer_manager(chunk_frames=4, pre_lookahead_frames=0)
+    entry = SimpleNamespace(list_data=[2])
+    request = SimpleNamespace(
+        external_req_id="rid-ic-req",
+        output_token_ids=[1, 2, 3, 4],
+        additional_information=SimpleNamespace(entries={"initial_codec_chunk_frames": entry}),
+        is_finished=lambda: False,
+    )
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 2]
+    assert payload.meta.left_context_size == 0
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():

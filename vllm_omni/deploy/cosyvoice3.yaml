@@ -33,6 +33,9 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       codec_chunk_frames: 15
+      # Optional: emit a smaller first chunk so code2wav starts earlier (lower TTFA).
+      # Subsequent chunks use codec_chunk_frames. Same pattern as Qwen3-TTS deploy yaml.
+      initial_codec_chunk_frames: 5
       codec_left_context_frames: 25
       codec_vocab_size: 6561
 

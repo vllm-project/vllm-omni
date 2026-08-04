@@ -134,17 +134,45 @@ def talker2code2wav_async_chunk(
         raw_cfg = getattr(connector, "config", {}) or {}
         cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
         chunk_size = int(cfg.get("codec_chunk_frames", 25))
+        configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
         code_vocab_size = int(cfg.get("codec_vocab_size", 6561))
         pre_lookahead_len = int(cfg.get("codec_pre_lookahead_frames", 3))
         max_chunk_size = int(cfg.get("codec_max_chunk_frames", 4 * chunk_size))
         stream_scale_factor = int(cfg.get("codec_stream_scale_factor", 2))
-        if chunk_size <= 0 or pre_lookahead_len < 0 or max_chunk_size <= 0 or stream_scale_factor <= 0:
+        if (
+            chunk_size <= 0
+            or configured_initial_chunk_size < 0
+            or pre_lookahead_len < 0
+            or max_chunk_size <= 0
+            or stream_scale_factor <= 0
+        ):
             raise ValueError(
                 f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
+                f"initial_codec_chunk_frames={configured_initial_chunk_size}, "
                 f"codec_pre_lookahead_frames={pre_lookahead_len}, "
                 f"codec_max_chunk_frames={max_chunk_size}, "
                 f"codec_stream_scale_factor={stream_scale_factor}"
             )
+
+        initial_chunk_size = configured_initial_chunk_size
+        additional_information = getattr(request, "additional_information", None)
+        if (
+            additional_information is not None
+            and hasattr(additional_information, "entries")
+            and "initial_codec_chunk_frames" in additional_information.entries
+        ):
+            entry = additional_information.entries["initial_codec_chunk_frames"]
+            if entry.list_data is not None and len(entry.list_data) == 1:
+                initial_chunk_size = int(entry.list_data[0])
+
+        initial_token_hop_len = initial_chunk_size if initial_chunk_size > 0 else chunk_size
+        if initial_chunk_size > chunk_size:
+            logger.warning(
+                "initial_codec_chunk_frames=%d > codec_chunk_frames=%d, clamping to codec_chunk_frames.",
+                initial_chunk_size,
+                chunk_size,
+            )
+            initial_token_hop_len = chunk_size
 
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
@@ -197,6 +225,7 @@ def talker2code2wav_async_chunk(
                     "emitted_chunks": 0,
                     "emitted_token_len": 0,
                     "token_hop_len": chunk_size,
+                    "initial_token_hop_len": initial_token_hop_len,
                     "prompt_token_pad": prompt_token_pad,
                     "pre_lookahead_len": pre_lookahead_len,
                     "token_max_hop_len": max(chunk_size, max_chunk_size),
@@ -255,10 +284,11 @@ def talker2code2wav_async_chunk(
 
         with nullcontext():
             token_hop_len = max(1, int(state.get("token_hop_len", chunk_size)))
+            first_token_hop_len = max(1, int(state.get("initial_token_hop_len", chunk_size)))
             prompt_token_pad = max(0, int(state.get("prompt_token_pad", 0)))
             pre_lookahead_len = max(0, int(state.get("pre_lookahead_len", pre_lookahead_len)))
             available = max(0, length - emitted_token_len)
-            this_token_hop_len = token_hop_len + prompt_token_pad if emitted_token_len == 0 else token_hop_len
+            this_token_hop_len = first_token_hop_len + prompt_token_pad if emitted_token_len == 0 else token_hop_len
             required = this_token_hop_len + pre_lookahead_len
 
             if not finished:
