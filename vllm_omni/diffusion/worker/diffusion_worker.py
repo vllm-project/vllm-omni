@@ -17,6 +17,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Iterator
@@ -73,6 +74,10 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.model_loader.prewarm import (
+    WeightsPrewarmHandoff,
+    use_parent_weights_prewarm,
+)
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -89,6 +94,11 @@ from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
+from vllm_omni.utils.startup_timing import (
+    log_process_checkpoint,
+    log_startup_duration,
+    startup_span,
+)
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 if TYPE_CHECKING:
@@ -271,6 +281,8 @@ class DiffusionWorker:
         distributed_init_method: str | None = None,
         set_proc_title: bool = True,
     ):
+        worker_started = time.perf_counter()
+        log_process_checkpoint(logger, "worker.process_to_init", rank=rank)
         self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
@@ -292,7 +304,8 @@ class DiffusionWorker:
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
-        self.init_device()
+        with startup_span(logger, "worker.device_init", rank=rank):
+            self.init_device()
         try:
             # Create model runner — one decision chain, in precedence order:
             #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -320,23 +333,27 @@ class DiffusionWorker:
                 model_runner_cls_path = engine_runner
             else:
                 model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
-            model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
-            self.model_runner = model_runner_cls(
-                vllm_config=self.vllm_config,
-                od_config=self.od_config,
-                device=self.device,
-            )
+            with startup_span(logger, "worker.model_runner_construct", rank=rank):
+                model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+                self.model_runner = model_runner_cls(
+                    vllm_config=self.vllm_config,
+                    od_config=self.od_config,
+                    device=self.device,
+                )
             self.profiler: WorkerProfiler | None = self._create_profiler()
             if not skip_load_model:
-                self.load_model(load_format=self.od_config.diffusion_load_format)
+                with startup_span(logger, "worker.model_load", rank=rank):
+                    self.load_model(load_format=self.od_config.diffusion_load_format)
                 self._init_weight_transfer_engine()
-                self.init_lora_manager()
+                with startup_span(logger, "worker.lora_init", rank=rank):
+                    self.init_lora_manager()
         except Exception:
             # init_device() owns process-global distributed state. If anything
             # after it fails, unwind that state before another inline worker is
             # allowed to initialize in this process.
             self.shutdown()
             raise
+        log_startup_duration(logger, "worker.total", time.perf_counter() - worker_started, rank=rank)
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def _init_weight_transfer_engine(self) -> None:
@@ -1343,6 +1360,7 @@ class WorkerProc:
         wake_event: Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        weights_prewarm_handoff: WeightsPrewarmHandoff | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
@@ -1366,8 +1384,11 @@ class WorkerProc:
 
         assert od_config.master_port is not None
 
-        # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        # Parent prewarm overlaps process spawn/import only. All ranks wait for
+        # its readers to stop before any worker starts model initialization,
+        # and the context suppresses the old per-worker speculative readers.
+        with use_parent_weights_prewarm(weights_prewarm_handoff):
+            self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
         self._async_output_queue: queue.Queue | None = None
@@ -1426,7 +1447,7 @@ class WorkerProc:
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
-        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
+        if not self.od_config.step_execution and isinstance(output, DiffusionOutput | BatchRunnerOutput):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:
@@ -1810,6 +1831,7 @@ class WorkerProc:
         wake_event: Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        weights_prewarm_handoff: WeightsPrewarmHandoff | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
@@ -1843,6 +1865,7 @@ class WorkerProc:
                 wake_event=wake_event,
                 worker_extension_cls=worker_extension_cls,
                 custom_pipeline_args=custom_pipeline_args,
+                weights_prewarm_handoff=weights_prewarm_handoff,
             )
             logger.info(f"Worker {rank}: Scheduler loop started.")
             pipe_writer.send(

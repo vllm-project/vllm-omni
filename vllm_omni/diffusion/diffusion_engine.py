@@ -75,6 +75,7 @@ from vllm_omni.metrics.utils import (
     extract_diffusion_denoise_ms,
     extract_diffusion_vae_decode_ms,
 )
+from vllm_omni.utils.startup_timing import startup_span
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
@@ -1826,9 +1827,11 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         logger.info("dummy run to warm up the model")
-        output = self.add_req_and_wait_for_response(req)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
+        with startup_span(logger, "engine.dummy_warmup"):
+            with startup_span(logger, "engine.dummy_request"):
+                output = self.add_req_and_wait_for_response(req)
+            if output.error:
+                raise RuntimeError(f"Dummy run failed: {output.error}")
 
     def _submit_rpc(
         self,

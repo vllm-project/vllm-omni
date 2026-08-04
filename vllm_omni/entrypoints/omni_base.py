@@ -42,6 +42,7 @@ from vllm_omni.metrics.utils import (
 )
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.startup_timing import log_process_checkpoint, startup_span
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 if TYPE_CHECKING:
@@ -70,7 +71,8 @@ class OmniEngineDeadError(EngineDeadError):
 def _weak_shutdown_engine(engine: OmniEngineBase) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
-        engine.shutdown()
+        with startup_span(logger, "engine.shutdown", trigger="finalizer"):
+            engine.shutdown()
     except Exception:
         pass
 
@@ -173,6 +175,7 @@ class OmniBase(PDDisaggregationMixin):
         model: str,
         **kwargs: Any,
     ) -> None:
+        log_process_checkpoint(logger, "entrypoint.process_to_init", entrypoint=self.__class__.__name__)
         if "engine_args" in kwargs:
             logger.warning(
                 "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
@@ -196,7 +199,8 @@ class OmniBase(PDDisaggregationMixin):
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
-        model = omni_snapshot_download(model)
+        with startup_span(logger, "entrypoint.snapshot_download", entrypoint=self.__class__.__name__):
+            model = omni_snapshot_download(model)
         self.__dict__["_name"] = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
@@ -215,16 +219,17 @@ class OmniBase(PDDisaggregationMixin):
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
-        self.engine = self._create_engine(
-            model=model,
-            init_timeout=init_timeout,
-            stage_init_timeout=stage_init_timeout,
-            transfer_emitter=self.transfer_metrics,
-            prom_metrics=self.prom_metrics,
-            log_stats=log_stats,
-            collect_stage_metrics=collect_stage_metrics,
-            **kwargs,
-        )
+        with startup_span(logger, "engine.total", entrypoint=self.__class__.__name__):
+            self.engine = self._create_engine(
+                model=model,
+                init_timeout=init_timeout,
+                stage_init_timeout=stage_init_timeout,
+                transfer_emitter=self.transfer_metrics,
+                prom_metrics=self.prom_metrics,
+                log_stats=log_stats,
+                collect_stage_metrics=collect_stage_metrics,
+                **kwargs,
+            )
         self._shutdown_called = False
         self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
@@ -347,7 +352,7 @@ class OmniBase(PDDisaggregationMixin):
             if allow_delta_coercion:
                 normalized = coerce_param_message_types(list(normalized), is_streaming=True)
 
-        elif isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, (str, bytes)):
+        elif isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, str | bytes):
             normalized = sampling_params_list
         elif self.num_stages == 1:
             normalized = [sampling_params_list]
@@ -823,4 +828,5 @@ class OmniBase(PDDisaggregationMixin):
         finalizer = getattr(self, "_weak_finalizer", None)
         if finalizer is not None and finalizer.alive:
             finalizer.detach()
-        self.engine.shutdown()
+        with startup_span(logger, "engine.shutdown", entrypoint=self.__class__.__name__):
+            self.engine.shutdown()
