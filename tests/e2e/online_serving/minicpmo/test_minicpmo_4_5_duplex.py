@@ -10,17 +10,15 @@ from pathlib import Path
 import pytest
 import websockets
 
-from tests.e2e.online_serving.minicpmo_realtime_duplex_scenarios import (
+from tests.e2e.online_serving.minicpmo.minicpmo_realtime_duplex_scenarios import (
     _ref_audio_data_url,
     run_demo,
 )
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
+from tests.e2e.online_serving.minicpmo.run_minicpmo_realtime_duplex_multi_session import (
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.minicpmo_4_5_duplex import (
-    CORE_SERVER_PARAMS,
-    SERVER_PARAMS,
     demo_args,
     multi_session_args,
     realtime_url,
@@ -83,8 +81,7 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", CORE_SERVER_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None:
     ref_audio = resolve_ref_audio(model_prefix)
     events = asyncio.run(
@@ -101,8 +98,7 @@ def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_duplex_single_session_response_required(omni_server, model_prefix: str, tmp_path: Path) -> None:
     result = asyncio.run(
         run_demo(
@@ -123,8 +119,7 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str, tmp_path: Path) -> None:
     result = asyncio.run(
         run_multi_session(
