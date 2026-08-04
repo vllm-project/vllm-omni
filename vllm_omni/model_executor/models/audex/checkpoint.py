@@ -57,12 +57,12 @@ def _download_audiogen_index(model: str) -> str:
     metadata round trip per stage-engine boot; a cache miss falls back to
     the network.
     """
-    from huggingface_hub import hf_hub_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
+        return hf_api().hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
     except Exception:
-        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
+        return hf_api().hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
 
 
 def _dedup_shard_patterns(model: str) -> list[str]:
@@ -111,13 +111,13 @@ def ensure_audex_snapshot(model: str, profile: str = "tts") -> str:
     if profile in ("tts", "tta"):
         patterns += _dedup_shard_patterns(model)
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return snapshot_download(model, allow_patterns=patterns)
+        return hf_api().snapshot_download(model, allow_patterns=patterns)
     except Exception as download_exc:
         try:
-            return snapshot_download(model, allow_patterns=patterns, local_files_only=True)
+            return hf_api().snapshot_download(model, allow_patterns=patterns, local_files_only=True)
         except Exception:
             raise RuntimeError(
                 f"Could not resolve the Audex repo {model!r} (profile {profile!r}): the download "
@@ -135,13 +135,13 @@ def ensure_xcodec1_snapshot(model: str | None) -> str:
     if os.path.isdir(model):
         return model
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return snapshot_download(model)
+        return hf_api().snapshot_download(model)
     except Exception as download_exc:
         try:
-            return snapshot_download(model, local_files_only=True)
+            return hf_api().snapshot_download(model, local_files_only=True)
         except Exception:
             raise RuntimeError(
                 f"Could not resolve the XCodec1 checkpoint {model!r}: the download failed and "

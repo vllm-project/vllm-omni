@@ -9,10 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from huggingface_hub import snapshot_download
 
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "openbmb/MiniCPM-o-4_5"
 DEPLOY_CONFIG = modify_stage_config(
@@ -110,7 +110,7 @@ def resolve_ref_audio(model_prefix: str) -> Path:
     if model_prefix:
         model_root = Path(model_prefix) / MODEL
     else:
-        model_root = Path(snapshot_download(MODEL, local_files_only=True))
+        model_root = Path(hf_api().snapshot_download(MODEL, local_files_only=True))
     ref_audio = model_root / REF_AUDIO_RELATIVE_PATH
     if not ref_audio.is_file():
         raise FileNotFoundError(f"MiniCPM-o checkpoint ref audio is missing: {ref_audio}")

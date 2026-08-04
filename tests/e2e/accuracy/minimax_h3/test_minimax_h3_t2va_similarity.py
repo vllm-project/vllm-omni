@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 import requests
 import torch
-from huggingface_hub import snapshot_download
 
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
@@ -22,6 +21,7 @@ from tests.e2e.accuracy.helpers import (
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.benchmark, pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -55,7 +55,7 @@ def _model_name() -> str:
     if configured:
         return configured
 
-    snapshot_root = snapshot_download(
+    snapshot_root = hf_api().snapshot_download(
         repo_id=MODEL_REPO_ID,
         revision=MODEL_REVISION,
         allow_patterns=["FL2VA/**"],

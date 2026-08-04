@@ -361,9 +361,9 @@ def _resolve_offline_model(model: str) -> str:
 
     if not model or os.path.isdir(model) or not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model, local_files_only=True)
+    return hf_api().snapshot_download(model, local_files_only=True)
 
 
 class DiffusionServer:

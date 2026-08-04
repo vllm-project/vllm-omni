@@ -23,11 +23,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir
 from tests.helpers.mark import hardware_test
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 OFFICIAL_REVISION = "9377758131b1ffde4b7f766804590a6617bf2ab9"
@@ -202,7 +202,7 @@ def _resolve_model(case: LTXAccuracyCase) -> Path:
     if revision is None and model_id == case.model_id:
         revision = case.model_revision
     return Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=model_id,
             revision=revision,
             allow_patterns=[
@@ -242,7 +242,7 @@ def _resolve_checkpoint(case: LTXAccuracyCase, model: Path) -> Path:
     if model_checkpoint.is_file():
         return model_checkpoint
     return Path(
-        hf_hub_download(
+        hf_api().hf_hub_download(
             repo_id=case.checkpoint_repo,
             filename=case.checkpoint_filename,
             revision=case.checkpoint_revision,
@@ -261,7 +261,7 @@ def _resolve_image(case: LTXAccuracyCase) -> Path | None:
         assert image.is_file(), f"LTX I2V conditioning image not found: {image}"
         return image
     return Path(
-        hf_hub_download(
+        hf_api().hf_hub_download(
             repo_id=case.image_repo,
             repo_type="dataset",
             filename=case.image_filename,
