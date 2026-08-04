@@ -31,6 +31,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -2010,14 +2011,33 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.discard_request_mask.gpu,
                     )
                     self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-                    # Since we couldn't run the drafter,
-                    # just use zeros for the draft tokens.
-                    self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
-                        len(self.input_batch.req_ids), self.num_spec_tokens
+            elif spec_config.use_ngram_gpu() and not spec_config.disable_padded_drafter_batch:
+                assert isinstance(self.drafter, NgramProposerGPU)
+                sampled_token_ids = sampler_output.sampled_token_ids
+                if input_fits_in_drafter:
+                    propose_draft_token_ids(sampled_token_ids)
+                elif self.valid_sampled_token_count_event is not None:
+                    assert spec_decode_common_attn_metadata is not None
+                    next_token_ids, valid_sampled_tokens_count, _ = self.drafter.update_token_ids_ngram(
+                        sampled_token_ids,
+                        self.input_batch,
+                        self.token_ids_gpu_tensor,
+                        self.num_tokens_no_spec_gpu,
+                        self.discard_request_mask.gpu,
                     )
-                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+
+            if not input_fits_in_drafter:
+                # Do not let optimistic drafts from the previous step survive
+                # when this step is too close to max_model_len for the drafter.
+                # Async scheduling can otherwise consume those stale tokens
+                # before the next bookkeeping synchronization.
+                self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
+                    len(self.input_batch.req_ids), self.num_spec_tokens
+                )
+                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
