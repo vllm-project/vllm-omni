@@ -1,8 +1,6 @@
-"""Shared fixtures for MiniCPM-o 4.5 E2E tests.
-
-All tests in this directory share a single three-stage duplex server
-via the session-scoped ``minicpmo_duplex_server`` fixture.
-"""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MiniCPM-o invalid-param tests share the session-scoped duplex server."""
 
 from __future__ import annotations
 

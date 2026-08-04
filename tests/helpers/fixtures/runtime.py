@@ -21,6 +21,81 @@ if TYPE_CHECKING:
 omni_fixture_lock = threading.Lock()
 
 
+class _SharedMiniCPMoServer:
+    """Reference-counted MiniCPM-o duplex server singleton.
+
+    Combined with ``pytest_collection_modifyitems`` grouping (see
+    ``tests/helpers/fixtures/minicpmo_grouping.py``), this keeps the
+    server alive only while MiniCPM-o tests are running.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._refcount = 0
+        self._server: Any = None
+        self._cm: Any = None
+
+    def acquire(self, run_level: str, model_prefix: str) -> Any:
+        with self._lock:
+            self._refcount += 1
+            if self._server is not None:
+                return self._server
+        self._server = self._start(run_level, model_prefix)
+        return self._server
+
+    def release(self) -> None:
+        with self._lock:
+            self._refcount -= 1
+            if self._refcount > 0:
+                return
+        self._stop()
+
+    def _start(self, run_level: str, model_prefix: str) -> Any:
+        from tests.helpers.minicpmo_4_5_duplex import DEPLOY_CONFIG, MODEL
+        from tests.helpers.runtime import OmniServerParams, OmniServerStageCli
+        from tests.helpers.stage_config import stage_config_path_for_run_level
+
+        params = OmniServerParams(
+            model=MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=True,
+            server_args=["--trust-remote-code"],
+        )
+        model = model_prefix + params.model
+        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
+        server_args = list(params.server_args or [])
+        server_args += ["--stage-init-timeout", "600", "--init-timeout", "900", "--log-stats"]
+        server_args += ["--stage-configs-path", stage_config_path]
+        cm = OmniServerStageCli(model, stage_config_path, server_args)
+        self._cm = cm
+        server = cm.__enter__()
+        print("SharedMiniCPMoServer started")
+        return server
+
+    def _stop(self) -> None:
+        if self._cm is not None:
+            self._cm.__exit__(None, None, None)
+            print("SharedMiniCPMoServer stopped")
+        self._cm = None
+        self._server = None
+
+
+_minicpmo_shared = _SharedMiniCPMoServer()
+
+
+@pytest.fixture(scope="module")
+def minicpmo_duplex_server(
+    run_level: str,
+    model_prefix: str,
+) -> Generator[OmniServer, Any, None]:
+    """Module-scoped fixture backed by a reference-counted server singleton."""
+    server = _minicpmo_shared.acquire(run_level, model_prefix)
+    try:
+        yield server
+    finally:
+        _minicpmo_shared.release()
+
+
 @pytest.fixture(scope="function")
 def omni_server_function(
     request: pytest.FixtureRequest,
