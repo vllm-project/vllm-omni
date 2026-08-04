@@ -107,6 +107,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.startup_timing import log_startup_duration
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -468,6 +469,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
+        runtime_setup_started = time.perf_counter()
 
         if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
             logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
@@ -550,6 +552,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
 
         self._validate_service_attention_schedule()
+
+        log_startup_duration(
+            logger,
+            "model.runtime_setup",
+            time.perf_counter() - runtime_setup_started,
+            model=self.od_config.model_class_name,
+        )
         logger.info("Model runner: Initialization complete.")
 
     def _require_attention_schedule_pipeline(self, load_format: str) -> None:

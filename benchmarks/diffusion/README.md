@@ -1,7 +1,87 @@
 
 # Diffusion Serving Benchmark (Image/Video)
 
-This folder contains an online-serving benchmark script for diffusion models.
+## Weight-loading microbenchmark
+
+Use the CUDA-only microbenchmark to compare pageable H2D, pinned H2D,
+dtype-converting H2D, and fused CPU cast plus pinned H2D without downloading a
+model:
+
+```bash
+python benchmarks/diffusion/bench_weight_load_staging.py --size-mb 512 --repeats 5
+```
+
+### End-to-end startup timing
+
+Startup paths emit parseable INFO records without an opt-in flag:
+
+```text
+[StartupTiming] phase=model.pipeline_construct duration_s=... status=ok device=cuda load_format=default
+```
+
+Collect process, snapshot-download, pipeline-construction, weight-loading,
+worker, runtime-setup, warmup, and shutdown spans with:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --height 480 --width 832 --num-frames 9 --num-inference-steps 2 \
+  2>&1 | tee startup.log
+
+grep '\[StartupTiming\]' startup.log
+```
+
+Add `--enable-diffusion-pipeline-profiler` to report synchronized text-encode,
+denoise, and VAE-decode durations, plus a JSON stage summary. GPU synchronization
+makes that mode diagnostic; do not compare its end-to-end time against an
+unprofiled run. The offline example also reports output processing separately
+from generation.
+
+### TP=2 cooperative-loading validation
+
+A real TP=2 run must assign both devices in the deploy config **and** set the
+nested tensor-parallel size. The CLI tensor-parallel flag alone does not assign
+stage devices. The checked-in `wan2_2_tp2.yaml` captures the validated topology.
+For a fixed checkpoint revision, run:
+
+```bash
+MODEL_PATH=$(python - <<'PY'
+from huggingface_hub import snapshot_download
+
+print(snapshot_download(
+    "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    revision="5be7df9619b54f4e2667b2755bc6a756675b5cd7",
+))
+PY
+)
+
+CUDA_VISIBLE_DEVICES=0,1 python \
+  examples/offline_inference/text_to_video/text_to_video.py \
+  --model "$MODEL_PATH" \
+  --deploy-config benchmarks/diffusion/wan2_2_tp2.yaml \
+  --tensor-parallel-size 2 --enforce-eager \
+  --prompt "A brown and white dog is running on the grass." \
+  --negative-prompt "" --seed 42 \
+  --height 480 --width 832 --num-frames 9 \
+  --num-inference-steps 2 --guidance-scale 4.0 \
+  --output wan22-tp2.mp4 2>&1 | tee wan22-tp2.log
+```
+
+Implementation commit `0a673b4b` (tree `7e504120`) was validated with a
+zero-residency 117.512 GiB checkpoint on one AWS `g7e.12xlarge` with two RTX
+PRO 6000 Blackwell GPUs. Both ranks cooperatively loaded each of the two Wan
+DiTs. Three cold runs completed model loading in
+27.381, 27.886, and 27.792 seconds; a confirmed 100%-resident run took 8.473
+seconds. All runs produced raw frame-tensor SHA256
+`546cbc02c686628e89c61d26daf6a2bb03c2796f7d5e5acd57d8e342060041de`
+and shut down both workers without cooperative fallback or rank loss.
+
+The transport-level regression test is
+`tests/diffusion/model_loader/test_cooperative_staging_cuda.py`. It launches two
+real CUDA processes, uses NCCL collectives with buckets owned by both ranks, and
+checks every received tensor.
+
+This folder also contains an online-serving benchmark script for diffusion models.
 It sends requests to a vLLM OpenAI-compatible endpoint and reports throughput,
 latency percentiles, and optional SLO attainment.
 
