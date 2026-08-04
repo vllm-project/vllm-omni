@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import numpy as np
 import soundfile as sf
@@ -332,6 +334,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers: set[str] = set()
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
+        # Stash the last cache key computed by _resolve_ref_audio so that the
+        # immediately following _get_resolved_ref_audio_artifact_key call can
+        # reuse it without re-stat-ing the file (avoids a TOCTOU race and
+        # halves syscalls on the hot path).
+        self._last_ref_audio_source_key: dict[str, str] = {}
         self._ref_audio_resolve_cache_bytes = 0
         self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
@@ -1995,14 +2002,87 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._higgs_audio_v3_adapter = adapter
         return adapter
 
+    @staticmethod
+    def _get_ref_audio_cache_key(
+        ref_audio_str: str,
+        allowed_local_media_path: str | None = None,
+    ) -> str:
+        """Compute a cache key hash for *ref_audio_str*.
+
+        For local files (bare paths and ``file://`` URIs) the key folds in
+        ``st_mtime_ns`` and ``st_size`` so that an on-disk edit automatically
+        invalidates the cached waveform without a server restart.  Remote URLs
+        and ``data:`` URIs are keyed on the raw string alone — the server does
+        not re-fetch them to check for changes.
+
+        When *allowed_local_media_path* is provided the ``os.stat`` call is
+        restricted to paths under that directory, preventing the server from
+        touching arbitrary client-supplied paths before ``MediaConnector``
+        validates the allowlist.
+
+        Note: when the key changes the *previous* entry stays in
+        ``_ref_audio_resolve_cache`` until LRU eviction, so
+        ``_discard_ref_audio_artifact_ready_if_unreferenced`` will not fire for
+        the replaced file and its stale artifact key remains in
+        ``_ref_audio_model_artifact_ready``.  This is functionally correct
+        (the stale entry is never *used*) but doubles memory until eviction.
+        """
+        cache_key_source = ref_audio_str
+        if not ref_audio_str.startswith(("http://", "https://", "data:")):
+            try:
+                if ref_audio_str.startswith("file://"):
+                    parsed = urlparse(ref_audio_str)
+                    # RFC 8089: only "" and "localhost" are valid for local
+                    # files; drop them so the path stays absolute.
+                    netloc = parsed.netloc or ""
+                    if netloc.lower() in ("", "localhost"):
+                        path = url2pathname(parsed.path or "")
+                    else:
+                        raise OSError(f"file:// URI with non-local authority {netloc!r} cannot be stat'd")
+                else:
+                    path = ref_audio_str
+                # Only stat paths under the configured allowlist to avoid
+                # touching arbitrary client-supplied paths (NFS automounts,
+                # etc.) before MediaConnector validates the request.
+                if allowed_local_media_path is not None:
+                    resolved = os.path.realpath(path)
+                    allowed_base = os.path.realpath(allowed_local_media_path)
+                    if os.path.commonpath([resolved, allowed_base]) != allowed_base:
+                        raise OSError("path outside allowed_local_media_path; skipping stat")
+                st = os.stat(path)
+                cache_key_source = f"{ref_audio_str}:{st.st_mtime_ns}:{st.st_size}"
+            except OSError:
+                # Truncate the value to avoid dumping huge base64 blobs into
+                # the server log when a client omits the ``data:`` prefix.
+                display = ref_audio_str[:80]
+                if len(ref_audio_str) > 80:
+                    display += f"... ({len(ref_audio_str)} chars)"
+                logger.debug(
+                    "Failed to stat ref_audio path %s; falling back to string-only cache key (stale cache possible)",
+                    display,
+                )
+        return hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        Local file references incorporate mtime and size into the cache key
+        so that modified files are automatically reloaded without a server
+        restart. Remote URLs remain cached by their original string locator.
         """
-        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        # Pass the allowed-local-media-path so the stat is restricted to
+        # paths the server operator has explicitly permitted.
+        allowed_path = None
+        if not self._diffusion_mode:
+            allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
+        cache_key = self._get_ref_audio_cache_key(ref_audio_str, allowed_local_media_path=allowed_path)
+        # Stash so _get_resolved_ref_audio_artifact_key can reuse without
+        # re-stat-ing.
+        self._last_ref_audio_source_key[ref_audio_str] = cache_key
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
@@ -2067,7 +2147,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return h.hexdigest()
 
     def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        # Reuse the cache key stashed by the preceding _resolve_ref_audio call
+        # to avoid a second os.stat (TOCTOU race + wasted syscall).
+        source_key = self._last_ref_audio_source_key.pop(ref_audio_str, None)
+        if source_key is None:
+            source_key = self._get_ref_audio_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(source_key)
         if cached is None:
             return None
