@@ -110,14 +110,10 @@ def test_wakeup_after_level2_sleep_fails(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ) -> None:
-    """Regression for #4473 Repro A via HTTP: wake after sleep(level=2) must not succeed.
+    """Regression for #4473 Repro A via HTTP: wake after sleep(level=2) → 501.
 
     Moved from ``tests/entrypoints/test_omni_sleep_mode.py`` (BAGEL cold start).
-    ``AsyncOmni.wake_up`` raises ``NotImplementedError``; without an HTTP exception
-    mapping the client only sees a generic 500 (message text is not in the body).
-    Exact ``sleep(level=2)`` wording is covered by
-    ``tests/entrypoints/openai_api/test_omni_sleep_wakeup.py``
-    (``TestClient(raise_server_exceptions=True)``).
+    Live serve surfaces ``NotImplementedError`` as OpenAI-style JSON with code 501.
     """
     assert omni_server is not None
     sleep_resps = openai_client.send_omni_sleep_http_request(
@@ -135,6 +131,7 @@ def test_wakeup_after_level2_sleep_fails(
         {
             "json": {"stage_ids": [0]},
             "timeout": 120,
-            "err_code": 500,
+            "err_code": 501,
+            "err_message": ("sleep(level=2)", "not yet implemented"),
         }
     )
