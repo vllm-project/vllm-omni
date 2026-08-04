@@ -47,8 +47,32 @@ def _init_mc2_group_for_diffusion(
 
 
 def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
+    override = None
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional_config, dict):
+        override = additional_config.get("npu_moe_comm_method")
+
+    enable_expert_parallel = vllm_config.parallel_config.enable_expert_parallel
+    ep_size = get_ep_group().world_size if enable_expert_parallel else 1
+
+    if override is not None:
+        if not isinstance(override, str):
+            raise TypeError(f"npu_moe_comm_method must be a string, got {type(override).__name__}")
+        normalized_override = override.strip().upper()
+        supported_overrides = {
+            "ALLGATHER": MoECommType.ALLGATHER,
+            "ALLTOALL": MoECommType.ALLTOALL,
+        }
+        if normalized_override not in supported_overrides:
+            supported = ", ".join(sorted(supported_overrides))
+            raise ValueError(f"Unsupported npu_moe_comm_method={override!r}. Supported values: {supported}")
+        moe_comm_type = supported_overrides[normalized_override]
+        if moe_comm_type is MoECommType.ALLTOALL and ep_size == 1:
+            raise ValueError("ALLTOALL requires expert parallelism with ep_size greater than 1")
+        return moe_comm_type
+
     soc_version = get_ascend_device_type()
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if ep_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A2}:
         moe_comm_type = MoECommType.ALLGATHER
