@@ -31,7 +31,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -470,6 +470,7 @@ class Wan22S2VPipeline(
     DenoiseProgressMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """
     Wan2.2 Speech-to-Video Pipeline.
@@ -484,6 +485,10 @@ class Wan22S2VPipeline(
       - Reference image encoded as separate ``ref_latents`` tokens (not
         channel-concatenated like I2V).
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "audio_model"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     # Default config values from Wan2.2/wan/configs/wan_s2v_14B.py
     _DEFAULT_MOTION_FRAMES = 73

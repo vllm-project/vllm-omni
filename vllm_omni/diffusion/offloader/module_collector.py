@@ -56,38 +56,7 @@ class PipelineModules:
 
 
 class ModuleDiscovery:
-    """Discovers pipeline components.
-
-    If the pipeline implements :class:`SupportsComponentDiscovery`,
-    its ``_dit_modules``, ``_encoder_modules``, and ``_vae_modules``
-    class variables are used directly.  Otherwise, falls back to
-    scanning well-known attribute names.
-    """
-
-    # Fallback attribute names for pipelines that do not implement
-    # SupportsComponentDiscovery.
-    _FALLBACK_DIT_ATTRS = [
-        "transformer",
-        "transformer_2",
-        "dit",
-        "sr_dit",
-        "language_model",
-        "transformer_blocks",
-        "model",
-    ]
-    _FALLBACK_ENCODER_ATTRS = [
-        "text_encoder",
-        "text_encoder_2",
-        "text_encoder_3",
-        "image_encoder",
-        "vision_encoder",
-        "mllm",
-    ]
-    _FALLBACK_VAE_ATTRS = [
-        "vae",
-        "audio_vae",
-        "sound_tokenizer",
-    ]
+    """Discovers pipeline components via :class:`SupportsComponentDiscovery`."""
 
     @staticmethod
     def _collect_modules(
@@ -139,22 +108,39 @@ class ModuleDiscovery:
         Returns:
             PipelineModules with lists of discovered modules and names
         """
-        declared = isinstance(pipeline, SupportsComponentDiscovery)
-        if declared:
-            dit_attrs = pipeline._dit_modules
-            enc_attrs = pipeline._encoder_modules
-            vae_attrs = pipeline._vae_modules
-            res_attrs = pipeline._resident_modules
-        else:
-            dit_attrs = ModuleDiscovery._FALLBACK_DIT_ATTRS
-            enc_attrs = ModuleDiscovery._FALLBACK_ENCODER_ATTRS
-            vae_attrs = ModuleDiscovery._FALLBACK_VAE_ATTRS
-            res_attrs = []
+        if not isinstance(pipeline, SupportsComponentDiscovery):
+            logger.warning(
+                "%s does not implement SupportsComponentDiscovery.",
+                type(pipeline).__name__,
+            )
+            return PipelineModules(
+                dits=[],
+                dit_names=[],
+                encoders=[],
+                encoder_names=[],
+                vaes=[],
+            )
 
-        dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
-        encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)
-        vaes, _ = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
-        residents, resident_names = ModuleDiscovery._collect_modules(pipeline, res_attrs, warn_missing=declared)
+        dit_modules, dit_names = ModuleDiscovery._collect_modules(
+            pipeline,
+            pipeline._dit_modules,
+            warn_missing=True,
+        )
+        encoders, encoder_names = ModuleDiscovery._collect_modules(
+            pipeline,
+            pipeline._encoder_modules,
+            warn_missing=True,
+        )
+        vaes, _ = ModuleDiscovery._collect_modules(
+            pipeline,
+            pipeline._vae_modules,
+            warn_missing=True,
+        )
+        residents, resident_names = ModuleDiscovery._collect_modules(
+            pipeline,
+            pipeline._resident_modules,
+            warn_missing=True,
+        )
 
         return PipelineModules(
             dits=dit_modules,

@@ -5,6 +5,7 @@
 import json
 import os
 from collections.abc import Callable, Iterable
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import ErnieImageTransformer2DModel
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -67,9 +68,18 @@ def get_ernie_image_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class ErnieImagePipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    CFGParallelMixin,
+    SupportImageInput,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     support_image_input = False
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,

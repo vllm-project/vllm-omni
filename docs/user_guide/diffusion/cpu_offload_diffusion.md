@@ -38,9 +38,9 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --enable-cpu-offload
 
 ### To Support a Model
 
-Implement the `SupportsComponentDiscovery` protocol to declare which
-submodules serve as pipeline components (used by offloading, HSDP
-sharding, and other framework features):
+All diffusion pipelines **should** implement the `SupportsComponentDiscovery`
+protocol.  It declares which submodules serve as pipeline components and
+is used by CPU offloading and HSDP device placement:
 
 ```python
 from typing import ClassVar
@@ -310,19 +310,10 @@ request while AllGather synchronizes only weight shards (request-independent).
 
 **Module Discovery**
 
-The offloader discovers pipeline components in two ways:
-
-1. **Protocol-based** (preferred): If the pipeline implements
-    `SupportsComponentDiscovery`, its `_dit_modules`, `_encoder_modules`,
-    `_vae_modules`, and `_resident_modules` class variables are used
-    directly.  All attribute names support dotted paths (e.g.
-    `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
-
-2. **Fallback attribute scan**: Otherwise, the offloader scans for
-    well-known attribute names:
-    - **DiT modules**: `transformer`, `transformer_2`, `dit`, `sr_dit`, `language_model`, `transformer_blocks`, `model`
-    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
-    - **VAE**: `vae`, `audio_vae`
+The offloader discovers pipeline components via the `SupportsComponentDiscovery` protocol.
+Pipelines declare their `_dit_modules`, `_encoder_modules`, `_vae_modules`, and `_resident_modules` class variables explicitly.
+All attribute names support dotted paths (e.g. `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
+Pipelines that do not implement the protocol will log a warning and skip offloading.
 
 **Hook System**
 

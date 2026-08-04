@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -69,6 +69,7 @@ class MingImagePipeline(ZImagePipeline):
     """
 
     supports_request_batch = False
+    _encoder_modules: ClassVar[list[str]] = ["condition_encoder"]
 
     def __init__(
         self,

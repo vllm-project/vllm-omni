@@ -17,6 +17,7 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -53,6 +54,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SEED,
     DEFAULT_SIGMA_SHIFT,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -108,7 +110,7 @@ class VideoActionScheduler:
 # ---------------------------------------------------------------------------
 
 
-class DreamZeroPipeline(nn.Module, CFGParallelMixin):
+class DreamZeroPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery):
     """DreamZero world model pipeline.
 
     Multi-output: predict_noise() returns (video_pred, action_pred).
@@ -117,6 +119,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     KV is managed by the AR-Diffusion engine through the explicit capability
     methods below. The runner binds one session state only for ``forward()``.
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"

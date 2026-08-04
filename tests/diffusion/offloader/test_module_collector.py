@@ -35,28 +35,6 @@ class FallbackPipeline(nn.Module):
         self.vae = nn.Linear(10, 10)
 
 
-class NonModuleAttrPipeline(nn.Module):
-    """Pipeline where an attribute is not an nn.Module (fallback path)."""
-
-    def __init__(self):
-        super().__init__()
-        self.transformer = nn.Linear(10, 10)
-        self.text_encoder = "not_a_module"
-        self.vae = nn.Linear(10, 10)
-
-
-class DuplicateAttrPipeline(nn.Module):
-    """Pipeline where two encoder attrs point to the same module."""
-
-    def __init__(self):
-        super().__init__()
-        self.transformer = nn.Linear(10, 10)
-        encoder = nn.Linear(10, 10)
-        self.text_encoder = encoder
-        self.text_encoder_2 = encoder
-        self.vae = nn.Linear(10, 10)
-
-
 class ProtocolPipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with non-standard names, using the protocol."""
 
@@ -188,32 +166,18 @@ class NestedDiTPipeline(nn.Module, SupportsComponentDiscovery):
 # ---------------------------------------------------------------------------
 
 
-class TestFallbackDiscovery:
-    """Test the fallback attribute scan (no SupportsComponentDiscovery)."""
+class TestNoProtocolDiscovery:
+    """Test that pipelines without SupportsComponentDiscovery return empty."""
 
-    def test_discovers_standard_attrs(self):
+    def test_returns_empty_without_protocol(self):
         pipeline = FallbackPipeline()
         result = ModuleDiscovery.discover(pipeline)
 
         assert not isinstance(pipeline, SupportsComponentDiscovery)
-        assert result.dit_names == ["transformer"]
-        assert result.dits[0] is pipeline.transformer
-        assert result.encoder_names == ["text_encoder", "text_encoder_2"]
-        assert result.vaes[0] is pipeline.vae
+        assert result.dits == []
+        assert result.encoders == []
+        assert result.vaes == []
         assert result.resident_modules == []
-
-    def test_deduplicates_encoders(self):
-        pipeline = DuplicateAttrPipeline()
-        result = ModuleDiscovery.discover(pipeline)
-
-        assert len(result.encoders) == 1
-        assert result.encoder_names == ["text_encoder"]
-
-    def test_skips_non_module_attr(self):
-        pipeline = NonModuleAttrPipeline()
-        result = ModuleDiscovery.discover(pipeline)
-
-        assert len(result.encoders) == 0
 
 
 class TestProtocolDiscovery:

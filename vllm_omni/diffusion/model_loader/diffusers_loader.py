@@ -35,6 +35,7 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
 
@@ -657,8 +658,7 @@ class DiffusersPipelineLoader:
         self._process_weights_after_loading(model, target_device)
 
         # Discover pipeline components (DiT, encoders, VAEs) via
-        # ModuleDiscovery, which consults SupportsComponentDiscovery
-        # when available and falls back to well-known attribute names.
+        # ModuleDiscovery, which requires SupportsComponentDiscovery.
         # This supports nested pipelines (e.g. LTX2DistilledPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
@@ -695,6 +695,11 @@ class DiffusersPipelineLoader:
 
         # HSDP only shards transformer modules. All other runtime modules must
         # be placed on the execution device explicitly after sharding.
+        if not isinstance(model, SupportsComponentDiscovery):
+            raise TypeError(
+                f"{type(model).__name__} does not implement "
+                "SupportsComponentDiscovery, required for HSDP device placement."
+            )
         modules_to_move: list[nn.Module] = []
         if discovered_modules.vaes is not None:
             modules_to_move.extend(discovered_modules.vaes)

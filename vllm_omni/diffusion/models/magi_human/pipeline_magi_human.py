@@ -1683,8 +1683,8 @@ def _resolve_subdir(
 # ===========================================================================
 class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     _dit_modules: ClassVar[list[str]] = ["dit", "sr_dit"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder.model"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae.vae_model"]
 
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
