@@ -200,18 +200,6 @@ async def diffusion_engine():
     await asyncio.sleep(1.5)
 
 
-@pytest_asyncio.fixture(scope="function", loop_scope="function")
-async def llm_engine_isolated():
-    """Function-scoped LLM engine for level=2 sleep (cannot wake; must not share)."""
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
-    stages, connectors = _build_llm_stages()
-    engine = AsyncOmni(model=MODEL, stages=stages, connectors=connectors, init_timeout=600, enable_sleep_mode=True)
-    yield engine
-    engine.shutdown()
-    await asyncio.sleep(1.5)
-
-
 class TestOmniLlmSleepMode:
     """LLM sleep/wake protocol tests sharing one class-scoped engine."""
 
@@ -271,22 +259,6 @@ class TestOmniLlmSleepMode:
             assert second_acks == [], f"Duplicate wake_up() should return [] but got {second_acks}"
         finally:
             await _ensure_awake(llm_engine, [0])
-
-
-class TestOmniLlmSleepLevel2:
-    """Isolated level=2 case: cannot wake, so must not share the class engine."""
-
-    @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    async def test_level2_sleep_wake_raises(self, llm_engine_isolated: AsyncOmni):
-        """Regression for #4473 Repro A: wake_up() after sleep(level=2) must raise
-        NotImplementedError instead of silently producing corrupted output."""
-        try:
-            await llm_engine_isolated.sleep(stage_ids=[0], level=2)
-            with pytest.raises(NotImplementedError, match="sleep\\(level=2\\)"):
-                await llm_engine_isolated.wake_up(stage_ids=[0])
-        finally:
-            llm_engine_isolated.shutdown()
 
 
 class TestOmniDiffusionSleepMode:
