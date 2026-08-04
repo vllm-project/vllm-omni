@@ -1849,36 +1849,59 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             and logits is not None
             and logits.shape[0] == 1
         ):
-            self._logits_audited = True
-            # Dump the per-layer steam RMS curve for this same decode step so
-            # the pod can bisect the compression: if layer-0 RMS already differs
-            # from the reference, it's upstream (embedding/rotary); if it tracks
-            # until a late layer, it's localized there.
-            if self._layer_rms is not None:
-                curve = self._layer_rms
-                self._layer_rms = None
-                # Fix: this used to only null out _layer_rms without ever
-                # setting _layer_rms_audited, so the hooks' guard
-                # (`if self._layer_rms_audited or not self._audio_debug`)
-                # never short-circuited -- the very next layer-forward call
-                # hit `self._layer_rms.append(...)` on a None and crashed
-                # every TP worker with AttributeError: 'NoneType' object has
-                # no attribute 'append'. Must be set here, alongside nulling
-                # the list, so the hooks actually stop after the one read.
-                self._layer_rms_audited = True
+            # vLLM's own startup memory-profiling dummy run also drives a full
+            # forward pass (including compute_logits, to size the logits
+            # tensor) through an all-zero hidden-state batch, and it can
+            # present with logits.shape[0] == 1 just like a real single-token
+            # decode step -- so "first qualifying call" alone does not mean
+            # "first real decode step". A genuine forward pass essentially
+            # never lands on an *exact* 0.0 RMS at every layer (RMSNorm,
+            # bias-free linear layers, and attention over an all-zero V all
+            # map zero to zero, which is exactly the dummy-run signature we
+            # keep seeing). Use that as the discriminator: if the captured
+            # curve is degenerate, this was a dummy pass -- don't disarm the
+            # audit, so the hooks (already reset per forward pass) get to
+            # capture the next, hopefully-real, pass instead.
+            curve = self._layer_rms
+            is_dummy_pass = curve is not None and all(v == 0.0 for _, v in curve)
+            if not is_dummy_pass:
+                self._logits_audited = True
+                # Dump the per-layer steam RMS curve for this same decode step
+                # so the pod can bisect the compression: if layer-0 RMS
+                # already differs from the reference, it's upstream
+                # (embedding/rotary); if it tracks until a late layer, it's
+                # localized there.
+                if curve is not None:
+                    self._layer_rms = None
+                    # Fix: this used to only null out _layer_rms without ever
+                    # setting _layer_rms_audited, so the hooks' guard
+                    # (`if self._layer_rms_audited or not self._audio_debug`)
+                    # never short-circuited -- the very next layer-forward
+                    # call hit `self._layer_rms.append(...)` on a None and
+                    # crashed every TP worker with AttributeError: 'NoneType'
+                    # object has no attribute 'append'. Must be set here,
+                    # alongside nulling the list, so the hooks actually stop
+                    # after the one read.
+                    self._layer_rms_audited = True
+                    logger.info(
+                        "[longcat-layers] per-slot RMS curve for first decode step: %s",
+                        [round(v, 4) for _, v in curve],
+                    )
+                topk_vals, topk_ids = torch.topk(logits[0], 10)
                 logger.info(
-                    "[longcat-layers] per-slot RMS curve for first decode step: %s",
-                    [round(v, 4) for _, v in curve],
+                    "[longcat-logits] first decode step top10 ids=%s vals=%s "
+                    "eos=%s logits_range=[%.3f, %.3f]",
+                    topk_ids.tolist(),
+                    [round(float(v), 3) for v in topk_vals],
+                    self._eos_id,
+                    float(logits[0].min()), float(logits[0].max()),
                 )
-            topk_vals, topk_ids = torch.topk(logits[0], 10)
-            logger.info(
-                "[longcat-logits] first decode step top10 ids=%s vals=%s "
-                "eos=%s logits_range=[%.3f, %.3f]",
-                topk_ids.tolist(),
-                [round(float(v), 3) for v in topk_vals],
-                self._eos_id,
-                float(logits[0].min()), float(logits[0].max()),
-            )
+            else:
+                logger.info(
+                    "[longcat-logits] skipped degenerate (all-zero RMS) pass, "
+                    "likely vLLM's profiling/warmup dummy run -- waiting for "
+                    "a real decode step"
+                )
         if logits is None or not (self._audio_gen or self._visual_gen):
             return logits
         # During audio/image-gen mode, suppress EOS and force visible tokens
