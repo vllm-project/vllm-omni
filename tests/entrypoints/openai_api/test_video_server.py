@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import os
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -1955,3 +1956,49 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+def test_video_upload_single_reference_rejected_when_too_large(test_client, monkeypatch):
+    """A single input_reference upload larger than the configured limit is
+    rejected with HTTP 413 before any decoding happens."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    oversized = b"x" * 1024
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "too big"},
+        files={"input_reference": ("ref.png", oversized, "image/png")},
+    )
+    assert response.status_code == 413
+    assert "VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES" in response.json()["detail"]
+
+
+def test_video_upload_multi_reference_rejected_when_too_large(test_client, monkeypatch):
+    """An input_references (multi-video) upload exceeding the limit is rejected
+    with HTTP 413 and leaves no persisted temp files behind."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    oversized = b"y" * 1024
+    tmp_before = set(Path(tempfile.gettempdir()).glob("vllm_omni_video_reference_*"))
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "too big"},
+        files={"input_references": ("ref.mp4", oversized, "video/mp4")},
+    )
+    assert response.status_code == 413
+    tmp_after = set(Path(tempfile.gettempdir()).glob("vllm_omni_video_reference_*"))
+    assert tmp_after == tmp_before, "oversized multi-upload must not leave temp files"
+
+
+def test_video_upload_within_limit_not_rejected_for_size(test_client, mocker: MockerFixture):
+    """An upload within the size limit is not rejected on size grounds; the
+    request proceeds past the 413 gate (size check must not affect valid uploads)."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"ok-mp4",
+    )
+    small_image = _make_test_image_bytes()
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "small ok"},
+        files={"input_reference": ("ref.png", small_image, "image/png")},
+    )
+    assert response.status_code != 413

@@ -2954,6 +2954,39 @@ async def _run_video_generation_job(
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
+# Maximum accepted size for a single uploaded reference (image/video) in bytes.
+# Enforced by streaming byte counting so an oversized upload is rejected without
+# first buffering the whole payload in memory or on disk. Configurable for
+# deployments that need to serve larger Ref2VA references or tighten the limit
+# on memory-constrained hosts.
+VIDEO_MAX_UPLOAD_BYTES = int(os.environ.get("VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES", 512 * 1024 * 1024))
+
+
+def _reject_oversized_upload(actual_bytes: int, *, filename: str | None = None) -> None:
+    """Raise HTTP 413 when an uploaded reference exceeds the configured limit."""
+    where = f" ({filename})" if filename else ""
+    raise HTTPException(
+        status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
+        detail=(
+            f"Uploaded reference{where} is {actual_bytes} bytes, exceeding the "
+            f"{VIDEO_MAX_UPLOAD_BYTES}-byte limit "
+            f"(set VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES to change it)."
+        ),
+    )
+
+
+async def _read_upload_capped(upload: UploadFile) -> bytes:
+    """Read an UploadFile fully into memory, rejecting it once the streamed
+    byte count exceeds ``VIDEO_MAX_UPLOAD_BYTES`` (HTTP 413)."""
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(1024 * 1024):
+        total += len(chunk)
+        if total > VIDEO_MAX_UPLOAD_BYTES:
+            _reject_oversized_upload(total, filename=upload.filename)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
     paths: list[str] = []
@@ -2964,8 +2997,12 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
                 suffix = ".mp4"
             fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
             paths.append(path)
+            written = 0
             with os.fdopen(fd, "wb") as output:
                 while chunk := await upload.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > VIDEO_MAX_UPLOAD_BYTES:
+                        _reject_oversized_upload(written, filename=upload.filename)
                     output.write(chunk)
     except Exception:
         for path in paths:
@@ -3021,7 +3058,7 @@ async def _parse_video_form(
     Used by both ``POST /v1/videos`` (async) and ``POST /v1/videos/sync``.
     """
     input_references = input_references or []
-    input_reference_bytes = await input_reference.read() if input_reference is not None else None
+    input_reference_bytes = await _read_upload_capped(input_reference) if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
     parsed_audio_reference = _parse_form_json(audio_reference)
