@@ -47,7 +47,7 @@ def _minimaxh3_params_builder(
 
     if "flow_shift" in params:
         form_fields["flow_shift"] = params.pop("flow_shift")
-    for key in ("duration", "audio_flow_shift"):
+    for key in ("audio_flow_shift",):
         if key in params:
             merged_extra_params[key] = params.pop(key)
     if params:
@@ -161,7 +161,7 @@ if __name__ == "__main__":
                 print(f"✓ {path:<40} → {result}")
             elif params_builder := spec.get("params_builder"):
                 result = params_builder(
-                    {"duration": 8.7, "audio_flow_shift": 3.0, "flow_shift": 12.0, "type": "minimax_h3"},
+                    {"audio_flow_shift": 3.0, "flow_shift": 12.0, "type": "minimax_h3"},
                     task="t2va",
                 )
                 print(f"✓ {path:<40} → {result}")

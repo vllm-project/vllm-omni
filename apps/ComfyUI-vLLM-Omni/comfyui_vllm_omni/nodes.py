@@ -756,16 +756,6 @@ class VLLMOmniMiniMaxH3Params:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "duration": (
-                    "FLOAT",
-                    {
-                        "default": 8,
-                        "min": 1,
-                        "max": 15,
-                        "step": 0.1,
-                        "tooltip": "Duration in seconds (preferred over num_frames for MiniMax-H3).",
-                    },
-                ),
                 "audio_flow_shift": (
                     "FLOAT",
                     {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1},
