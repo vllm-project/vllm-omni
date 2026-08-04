@@ -345,7 +345,7 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
             "weight_scale",
             ModelWeightParameter(
                 data=torch.empty(output_size_per_partition, num_groups, dtype=torch.uint8),
-                input_dim=None,
+                input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             ),
