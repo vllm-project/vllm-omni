@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.platforms import current_omni_platform
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
@@ -40,6 +41,10 @@ def _tensor_to_shm(
     import numpy as np
 
     original_dtype = tensor.dtype
+    # XPU's stream synchronization is unreliable (see sequential_backend.py:79-82).
+    # Force the blocking .cpu().contiguous() path to avoid corrupted D2H transfers.
+    if d2h_stream is not None and current_omni_platform.is_xpu():
+        d2h_stream = None
     if d2h_stream is not None:
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
