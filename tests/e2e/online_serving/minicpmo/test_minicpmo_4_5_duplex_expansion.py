@@ -9,15 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
+from tests.e2e.online_serving.minicpmo.run_minicpmo_realtime_duplex_multi_session import (
     run_lifecycle_probes,
 )
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
+from tests.e2e.online_serving.minicpmo.run_minicpmo_realtime_duplex_soft_interrupt import (
     run_soft_interrupt,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.minicpmo_4_5_duplex import (
-    SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
     multi_session_args,
     realtime_url,
@@ -29,8 +28,7 @@ from tests.helpers.minicpmo_4_5_duplex import (
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_path: Path) -> None:
     args = multi_session_args(
         omni_server=omni_server,
@@ -53,8 +51,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
     input_wav = validated_soft_interrupt_wav()
     result = asyncio.run(

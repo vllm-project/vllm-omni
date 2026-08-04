@@ -4,35 +4,13 @@ These cover modality combinations, separate Code2Wav behavior, sequential
 request isolation, longer audio output, and Chinese speech.
 """
 
-import os
-
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
-from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.runtime import dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-_MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
-
-test_params = [
-    pytest.param(
-        OmniServerParams(
-            model=_MODEL,
-            stage_config_path=_CI_DEPLOY,
-            use_stage_cli=False,
-            server_args=[
-                "--trust-remote-code",
-            ],
-        ),
-        id="default",
-    )
-]
 
 
 def get_system_prompt():
@@ -64,7 +42,6 @@ def get_max_batch_size(size_type="few"):
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
     """
     Test text + video input generating text output.
@@ -91,7 +68,6 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_sequential_requests_independent(omni_server, openai_client) -> None:
     """
     Verify that sequential requests produce independent results and that the
@@ -132,7 +108,6 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     Test text input generating a longer audio output to exercise the
@@ -167,7 +142,6 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """
     Test Chinese text input generating audio output.

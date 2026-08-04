@@ -151,9 +151,9 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "events = [",
                 "    {'type': 'session.created'},",
                 "    {'type': 'response.created', 'response': {'id': response_id}},",
-                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "    {'type': 'response.output_audio.delta', 'response_id': response_id, "
                 "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.1},",
-                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "    {'type': 'response.output_audio.delta', 'response_id': response_id, "
                 "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.6},",
                 "    {'type': 'response.done', 'response_id': response_id},",
                 "    {'type': 'session.closed'},",

@@ -7,33 +7,11 @@ both async_chunk (streaming) and full-payload (``--no-async-chunk``) modes, so t
 tests below exercise the sync path as well.
 """
 
-import os
-
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
-from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-_MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
-
-test_params = [
-    pytest.param(
-        OmniServerParams(
-            model=_MODEL,
-            stage_config_path=_CI_DEPLOY,
-            use_stage_cli=False,
-            server_args=[
-                "--trust-remote-code",
-            ],
-        ),
-        id="default",
-    )
-]
+from tests.helpers.runtime import dummy_messages_from_mix_data
 
 
 def get_system_prompt():
@@ -69,7 +47,6 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text output via OpenAI API.
@@ -94,7 +71,6 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text + audio output via OpenAI API.
@@ -119,7 +95,6 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test audio input generating text + audio output via OpenAI API.
@@ -147,7 +122,6 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test image input generating text + audio output via OpenAI API.
@@ -175,7 +149,6 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test video input generating text + audio output via OpenAI API.
@@ -204,7 +177,6 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test multi-modal input (text + audio + video + image) generating text + audio output.
