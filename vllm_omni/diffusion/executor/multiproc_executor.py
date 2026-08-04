@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DEQUEUE_TIMEOUT_S = 5.0
+_WORKER_JOIN_TIMEOUT_S = 5.0
+_WORKER_KILL_JOIN_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -55,11 +57,17 @@ class _ExecutorShutdownCleaner:
             for proc in self.processes:
                 if not proc.is_alive():
                     continue
-                proc.join(5)
-                if proc.is_alive():
-                    logger.warning("Terminating diffusion worker %s after timeout", proc.name)
-                    proc.terminate()
-                    proc.join(5)
+                proc.join(_WORKER_JOIN_TIMEOUT_S)
+                if not proc.is_alive():
+                    continue
+                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
+                proc.terminate()
+                proc.join(_WORKER_JOIN_TIMEOUT_S)
+                if not proc.is_alive():
+                    continue
+                logger.error("Killing diffusion worker %s after termination timeout", proc.name)
+                proc.kill()
+                proc.join(_WORKER_KILL_JOIN_TIMEOUT_S)
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):

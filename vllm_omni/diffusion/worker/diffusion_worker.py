@@ -789,6 +789,12 @@ class CustomPipelineWorkerExtension:
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
+    _ASYNC_OUTPUT_STOP = object()
+    # Keep this below the executor's graceful process join timeout so a stuck
+    # D2H operation takes the worker's force-exit path before the parent sends
+    # SIGTERM.
+    _ASYNC_OUTPUT_JOIN_TIMEOUT_S = 4.0
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -895,35 +901,71 @@ class WorkerProc:
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
-        while self._running:
-            output, async_output_id, gpu_event = self._async_output_queue.get()
-            try:
-                # Cross-stream ordering: wait for default stream to finish
-                # writing the output tensors before the side stream reads.
-                if gpu_event is not None:
-                    d2h_stream.wait_event(gpu_event)
-                pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
-                d2h_stream.synchronize()
+        try:
+            while True:
+                item = self._async_output_queue.get()
+                if item is WorkerProc._ASYNC_OUTPUT_STOP:
+                    break
+                output, async_output_id, gpu_event = item
+                try:
+                    # Cross-stream ordering: wait for default stream to finish
+                    # writing the output tensors before the side stream reads.
+                    if gpu_event is not None:
+                        d2h_stream.wait_event(gpu_event)
+                    pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
+                    d2h_stream.synchronize()
 
-                self.result_mq.enqueue(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
-                        output=output,
+                    self.result_mq.enqueue(
+                        AsyncDiffusionOutput(
+                            kind=AsyncOutputKind.OUTPUT_READY,
+                            async_output_id=async_output_id,
+                            output=output,
+                        )
                     )
-                )
+                except Exception:
+                    logger.exception(
+                        "Async output packing failed for id '%s'; sending error",
+                        async_output_id,
+                    )
+                    self.result_mq.enqueue(
+                        AsyncDiffusionOutput(
+                            kind=AsyncOutputKind.OUTPUT_READY,
+                            async_output_id=async_output_id,
+                            error="Background D2H/SHM packing failed",
+                        )
+                    )
+        finally:
+            try:
+                d2h_stream.synchronize()
             except Exception:
-                logger.exception(
-                    "Async output packing failed for id '%s'; sending error",
-                    async_output_id,
-                )
-                self.result_mq.enqueue(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
-                        error="Background D2H/SHM packing failed",
-                    )
-                )
+                logger.debug("Failed to synchronize async output stream during shutdown", exc_info=True)
+
+    def _stop_async_output_thread(self) -> bool:
+        """Drain queued output work within the shutdown deadline.
+
+        A thread blocked in a device runtime call cannot be cancelled safely.
+        Returning ``False`` tells the caller to skip device teardown and force
+        the worker process to exit instead.
+        """
+        self._running = False
+        output_queue = self._async_output_queue
+        output_thread = self._async_output_thread
+        if output_queue is None or output_thread is None:
+            return True
+
+        output_queue.put(WorkerProc._ASYNC_OUTPUT_STOP)
+        output_thread.join(timeout=WorkerProc._ASYNC_OUTPUT_JOIN_TIMEOUT_S)
+        if output_thread.is_alive():
+            logger.error(
+                "Async output thread did not stop within %.1f seconds; "
+                "skipping device teardown and forcing worker exit",
+                WorkerProc._ASYNC_OUTPUT_JOIN_TIMEOUT_S,
+            )
+            return False
+
+        self._async_output_thread = None
+        self._async_output_queue = None
+        return True
 
     def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
         if not torch.distributed.is_initialized():
@@ -1195,6 +1237,11 @@ class WorkerProc:
             raise
         finally:
             if worker_proc is not None:
+                if not worker_proc._stop_async_output_thread():
+                    # The daemon thread may still own an active device stream.
+                    # Running Python or device-runtime destructors concurrently
+                    # with it is unsafe, so terminate this child immediately.
+                    os._exit(1)
                 try:
                     worker_proc.worker.shutdown()
                 except Exception as exc:
