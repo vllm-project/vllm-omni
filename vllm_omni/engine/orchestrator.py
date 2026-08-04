@@ -57,6 +57,12 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+#: Stages that consume the *source* multimodal features rather than a previous
+#: stage's output, so the encoder pass done for stage 0 can be reused instead of
+#: repeated. Forwarding these to a stage that does not re-read the source
+#: modality costs encoder-cache misses, so this stays an explicit list.
+_MM_FEATURE_CONSUMER_STAGES = frozenset({"thinker", "forced_aligner"})
+
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
         DuplexControlPlanePort,
@@ -2054,10 +2060,14 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only AR thinker stages consume encoder mm_features; downstream
-            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+            # Only stages that re-read the *source* modality consume encoder
+            # mm_features; the rest (talker/code2wav/…) must not see them, which
+            # would cost encoder-cache misses. A forced-aligner stage does
+            # re-read the input audio, and its feature extractor is configured
+            # identically to the ASR stage's, so forwarding what stage 0 already
+            # extracted saves a second mel pass over the same waveform.
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
-            mm_features = req_state.mm_features if model_stage == "thinker" else None
+            mm_features = req_state.mm_features if model_stage in _MM_FEATURE_CONSUMER_STAGES else None
             request = self._build_next_stage_request(
                 req_id,
                 next_logical,
