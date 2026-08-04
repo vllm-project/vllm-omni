@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -N longcat_next_rms_audit_4gpu
+#PBS -l select=1:ncpus=64:ngpus=4:mem=440gb
+#PBS -l walltime=00:20:00
+#PBS -o /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_rms_audit_4gpu.out
+#PBS -e /scratch/users/ntu/karthik0/opensource_stff/vllm-omni/pbs/logs/longcat_next_rms_audit_4gpu.err
+
+# LongCat-Next port-side per-layer RMS + top-10 logit dump on 4x A100-40GB
+# (TP=4, fp8 thinker-only, longcat_next_4gpu.yaml), re-run now that the
+# redundant _apply_mla_scale_fold double-scaling has been removed from
+# modeling_longcat_next.py.
+#
+# This resumes the BUILD.md Sec.10 "Text" investigation at the exact point
+# it was interrupted: commit 9d523742 added forward hooks on every
+# FlashDecoderLayer (_attach_layer_rms_audit, gated by LONGCAT_AUDIO_DEBUG=1)
+# that record RMS(hidden_out) per layer for the first pure-text decode step,
+# alongside the existing [longcat-logits] top-10-logit dump -- but the pod
+# was preempted before this was ever actually run against the reference
+# model for comparison. This job produces a FRESH port-side curve/top-10
+# (previous captures predate the scale-fold fix), which is a prerequisite
+# for that reference-side diff regardless of whether it changed anything.
+#
+# Same 4x40GB fp8 thinker-only setup as longcat_next_debug_quality_4gpu.pbs
+# (that job completed in ~9 min; 20 min walltime carries the same margin).
+
+set -u
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_HOME=/app/apps/cuda/12.8.1
+export HF_HOME=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads
+export UV_CACHE_DIR=/scratch/users/ntu/karthik0/.uv_cache
+export NCCL_DEBUG=WARN
+export VLLM_LOG_STATS_INTERVAL=10
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export VLLM_LOGGING_LEVEL=INFO
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export TORCH_SHOW_CPP_STACKTRACES=1
+export LONGCAT_AUDIO_DEBUG=1
+
+OMNI_DIR=/scratch/users/ntu/karthik0/opensource_stff/vllm-omni
+VENV="$OMNI_DIR/.venv"
+MODEL_PATH=/scratch/users/ntu/karthik0/opensource_stff/hf_downloads/hub/models--meituan-longcat--LongCat-Next/snapshots/0cf0631862402ff36366e513e4023d22e7e5c84c
+DEPLOY_CONFIG="$OMNI_DIR/vllm_omni/deploy/longcat_next_4gpu.yaml"
+RESULT_DIR="$OMNI_DIR/pbs/logs"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$RESULT_DIR/longcat_next_rms_audit_4gpu_${RUN_TS}"
+RUN_LOG="${OUT_DIR}.log"
+
+mkdir -p "$RESULT_DIR" "$OUT_DIR"
+source "$VENV/bin/activate"
+cd "$OMNI_DIR"
+
+{
+echo "[$(date)] ===== LongCat-Next per-layer RMS + top-10 logit audit (4x40GB, fp8 TP=4) ====="
+echo "[$(date)] job=${PBS_JOBID:-<none>} node=$(hostname) gpus=$(nvidia-smi -L | wc -l)"
+echo "[$(date)] out_dir=$OUT_DIR"
+nvidia-smi -L
+echo "[$(date)] --- code version ---"
+git -C "$OMNI_DIR" rev-parse HEAD 2>/dev/null && git -C "$OMNI_DIR" status --short 2>/dev/null | head -30
+echo "[$(date)] --- deploy config ---"
+cat "$DEPLOY_CONFIG"
+
+pkill -u "$(id -un)" -f "vllm.entrypoints" 2>/dev/null || true
+sleep 5
+
+echo "[$(date)] Running text-only quality diagnostic with LONGCAT_AUDIO_DEBUG=1 ..."
+stdbuf -oL -eL python -X faulthandler pbs/scripts/longcat_next_debug_quality.py \
+  "$MODEL_PATH" "$DEPLOY_CONFIG" "$OUT_DIR" --runs text
+status=$?
+
+echo "[$(date)] debug_quality python exited status=$status"
+if [ -f "$OUT_DIR/quality_diagnostics.json" ]; then
+  echo "[$(date)] diagnostics:"
+  cat "$OUT_DIR/quality_diagnostics.json"
+fi
+
+if [ $status -ne 0 ]; then
+  echo "[$(date)] Text-quality run FAILED (exit=$status)"
+else
+  echo "[$(date)] Text-quality run completed."
+fi
+} 2>&1 | tee "$RUN_LOG"
+
+{
+echo "[$(date)] ================ RMS / LOGIT AUDIT SUMMARY ================"
+echo "--- per-layer RMS curve ---"
+grep -a "\[longcat-layers\]" "$RUN_LOG"
+echo "--- top-10 pre-sampling logits ---"
+grep -a "\[longcat-logits\]" "$RUN_LOG"
+echo "[$(date)] ============================================================"
+} 2>&1 | tee -a "$RUN_LOG"
