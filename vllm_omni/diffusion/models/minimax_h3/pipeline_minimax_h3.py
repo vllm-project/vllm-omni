@@ -101,8 +101,15 @@ MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
 }
 
 
-def _minimax_h3_partition_for_task(task_type: str | None) -> str:
+def _minimax_h3_partition_for_task(
+    task_type: str | None,
+    model: str | None = None,
+) -> str:
     task = str(task_type or "auto").lower()
+    if task == "auto" and model is not None:
+        path = Path(model)
+        if path.is_dir() and path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
+            return path.name.lower()
     if task in {"auto", "combined"}:
         return "combined"
     if task in {"t2va", "fl2va"}:
@@ -303,7 +310,7 @@ class MiniMaxH3Pipeline(
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
-    _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
     _PROFILER_TARGETS: ClassVar[list[str]] = [
@@ -329,7 +336,10 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
-        self.partition = _minimax_h3_partition_for_task(getattr(od_config, "task_type", None))
+        self.partition = _minimax_h3_partition_for_task(
+            getattr(od_config, "task_type", None),
+            str(od_config.model),
+        )
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -379,11 +389,11 @@ class MiniMaxH3Pipeline(
                     model_or_path=str(ref2va_model_path),
                     subfolder="transformer",
                     revision=od_config.revision,
-                    prefix="transformer_2.",
+                    prefix="transformers_ref.",
                     fall_back_to_pt=False,
                 )
             )
-            self._dit_modules.append("transformer_2")
+            self._dit_modules.append("transformers_ref")
         transformer_quant_config = _resolve_component_quant_config(
             od_config.quantization_config,
             "transformer",
@@ -393,7 +403,7 @@ class MiniMaxH3Pipeline(
             quant_config=transformer_quant_config,
         )
         if ref2va_model_path is not None:
-            self.transformer_2 = MiniMaxH3DiTModel(
+            self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
                 quant_config=transformer_quant_config,
             )
@@ -456,7 +466,7 @@ class MiniMaxH3Pipeline(
         def source_prefix(item: tuple[str, torch.Tensor]) -> str:
             name, _ = item
             prefix = name.partition(".")[0] + "."
-            if prefix in {"transformer.", "transformer_2."}:
+            if prefix in {"transformer.", "transformers_ref."}:
                 return prefix
             raise ValueError(f"unexpected MiniMax-H3 weight {name!r}")
 
@@ -479,8 +489,8 @@ class MiniMaxH3Pipeline(
         return loaded_with_prefix
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
-        if task == "ref2va" and hasattr(self, "transformer_2"):
-            return self.transformer_2
+        if task == "ref2va" and hasattr(self, "transformers_ref"):
+            return self.transformers_ref
         return self.transformer
 
     def _resolve_task(

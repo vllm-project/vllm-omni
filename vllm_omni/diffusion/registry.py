@@ -432,9 +432,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         if sp_size <= 1:
             return
 
-        # Find transformer model(s) in the pipeline that have _sp_plan
-        # Include transformer_2 for two-stage models (e.g., Wan MoE)
-        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+        # Prefer the pipeline's declared DiT components so custom component
+        # names receive the same SP hooks as conventional transformer names.
+        transformer_attrs = getattr(model, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
         applied_count = 0
 
         for attr in transformer_attrs:

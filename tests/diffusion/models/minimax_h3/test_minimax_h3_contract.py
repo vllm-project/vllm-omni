@@ -30,7 +30,7 @@ def test_pipeline_import_registry_and_component_discovery():
     assert (
         _DIFFUSION_POST_PROCESS_FUNCS["MiniMaxH3ModularPipeline"] == _DIFFUSION_POST_PROCESS_FUNCS["MiniMaxH3Pipeline"]
     )
-    assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformer_2"]
+    assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
 
@@ -95,6 +95,20 @@ def test_startup_task_selects_weight_partition(task_type, partition):
     assert _minimax_h3_partition_for_task(task_type) == partition
 
 
+def test_startup_auto_task_uses_explicit_local_partition(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    for directory, partition, tasks in (
+        ("FL2VA", "fl2va", ["t2va", "fl2va"]),
+        ("Ref2VA", "ref2va", ["ref2va"]),
+    ):
+        model_path = tmp_path / directory
+        _write_partition_index(model_path, partition=partition, tasks=tasks)
+        assert _minimax_h3_partition_for_task(None, str(model_path)) == partition
+        assert _minimax_h3_partition_for_task("auto", str(model_path)) == partition
+        assert _minimax_h3_partition_for_task("combined", str(model_path)) == "combined"
+
+
 def test_startup_task_rejects_unsupported_value():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
 
@@ -110,13 +124,13 @@ def test_combined_task_inference_and_transformer_routing():
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline.transformer = torch.nn.Identity()
-    pipeline.transformer_2 = torch.nn.Linear(1, 1)
+    pipeline.transformers_ref = torch.nn.Linear(1, 1)
     assert pipeline._resolve_task(None, {}) == "t2va"
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
     assert pipeline._transformer_for_task("fl2va") is pipeline.transformer
-    assert pipeline._transformer_for_task("ref2va") is pipeline.transformer_2
+    assert pipeline._transformer_for_task("ref2va") is pipeline.transformers_ref
 
 
 @pytest.mark.parametrize(
@@ -259,9 +273,9 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
     assert len(tokenizer_calls) == 1
     assert len(processor_calls) == 1
-    expected_dit_modules = ["transformer", "transformer_2"] if expected_dits == 2 else ["transformer"]
+    expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
     assert pipeline._dit_modules == expected_dit_modules
-    assert hasattr(pipeline, "transformer_2") is (expected_dits == 2)
+    assert hasattr(pipeline, "transformers_ref") is (expected_dits == 2)
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
@@ -302,7 +316,7 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.transformer = FakeTransformer()
-    pipeline.transformer_2 = FakeTransformer()
+    pipeline.transformers_ref = FakeTransformer()
     pipeline.text_encoder = torch.nn.Identity()
     pipeline.video_vae = torch.nn.Identity()
     pipeline.audio_vae = torch.nn.Identity()
@@ -311,16 +325,16 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
             [
                 ("transformer.a", torch.ones(1)),
                 ("transformer.b", torch.ones(1)),
-                ("transformer_2.a", torch.ones(1)),
+                ("transformers_ref.a", torch.ones(1)),
             ]
         )
     )
 
     assert pipeline.transformer.loaded == ["a", "b"]
-    assert pipeline.transformer_2.loaded == ["a"]
+    assert pipeline.transformers_ref.loaded == ["a"]
     assert pipeline.transformer.post_load_calls == 1
-    assert pipeline.transformer_2.post_load_calls == 1
-    assert loaded == {"transformer.a", "transformer.b", "transformer_2.a"}
+    assert pipeline.transformers_ref.post_load_calls == 1
+    assert loaded == {"transformer.a", "transformer.b", "transformers_ref.a"}
 
 
 def test_joint_postprocess_is_multiprocessing_picklable():
