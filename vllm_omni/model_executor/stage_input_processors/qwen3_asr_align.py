@@ -77,11 +77,21 @@ def _source_prompt_by_request_id(source_outputs: list[Any], prompt: Any) -> dict
 
 
 def _extract_text(source_output: Any) -> str:
+    """Stage 0's transcript, post-processed the way the endpoint returns it.
+
+    Qwen3-ASR generates ``"language {lang}<asr_text>{transcription}"``. The
+    serving layer strips that scaffolding before returning the transcript, so
+    the aligner has to as well -- segmenting the raw text yields phantom words
+    ("language", "English", "asr", "text") that are not in the audio, and every
+    timestamp after them is attributed to the wrong word.
+    """
     outputs = getattr(source_output, "outputs", None) or []
     for out in outputs:
         text = getattr(out, "text", None)
         if text:
-            return str(text)
+            from vllm.model_executor.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+
+            return str(Qwen3ASRForConditionalGeneration.post_process_output(str(text)))
     return ""
 
 
