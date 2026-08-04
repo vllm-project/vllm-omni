@@ -476,7 +476,7 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         "modalities": ["audio", "text"],
         "input_audio_format": "pcm16",
         "output_audio_format": args.output_audio_format,
-        "turn_detection": None,
+        "turn_detection": {"type": "server_vad"},
         "overlap_policy": "listen_only",
         "overlap_short_ack_ms": args.short_ack_ms,
         "playback_commit_policy": "ack_only",
