@@ -61,6 +61,13 @@ repos:
       types: [python]
       files: ^tests/
 
+    - id: check-forbidden-imports
+      name: Check for forbidden imports
+      entry: python tools/pre_commit/check_forbidden_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
@@ -69,10 +76,3 @@ repos:
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry
-
-    - id: check-forbidden-imports
-      name: Check for forbidden imports
-      entry: python tools/pre_commit/check_forbidden_imports.py
-      language: python
-      types: [python]
-      additional_dependencies: [regex]
