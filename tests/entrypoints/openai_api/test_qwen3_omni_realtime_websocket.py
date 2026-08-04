@@ -208,6 +208,37 @@ WEATHER_TOOL = {
 }
 
 
+# Two cities in one utterance, to make the model request two calls in one turn.
+TOOL_CALLING_TWO_CITY_PHRASE_TEXT = "What is the weather like in Boston and in Denver right now?"
+
+# Distinct results per city, so the final reply shows each result reached the call
+# that asked for it rather than both being collapsed into one <tool_response>.
+_TOOL_RESULT_BY_CITY = {
+    "boston": "sunny and 72 degrees",
+    "denver": "snowing and 28 degrees",
+}
+
+
+def _tool_result_for(arguments: str) -> str:
+    """Answer a get_weather call based on the city it asked about."""
+    city = (json.loads(arguments).get("city") or "").lower()
+    for key, result in _TOOL_RESULT_BY_CITY.items():
+        if key in city:
+            return result
+    raise AssertionError(f"Tool call asked about an unexpected city: {arguments!r}")
+
+
+def _two_city_tool_calling_pcm16_input() -> bytes:
+    syn = generate_synthetic_audio(
+        10,
+        1,
+        sample_rate=16000,
+        phrase_text=TOOL_CALLING_TWO_CITY_PHRASE_TEXT,
+    )
+    wav_bytes = base64.b64decode(syn["base64"])
+    return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+
+
 def _tool_calling_pcm16_input() -> bytes:
     syn = generate_synthetic_audio(
         10,
@@ -233,8 +264,10 @@ async def _run_realtime_tool_call_roundtrip(
     bytes_per_ms = 16000 * 2 // 1000
     chunk_bytes = max(bytes_per_ms * chunk_ms, 2)
 
-    tool_call_name: str | None = None
-    tool_call_args = ""
+    # Keyed by call_id: with parallel calls the added/delta/done events for the
+    # two calls interleave, so per-call state cannot be a single accumulator.
+    calls: dict[str, dict[str, str]] = {}
+    call_order: list[str] = []
     final_text_chunks: list[str] = []
     final_text = ""
     saw_final_audio_delta = False
@@ -259,13 +292,16 @@ async def _run_realtime_tool_call_roundtrip(
             if event_type in ("session.created", "transcription.delta"):
                 continue
             if event_type == "response.output_item.added":
-                tool_call_name = event["item"]["name"]
+                call_id = event["item"]["call_id"]
+                calls[call_id] = {"name": event["item"]["name"], "arguments": ""}
+                call_order.append(call_id)
                 continue
             if event_type == "response.function_call_arguments.delta":
-                tool_call_args += event["delta"]
+                calls[event["call_id"]]["arguments"] += event["delta"]
                 continue
             if event_type == "response.function_call_arguments.done":
-                # Answer the tool call so generation resumes with a real result.
+                # Answer with a result keyed to the requested city, so a parallel
+                # pair can be checked for having each result matched to its call.
                 await ws.send(
                     json.dumps(
                         {
@@ -273,7 +309,7 @@ async def _run_realtime_tool_call_roundtrip(
                             "item": {
                                 "type": "function_call_output",
                                 "call_id": event["call_id"],
-                                "output": "sunny and 72 degrees",
+                                "output": _tool_result_for(event["arguments"]),
                             },
                         }
                     )
@@ -292,9 +328,14 @@ async def _run_realtime_tool_call_roundtrip(
                 raise AssertionError(f"WebSocket error: {event}")
             raise AssertionError(f"Unexpected WebSocket event: {event}")
 
+    ordered = [calls[cid] for cid in call_order]
     return {
-        "tool_call_name": tool_call_name,
-        "tool_call_arguments": tool_call_args,
+        # Single-call view, kept for the one-city test.
+        "tool_call_name": ordered[0]["name"] if ordered else None,
+        "tool_call_arguments": ordered[0]["arguments"] if ordered else "",
+        # Full view, in the order the model requested the calls.
+        "calls": ordered,
+        "call_ids": list(call_order),
         "final_text": final_text,
         "saw_final_audio_delta": saw_final_audio_delta,
     }
@@ -310,6 +351,25 @@ def _assert_tool_call_roundtrip(result: dict) -> None:
     assert "boston" in parsed_args["city"].lower()
     assert result["final_text"], "Expected a spoken final reply after the tool result was submitted"
     assert "72" in result["final_text"], f"Expected the mocked tool result to reach the final reply: {result}"
+    assert result["saw_final_audio_delta"], "Expected audio for the final (non-tool-call) reply leg"
+
+
+def _assert_two_call_roundtrip(result: dict) -> None:
+    """Both results must reach the reply, which requires each `role="tool"` message
+    to be its own `<tool_response>` block - joining them into one leaves the model
+    unable to tell which result answered which call."""
+    calls = result["calls"]
+    assert len(calls) == 2, f"Expected two parallel tool calls, got {len(calls)}: {calls}"
+    assert len(set(result["call_ids"])) == 2, f"Expected distinct call_ids: {result['call_ids']}"
+    assert {c["name"] for c in calls} == {"get_weather"}, calls
+
+    cities = [json.loads(c["arguments"])["city"].lower() for c in calls]
+    assert any("boston" in c for c in cities), cities
+    assert any("denver" in c for c in cities), cities
+
+    final = result["final_text"].lower()
+    assert "72" in final, f"Boston's result did not reach the reply: {result['final_text']!r}"
+    assert "28" in final, f"Denver's result did not reach the reply: {result['final_text']!r}"
     assert result["saw_final_audio_delta"], "Expected audio for the final (non-tool-call) reply leg"
 
 
@@ -432,3 +492,30 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         _assert_tool_call_roundtrip(result)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_sync_server_params, indirect=True)
+    def test_two_call_tool_round_trip(self, omni_server) -> None:
+        """Merge CI: one utterance naming two cities -> the model requests two
+        `get_weather` calls -> the test client answers each with a distinct result
+        -> both results reach the spoken reply.
+
+        This is the case that fails when parallel results are joined into a single
+        `role="tool"` message: the template then emits one `<tool_response>` holding
+        both outputs, and the model cannot tell which result answered which call.
+        Same `async_chunk`-off requirement as the single-call test above.
+        """
+        pcm16 = _two_city_tool_calling_pcm16_input()
+
+        result = asyncio.run(
+            _run_realtime_tool_call_roundtrip(
+                omni_server.host,
+                omni_server.port,
+                omni_server.model,
+                pcm16,
+            )
+        )
+
+        _assert_two_call_roundtrip(result)
