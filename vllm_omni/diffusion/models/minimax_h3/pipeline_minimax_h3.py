@@ -95,22 +95,41 @@ MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "Ref2VA/model_index.json",
     "Ref2VA/transformer/**",
 ]
+MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
+    "fl2va": ["FL2VA/**"],
+    "ref2va": ["Ref2VA/**"],
+}
+
+
+def _minimax_h3_partition_for_task(task_type: str | None) -> str:
+    task = str(task_type or "auto").lower()
+    if task in {"auto", "combined"}:
+        return "combined"
+    if task in {"t2va", "fl2va"}:
+        return "fl2va"
+    if task == "ref2va":
+        return "ref2va"
+    raise ValueError(f"MiniMax-H3 task_type must be one of auto, t2va, fl2va, or ref2va; got {task_type!r}")
 
 
 def _resolve_minimax_h3_model_root(
     model: str,
     revision: str | None,
+    partition: str,
 ) -> Path:
     path = Path(model)
     if path.is_dir():
-        if path.name == "FL2VA" and (path / "model_index.json").is_file():
+        if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
             return path.parent
         return path
+    allow_patterns = (
+        MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
+    )
     return Path(
         download_weights_from_hf_specific(
             model_name_or_path=model,
             cache_dir=None,
-            allow_patterns=MINIMAX_H3_DOWNLOAD_PATTERNS,
+            allow_patterns=allow_patterns,
             revision=revision,
             require_all=True,
         )
@@ -304,23 +323,36 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self.partition = _minimax_h3_partition_for_task(getattr(od_config, "task_type", None))
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
+            self.partition,
         )
-        model_path = model_root / "FL2VA"
+        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
         release = model_index.get("_minimax_h3") or {}
         partition = str(release.get("partition", "")).lower()
-        if partition != "fl2va":
-            raise ValueError(f"invalid MiniMax-H3 FL2VA partition at {model_path}")
+        expected_partition = "ref2va" if self.partition == "ref2va" else "fl2va"
+        if partition != expected_partition:
+            raise ValueError(f"invalid MiniMax-H3 {expected_partition} partition at {model_path}")
 
-        ref2va_model_path = model_root / "Ref2VA"
-        if not (ref2va_model_path / "model_index.json").is_file():
-            raise ValueError(f"Ref2VA partition not found at {ref2va_model_path}")
+        supported_tasks = {str(task).lower() for task in release.get("tasks", [])}
+        if not supported_tasks:
+            supported_tasks = {"ref2va"} if partition == "ref2va" else {"t2va", "fl2va"}
+        ref2va_model_path = None
+        if self.partition == "combined":
+            ref2va_model_path = model_root / "Ref2VA"
+            ref2va_index_path = ref2va_model_path / "model_index.json"
+            if not ref2va_index_path.is_file():
+                raise ValueError(f"Ref2VA partition not found at {ref2va_model_path}")
+            ref2va_index = json.loads(ref2va_index_path.read_text(encoding="utf-8"))
+            ref2va_release = ref2va_index.get("_minimax_h3") or {}
+            if str(ref2va_release.get("partition", "")).lower() != "ref2va":
+                raise ValueError(f"invalid MiniMax-H3 ref2va partition at {ref2va_model_path}")
+            supported_tasks.update(str(task).lower() for task in ref2va_release.get("tasks", ["ref2va"]))
 
-        self.partition = "combined"
-        self.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+        self.supported_tasks = frozenset(supported_tasks)
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
@@ -332,23 +364,29 @@ class MiniMaxH3Pipeline(
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=False,
-            ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(ref2va_model_path),
-                subfolder="transformer",
-                revision=od_config.revision,
-                prefix="transformer_2.",
-                fall_back_to_pt=False,
-            ),
+            )
         ]
+        self._dit_modules = ["transformer"]
+        if ref2va_model_path is not None:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(ref2va_model_path),
+                    subfolder="transformer",
+                    revision=od_config.revision,
+                    prefix="transformer_2.",
+                    fall_back_to_pt=False,
+                )
+            )
+            self._dit_modules.append("transformer_2")
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=od_config.quantization_config,
         )
-        self.transformer_2 = MiniMaxH3DiTModel(
-            od_config,
-            quant_config=od_config.quantization_config,
-        )
+        if ref2va_model_path is not None:
+            self.transformer_2 = MiniMaxH3DiTModel(
+                od_config,
+                quant_config=od_config.quantization_config,
+            )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             str(model_path),
@@ -431,7 +469,9 @@ class MiniMaxH3Pipeline(
         return loaded_with_prefix
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
-        return self.transformer_2 if task == "ref2va" else self.transformer
+        if task == "ref2va" and hasattr(self, "transformer_2"):
+            return self.transformer_2
+        return self.transformer
 
     def _resolve_task(
         self,

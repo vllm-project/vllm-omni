@@ -79,6 +79,29 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
     assert config.max_multimodal_image_inputs == 1
 
 
+@pytest.mark.parametrize(
+    ("task_type", "partition"),
+    [
+        (None, "combined"),
+        ("auto", "combined"),
+        ("t2va", "fl2va"),
+        ("fl2va", "fl2va"),
+        ("ref2va", "ref2va"),
+    ],
+)
+def test_startup_task_selects_weight_partition(task_type, partition):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    assert _minimax_h3_partition_for_task(task_type) == partition
+
+
+def test_startup_task_rejects_unsupported_value():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    with pytest.raises(ValueError, match="task_type must be one of"):
+        _minimax_h3_partition_for_task("unsupported")
+
+
 def test_combined_task_inference_and_transformer_routing():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -96,7 +119,31 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._transformer_for_task("ref2va") is pipeline.transformer_2
 
 
-def test_pipeline_loads_two_dits_and_shared_components_once(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    (
+        "task_type",
+        "expected_partition",
+        "expected_dits",
+        "component_partition",
+        "source_partitions",
+        "expected_tasks",
+    ),
+    [
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+    ],
+)
+def test_pipeline_loads_task_selected_dits_and_shared_components_once(
+    monkeypatch,
+    tmp_path,
+    task_type,
+    expected_partition,
+    expected_dits,
+    component_partition,
+    source_partitions,
+    expected_tasks,
+):
     from vllm_omni.diffusion.models.minimax_h3 import (
         pipeline_minimax_h3 as pipeline_module,
     )
@@ -111,16 +158,16 @@ def test_pipeline_loads_two_dits_and_shared_components_once(monkeypatch, tmp_pat
         partition="ref2va",
         tasks=["ref2va"],
     )
-    for component in (
-        "transformer",
-        "tokenizer",
-        "processor",
-        "text_encoder",
-        "video_vae",
-        "audio_vae",
-    ):
-        (tmp_path / "FL2VA" / component).mkdir()
-    (tmp_path / "Ref2VA" / "transformer").mkdir()
+    for partition_name in ("FL2VA", "Ref2VA"):
+        for component in (
+            "transformer",
+            "tokenizer",
+            "processor",
+            "text_encoder",
+            "video_vae",
+            "audio_vae",
+        ):
+            (tmp_path / partition_name / component).mkdir()
 
     created = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
 
@@ -193,6 +240,7 @@ def test_pipeline_loads_two_dits_and_shared_components_once(monkeypatch, tmp_pat
     od_config = SimpleNamespace(
         model="MiniMaxAI/MiniMax-H3",
         revision=None,
+        task_type=task_type,
         quantization_config=None,
         parallel_config=SimpleNamespace(
             cfg_parallel_size=1,
@@ -202,22 +250,33 @@ def test_pipeline_loads_two_dits_and_shared_components_once(monkeypatch, tmp_pat
     )
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 
-    assert len(created["dit"]) == 2
-    assert created["text_encoder"] == [str(tmp_path / "FL2VA" / "text_encoder")]
-    assert created["video_vae"] == [str(tmp_path / "FL2VA" / "video_vae")]
-    assert created["audio_vae"] == [str(tmp_path / "FL2VA" / "audio_vae")]
+    assert pipeline.partition == expected_partition
+    assert pipeline.supported_tasks == expected_tasks
+    assert len(created["dit"]) == expected_dits
+    component_path = tmp_path / component_partition
+    assert created["text_encoder"] == [str(component_path / "text_encoder")]
+    assert created["video_vae"] == [str(component_path / "video_vae")]
+    assert created["audio_vae"] == [str(component_path / "audio_vae")]
     assert len(tokenizer_calls) == 1
     assert len(processor_calls) == 1
-    assert pipeline._dit_modules == ["transformer", "transformer_2"]
+    expected_dit_modules = ["transformer", "transformer_2"] if expected_dits == 2 else ["transformer"]
+    assert pipeline._dit_modules == expected_dit_modules
+    assert hasattr(pipeline, "transformer_2") is (expected_dits == 2)
+    if expected_partition == "ref2va":
+        assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
-        str(tmp_path / "FL2VA"),
-        str(tmp_path / "Ref2VA"),
+        str(tmp_path / partition_name) for partition_name in source_partitions
     ]
+    expected_patterns = (
+        pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
+        if expected_partition == "combined"
+        else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
+    )
     assert download_calls == [
         {
             "model_name_or_path": "MiniMaxAI/MiniMax-H3",
             "cache_dir": None,
-            "allow_patterns": pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS,
+            "allow_patterns": expected_patterns,
             "revision": None,
             "require_all": True,
         }

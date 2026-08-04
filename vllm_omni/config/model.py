@@ -101,8 +101,8 @@ class OmniModelConfig(ModelConfig):
              "audio", "latents"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
-         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-             If not specified, will be inferred from model path.
+         task_type: Model-defined startup task type. Each model validates its
+             supported values and applies the corresponding behavior.
 
 
     The correct way to initialize this class is via vLLM config, as most

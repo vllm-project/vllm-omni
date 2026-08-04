@@ -240,6 +240,28 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--task-type",
+            "fl2va",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.task_type == "fl2va"
+    assert stage_cfg["engine_args"]["task_type"] == "fl2va"
+
+
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     """Ensure diffusion serve CLI exposes the profiler switch."""
     parser = TrackingArgumentParser()

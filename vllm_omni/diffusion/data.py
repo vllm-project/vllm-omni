@@ -602,6 +602,10 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Optional model-defined startup task. Pipelines may use this to select
+    # task-specific components or weights before serving requests.
+    task_type: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)

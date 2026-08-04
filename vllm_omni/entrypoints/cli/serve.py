@@ -213,9 +213,10 @@ class OmniServeCommand(CLISubcommand):
             "--task-type",
             type=str,
             default=None,
-            choices=["CustomVoice", "VoiceDesign", "Base"],
-            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
-            "If not specified, will be inferred from model path.",
+            help="Model-defined startup task type. The selected model validates "
+            "supported values; for example, TTS models accept CustomVoice, "
+            "VoiceDesign, or Base, while diffusion models may use it to select "
+            "task-specific weights. If omitted, the model default is used.",
         )
         # Forced aligner / word timestamps. --forced-aligner is the opt-in
         # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
