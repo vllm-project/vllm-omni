@@ -72,6 +72,20 @@ class RealtimeConnection(VllmRealtimeConnection):
     corresponding synthesized audio.
 
     A chain of tool calls is bounded by MAX_TOOL_ROUNDS.
+
+    Scope and limitations of the tool-calling path:
+
+    - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
+      full-duplex runtime under `experimental/fullduplex/` has no tool-calling
+      support and shares no code with this.
+    - **Requires `async_chunk` disabled.** `session.update` with `tools` is
+      rejected when the server runs in async-chunk mode; see
+      `_async_chunk_enabled` for why aggregating instead would not be enough.
+    - **Waits on client liveness.** Once the model has requested a tool, the turn
+      blocks until a `function_call_output` arrives for every pending call. There
+      is deliberately no deadline, because a slow tool is indistinguishable from
+      an absent one; a client that disconnects releases the wait, and malformed
+      or unknown results are reported back rather than silently dropped.
     """
 
     # Upper bound on consecutive tool-call rounds within one user turn.
@@ -100,16 +114,67 @@ class RealtimeConnection(VllmRealtimeConnection):
         if event_type == "session.update":
             tools = event.get("tools")
             if tools is not None:
-                self._tools = tools
+                if self._async_chunk_enabled():
+                    # Refuse rather than half-work. Two independent things break
+                    # under async_chunk: the buffer yields one TokensPrompt per
+                    # segment, so a tool-call continuation would reattach only the
+                    # final segment's audio and lose the start of the utterance;
+                    # and the generation loop never sees one complete thinker turn
+                    # to scan for a <tool_call> block. Aggregating the audio would
+                    # fix only the first, leaving the feature looking supported
+                    # while still broken -- so the limitation is explicit instead.
+                    await self.send_error(
+                        "Tool calling on /v1/realtime requires async_chunk to be disabled "
+                        "(serve with --no-async-chunk); tools were not applied.",
+                        "tools_require_no_async_chunk",
+                    )
+                else:
+                    self._tools = tools
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
             if item.get("type") == "function_call_output":
-                self._tool_result_queue.put_nowait(item)
+                await self._enqueue_tool_result(item)
             else:
                 await self.send_error(f"Unsupported conversation.item type: {item.get('type')!r}", "unsupported_item")
         else:
             await super().handle_event(event)
+
+    def _async_chunk_enabled(self) -> bool:
+        """Whether the server runs in async-chunk mode.
+
+        Read off ``model_config`` the same way ``serving_speech.py`` does
+        (``:3232``, ``:3569``).
+        """
+        return bool(getattr(self.serving.model_config, "async_chunk", False))
+
+    async def _enqueue_tool_result(self, item: dict) -> None:
+        """Validate a `function_call_output` before it can influence generation.
+
+        Without this, any dict carrying the right `type` was accepted: a missing
+        or non-string `call_id` never matched a pending call, and `output` was
+        coerced with `str()`. A client typo therefore left generation waiting
+        with nothing reported back. Shape errors are protocol errors, so they are
+        rejected here rather than discovered later.
+
+        (Kept as explicit checks for now; supersede with pydantic tool-event
+        models when those land.)
+        """
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            await self.send_error(
+                "function_call_output requires a non-empty string 'call_id'",
+                "invalid_function_call_output",
+            )
+            return
+        output = item.get("output")
+        if not isinstance(output, str):
+            await self.send_error(
+                f"function_call_output 'output' must be a string, got {type(output).__name__}",
+                "invalid_function_call_output",
+            )
+            return
+        self._tool_result_queue.put_nowait(item)
 
     async def start_generation(self):
         if self.generation_task is not None and not self.generation_task.done():
@@ -467,9 +532,17 @@ class RealtimeConnection(VllmRealtimeConnection):
             call_id = item.get("call_id")
             idx = call_id_to_index.get(call_id)
             if idx is None:
+                # Tell the client: silently dropping this would leave the turn
+                # waiting for a result that is never going to match. Keep waiting
+                # afterwards, since the correct result may still arrive.
                 logger.warning("received function_call_output for unknown call_id=%s", call_id)
+                await self.send_error(
+                    f"No pending tool call with call_id={call_id!r}; expected one of {sorted(call_id_to_index)}",
+                    "unknown_tool_call_id",
+                )
                 continue
-            results_by_index[idx] = str(item.get("output", ""))
+            # `output` is validated as a string at ingress (_enqueue_tool_result).
+            results_by_index[idx] = item["output"]
 
         if not self._is_connected:
             return
@@ -481,16 +554,27 @@ class RealtimeConnection(VllmRealtimeConnection):
         # for why relying on safe_apply_chat_template's own auto-resolution
         # is unsafe for this checkpoint.
         processor = cached_processor_from_config(model_config)
-        # Multiple tool calls in one turn -> one combined tool-role message,
-        # matching how Qwen's own chat template batches consecutive tool
-        # results under a single <|im_start|>user block. No `tools=` here:
-        # this is a continuation of a conversation that already has the
-        # tools system preamble in its token history, not a fresh turn.
-        combined_result_text = "\n".join(results_by_index[i] for i in sorted(results_by_index))
+        # One `role="tool"` message PER result, in call order. The chat template
+        # emits one <tool_response> block per tool message and groups consecutive
+        # tool messages under a single <|im_start|>user turn, so passing separate
+        # messages is what lets the model associate each result with its call.
+        # Joining the results instead produces a single <tool_response> holding
+        # both outputs, which breaks parallel calls.
+        #
+        # `sorted()` on the parser-assigned index is call order: extract_deltas
+        # appends `tool_call_starts` in the order <tool_call> appears in the
+        # generated text, so this is stable regardless of the order in which the
+        # client returns the results.
+        #
+        # No `tools=` here: this continues a conversation whose token history
+        # already carries the tools system preamble; it is not a fresh turn.
+        tool_messages: list[dict[str, str]] = [
+            {"role": "tool", "content": results_by_index[i]} for i in sorted(results_by_index)
+        ]
         suffix_text = safe_apply_chat_template(
             model_config,
             tokenizer,
-            [{"role": "tool", "content": combined_result_text}],
+            tool_messages,
             chat_template=processor.chat_template,
             add_generation_prompt=True,
             tokenize=False,

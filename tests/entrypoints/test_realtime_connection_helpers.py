@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
@@ -25,6 +26,18 @@ def realtime_conn() -> RealtimeConnection:
     return RealtimeConnection.__new__(RealtimeConnection)
 
 
+@dataclass
+class _FakeModelConfig:
+    """Only the field `_async_chunk_enabled` reads."""
+
+    async_chunk: bool = False
+
+
+@dataclass
+class _FakeServing:
+    model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
+
+
 @pytest.fixture
 def tool_call_conn() -> RealtimeConnection:
     conn = RealtimeConnection.__new__(RealtimeConnection)
@@ -32,6 +45,9 @@ def tool_call_conn() -> RealtimeConnection:
     conn._tool_result_queue = asyncio.Queue()
     conn._pending_tool_calls = {}
     conn._tool_rounds = 0
+    # Tool calling is only supported with async_chunk off, so that is the default
+    # here; tests that care about the other mode set it explicitly.
+    conn.serving = _FakeServing()
     return conn
 
 
@@ -323,3 +339,166 @@ class TestToolResultWaitReleasesOnDisconnect:
         asyncio.run(asyncio.wait_for(tool_call_conn._await_tool_results_and_continue([1], [2]), timeout=5))
 
         run_generation.assert_not_awaited()
+
+
+class TestParallelToolResultsRenderSeparateBlocks:
+    """Review #5555: joining parallel tool results into one `role="tool"` message
+    produced a single `<tool_response>` holding both outputs, so the model could
+    not associate each result with its call. The chat template emits one
+    `<tool_response>` per tool message (grouping consecutive tool messages under
+    one user turn), so each result must be its own message, in call order.
+    """
+
+    @staticmethod
+    def _capture_suffix(conn, mocker, pending: dict[int, _PendingToolCall]) -> list[dict[str, str]]:
+        """Drive `_await_tool_results_and_continue` and return the message list
+        handed to the chat template."""
+        conn._is_connected = True
+        conn._tool_rounds = 0
+        conn._turn_prompt = None
+        conn._pending_tool_calls = pending
+        conn.serving = mocker.Mock()
+        mocker.patch.object(conn, "_run_generation", new_callable=mocker.AsyncMock)
+        mocker.patch.object(conn, "send_error", new_callable=mocker.AsyncMock)
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.realtime_connection.cached_tokenizer_from_config",
+            return_value=mocker.Mock(
+                encode=lambda text, add_special_tokens=True: [9],
+                convert_tokens_to_ids=lambda token: 151645,
+                unk_token_id=0,
+            ),
+        )
+        mocker.patch("vllm_omni.entrypoints.openai.realtime_connection.cached_processor_from_config")
+        apply_tmpl = mocker.patch(
+            "vllm_omni.entrypoints.openai.realtime_connection.safe_apply_chat_template",
+            return_value="<|im_start|>user\nr<|im_end|>\n<|im_start|>assistant\n",
+        )
+        asyncio.run(conn._await_tool_results_and_continue([1, 2], [3]))
+        return apply_tmpl.call_args.args[2]
+
+    def test_two_results_become_two_tool_messages_in_call_order(self, tool_call_conn, mocker) -> None:
+        pending = {
+            0: _PendingToolCall(call_id="call_a", name="get_weather"),
+            1: _PendingToolCall(call_id="call_b", name="get_weather"),
+        }
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_a", "output": "sunny 72"})
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_b", "output": "rainy 55"})
+
+        messages = self._capture_suffix(tool_call_conn, mocker, pending)
+
+        assert messages == [
+            {"role": "tool", "content": "sunny 72"},
+            {"role": "tool", "content": "rainy 55"},
+        ]
+
+    def test_call_order_is_kept_when_results_arrive_reversed(self, tool_call_conn, mocker) -> None:
+        """Arrival order is the client's choice; call order is the model's."""
+        pending = {
+            0: _PendingToolCall(call_id="call_a", name="get_weather"),
+            1: _PendingToolCall(call_id="call_b", name="get_weather"),
+        }
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_b", "output": "rainy 55"})
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_a", "output": "sunny 72"})
+
+        messages = self._capture_suffix(tool_call_conn, mocker, pending)
+
+        assert [m["content"] for m in messages] == ["sunny 72", "rainy 55"]
+
+    def test_duplicate_result_for_one_call_does_not_desync_the_wait(self, tool_call_conn, mocker) -> None:
+        pending = {0: _PendingToolCall(call_id="call_a", name="get_weather")}
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_a", "output": "first"})
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_a", "output": "second"})
+
+        messages = self._capture_suffix(tool_call_conn, mocker, pending)
+
+        assert messages == [{"role": "tool", "content": "first"}]
+
+
+class TestToolResultValidation:
+    """Review #5555: any dict with `type="function_call_output"` was enqueued, so a
+    missing/non-string `call_id` or a non-string `output` was accepted and the turn
+    then waited for a result that could never match - with nothing reported to the
+    client. Shape problems are protocol errors."""
+
+    @staticmethod
+    def _create(item: dict) -> dict:
+        return {"type": "conversation.item.create", "item": item}
+
+    def _run(self, conn, mocker, item: dict):
+        send_error = mocker.patch.object(conn, "send_error", new_callable=mocker.AsyncMock)
+        mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+        asyncio.run(conn.handle_event(self._create(item)))
+        return send_error
+
+    def test_missing_call_id_is_rejected(self, tool_call_conn, mocker) -> None:
+        send_error = self._run(tool_call_conn, mocker, {"type": "function_call_output", "output": "x"})
+        assert send_error.await_args.args[1] == "invalid_function_call_output"
+        assert tool_call_conn._tool_result_queue.empty()
+
+    def test_non_string_call_id_is_rejected(self, tool_call_conn, mocker) -> None:
+        send_error = self._run(tool_call_conn, mocker, {"type": "function_call_output", "call_id": 7, "output": "x"})
+        assert send_error.await_args.args[1] == "invalid_function_call_output"
+        assert tool_call_conn._tool_result_queue.empty()
+
+    def test_non_string_output_is_rejected(self, tool_call_conn, mocker) -> None:
+        send_error = self._run(
+            tool_call_conn, mocker, {"type": "function_call_output", "call_id": "call_a", "output": {"a": 1}}
+        )
+        assert send_error.await_args.args[1] == "invalid_function_call_output"
+        assert tool_call_conn._tool_result_queue.empty()
+
+    def test_well_formed_result_is_enqueued(self, tool_call_conn, mocker) -> None:
+        send_error = self._run(
+            tool_call_conn, mocker, {"type": "function_call_output", "call_id": "call_a", "output": "sunny"}
+        )
+        send_error.assert_not_awaited()
+        assert tool_call_conn._tool_result_queue.qsize() == 1
+
+    def test_unknown_call_id_is_reported_to_the_client(self, tool_call_conn, mocker) -> None:
+        """Previously only logged, so a client typo produced silence."""
+        tool_call_conn._is_connected = True
+        tool_call_conn._tool_rounds = 0
+        tool_call_conn._pending_tool_calls = {0: _PendingToolCall(call_id="call_a", name="get_weather")}
+        tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_TYPO", "output": "sunny"})
+        send_error = mocker.patch.object(tool_call_conn, "send_error", new_callable=mocker.AsyncMock)
+        mocker.patch.object(tool_call_conn, "_run_generation", new_callable=mocker.AsyncMock)
+
+        async def _drive() -> None:
+            task = asyncio.ensure_future(tool_call_conn._await_tool_results_and_continue([1], [2]))
+            for _ in range(40):
+                await asyncio.sleep(0.02)
+                if send_error.await_count:
+                    break
+            tool_call_conn._is_connected = False
+            await asyncio.wait_for(task, timeout=5)
+
+        asyncio.run(_drive())
+
+        assert send_error.await_args.args[1] == "unknown_tool_call_id"
+
+
+class TestToolsRejectedUnderAsyncChunk:
+    """Review #5555: with async_chunk on, the buffer yields one TokensPrompt per
+    segment, so a tool-call continuation reattached only the final segment and lost
+    the start of the utterance. Aggregating the audio would not be enough - the
+    generation loop also never sees one complete thinker turn to scan for a
+    <tool_call> block - so tools are refused outright instead."""
+
+    def _session_update(self, conn, mocker, async_chunk: bool):
+        conn.serving = _FakeServing(_FakeModelConfig(async_chunk=async_chunk))
+        send_error = mocker.patch.object(conn, "send_error", new_callable=mocker.AsyncMock)
+        base = mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        asyncio.run(conn.handle_event({"type": "session.update", "model": "m", "tools": tools}))
+        return send_error, base
+
+    def test_tools_rejected_when_async_chunk_enabled(self, tool_call_conn, mocker) -> None:
+        send_error, base = self._session_update(tool_call_conn, mocker, async_chunk=True)
+        assert send_error.await_args.args[1] == "tools_require_no_async_chunk"
+        assert tool_call_conn._tools is None
+        base.assert_awaited_once()
+
+    def test_tools_accepted_when_async_chunk_disabled(self, tool_call_conn, mocker) -> None:
+        send_error, _ = self._session_update(tool_call_conn, mocker, async_chunk=False)
+        send_error.assert_not_awaited()
+        assert tool_call_conn._tools == [{"type": "function", "function": {"name": "get_weather"}}]
