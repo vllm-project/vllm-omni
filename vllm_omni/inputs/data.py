@@ -263,7 +263,7 @@ class OmniDiffusionSamplingParams:
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
     num_inference_steps: int | None = None
-    guidance_scale: float = 0.0
+    guidance_scale: float | None = None
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_scale_2_provided: bool = False

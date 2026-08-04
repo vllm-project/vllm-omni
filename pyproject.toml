@@ -75,6 +75,7 @@ dev = [
 ]
 
 demo = [
+    "gradio>=6.7.0",
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
@@ -93,6 +94,12 @@ local = [
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [
     "quack-kernels>=0.3.11",
+]
+
+# Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
+# the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
+fa4 = [
+    "flash-attn-4[cu13]==4.0.0b18",
 ]
 
 docs = [

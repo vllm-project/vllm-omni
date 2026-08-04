@@ -468,6 +468,10 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["london"]},
+        # A one-word English clip is too short for whisper's language detection to
+        # be stable; unpinned it renders "London" as 런던 / ランデ / 梁敦 and the
+        # containment check then fails on correct audio.
+        "transcript_language": "en",
     }
 
     # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).

@@ -336,7 +336,7 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
 # or:
 ./moss_tts_nano/run_server.sh
 ```
-The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no `--stage-configs-path`, `--trust-remote-code`, or `--enforce-eager` flags are needed.
+The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no `--deploy-config`, `--trust-remote-code`, or `--enforce-eager` flags are needed.
 
 ### Sending requests
 ```bash

@@ -21,6 +21,7 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -91,6 +92,17 @@ def _make_update(**kwargs) -> StreamingUpdate:
     )
     defaults.update(kwargs)
     return StreamingUpdate(**defaults)
+
+
+def test_generation_scheduler_records_prefill_stats_for_metrics() -> None:
+    request = _make_request(prompt_token_ids=[1, 2, 3, 4])
+    request.prefill_stats = PrefillStats()
+
+    OmniGenerationScheduler._record_prefill_stats(request)
+
+    assert request.prefill_stats.num_prompt_tokens == 4
+    assert request.prefill_stats.num_computed_tokens == 4
+    assert request.prefill_stats.num_cached_tokens == 0
 
 
 def test_resumable_generation_stop_marks_segment_boundary() -> None:
