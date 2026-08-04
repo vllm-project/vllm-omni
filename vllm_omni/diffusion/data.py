@@ -192,6 +192,16 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    text_encoder_tp_size: int = 1
+    """Number of ranks used to tensor-parallel shard the diffusion text encoder.
+
+    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
+    which keeps the encoder fully resident on the DiT main rank (historical
+    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
+    ranks and run the encode with distributed collectives over the encoder
+    process group.
+    """
+
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
 
