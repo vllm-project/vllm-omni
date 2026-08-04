@@ -162,9 +162,8 @@ if __name__ == "__main__":
             elif params_builder := spec.get("params_builder"):
                 result = params_builder(
                     {"audio_flow_shift": 3.0, "flow_shift": 12.0, "type": "minimax_h3"},
-                    task="t2va",
+                    extra_params={"task": "t2va"},
                 )
-                print(f"✓ {path:<40} → {result}")
             else:
                 print(f"✓ {path:<40} → No preprocessor/params_builder")
         else:
