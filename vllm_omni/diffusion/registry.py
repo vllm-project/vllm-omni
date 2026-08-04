@@ -91,6 +91,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "MiniMaxH3ModularPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -508,6 +513,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",

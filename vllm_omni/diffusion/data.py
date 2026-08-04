@@ -541,16 +541,15 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+
     if not model:
         return None
 
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from model_index.json.
-    try:
-        model_index = get_hf_file_to_dict("model_index.json", model)
-    except Exception:
-        model_index = None
+    # Diffusers models: read _class_name from the pipeline index.
+    model_index = get_diffusion_model_index(model)
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -1137,18 +1136,23 @@ class OmniDiffusionConfig:
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
-        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Diffusers-style models expose a pipeline index with ``_class_name``.
         Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
             self.model_class_name = "DiffusersAdapterPipeline"
 
         try:
-            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            config_dict = get_diffusion_model_index(
+                self.model,
+                revision=self.revision,
+            )
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1163,7 +1167,7 @@ class OmniDiffusionConfig:
                         self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
                     except (KeyError, AttributeError) as exc:
                         logger.warning(
-                            "Could not find valid _class_name for diffusers pipeline in model_index.json: %s. "
+                            "Could not find a valid _class_name in the Diffusers pipeline index: %s. "
                             "Without the underlying pipeline class the dummy run may omit required inputs.",
                             exc,
                         )
@@ -1176,16 +1180,16 @@ class OmniDiffusionConfig:
                     else:
                         self.set_tf_model_config(TransformerConfig())
             else:
-                raise FileNotFoundError("model_index.json not found")
+                raise FileNotFoundError("Diffusers pipeline index not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
-                    "Could not find valid model_index.json per diffusers format. "
+                    "Could not find a valid pipeline index per Diffusers format. "
                     "This model is likely unsupported by the diffusers backend. "
-                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
+                    "Also, without knowing the underlying pipeline class from its index, "
                     "the dummy run will input only text prompt, which may cause errors for pipelines "
                     "that require additional inputs."
                 )
@@ -1201,7 +1205,7 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
                         return
-                    raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+                    raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 model_type = cfg.get("model_type")
