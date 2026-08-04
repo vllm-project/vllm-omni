@@ -340,6 +340,9 @@ class StageDeployConfig:
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
+    # Pooling stages (runner="pooling") take PoolingParams instead, and carry
+    # their task here -- e.g. {"task": "token_classify"}.
+    default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
 
     # === Generic stage engine fields ===
@@ -512,6 +515,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
+        "default_pooling_params",
         "engine_extras",
         "engine_args",
         "runtime",
@@ -565,11 +569,20 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
+    kwargs["default_pooling_params"] = stage_data.get("default_pooling_params")
     kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
-_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
+_DEEP_MERGE_KEYS = frozenset(
+    {
+        "default_sampling_params",
+        "default_pooling_params",
+        "subtalker_sampling_params",
+        "engine_extras",
+        "engine_args",
+    }
+)
 
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
@@ -885,6 +898,8 @@ def _build_extras(
     sampling.update(ps.sampling_constraints)
     if sampling:
         extras["default_sampling_params"] = sampling
+    if ds is not None and ds.default_pooling_params:
+        extras["default_pooling_params"] = dict(ds.default_pooling_params)
     if ds is not None and ds.output_connectors:
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
@@ -947,12 +962,22 @@ def merge_pipeline_deploy(
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
         if not ps.requires_multimodal_data:
             engine_args.setdefault("skip_mm_profiling", True)
-        sched_cls = _resolve_scheduler(
-            ps.execution_type,
-            engine_args.get("async_scheduling", True),
-        )
-        if ps.execution_type == StageExecutionType.LLM_AR:
-            engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+        # A pooling stage runs one forward pass per request with no
+        # autoregressive decode, so the omni AR schedulers do not apply: they
+        # schedule zero tokens for such a request and the executor is then
+        # called with an empty batch. Fall back to vLLM's own scheduler, the
+        # same way diffusion stages already do.
+        is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+        if is_pooling:
+            sched_cls = None
+            engine_args["async_scheduling"] = False
+        else:
+            sched_cls = _resolve_scheduler(
+                ps.execution_type,
+                engine_args.get("async_scheduling", True),
+            )
+            if ps.execution_type == StageExecutionType.LLM_AR:
+                engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

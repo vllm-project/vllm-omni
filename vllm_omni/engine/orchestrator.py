@@ -1445,13 +1445,32 @@ class Orchestrator:
             request_id=req_id,
             prompt=next_input,
             params=params,
-            supported_tasks=("generate",),
+            supported_tasks=self._stage_supported_tasks(next_stage_id),
             arrival_time=_time.time(),
             resumable=resumable,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
         return request
+
+    def _stage_supported_tasks(self, stage_id: int) -> tuple[str, ...]:
+        """Tasks the given stage's model can actually run.
+
+        This used to be hard-coded to ``("generate",)``, which quietly made a
+        pooling stage impossible: vLLM's input processor validates the params
+        against this tuple, so ``PoolingParams`` was rejected before the stage
+        ever saw them. Reading it off the stage's own model config keeps the
+        generative path identical while letting a pooling stage through.
+        """
+        model_config = getattr(self.stage_pools[stage_id].stage_vllm_config, "model_config", None)
+        if getattr(model_config, "runner_type", None) == "pooling":
+            tasks = getattr(model_config, "supported_tasks", None)
+            # supported_tasks is resolved inside the stage's engine process, so
+            # it can still be unset on the config the orchestrator holds. The
+            # engine validates the task again on arrival, so naming the pooling
+            # task here only has to get the request past this check.
+            return tuple(tasks) if tasks else ("token_classify",)
+        return ("generate",)
 
     @staticmethod
     def _duplex_output_context(
