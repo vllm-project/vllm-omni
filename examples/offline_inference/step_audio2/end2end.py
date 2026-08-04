@@ -232,15 +232,8 @@ def main(args):
         raise ValueError(f"Unknown query type: {args.query_type}")
 
     # Initialize vLLM-Omni with Step-Audio2
-    # Resolve deploy config path. Keep explicit stage_configs_path for legacy
-    # custom configs, but use bundled deploy configs by default.
-    deploy_config_path = None
-    stage_config_path = None
-    if args.stage_configs_path and args.deploy_config:
-        raise ValueError("--stage-configs-path and --deploy-config are mutually exclusive")
-    if args.stage_configs_path:
-        stage_config_path = args.stage_configs_path
-    elif args.deploy_config:
+    # Resolve an explicit deploy config or use the bundled task default.
+    if args.deploy_config:
         deploy_config_path = args.deploy_config
     else:
         configs_dir = Path(__file__).parent.parent.parent.parent / "vllm_omni/deploy"
@@ -262,10 +255,7 @@ def main(args):
         "ray_address": args.ray_address,
         "trust_remote_code": True,
     }
-    if stage_config_path is not None:
-        omni_kwargs["stage_configs_path"] = stage_config_path
-    else:
-        omni_kwargs["deploy_config"] = deploy_config_path
+    omni_kwargs["deploy_config"] = deploy_config_path
 
     omni_llm = Omni(**omni_kwargs)
 
@@ -417,12 +407,6 @@ def parse_args():
             "  - Local path: /path/to/step-audio-2\n"
             "  - HuggingFace ID: stepfun-ai/Step-Audio-2-mini"
         ),
-    )
-    parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="Path to a legacy stage config YAML file (default: use bundled deploy config)",
     )
     parser.add_argument(
         "--deploy-config",

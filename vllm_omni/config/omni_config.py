@@ -753,7 +753,7 @@ def _global_stage_cli_fields() -> frozenset[str]:
         frozenset(f.name for f in fields(OmniEngineArgs))
         | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
         | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-    ) - {"model", "stage_id", "stage_configs_path", "async_chunk"}
+    ) - {"model", "stage_id", "async_chunk"}
 
 
 def _mapping_or_empty(value: Any) -> Mapping[str, Any]:

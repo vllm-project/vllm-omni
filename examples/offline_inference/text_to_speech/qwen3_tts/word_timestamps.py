@@ -36,7 +36,7 @@ from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.utils.forced_aligner import align, build_forced_aligner_config
 
 
-def _default_stage_config() -> str:
+def _default_deploy_config() -> str:
     repo_root = Path(__file__).resolve().parents[4]
     return str(repo_root / "vllm_omni" / "deploy" / "qwen3_tts.yaml")
 
@@ -109,7 +109,7 @@ def main(args: Any) -> None:
         "output_dir",
     ):
         omni_kwargs.pop(key, None)
-    omni_kwargs["stage_configs_path"] = args.stage_configs_path or _default_stage_config()
+    omni_kwargs["deploy_config"] = args.deploy_config or _default_deploy_config()
     omni_kwargs["log_stats"] = args.log_stats
     omni = Omni(**omni_kwargs)
 
@@ -156,7 +156,7 @@ def parse_args() -> Any:
         default=None,
         help="Optional YAML file for forced aligner settings (incl. gpu_memory_utilization)",
     )
-    parser.add_argument("--stage-configs-path", default=None, help="Qwen3-TTS deploy YAML")
+    parser.add_argument("--deploy-config", default=None, help="Qwen3-TTS deploy YAML")
     parser.add_argument("--text", default="Hello world.", help="Text to synthesize and align")
     parser.add_argument("--language", default="English", help="Qwen3-TTS language field")
     parser.add_argument("--speaker", default="Vivian", help="CustomVoice speaker name")

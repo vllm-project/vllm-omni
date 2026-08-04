@@ -6,7 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,9 +34,8 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
-    strip_parent_engine_args,
 )
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -475,7 +474,7 @@ class TestStageConfigFactory:
         cli_overrides = {
             "gpu_memory_utilization": 0.9,
             "model": "some_model",  # Internal
-            "stage_configs_path": "/path",  # Internal
+            "deploy_config": "/path",  # Internal
             "batch_timeout": 10,  # Internal
         }
 
@@ -483,7 +482,7 @@ class TestStageConfigFactory:
 
         assert overrides["gpu_memory_utilization"] == 0.9
         assert "model" not in overrides
-        assert "stage_configs_path" not in overrides
+        assert "deploy_config" not in overrides
         assert "batch_timeout" not in overrides
 
     def test_per_stage_override_excludes_internal_keys(self):
@@ -524,49 +523,6 @@ class TestStageResolutionHelpers:
         assert overrides["gpu_memory_utilization"] == 0.9
         assert "model" not in overrides
         assert "parallel_config" not in overrides
-
-    def test_strip_parent_engine_args_reports_only_surprising_parent_overrides(self):
-        parent_fields = {f.name: f for f in fields(EngineArgs)}
-        filtered, overridden = strip_parent_engine_args(
-            {
-                "model": "some/model",
-                "stage_configs_path": "/tmp/stages.yaml",
-                "tensor_parallel_size": 4,
-                "worker_extension_cls": "some.Extension",
-                "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
-            },
-            parent_fields=parent_fields,
-            keep_keys={"worker_extension_cls"},
-            strip_keys={"stage_configs_path"},
-            no_warn_keys={"model"},
-        )
-
-        assert filtered == {
-            "worker_extension_cls": "some.Extension",
-            "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
-        }
-        assert overridden == ["tensor_parallel_size"]
-
-    def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
-        parent_fields = {f.name: f for f in fields(EngineArgs)}
-        filtered, overridden = strip_parent_engine_args(
-            {
-                "model": "some/model",
-                "stage_configs_path": "/tmp/stages.yaml",
-                "allowed_local_media_path": "/data/qwentts",
-                "allowed_media_domains": ["example.com"],
-            },
-            parent_fields=parent_fields,
-            keep_keys={"allowed_local_media_path", "allowed_media_domains"},
-            strip_keys={"stage_configs_path"},
-            no_warn_keys={"model"},
-        )
-
-        assert filtered == {
-            "allowed_local_media_path": "/data/qwentts",
-            "allowed_media_domains": ["example.com"],
-        }
-        assert overridden == []
 
 
 class TestPipelineDiscovery:

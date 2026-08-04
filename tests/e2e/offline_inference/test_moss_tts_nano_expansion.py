@@ -25,7 +25,7 @@ from vllm_omni import Omni
 MODEL_NAME = "OpenMOSS-Team/MOSS-TTS-Nano"
 STAGE_CONFIG = get_deploy_config_path("moss_tts_nano.yaml")
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,

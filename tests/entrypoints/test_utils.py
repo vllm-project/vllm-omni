@@ -381,7 +381,6 @@ class TestLoadAndResolveStageConfigs:
 
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
-            stage_configs_path=None,
             kwargs=kwargs,
             trust_remote_code=False,
             default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
@@ -390,9 +389,7 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
-    def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
-        self, tmp_path, mocker: MockerFixture
-    ):
+    def test_deploy_config_does_not_expand_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"
         deploy_path.write_text(
             'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
@@ -416,9 +413,9 @@ class TestLoadAndResolveStageConfigs:
 
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="dummy-model",
-            stage_configs_path=str(deploy_path),
             kwargs={},
             trust_remote_code=True,
+            deploy_config_path=str(deploy_path),
         )
 
         load_stage_configs.assert_called_once_with(
