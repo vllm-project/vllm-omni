@@ -162,7 +162,9 @@ class RotaryEmbedding(CustomOp):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
+            x, squeezed = _ensure_batch_dim(x)
+            output = apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
+            return _restore_batch_dim(output, squeezed)
         else:
             return self.forward_native(x, cos, sin)
 
