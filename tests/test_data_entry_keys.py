@@ -372,8 +372,9 @@ class TestSerializeDeserializePayload:
         assert torch.equal(restored["hidden_states"]["layers"][24], torch.tensor([3.0]))
 
     def test_tensor_dtype_preserved(self):
-        # bfloat16 excluded: numpy() doesn't support it; callers must cast before serializing.
-        for dtype in [torch.float16, torch.float32, torch.int64, torch.int32, torch.bool]:
+        # bfloat16 is stored as float32 bytes and rebound to bfloat16 on
+        # decode (numpy has no native bfloat16, see _serialize_tensor).
+        for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.int32, torch.bool]:
             original: OmniPayload = {"codes": {"audio": torch.tensor([1], dtype=dtype)}}
             wire = serialize_payload(original)
             restored = deserialize_payload(wire)
@@ -386,6 +387,18 @@ class TestSerializeDeserializePayload:
         restored = deserialize_payload(wire)
         assert restored["hidden_states"]["output"].shape == (3, 4, 5)
         assert torch.allclose(restored["hidden_states"]["output"], t)
+
+    def test_bfloat16_round_trip_preserves_values(self):
+        # Regression for #5739: numpy() would raise "Got unsupported ScalarType
+        # BFloat16"; bfloat16 tensors are now stored as float32 bytes and
+        # rebound to bfloat16 with the same values on decode.
+        t = torch.tensor([[1.5, 2.5, 100.0, 0.125]], dtype=torch.bfloat16)
+        original: OmniPayload = {"codes": {"audio": t}}
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+        assert restored["codes"]["audio"].dtype == torch.bfloat16
+        assert restored["codes"]["audio"].shape == t.shape
+        assert torch.equal(restored["codes"]["audio"], t)
 
     def test_empty_payload_returns_none(self):
         assert serialize_payload({}) is None

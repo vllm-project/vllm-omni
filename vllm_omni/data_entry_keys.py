@@ -352,18 +352,34 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
+    # ``numpy`` does not support ``torch.bfloat16`` (``.numpy()`` would raise
+    # ``TypeError: Got unsupported ScalarType BFloat16``). Store the raw bytes
+    # as ``float32`` but keep the real dtype name in ``tensor_dtype``, and let
+    # :func:`_deserialize_tensor` restore the ``bfloat16`` dtype on decode.
+    dtype_name = _dtype_to_name(t_cpu.dtype)
+    if t_cpu.dtype == torch.bfloat16:
+        t_cpu = t_cpu.to(dtype=torch.float32)
+        np_dtype = np.dtype("float32")
+    else:
+        np_dtype = np.dtype(dtype_name)
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=t_cpu.numpy().astype(np_dtype).tobytes(),
         tensor_shape=list(t_cpu.shape),
-        tensor_dtype=_dtype_to_name(t_cpu.dtype),
+        tensor_dtype=dtype_name,
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
+    # ``bfloat16`` tensor bytes are stored as ``float32`` (see
+    # :func:`_serialize_tensor`); decode as float32 and cast back.
+    if entry.tensor_dtype == "bfloat16":
+        dt = np.dtype("float32")
+    else:
+        dt = np.dtype(entry.tensor_dtype or "float32")
     arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
     arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    tensor = torch.from_numpy(arr.copy())
+    return tensor.to(dtype=torch.bfloat16) if entry.tensor_dtype == "bfloat16" else tensor
 
 
 def serialize_payload(
