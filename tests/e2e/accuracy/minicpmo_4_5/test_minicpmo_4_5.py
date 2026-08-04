@@ -33,8 +33,8 @@ _RESULT_DIR = Path(
         str(Path(__file__).resolve().parent / "results"),
     )
 )
-# Manual start_server + daily_omni_bench reaches ~0.782; keep a small CI margin.
-_MIN_DAILY_OMNI_ACCURACY = 0.75
+
+_MIN_DAILY_OMNI_ACCURACY = 0.78
 _MAX_SEED_TTS_MEAN_WER = 0.05
 # Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {
