@@ -147,6 +147,7 @@ from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
+from vllm_omni.utils.forced_aligner import preload as preload_forced_aligner
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -1030,13 +1031,16 @@ async def omni_init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
+    # One config for both consumers (transcription and streaming speech), and
+    # the handle we preload below.
+    forced_aligner_config = build_forced_aligner_config(args)
     state.openai_serving_transcription = (
         OmniServingTranscription(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
-            forced_aligner_config=build_forced_aligner_config(args),
+            forced_aligner_config=forced_aligner_config,
             audio_decode_procs=getattr(engine_client, "audio_decode_procs", 0),
         )
         if "transcription" in supported_tasks
@@ -1092,12 +1096,20 @@ async def omni_init_app_state(
         state.openai_serving_models,
         request_logger=request_logger,
         model_name=model_name,
-        forced_aligner_config=build_forced_aligner_config(args),
+        forced_aligner_config=forced_aligner_config,
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
+
+    # Same reasoning as the warmup above, but for correctness rather than
+    # latency: the aligner shares a card with the model stages, so an
+    # over-subscribed deployment cannot allocate it. Loading lazily would let
+    # the server report healthy and fail the first request that asks for word
+    # timestamps; loading here fails startup instead.
+    if forced_aligner_config is not None:
+        await preload_forced_aligner(forced_aligner_config)
 
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name

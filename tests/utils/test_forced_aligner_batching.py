@@ -200,3 +200,31 @@ async def test_batch_size_is_capped(stub_batches, monkeypatch):
         *(fa.align(audio=b"\x00\x00", text=f"t{i}", sample_rate=16000, config=_cfg()) for i in range(20))
     )
     assert max(sizes) <= 4
+
+
+async def test_preload_surfaces_a_load_failure_at_startup(monkeypatch):
+    """An over-subscribed GPU must fail the deploy, not the first user.
+
+    The aligner shares a card with the model stages. Loaded lazily, a card that
+    cannot fit it lets the server report healthy and then fails whichever
+    request first asks for timestamps.
+    """
+
+    def bad_load(config):
+        raise RuntimeError("Free memory on device cuda:0 is less than desired")
+
+    monkeypatch.setattr(fa, "_ensure_loaded", bad_load)
+    with pytest.raises(fa.ForcedAlignerLoadError):
+        await fa.preload(_cfg())
+
+
+async def test_preload_means_align_does_not_load_again(monkeypatch, stub_batches):
+    """After preload, the request path must not re-enter the loader."""
+    stub_batches()  # sets _llm, so the loader should never be consulted
+    calls: list = []
+    monkeypatch.setattr(fa, "_ensure_loaded", lambda config: calls.append(config))
+
+    await fa.preload(_cfg())
+    await fa.align(audio=b"\x00\x00", text="hello", sample_rate=16000, config=_cfg())
+
+    assert calls == [], "loader ran despite the aligner already being resident"

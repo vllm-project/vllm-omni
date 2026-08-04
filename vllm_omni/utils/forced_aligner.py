@@ -139,6 +139,42 @@ class _AlignJob:
     future: asyncio.Future
 
 
+async def _load_if_needed(config: ForcedAlignerConfig) -> None:
+    """Lazy-load the aligner once, mapping any failure to ForcedAlignerLoadError.
+
+    Deliberately does not take ``_encode_lock``. The batch worker holds that for
+    the duration of an encode, so gating this (idempotent, almost always
+    already-done) check on it would block callers before they reach the queue:
+    nothing could enqueue while a batch ran, the queue would be empty at every
+    drain, and batch size would be pinned at 1.
+    """
+    if _llm is not None:
+        return
+    async with _load_lock:
+        if _llm is None:
+            try:
+                await asyncio.to_thread(_ensure_loaded, config)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Forced aligner failed to load")
+                raise ForcedAlignerLoadError(str(exc)) from exc
+
+
+async def preload(config: ForcedAlignerConfig) -> None:
+    """Load the aligner at startup instead of on the first request.
+
+    The aligner shares a card with the model stages, so an over-subscribed
+    deployment cannot allocate it. Loaded lazily, that surfaces as the *first*
+    request asking for timestamps failing while the server reports healthy --
+    the operator sees a green deploy and one unlucky user sees the error.
+    Loading here converts it into a startup failure with the same message.
+
+    Raises:
+        ForcedAlignerLoadError: propagated so startup aborts.
+    """
+    await _load_if_needed(config)
+    logger.info("Forced aligner preloaded: %s", config.model)
+
+
 async def align(
     *,
     audio: bytes,
@@ -172,21 +208,7 @@ async def align(
     """
     # Load outside the batcher so a load failure reaches this caller instead of
     # dissolving into a batch of per-request ``None`` results.
-    #
-    # This must NOT take _encode_lock. The batch worker holds that for the whole
-    # encode, so gating the (idempotent, almost always already-done) load on it
-    # would block callers here until the in-flight batch finished -- meaning
-    # nothing could enqueue while a batch ran, the queue would be empty at every
-    # drain, and batch size would be pinned at 1. Fast-path the loaded case and
-    # use a dedicated lock for the one-time load.
-    if _llm is None:
-        async with _load_lock:
-            if _llm is None:
-                try:
-                    await asyncio.to_thread(_ensure_loaded, config)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Forced aligner failed to load")
-                    raise ForcedAlignerLoadError(str(exc)) from exc
+    await _load_if_needed(config)
 
     job = _AlignJob(
         audio=audio,
