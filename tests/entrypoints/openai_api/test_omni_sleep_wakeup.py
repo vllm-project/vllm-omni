@@ -68,20 +68,15 @@ def test_sleep_default_level(sleep_capable_engine):
     sleep_capable_engine.sleep.assert_awaited_once_with(stage_ids=[0], level=2)
 
 
-def test_sleep_empty_stage_ids(sleep_capable_engine, mocker):
-    """Empty stage_ids: engine is still called and returns SUCCESS with no acks."""
-    sleep_capable_engine.sleep = mocker.AsyncMock(return_value=[])
+def test_sleep_empty_stage_ids(sleep_capable_engine):
+    """Empty stage_ids is rejected by min_length=1 validation."""
     app = _make_app(sleep_capable_engine)
     client = TestClient(app)
 
     response = client.post("/v1/omni/sleep", json={"stage_ids": [], "level": 2})
 
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "SUCCESS"
-    assert data["acks"] == []
-    assert app.state.sleeping_stages == set()
-    sleep_capable_engine.sleep.assert_awaited_once_with(stage_ids=[], level=2)
+    assert response.status_code == 422
+    sleep_capable_engine.sleep.assert_not_awaited()
 
 
 def test_sleep_updates_sleeping_set(sleep_capable_engine):
@@ -152,15 +147,14 @@ def test_wakeup_partial_sleeping(sleep_capable_engine):
 
 
 def test_wakeup_empty_stage_ids(sleep_capable_engine):
-    """Empty stage_ids: any() on empty iterable is False → SKIPPED, engine not called."""
+    """Empty stage_ids is rejected by min_length=1 validation."""
     app = _make_app(sleep_capable_engine)
     app.state.sleeping_stages = {0, 1}
     client = TestClient(app)
 
     response = client.post("/v1/omni/wakeup", json={"stage_ids": []})
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "SKIPPED"
+    assert response.status_code == 422
     sleep_capable_engine.wake_up.assert_not_awaited()
 
 
