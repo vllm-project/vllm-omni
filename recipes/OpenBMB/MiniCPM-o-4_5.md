@@ -240,9 +240,9 @@ speech output (TTS)"** checkbox on / off.
   model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
-- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
-  eager on CUDA. On Ascend, its request orchestration stays eager while the
-  exact-shape CFM DiT estimator uses inner NPUGraph replay.
+- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 keeps its
+  request orchestration eager while using inner CFM and HiFT CUDA Graphs. On
+  Ascend, the exact-shape CFM DiT estimator instead uses inner NPUGraph replay.
 - All default stages use `max_num_seqs: 4` to reduce cross-process GPU
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only

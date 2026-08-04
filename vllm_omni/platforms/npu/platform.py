@@ -36,10 +36,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
-        from vllm_omni.platforms.npu.models.minimax_h3 import apply_minimax_h3_qwen3vl_patch
         from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
             apply_minicpmo_4_5_code2wav_patch,
         )
+        from vllm_omni.platforms.npu.models.minimax_h3 import apply_minimax_h3_qwen3vl_patch
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )

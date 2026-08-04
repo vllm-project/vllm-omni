@@ -15,6 +15,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+    _graphable_estimator_step,
     prepare_code2wav_graph_runtime,
 )
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
@@ -63,7 +64,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .eval()
     )
     graph_runner = NPUExactGraphRunner(max_graphs=4)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator), graph_runner=graph_runner)
+    adapter = BatchedToken2Wav(_Token2Wav(estimator))
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -84,7 +85,8 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
 
     def compute(*values, caches=None):
         cnn_cache, att_cache = (None, None) if caches is None else caches
-        return adapter._estimator_step(
+        return _graphable_estimator_step(
+            adapter,
             estimator,
             x=values[0],
             mu=values[1],
