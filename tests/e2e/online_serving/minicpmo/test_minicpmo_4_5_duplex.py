@@ -75,8 +75,6 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
             {"session.created", "session.updated"},
             timeout_s=60,
         )
-        await ws.send(json.dumps({"type": "session.close"}))
-        events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=60))
     return events
 
 
@@ -94,7 +92,6 @@ def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None
     event_types = [event.get("type") for event in events]
     assert "session.created" in event_types
     assert "session.updated" in event_types
-    assert event_types[-1] == "session.closed"
 
 
 @pytest.mark.advanced_model

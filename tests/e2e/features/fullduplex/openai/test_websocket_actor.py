@@ -22,7 +22,7 @@ class FakeWebSocket:
 
 
 def test_normalize_is_identity():
-    event = {"type": "session.close", "reason": "done"}
+    event = {"type": "input.cancel", "reason": "done"}
     assert normalize_duplex_input_event(event) is event
 
 
@@ -59,7 +59,7 @@ async def test_control_event_does_not_overtake_earlier_audio_input():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_type", ["input.cancel", "session.close"])
+@pytest.mark.parametrize("event_type", ["input.cancel", "response.cancel"])
 async def test_terminal_control_preserves_wire_order(event_type: str):
     actor = DuplexWebSocketActor(FakeWebSocket())
     await actor.enqueue_event({"type": "input_audio_buffer.append", "audio": "pcm"})

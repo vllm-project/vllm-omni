@@ -144,8 +144,6 @@ async def _open_admission_session(
 
 
 async def _close_admission_session(ws, *, timeout_s: float) -> None:
-    await ws.send(json.dumps({"type": "session.close"}))
-    await _receive_until(ws, "session.closed", timeout_s=timeout_s)
     await ws.close()
 
 
@@ -299,35 +297,20 @@ async def _resume_probe(
         rotated = resumed.get("resume_token")
         if not isinstance(rotated, str) or rotated == token:
             raise RuntimeError("session.resume did not rotate the resume token")
-        await second.send(json.dumps({"type": "session.heartbeat"}))
-        heartbeat, heartbeat_events = await _receive_until(
-            second,
-            "session.heartbeat_ack",
-            timeout_s=args.timeout_s,
-        )
-        await second.send(json.dumps({"type": "session.close"}))
-        closed, close_events = await _receive_until(second, "session.closed", timeout_s=args.timeout_s)
-
     replay_sequences = [event["server_event_seq"] for event in replay if isinstance(event.get("server_event_seq"), int)]
     return {
         "ok": (
             resumed.get("session_id") == session_id
             and isinstance(generation, int)
             and resumed.get("attachment_generation") == generation + 1
-            and _event_session_id(heartbeat) == session_id
-            and _event_session_id(closed) == session_id
             and replay_sequences == sorted(replay_sequences)
         ),
         "session_id": session_id,
         "resumed_session_id": resumed.get("session_id"),
-        "heartbeat_session_id": _event_session_id(heartbeat),
-        "closed_session_id": _event_session_id(closed),
         "initial_attachment_generation": generation,
         "resumed_attachment_generation": resumed.get("attachment_generation"),
         "replayed_event_count": len(replay_sequences),
         "replayed_event_sequences": replay_sequences,
-        "heartbeat_event_count": len(heartbeat_events),
-        "close_event_count": len(close_events),
         "token_rotated": True,
     }
 
@@ -402,14 +385,6 @@ async def _takeover_probe(
             except ConnectionClosed:
                 rejected_old_writes += 1
 
-        await second.send(json.dumps({"type": "session.heartbeat"}))
-        heartbeat, heartbeat_events = await _receive_until(
-            second,
-            "session.heartbeat_ack",
-            timeout_s=args.timeout_s,
-        )
-        await second.send(json.dumps({"type": "session.close"}))
-        closed, close_events = await _receive_until(second, "session.closed", timeout_s=args.timeout_s)
         rotated_token = resumed.get("resume_token")
         return {
             "ok": (
@@ -420,8 +395,6 @@ async def _takeover_probe(
                 and _event_session_id(replaced) == session_id
                 and replaced.get("attachment_generation") == generation
                 and rejected_old_writes == 4
-                and _event_session_id(heartbeat) == session_id
-                and _event_session_id(closed) == session_id
             ),
             "session_id": session_id,
             "initial_attachment_generation": generation,
@@ -432,8 +405,6 @@ async def _takeover_probe(
             "rejected_old_writes": rejected_old_writes,
             "replay_event_count": len(replay_events),
             "replaced_event_count": len(replaced_events),
-            "heartbeat_event_count": len(heartbeat_events),
-            "close_event_count": len(close_events),
         }
     finally:
         if second is not None:

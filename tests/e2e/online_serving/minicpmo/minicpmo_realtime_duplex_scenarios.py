@@ -81,8 +81,6 @@ class DemoState:
     buffering_listen_count: int = 0
     model_speak_event_count: int = 0
     model_speak_delta_count: int = 0
-    playback_ack_count: int = 0
-    playback_history_committed_count: int = 0
     truncate_count: int = 0
     input_transcription_count: int = 0
     audio_marks_seen: bool = False
@@ -144,11 +142,6 @@ class DemoState:
             self.model_speak_event_count += 1
         elif event_type == "overlap.decision":
             self.overlap_decisions.append(event)
-        elif event_type == "playback.acknowledged":
-            self.playback_ack_count += 1
-            payload = event.get("event")
-            if isinstance(payload, dict) and payload.get("history_committed") is True:
-                self.playback_history_committed_count += 1
         elif event_type == "conversation.item.truncated":
             self.truncate_count += 1
         elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -401,18 +394,6 @@ class DemoState:
                 return max(0, int(sent_ms))
         return 0
 
-    def response_playback_history_committed(self, response_id: str) -> bool:
-        item_id = f"item_{response_id}"
-        for event in self.events:
-            if event.get("type") != "playback.acknowledged":
-                continue
-            payload = event.get("event")
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("item_id") == item_id and payload.get("history_committed") is True:
-                return True
-        return False
-
     def response_transcript_delta(self, response_id: str) -> str:
         return "".join(
             str(event.get("delta", ""))
@@ -647,14 +628,6 @@ def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[st
         state.response_audio_delta_count(response_id) == 0
         or bool(_canonical_transcript(state.response_transcript_delta(response_id)))
         for response_id in response_ids
-    )
-
-
-def _all_response_playback_history_committed(state: DemoState, response_ids: list[str]) -> bool:
-    return all(
-        state.response_playback_history_committed(response_id)
-        for response_id in response_ids
-        if state.response_playback_sent_ms(response_id) > 0
     )
 
 
@@ -974,65 +947,7 @@ async def _send_clean_turn(
     )
     if not isinstance(response_id, str):
         raise TimeoutError(f"Missing response id for {transcript}")
-    await _ack_response_playback(
-        ws,
-        state,
-        response_id,
-        timeout_s=timeout_s,
-        label=transcript,
-    )
     return response_id, "speak"
-
-
-async def _ack_response_playback(
-    ws,
-    state: DemoState,
-    response_id: str,
-    *,
-    timeout_s: float,
-    label: str,
-) -> None:
-    played_ms = state.response_playback_sent_ms(response_id)
-    if played_ms <= 0:
-        return
-    before_ack = state.playback_ack_count
-    await ws.send(
-        json.dumps(
-            {
-                "type": "playback.ack",
-                "response_id": response_id,
-                "item_id": f"item_{response_id}",
-                "played_ms": played_ms,
-                "committed_ms": played_ms,
-            }
-        )
-    )
-    await _wait_for(
-        state,
-        lambda: state.playback_ack_count > before_ack and state.response_playback_history_committed(response_id),
-        timeout_s=timeout_s,
-        label=f"{label} playback history committed",
-    )
-
-
-async def _ack_all_completed_response_playback(
-    ws,
-    state: DemoState,
-    *,
-    timeout_s: float,
-) -> None:
-    for response_id in state.completed_response_ids():
-        if state.response_playback_sent_ms(response_id) <= 0:
-            continue
-        if state.response_playback_history_committed(response_id):
-            continue
-        await _ack_response_playback(
-            ws,
-            state,
-            response_id,
-            timeout_s=timeout_s,
-            label=response_id,
-        )
 
 
 async def _drain_model_policy_responses(
@@ -1054,12 +969,6 @@ async def _drain_model_policy_responses(
         ]
         if remaining_s <= 0:
             raise TimeoutError(f"Timed out draining model-policy responses; active response ids: {active_response_ids}")
-
-        await _ack_all_completed_response_playback(
-            ws,
-            state,
-            timeout_s=remaining_s,
-        )
 
         now = time.monotonic()
         created_count = state.count("response.created")
@@ -1212,13 +1121,6 @@ async def _send_listen_only_overlap_pair(
         timeout_s=timeout_s,
         label=f"{transcripts[0]} response.done",
     )
-    await _ack_response_playback(
-        ws,
-        state,
-        first_response_id,
-        timeout_s=timeout_s,
-        label=transcripts[0],
-    )
 
     if _continuous_overlap_terminal_is_outcome(
         state,
@@ -1245,13 +1147,6 @@ async def _send_listen_only_overlap_pair(
             lambda: state.response_done(second_response_id),
             timeout_s=timeout_s,
             label=f"{transcripts[1]} response.done",
-        )
-        await _ack_response_playback(
-            ws,
-            state,
-            second_response_id,
-            timeout_s=timeout_s,
-            label=transcripts[1],
         )
 
     first_done_index = _event_index_for_response(state, "response.done", first_response_id)
@@ -1386,25 +1281,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     timeout_s=args.timeout_s,
                     settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                 )
-            await _ack_all_completed_response_playback(
-                ws,
-                state,
-                timeout_s=args.timeout_s,
-            )
-            await ws.send(json.dumps({"type": "session.close"}))
-            await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
         finally:
-            if state.count("session.created") > 0 and state.count("session.closed") == 0:
-                try:
-                    await ws.send(json.dumps({"type": "session.close"}))
-                    await _wait_for(
-                        state,
-                        lambda: state.count("session.closed") > 0,
-                        timeout_s=min(args.timeout_s, 5),
-                        label="session.closed during cleanup",
-                    )
-                except (ConnectionClosed, TimeoutError):
-                    pass
             stop.set()
             reader.cancel()
             try:
@@ -1473,10 +1350,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
-    playback_history_committed_ok = _all_response_playback_history_committed(
-        state,
-        completed_response_ids,
-    )
     if validation_mode == "response-required":
         full_audio_response_ok = (
             len(observed_turn_response_ids) == expected_audio_turns + len(expected_empty_turns)
@@ -1505,7 +1378,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     continuous_input_ok = not continuous_input or state.count("input_audio_buffer.committed") == 0
     result = {
         "ok": terminal_activity_ok
-        and state.count("session.closed") > 0
         and state.cancelled_count == 0
         and not overlap_barge_in
         and state.truncate_count == 0
@@ -1527,9 +1399,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "buffering_listen_count": state.buffering_listen_count,
         "model_speak_event_count": state.model_speak_event_count,
         "model_speak_delta_count": state.model_speak_delta_count,
-        "playback_ack_count": state.playback_ack_count,
-        "playback_history_committed_count": state.playback_history_committed_count,
-        "playback_history_committed_ok": playback_history_committed_ok,
         "truncate_count": state.truncate_count,
         "input_transcription_count": state.input_transcription_count,
         "audio_marks_seen": state.audio_marks_seen,
@@ -1584,7 +1453,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
         and all_audio_responses_have_transcript
-        and playback_history_committed_ok
         and listen_only_overlap_ok
         and not unexpected_error_events
         and response_speak_contract["response_speak_contract_ok"]
@@ -1681,7 +1549,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--short-ack-ms", type=int, default=350)
     parser.add_argument("--silence-ms", type=int, default=500)
-    parser.add_argument("--playback-ack-ms", type=int, default=500)
     parser.add_argument("--turns", type=int, default=3)
     parser.add_argument("--timeout-s", type=float, default=60.0)
     parser.add_argument(

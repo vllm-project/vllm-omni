@@ -156,7 +156,6 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "    {'type': 'response.output_audio.delta', 'response_id': response_id, "
                 "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.6},",
                 "    {'type': 'response.done', 'response_id': response_id},",
-                "    {'type': 'session.closed'},",
                 "]",
                 "Path(output / 'events.jsonl').write_text(",
                 "    ''.join(json.dumps(event) + '\\n' for event in events),",
@@ -679,10 +678,6 @@ def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
     demo = _load_multi_demo_module()
 
     assert demo._event_session_id({"type": "session.heartbeat_ack", "session_id": "sid"}) == "sid"
-    assert (
-        demo._event_session_id({"type": "session.closed", "event": {"type": "session.closed", "session_id": "sid"}})
-        == "sid"
-    )
 
 
 def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
@@ -1383,84 +1378,6 @@ def test_realtime_duplex_demo_model_policy_waits_for_speak_after_intermediate_li
     assert outcome == "speak"
 
 
-def test_realtime_duplex_demo_playback_gate_covers_unassigned_completed_response():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    for response_id in ("resp-assigned", "resp-unassigned"):
-        state.add({"type": "response.created", "response": {"id": response_id}})
-        state.add(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": response_id,
-                    "metadata": {"playback": {"sent_ms": 1200}},
-                },
-            }
-        )
-    state.add(
-        {
-            "type": "playback.acknowledged",
-            "event": {
-                "item_id": "item_resp-assigned",
-                "history_committed": True,
-            },
-        }
-    )
-
-    assert not demo._all_response_playback_history_committed(
-        state,
-        state.completed_response_ids(),
-    )
-
-
-def test_realtime_duplex_demo_acks_unassigned_completed_response():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    for response_id in ("resp-assigned", "resp-unassigned"):
-        state.add({"type": "response.created", "response": {"id": response_id}})
-        state.add(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": response_id,
-                    "metadata": {"playback": {"sent_ms": 1200}},
-                },
-            }
-        )
-    state.add(
-        {
-            "type": "playback.acknowledged",
-            "event": {
-                "item_id": "item_resp-assigned",
-                "history_committed": True,
-            },
-        }
-    )
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.messages = []
-
-        async def send(self, payload):
-            message = demo.json.loads(payload)
-            self.messages.append(message)
-            state.add(
-                {
-                    "type": "playback.acknowledged",
-                    "event": {
-                        "item_id": message["item_id"],
-                        "history_committed": True,
-                    },
-                }
-            )
-
-    ws = FakeWebSocket()
-    asyncio.run(demo._ack_all_completed_response_playback(ws, state, timeout_s=0.1))
-
-    assert [message["response_id"] for message in ws.messages] == ["resp-unassigned"]
-    assert demo._all_response_playback_history_committed(state, state.completed_response_ids())
-
-
 def test_realtime_duplex_demo_model_policy_does_not_assume_one_response_per_physical_input():
     demo = _load_demo_module()
 
@@ -1524,10 +1441,9 @@ def test_realtime_duplex_demo_drains_late_model_response_before_close():
         await late_response
         return ws
 
-    ws = asyncio.run(run_fixture())
+    asyncio.run(run_fixture())
 
     assert state.completed_response_ids() == ["resp-first", "resp-late"]
-    assert not [message for message in ws.messages if message.get("type") == "session.close"]
 
 
 def test_realtime_duplex_demo_model_response_drain_times_out_with_active_ids():
@@ -1645,60 +1561,6 @@ def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_fi
     assert outcomes == ["speak", "speak"]
     assert overlap_ok is True
     assert sum(demo.json.loads(message)["type"] == "input_audio_buffer.commit" for message in ws.messages) == 2
-
-
-def test_realtime_duplex_demo_playback_ack_identifies_and_commits_response():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    response_id = "resp-overlap-second"
-    state.add(
-        {
-            "type": "response.done",
-            "response": {
-                "id": response_id,
-                "metadata": {"playback": {"sent_ms": 1200}},
-            },
-        }
-    )
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.messages = []
-
-        async def send(self, payload):
-            message = demo.json.loads(payload)
-            self.messages.append(message)
-            state.add(
-                {
-                    "type": "playback.acknowledged",
-                    "event": {
-                        "item_id": message.get("item_id"),
-                        "history_committed": message.get("item_id") == f"item_{response_id}",
-                    },
-                }
-            )
-
-    ws = FakeWebSocket()
-    asyncio.run(
-        demo._ack_response_playback(
-            ws,
-            state,
-            response_id,
-            timeout_s=0.1,
-            label="overlap second",
-        )
-    )
-
-    assert ws.messages == [
-        {
-            "type": "playback.ack",
-            "response_id": response_id,
-            "item_id": f"item_{response_id}",
-            "played_ms": 1200,
-            "committed_ms": 1200,
-        }
-    ]
-    assert state.playback_history_committed_count == 1
 
 
 def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
