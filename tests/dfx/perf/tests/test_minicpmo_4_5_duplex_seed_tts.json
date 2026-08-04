@@ -39,7 +39,6 @@
         "seed_tts_locale": "en",
         "seed_tts_turns_per_session": 4,
         "expected_duplex_audio_turns_per_session": 4,
-        "baseline_hardware": "L20X (provisional; H100 recalibration required)",
         "extra_body": {
           "save_duplex_request_metrics": true
         },
