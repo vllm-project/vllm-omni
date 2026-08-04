@@ -178,13 +178,6 @@ class NativeRuntimeBridgeMixin:
             if not await self._close_runtime_session(session, reason=close_reason, send_json=send_json):
                 return False, emitted_response
             session.close()
-            await send_json(
-                {
-                    "type": "session.closed",
-                    "session_id": session.session_id,
-                    "reason": close_reason,
-                }
-            )
             return False, emitted_response
         return True, emitted_response
 
@@ -286,13 +279,6 @@ class NativeRuntimeBridgeMixin:
                 if close_reason is not None:
                     if await self._close_runtime_session(session, reason=close_reason, send_json=send_json):
                         session.close()
-                        await send_json(
-                            {
-                                "type": "session.closed",
-                                "session_id": session.session_id,
-                                "reason": close_reason,
-                            }
-                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -302,13 +288,6 @@ class NativeRuntimeBridgeMixin:
                     close_reason = "runtime_data_plane_stream_failed"
                     if await self._close_runtime_session(session, reason=close_reason, send_json=send_json):
                         session.close()
-                        await send_json(
-                            {
-                                "type": "session.closed",
-                                "session_id": session.session_id,
-                                "reason": close_reason,
-                            }
-                        )
             finally:
                 if native.data_plane_task is task:
                     native.data_plane_task = None
@@ -866,16 +845,6 @@ class NativeRuntimeBridgeMixin:
         if native_result.get("is_buffering") is True or native_result.get("prefill_success") is False:
             if native_result.get("data_plane_request_id") == session.active_request_id:
                 session.clear_request()
-            payload = {
-                "type": "response.listen",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "reason": native_result.get("reason") or "buffering",
-                "model_listen": False,
-                "buffering": True,
-            }
-            self._attach_native_runtime_metadata(payload, native_result)
-            await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
             await self._end_active_response_before_future_model_turn(
@@ -912,15 +881,6 @@ class NativeRuntimeBridgeMixin:
             if isinstance(data_plane_request_id, str) and not auto_response:
                 self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             emitted_response = True
-            payload = {
-                "type": "response.listen",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "reason": native_result.get("reason") or "model_listen",
-                "model_listen": model_listen,
-            }
-            self._attach_native_runtime_metadata(payload, native_result)
-            await send_json(payload)
             if native_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
                 await self._abort_request_background(
                     session,
@@ -986,15 +946,6 @@ class NativeRuntimeBridgeMixin:
             if self._session_auto_responds(session):
                 self._runtime_session_state(session).clear_continuation()
                 emitted_response = True
-                payload = {
-                    "type": "response.listen",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "reason": "model_turn_completed_without_output",
-                    "model_listen": True,
-                }
-                self._attach_native_runtime_metadata(payload, native_result)
-                await send_json(payload)
             return close_reason, emitted_response
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
             # A continuation append can already be in flight when the prior
@@ -1014,11 +965,9 @@ class NativeRuntimeBridgeMixin:
         ):
             return close_reason, emitted_response
         emitted_response = True
-        response_created = False
         response_id = session.active_response_id
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
-            response_created = True
             await send_json(
                 self._response_created_payload(
                     session,
@@ -1029,22 +978,6 @@ class NativeRuntimeBridgeMixin:
         response_stage_metrics = session.accumulate_response_stage_metrics(
             native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
         )
-        if response_created:
-            speak_payload = {
-                "type": "response.speak",
-                "session_id": session.session_id,
-                "response_id": response_id,
-                "epoch": session.epoch,
-                "text": text if isinstance(text, str) else "",
-                "end_of_turn": end_of_turn,
-                "model_speak": True,
-            }
-            self._attach_native_runtime_metadata(
-                speak_payload,
-                native_result,
-                stage_metrics=response_stage_metrics,
-            )
-            await send_json(speak_payload)
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
         if isinstance(text, str):

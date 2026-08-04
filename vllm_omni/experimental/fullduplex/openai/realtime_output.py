@@ -37,14 +37,10 @@ class RealtimeOutputProjector:
             session = self._realtime_session_payload(event.get("session"))
             return [{"type": "session.updated", "session": session}]
         if event_type in {
-            "session.resumed",
-            "session.heartbeat_ack",
             "session.replaced",
             "session.expired",
             "session.resync_required",
         }:
-            if event_type == "session.resumed":
-                self._hold_realtime_output_until_session_created = False
             return [dict(event)]
         if event_type == "response.created":
             response_id = event.get("response_id")
@@ -71,36 +67,6 @@ class RealtimeOutputProjector:
             if has_audio_modality:
                 payloads.extend(self._ensure_response_audio_part_added(response_id))
             return payloads
-        if event_type == "response.listen":
-            return [
-                {
-                    "type": "response.listen",
-                    "session_id": event.get("session_id"),
-                    "epoch": event.get("epoch"),
-                    "response": {
-                        "object": "realtime.response",
-                        "status": "listening",
-                        "metadata": event,
-                    },
-                }
-            ]
-        if event_type == "response.speak":
-            response_id = event.get("response_id")
-            state = self._response_state(response_id)
-            if state is not None:
-                if state.speak_emitted:
-                    return []
-                state.speak_emitted = True
-            return [
-                {
-                    "type": "response.speak",
-                    "response_id": response_id,
-                    "item_id": self._response_item_id(response_id),
-                    "output_index": 0,
-                    "content_index": 0,
-                    "metadata": self._response_speak_metadata(event),
-                }
-            ]
         if event_type == "overlap.decision":
             return [
                 {
@@ -230,8 +196,6 @@ class RealtimeOutputProjector:
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
             return [{"type": "input_audio_buffer.cleared"}]
-        if event_type == "playback.acknowledged":
-            return [{"type": "playback.acknowledged", "event": event}]
         if event_type == "conversation.item.created":
             item = event.get("item")
             if isinstance(item, dict) and isinstance(item.get("id"), str):
@@ -300,8 +264,6 @@ class RealtimeOutputProjector:
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
             return [self._realtime_error_payload(code, message)]
-        if event_type == "session.closed":
-            return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]
 
     @staticmethod
@@ -671,19 +633,6 @@ class RealtimeOutputProjector:
             state.audio_delta_emitted = True
             self._remember_response_audio_metadata(response_id, event)
         payloads: list[dict[str, object]] = []
-        if state is not None and not state.speak_emitted and metadata.get("model_speak") is True:
-            state.speak_emitted = True
-            payloads.insert(
-                0,
-                {
-                    "type": "response.speak",
-                    "response_id": response_id,
-                    "item_id": item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "metadata": self._response_speak_metadata(event),
-                },
-            )
         payloads.append(
             {
                 "type": "response.output_audio.delta",
@@ -698,10 +647,6 @@ class RealtimeOutputProjector:
             }
         )
         return payloads
-
-    @staticmethod
-    def _response_speak_metadata(event: dict[str, Any]) -> dict[str, object]:
-        return {key: event[key] for key in ("session_id", "epoch", "model_speak") if key in event}
 
     def _realtime_audio_done_events(
         self,

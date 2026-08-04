@@ -41,8 +41,6 @@ class DuplexRuntime:
                 await self._cancel(task)
                 task = None
                 await emit(ev.cancelled(self.session.response_index))
-            elif etype == ev.PLAYBACK_ACK:
-                await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
             elif etype == ev.CLOSE:
                 break
         if task is not None and not task.done():

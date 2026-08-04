@@ -389,26 +389,6 @@ class RealtimeDuplexClient:
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
 
-    async def acknowledge_playback(self) -> None:
-        for response_id in self.events.response_ids:
-            pcm16 = self.events.audio_bytes(response_id)
-            if not pcm16:
-                continue
-            played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send(
-                {
-                    "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
-            )
-
-    async def close_session(self, *, timeout_s: float = 20.0) -> None:
-        await self.send({"type": "session.close"})
-        await wait_for(
-            lambda: self.events.count("session.closed") > 0,
-            timeout_s=timeout_s,
-            label="session.closed",
-        )
+    async def close(self) -> None:
+        if self._ws is not None:
+            await self._ws.close()

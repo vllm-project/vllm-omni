@@ -50,9 +50,7 @@ from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
     NativeRuntimeBridgeMixin,
 )
 from vllm_omni.experimental.fullduplex.openai.session_attachment import (
-    DuplexJournalGapError,
     DuplexSessionAttachmentRegistry,
-    InvalidResumeTokenError,
 )
 from vllm_omni.experimental.fullduplex.openai.session_runner import (
     DuplexSessionRunnerMixin,
@@ -77,8 +75,6 @@ _DEFAULT_IDLE_TIMEOUT_S = 300.0
 @dataclass(frozen=True)
 class _DuplexSessionHandshake:
     session: DuplexSession
-    resumed: bool = False
-    attachment_generation: int | None = None
 
 
 class OmniDuplexSessionHandler(
@@ -270,17 +266,10 @@ class OmniDuplexSessionHandler(
             payload_epoch = payload.get("epoch")
             if isinstance(payload_epoch, int) and payload_epoch != session.epoch:
                 return False, None
-            if payload_type in {"response.done", "response.listen"} and (
-                actor.closing or session.state == DuplexSessionState.CLOSED
-            ):
+            if payload_type == "response.done" and (actor.closing or session.state == DuplexSessionState.CLOSED):
                 return False, None
         elif actor._is_stale_model_output(payload):
             return False, None
-
-        if payload_type == "session.closed":
-            actor.close_reason = actor.close_reason or str(payload.get("reason") or "closed")
-            if session is not None:
-                session.mark_closing()
 
         if not is_terminal or session is None:
             return True, None
@@ -289,9 +278,7 @@ class OmniDuplexSessionHandler(
         terminal_status_details = payload.get("status_details")
         if terminal_status is None and isinstance(terminal_status_details, dict):
             terminal_status = terminal_status_details.get("type")
-        response_terminal = payload_type == "response.done" or (
-            payload_type == "response.listen" and session.active_response_id is not None
-        )
+        response_terminal = payload_type == "response.done"
         can_promote_overlap = response_terminal and terminal_status not in {"cancelled", "failed"}
         deferred_overlap_payload: dict[str, object] | None = None
         continuous_input_crosses_terminal = (
@@ -364,7 +351,7 @@ class OmniDuplexSessionHandler(
                 native.speech_since_commit = False
                 if had_pending_overlap_audio and realtime_protocol is not None:
                     await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
-                if payload_type in {"input.cancelled", "session.closed"} or (
+                if payload_type == "input.cancelled" or (
                     payload_type == "response.done" and payload.get("status") == "cancelled"
                 ):
                     session.release_input_bytes(native.clear_committed_audio())
@@ -869,23 +856,6 @@ class OmniDuplexSessionHandler(
         except json.JSONDecodeError:
             await send_json({"type": "error", "error": "Invalid JSON in session.create", "code": "invalid_json"})
             return None
-        if isinstance(event, dict) and event.get("type") == "session.resume":
-            if realtime_protocol is None:
-                await send_json(
-                    {
-                        "type": "error",
-                        "error": "session.resume requires the Realtime protocol",
-                        "code": "unsupported_session_resume",
-                    }
-                )
-                return None
-            return await self._resume_session_handshake(
-                event,
-                send_json=send_json,
-                realtime_protocol=realtime_protocol,
-                attachment_send=attachment_send,
-                attachment_close=attachment_close,
-            )
         if not isinstance(event, dict) or event.get("type") not in {"session.create", "open_session", "session.config"}:
             await send_json(
                 {
@@ -933,185 +903,6 @@ class OmniDuplexSessionHandler(
             await send_json(td_error)
             return None
         return _DuplexSessionHandshake(session=session)
-
-    async def _resume_session_handshake(
-        self,
-        event: dict[str, object],
-        *,
-        send_json,
-        realtime_protocol: NativeRealtimeSessionProtocol,
-        attachment_send,
-        attachment_close,
-    ) -> _DuplexSessionHandshake | None:
-        session_id = event.get("session_id")
-        incarnation = event.get("incarnation")
-        resume_token = event.get("resume_token")
-        last_received = event.get("last_received_server_event_seq", 0)
-        if (
-            not isinstance(session_id, str)
-            or not session_id
-            or not isinstance(incarnation, int)
-            or incarnation < 0
-            or not isinstance(resume_token, str)
-            or not resume_token
-            or not isinstance(last_received, int)
-            or last_received < 0
-        ):
-            await send_json(
-                {
-                    "type": "error",
-                    "error": (
-                        "session.resume requires session_id, incarnation, resume_token, "
-                        "and a non-negative event sequence"
-                    ),
-                    "code": "invalid_session_resume",
-                }
-            )
-            return None
-        session = self._registry.get(session_id)
-        if session is None or session.state != DuplexSessionState.OPEN:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": f"Unknown or expired duplex session: {session_id}",
-                    "code": "session_resume_expired",
-                }
-            )
-            return None
-        if not session.capabilities.supports_session_resume:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": f"Session does not support resume: {session_id}",
-                    "code": "unsupported_session_resume",
-                }
-            )
-            return None
-        try:
-            await self._attachment_registry.authenticate_resume(
-                session_id,
-                incarnation=incarnation,
-                resume_token=resume_token,
-                last_received_server_event_seq=last_received,
-            )
-        except InvalidResumeTokenError:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": "Invalid duplex session resume token",
-                    "code": "invalid_resume_token",
-                }
-            )
-            return None
-        except DuplexJournalGapError:
-            await send_json(
-                {
-                    "type": "session.resync_required",
-                    "session_id": session_id,
-                    "reason": "journal_gap",
-                }
-            )
-            return None
-        except (KeyError, ValueError) as exc:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": str(exc),
-                    "code": "session_resume_conflict",
-                }
-            )
-            return None
-
-        resume_runtime = getattr(self._chat_service.engine_client, "resume_duplex_session_async", None)
-        if not callable(resume_runtime):
-            await send_json(
-                {
-                    "type": "error",
-                    "error": "Duplex runtime does not expose session resume control",
-                    "code": "runtime_resume_unsupported",
-                }
-            )
-            return None
-        expected_generation = self._lease_generations.get(session_id, 0)
-        try:
-            runtime_result = await resume_runtime(
-                session_id,
-                fence=DuplexFence(
-                    session.session_id,
-                    epoch=session.epoch,
-                    turn_id=session.turn_id,
-                    incarnation=session.incarnation,
-                ),
-                expected_lease_generation=expected_generation,
-            )
-            lease_generation = self._runtime_lease_generation(runtime_result)
-            if lease_generation is None:
-                raise RuntimeError("runtime resume result omitted lease_generation")
-        except Exception as exc:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": str(exc),
-                    "code": "runtime_resume_failed",
-                }
-            )
-            return None
-
-        if not callable(attachment_send) or not callable(attachment_close):
-            raise RuntimeError("session.resume requires transport attachment callbacks")
-
-        def activation_payload_factory(token, generation: int) -> dict[str, object]:
-            internal = {
-                "type": "session.resumed",
-                "session_id": session_id,
-                "incarnation": incarnation,
-                "attachment_generation": generation,
-                "resume_token": token.plaintext,
-            }
-            return realtime_protocol.encode_outbound_event(internal)[0]
-
-        try:
-            resumed = await self._attachment_registry.resume(
-                session_id,
-                incarnation=incarnation,
-                resume_token=resume_token,
-                last_received_server_event_seq=last_received,
-                send=attachment_send,
-                close=attachment_close,
-                activation_payload_factory=activation_payload_factory,
-            )
-        except Exception as exc:
-            # The engine-side CAS already advanced even if the transport
-            # vanished before it received the rotated token. Keep that
-            # generation so the registry's one-shot recovery token can retry.
-            self._lease_generations[session_id] = lease_generation
-            await send_json(
-                {
-                    "type": "error",
-                    "error": str(exc),
-                    "code": "session_resume_conflict",
-                }
-            )
-            return None
-        self._lease_generations[session_id] = lease_generation
-        replaced = resumed.replaced_attachment
-        if replaced is not None:
-            replaced_payload = realtime_protocol.encode_outbound_event(
-                {
-                    "type": "session.replaced",
-                    "session_id": session_id,
-                    "attachment_generation": replaced.generation,
-                }
-            )[0]
-            with suppress(Exception):
-                await replaced.send(replaced_payload)
-            with suppress(Exception):
-                await replaced.close("session_replaced")
-        return _DuplexSessionHandshake(
-            session=session,
-            resumed=True,
-            attachment_generation=resumed.attachment_generation,
-        )
 
     @classmethod
     def _runtime_lease_generation(cls, result: object) -> int | None:
@@ -1673,100 +1464,6 @@ class OmniDuplexSessionHandler(
         if text:
             return {"role": role, "content": text}
         return None
-
-    async def _handle_playback_ack(self, session: DuplexSession, event: dict[str, object], send_json) -> None:
-        played_ms = event.get("played_ms", event.get("audio_ms", 0))
-        committed_ms = event.get("committed_ms")
-        if not isinstance(played_ms, int | float):
-            await send_json({"type": "error", "error": "playback.ack requires played_ms", "code": "bad_event"})
-            return
-        committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
-        item_id = event.get("item_id")
-        response_id = event.get("response_id")
-        response_id = response_id if isinstance(response_id, str) and response_id else None
-        if not isinstance(item_id, str) or not item_id:
-            item_id = f"item_{response_id}" if response_id is not None else None
-        elif response_id is None and item_id.startswith("item_"):
-            response_id = item_id.removeprefix("item_")
-        if response_id is None and item_id is None and len(session.pending_history_item_ids) == 1:
-            item_id = next(iter(session.pending_history_item_ids))
-            if item_id.startswith("item_"):
-                response_id = item_id.removeprefix("item_")
-        if response_id is None and item_id is None and session.active_response_id is not None:
-            response_id = session.active_response_id
-            item_id = f"item_{response_id}"
-        if event.get("truncate") is True:
-            playback = session.acknowledge_playback(
-                int(played_ms),
-                committed_cursor,
-                response_id=response_id,
-            )
-            playback = session.truncate_playback_commit(
-                committed_cursor,
-                response_id=response_id,
-            )
-        else:
-            playback = session.acknowledge_playback(
-                int(played_ms),
-                committed_cursor,
-                response_id=response_id,
-            )
-        committed_history = False
-        if isinstance(item_id, str) and item_id:
-            committed_history = session.truncate_history_item(
-                item_id,
-                audio_end_ms=committed_cursor,
-                playback=playback,
-            )
-        elif session.pending_history_item_ids:
-            # A plain playback ack has no OpenAI item id. Commit the only
-            # uncommitted assistant candidate if the session has an unambiguous
-            # pending response; otherwise wait for conversation.item.truncate.
-            pending_ids = list(session.pending_history_item_ids)
-            if len(pending_ids) == 1:
-                item_id = pending_ids[0]
-                committed_history = session.truncate_history_item(
-                    item_id,
-                    audio_end_ms=committed_cursor,
-                    playback=playback,
-                )
-        elif session.active_response_id is not None:
-            item_id = f"item_{session.active_response_id}"
-            committed_history = session.truncate_history_item(
-                item_id,
-                audio_end_ms=committed_cursor,
-                playback=playback,
-            )
-        elif session.last_assistant_full_message is not None:
-            if item_id is None and session.history_item_ids:
-                assistant_item_ids = [
-                    known_item_id
-                    for known_item_id, message in session.history_item_ids.items()
-                    if message.get("role") == "assistant"
-                ]
-                if len(assistant_item_ids) == 1:
-                    item_id = assistant_item_ids[0]
-            if isinstance(item_id, str) and item_id:
-                committed_history = session.truncate_history_item(
-                    item_id,
-                    audio_end_ms=committed_cursor,
-                    playback=playback,
-                )
-        await send_json(
-            {
-                "type": "playback.acknowledged",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "item_id": item_id,
-                "played_ms": int(played_ms),
-                "committed_ms": committed_cursor,
-                "truncate": event.get("truncate") is True,
-                "playback": playback.as_dict(),
-                "history_committed": committed_history,
-            }
-        )
-        if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
-            session.release_response_playback(response_id)
 
     async def _cancel_active_response(
         self,

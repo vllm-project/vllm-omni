@@ -29,8 +29,6 @@ def normalize_duplex_input_event(event: dict[str, object]) -> dict[str, object]:
 MODEL_OUTPUT_EVENTS = frozenset(
     {
         "response.created",
-        "response.listen",
-        "response.speak",
         "response.output_item.added",
         "response.content_part.added",
         "response.output_audio.delta",
@@ -47,9 +45,7 @@ MODEL_OUTPUT_EVENTS = frozenset(
 DOMAIN_TERMINAL_EVENTS = frozenset(
     {
         "response.done",
-        "response.listen",
         "input.cancelled",
-        "session.closed",
     }
 )
 
@@ -110,7 +106,6 @@ class DuplexWebSocketActor:
 
     websocket: Any
     current_epoch: Callable[[], int | None] | None = None
-    session_closed: Callable[[], bool] | None = None
     output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
     mailbox: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
     outbound_protocol: Any | None = None
@@ -190,19 +185,9 @@ class DuplexWebSocketActor:
             return False
         if event_type not in MODEL_OUTPUT_EVENTS:
             return False
-        if self.closing and event_type not in {"response.listen", "runtime.control"}:
+        if self.closing and event_type != "runtime.control":
             return True
         expected_epoch = self.current_epoch() if self.current_epoch is not None else None
-        if (
-            self.session_closed is not None
-            and self.session_closed()
-            and event_type
-            not in {
-                "response.listen",
-                "runtime.control",
-            }
-        ):
-            return True
         epoch = payload.get("epoch")
         return isinstance(epoch, int) and isinstance(expected_epoch, int) and epoch != expected_epoch
 

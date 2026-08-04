@@ -14,11 +14,8 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 class DuplexLeaseActivity(str, Enum):
     APPEND = "append"
     SIGNAL = "signal"
-    PLAYBACK_ACK = "playback_ack"
-    HEARTBEAT = "heartbeat"
     ATTACH = "attach"
     DETACH = "detach"
-    RESUME = "resume"
     MODEL_OUTPUT = "model_output"
 
 

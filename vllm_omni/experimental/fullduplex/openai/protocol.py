@@ -40,7 +40,6 @@ class DuplexTurnEventType(str, Enum):
     ASSISTANT_STARTED = "assistant_started"
     ASSISTANT_DONE = "assistant_done"
     BARGE_IN = "barge_in"
-    PLAYBACK_ACK = "playback_ack"
     TIMEOUT = "timeout"
     CLOSE = "close"
 
@@ -65,7 +64,6 @@ class DuplexCapabilities:
     supports_external_turn_signal: bool = True
     supports_client_commit: bool = True
     supports_barge_in: bool = True
-    supports_playback_ack: bool = True
     supports_input_append: bool = False
     supports_replace_latest_chunk: bool = True
     supports_reencode_context: bool = True
@@ -83,7 +81,6 @@ class DuplexCapabilities:
     supports_multi_session: bool = False
     supports_multi_session_same_replica: bool = False
     supports_session_lease: bool = False
-    supports_session_resume: bool = False
     session_admission_mode: str = "serving_managed"
     supports_audio_truncate: bool = False
     requires_model_runner_kv: bool = False
@@ -119,7 +116,6 @@ class DuplexCapabilities:
             supports_multi_session=supports_multi_session,
             supports_multi_session_same_replica=supports_multi_session,
             supports_session_lease=True,
-            supports_session_resume=True,
             session_admission_mode="engine_managed",
             supports_audio_truncate=True,
             requires_model_runner_kv=True,
@@ -156,7 +152,6 @@ class DuplexCapabilities:
             supports_multi_session=supports_multi_session,
             supports_multi_session_same_replica=supports_multi_session,
             supports_session_lease=True,
-            supports_session_resume=True,
             session_admission_mode="engine_managed",
             supports_audio_truncate=True,
             requires_model_runner_kv=True,
@@ -177,7 +172,6 @@ class DuplexCapabilities:
             "supports_external_turn_signal": self.supports_external_turn_signal,
             "supports_client_commit": self.supports_client_commit,
             "supports_barge_in": self.supports_barge_in,
-            "supports_playback_ack": self.supports_playback_ack,
             "supports_input_append": self.supports_input_append,
             "supports_replace_latest_chunk": self.supports_replace_latest_chunk,
             "supports_reencode_context": self.supports_reencode_context,
@@ -195,7 +189,6 @@ class DuplexCapabilities:
             "supports_multi_session": self.supports_multi_session,
             "supports_multi_session_same_replica": self.supports_multi_session_same_replica,
             "supports_session_lease": self.supports_session_lease,
-            "supports_session_resume": self.supports_session_resume,
             "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
             "requires_model_runner_kv": self.requires_model_runner_kv,
@@ -1327,13 +1320,6 @@ class DuplexTurnController:
             session.transition_turn(DuplexTurnState.ASSISTANT_GENERATING)
         elif event_type == DuplexTurnEventType.ASSISTANT_DONE.value:
             session.transition_turn(DuplexTurnState.IDLE)
-        elif event_type == DuplexTurnEventType.PLAYBACK_ACK.value:
-            played_ms = int(payload.get("played_ms", 0) or 0)
-            committed_ms = payload.get("committed_ms")
-            session.acknowledge_playback(
-                played_ms,
-                int(committed_ms) if isinstance(committed_ms, int | float) else None,
-            )
         elif event_type == DuplexTurnEventType.BARGE_IN.value:
             session.transition_turn(DuplexTurnState.BARGE_IN)
         elif event_type in {DuplexTurnEventType.CLOSE.value, DuplexTurnEventType.TIMEOUT.value}:

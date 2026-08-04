@@ -221,15 +221,6 @@ class RealtimeInputTranslator:
                     },
                 }
             )
-            await self._pending_outbound.put(
-                {
-                    "type": "playback.ack",
-                    "item_id": item_id,
-                    "committed_ms": int(audio_end_ms),
-                    "played_ms": int(audio_end_ms),
-                    "truncate": True,
-                }
-            )
             return None
         if event_type == "input_audio_buffer.append":
             audio = event.get("audio") or event.get("delta")
@@ -390,8 +381,6 @@ class RealtimeInputTranslator:
                 "type": "response.create",
                 "response": response_payload if isinstance(response_payload, dict) else {},
             }
-        if event_type in {"session.close", "close"}:
-            return {"type": "session.close"}
         return event
 
     @staticmethod

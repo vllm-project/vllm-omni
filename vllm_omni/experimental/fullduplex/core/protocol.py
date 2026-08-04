@@ -9,7 +9,6 @@ INPUT_APPEND = "input.append"
 INPUT_COMMIT = "input.commit"
 RESPONSE_CREATE = "response.create"
 RESPONSE_CANCEL = "response.cancel"
-PLAYBACK_ACK = "playback.ack"
 CLOSE = "close"
 
 

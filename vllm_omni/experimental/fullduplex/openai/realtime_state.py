@@ -78,7 +78,6 @@ class _RealtimeResponseState:
     output_text_done: bool = False
     output_item_done: bool = False
     conversation_item_done: bool = False
-    speak_emitted: bool = False
     done_emitted: bool = False
 
     @property

@@ -65,14 +65,6 @@ class NativeRealtimeSessionProtocol(
                 return raw
             if not isinstance(event, dict):
                 return raw
-            if not self._opened and event.get("type") == "session.resume":
-                self._opened = True
-                translated = await self._to_duplex_event(event)
-                if translated is None:
-                    if not self._pending_outbound.empty():
-                        return json.dumps(await self._pending_outbound.get())
-                    continue
-                return json.dumps(translated)
             if not self._opened and self._resume_only:
                 translated = await self._to_duplex_event(event)
                 if translated is None:
