@@ -1253,7 +1253,7 @@ td.fail-status-cell[data-status="not-issue"] {
 table.focus-table {
   table-layout: fixed;
   font-size: 0.86rem;
-  min-width: 1080px;
+  min-width: 1180px;
 }
 table.focus-table th,
 table.focus-table td {
@@ -1272,11 +1272,13 @@ table.focus-table td:nth-child(2) {
 }
 table.focus-table th:nth-child(3),
 table.focus-table td:nth-child(3) {
-  width: 6.8rem;
+  width: 5.4rem;
+  text-align: center;
+  white-space: nowrap;
 }
 table.focus-table th:nth-child(4),
 table.focus-table td:nth-child(4) {
-  width: 12rem;
+  width: 6.8rem;
 }
 table.focus-table th:nth-child(5),
 table.focus-table td:nth-child(5) {
@@ -1284,25 +1286,29 @@ table.focus-table td:nth-child(5) {
 }
 table.focus-table th:nth-child(6),
 table.focus-table td:nth-child(6) {
-  width: 8rem;
+  width: 12rem;
 }
 table.focus-table th:nth-child(7),
-table.focus-table td:nth-child(7),
+table.focus-table td:nth-child(7) {
+  width: 8rem;
+}
 table.focus-table th:nth-child(8),
 table.focus-table td:nth-child(8),
 table.focus-table th:nth-child(9),
-table.focus-table td:nth-child(9) {
+table.focus-table td:nth-child(9),
+table.focus-table th:nth-child(10),
+table.focus-table td:nth-child(10) {
   width: 6.4rem;
   text-align: right;
   white-space: nowrap;
 }
-table.focus-table th:nth-child(10),
-table.focus-table td:nth-child(10) {
+table.focus-table th:nth-child(11),
+table.focus-table td:nth-child(11) {
   width: 5rem;
   white-space: nowrap;
 }
-table.focus-table th:nth-child(11),
-table.focus-table td:nth-child(11) {
+table.focus-table th:nth-child(12),
+table.focus-table td:nth-child(12) {
   width: 6.5rem;
   white-space: nowrap;
   text-align: center;
@@ -1319,7 +1325,8 @@ table.focus-table td:nth-child(11) {
   top: 0;
   z-index: 1;
 }
-.focus-model-filter {
+.focus-model-filter,
+.focus-hardware-filter {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1331,16 +1338,19 @@ table.focus-table td:nth-child(11) {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--dashboard-panel-bg) 86%, var(--ci-soft) 14%);
 }
-.focus-model-filter legend {
+.focus-model-filter legend,
+.focus-hardware-filter legend {
   padding: 0 0.25rem;
   color: var(--dashboard-muted);
   font-size: 0.78rem;
   font-weight: 760;
 }
-.focus-model-filter legend span {
+.focus-model-filter legend span,
+.focus-hardware-filter legend span {
   font-weight: 520;
 }
-.focus-model-check {
+.focus-model-check,
+.focus-hardware-check {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
@@ -1349,11 +1359,13 @@ table.focus-table td:nth-child(11) {
   font-size: 0.82rem;
   font-weight: 640;
 }
-.focus-model-check input {
+.focus-model-check input,
+.focus-hardware-check input {
   margin: 0;
   flex-shrink: 0;
 }
-.focus-model-check span {
+.focus-model-check span,
+.focus-hardware-check span {
   overflow-wrap: anywhere;
 }
 .nightly-root.panel {
@@ -2405,5 +2417,189 @@ RELEASE_MARKDOWN_DOC_CSS = """
 .fail-status-note {
   color: var(--dashboard-muted);
   font-style: italic;
+}
+
+/* ------------------------------------------------------------------ */
+/* Skip Test Case Monitoring — per-issue collapsible groups.           */
+/* The table's first column is ``Issue #``; rows sharing one issue are */
+/* folded under a single group row by                                  */
+/* ``release_md_to_html._group_skip_monitor_table_by_issue`` and        */
+/* toggled by ``_SKIP_GROUP_SCRIPT``.                                  */
+/* ------------------------------------------------------------------ */
+.skip-group-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.35rem 0 0.6rem;
+}
+.skip-group-tools-label {
+  font-size: 0.82rem;
+  color: var(--dashboard-muted);
+  margin-right: auto;
+}
+.skip-group-all {
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.skip-group-all:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+tr.skip-issue-group {
+  cursor: pointer;
+  background: color-mix(in srgb, var(--accent) 6%, var(--dashboard-panel-bg, #fff));
+}
+tr.skip-issue-group:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--dashboard-panel-bg, #fff));
+}
+tr.skip-issue-group > td {
+  font-weight: 600;
+}
+td.skip-group-issue {
+  white-space: nowrap;
+}
+.skip-group-toggle {
+  font: inherit;
+  padding: 0;
+  margin-right: 0.15rem;
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  line-height: 1;
+}
+.skip-group-caret {
+  display: inline-block;
+  font-size: 0.85em;
+}
+.skip-group-count {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0.02em 0.5em;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--dashboard-muted) 18%, transparent);
+  color: var(--dashboard-muted);
+}
+td.skip-group-summary {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--dashboard-muted);
+}
+tr.skip-issue-child[hidden] {
+  display: none;
+}
+tr.skip-issue-child > td {
+  font-size: 0.92em;
+}
+td.skip-child-issue {
+  border-left: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Open issues — manual triage columns (Follow-up dropdown + Remarks).  */
+/* Upgraded from `—` placeholders by                                   */
+/* ``release_md_to_html._upgrade_open_issue_action_cells`` and driven   */
+/* by ``_OPEN_ISSUE_ACTION_SCRIPT`` (localStorage, keyed by issue #).   */
+/* ------------------------------------------------------------------ */
+td.oi-followup-cell,
+td.oi-note-cell {
+  min-width: 9.5rem;
+  vertical-align: middle;
+}
+.oi-followup-select {
+  font: inherit;
+  font-size: 0.82rem;
+  width: 100%;
+  max-width: 12rem;
+  padding: 0.22rem 0.4rem;
+  border-radius: 7px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.oi-followup-select:hover {
+  border-color: var(--accent);
+}
+td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--dashboard-border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--dashboard-panel-bg, #fff));
+  font-weight: 600;
+}
+.oi-note-btn {
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.22rem 0.4rem;
+  border-radius: 7px;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  background: transparent;
+  color: var(--dashboard-text);
+  cursor: pointer;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.oi-note-btn:hover {
+  border-style: solid;
+  border-color: var(--accent);
+}
+.oi-note-btn.oi-note-empty {
+  color: var(--dashboard-muted);
+  font-style: italic;
+}
+.oi-note-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 12rem;
+}
+.oi-note-input {
+  font: inherit;
+  font-size: 0.82rem;
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  resize: vertical;
+}
+.oi-note-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.oi-note-save,
+.oi-note-cancel {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.18rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.oi-note-save {
+  background: var(--dashboard-healthy);
+  border-color: var(--dashboard-healthy);
+  color: #fff;
+  font-weight: 600;
+}
+.oi-note-save:hover {
+  filter: brightness(0.95);
+}
+.oi-note-cancel:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
 }
 """

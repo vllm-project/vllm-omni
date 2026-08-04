@@ -446,6 +446,24 @@ def inline_md_to_html(s: str) -> str:
         carved,
         flags=re.DOTALL,
     )
+    # Stash Markdown links whose **label contains a code span**, e.g.
+    # ``[`tests/foo.py`](https://…)`` (emitted by the Skip Test Case Monitoring
+    # file links). The backtick chunker below runs before link parsing, so
+    # without this carve-out such a link is torn into "[", <code>…</code>,
+    # "](url)" and renders as literal Markdown. Only backtick-bearing labels are
+    # stashed so a link *inside* a code span (`` `[a](b)` ``) keeps its current
+    # literal rendering.
+    code_links: list[str] = []
+
+    def _stash_code_link(m: re.Match[str]) -> str:
+        idx = len(code_links)
+        label_html = inline_md_to_html(m.group(1))
+        url = html.escape(m.group(2), quote=True)
+        code_links.append(f'<a href="{url}">{label_html}</a>')
+        return f"\x00CODELINK_{idx}\x00"
+
+    carved = re.sub(r"\[([^\]`]*`[^\]]*)\]\(([^)\s]+)\)", _stash_code_link, carved)
+
     chunks: list[tuple[str, str]] = []
     last = 0
     for m in re.finditer(r"`([^`]+)`", carved):
@@ -460,6 +478,9 @@ def inline_md_to_html(s: str) -> str:
         else:
             out.append(_inline_text_with_links(content))
     rendered = "".join(out)
+    if code_links:
+        for idx, link_html in enumerate(code_links):
+            rendered = rendered.replace(f"\x00CODELINK_{idx}\x00", link_html)
     if spans:
         for idx, span_html in spans:
             rendered = rendered.replace(f"\x00DEV_SNAPSHOT_SPAN_{idx}\x00", span_html)
@@ -1165,6 +1186,390 @@ def _upgrade_submit_issue_cells_in_failure_tables(html_fragment: str) -> str:
     return "".join(rebuilt)
 
 
+def _group_skip_monitor_table_by_issue(html_fragment: str) -> str:
+    """Fold the ``## Skip Test Case Monitoring`` table into per-issue collapsible groups.
+
+    ``skip_issue_monitor.render_skip_monitor_table`` emits a flat table whose
+    **first** column is ``Issue #`` and whose rows are already sorted so that
+    every site referencing the same issue is contiguous. This post-processor
+    rewrites that table's ``<tbody>`` into:
+
+    * one **group row** per distinct issue (``<tr class="skip-issue-group">``)
+      carrying the four issue-level cells (Issue # / Title / State / Updated),
+      a toggle button, a site count, and a ``colspan`` summary cell; and
+    * the original rows as **child rows** (``<tr class="skip-issue-child" hidden>``)
+      whose issue-level cells are blanked (the group row already shows them).
+
+    An *Expand all / Collapse all* toolbar is inserted above the table. All
+    groups start collapsed; ``_SKIP_GROUP_SCRIPT`` handles the toggling.
+    Markdown output is untouched (it keeps the flat, Issue-#-first table).
+    """
+    H2_RE = re.compile(r"<h2\b[^>]*>(.*?)</h2>", re.DOTALL | re.IGNORECASE)
+    TAG_RE = re.compile(r"<[^>]+>")
+
+    target = None
+    for m in H2_RE.finditer(html_fragment):
+        if "skip test case monitoring" in TAG_RE.sub("", m.group(1)).strip().lower():
+            target = m
+            break
+    if target is None:
+        return html_fragment
+
+    next_h2 = H2_RE.search(html_fragment, target.end())
+    section_end = next_h2.start() if next_h2 else len(html_fragment)
+
+    table_m = re.search(
+        r"<table\b[^>]*>.*?</table>",
+        html_fragment[target.end() : section_end],
+        re.DOTALL | re.IGNORECASE,
+    )
+    if table_m is None:
+        return html_fragment
+    t_start = target.end() + table_m.start()
+    t_end = target.end() + table_m.end()
+    table_html = table_m.group(0)
+
+    headers = re.findall(r"<th\b[^>]*>(.*?)</th>", table_html, re.DOTALL | re.IGNORECASE)
+    if not headers or "issue #" not in TAG_RE.sub("", headers[0]).strip().lower():
+        return html_fragment
+    n_cols = len(headers)
+    issue_cols = min(4, n_cols)
+    detail_cols = n_cols - issue_cols
+    if detail_cols <= 0:
+        return html_fragment
+
+    body_m = re.search(r"<tbody\b[^>]*>(.*?)</tbody>", table_html, re.DOTALL | re.IGNORECASE)
+    if body_m is None:
+        return html_fragment
+    raw_rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", body_m.group(1), re.DOTALL | re.IGNORECASE)
+    if not raw_rows:
+        return html_fragment
+
+    parsed: list[list[str]] = []
+    for row in raw_rows:
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.DOTALL | re.IGNORECASE)
+        if len(cells) != n_cols:
+            return html_fragment  # unexpected shape -> leave the table alone
+        parsed.append(cells)
+
+    # Group contiguous rows that share the same issue label (e.g. "#4636" or
+    # "vllm-project/vllm#43060"). Non-contiguous repeats would each get their
+    # own group, which is why the renderer sorts by issue first.
+    groups: list[tuple[str, list[list[str]]]] = []
+    for cells in parsed:
+        key = TAG_RE.sub("", cells[0]).strip()
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(cells)
+        else:
+            groups.append((key, [cells]))
+
+    out_rows: list[str] = []
+    for gi, (key, rows) in enumerate(groups):
+        gid = f"skip-issue-g{gi}"
+        n = len(rows)
+        count_label = "1 site" if n == 1 else f"{n} sites"
+        head = rows[0]
+        summary_txt = "1 skipped test — expand to view" if n == 1 else f"{n} skipped tests — expand to view"
+        issue_cells = [
+            (
+                '<td class="skip-group-issue">'
+                f'<button type="button" class="skip-group-toggle" aria-expanded="false" '
+                f'aria-controls="{gid}" data-skip-group="{gid}" '
+                'title="Show / hide the skipped tests for this issue">'
+                '<span class="skip-group-caret" aria-hidden="true">▸</span>'
+                "</button> "
+                f"{head[0]} "
+                f'<span class="skip-group-count">{count_label}</span>'
+                "</td>"
+            )
+        ]
+        issue_cells += [f"<td>{head[i]}</td>" for i in range(1, issue_cols)]
+        out_rows.append(
+            f'<tr class="skip-issue-group" data-skip-group="{gid}" data-expanded="false">'
+            + "".join(issue_cells)
+            + f'<td class="skip-group-summary" colspan="{detail_cols}">{summary_txt}</td>'
+            + "</tr>"
+        )
+        for cells in rows:
+            blanks = '<td class="skip-child-issue"></td>' + "<td></td>" * (issue_cols - 1)
+            details = "".join(f"<td>{c}</td>" for c in cells[issue_cols:])
+            out_rows.append(
+                f'<tr class="skip-issue-child" data-skip-group="{gid}" hidden>' + blanks + details + "</tr>"
+            )
+
+    new_tbody = "<tbody>\n" + "\n".join(out_rows) + "\n</tbody>"
+    new_table = table_html[: body_m.start()] + new_tbody + table_html[body_m.end() :]
+    toolbar = (
+        '<div class="skip-group-tools">'
+        f'<span class="skip-group-tools-label">{len(groups)} issue(s) · {len(parsed)} skipped site(s)</span>'
+        '<button type="button" class="skip-group-all" data-skip-all="expand">Expand all</button>'
+        '<button type="button" class="skip-group-all" data-skip-all="collapse">Collapse all</button>'
+        "</div>"
+    )
+    # Place the toolbar *outside* the horizontal scroll wrapper when present so
+    # it stays visible while the table scrolls sideways.
+    insert_at = t_start
+    scroll_open = html_fragment.rfind('<div class="table-scroll">', target.end(), t_start)
+    if scroll_open != -1:
+        insert_at = scroll_open
+    return (
+        html_fragment[:insert_at]
+        + toolbar
+        + "\n"
+        + html_fragment[insert_at:t_start]
+        + new_table
+        + html_fragment[t_end:]
+    )
+
+
+_SKIP_GROUP_SCRIPT = """<script>
+(function () {
+  function setGroup(gid, expanded, scope) {
+    var root = scope || document;
+    var rows = root.querySelectorAll('tr.skip-issue-child[data-skip-group="' + gid + '"]');
+    for (var i = 0; i < rows.length; i++) {
+      if (expanded) { rows[i].removeAttribute("hidden"); }
+      else { rows[i].setAttribute("hidden", ""); }
+    }
+    var head = root.querySelector('tr.skip-issue-group[data-skip-group="' + gid + '"]');
+    if (head) {
+      head.setAttribute("data-expanded", expanded ? "true" : "false");
+      var btn = head.querySelector(".skip-group-toggle");
+      if (btn) { btn.setAttribute("aria-expanded", expanded ? "true" : "false"); }
+      var caret = head.querySelector(".skip-group-caret");
+      if (caret) { caret.textContent = expanded ? "\\u25BE" : "\\u25B8"; }
+    }
+  }
+
+  document.addEventListener("click", function (ev) {
+    var all = ev.target.closest ? ev.target.closest("[data-skip-all]") : null;
+    if (all) {
+      ev.preventDefault();
+      var expand = all.getAttribute("data-skip-all") === "expand";
+      var heads = document.querySelectorAll("tr.skip-issue-group");
+      for (var i = 0; i < heads.length; i++) {
+        setGroup(heads[i].getAttribute("data-skip-group"), expand, document);
+      }
+      return;
+    }
+    if (ev.target.closest && ev.target.closest("a")) return;
+    var row = ev.target.closest ? ev.target.closest("tr.skip-issue-group") : null;
+    if (!row) return;
+    ev.preventDefault();
+    var gid = row.getAttribute("data-skip-group");
+    if (!gid) return;
+    setGroup(gid, row.getAttribute("data-expanded") !== "true", document);
+  });
+})();
+</script>"""
+
+
+#: Allowed values of the ``Follow-up action`` dropdown in the Open issues table.
+OPEN_ISSUE_FOLLOWUP_OPTIONS: tuple[str, ...] = (
+    "Fix in a later iteration",
+    "Blocked by dependency",
+    "Won't fix (evaluated)",
+)
+
+
+def _upgrade_open_issue_action_cells(html_fragment: str) -> str:
+    """Upgrade the ``Follow-up action`` / ``Remarks`` columns of the Open issues table.
+
+    ``compose_full_report.OPEN_ISSUES_HEADERS`` appends two manual-entry columns
+    to the ``## Open issues`` table (release *and* development variants); the
+    Markdown renders them as ``—`` placeholders. Here each placeholder becomes:
+
+    * **Follow-up action** — a native ``<select>`` offering ``Fix in a later
+      iteration`` / ``Blocked by dependency`` / ``Won't fix (evaluated)`` (plus
+      an empty "not set" option); and
+    * **Remarks** — a click-to-edit note box (button → inline ``<textarea>``
+      with Save / Cancel; Ctrl+Enter saves, Esc cancels).
+
+    Both are persisted in ``localStorage`` by ``_OPEN_ISSUE_ACTION_SCRIPT``,
+    keyed by the row's **issue number** (e.g. ``open-issue-followup:#4700``) so
+    the operator's triage survives a report regeneration and is shared between
+    the release and development variants of the same issue. Rows without a
+    recognisable issue number fall back to a positional key.
+    """
+    TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
+    TAG_RE = re.compile(r"<[^>]+>")
+
+    def _upgrade_table(table_html: str) -> str:
+        headers = [
+            TAG_RE.sub("", h).strip()
+            for h in re.findall(r"<th\b[^>]*>(.*?)</th>", table_html, re.DOTALL | re.IGNORECASE)
+        ]
+        if "Follow-up action" not in headers or "Remarks" not in headers:
+            return table_html
+        f_idx = headers.index("Follow-up action")
+        n_idx = headers.index("Remarks")
+        n_cols = len(headers)
+
+        body_m = re.search(r"<tbody\b[^>]*>(.*?)</tbody>", table_html, re.DOTALL | re.IGNORECASE)
+        if body_m is None:
+            return table_html
+
+        row_no = [0]
+
+        def _row_sub(row_m: re.Match[str]) -> str:
+            row_html = row_m.group(0)
+            cells = re.findall(r"(<td\b[^>]*>)(.*?)(</td>)", row_html, re.DOTALL | re.IGNORECASE)
+            idx = row_no[0]
+            row_no[0] += 1
+            if len(cells) != n_cols:
+                return row_html
+            issue_txt = TAG_RE.sub("", cells[0][1]).strip()
+            m_issue = re.search(r"#(\d+)", issue_txt)
+            key = f"#{m_issue.group(1)}" if m_issue else f"row-{idx}"
+            key_attr = html.escape(key, quote=True)
+
+            opts = ['<option value="">—</option>']
+            for label in OPEN_ISSUE_FOLLOWUP_OPTIONS:
+                esc = html.escape(label)
+                opts.append(f'<option value="{esc}">{esc}</option>')
+            followup_td = (
+                f'<td class="oi-followup-cell" data-oi-key="{key_attr}">'
+                f'<select class="oi-followup-select" data-oi-key="{key_attr}" '
+                'aria-label="Follow-up action">' + "".join(opts) + "</select></td>"
+            )
+            note_td = (
+                f'<td class="oi-note-cell" data-oi-key="{key_attr}" data-oi-state="empty">'
+                '<button type="button" class="oi-note-btn oi-note-empty" '
+                'data-oi-note-action="edit" title="Click to add a remark">'
+                "Click to add a remark</button></td>"
+            )
+
+            parts = [row_html[: row_html.index(">") + 1]]
+            for i, (open_tag, inner, close_tag) in enumerate(cells):
+                if i == f_idx:
+                    parts.append(followup_td)
+                elif i == n_idx:
+                    parts.append(note_td)
+                else:
+                    parts.append(f"{open_tag}{inner}{close_tag}")
+            parts.append("</tr>")
+            return "".join(parts)
+
+        new_body = re.sub(r"<tr\b[^>]*>.*?</tr>", _row_sub, body_m.group(1), flags=re.DOTALL | re.IGNORECASE)
+        return table_html[: body_m.start(1)] + new_body + table_html[body_m.end(1) :]
+
+    return TABLE_RE.sub(lambda m: _upgrade_table(m.group(0)), html_fragment)
+
+
+_OPEN_ISSUE_ACTION_SCRIPT = """<script>
+(function () {
+  function fKey(k) { return "open-issue-followup:" + k; }
+  function nKey(k) { return "open-issue-note:" + k; }
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) {
+    try { if (v) { localStorage.setItem(k, v); } else { localStorage.removeItem(k); } }
+    catch (e) { /* localStorage unavailable (e.g. file:// in Chrome) */ }
+  }
+
+  // In-memory store is the source of truth for rendering; localStorage is a
+  // best-effort persistence layer on top. Without this, opening the report
+  // from a file:// URL (where Chrome denies localStorage) would silently drop
+  // every remark the moment the user pressed Save, because the cell used to
+  // re-read the value straight back out of storage.
+  var mem = {};
+  function memGet(k) {
+    if (!Object.prototype.hasOwnProperty.call(mem, k)) { mem[k] = lsGet(k) || ""; }
+    return mem[k];
+  }
+  function memSet(k, v) { mem[k] = v || ""; lsSet(k, v); }
+
+  function renderNote(cell) {
+    var key = cell.getAttribute("data-oi-key") || "";
+    var val = memGet(nKey(key));
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "oi-note-btn" + (val ? "" : " oi-note-empty");
+    btn.setAttribute("data-oi-note-action", "edit");
+    btn.title = val ? "Click to edit this remark" : "Click to add a remark";
+    btn.textContent = val || "Click to add a remark";
+    cell.innerHTML = "";
+    cell.appendChild(btn);
+    cell.setAttribute("data-oi-state", val ? "set" : "empty");
+  }
+
+  function editNote(cell) {
+    var key = cell.getAttribute("data-oi-key") || "";
+    var val = memGet(nKey(key));
+    cell.innerHTML =
+      '<div class="oi-note-editor">' +
+      '<textarea class="oi-note-input" rows="3" ' +
+      'placeholder="e.g. re-verify once the upstream PR lands"></textarea>' +
+      '<div class="oi-note-actions">' +
+      '<button type="button" class="oi-note-save">Save</button>' +
+      '<button type="button" class="oi-note-cancel">Cancel</button>' +
+      "</div></div>";
+    cell.setAttribute("data-oi-state", "editing");
+    var ta = cell.querySelector("textarea");
+    if (ta) { ta.value = val; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+  }
+
+  function commitNote(cell) {
+    var key = cell.getAttribute("data-oi-key") || "";
+    var ta = cell.querySelector("textarea");
+    var val = ta ? ta.value.trim() : "";
+    memSet(nKey(key), val);
+    renderNote(cell);
+  }
+
+  function initAll() {
+    var selects = document.querySelectorAll("select.oi-followup-select");
+    for (var i = 0; i < selects.length; i++) {
+      var sel = selects[i];
+      var saved = memGet(fKey(sel.getAttribute("data-oi-key") || ""));
+      if (saved) {
+        var ok = false;
+        for (var j = 0; j < sel.options.length; j++) {
+          if (sel.options[j].value === saved) { ok = true; break; }
+        }
+        if (ok) { sel.value = saved; }
+      }
+      var td = sel.closest ? sel.closest("td") : null;
+      if (td) { td.setAttribute("data-oi-state", sel.value ? "set" : "empty"); }
+    }
+    var notes = document.querySelectorAll("td.oi-note-cell");
+    for (var k = 0; k < notes.length; k++) { renderNote(notes[k]); }
+  }
+
+  document.addEventListener("change", function (ev) {
+    var sel = ev.target;
+    if (!sel || !sel.classList || !sel.classList.contains("oi-followup-select")) return;
+    memSet(fKey(sel.getAttribute("data-oi-key") || ""), sel.value);
+    var td = sel.closest ? sel.closest("td") : null;
+    if (td) { td.setAttribute("data-oi-state", sel.value ? "set" : "empty"); }
+  });
+
+  document.addEventListener("click", function (ev) {
+    if (!ev.target || !ev.target.closest) return;
+    var cell = ev.target.closest("td.oi-note-cell");
+    if (!cell) return;
+    if (ev.target.closest(".oi-note-save")) { ev.preventDefault(); commitNote(cell); return; }
+    if (ev.target.closest(".oi-note-cancel")) { ev.preventDefault(); renderNote(cell); return; }
+    if (ev.target.closest("[data-oi-note-action='edit']")) { ev.preventDefault(); editNote(cell); }
+  });
+
+  document.addEventListener("keydown", function (ev) {
+    if (!ev.target || !ev.target.classList) return;
+    if (!ev.target.classList.contains("oi-note-input")) return;
+    var cell = ev.target.closest ? ev.target.closest("td.oi-note-cell") : null;
+    if (!cell) return;
+    if (ev.key === "Escape") { ev.preventDefault(); renderNote(cell); }
+    else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); commitNote(cell); }
+  });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
 def _wrap_summary_section_in_details(html_fragment: str) -> str:
     """Wrap the ``### Summary`` section (Test Result → first h3 after Common stack) in a collapsible ``<details>``.
 
@@ -1600,6 +2005,8 @@ def wrap_html_document(
 {_FAIL_STATUS_SCRIPT}
 {_GITHUB_ISSUE_SUBMIT_SCRIPT}
 {_UT_COVERAGE_SUBMIT_SCRIPT}
+{_SKIP_GROUP_SCRIPT}
+{_OPEN_ISSUE_ACTION_SCRIPT}
 </body>
 </html>
 """
@@ -1663,6 +2070,8 @@ def convert_release_report_markdown(
     body = _upgrade_excerpt_cells_in_failure_tables(body)
     body = _upgrade_submit_issue_cells_in_failure_tables(body)
     body = _upgrade_status_cells_in_failure_tables(body)
+    body = _group_skip_monitor_table_by_issue(body)
+    body = _upgrade_open_issue_action_cells(body)
     body = _wrap_summary_section_in_details(body)
     body = _wrap_failure_analysis_h4_in_details(body)
     body = _wrap_pdc_h4_in_details(body)

@@ -173,11 +173,21 @@ def resolve_latest_scheduled_nightly_number(
     pipeline: str = PIPELINE,
     branch: str = BRANCH,
 ) -> int | None:
+    """Return latest **scheduled nightly** build number on ``branch``.
+
+    Falls back to the most recent green/red ``branch`` build if no scheduled
+    nightly message matches within the first 50 builds (the upstream
+    ``releases`` also recommends this fallback for rebase / API-cache edge cases).
+    Returns ``None`` only if the pipeline has zero builds on ``branch``.
+    """
     url = f"https://api.buildkite.com/v2/organizations/{org}/pipelines/{pipeline}/builds?branch={branch}&per_page=50"
     builds = http_json(url, token)
     for b in builds:
         if re.search(r"scheduled\s+nightly", b.get("message") or "", re.I):
             return int(b["number"])
+    # Fallback: most recent main build (any state) — last entry is newest.
+    if builds:
+        return int(builds[0]["number"])
     return None
 
 

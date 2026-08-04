@@ -1786,6 +1786,7 @@ _PERF_TABLE_HEADERS = [
 _FOCUS_TABLE_HEADERS = (
     "Source",
     "Model",
+    "Hardware",
     "Type",
     "Config",
     "Test",
@@ -2105,13 +2106,14 @@ class NightlyFocusItem:
     source: str
     model: str
     model_type: str
-    config: str
-    test: str
-    metric: str
-    latest: Any
-    baseline: Any
-    vs_baseline_pct: Any
-    status: str
+    hardware: str = ""
+    config: str = ""
+    test: str = ""
+    metric: str = ""
+    latest: Any = None
+    baseline: Any = None
+    vs_baseline_pct: Any = None
+    status: str = ""
     consec_fail_days: int = 0
 
 
@@ -2159,6 +2161,7 @@ def _focus_item_from_perf_row(
         source=source,
         model=str(get_value("model", "") or "unknown"),
         model_type=str(get_value("model_type", "") or ""),
+        hardware=str(get_value("hardware", "") or ""),
         config=str(get_value("config_view", "") or ""),
         test=str(get_value("test_name", "") or ""),
         metric=str(get_value("metric", "") or ""),
@@ -2172,12 +2175,26 @@ def _focus_item_from_perf_row(
     return out
 
 
-def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str]:
+def _norm_focus_hardware(value: Any) -> str:
+    """Return the focus-table hardware bucket label for a raw hardware value.
+
+    Missing / blank / non-string values collapse to ``"unknown"`` so legacy
+    ``*_history.json`` records (which may lack the field entirely) are still
+    filterable. Otherwise the trimmed string is returned verbatim so labels
+    like ``"H100"``, ``"H200"``, and ``"910"`` round-trip unchanged.
+    """
+    if value is None:
+        return "unknown"
+    text = str(value).strip()
+    return text or "unknown"
+
+
+def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str, str]:
     status_rank = {"fail": 0, "normal": 1, "n/a": 2, "pass": 3}
     pct = _as_num(item.vs_baseline_pct)
     if pct is None:
         pct = 999999.0
-    return (status_rank.get(item.status, 4), pct, item.source, item.model)
+    return (status_rank.get(item.status, 4), pct, item.source, item.model, _norm_focus_hardware(item.hardware))
 
 
 def _focus_perf_items(
@@ -2216,6 +2233,7 @@ def _focus_perf_table_rows(items: list[NightlyFocusItem]) -> list[list[str]]:
             [
                 _md_cell(item.source),
                 _md_cell(item.model),
+                _md_cell(_norm_focus_hardware(item.hardware)),
                 _md_cell(item.model_type),
                 _md_cell(item.config),
                 _md_cell(item.test),
@@ -2240,24 +2258,60 @@ def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
             f'<input type="checkbox" data-filter-key="model" value="{val}">'
             f"<span>{html.escape(model)}</span></label>"
         )
+    hardware_buckets: list[str] = []
+    seen_hardware: set[str] = set()
+    has_unknown = False
+    for item in items:
+        bucket = _norm_focus_hardware(item.hardware)
+        if bucket == "unknown":
+            has_unknown = True
+            continue
+        if bucket in seen_hardware:
+            continue
+        seen_hardware.add(bucket)
+        hardware_buckets.append(bucket)
+    hardware_buckets.sort()
+    if has_unknown:
+        hardware_buckets.append("unknown")
+    hardware_checks: list[str] = []
+    for bucket in hardware_buckets:
+        val = html.escape(bucket, quote=True)
+        label = "Unknown" if bucket == "unknown" else bucket
+        hardware_checks.append(
+            '<label class="focus-hardware-check">'
+            f'<input type="checkbox" data-filter-key="hardware" value="{val}">'
+            f"<span>{html.escape(label)}</span></label>"
+        )
     parts: list[str] = [
         '<div class="perf-filter-scope focus-filter-scope" data-perf-filter-scope="daily-focus-regressions">',
         '<div class="perf-filter-bar focus-filter-bar">',
         '<fieldset class="focus-model-filter"><legend>Model <span>No selection = All</span></legend>',
         "".join(model_checks),
         "</fieldset>",
-        '<button type="button" class="focus-expand-btn" data-focus-expand="0" '
-        'aria-expanded="false">Expand table</button>',
-        "</div>",
-        '<div class="table-scroll">',
-        '<table class="summary focus-table">',
-        "<thead><tr>",
     ]
+    if hardware_checks:
+        legend = "Hardware" if not has_unknown else "Hardware (Unknown last)"
+        parts.append(
+            f'<fieldset class="focus-hardware-filter"><legend>{html.escape(legend)} '
+            "<span>No selection = All</span></legend>"
+        )
+        parts.append("".join(hardware_checks))
+        parts.append("</fieldset>")
+    parts.append(
+        '<button type="button" class="focus-expand-btn" data-focus-expand="0" '
+        'aria-expanded="false">Expand table</button>'
+    )
+    parts.append("</div>")
+    parts.append('<div class="table-scroll">')
+    parts.append('<table class="summary focus-table">')
+    parts.append("<thead><tr>")
     for header in _FOCUS_TABLE_HEADERS:
         parts.append(f"<th>{html.escape(header)}</th>")
     parts.append("</tr></thead><tbody>")
     for item in items:
         model = html.escape(item.model, quote=True)
+        hardware_bucket = _norm_focus_hardware(item.hardware)
+        hardware_attr = html.escape(hardware_bucket, quote=True)
         row_class = "summary-row--fail" if item.status == "fail" else "summary-row--unknown"
         streak_class = _consec_fail_color_class(item.consec_fail_days)
         row_classes = [row_class]
@@ -2271,10 +2325,14 @@ def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
             if streak_class
             else f' data-consec-days="{days}"'
         )
-        parts.append(f'<tr class="{row_class_attr}" data-perf-row="1" data-model="{model}"{days_attr}>')
+        parts.append(
+            f'<tr class="{row_class_attr}" data-perf-row="1" data-model="{model}" '
+            f'data-hardware="{hardware_attr}"{days_attr}>'
+        )
         cells = [
             item.source,
             item.model,
+            hardware_bucket,
             item.model_type,
             item.config,
             item.test,

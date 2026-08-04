@@ -54,6 +54,7 @@ class PerfRow:
 
     model: str
     model_type: str
+    hardware: str
     config_key: str
     config_view: str
     test_name: str
@@ -422,6 +423,10 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]
         m_type = _model_type(model, test_name)
         cfg_view = _config_view(rec, m_type)
         date_value = str(rec.get("date") or "")
+        raw_hw = rec.get("hardware")
+        if raw_hw is None:
+            raw_hw = rec.get("Hardware")
+        hardware = "" if raw_hw is None else str(raw_hw).strip()
         for metric, latest, baseline in _iter_metric_pairs(rec):
             direction = _metric_direction(metric)
             if abs(baseline) < 1e-12:
@@ -438,6 +443,7 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]
                 PerfRow(
                     model=model,
                     model_type=m_type,
+                    hardware=hardware,
                     config_key=config_key,
                     config_view=cfg_view,
                     test_name=test_name,
@@ -661,6 +667,7 @@ def build_assets_perf_summary(
             {
                 "model": r.model,
                 "model_type": r.model_type,
+                "hardware": r.hardware,
                 "config_key": r.config_key,
                 "config_view": r.config_view,
                 "test_name": r.test_name,

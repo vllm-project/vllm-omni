@@ -69,6 +69,10 @@ from report_naming import (  # noqa: E402
     release_report_preview_basename,
     resolve_report_date_iso,
 )
+from skip_issue_monitor import (  # noqa: E402
+    render_skip_issue_monitor_preview_section,
+    render_skip_issue_monitor_section,
+)
 
 CI_FAILURE_LABEL = "ci-failure"  # matches GitHub label on vllm-project/vllm-omni
 BUG_DI_THRESHOLD_TENTHS = 300  # "Remaining DI < 30"; store DI in tenths to avoid float drift.
@@ -809,6 +813,11 @@ def render_development_report_markdown_preview(
         dev_perf_a100=_dev_perf_preview_note("A100"),
     )
 
+    # 4) Skip Test Case Monitoring: hardcoded preview rows (no git pull, no
+    #    AST scan, no GitHub API call). Two rows share one issue number so the
+    #    HTML per-issue collapsible grouping is visible in preview mode.
+    skip_monitor_preview = render_skip_issue_monitor_preview_section()
+
     # Open issues (stats window) preview block: same column layout as `release`.
     open_issues_preview = (
         f"## Open issues (stats window)\n\n"
@@ -816,7 +825,7 @@ def render_development_report_markdown_preview(
         f"(UTC date) in **{stats_from}** … **{stats_to}** (same as Buildkite `--stats-from` / "
         f"`--stats-to`): placeholder preview rows.\n\n"
         + render_markdown_table(
-            ["Issue", "Title", "Opened at", "Priority", "DI", "Status", "Owner"],
+            OPEN_ISSUES_HEADERS,
             [
                 [
                     "[#10042](https://github.com/vllm-project/vllm-omni/issues/10042)",
@@ -826,6 +835,7 @@ def render_development_report_markdown_preview(
                     "1",
                     "open",
                     "@preview-dev-1",
+                    *OPEN_ISSUE_ACTION_CELLS,
                 ],
                 [
                     "[#10018](https://github.com/vllm-project/vllm-omni/issues/10018)",
@@ -835,6 +845,7 @@ def render_development_report_markdown_preview(
                     "3",
                     "open",
                     "@preview-dev-2",
+                    *OPEN_ISSUE_ACTION_CELLS,
                 ],
             ],
         )
@@ -928,6 +939,7 @@ def render_development_report_markdown_preview(
 {failure_analysis}
 
 {pdc_section}
+{skip_monitor_preview}
 {open_issues_preview}
 
 {bugfix_monitor_preview}
@@ -942,14 +954,40 @@ def render_development_report_markdown_preview(
    failed Buildkite steps).
 - **Performance Data Comparison:** Top-level section; read-only against kanban
    `docs/assets/charts/*_history.json` (no kanban writes).
+- **Skip Test Case Monitoring:** top-level section; one hardcoded 5-row preview
+   (no AST scan, no `git pull`, no GitHub API call). Two preview rows share one
+   issue number so the per-issue collapsible grouping is visible.
 - **Metrics overview:** Buildkite latest finished merge build
    (`buildkite_build_stats.fetch_latest_finished_merge_build`) + GitHub REST
    (`label:bug`, `label:bug+critical` AND filter, assignee scan). 4-row snapshot; each
    row turns red via `<span class="dev-snapshot-alert">` when threshold breached.
 - **Open issues (stats window):** Same as `release` —
-   `compose_full_report.render_open_issues_section(stats_from, stats_to, gh_token)`.
+   `compose_full_report.render_open_issues_section(stats_from, stats_to, gh_token)`; the
+   **Follow-up action** dropdown + **Remarks** note columns are interactive in HTML
+   (localStorage, keyed by issue number).
 - Live report: `buildkite_build_stats`, GitHub REST
 """
+
+
+#: Column layout of the ``## Open issues`` table (release *and* development).
+#: The last two columns are **manual-entry** cells: in HTML they are upgraded by
+#: ``release_md_to_html._upgrade_open_issue_action_cells`` into a ``<select>``
+#: (Follow-up action) and a click-to-edit note box (Remarks), both persisted in
+#: ``localStorage`` keyed by the row's issue number. In Markdown they stay ``—``.
+OPEN_ISSUES_HEADERS: list[str] = [
+    "Issue",
+    "Title",
+    "Opened at",
+    "Priority",
+    "DI",
+    "Status",
+    "Owner",
+    "Follow-up action",
+    "Remarks",
+]
+
+#: Placeholder cells for the two manual-entry columns above.
+OPEN_ISSUE_ACTION_CELLS: list[str] = ["—", "—"]
 
 
 def github_open_bug_rows_in_range(
@@ -982,10 +1020,11 @@ def github_open_bug_rows_in_range(
                 _format_di_tenths(di_tenths),
                 "open",
                 f"@{u}",
+                *OPEN_ISSUE_ACTION_CELLS,
             ]
         )
     body = render_markdown_table(
-        ["Issue", "Title", "Opened at", "Priority", "DI", "Status", "Owner"],
+        OPEN_ISSUES_HEADERS,
         row_cells,
     )
     return len(all_items), len(in_range), body, in_range
@@ -1018,10 +1057,11 @@ def github_open_bug_issue_rows(issues: list[dict]) -> str:
                 _format_di_tenths(di_tenths),
                 "open",
                 f"@{u}",
+                *OPEN_ISSUE_ACTION_CELLS,
             ]
         )
     return render_markdown_table(
-        ["Issue", "Title", "Opened at", "Priority", "DI", "Status", "Owner"],
+        OPEN_ISSUES_HEADERS,
         row_cells,
     )
 
@@ -1062,11 +1102,13 @@ def render_open_issues_section_with_di(
         open_total = 0
         open_range_n = 0
         issue_rows = render_markdown_table(
-            ["Issue", "Title", "Opened at", "Priority", "DI", "Status", "Owner"],
+            OPEN_ISSUES_HEADERS,
             [
                 [
                     "*—*",
                     "*Failed to fetch; set `GITHUB_TOKEN` or fill in manually*",
+                    "*—*",
+                    "*—*",
                     "*—*",
                     "*—*",
                     "*—*",
@@ -2897,7 +2939,7 @@ def preview_report_markdown(
         f"(UTC date) in **{stats_from}** … **{stats_to}**. "
         "*Preview placeholder data; live report uses paginated GitHub results.*\n\n"
         + render_markdown_table(
-            ["Issue", "Title", "Opened at", "Priority", "DI", "Status", "Owner"],
+            OPEN_ISSUES_HEADERS,
             [
                 [
                     "[#10055](https://github.com/vllm-project/vllm-omni/issues/10055)",
@@ -2907,6 +2949,7 @@ def preview_report_markdown(
                     "3",
                     "open",
                     "@alice-preview",
+                    *OPEN_ISSUE_ACTION_CELLS,
                 ],
                 [
                     "[#10042](https://github.com/vllm-project/vllm-omni/issues/10042)",
@@ -2916,6 +2959,7 @@ def preview_report_markdown(
                     "1",
                     "open",
                     "@bob-preview",
+                    *OPEN_ISSUE_ACTION_CELLS,
                 ],
                 [
                     "[#10030](https://github.com/vllm-project/vllm-omni/issues/10030)",
@@ -2925,6 +2969,7 @@ def preview_report_markdown(
                     "0.1",
                     "open",
                     "@carol-preview",
+                    *OPEN_ISSUE_ACTION_CELLS,
                 ],
             ],
         )
@@ -3077,6 +3122,29 @@ def main() -> None:
             "Optional. Explicit override for the kanban assets dir "
             "(`docs/assets/charts`) used by --kind development's perf subsection. "
             "Takes precedence over `--kanban-repo-root` when both are supplied."
+        ),
+    )
+    parser.add_argument(
+        "--omni-repo-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional. Path to the vllm-omni checkout used by --kind "
+            "development to scan `tests/**` for issue-linked pytest skips in "
+            "the `Skip Test Case Monitoring` section. Resolution order: (1) "
+            "this flag, (2) $OMNI_REPO_ROOT env, (3) $REPO_ROOT env, (4) "
+            "the skill's containing checkout, (5) ~/vllm-omni. The repo's "
+            "`tests/` directory must exist or the section renders a note."
+        ),
+    )
+    parser.add_argument(
+        "--no-repo-pull",
+        action="store_true",
+        help=(
+            "Optional. Skip the fast-forward `git pull` step in the `Skip "
+            "Test Case Monitoring` section. The section will scan the "
+            "on-disk tree as-is. No-op when --omni-repo-root is not "
+            "resolvable to a git checkout."
         ),
     )
     args = parser.parse_args()
@@ -3287,6 +3355,16 @@ def main() -> None:
         # grouped into Open / Closed, with a per-PR "needs more tests?" verdict.
         bugfix_monitor_block = render_bugfix_monitor_section(gh_token, days_back=7)
 
+        # Skip Test Case Monitoring: static scan of `tests/**` for pytest skips
+        # whose reason references a GitHub issue, cross-referenced via the
+        # GitHub REST API. The pull is fast-forward-only and non-fatal so a
+        # dirty working tree never blocks report generation.
+        skip_monitor_block = render_skip_issue_monitor_section(
+            repo_root=args.omni_repo_root,
+            gh_token=gh_token,
+            pull=not args.no_repo_pull,
+        )
+
         md = f"""# vLLM-Omni Test Report - Development
 
 * **Report date (UTC):** {today_utc}
@@ -3298,6 +3376,7 @@ def main() -> None:
 {failure_analysis}
 
 {pdc_section}
+{skip_monitor_block}
 {open_issues_block}
 
 {bugfix_monitor_block}
@@ -3322,8 +3401,34 @@ def main() -> None:
 - **Test Result:** Common stack from `references/local-test-matrix.md`; H200/H800/A100 via
   `--log-dir-h200` / `--log-dir-h800` / `--log-dir-a100`; H100 = Buildkite scheduled nightly
   (this build #{build_no}; reportable jobs only — upload steps excluded).
+- **Skip Test Case Monitoring:** static AST scan of `vllm-omni/tests/**` for
+  `pytest.mark.{{skip,skipif,xfail}}(reason=...)` / `pytest.skip("…")` whose
+  reason text references a GitHub issue. Idioms recognised: full
+  `https://github.com/<owner>/<repo>/issues/N` URL, `issue#N`, `issue #N`,
+  bare `#N` (>=3 digits), and cross-repo `vllm issue#N` (fetched from
+  `vllm-project/vllm`). Before scanning, a **fast-forward-only** `git pull`
+  is attempted on the resolved vllm-omni checkout (`--no-repo-pull` skips
+  it; failures never abort the report). Repo root resolution order: explicit
+  `--omni-repo-root`, `$OMNI_REPO_ROOT`, `$REPO_ROOT`, the skill's
+  containing checkout, then `~/vllm-omni`. Issue data is fetched via
+  GitHub REST `GET /repos/{{owner}}/{{repo}}/issues/{{n}}` (per-issue; `requests`
+  direct call so 404s do not retry); pass `GITHUB_TOKEN` for stable rate
+  limits — without it, the table still lists every site with real file /
+  test / reason / issue-number data and the three GitHub-sourced columns
+  fall back to `—`. **Layout:** `Issue #` is the **first** column (followed by
+  Issue Title / State / Updated, then Test File / Test / Skip Mark / Skip
+  Reason) and rows are sorted by issue number, so the HTML post-processor
+  `release_md_to_html._group_skip_monitor_table_by_issue` folds every site
+  sharing an issue under **one collapsible group row** (click the row or its
+  caret to expand; *Expand all* / *Collapse all* buttons sit above the table).
+  Markdown output keeps the flat, Issue-#-first table.
 - **Open issues (stats window):** Identical to `release`, REST pagination `GET /issues?state=open&labels=bug`,
-  filter `created_at` UTC date falls in `{stats_from}`..`{stats_to}`.
+  filter `created_at` UTC date falls in `{{stats_from}}`..`{{stats_to}}`. The table's last two
+  columns (**Follow-up action** / **Remarks**) are **manual triage** cells: in HTML the first is
+  a `<select>` (Fix in a later iteration / Blocked by dependency / Won't fix (evaluated)) and the
+  second a click-to-edit note box; both persist in `localStorage` keyed by the row's issue number
+  (`open-issue-followup:#N` / `open-issue-note:#N`), so the same issue keeps its triage across
+  report regenerations and across the release / development variants. Markdown keeps `—`.
 """
         if args.format == "html":
             archive_name = out_path.with_suffix(".md").name
