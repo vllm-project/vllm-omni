@@ -963,12 +963,23 @@ async def _send_clean_turn(
         if outcome == "listen":
             return None, "listen"
     else:
-        await _wait_for(
-            state,
-            lambda: state.count("response.created") > before_created,
-            timeout_s=timeout_s,
-            label=f"{transcript} response.created",
-        )
+        try:
+            await _wait_for(
+                state,
+                lambda: state.count("response.created") > before_created,
+                timeout_s=timeout_s,
+                label=f"{transcript} response.created",
+            )
+        except TimeoutError:
+            # ``auto_response`` sessions only get ``response.created`` once the model
+            # decides to speak, so report the listen decisions that took its place.
+            raise TimeoutError(
+                f"Timed out waiting for {transcript} response.created after "
+                f"{state.count('input_audio_buffer.committed')} committed input turns; "
+                f"model_listen={state.model_listen_count - before_model_listen} "
+                f"buffering_listen={state.buffering_listen_count} "
+                f"errors={state.count('error')}"
+            ) from None
         await _wait_for(
             state,
             lambda: eligible_response_id() is not None,

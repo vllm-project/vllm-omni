@@ -133,6 +133,10 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
         output_dir=tmp_path / "single_session",
     )
     args.turns = 2
+    # Every turn replays the same active-speech window as the first one. The default
+    # shorter follow-up window is a different mid-utterance slice, which the native
+    # duplex model may legitimately answer with "listen" instead of a response.
+    args.turn_duration_ms = [args.first_turn_ms] * args.turns
     result = asyncio.run(run_demo(args))
     assert result["ok"] is True
     assert result["audio_delta_count"] > 0

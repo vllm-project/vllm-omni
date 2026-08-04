@@ -39,10 +39,7 @@ _MAX_SEED_TTS_MEAN_WER = 0.05
 # Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {
     "modalities": ["text"],
-    "chat_template_kwargs": {
-        "enable_thinking": False,
-        "use_tts_template": True,
-    },
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 _SEED_EXTRA_BODY = {
     "modalities": ["text", "audio"],
@@ -151,6 +148,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
         omni_server,
         skip_seed=False,
         skip_daily=True,
+        max_concurrency=4,
     )
     argv.extend(
         [

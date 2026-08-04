@@ -41,6 +41,9 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "hyperpyyaml>=1.2.0" \
       "onnx>=1.16.0" \
       "librosa>=0.10.0" \
+      "jiwer>=4.0.0" \
+      "zhon>=2.1.1" \
+      "zhconv>=1.4.3" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \
