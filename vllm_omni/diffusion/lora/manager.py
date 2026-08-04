@@ -8,6 +8,7 @@ from typing import get_args
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 from vllm.config.lora import MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
@@ -26,6 +27,8 @@ from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
+    convert_single_file_lora,
+    find_single_file_lora,
     from_layer_diffusion,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -284,11 +287,31 @@ class DiffusionLoRAManager:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
+        # Single-file (Kohya/diffusers) checkpoints — the format used by most
+        # published diffusion LoRAs (e.g. lightx2v/Qwen-Image-Lightning) —
+        # carry no adapter_config.json, so they are converted to the PEFT
+        # layout in memory instead of going through PEFTHelper.from_local_dir.
+        single_file = find_single_file_lora(lora_path)
+        single_file_tensors = None
+        if single_file is not None:
+            logger.info(
+                "Detected single-file (non-PEFT) LoRA at %s; converting to PEFT layout in memory",
+                single_file,
+            )
+            raw_tensors = load_file(single_file)
+            peft_config, single_file_tensors = convert_single_file_lora(
+                raw_tensors,
+                self._expected_lora_modules,
+            )
+            # Release the unconverted state dict early to reduce peak memory.
+            del raw_tensors
+            peft_helper = PEFTHelper.from_dict(peft_config)
+        else:
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,  # no need in diffusion
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
@@ -297,17 +320,28 @@ class DiffusionLoRAManager:
             peft_helper.target_modules,
         )
 
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
-        )
+        if single_file_tensors is not None:
+            lora_model = LoRAModel.from_lora_tensors(
+                lora_model_id=lora_request.lora_int_id,
+                tensors=single_file_tensors,
+                peft_helper=peft_helper,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                weights_mapper=None,
+            )
+        else:
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
 
         logger.info(
             "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",

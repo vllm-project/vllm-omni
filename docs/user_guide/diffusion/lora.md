@@ -8,7 +8,9 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be dy
 
 ## LoRA Adapter Format
 
-LoRA adapters must be in **PEFT (Parameter-Efficient Fine-Tuning)** format. A typical LoRA adapter directory structure:
+LoRA adapters can be provided in either of two formats:
+
+**PEFT (Parameter-Efficient Fine-Tuning) format** — a directory:
 
 ```
 lora_adapter/
@@ -20,6 +22,16 @@ The `adapter_config.json` file contains metadata about the LoRA adapter, includi
 - `r`: LoRA rank
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
+
+**Single-file (Kohya/diffusers) format** — a bare `.safetensors` file with
+`{module}.lora_down/lora_up.weight` (or `lora_A/lora_B`) keys and optional
+per-module `alpha` scalars, and no `adapter_config.json`. This is the format
+most published diffusion LoRAs use (e.g.
+[`lightx2v/Qwen-Image-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-Lightning)).
+Point `lora_path` at the `.safetensors` file (or a directory containing
+exactly one) and it is converted to the PEFT layout in memory at load time —
+see [`recipes/Qwen/Qwen-Image-Lightning.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-Lightning.md)
+for a complete example.
 
 ## Quick Start
 
