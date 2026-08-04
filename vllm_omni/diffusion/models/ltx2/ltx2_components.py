@@ -127,7 +127,7 @@ def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
             return {}
     else:
         try:
-            path = hf_hub_download(repo_id=model, filename=filename)
+            path = hf_api().hf_hub_download(repo_id=model, filename=filename)
         except Exception:
             return {}
     try:
