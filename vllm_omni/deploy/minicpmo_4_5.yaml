@@ -29,6 +29,13 @@ stages:
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
+    # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
+    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
       image: 64
@@ -85,13 +92,6 @@ stages:
       detokenize: true
 
 platforms:
-  cuda:
-    stages:
-      - stage_id: 1
-        # Four Talker streams need much less KV than automatic sizing.
-        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
-        kv_cache_memory_bytes: 2147483648  # 2 GiB
-
   npu:
     stages:
       - stage_id: 0

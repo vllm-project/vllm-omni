@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
 
-Daily-Omni settings follow the MiniCPM interleaved AV recipe from
-https://github.com/vllm-project/vllm-omni/pull/5606 (``minicpm-interleave``,
-``temperature=0``, ``output-len=512``, text-only modalities, and server
-``--interleave-mm-strings`` + 1fps / 64-frame media-io kwargs).
+Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
+~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
+text modalities with ``use_tts_template``, and server ``--interleave-mm-strings``
++ 1fps / 128-frame media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
 """
 
 from __future__ import annotations
@@ -33,13 +33,15 @@ _RESULT_DIR = Path(
         str(Path(__file__).resolve().parent / "results"),
     )
 )
-_MIN_DAILY_OMNI_ACCURACY = 0.64
+# Manual start_server + daily_omni_bench reaches ~0.782; keep a small CI margin.
+_MIN_DAILY_OMNI_ACCURACY = 0.75
 _MAX_SEED_TTS_MEAN_WER = 0.05
-# PR #5606: Daily-Omni MCQ is text-only (no TTS modalities / use_tts_template).
+# Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {
     "modalities": ["text"],
     "chat_template_kwargs": {
         "enable_thinking": False,
+        "use_tts_template": True,
     },
 }
 _SEED_EXTRA_BODY = {
@@ -52,11 +54,12 @@ _SEED_EXTRA_BODY = {
 # Server flags required for MiniCPM interleaved image/audio packs (Daily-Omni only).
 # Do not reuse these for Seed-TTS: ``--interleave-mm-strings`` + TTS ref_audio can trip
 # msgspec ValidationError and kill the orchestrator mid-suite.
+# Also pinned in ``minicpmo_4_5.yaml`` stage 0 so they survive config-path routing.
 _DAILY_OMNI_SERVER_ARGS = [
     "--trust-remote-code",
     "--interleave-mm-strings",
     "--media-io-kwargs",
-    '{"video":{"fps":1,"num_frames":64}}',
+    '{"video":{"fps":1,"num_frames":128}}',
 ]
 _SEED_TTS_SERVER_ARGS = [
     "--trust-remote-code",
@@ -90,7 +93,7 @@ def _require_vllm_cli() -> None:
 
 @pytest.fixture(autouse=True)
 def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inline cached Hub videos because the test server has no local-media allowlist."""
+    """Inline cached Hub/local videos because the test server has no local-media allowlist."""
     original = _acc_bench.daily_omni_bench_argv
 
     def _wrapped() -> list[str]:

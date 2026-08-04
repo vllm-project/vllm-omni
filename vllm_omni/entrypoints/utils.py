@@ -30,6 +30,15 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = init_logger(__name__)
 
 
+def is_new_format_deploy_config(path: str | None) -> bool:
+    """Return True when *path* is a deploy YAML (``stages:`` without legacy ``stage_args:``)."""
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        peek = yaml.safe_load(f) or {}
+    return isinstance(peek, dict) and "stages" in peek and "stage_args" not in peek
+
+
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
@@ -642,9 +651,7 @@ def load_and_resolve_stage_configs(
                 "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
                 "use --deploy-config. See docs/configuration/stage_configs.md."
             )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
+        if is_new_format_deploy_config(stage_configs_path):
             deploy_config_path = stage_configs_path
             stage_configs_path = None
         else:

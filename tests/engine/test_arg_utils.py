@@ -340,6 +340,56 @@ def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
     assert "model" not in warned_args
 
 
+def test_new_format_deploy_yaml_does_not_strip_interleave_cli_overrides(tmp_path):
+    """New-format deploy YAMLs must not strip interleave_mm_strings / media_io_kwargs.
+
+    Pytest historically passed ``--stage-configs-path`` for deploy YAMLs; stripping
+    those CLI flags dropped MiniCPM interleaved AV packing and cut Daily-Omni
+    accuracy from ~78% to ~70%.
+    """
+    from vllm_omni.entrypoints.utils import is_new_format_deploy_config
+
+    yaml_path = tmp_path / "minicpm_deploy.yaml"
+    yaml_path.write_text(
+        """
+pipeline: minicpmo_4_5
+async_chunk: true
+stages:
+  - stage_id: 0
+    devices: "0"
+""".strip(),
+        encoding="utf-8",
+    )
+    path = str(yaml_path)
+    assert is_new_format_deploy_config(path)
+
+    kwargs = {
+        "stage_configs_path": path,
+        "trust_remote_code": True,
+        "interleave_mm_strings": True,
+        "media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}},
+        "gpu_memory_utilization": 0.55,
+    }
+    # Mirror AsyncOmniEngine._resolve_stage_configs strip decision.
+    if kwargs.get("stage_configs_path") is not None and not is_new_format_deploy_config(kwargs["stage_configs_path"]):
+        base = AsyncOmniEngine._strip_single_engine_args(dict(kwargs))
+    else:
+        base = dict(kwargs)
+    assert base.get("interleave_mm_strings") is True
+    assert base.get("media_io_kwargs") == {"video": {"fps": 1, "num_frames": 128}}
+    # Parent EngineArgs fields also remain available for deploy merge.
+    assert base.get("gpu_memory_utilization") == 0.55
+
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
+    assert not is_new_format_deploy_config(str(legacy))
+    legacy_kwargs = dict(kwargs, stage_configs_path=str(legacy))
+    stripped = AsyncOmniEngine._strip_single_engine_args(legacy_kwargs)
+    assert "interleave_mm_strings" not in stripped
+    assert "media_io_kwargs" not in stripped
+    assert "gpu_memory_utilization" not in stripped
+
+
 # For https://github.com/vllm-project/vllm-omni/issues/3293
 def test_tensor_parallel_size_none_is_handled():
     """Ensure the tensor parallel size of None isn't forwarded."""
