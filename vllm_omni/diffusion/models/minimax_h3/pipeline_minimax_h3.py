@@ -65,6 +65,7 @@ from .presentation import (
     minimax_h3_text_only_ids,
 )
 from .reference_video import (
+    load_audio_file,
     load_video_audio,
     load_video_frames,
     prepare_reference_videos,
@@ -146,14 +147,12 @@ def _load_image(value: Any) -> Image.Image:
 
 
 def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
-    import torchaudio
-
     if isinstance(value, list):
         if len(value) != 1:
             raise ValueError("MiniMax H3 currently supports exactly one audio")
         value = value[0]
     if isinstance(value, (str, os.PathLike)):
-        return torchaudio.load(str(value))
+        return load_audio_file(str(value))
     if isinstance(value, tuple) and len(value) == 2:
         waveform, sample_rate = value
         waveform = torch.as_tensor(waveform).float()
