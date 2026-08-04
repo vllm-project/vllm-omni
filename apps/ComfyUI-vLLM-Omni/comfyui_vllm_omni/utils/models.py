@@ -124,12 +124,10 @@ del _MODEL_PIPELINE_SPECS
 
 
 def lookup_model_spec(model: str) -> tuple[Spec | None, str | None]:
-    try:
-        last_component = model.rstrip("/").rsplit("/", 1)[-1]
-    except IndexError:
-        last_component = model
+    normalized = model.rstrip("/").lstrip("/")
+    lookup_key = normalized.split("/", 1)[-1]
     for pattern, spec in MODEL_PIPELINE_SPECS.items():
-        if pattern.search(last_component):
+        if pattern.search(lookup_key):
             return spec, pattern.pattern
     return None, None
 
@@ -164,6 +162,7 @@ if __name__ == "__main__":
                     {"audio_flow_shift": 3.0, "flow_shift": 12.0, "type": "minimax_h3"},
                     extra_params={"task": "t2va"},
                 )
+                print(f"✓ {path:<40} → {result}")
             else:
                 print(f"✓ {path:<40} → No preprocessor/params_builder")
         else:
