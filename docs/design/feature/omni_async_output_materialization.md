@@ -19,9 +19,9 @@ construction of those partial outputs from blocking the next decode step.
 
 An AR stage must return sampled token IDs quickly because the scheduler needs
 them for the next decode step. However, an Omni stage can also produce hidden
-states, multimodal tensors, full-payload accumulations, and connector metadata.
-Building these payloads can require device-to-host (D2H) copies, tensor slicing,
-flattening, and Python object construction.
+states, multimodal tensors, streaming inter-stage payloads, and connector
+metadata. Building these payloads can require device-to-host (D2H) copies,
+tensor slicing, flattening, and Python object construction.
 
 Without this feature, all of that work runs inline in `sample_tokens()`:
 
@@ -30,7 +30,8 @@ sample tokens
   -> update decode state
   -> copy hidden and multimodal outputs to CPU
   -> build per-request payloads
-  -> accumulate connector outputs
+  -> build the streaming wire payload
+  -> collect connector signals
   -> return sampled tokens
   -> launch the next decode step
 ```
@@ -48,24 +49,28 @@ sample tokens
 background output path
   -> wait for the payload snapshot
   -> build per-request payloads
-  -> accumulate connector outputs
+  -> build the streaming wire payload
+  -> collect connector signals
   -> construct OmniModelRunnerOutput
 ```
 
 This allows payload construction for step `N` to overlap with GPU decode work
 for step `N + 1`. It does not change model computation or generated output.
 
-!!! note "Platform scope"
-    This design currently applies to the CUDA and ROCm AR runners, which use
-    `GPUARModelRunner`. Ascend NPU uses a separate `NPUARModelRunner` path that
-    still constructs `OmniModelRunnerOutput` and drains connector output
-    synchronously before wrapping the result as an asynchronous runner output.
-    XPU and MUSA are not currently covered or validated by this design.
+!!! note "Platform and validation scope"
+    The performance and correctness validation in this document covers CUDA
+    and ROCm. This is a validation scope, not a runtime platform guard: XPU
+    inherits `GPUARModelRunner`, and MUSA selects `GPUARWorker`, so those
+    backends may enter the asynchronous path when its other guards pass. XPU
+    and MUSA have not been validated for this optimization. Ascend NPU uses a
+    separate `NPUARModelRunner` path that still constructs
+    `OmniModelRunnerOutput` and drains connector output synchronously before
+    wrapping the result as an asynchronous runner output.
 
 <p align="center">
   <img
     alt="Decode step gap before and after async output materialization"
-    src="../../source/architecture/qwen3-omni-async-output-step-gap.svg"
+    src="../../../source/architecture/qwen3-omni-async-output-step-gap.svg"
     width="100%"
   >
 </p>
@@ -157,8 +162,9 @@ forward + sample
       +-- register sampled tokens               |
       +-- return async output                    +-- slice per request
       |                                         +-- build multimodal payloads
-next decode step                                +-- accumulate full payloads
-                                                +-- read connector output
+next decode step                                +-- partition streaming payloads
+                                                +-- build the wire payload
+                                                +-- drain connector signals
                                                 +-- build OmniModelRunnerOutput
 ```
 
@@ -182,21 +188,21 @@ CUDA sources until the transfer event completes.
 
 ### Live Runner State and Ownership
 
-The complete builder input is not a detached snapshot. Two parts deliberately
-remain runner-owned:
-
-- Full-payload accumulation looks up each request in `self.requests` and
-  updates the runner's pending full-payload accumulator.
-- `get_omni_connector_output()` drains live, per-cycle connector signals after
-  payload accumulation. Connector output state itself is not snapshotted.
-
-Correctness therefore depends on the output lifecycle: request entries and the
-full-payload accumulator must remain valid until the background builder
-finishes, and that builder must be the only consumer that drains connector
-signals for its output cycle. Receive-side connector state written by the
-background receiver is coordinated by the connector mixin's `_lock`.
+The complete builder input is not a detached snapshot. Connector output state
+remains runner-owned: `get_omni_connector_output()` drains live, per-cycle
+connector signals after the streaming payload is built. Correctness therefore
+depends on that builder being the only consumer that drains connector signals
+for its output cycle. Receive-side connector state written by the background
+receiver is coordinated by the connector mixin's `_lock`.
 `OmniAsyncGPUModelRunnerOutput.get_output()` joins the builder and is the
 completion and exception boundary before the materialized output is consumed.
+
+The shared output builder also contains a full-payload accumulation branch
+that reads `self.requests`. That branch is not reachable when async Omni output
+materialization is enabled: this feature requires `async_chunk`, while
+`should_accumulate_full_payload_output()` returns `False` whenever
+`async_chunk` is enabled. The feature path partitions each step's payload into
+streaming inter-stage and client handoffs instead.
 
 ### Output Builder
 
@@ -205,9 +211,9 @@ The background builder performs the work that previously ran inline:
 - resolves which requests need downstream payloads
 - converts hidden and multimodal tensors into per-request CPU payloads
 - applies model-specific payload processing
-- accumulates full payloads when required
+- partitions per-step payloads into inter-stage and client streams
 - creates the tensor-only `multimodal_outputs` wire payload
-- drains live connector readiness signals after payload accumulation
+- drains live connector readiness signals after building the streaming payload
 - constructs the final `OmniModelRunnerOutput`
 
 Input-side connector operations remain synchronous with model execution. In
@@ -231,9 +237,12 @@ uses the normal generation-stage path.
 
 There is no separate `async_omni_output` command-line or YAML option. The
 feature is selected automatically for model stages that opt in when the runtime
-conditions are safe. On CUDA and ROCm, using the bundled deployment profile is
-enough to turn it on for the supported Qwen3-Omni and Qwen3-TTS pipelines. The
-same profile does not enable background Omni materialization on Ascend NPU.
+conditions are safe. On the validated CUDA and ROCm configurations, using the
+bundled deployment profile is enough to turn it on for the supported
+Qwen3-Omni and Qwen3-TTS pipelines. The selection logic has no CUDA/ROCm-only
+guard; see [Compatibility and Fallbacks](#compatibility-and-fallbacks) for the
+other platform paths. The same profile does not enable background Omni
+materialization on Ascend NPU.
 
 ### Example 1: Qwen3-Omni
 
@@ -314,13 +323,21 @@ because they use the same Talker implementation.
     output construction. Enabling async chunk alone cannot activate the feature
     for a model that has not opted into async Omni output.
 
+!!! note "Prefix cache compatibility"
+    Async Omni output materialization and Omni prefix caching cannot currently
+    run together. `_should_use_async_omni_output()` returns `False` whenever
+    `self.omni_prefix_cache` is present, so prefix caching selects synchronous
+    output materialization. Supporting both features requires snapshotting or
+    otherwise synchronizing prefix-cache merge and update state before the
+    background output path can consume it safely.
+
 ## Compatibility and Fallbacks
 
-The async output path is used only when all of the following conditions hold:
+`GPUARModelRunner` uses the async output path only when all of the following
+runtime conditions hold:
 
 | Requirement | Reason |
 |---|---|
-| The platform uses the CUDA or ROCm `GPUARModelRunner` path | Ascend NPU materializes the Omni output synchronously; XPU and MUSA are not covered or validated by this design |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -329,9 +346,14 @@ The async output path is used only when all of the following conditions hold:
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
 | Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns |
 
-On CUDA and ROCm, these checks are evaluated per stage. An unsupported
-combination does not prevent serving; it only falls back to synchronous output
-construction for that stage. On Ascend NPU, `NPUARModelRunner.sample_tokens()`
+These checks are evaluated per stage on runners based on `GPUARModelRunner`.
+An unsupported combination does not prevent serving; it only falls back to
+synchronous output construction for that stage. CUDA and ROCm are the validated
+platforms. XPU inherits `GPUARModelRunner`, and MUSA selects `GPUARWorker`, so
+they may select the async path when these checks pass, but this optimization is
+not yet validated on either backend.
+
+Ascend NPU does not use this selection path. `NPUARModelRunner.sample_tokens()`
 fully constructs `OmniModelRunnerOutput`, calls
 `get_omni_connector_output()`, and only then creates the asynchronous wrapper,
 so Omni payload materialization remains synchronous.

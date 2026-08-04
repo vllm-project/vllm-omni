@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="600" viewBox="0 0 1024 600" role="img" aria-labelledby="title desc">
   <title id="title">Qwen3-Omni Talker step gap before and after asynchronous output materialization</title>
-  <desc id="desc">Before the optimization, synchronous D2H copy, per-request payload construction, full-payload accumulation, and connector drain separate consecutive Talker forward and sample steps by about 2.8 milliseconds. After the optimization, that Omni output work runs on a background builder while the next Talker step executes, leaving a boundary of about 41 microseconds for snapshot, D2H enqueue, state update, and sampled-token feedback.</desc>
+  <desc id="desc">Before the optimization, synchronous D2H copy, per-request payload construction, streaming payload handoff, and connector-signal drain separate consecutive Talker forward and sample steps by about 2.8 milliseconds. After the optimization, that Omni output work runs on a background builder while the next Talker step executes, leaving a boundary of about 41 microseconds for snapshot, D2H enqueue, state update, and sampled-token feedback.</desc>
   <defs>
     <marker id="time-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
@@ -72,7 +72,7 @@
   <rect x="490" y="104" width="250" height="54" rx="5" class="sync-output"/>
   <text x="615" y="120" text-anchor="middle" class="block-title">SYNC OMNI OUTPUT &#183; STEP N</text>
   <text x="615" y="138" text-anchor="middle" class="block-op">D2H &#8594; per-request slice / payload build</text>
-  <text x="615" y="152" text-anchor="middle" class="block-op">full-payload accumulate &#8594; connector drain</text>
+  <text x="615" y="152" text-anchor="middle" class="block-op">streaming handoff &#8594; connector-signal drain</text>
 
   <rect x="740" y="104" width="220" height="54" rx="5" class="talker"/>
   <text x="850" y="124" text-anchor="middle" class="block-title">TALKER STAGE &#183; STEP N+1</text>
@@ -105,7 +105,7 @@
   <rect x="540" y="298" width="360" height="58" rx="5" class="async-output"/>
   <text x="720" y="315" text-anchor="middle" class="block-title">BACKGROUND OMNI OUTPUT &#183; STEP N</text>
   <text x="720" y="334" text-anchor="middle" class="block-op">wait for D2H &#8594; per-request slice / payload build</text>
-  <text x="720" y="349" text-anchor="middle" class="block-op">full-payload accumulate &#8594; connector drain</text>
+  <text x="720" y="349" text-anchor="middle" class="block-op">streaming handoff &#8594; connector-signal drain</text>
 
   <line x1="300" y1="366" x2="930" y2="366" class="time-line"/>
   <text x="922" y="382" text-anchor="end" class="axis">time</text>
