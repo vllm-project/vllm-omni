@@ -1173,7 +1173,7 @@ class DuplexSessionRunnerMixin:
                         await emit_event(
                             {
                                 "type": "error",
-                                "error": "input.audio.append requires audio",
+                                "error": "input_audio_buffer.append requires audio",
                                 "code": "bad_event",
                             }
                         )

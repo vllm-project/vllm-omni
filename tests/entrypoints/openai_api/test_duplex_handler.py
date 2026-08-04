@@ -943,8 +943,89 @@ async def test_native_session_update_rejects_client_runtime_config():
     await handler.handle_session(ws)
 
     error = next(message for message in ws.sent if message.get("type") == "error")
-    assert error["code"] == "invalid_duplex_runtime_config"
+    assert error["error"]["code"] == "invalid_duplex_runtime_config"
     assert ("sid-runtime-update-reject", "session.update") not in engine.signals
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_session_create_rejects_null_turn_detection():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    event = _native_session_create("sid-td-null-create")
+    event["session"]["extra_body"] = {"realtime_turn_detection": None}
+    ws.put(event)
+
+    await handler.handle_session(ws)
+
+    assert ws.sent_types() == ["error"]
+    error = ws.sent[0]
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_turn_detection"
+    assert error["error"]["param"] == "turn_detection"
+    assert "server_vad" in error["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_session_update_rejects_null_turn_detection():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-td-null-update"))
+    ws.put(
+        {
+            "type": "turn.signal",
+            "event": "session.update",
+            "payload": {"turn_detection": None},
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    error = next(m for m in ws.sent if m.get("type") == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_turn_detection"
+    assert error["error"]["param"] == "turn_detection"
+    assert "session.updated" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_session_update_accepts_server_vad_turn_detection():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-td-vad-update"))
+    ws.put(
+        {
+            "type": "turn.signal",
+            "event": "session.update",
+            "payload": {
+                "turn_detection": {
+                    "type": "server_vad",
+                    "silence_duration_ms": 800,
+                },
+            },
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    assert "session.updated" in ws.sent_types()
+    assert not any(m.get("type") == "error" for m in ws.sent)
 
 
 @pytest.mark.asyncio
@@ -969,7 +1050,7 @@ async def test_minicpmo_native_session_update_requires_ref_audio_before_enabling
     await handler.handle_session(ws)
 
     error = next(message for message in ws.sent if message.get("type") == "error")
-    assert error["code"] == "ref_audio_required"
+    assert error["error"]["code"] == "ref_audio_required"
     assert "session.updated" not in ws.sent_types()
     assert ("sid-runtime-update-ref-required", "session.update") not in engine.signals
 
@@ -5532,7 +5613,7 @@ async def test_minicpmo_native_duplex_rejects_client_runtime_config():
     await handler.handle_session(ws)
 
     assert ws.sent_types() == ["error"]
-    assert ws.sent[0]["code"] == "invalid_duplex_runtime_config"
+    assert ws.sent[0]["error"]["code"] == "invalid_duplex_runtime_config"
     assert engine.opened == []
 
 
@@ -5578,7 +5659,7 @@ async def test_minicpmo_native_duplex_open_session_maps_missing_ref_audio_to_typ
     await handler.handle_session(ws)
 
     assert ws.sent_types() == ["error"]
-    assert ws.sent[0]["code"] == "ref_audio_required"
+    assert ws.sent[0]["error"]["code"] == "ref_audio_required"
     assert engine.opened == []
 
 
@@ -5648,7 +5729,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     await handler.handle_session(ws)
 
     assert ws.sent_types() == ["error"]
-    assert ws.sent[0]["code"] == "unsupported_ref_audio_path"
+    assert ws.sent[0]["error"]["code"] == "unsupported_ref_audio_path"
     assert engine.opened == []
 
 

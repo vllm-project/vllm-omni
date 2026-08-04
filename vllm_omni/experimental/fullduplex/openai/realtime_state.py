@@ -54,6 +54,8 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "model_update_unsupported": "invalid_request_error",
     "voice_update_after_audio_unsupported": "invalid_request_error",
     "ref_audio_update_unsupported": "invalid_request_error",
+    "unsupported_turn_detection": "invalid_request_error",
+    "invalid_turn_detection": "invalid_request_error",
     "native_text_append_unsupported": "invalid_request_error",
     "runtime_native_stage_role_required": "server_error",
     "runtime_native_runner_kv_required": "server_error",

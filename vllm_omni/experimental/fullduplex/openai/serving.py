@@ -908,10 +908,16 @@ class OmniDuplexSessionHandler(
                     model_config=getattr(self._chat_service, "model_config", None),
                 )
             except ServingRuntimeConfigError as exc:
-                await send_json({"type": "error", "error": str(exc), "code": exc.code})
+                await send_json(NativeRealtimeSessionProtocol._realtime_error_payload(exc.code, str(exc)))
                 return None
             except ValueError as exc:
-                await send_json({"type": "error", "error": str(exc), "code": "unsupported_ref_audio_path"})
+                await send_json(
+                    NativeRealtimeSessionProtocol._realtime_error_payload(
+                        "unsupported_ref_audio_path",
+                        str(exc),
+                        param="ref_audio",
+                    )
+                )
                 return None
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
@@ -1138,12 +1144,10 @@ class OmniDuplexSessionHandler(
         try:
             self._serving_runtime_adapter.validate_client_extra_body(payload.get("extra_body"))
         except ServingRuntimeConfigError as exc:
-            return {
-                "type": "error",
-                "session_id": session.session_id,
-                "code": exc.code,
-                "error": str(exc),
-            }
+            return NativeRealtimeSessionProtocol._realtime_error_payload(
+                exc.code,
+                str(exc),
+            )
         return None
 
     def _runtime_config_for_session_update(
@@ -1171,12 +1175,11 @@ class OmniDuplexSessionHandler(
             return None
         if "ref_audio_data" in session.runtime_config:
             return None
-        return {
-            "type": "error",
-            "session_id": session.session_id,
-            "code": "ref_audio_required",
-            "error": "native duplex audio output requires ref_audio",
-        }
+        return NativeRealtimeSessionProtocol._realtime_error_payload(
+            "ref_audio_required",
+            "native duplex audio output requires ref_audio",
+            param="ref_audio",
+        )
 
     @staticmethod
     def _uses_native_input_append(session: DuplexSession) -> bool:
@@ -1242,48 +1245,32 @@ class OmniDuplexSessionHandler(
 
         if td_raw is None:
             if session.capabilities.supports_model_native_turn_policy:
-                return {
-                    "type": "error",
-                    "session_id": session.session_id,
-                    "code": "unsupported_turn_detection",
-                    "error": {
-                        "type": "unsupported_turn_detection",
-                        "message": (
-                            "This model requires model-native turn detection "
-                            "(server_vad); turn_detection cannot be set to null."
-                        ),
-                    },
-                }
+                return NativeRealtimeSessionProtocol._realtime_error_payload(
+                    "unsupported_turn_detection",
+                    "This model requires model-native turn detection "
+                    "(server_vad); turn_detection cannot be set to null.",
+                    param="turn_detection",
+                )
             return None
 
         if not isinstance(td_raw, dict):
-            return {
-                "type": "error",
-                "session_id": session.session_id,
-                "code": "invalid_turn_detection",
-                "error": {
-                    "type": "invalid_turn_detection",
-                    "message": (f"turn_detection must be null or an object, got {type(td_raw).__name__}"),
-                },
-            }
+            return NativeRealtimeSessionProtocol._realtime_error_payload(
+                "invalid_turn_detection",
+                f"turn_detection must be null or an object, got {type(td_raw).__name__}",
+                param="turn_detection",
+            )
 
         td_type = td_raw.get("type")
         if td_type == "server_vad":
             if not session.capabilities.supports_model_native_turn_policy:
-                return {
-                    "type": "error",
-                    "session_id": session.session_id,
-                    "code": "unsupported_turn_detection",
-                    "error": {
-                        "type": "unsupported_turn_detection",
-                        "message": (
-                            "turn_detection.type='server_vad' is not supported "
-                            "by this model; set turn_detection to null and "
-                            "commit input explicitly via "
-                            "input_audio_buffer.commit + response.create"
-                        ),
-                    },
-                }
+                return NativeRealtimeSessionProtocol._realtime_error_payload(
+                    "unsupported_turn_detection",
+                    "turn_detection.type='server_vad' is not supported "
+                    "by this model; set turn_detection to null and "
+                    "commit input explicitly via "
+                    "input_audio_buffer.commit + response.create",
+                    param="turn_detection",
+                )
             create_response = td_raw.get("create_response", True)
             td_config: dict[str, object] = {
                 "type": "server_vad",
@@ -1301,15 +1288,11 @@ class OmniDuplexSessionHandler(
             extra["realtime_turn_detection"] = td_config
             return None
 
-        return {
-            "type": "error",
-            "session_id": session.session_id,
-            "code": "unsupported_turn_detection",
-            "error": {
-                "type": "unsupported_turn_detection",
-                "message": (f"turn_detection.type={td_type!r} is not supported; use 'server_vad' or null"),
-            },
-        }
+        return NativeRealtimeSessionProtocol._realtime_error_payload(
+            "unsupported_turn_detection",
+            f"turn_detection.type={td_type!r} is not supported; use 'server_vad' or null",
+            param="turn_detection",
+        )
 
     async def _receive_text(
         self,
@@ -1409,28 +1392,25 @@ class OmniDuplexSessionHandler(
         if not isinstance(voice, str) and isinstance(audio_output, dict):
             voice = audio_output.get("voice")
         if isinstance(model, str) and session.config.model is not None and model != session.config.model:
-            return {
-                "type": "error",
-                "session_id": session.session_id,
-                "code": "model_update_unsupported",
-                "error": "session.update cannot change model for an open realtime duplex session",
-            }
+            return NativeRealtimeSessionProtocol._realtime_error_payload(
+                "model_update_unsupported",
+                "session.update cannot change model for an open realtime duplex session",
+                param="model",
+            )
         if isinstance(model, str) and session.config.model is None:
             session.config.model = model
         if isinstance(voice, str) and (session.playback.generated_ms > 0 or session.playback.sent_ms > 0):
-            return {
-                "type": "error",
-                "session_id": session.session_id,
-                "code": "voice_update_after_audio_unsupported",
-                "error": "session.update cannot change voice after audio output has started",
-            }
+            return NativeRealtimeSessionProtocol._realtime_error_payload(
+                "voice_update_after_audio_unsupported",
+                "session.update cannot change voice after audio output has started",
+                param="voice",
+            )
         if isinstance(payload.get("ref_audio"), str):
-            return {
-                "type": "error",
-                "session_id": session.session_id,
-                "code": "ref_audio_update_unsupported",
-                "error": "session.update cannot change ref_audio after the native duplex runtime is open",
-            }
+            return NativeRealtimeSessionProtocol._realtime_error_payload(
+                "ref_audio_update_unsupported",
+                "session.update cannot change ref_audio after the native duplex runtime is open",
+                param="ref_audio",
+            )
         if isinstance(payload.get("instructions"), str):
             session.config.instructions = str(payload["instructions"])
         elif "instructions" in payload and payload.get("instructions") is None:

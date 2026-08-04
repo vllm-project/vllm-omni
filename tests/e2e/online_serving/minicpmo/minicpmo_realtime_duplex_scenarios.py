@@ -964,7 +964,7 @@ async def _send_clean_turn(
             state,
             lambda: state.response_audio_delta_count(response_id) > 0,
             timeout_s=timeout_s,
-            label=f"{transcript} response.audio.delta",
+            label=f"{transcript} response.output_audio.delta",
         )
     await _wait_for(
         state,
@@ -1177,7 +1177,7 @@ async def _send_listen_only_overlap_pair(
         state,
         lambda: state.response_audio_delta_count(first_response_id) > 0,
         timeout_s=timeout_s,
-        label=f"{transcripts[0]} response.audio.delta",
+        label=f"{transcripts[0]} response.output_audio.delta",
     )
     if state.response_done(first_response_id):
         raise RuntimeError("first response completed before overlap input could start")

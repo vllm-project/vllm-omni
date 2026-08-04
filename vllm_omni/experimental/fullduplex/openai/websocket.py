@@ -20,31 +20,10 @@ INPUT_EVENTS = frozenset(
     }
 )
 
-_INPUT_EVENT_ALIASES = {
-    "signal_turn": "turn.signal",
-    "close_session": "session.close",
-    "audio.playback_ack": "playback.ack",
-    "input_text.append": "input.text.append",
-    "push_text": "input.text.append",
-    "input.audio.append": "input_audio_buffer.append",
-    "push_chunk": "input_audio_buffer.append",
-}
-_WAV_AUDIO_ALIASES = frozenset({"input.audio.append", "push_chunk"})
-
 
 def normalize_duplex_input_event(event: dict[str, object]) -> dict[str, object]:
-    """Normalize compatibility aliases before an event enters the mailbox."""
-    event_type = event.get("type")
-    if not isinstance(event_type, str):
-        return event
-    canonical_type = _INPUT_EVENT_ALIASES.get(event_type)
-    if canonical_type is None:
-        return event
-    normalized = dict(event)
-    normalized["type"] = canonical_type
-    if event_type in _WAV_AUDIO_ALIASES:
-        normalized.setdefault("format", "wav")
-    return normalized
+    """Identity pass-through; no aliases are supported."""
+    return event
 
 
 MODEL_OUTPUT_EVENTS = frozenset(
@@ -55,13 +34,9 @@ MODEL_OUTPUT_EVENTS = frozenset(
         "response.output_item.added",
         "response.content_part.added",
         "response.output_audio.delta",
-        "response.audio.delta",
         "response.output_audio.done",
-        "response.audio.done",
         "response.output_text.delta",
         "response.output_text.done",
-        "response.text.delta",
-        "response.text.done",
         "response.message",
         "response.output_item.done",
         "response.content_part.done",
