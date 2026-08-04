@@ -125,10 +125,16 @@ def _duration_seconds(audio_data: bytes) -> float:
 class OmniServingTranscription(OpenAIServingTranscription):
     """Upstream transcription serving plus optional forced alignment."""
 
-    #: Cap on in-flight decoded-audio handoffs. Entries are popped by the
-    #: request that produced them; this only bounds leakage if one errors out
-    #: between decode and pickup.
-    _MAX_PENDING_DECODES = 256
+    #: Cap on in-flight decoded-audio handoffs, which bounds host memory: each
+    #: entry is one decoded waveform (~1.9 MB for a 30s 16 kHz clip), so 1024
+    #: is ~2 GB worst case.
+    #:
+    #: This has to exceed peak request concurrency, not just cover leaks. Every
+    #: in-flight request holds an entry between its decode and its alignment,
+    #: so a cap below concurrency evicts live handoffs and silently sends those
+    #: requests back to decoding the upload a second time -- measured as a 6%
+    #: miss rate at concurrency 384 when this was 256.
+    _MAX_PENDING_DECODES = 1024
 
     def __init__(
         self,
@@ -307,15 +313,19 @@ class OmniServingTranscription(OpenAIServingTranscription):
         synthesize_verbose = wants_words and not self.model_cls.supports_segment_timestamp
         inner_request = request.model_copy(update={"response_format": "json"}) if synthesize_verbose else request
 
-        result = await super().create_transcription(
-            audio_data=audio_data,
-            request=inner_request,
-            raw_request=raw_request,
-        )
-
-        # Always reclaim the handoff, even on paths that will not align, so a
-        # rejected or errored request cannot leave its waveform parked.
-        decoded = self._take_decoded(audio_data) if self.forced_aligner_config is not None else None
+        # finally, not a trailing statement: the handoff must be reclaimed even
+        # when the inner call raises, or a failing request parks its waveform
+        # until the size cap evicts it.
+        decoded = None
+        try:
+            result = await super().create_transcription(
+                audio_data=audio_data,
+                request=inner_request,
+                raw_request=raw_request,
+            )
+        finally:
+            if self.forced_aligner_config is not None:
+                decoded = self._take_decoded(audio_data)
 
         if not wants_words:
             return result

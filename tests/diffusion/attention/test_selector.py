@@ -101,7 +101,7 @@ def test_backend_class_resolution_is_cached(monkeypatch):
     platform_calls = []
     load_calls = []
     fake_platform = SimpleNamespace(
-        get_diffusion_attn_backend_cls=lambda **kwargs: (platform_calls.append(kwargs) or "fake.module.Backend")
+        get_diffusion_attn_backend_cls=lambda **kwargs: platform_calls.append(kwargs) or "fake.module.Backend"
     )
 
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", fake_platform)

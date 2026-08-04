@@ -377,3 +377,31 @@ async def test_concurrent_requests_each_get_their_own_words(stub_upstream, stub_
 
     assert all([w.word for w in r.words] == ["hello"] for r in results)
     assert serving._pending == 0
+
+
+async def test_handoff_is_reclaimed_when_the_inner_call_raises(stub_upstream, monkeypatch):
+    """A failing request must not park its waveform until the cap evicts it."""
+
+    async def boom(self, *, audio_data, request, raw_request=None):
+        raise RuntimeError("engine died")
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.speech_to_text.transcription.serving.OpenAIServingTranscription.create_transcription",
+        boom,
+    )
+    serving = _serving()
+    audio = _wav_bytes()
+    serving._stash_decoded(audio, [np.ones(4, dtype=np.float32)], 1.0)
+
+    with pytest.raises(RuntimeError):
+        await serving.create_transcription(audio_data=audio, request=_request())
+
+    assert serving._pending == 0, "waveform leaked when the inner call raised"
+
+
+def test_pending_cap_exceeds_realistic_concurrency():
+    """The cap bounds memory, but must sit above peak concurrency: every
+    in-flight request holds an entry between decode and alignment, so a cap
+    below concurrency evicts live handoffs and sends those requests back to
+    decoding the upload a second time."""
+    assert OmniServingTranscription._MAX_PENDING_DECODES >= 384
