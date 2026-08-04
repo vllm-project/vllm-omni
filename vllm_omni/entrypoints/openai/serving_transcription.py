@@ -34,6 +34,10 @@ from vllm.entrypoints.speech_to_text.transcription.protocol import (
 from vllm.entrypoints.speech_to_text.transcription.serving import OpenAIServingTranscription
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.stage_input_processors.qwen3_asr_align import (
+    ALIGNER_STAGE_NAME,
+    attach_aligner_audio,
+)
 from vllm_omni.utils.forced_aligner import ForcedAlignerConfig, ForcedAlignerLoadError
 from vllm_omni.utils.forced_aligner import align as forced_align
 
@@ -122,6 +126,46 @@ def _duration_seconds(audio_data: bytes) -> float:
     return float(info.duration)
 
 
+class _AlignerOutputFilter:
+    """Keeps the aligner stage's pooling result out of the transcript stream.
+
+    The ASR stage and the aligner stage are both declared final outputs, so the
+    engine emits two results per request. Upstream's transcription loop reads
+    ``outputs[0].text`` off whatever arrives and has no notion of a second,
+    differently-typed terminal output -- there is no mechanism yet for a stage
+    whose result goes to the client instead of downstream (RFC #4468). Splitting
+    the stream here keeps that concern in the entrypoint: pooling results are
+    captured for the alignment decode, everything else passes through untouched.
+
+    Delegates everything else to the real client, so the generative paths that
+    share this engine are unaffected.
+    """
+
+    def __init__(self, inner: Any, sink: Any) -> None:
+        self._inner = inner
+        self._sink = sink
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        stream = self._inner.generate(*args, **kwargs)
+
+        async def _filtered() -> Any:
+            async for out in stream:
+                outputs = getattr(out, "outputs", None)
+                first = outputs[0] if outputs else None
+                # A pooling result carries data, not text. Duck-typing rather
+                # than importing PoolingOutput keeps this tolerant of the
+                # several shapes the omni layer can hand back.
+                if first is not None and not hasattr(first, "text") and hasattr(first, "data"):
+                    self._sink(getattr(out, "request_id", None), first)
+                    continue
+                yield out
+
+        return _filtered()
+
+
 class OmniServingTranscription(OpenAIServingTranscription):
     """Upstream transcription serving plus optional forced alignment."""
 
@@ -150,6 +194,11 @@ class OmniServingTranscription(OpenAIServingTranscription):
         self._decoded_lock = threading.Lock()
         self._reuse_hits = 0
         self._reuse_misses = 0
+        self._aligner_stage_cache: bool | None = None
+        self._pooling_results: OrderedDict[str, Any] = OrderedDict()
+        self._aligned_count = 0
+        if self._has_aligner_stage:
+            self.engine_client = _AlignerOutputFilter(self.engine_client, self._capture_pooling_output)
 
         # Audio decode is GIL-bound: ~40 decodes/s for a 30s 48 kHz stereo mp3
         # no matter how many *threads* upstream's preprocess pool gets (it
@@ -253,7 +302,7 @@ class OmniServingTranscription(OpenAIServingTranscription):
         65% miss under load, i.e. two thirds of requests decoding twice.
         Queueing one entry per decode makes hits track decodes exactly.
         """
-        if self.forced_aligner_config is None or len(chunks) != 1:
+        if not self._aligner_enabled or len(chunks) != 1:
             return
         with self._decoded_lock:
             self._decoded.setdefault(_audio_key(audio_data), []).append((chunks[0], duration))
@@ -293,6 +342,84 @@ class OmniServingTranscription(OpenAIServingTranscription):
                 )
         return hit
 
+    @property
+    def _has_aligner_stage(self) -> bool:
+        """Whether the running pipeline includes a forced-aligner stage.
+
+        Read off the engine's own stage metadata rather than a flag, so the
+        topology stays the single source of truth: deploying ``qwen3_asr``
+        instead of ``qwen3_asr_align`` turns this off with no other change.
+        """
+        if self._aligner_stage_cache is None:
+            # engine_client is the AsyncOmni facade; the stage metadata lives on
+            # the AsyncOmniEngine it wraps.
+            meta: Any = None
+            for holder in (self.engine_client, getattr(self.engine_client, "engine", None)):
+                meta = getattr(holder, "stage_metadata", None)
+                if meta:
+                    break
+            self._aligner_stage_cache = any(getattr(m, "model_stage", None) == ALIGNER_STAGE_NAME for m in meta or [])
+            logger.info("Forced-aligner stage detected: %s", self._aligner_stage_cache)
+        return self._aligner_stage_cache
+
+    def _capture_pooling_output(self, request_id: str | None, pooling_output: Any) -> None:
+        """Hold the aligner stage's logits until the request assembles its response."""
+        if request_id is None:
+            return
+        with self._decoded_lock:
+            self._aligned_count += 1
+            if self._aligned_count % _REUSE_STATS_EVERY == 0:
+                logger.info("Aligner stage: %d requests aligned", self._aligned_count)
+            self._pooling_results[request_id] = pooling_output
+            while len(self._pooling_results) > self._MAX_PENDING_DECODES:
+                self._pooling_results.popitem(last=False)
+
+    @property
+    def _aligner_enabled(self) -> bool:
+        """Whether anything downstream still needs the decoded waveform."""
+        return self.forced_aligner_config is not None or self._has_aligner_stage
+
+    def _peek_decoded(self, audio_data: bytes) -> tuple[np.ndarray, float] | None:
+        """Read this request's decoded waveform without consuming the handoff.
+
+        The stage path reads the waveform while building the prompt but the
+        entry is still reclaimed later by ``_take_decoded``, so the accounting
+        stays identical to the sidecar's. Peeking the head entry is safe even
+        when concurrent requests collide on the key: the key is a content hash,
+        so every queued entry under it holds the same audio.
+        """
+        with self._decoded_lock:
+            queued = self._decoded.get(_audio_key(audio_data))
+            return queued[0] if queued else None
+
+    async def _preprocess_speech_to_text(
+        self,
+        request: TranscriptionRequest,
+        audio_data: bytes,
+        request_id: str,
+    ) -> tuple[list[Any], float]:
+        """Carry the decoded waveform to the aligner stage on the prompt itself.
+
+        By the time a prompt reaches a downstream stage the audio has been
+        turned into processed features (``mm_kwargs``); the raw waveform the
+        aligner needs is gone, and the framework's default stage input
+        processor looks for a ``multi_modal_data`` key that the transcription
+        entrypoint never puts there. Attaching the waveform that stage 0's
+        decode already produced keeps the pipeline to one decode per request
+        without a second lookup path.
+        """
+        engine_inputs, duration = await super()._preprocess_speech_to_text(request, audio_data, request_id)
+        if self._has_aligner_stage:
+            peeked = self._peek_decoded(audio_data)
+            if peeked is not None:
+                for engine_input in engine_inputs:
+                    attach_aligner_audio(engine_input, peeked[0], self.asr_config.sample_rate)
+            else:
+                # Chunked audio has no single reusable waveform; the stage
+                # degrades to a transcript without words rather than failing.
+                logger.debug("No reusable decode for %s; aligner stage will skip", request_id)
+        return engine_inputs, duration
+
     @staticmethod
     def _wants_word_timestamps(request: TranscriptionRequest) -> bool:
         return "word" in (request.timestamp_granularities or []) and request.response_format == "verbose_json"
@@ -324,7 +451,7 @@ class OmniServingTranscription(OpenAIServingTranscription):
                 raw_request=raw_request,
             )
         finally:
-            if self.forced_aligner_config is not None:
+            if self._aligner_enabled:
                 decoded = self._take_decoded(audio_data)
 
         if not wants_words:

@@ -1,0 +1,63 @@
+# Qwen3-ASR with word timestamps: ASR stage feeding a forced-aligner stage.
+#
+#   vllm-omni serve Qwen/Qwen3-ASR-1.7B --omni --trust-remote-code \
+#       --deploy-config vllm_omni/deploy/qwen3_asr_align.yaml
+#
+# For transcripts without timestamps use qwen3_asr.yaml, which is this
+# without stage 1 and does not load the aligner at all.
+pipeline: qwen3_asr_align
+
+# The aligner runs once per utterance over the whole waveform, so there is no
+# per-chunk producer to stream through and async_chunk has nothing to do.
+async_chunk: false
+
+# Audio decode is GIL-bound and becomes the ceiling well before the GPU does;
+# same value as the single-stage qwen3_asr profile so the two are comparable.
+audio_decode_procs: 16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 256
+    # 30s of audio is a large multimodal prefill; the 16384 default splits it
+    # across more chunked-prefill steps than necessary.
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.70
+    trust_remote_code: true
+    enable_prefix_caching: true
+    max_model_len: 8192
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+
+  - stage_id: 1
+    model: Qwen/Qwen3-ForcedAligner-0.6B
+    # Pooling model: one forward pass, token_classify, no autoregressive
+    # decode. It has no use for a KV cache, so it gets a small share -- sized
+    # for weights plus activation headroom rather than as a fraction of
+    # concurrency. On a smaller device this fraction needs to go *up*, since
+    # the requirement is absolute (~1.2 GiB of weights) while the unit is not.
+    runner: pooling
+    # The checkpoint's config.json declares the *generative* arch it shares
+    # with Qwen3-ASR, so loading it as-is yields a model that cannot pool.
+    # The token-classification head is selected by overriding the arch, the
+    # same way the standalone aligner does.
+    hf_overrides:
+      architectures:
+        - Qwen3ASRForcedAlignerForTokenClassification
+    gpu_memory_utilization: 0.15
+    dtype: bfloat16
+    max_model_len: 4096
+    trust_remote_code: true
+    # Sized like stage 0 rather than left on defaults: one forward pass per
+    # request means throughput here is almost entirely a batching question.
+    max_num_seqs: 256
+    max_num_batched_tokens: 32768
+    # Off for two reasons. Nothing to reuse -- every request aligns a different
+    # utterance -- and omni's hidden-state cache sizes its slots to the model's
+    # hidden dim, while a token-classification head emits classify_num per
+    # token instead, so the write is a shape mismatch.
+    enable_prefix_caching: false
+    default_pooling_params:
+      task: token_classify
