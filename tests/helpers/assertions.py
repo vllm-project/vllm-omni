@@ -527,7 +527,7 @@ def _resolve_audio_transcript(
     audio_bytes = getattr(response, "audio_bytes", None)
     if not audio_bytes:
         return None
-    return convert_audio_bytes_to_text(audio_bytes)
+    return convert_audio_bytes_to_text(audio_bytes, language=request_config.get("transcript_language"))
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
@@ -632,6 +632,7 @@ def _assert_transcript_matches(
     *,
     threshold: float,
     escalation_model: str | None = None,
+    language: str | None = None,
 ) -> None:
     """Assert spoken audio matches ``expected_text``.
 
@@ -647,7 +648,8 @@ def _assert_transcript_matches(
     clip is re-transcribed with that stronger ASR and the assertion is decided on
     its verdict -- so a weak whisper-``small`` mishear on a short clip does not
     flake the gate, while a genuine model artifact still fails (the strong ASR
-    mismatches too).
+    mismatches too). ``language`` applies to that escalated pass too, so a request
+    that pins a language does not silently fall back to auto-detection on retry.
     """
     expected = str(expected_text).strip().lower()
     similarity = cosine_similarity_text(transcript.strip().lower(), expected)
@@ -664,7 +666,7 @@ def _assert_transcript_matches(
             f"whisper-small below threshold ({similarity:.2f} <= {threshold}); "
             f"escalating to whisper-{escalation_model} to rule out an ASR mishear"
         )
-        strong_transcript = convert_audio_bytes_to_text(audio_bytes, model_size=escalation_model)
+        strong_transcript = convert_audio_bytes_to_text(audio_bytes, model_size=escalation_model, language=language)
         strong_similarity = cosine_similarity_text(strong_transcript.strip().lower(), expected)
         print(
             f"audio content (whisper-{escalation_model}): {strong_transcript}\n"
@@ -741,6 +743,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
                     expected_text,
                     threshold=0.9,
                     escalation_model=request_config.get("transcript_escalation_model"),
+                    language=request_config.get("transcript_language"),
                 )
         _assert_preset_voice_gender_from_audio(
             response.audio_bytes,

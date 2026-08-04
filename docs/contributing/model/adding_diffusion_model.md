@@ -653,7 +653,7 @@ python end2end.py --model your-org/your-model-name --modality text2img --prompts
 Mirror BAGEL’s online serving setup:
 
 - Server launcher: `examples/online_serving/your_model_name/run_server.sh`
-  - Wrap `vllm serve ... --omni --port ...` (and `--stage-configs-path ...` if needed)
+  - Wrap `vllm serve ... --omni --port ...` (and `--deploy-config ...` if needed)
 - Client: `examples/online_serving/your_model_name/openai_chat_client.py`
   - Send requests to `POST /v1/chat/completions`
   - Support multimodal inputs (e.g., base64 image) if your model needs it

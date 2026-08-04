@@ -92,6 +92,21 @@ class MockScheduler:
         # assume all new req finished
         return [req.request_id for req in sched_output.scheduled_new_reqs]
 
+    def get_request_state(self, request_id):
+        return None
+
+    def pop_request_state(self, request_id):
+        return None
+
+    def finish_requests(self, request_id, status):
+        pass
+
+    def close(self):
+        pass
+
+    def initialize(self, od_config):
+        pass
+
 
 class _BatchCapablePipeline:
     supports_request_batch = True
@@ -644,7 +659,7 @@ async def test_async_add_req_and_stream_response():
     engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
-    def _finalize(rid, out, err=None):
+    def _finalize(rid, out, err=None, **kwargs):
         # Stream consumers stop on ``finished``; keep result_data for assertions.
         return SimpleNamespace(result_data=out.result.result_data, finished=True)
 

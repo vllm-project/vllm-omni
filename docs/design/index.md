@@ -10,6 +10,7 @@ This section contains design documents and architecture specifications for vLLM-
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
+- [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
 
 ## Infrastructure Design Documents

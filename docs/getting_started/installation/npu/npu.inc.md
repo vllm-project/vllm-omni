@@ -53,16 +53,20 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 You can also build vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. (But sometimes it will break for a while. You can check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest commit of vLLM-Omni main branch on NPU.)
 
 ```bash
-# Pin vLLM version to 0.18.0
-git clone -b v0.18.0 https://github.com/vllm-project/vllm.git
+# Pin vLLM and vLLM-Ascend to the v0.26 release line
+git clone -b v0.26.0 https://github.com/vllm-project/vllm.git
+cd vllm
 VLLM_TARGET_DEVICE=empty pip install -v -e .
+cd ..
 
-git clone -b v0.18.0rc1 https://github.com/vllm-project/vllm-ascend.git
+git clone -b releases/v0.26.0rc https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
 pip install -v -e .
+cd ..
 
 # Install vLLM-Omni from the latest main branch
 git clone https://github.com/vllm-project/vllm-omni.git
-cd /vllm-workspace/vllm-omni
+cd vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
