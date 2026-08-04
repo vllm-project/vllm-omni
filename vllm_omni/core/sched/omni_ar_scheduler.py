@@ -147,7 +147,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return None
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when orchestrator will not run stage 1+ for this request (e.g. text-only).
+        """True when this stage-zero-final request does not need downstream KV.
 
         The result is cached per request to avoid repeated deserialization of
         additional_information on every scheduler tick.
@@ -162,7 +162,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             result = False
         else:
             info = deserialize_additional_information(payload)
-            result = info.get("omni_final_stage_id") == 0
+            result = info.get("omni_final_stage_id") == 0 and not bool(info.get("omni_force_kv_transfer", False))
 
         self._omits_kv_transfer_cache[rid] = result
         return result

@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,11 +63,19 @@ class FakeAsyncOmni:
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.captured_prompt = None
+        self.captured_reference_video_bytes = None
         self.captured_sampling_params_list = None
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        reference_videos = prompt.get("multi_modal_data", {}).get("video")
+        if (
+            isinstance(reference_videos, list)
+            and reference_videos
+            and all(isinstance(item, str) for item in reference_videos)
+        ):
+            self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
@@ -499,6 +508,44 @@ def test_v2v_video_generation_with_video_reference_form(test_client, mocker: Moc
     input_video = engine.captured_prompt["multi_modal_data"]["video"]
     assert len(input_video) == 2
     assert input_video[0].size == (32, 24)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_multi_video_generation_preserves_uploaded_files_until_generation(
+    endpoint,
+    test_client,
+    mocker: MockerFixture,
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Composite the subject from the first video into the second.",
+            "extra_params": json.dumps({"task": "ref2va", "duration": 15.0}),
+        },
+        files=[
+            ("input_references", ("subject.mp4", b"subject-video", "video/mp4")),
+            ("input_references", ("background.mov", b"background-video", "video/quicktime")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint.endswith("/sync"):
+        assert response.content == b"fake-video"
+    else:
+        video_id = response.json()["id"]
+        _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_videos = engine.captured_prompt["multi_modal_data"]["video"]
+    assert engine.captured_reference_video_bytes == [b"subject-video", b"background-video"]
+    assert len(input_videos) == 2
+    assert all(not Path(path).exists() for path in input_videos)
+    assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
+    assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
 
 
 def test_decode_video_bytes_can_keep_last_frames():
