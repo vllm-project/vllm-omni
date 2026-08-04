@@ -33,7 +33,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.quantization.component_config import safe_quant_config
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -526,7 +525,7 @@ class MiniMaxH3AdalnProj(nn.Module):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=safe_quant_config(quant_config),
+            quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
 
@@ -892,7 +891,7 @@ class MiniMaxH3DiTModel(nn.Module):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=None,
+            quant_config=quant_config,
             prefix="condition_proj",
         )
         self.time_embedder = MiniMaxH3TimeEmbedder(

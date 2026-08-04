@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -66,6 +67,12 @@ def _small_od_config():
 
 
 def test_fp8_scope_and_prefix_propagation(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
+
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
     monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
@@ -75,7 +82,14 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
     monkeypatch.setattr(h3, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
-    fp8_config = object()
+    ignored_layers = {
+        "token_refiner.blocks.0.mlp.fc2",
+        "blocks.0.attn.qkv_proj",
+        "condition_proj",
+        "blocks.0.adaln_proj.linear",
+        "final_layer.adaln_proj.linear",
+    }
+    fp8_config = Fp8Config(ignored_layers=sorted(ignored_layers))
     model = h3.MiniMaxH3DiTModel(
         _small_od_config(),
         quant_config=fp8_config,
@@ -91,15 +105,15 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
         "blocks.0.attn.out_proj",
         "blocks.0.mlp.fc1",
         "blocks.0.mlp.fc2",
+        "condition_proj",
+        "blocks.0.adaln_proj.linear",
+        "final_layer.adaln_proj.linear",
     }
     full_precision = {
         "video_patch_proj",
         "audio_patch_proj",
-        "condition_proj",
         "time_embedder.proj_in",
         "time_embedder.proj_out",
-        "blocks.0.adaln_proj.linear",
-        "final_layer.adaln_proj.linear",
         "final_layer.video_out",
         "final_layer.audio_out",
     }
@@ -108,6 +122,15 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
     assert full_precision <= linears.keys()
     assert all(linears[prefix] is fp8_config for prefix in quantized)
     assert all(linears[prefix] is None for prefix in full_precision)
+    assert {prefix for prefix in quantized if is_layer_skipped(prefix, fp8_config.ignored_layers)} == ignored_layers
+    linear = Mock(spec=LinearBase)
+    assert all(
+        isinstance(
+            fp8_config.get_quant_method(linear, prefix),
+            UnquantizedLinearMethod,
+        )
+        for prefix in ignored_layers
+    )
 
 
 class _WeightTarget(nn.Module):
@@ -172,13 +195,19 @@ def test_pipeline_resolves_transformer_component_quant_config():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_component_quant_config,
     )
+    from vllm_omni.quantization import build_quant_config
 
-    transformer_config = object()
+    ignored_layers = ["blocks.0.attn.qkv_proj"]
+    component_config = build_quant_config(
+        {
+            "transformer": {
+                "method": "fp8",
+                "ignored_layers": ignored_layers,
+            }
+        }
+    )
+    transformer_config = component_config.resolve("transformer")
 
-    class _ComponentConfig:
-        def resolve(self, component):
-            assert component == "transformer"
-            return transformer_config
-
-    assert _resolve_component_quant_config(_ComponentConfig(), "transformer") is transformer_config
+    assert transformer_config.ignored_layers == ignored_layers
+    assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
