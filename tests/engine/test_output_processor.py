@@ -10,9 +10,11 @@ import pytest
 import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
+from vllm.v1.metrics.stats import IterationStats, PrefillStats
 
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import output_processor
 from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
@@ -616,3 +618,48 @@ def test_no_detokenizer_final_only():
     result = s.make_request_output([], None, FinishReason.STOP, None)
     assert result is not None
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_mm_only_outputs_update_iteration_stats():
+    processor = MultimodalOutputProcessor(
+        tokenizer=None,
+        log_stats=True,
+        engine_core_output_type=AUDIO,
+    )
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+
+    prefill_stats = PrefillStats()
+    prefill_stats.set(
+        num_prompt_tokens=4,
+        num_local_cached_tokens=0,
+        num_external_cached_tokens=0,
+    )
+    output = OmniEngineCoreOutput(
+        request_id=state.request_id,
+        new_token_ids=[10, 11],
+        finish_reason=FinishReason.STOP,
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.0),
+        ],
+        prefill_stats=prefill_stats,
+        multimodal_output={AUDIO: torch.ones(1, 8)},
+    )
+    iteration_stats = IterationStats()
+
+    processor.process_outputs(
+        [output],
+        engine_core_timestamp=3.0,
+        iteration_stats=iteration_stats,
+    )
+
+    assert iteration_stats.num_prompt_tokens == 4
+    assert iteration_stats.num_generation_tokens == 2
+    assert len(iteration_stats.time_to_first_tokens_iter) == 1
+    assert len(iteration_stats.finished_requests) == 1
+    finished = iteration_stats.finished_requests[0]
+    assert finished.finish_reason == FinishReason.STOP
+    assert finished.num_prompt_tokens == state.prompt_len
+    assert finished.num_generation_tokens == 2
