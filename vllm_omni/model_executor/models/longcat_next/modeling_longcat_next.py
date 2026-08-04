@@ -330,6 +330,21 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             def _h(module, args, output):
                 if self._layer_rms_audited or not self._audio_debug:
                     return
+                # Hooks are armed once in __init__, before vLLM's own
+                # internal memory-profiling pass (a dummy, large-batch,
+                # zero-valued forward run used to size the KV cache before
+                # any real request). Nothing else resets this list between
+                # forward calls, so without this, the profiling pass's
+                # all-zero hidden states silently sit in _layer_rms until
+                # compute_logits reads it -- producing the exact
+                # `max_abs=0.0 rms=0.0` reading observed, not a real decode
+                # step's curve. Reset on every layer-0 hit so each new
+                # forward pass starts clean; since compute_logits reads
+                # _layer_rms immediately after the same forward pass
+                # completes, this guarantees it only ever sees that pass's
+                # real data.
+                if idx == 0:
+                    self._layer_rms = []
                 if isinstance(output, (tuple, list)):
                     hidden = output[0]
                 else:
