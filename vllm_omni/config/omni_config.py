@@ -467,6 +467,7 @@ class _DiffusionConfigProjection:
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     diffusion_load_format: str = "default"
+    materialize_safetensors_weights: bool = False
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None

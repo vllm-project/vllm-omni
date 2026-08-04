@@ -74,6 +74,23 @@ def download_gguf(
 logger = init_logger(__name__)
 
 
+def _materialize_safetensors_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    enabled: bool,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Detach safetensors mmap storage before a platform device copy.
+
+    Some device runtimes can stall when copying directly from an mmap-backed
+    CPU tensor. This opt-in iterator keeps only one materialized tensor alive
+    at a time, so peak host memory grows by at most the current tensor size.
+    """
+    for name, tensor in weights:
+        if enabled and tensor.device.type == "cpu":
+            tensor = tensor.clone()
+        yield name, tensor
+
+
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
     model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
@@ -259,6 +276,11 @@ class DiffusersPipelineLoader:
                 hf_weights_files,
                 self.load_config.use_tqdm_on_load,
                 self.load_config.safetensors_load_strategy,
+            )
+        if use_safetensors:
+            weights_iterator = _materialize_safetensors_weights(
+                weights_iterator,
+                enabled=self.od_config.materialize_safetensors_weights,
             )
 
         if self.counter_before_loading_weights == 0.0:

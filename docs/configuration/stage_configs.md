@@ -48,7 +48,22 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
+| `materialize_safetensors_weights` | bool | optional | `false` | Diffusion stages only. Materialize CPU safetensors into owned host memory before device copies. |
 | `engine_extras` | dict | optional | `{}` | Catch-all for keys not listed above; deep-merged across overlays. Also carries per-stage overrides of pipeline-wide settings (e.g. stage-specific `dtype`). |
+
+#### Materializing safetensors before device copies
+
+For diffusion stages, enable `materialize_safetensors_weights` when direct device copies from memory-mapped safetensors stall on the target accelerator:
+
+```yaml
+stages:
+  - stage_id: 1
+    materialize_safetensors_weights: true
+```
+
+The option defaults to `false`. When enabled, the diffusion loader clones each CPU tensor yielded by the safetensors iterator before passing it to the model weight loader. It has no effect on other checkpoint formats or tensors that are already on another device.
+
+Only the tensor currently being loaded is materialized. Peak additional host-memory usage is therefore approximately the size of the largest individual tensor in the checkpoint.
 
 ### Connector schema
 
