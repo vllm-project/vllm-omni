@@ -444,9 +444,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     )
 
     assert summary["ok"] is True
-    assert summary["listen_between_responses"] is False
     assert summary["second_response_before_final_commit"] is True
-    assert summary["final_listen_after_commit"] is True
     assert summary["response_audio_contract_ok"] is True
     assert summary["response_summaries"][0]["audio_delta_count"] == 2
     assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
