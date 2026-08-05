@@ -12,6 +12,8 @@ stages:
   - stage_id: 1
     devices: "0"
     gpu_memory_utilization: 0.15
+    max_model_len: 32768
   - stage_id: 2
     devices: "0"
     gpu_memory_utilization: 0.05
+    max_model_len: 32768
