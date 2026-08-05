@@ -108,12 +108,13 @@ def _post_commit_model_decision(
         return None
     for event in events[committed_index + 1 :]:
         event_type = event.get("type")
-        if event_type == "response.listen":
-            return "listen"
         if event_type == "response.done":
             response = event.get("response")
-            if not isinstance(response, dict) or response.get("status") != "cancelled":
-                return "speak"
+            if isinstance(response, dict) and response.get("status") == "cancelled":
+                return "listen"
+            return "speak"
+        if event_type == "response.created":
+            return "speak"
     return None
 
 
@@ -124,12 +125,14 @@ def _latest_model_decision(
     decision: str | None = None
     for event in events[max(after_index, 0) :]:
         event_type = event.get("type")
-        if event_type == "response.listen":
-            decision = "listen"
-        elif event_type == "response.done":
+        if event_type == "response.done":
             response = event.get("response")
-            if not isinstance(response, dict) or response.get("status") != "cancelled":
+            if isinstance(response, dict) and response.get("status") == "cancelled":
+                decision = "listen"
+            else:
                 decision = "speak"
+        elif event_type == "response.created":
+            decision = "speak"
     return decision
 
 
@@ -294,7 +297,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         result = {
             "ok": (
                 client.events.count("session.created") > 0
-                and client.events.count("session.closed") > 0
                 and not errors
                 and model_decision is not None
                 and (bool(audio) or not args.require_audio)
@@ -305,11 +307,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
                 "input_had_residual_model_unit": input_has_residual_model_unit,
-                "response_listen_count": _event_count_after(
-                    client.events.events,
-                    "response.listen",
-                    committed_index,
-                ),
                 "response_done_count": _event_count_after(
                     client.events.events,
                     "response.done",
