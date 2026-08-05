@@ -433,6 +433,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         diffusion_engine: "Any",
         model_name: str,
         stage_configs: "list[Any] | None" = None,
+        allowed_local_media_path: str = "",
+        allowed_media_domains: list[str] | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -444,6 +446,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
+        instance._allowed_local_media_path = allowed_local_media_path
+        instance._allowed_media_domains = allowed_media_domains
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
         instance._is_fish_speech = False
@@ -2017,7 +2021,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # In diffusion mode, model_config may not be available
         if self._diffusion_mode:
-            connector = MediaConnector()
+            connector = MediaConnector(
+                allowed_local_media_path=self._allowed_local_media_path,
+                allowed_media_domains=self._allowed_media_domains,
+            )
         else:
             model_config = self.model_config
             connector = MediaConnector(
