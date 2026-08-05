@@ -1964,36 +1964,21 @@ def test_auto_response_force_barge_in_has_no_waiting_turn_variant():
     )
 
 
-def test_duplex_endpoint_requires_explicit_session_mode_duplex():
-    assert should_enable_duplex_endpoint(None) is False
-    assert should_enable_duplex_endpoint([]) is False
-    assert should_enable_duplex_endpoint([SimpleNamespace(session_mode="turn")]) is False
-    assert should_enable_duplex_endpoint([{"session_mode": "turn"}]) is False
+def test_duplex_endpoint_enabled_by_pipeline_adapter():
+    assert should_enable_duplex_endpoint() is False
+    assert should_enable_duplex_endpoint(engine_client=SimpleNamespace()) is False
     assert (
         should_enable_duplex_endpoint(
-            [
-                SimpleNamespace(session_mode="turn"),
-                SimpleNamespace(session_mode="duplex"),
-            ]
+            engine_client=SimpleNamespace(duplex_serving_adapter_path=None),
+        )
+        is False
+    )
+    assert (
+        should_enable_duplex_endpoint(
+            engine_client=SimpleNamespace(duplex_serving_adapter_path="some.module.Adapter"),
         )
         is True
     )
-    assert should_enable_duplex_endpoint([{"session_mode": "duplex"}]) is True
-
-
-def test_duplex_endpoint_supports_top_level_session_mode(tmp_path):
-    config_path = tmp_path / "stage_config.yaml"
-    config_path.write_text(
-        """
-session_mode: duplex
-stage_args:
-  - stage_id: 0
-    engine_args: {}
-""",
-        encoding="utf-8",
-    )
-
-    assert should_enable_duplex_endpoint([], config_path=str(config_path)) is True
 
 
 def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
