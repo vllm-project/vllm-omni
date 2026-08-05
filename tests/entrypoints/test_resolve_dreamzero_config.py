@@ -1,6 +1,6 @@
 import pytest
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model, resolve_model_config_path
 
@@ -61,3 +61,46 @@ def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch
     proc._enrich_config()
 
     assert od_config.model_class_name == "DreamZeroPipeline"
+
+
+def test_dreamzero_resolve_model_class_name(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda path, _model: None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]},
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.utils.hf_utils._looks_like_dreamzero",
+        lambda _model: True,
+    )
+
+    assert resolve_model_class_name("GEAR-Dreams/DreamZero-DROID") == "DreamZeroPipeline"
+
+
+def test_non_dreamzero_vla_does_not_use_architecture_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda path, _model: None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]},
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.utils.hf_utils._looks_like_dreamzero",
+        lambda _model: False,
+    )
+
+    assert resolve_model_class_name("some-vla-model") is None
+
+
+def test_non_dreamzero_vla_still_raises(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda path, _model: None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]},
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.utils.hf_utils._looks_like_dreamzero",
+        lambda _model: False,
+    )
+
+    od_config = OmniDiffusionConfig(model="some-vla-model")
+    proc = StageDiffusionProc(od_config.model, od_config)
+
+    with pytest.raises(FileNotFoundError):
+        proc._enrich_config()
