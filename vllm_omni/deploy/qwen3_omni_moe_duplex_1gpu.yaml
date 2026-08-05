@@ -1,12 +1,16 @@
 # Single-GPU Qwen3-Omni-MoE duplex deployment (all stages on cuda:0).
+# Weights: stage0 ~60 GiB, stage1 ~6 GiB, stage2 ~0.5 GiB = ~67 GiB.
+# On a 96 GiB GPU the fractions must leave room for all three sets of
+# weights plus KV cache.  stage0 gets the lion's share; stages 1+2 get
+# just enough for their weights and a small KV budget.
 base_config: qwen3_omni_moe_duplex.yaml
 stages:
   - stage_id: 0
     devices: "0"
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.7
   - stage_id: 1
     devices: "0"
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.15
   - stage_id: 2
     devices: "0"
     gpu_memory_utilization: 0.05
