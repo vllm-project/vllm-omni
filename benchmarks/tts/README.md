@@ -40,7 +40,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"Base"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
 
@@ -58,7 +58,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
 
@@ -76,9 +76,27 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"VoiceDesign","language":"English"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
+
+#### Streaming continuity (`audio_underrun`)
+
+`audio_underrun` (seconds) is the per-request worst-case buffer deficit
+under a realtime-rate player simulation. The audio-speech backend records
+chunk arrival times during the SSE stream and surfaces:
+
+- `Mean / Median / P{50,99} AUDIO_UNDERRUN (s)` per the standard percentile
+  output - any positive value means at least one inter-chunk gap was longer
+  than the chunk's audio duration.
+- `Streaming continuity OK rate` - fraction of requests whose worst-case
+  underrun stayed under the threshold (default 100 ms, the commonly cited
+  "audible gap" budget). Override the threshold with
+  `VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S=<float>`.
+
+This captures the failure mode where `RTF_p50 < 1` (server keeps up in
+aggregate) but per-stream chunk arrival is bursty enough that listeners
+still hear gaps - common at high concurrency on streaming TTS pipelines.
 
 #### Add WER / SIM / UTMOS to any of the above
 
@@ -215,7 +233,6 @@ sentinel for regressions in this area.
 benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
-├── bench_voxcpm_offline.py    CLI — offline VoxCPM benchmark (sync + streaming)
 ├── plot_results.py            Generate per-task / per-concurrency curves
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```

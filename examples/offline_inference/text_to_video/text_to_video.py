@@ -11,12 +11,23 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 _MODEL_PRESETS = {
+    "vace": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 81,
+        "num_inference_steps": 30,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "vace_t2v_output.mp4",
+    },
     "wan": {
         "height": 720,
         "width": 1280,
@@ -35,13 +46,86 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "cosmos": {
+        "height": 720,
+        "width": 1280,
+        "num_frames": 189,
+        "num_inference_steps": 35,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "flow_shift": 10.0,
+        "output": "cosmos3_t2v_output.mp4",
+    },
+    # Cosmos3-Edge is a compact checkpoint with its own native resolution / guidance /
+    # flow_shift. It must NOT inherit the Nano/Super "cosmos" numbers above (720p / gs 6.0 /
+    # flow_shift 10.0), which produce degenerate output on Edge.
+    "cosmos3_edge": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 189,
+        "num_inference_steps": 35,
+        "guidance_scale": 5.0,
+        "fps": 24,
+        "flow_shift": 3.0,
+        "output": "cosmos3_edge_t2v_output.mp4",
+    },
+    "helios": {
+        "height": 384,
+        "width": 640,
+        "num_frames": 99,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "helios_output.mp4",
+    },
+    "ltx2": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 40,
+        "fps": 24,
+        "output": "ltx2_output.mp4",
+    },
+    "ltx2_distilled": {
+        "height": 1024,
+        "width": 1536,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "fps": 24,
+        "output": "ltx2_distilled_output.mp4",
+    },
+    "ltx23": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 30,
+        "fps": 24,
+        "output": "ltx23_output.mp4",
+    },
 }
 
 
-def _detect_preset(model: str) -> dict:
+def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
+    class_lower = (model_class_name or "").lower()
+    if "distilled" in class_lower or "distilled" in model_lower:
+        return _MODEL_PRESETS["ltx2_distilled"]
+    if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
+        return _MODEL_PRESETS["ltx23"]
+    if "ltx2" in class_lower or "ltx-2" in model_lower or "ltx_2" in model_lower:
+        return _MODEL_PRESETS["ltx2"]
+    if "vace" in model_lower:
+        return _MODEL_PRESETS["vace"]
+    # Edge must be matched before the generic cosmos branch (its "cosmos" substring would
+    # otherwise pick up the Nano/Super 720p / gs 6.0 / flow_shift 10.0 preset).
+    if ("cosmos" in model_lower or "cosmos" in class_lower) and ("edge" in model_lower or "edge" in class_lower):
+        return _MODEL_PRESETS["cosmos3_edge"]
+    if "cosmos" in model_lower:
+        return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "helios" in model_lower:
+        return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -55,10 +139,26 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def parse_extra_body(value: str) -> dict[str, Any]:
+    """Parse a JSON object of model-specific extra_body params.
+
+    Pipeline-declared knobs (see vllm_omni/model_extras/) are merged into
+    OmniDiffusionSamplingParams.extra_args, so a single generic example can
+    drive model-specific behaviour without bespoke per-model flags.
+    """
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return body
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -70,10 +170,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+        help="Override model class name (e.g., LTX2Pipeline).",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help="JSON dict of model-specific extra_body params (declared in vllm_omni/model_extras/), "
+        "merged into sampling extra_args. Unknown keys for the chosen model are dropped. "
+        'Cosmos3 example: \'{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false, '
+        '"use_resolution_template": false, "use_duration_template": false}\' '
+        '(add "generate_sound": true and optional "sound_duration" for synchronized audio). '
+        'Helios-Distilled example: \'{"is_enable_stage2": true, '
+        '"pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}\'.',
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -143,6 +260,32 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=24000,
+        help="Sample rate for audio output when saved (default: 24000).",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
+    )
+
+    # Distributed and parallel execution
+    parser.add_argument(
         "--ulysses-mode",
         type=str,
         default="strict",
@@ -175,39 +318,21 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=24000,
-        help="Sample rate for audio output when saved (default: 24000).",
-    )
-    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     parser.add_argument(
+        "--pipeline-parallel-size",
+        type=int,
+        default=1,
+        help="Number of pipeline parallel stages.",
+    )
+    parser.add_argument(
         "--enable-expert-parallel",
         action="store_true",
         help="Enable expert parallelism for MoE layers.",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
-    )
-    parser.add_argument(
-        "--profiler-config",
-        type=parse_profiler_config,
-        default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
-    )
-    parser.add_argument(
-        "--quantization",
-        type=str,
-        default=None,
-        choices=["fp8", "mxfp8", "int8", "gguf"],
-        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
     )
     parser.add_argument(
         "--use-hsdp",
@@ -229,11 +354,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _extract_peak_memory_mb(result: Any) -> float:
+    """Pull worker-reported peak VRAM (MiB) generation result.
+
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if result is None:
+        return 0.0
+    val = getattr(result, "peak_memory_mb", 0.0)
+    if not val:
+        inner = getattr(result, "request_output", None)
+        if isinstance(inner, list):
+            inner = inner[0] if inner else None
+        val = getattr(inner, "peak_memory_mb", 0.0)
+    try:
+        return float(val or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def main():
     args = parse_args()
     model_class_name = args.model_class_name
 
-    preset = _detect_preset(args.model)
+    preset = _detect_preset(args.model, model_class_name)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
@@ -262,6 +408,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
     )
 
@@ -281,6 +428,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if args.boundary_ratio is not None:
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
     if args.flow_shift is not None:
@@ -292,7 +441,14 @@ def main():
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
 
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni) or model_class_name
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -307,14 +463,18 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
+        f" enable_expert_parallel={args.enable_expert_parallel}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
     prompt_dict = {"prompt": args.prompt}
-    if args.negative_prompt:
+    if args.negative_prompt is not None:
         prompt_dict["negative_prompt"] = args.negative_prompt
+    elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        prompt_dict["negative_prompt"] = ""
 
     sampling_kwargs = dict(
         height=args.height,
@@ -327,10 +487,20 @@ def main():
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 
+    sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
+    # Route model-specific knobs through extra_body, filtered against the model's
+    # declared extra_body_params. Models without a declaration only forward explicit
+    # --extra-body JSON (preserving the generic flags' legacy behavior).
+    extra_body = dict(args.extra_body or {})
+    if declared_extra_body_params:
+        apply_declared_extra_args(sampling_params, declared_extra_body_params, extra_body)
+    elif extra_body:
+        sampling_params.extra_args.update({k: v for k, v in extra_body.items() if v is not None})
+
     generation_start = time.perf_counter()
     frames = omni.generate(
         prompt_dict,
-        OmniDiffusionSamplingParams(**sampling_kwargs),
+        sampling_params,
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -338,7 +508,12 @@ def main():
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
+    peak_mb = _extract_peak_memory_mb(frames)
+    if peak_mb:
+        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -349,11 +524,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -361,6 +538,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -373,6 +551,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -381,6 +560,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -495,7 +675,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(args.fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

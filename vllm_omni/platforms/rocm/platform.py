@@ -10,6 +10,7 @@ from vllm.platforms.rocm import RocmPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.rocm.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -29,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -51,6 +52,10 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     _omni_enum = OmniPlatformEnum.ROCM
 
+    def __init__(self):
+        super().__init__()
+        apply_patches()
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
@@ -70,7 +75,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        """Get the diffusion attention backend class path for ROCm platform.
+
+        ROCm supports FLASH_ATTN via the aiter library, and SDPA as fallback.
+
+        Args:
+            selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
+                "TORCH_SDPA"). If None, uses platform default.
+            head_size: Attention head size.
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
+        Returns:
+            Fully qualified class path of the selected backend.
+        """
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         # Check if aiter is available for Flash Attention support
@@ -83,6 +102,14 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on ROCm. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             if backend_upper == "FLASH_ATTN" and not aiter_supported:
                 logger.warning(
                     "Flash Attention requires `aiter` library which is only supported "
@@ -109,7 +136,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/rocm/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
@@ -133,9 +160,24 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         torch.accelerator.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.cuda.mem_get_info(device)
+        return free, total
 
     @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
@@ -153,10 +195,18 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from vllm/platforms/rocm/platform.py v0.20.0 with force using vllm_c kernels"""
+        """Copied from upstream RocmPlatform with inductor-aware logic.
+
+        When inductor is active (compiling) use native as the default;
+        otherwise prefer vllm_c kernels where available.
+        Preserves omni-specific is_custom_op_enabled('rms_norm') check.
+        """
+        from vllm.config.compilation import CompilationMode
+
         # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
         cc = vllm_config.compilation_config
-        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         # This (mostly) preserves previous CustomOp behavior
         # Necessary on ROCm because it's common that users
@@ -167,4 +217,4 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)

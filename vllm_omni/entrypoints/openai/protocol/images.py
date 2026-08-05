@@ -7,12 +7,26 @@ This module provides Pydantic models that follow the OpenAI DALL-E API specifica
 for text-to-image generation, with vllm-omni specific extensions.
 """
 
+import base64
+import io
+import uuid
+import zipfile
 from enum import Enum
-from typing import Any
+from http import HTTPStatus
+from typing import Any, Literal
 
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+
+_IMAGE_FILE_METADATA = {
+    "jpg": ("jpg", "image/jpeg"),
+    "jpeg": ("jpeg", "image/jpeg"),
+    "png": ("png", "image/png"),
+    "webp": ("webp", "image/webp"),
+}
 
 
 class ResponseFormat(str, Enum):
@@ -20,6 +34,7 @@ class ResponseFormat(str, Enum):
 
     B64_JSON = "b64_json"
     URL = "url"  # Not implemented in PoC
+    FILE = "file"  # file response
 
 
 class ImageGenerationRequest(BaseModel):
@@ -32,6 +47,11 @@ class ImageGenerationRequest(BaseModel):
 
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")
+    bot_task: str | None = Field(
+        None,
+        description="Task mode for the model (e.g., 'cot' enables chain-of-thought generation). "
+        "Only supported by specific diffusion models.",
+    )
 
     # OpenAI standard fields
     model: str | None = Field(
@@ -47,7 +67,7 @@ class ImageGenerationRequest(BaseModel):
     user: str | None = Field(default=None, description="User identifier for tracking")
     layers: int | None = Field(
         default=None,
-        description="Number of output layers for layered image models. Supported range: 3-10.",
+        description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
     @field_validator("size")
@@ -68,9 +88,9 @@ class ImageGenerationRequest(BaseModel):
     @field_validator("response_format")
     @classmethod
     def validate_response_format(cls, v):
-        """Validate response format - only b64_json is supported."""
-        if v is not None and v != ResponseFormat.B64_JSON:
-            raise ValueError(f"Only 'b64_json' response format is supported, got: {v}")
+        """Validate response format - only b64_json and file are supported."""
+        if v is not None and v not in (ResponseFormat.B64_JSON, ResponseFormat.FILE):
+            raise ValueError(f"Only 'b64_json' or 'file' response format is supported, got: {v}")
         return v
 
     @field_validator("layers")
@@ -116,6 +136,13 @@ class ImageGenerationRequest(BaseModel):
         ge=0.0,
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
+    )
+    flow_shift: float | None = Field(
+        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
@@ -164,5 +191,95 @@ class ImageGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
-    output_format: str = Field(None, description="The output format of the image generation")
+    output_format: str | None = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
+    cot_output: str | None = Field(
+        None,
+        description="Chain-of-thought text output from the AR stage. "
+        "Only present for image editing (IT2I) with CoT-enabled models.",
+    )
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request generation metrics.",
+    )
+
+    def stream_response(self) -> StreamingResponse:
+        if not self.data or not self.data[0].b64_json:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail="No image data available for file response.",
+            )
+        extension, media_type = _IMAGE_FILE_METADATA.get(
+            (self.output_format or "png").lower(),
+            _IMAGE_FILE_METADATA["png"],
+        )
+        if len(self.data) == 1:
+            image_bytes = base64.b64decode(self.data[0].b64_json)
+            filename = f"image_{uuid.uuid4().hex[:8]}.{extension}"
+            return StreamingResponse(
+                io.BytesIO(image_bytes),
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(image_bytes)),
+                },
+            )
+        else:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for idx, item in enumerate(self.data):
+                    if item.b64_json:
+                        zf.writestr(f"image_{idx}.{extension}", base64.b64decode(item.b64_json))
+            zip_bytes = zip_buffer.getvalue()
+            filename = f"images_{uuid.uuid4().hex[:8]}.zip"
+            return StreamingResponse(
+                io.BytesIO(zip_bytes),
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(zip_bytes)),
+                },
+            )
+
+
+class ImageEditARDeltaChunk(BaseModel):
+    """Streaming chunk carrying a text delta from the image-edit AR stage."""
+
+    object: Literal["image.edit.chunk"] = "image.edit.chunk"
+    type: Literal["ar_delta"] = "ar_delta"
+    delta: str = Field(..., description="Text delta generated by the AR stage")
+    index: int = Field(default=0, description="Completion index for the AR stage output")
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image edit request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional vLLM-Omni per-stage metrics snapshot for benchmark clients.",
+    )
+
+
+class ImageEditImageChunk(BaseModel):
+    """Streaming chunk carrying the final image-edit result."""
+
+    object: Literal["image.edit.chunk"] = "image.edit.chunk"
+    type: Literal["image"] = "image"
+    data: list[ImageData] = Field(..., description="Array of generated images")
+    output_format: str = Field(..., description="The output format of the image generation")
+    size: str = Field(..., description="The generated image size")
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image edit request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional vLLM-Omni per-stage metrics snapshot for benchmark clients.",
+    )
+
+
+class ImageEditStreamError(BaseModel):
+    """Streaming error chunk emitted before the terminal [DONE] event."""
+
+    object: Literal["error"] = "error"
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image edit request")
+    error: dict[str, Any] = Field(..., description="OpenAI-compatible streaming error payload")
+
+
+ImageEditStreamResponse = ImageEditARDeltaChunk | ImageEditImageChunk | ImageEditStreamError

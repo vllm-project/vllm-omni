@@ -133,10 +133,17 @@ class DiffusionMXFP8Config(QuantizationConfig):
                 if self.is_checkpoint_mxfp8_serialized:
                     return NPUMxfp8LinearMethod(self)
                 return NPUMxfp8OnlineLinearMethod(self)
-            # Placeholder for future platforms: add `elif is_cuda(): ...` here.
+            if current_omni_platform.is_xpu():
+                if self.is_checkpoint_mxfp8_serialized:
+                    raise NotImplementedError(
+                        "Native MXFP8 offline mode is not supported on XPU. "
+                        "Use AutoRound MXFP8 checkpoints (quant_method='auto-round', data_type='mx_fp') instead, "
+                        "or use online MXFP8 mode without is_checkpoint_mxfp8_serialized."
+                    )
+                return VllmMxfp8OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP8Config (W8A8 MXFP8) is currently only supported "
-                "on NPU (Ascend) platforms. CUDA support is not yet implemented."
+                "on NPU (Ascend) and XPU (Intel) platforms."
             )
         return None
 
@@ -450,3 +457,64 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
         replace_parameter(layer, "weight", weight_fp8)
         replace_parameter(layer, "weight_scale", weight_scale)
         layer._already_called_process_weights_after_loading = True
+
+
+# ---------------------------------------------------------------------------
+# vLLM kernel-based methods (XPU, CUDA, ROCm — any platform with Mxfp8LinearKernel)
+# ---------------------------------------------------------------------------
+# Note: VllmMxfp8OfflineLinearMethod removed - XPU only supports AutoRound MXFP8 offline
+#       (see IncMxfp8OfflineLinearMethod in inc_config.py)
+
+try:
+    from vllm.model_executor.layers.quantization.online.mxfp8 import (
+        Mxfp8OnlineLinearMethod as _VllmMxfp8OnlineBase,
+    )
+except ImportError as e:
+    raise ImportError(
+        "vLLM MXFP8 support is not available. "
+        "Online MXFP8 quantization requires vLLM with MXFP8 kernel support. "
+        "Please upgrade vLLM or use a compatible build."
+    ) from e
+
+
+class VllmMxfp8OnlineLinearMethod(_VllmMxfp8OnlineBase):
+    """Online MXFP8 linear method extending vLLM's implementation with 3D tensor support.
+
+    Loads BF16 weights, quantizes to MXFP8 at load time using vLLM's kernel.
+    Adds reshape logic to handle 3D tensors from diffusion models.
+
+    Inherits from vLLM's Mxfp8OnlineLinearMethod and only overrides __init__ and apply().
+    __init__ directly initializes the kernel without calling super().__init__() to avoid
+    vLLM config dependency in unit tests. All other methods (create_weights,
+    process_weights_after_loading) are inherited directly from vLLM.
+    """
+
+    def __init__(self) -> None:
+        """Initialize kernel directly without calling parent __init__ to avoid config dependency.
+
+        TODO: skipping super().__init__() couples this to vLLM internals. If the parent
+        adds required initialization, consider a version-aware assertion or calling
+        super().__init__() with a fallback config.
+        """
+        from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+
+        self.kernel = init_mxfp8_linear_kernel()
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply with 3D tensor support for diffusion models.
+
+        vLLM's kernel expects 2D tensors (M, K), but diffusion models pass
+        3D tensors (batch, seq, hidden). Flatten before kernel, reshape after.
+        """
+        ori_shape = x.shape
+        if x.dim() > 2:
+            x = x.reshape(-1, ori_shape[-1])
+        output = super().apply(layer, x, bias)
+        if len(ori_shape) > 2:
+            output = output.reshape(*ori_shape[:-1], -1)
+        return output

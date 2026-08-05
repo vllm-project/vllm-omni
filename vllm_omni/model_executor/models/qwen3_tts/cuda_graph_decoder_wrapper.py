@@ -7,6 +7,7 @@ This module provides CUDA Graph acceleration for the speech tokenizer decoder,
 reducing kernel launch overhead during inference.
 """
 
+import bisect
 import os
 import time
 from collections import Counter
@@ -43,7 +44,13 @@ def _batched_chunked_decode(
     left_context_size: int = 25,
     max_batch_size: int = 0,
 ) -> torch.Tensor:
-    """Decode a padded batch by grouping same-round chunks across requests."""
+    """Decode a padded batch by grouping same-round chunks across requests.
+
+    Assumes ``decode_fn`` returns exactly ``chunk_len * total_upsample`` samples per
+    chunk (causal-conv trim constant C = 0, e.g. Qwen3-TTS) and raises otherwise. It
+    is not used by short-output decoders such as Qwen3-Omni Code2Wav (C = 555), which
+    go through the per-request ``chunked_decode`` / ``chunked_decode_streaming`` paths.
+    """
     if codes.dim() < 3:
         raise ValueError(f"Expected codes with shape [B, Q, F], got {tuple(codes.shape)}")
     if chunk_size <= 0:
@@ -225,9 +232,11 @@ class CUDAGraphDecoderWrapper:
         return sorted(sizes)
 
     def _get_padded_size(self, actual_size: int) -> int | None:
-        for size in self._bucket_sizes:
-            if actual_size <= size:
-                return size
+        # bisect_left over the pre-sorted _bucket_sizes is O(log n) vs the linear scan;
+        # this matters because _decode invokes it on every per-chunk replay.
+        idx = bisect.bisect_left(self._bucket_sizes, actual_size)
+        if idx < len(self._bucket_sizes):
+            return self._bucket_sizes[idx]
         return None
 
     def _get_capture_shapes(self) -> list[tuple[int, int]]:
@@ -508,8 +517,7 @@ class CUDAGraphDecoderWrapper:
                 static_input.zero_()
                 static_input[:, :, :actual_size] = codes
             self._compiled_graphs[compile_key].replay()
-            actual_out_len = actual_size * self.decoder.total_upsample
-            output = self._compiled_static_outputs[compile_key][..., :actual_out_len]
+            output = self._trim_replay_output(self._compiled_static_outputs[compile_key], actual_size, compiled_size)
             if clone_graph_output:
                 return output.clone()
             return output
@@ -539,11 +547,25 @@ class CUDAGraphDecoderWrapper:
             static_input[:, :, :actual_size] = codes
         self.graphs[graph_key].replay()
 
-        actual_out_len = actual_size * self.decoder.total_upsample
-        output = self.static_outputs[graph_key][..., :actual_out_len]
+        output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, padded_size)
         if clone_graph_output:
             return output.clone()
         return output
+
+    def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:
+        """Trim a graph/compiled replay output to the eager-equivalent length.
+
+        The captured ``static_output`` already reflects the decoder's TRUE output
+        length for ``padded_size`` frames, which for causal decoders (e.g.
+        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
+        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
+        ``total_upsample`` trailing samples that are stale buffer content, so trim
+        relative to the captured length instead of the nominal length. This is a
+        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
+        """
+        drop = (padded_size - actual_size) * self.decoder.total_upsample
+        actual_out_len = max(0, static_output.shape[-1] - drop)
+        return static_output[..., :actual_out_len]
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         return self._decode(codes, clone_graph_output=True)
@@ -554,10 +576,10 @@ class CUDAGraphDecoderWrapper:
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
+        wavs = []
         start_index = 0
         total_len = codes.shape[-1]
         total_upsample = self.decoder.total_upsample
-        wav_out = None
 
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
@@ -566,21 +588,16 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self._decode(codes_chunk, clone_graph_output=False)
 
-            if wav_out is None:
-                wav_out = torch.empty(
-                    (*wav_chunk.shape[:-1], total_len * total_upsample),
-                    dtype=wav_chunk.dtype,
-                    device=wav_chunk.device,
-                )
-            src_start = context_size * total_upsample
-            dst_start = start_index * total_upsample
-            dst_end = end_index * total_upsample
-            wav_out[..., dst_start:dst_end].copy_(wav_chunk[..., src_start:])
+            # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
+            # that is shorter than the nominal code_len * total_upsample length.
+            # Clone each slice because graph outputs are static buffers that later
+            # replays may overwrite.
+            wavs.append(wav_chunk[..., context_size * total_upsample :].clone())
             start_index = end_index
 
-        if wav_out is None:
+        if not wavs:
             return self.decoder(codes)
-        return wav_out
+        return torch.cat(wavs, dim=-1)
 
     def batched_chunked_decode_with_cudagraph(
         self,

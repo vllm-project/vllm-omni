@@ -51,16 +51,23 @@ def build_payload(
     response_format: str = "wav",
     stream: bool = False,
 ) -> dict:
-    """Build the /v1/audio/speech request payload."""
+    """Build the /v1/audio/speech request payload.
+
+    Fish Speech has no built-in speakers; omit ``voice`` so the model
+    generates with a random timbre (controllable via text tags like
+    ``[cool]``, ``[warm]``, etc.).  When ``ref_audio`` is supplied we
+    enter voice-cloning mode instead.
+    """
     if not text or not text.strip():
         raise gr.Error("Please enter text to synthesize.")
 
     payload: dict = {
         "input": text.strip(),
-        "voice": "default",
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
     }
+    if stream:
+        payload["stream_format"] = "audio"
 
     # Voice cloning: ref_audio takes priority over URL.
     ref_url_stripped = ref_audio_url.strip() if ref_audio_url else ""
@@ -193,7 +200,8 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.5):
 
                 with gr.Accordion("Voice Cloning (optional)", open=False):
                     gr.Markdown(
-                        "Upload or link a short reference audio (10-30s) and provide its transcript to clone the voice."
+                        "Upload or link a short reference audio (10-30s) and provide its transcript to clone the voice. "
+                        "Leave empty for random timbre; use text tags like `[cool]`, `[warm]`, `[happy]` to steer the output."
                     )
                     ref_audio = gr.Audio(
                         label="Reference Audio",

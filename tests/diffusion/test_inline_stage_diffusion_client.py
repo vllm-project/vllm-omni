@@ -46,6 +46,7 @@ def client(mock_engine):
     )
     with patch.object(InlineStageDiffusionClient, "_enrich_config"):
         od_config = MagicMock(spec=OmniDiffusionConfig)
+        od_config.streaming_output = False
         c = InlineStageDiffusionClient(model="test_model", od_config=od_config, metadata=metadata, batch_size=1)
         yield c
         c.shutdown()
@@ -53,9 +54,12 @@ def client(mock_engine):
 
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_success(client, mock_engine):
-    # Setup mock engine step to return a successful result
     mock_result = OmniRequestOutput.from_diffusion(request_id="req-1", images=[MagicMock()])
-    mock_engine.step.return_value = [mock_result]
+
+    async def _step_streaming(_request):
+        yield [mock_result]
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-1", "A test prompt", sampling_params)
@@ -69,13 +73,44 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
-    mock_engine.step.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inline_dispatch_request_streaming_success(client, mock_engine):
+    """Inline StageDiffusionClient correctly receives streaming chunk output from Diffusion Engine"""
+    chunks = [
+        OmniRequestOutput.from_diffusion(request_id="req-stream", images=[], finished=False),
+        OmniRequestOutput.from_diffusion(request_id="req-stream", images=[], finished=True),
+    ]
+
+    async def _step_streaming(_request):
+        for chunk in chunks:
+            yield [chunk]
+
+    client.od_config.streaming_output = True
+    mock_engine.step_streaming = _step_streaming
+
+    await client.add_request_async("req-stream", "A test prompt", OmniDiffusionSamplingParams())
+
+    outputs = []
+    for _ in range(20):
+        output = client.get_diffusion_output_nowait()
+        if output is not None:
+            outputs.append(output)
+            if output.finished:
+                break
+        await asyncio.sleep(0.01)
+
+    assert outputs == chunks
 
 
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_error(client, mock_engine):
-    # Setup mock engine step to raise an exception
-    mock_engine.step.side_effect = RuntimeError("Engine failure")
+    async def _step_streaming(_request):
+        raise RuntimeError("Engine failure")
+        yield  # pragma: no cover
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-err", "A test prompt", sampling_params)

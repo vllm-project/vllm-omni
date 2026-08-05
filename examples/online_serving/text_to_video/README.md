@@ -10,6 +10,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 
 ## Wan2.2 T2V
 
@@ -87,14 +88,17 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+
+`VLLM_OMNI_STORAGE_PATH` and `VLLM_OMNI_STORAGE_MAX_CONCURRENCY` are deprecated and will be
+removed in a future release; use the names above instead.
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
 ```
 
 ## API Calls
@@ -244,79 +248,51 @@ done
 
 ## LTX-2
 
+```bash
+vllm serve Lightricks/LTX-2 --omni --port 8098
+```
+
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, requests, defaults, and advanced options.
+
+## Helios
+
+Helios ships three variants (`Helios-Base`, `Helios-Mid`, `Helios-Distilled`) that
+share the same server launch. Variant-specific knobs (declared in
+`vllm_omni/model_extras/helios.py`) are sent per request through the generic
+`extra_params` JSON form field — no per-model server flags required.
+
 ### Start Server
 
-#### Basic Start
-
 ```bash
-vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+vllm serve BestWishYsh/Helios-Base --omni --port 8098
+# or: MODEL=BestWishYsh/Helios-Mid bash run_server_helios.sh
 ```
-
-#### Start with Optimization Presets
-
-Use the LTX-2 startup script with built-in optimization presets:
-
-```bash
-# Baseline (1 GPU, eager)
-bash run_server_ltx2.sh baseline
-
-# 4-GPU Ulysses sequence parallelism (lossless)
-bash run_server_ltx2.sh ulysses4
-
-# Cache-DiT lossy acceleration (1 GPU, ~1.4× speedup)
-bash run_server_ltx2.sh cache-dit
-
-# Best combo: 4-GPU Ulysses SP + Cache-DiT (~2.2× speedup)
-bash run_server_ltx2.sh best-combo
-```
-
-#### Optimization Benchmarks
-
-Benchmarked on H800, online serving (480×768, 41 frames, 20 steps, `seed=42`).
-"Inference" is the server-reported inference time; excludes HTTP/poll overhead.
-
-| Preset | Server Command | Inference (s) | Speedup | Type |
-|--------|---------------|---------------|---------|------|
-| `baseline` | `--enforce-eager` | 10.3 | 1.00× | — |
-| `compile` | *(default, no --enforce-eager)* | ~10.3 (warm) | ~1.00× | Lossless |
-| `ulysses4` | `--enforce-eager --usp 4` | ~10.3 | ~1.00× | Lossless |
-| `cache-dit` | `--enforce-eager --cache-backend cache_dit` | 7.4 avg | ~1.4× | Lossy |
-| `best-combo` | `--enforce-eager --usp 4 --cache-backend cache_dit` | 4.7 avg | **~2.2×** | Lossless + Lossy |
-
-**Observations**:
-- **torch.compile**: On H800, warm-request inference time matches the eager baseline (~10.3s).
-  The first request pays ~6s compilation overhead. Benefit depends on model architecture and GPU.
-- **Ulysses SP (4 GPU)**: No measurable speedup alone for 41-frame generation at this resolution.
-  Communication overhead outweighs gains at this sequence length.
-- **Cache-DiT**: Inference varies per request (6–10s) due to dynamic caching decisions.
-  Average is ~7.4s (~1.4× speedup) with slight quality tradeoff.
-- **Best combo**: 4-GPU Ulysses SP + Cache-DiT synergize well — Cache-DiT reduces per-step
-  computation, making the communication overhead of Ulysses SP worthwhile. Average ~4.7s
-  (~2.2× speedup).
-- **FP8 quantization**: Reduces VRAM but does not speed up LTX-2 on H800 (compute-bound).
-
-**Deployment Recommendations**:
-- For **production with quality priority**: use `baseline` with `--enforce-eager`
-- For **maximum throughput** (4 GPUs, quality tradeoff): use `best-combo` (~2.2× speedup)
-- For **single-GPU throughput**: use `cache-dit` (~1.4× speedup)
-- `--enforce-eager` is recommended to avoid torch.compile warmup latency on first request
 
 ### Send Requests (curl)
 
 ```bash
-# Using the provided script
-bash run_curl_ltx2.sh
+# Helios-Base (Stage 1 only)
+bash run_curl_helios.sh
 
-# Or directly
+# Helios-Mid (Stage 2 pyramid + CFG-Zero*)
+PRESET=mid-stage2 MODEL=BestWishYsh/Helios-Mid bash run_curl_helios.sh
+
+# Helios-Distilled (Stage 2 pyramid + DMD, few-step)
+PRESET=distilled MODEL=BestWishYsh/Helios-Distilled bash run_curl_helios.sh
+```
+
+The `mid-stage2` and `distilled` presets attach an `extra_params` field, e.g. for Helios-Distilled:
+
+```bash
 curl -sS -X POST http://localhost:8098/v1/videos \
   -H "Accept: application/json" \
-  -F "prompt=A serene lakeside sunrise with mist over the water." \
-  -F "width=768" \
-  -F "height=480" \
-  -F "num_frames=41" \
-  -F "fps=24" \
-  -F "num_inference_steps=20" \
-  -F "guidance_scale=3.0" \
-  -F "seed=42"
+  -F "prompt=A dynamic time-lapse of scenery rushing past the window of a speeding train." \
+  -F "model=BestWishYsh/Helios-Distilled" \
+  -F "size=640x384" \
+  -F "num_frames=99" \
+  -F "fps=16" \
+  -F "guidance_scale=1.0" \
+  -F "seed=42" \
+  -F 'extra_params={"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}'
 ```

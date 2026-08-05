@@ -4,10 +4,16 @@ This module keeps fault injection callable from tests directly:
 - GPU OOM (CUDA sidecar memory hog)
 - process kill by pattern and signal
 - post-ready hooks via ``fault_injector`` / ``omni_server_after_fault`` fixtures
+
+Worker PID classification (``worker_pids`` in snapshots) is still used for logging /
+markers; post-fault **process** cleanup assertions use the full captured
+``tree_pids`` (serve root + descendants at fault time) — see
+:func:`assert_no_server_tree_process_residual_and_gpu_release`.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import json
 import logging
@@ -26,6 +32,16 @@ import psutil
 import pytest
 
 logger = logging.getLogger(__name__)
+
+# Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
+# workers under the test server tree. Extend per-suite via
+# ``server.reliability_worker_markers_extra`` or replace via
+# ``server.reliability_worker_markers`` (see ``_resolve_runtime_worker_markers``).
+DEFAULT_RUNTIME_WORKER_MARKERS: tuple[str, ...] = (
+    "multiprocessing.spawn",
+    # Covers ``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*`` (Omni stage engines), etc.
+    "VLLM::",
+)
 
 
 @dataclass
@@ -452,6 +468,61 @@ def _safe_proc_info(pid: int) -> tuple[str, str]:
         return "<unknown>", "<unavailable>"
 
 
+def _normalize_worker_marker_substrings(seq: Sequence[Any], *, context: str) -> tuple[str, ...]:
+    """Return deduped non-empty marker substrings; raises if any entry is blank."""
+    out: list[str] = []
+    for item in seq:
+        s = str(item).strip()
+        if not s:
+            raise ValueError(f"{context}: worker marker must be a non-empty string, got {item!r}")
+        out.append(s)
+    return tuple(dict.fromkeys(out))
+
+
+def _resolve_runtime_worker_markers(
+    server: Any,
+    injector_markers_extra: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve which substrings classify worker PIDs for fault snapshots.
+
+    If ``server.reliability_worker_markers`` is set to a sequence, **only** those
+    markers are used (no defaults). Otherwise defaults from
+    :data:`DEFAULT_RUNTIME_WORKER_MARKERS` are merged with:
+
+    - ``server.reliability_worker_markers_extra`` when present, and
+    - ``injector_markers_extra`` from :func:`make_server_root_kill_fault_injector` /
+      :func:`make_server_tree_kill_fault_injector`.
+    """
+    replace = getattr(server, "reliability_worker_markers", None)
+    if replace is not None:
+        return _normalize_worker_marker_substrings(replace, context="server.reliability_worker_markers")
+
+    merged: list[str] = []
+    merged.extend(DEFAULT_RUNTIME_WORKER_MARKERS)
+    extra_attr = getattr(server, "reliability_worker_markers_extra", None)
+    if extra_attr is not None:
+        merged.extend(
+            _normalize_worker_marker_substrings(extra_attr, context="server.reliability_worker_markers_extra")
+        )
+    if injector_markers_extra is not None:
+        merged.extend(
+            _normalize_worker_marker_substrings(
+                injector_markers_extra,
+                context="injector worker_markers_extra",
+            )
+        )
+    return tuple(dict.fromkeys(merged))
+
+
+def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
+    """True when process name or argv contains any resolved worker marker substring."""
+    if not markers:
+        return False
+    name, cmdline = _safe_proc_info(pid)
+    text = f"{name} {cmdline}"
+    return any(marker in text for marker in markers)
+
+
 def _list_server_process_tree(server: Any) -> list[int]:
     """Return [root, descendants...] PIDs for the current test server instance."""
     root_proc = getattr(server, "proc", None)
@@ -466,6 +537,29 @@ def _list_server_process_tree(server: Any) -> list[int]:
 
     descendants = [child.pid for child in root.children(recursive=True)]
     return [root_pid, *descendants]
+
+
+def _pids_in_server_tree_substring_match(server: Any, pattern: str, *, limit: int) -> list[int]:
+    """Return up to ``limit`` PIDs in the server tree whose name+cmdline contains ``pattern`` literally.
+
+    ``pgrep -f`` matches the process command line used by procps and does not consult the
+    short process name; vLLM-Omni often exposes titles like ``VLLM::Worker`` or
+    ``VLLM::StageEngineCoreProc_*`` via prctl/setproctitle in ``ps``/``name()`` only.
+    This helper keeps kill injection aligned with :func:`_safe_proc_info` / fault snapshots.
+    """
+    if limit <= 0:
+        return []
+    tree = _list_server_process_tree(server)
+    if not tree or not pattern:
+        return []
+    hits: list[int] = []
+    for pid in tree:
+        if len(hits) >= limit:
+            break
+        name, cmdline = _safe_proc_info(int(pid))
+        if pattern in f"{name} {cmdline}":
+            hits.append(int(pid))
+    return hits
 
 
 def _log_server_process_tree(server: Any) -> None:
@@ -486,6 +580,315 @@ FaultInjector = Callable[[Any], None]
 """Callable invoked with the live ``OmniServer`` after it is ready (see ``omni_server_after_fault``)."""
 
 
+def run_fault_injection_with_rate_load(
+    *,
+    submit_request: Callable[[], Any],
+    inject_fault: Callable[[], None],
+    num_requests: int = 10,
+    request_rate: float = 0.3,
+    submit_interval_sec: float | None = None,
+    completion_timeout_sec: float = 120.0,
+) -> dict[str, Any]:
+    """Submit requests with a fixed rate, then inject fault once an in-flight request is observed."""
+    if num_requests <= 0:
+        raise ValueError("num_requests must be > 0")
+    if request_rate <= 0:
+        raise ValueError("request_rate must be > 0")
+
+    interval_sec = submit_interval_sec if submit_interval_sec is not None else (1.0 / request_rate)
+    if interval_sec < 0:
+        raise ValueError("submit_interval_sec must be >= 0")
+
+    max_workers = min(max(2, num_requests), 8)
+    injected = False
+    futures: list[concurrent.futures.Future[Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx in range(num_requests):
+            futures.append(executor.submit(submit_request))
+            in_flight = any(not future.done() for future in futures)
+            if in_flight and not injected:
+                inject_fault()
+                injected = True
+            if idx != num_requests - 1 and interval_sec > 0:
+                time.sleep(interval_sec)
+
+        if not injected:
+            in_flight = any(not future.done() for future in futures)
+            if in_flight:
+                inject_fault()
+                injected = True
+
+        if not injected:
+            pytest.skip(
+                "no in-flight request observed before fault injection; "
+                "increase request cost or request rate for this environment"
+            )
+
+        done, pending = concurrent.futures.wait(
+            futures,
+            timeout=completion_timeout_sec,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+        assert not pending, (
+            "some in-flight-load requests did not converge after fault injection: "
+            f"pending={len(pending)} done={len(done)}"
+        )
+    failure_observed = False
+    completed = 0
+    success = 0
+    exceptions = 0
+    for future in futures:
+        completed += 1
+        try:
+            future.result()
+            success += 1
+        except Exception:  # noqa: BLE001
+            exceptions += 1
+            failure_observed = True
+    return {
+        "num_submitted": num_requests,
+        "completed": completed,
+        "success": success,
+        "exceptions": exceptions,
+        "failure_observed": failure_observed,
+        "inflight_observed": True,
+    }
+
+
+def list_alive_pids(pids: Sequence[int]) -> list[int]:
+    """Return PIDs from ``pids`` that still exist in the kernel and are **not** zombies.
+
+    After SIGTERM/SIGKILL the serve child may exit before the test harness calls
+    ``Popen.wait()``; until reaped, ``psutil.pid_exists`` stays true for the defunct
+    slot. Those PIDs must not count as "residual server processes" for leak checks.
+    """
+    out: list[int] = []
+    for pid in pids:
+        pid_i = int(pid)
+        if not psutil.pid_exists(pid_i):
+            continue
+        try:
+            if psutil.Process(pid_i).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.Error:
+            continue
+        out.append(pid_i)
+    return out
+
+
+def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
+    """Query NVIDIA compute-process memory map (pid -> used MB).
+
+    Returns ``None`` when ``nvidia-smi`` is unavailable/unreadable on current host.
+    """
+    out = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        logger.warning("[reliability][gpu] nvidia-smi query failed: %s", out.stderr.strip())
+        return None
+
+    pid_to_mem_mb: dict[int, int] = {}
+    for line in out.stdout.splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        pieces = [part.strip() for part in row.split(",", maxsplit=1)]
+        if len(pieces) != 2:
+            continue
+        pid_raw, mem_raw = pieces
+        if not pid_raw.isdigit():
+            continue
+        mem_digits = "".join(ch for ch in mem_raw if ch.isdigit())
+        if not mem_digits:
+            continue
+        pid_to_mem_mb[int(pid_raw)] = int(mem_digits)
+    return pid_to_mem_mb
+
+
+def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
+    """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
+    if signal_name == "SIGKILL":
+        return 30.0
+    if signal_name == "SIGINT":
+        return 120.0
+    if signal_name == "SIGTERM":
+        return 90.0
+    return 30.0
+
+
+def assert_no_server_tree_process_residual_and_gpu_release(
+    server: Any,
+    *,
+    scenario: str,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 0.5,
+) -> None:
+    """Assert no live PIDs remain from the fault-time server tree and no GPU use by those PIDs.
+
+    Uses ``reliability_fault_snapshot["tree_pids"]`` (root + all descendants captured at
+    injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
+    ``multiprocessing.resource_tracker`` are included in the residual check.
+
+    **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
+    from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
+
+    Note: if a child is reparented to PID 1 while staying alive, its PID is unchanged
+    and remains detected; if it **exits and a new unrelated process reuses the same
+    numeric PID**, this check may false-positive (rare on short windows).
+    """
+    snapshot = getattr(server, "reliability_fault_snapshot", None)
+    if not isinstance(snapshot, dict):
+        pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
+    if not tree_pids:
+        pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
+
+    tree_pid_set = set(tree_pids)
+    deadline = time.monotonic() + timeout_sec
+    last_alive: list[int] = []
+    last_gpu_leaks: dict[int, int] = {}
+    while time.monotonic() < deadline:
+        last_alive = list_alive_pids(tree_pids)
+        gpu_map = query_gpu_compute_pid_used_memory_mb()
+        if gpu_map is None:
+            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
+        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
+        if not last_alive and not last_gpu_leaks:
+            return
+        time.sleep(poll_interval_sec)
+
+    assert not last_alive, f"[{scenario}] residual server-tree processes remain alive: {last_alive}"
+    assert not last_gpu_leaks, f"[{scenario}] server-tree PID GPU memory not released: {last_gpu_leaks}"
+
+
+def assert_no_worker_residual_and_gpu_release(
+    server: Any,
+    *,
+    scenario: str,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 0.5,
+) -> None:
+    """Deprecated: use :func:`assert_no_server_tree_process_residual_and_gpu_release`."""
+    assert_no_server_tree_process_residual_and_gpu_release(
+        server,
+        scenario=scenario,
+        timeout_sec=timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+    )
+
+
+def _capture_server_fault_snapshot(
+    server: Any,
+    *,
+    worker_markers_extra: Sequence[str] | None = None,
+) -> dict[str, list[int]]:
+    """Capture current server process snapshot for post-fault assertions.
+
+    ``tree_pids`` is ``[root, ...descendants]`` and is used by
+    :func:`assert_no_server_tree_process_residual_and_gpu_release`.
+    ``worker_pids`` is the marker-filtered subset for debugging only.
+    """
+    markers = _resolve_runtime_worker_markers(server, worker_markers_extra)
+    tree_pids = _list_server_process_tree(server)
+    root_pid = tree_pids[0] if tree_pids else None
+    worker_pids: list[int] = []
+    for pid in tree_pids:
+        if root_pid is not None and int(pid) == int(root_pid):
+            continue
+        if _pid_looks_like_runtime_worker(pid, markers):
+            worker_pids.append(pid)
+    snapshot = {
+        "root_pids": [root_pid] if root_pid is not None else [],
+        "tree_pids": tree_pids,
+        "worker_pids": worker_pids,
+        "worker_markers": list(markers),
+    }
+    setattr(server, "reliability_fault_snapshot", snapshot)
+    return snapshot
+
+
+def make_server_root_kill_fault_injector(
+    *,
+    signal_name: str = "SIGKILL",
+    post_kill_wait_seconds: float = 0.0,
+    worker_markers_extra: Sequence[str] | None = None,
+) -> FaultInjector:
+    """Kill only the current server root process (simulate first strike on PID1-like process).
+
+    ``worker_markers_extra`` is merged into worker PID detection for the fault snapshot
+    (after :data:`DEFAULT_RUNTIME_WORKER_MARKERS` unless
+    ``server.reliability_worker_markers`` replaces the set entirely).
+    """
+
+    def _inject(server: Any) -> None:
+        _log_server_process_tree(server)
+        snapshot = _capture_server_fault_snapshot(server, worker_markers_extra=worker_markers_extra)
+        root_pids = snapshot["root_pids"]
+        if not root_pids:
+            pytest.skip("no server root process found for root-kill injection")
+        root_pid = int(root_pids[0])
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            raise ValueError(f"Unsupported signal_name: {signal_name}")
+        name, cmdline = _safe_proc_info(root_pid)
+        print(
+            f"[reliability][process-kill] root-kill pid={root_pid} name={name} signal={signal_name} cmdline={cmdline}",
+            flush=True,
+        )
+        os.kill(root_pid, sig)
+        if post_kill_wait_seconds > 0:
+            time.sleep(post_kill_wait_seconds)
+
+    return _inject
+
+
+def make_server_tree_kill_fault_injector(
+    *,
+    signal_name: str = "SIGKILL",
+    post_kill_wait_seconds: float = 0.0,
+    inter_kill_wait_seconds: float = 0.2,
+    worker_markers_extra: Sequence[str] | None = None,
+) -> FaultInjector:
+    """Kill current server root first, then kill all remaining descendants.
+
+    See :func:`make_server_root_kill_fault_injector` for ``worker_markers_extra``.
+    """
+
+    def _inject(server: Any) -> None:
+        _log_server_process_tree(server)
+        snapshot = _capture_server_fault_snapshot(server, worker_markers_extra=worker_markers_extra)
+        tree_pids = [int(pid) for pid in snapshot["tree_pids"]]
+        if not tree_pids:
+            pytest.skip("no server process tree found for tree-kill injection")
+
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            raise ValueError(f"Unsupported signal_name: {signal_name}")
+
+        root_pid = tree_pids[0]
+        kill_order = [root_pid, *[pid for pid in tree_pids if pid != root_pid]]
+        for pid in kill_order:
+            if not psutil.pid_exists(pid):
+                continue
+            name, cmdline = _safe_proc_info(pid)
+            print(
+                f"[reliability][process-kill] tree-kill pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
+                flush=True,
+            )
+            os.kill(pid, sig)
+            if inter_kill_wait_seconds > 0:
+                time.sleep(inter_kill_wait_seconds)
+
+        if post_kill_wait_seconds > 0:
+            time.sleep(post_kill_wait_seconds)
+
+    return _inject
+
+
 def make_process_kill_fault_injector(
     *,
     grep_patterns: str | Sequence[str],
@@ -493,11 +896,18 @@ def make_process_kill_fault_injector(
     limit: int = 1,
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
-    """Build a post-ready injector that kills processes matched by ``pgrep -f``.
+    """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
 
-    Tries each pattern in order until at least one PID is killed. If none match,
-    the returned callable issues ``pytest.skip`` (same behavior as the previous
-    inline reliability test).
+    Matching is tried in two phases per pattern (first hit wins):
+
+    1. **Server process tree** (``psutil``): literal substring match against
+       ``Process.name()`` plus argv text. This matches how :func:`_safe_proc_info`
+       logs processes and catches vLLM-style titles (``VLLM::...``) that often do not
+       appear in ``pgrep -f``\'s command-line view.
+    2. **``pgrep -f``** (legacy): scoped to the server PID tree when it is known;
+       uses procps regular-expression rules for the pattern.
+
+    If neither phase finds a target, the returned callable issues ``pytest.skip``.
 
     Args:
         grep_patterns: One pattern or an ordered list of patterns.
@@ -514,9 +924,45 @@ def make_process_kill_fault_injector(
             logger.warning(
                 "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
             )
+
+        def _kill_and_wait(filtered: list[int], pattern: str, *, source: str) -> None:
+            sig = getattr(signal, signal_name, None)
+            if sig is None:
+                raise ValueError(f"Unsupported signal_name: {signal_name}")
+            for pid in filtered:
+                name, cmdline = _safe_proc_info(pid)
+                print(
+                    f"[reliability][process-kill] killing pid={pid} name={name} signal={signal_name} "
+                    f"source={source} cmdline={cmdline}",
+                    flush=True,
+                )
+                os.kill(pid, sig)
+            print(
+                f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
+                f"killed_pids={filtered} killed_count={len(filtered)}",
+                flush=True,
+            )
+            if post_kill_wait_seconds > 0:
+                print(
+                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
+                    flush=True,
+                )
+                time.sleep(post_kill_wait_seconds)
+
         for pattern in patterns:
             print(
-                f"[reliability][process-kill] trying pattern={pattern} signal={signal_name} limit={limit}",
+                f"[reliability][process-kill] trying server_tree substring pattern={pattern!r} "
+                f"signal={signal_name} limit={limit}",
+                flush=True,
+            )
+            tree_hits = _pids_in_server_tree_substring_match(server, pattern, limit=limit)
+            if tree_hits:
+                _kill_and_wait(tree_hits, pattern, source="server_tree")
+                return
+
+        for pattern in patterns:
+            print(
+                f"[reliability][process-kill] trying pgrep -f pattern={pattern!r} signal={signal_name} limit={limit}",
                 flush=True,
             )
             pids = inject_process_kill(
@@ -535,26 +981,7 @@ def make_process_kill_fault_injector(
                 )
                 continue
             if filtered:
-                sig = getattr(signal, signal_name, None)
-                if sig is None:
-                    raise ValueError(f"Unsupported signal_name: {signal_name}")
-                for pid in filtered:
-                    name, cmdline = _safe_proc_info(pid)
-                    print(
-                        f"[reliability][process-kill] killing pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
-                        flush=True,
-                    )
-                    os.kill(pid, sig)
-                print(
-                    f"[reliability][process-kill] matched pattern={pattern} killed_pids={filtered} killed_count={len(filtered)}",
-                    flush=True,
-                )
-                if post_kill_wait_seconds > 0:
-                    print(
-                        f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                        flush=True,
-                    )
-                    time.sleep(post_kill_wait_seconds)
+                _kill_and_wait(filtered, pattern, source="pgrep")
                 return
         logger.warning(
             "[reliability][process-kill] no process matched patterns=%s signal=%s limit=%s",

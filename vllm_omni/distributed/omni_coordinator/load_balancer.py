@@ -9,14 +9,14 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, TypedDict
 
-from .messages import InstanceInfo
+from .messages import ReplicaInfo
 
 
 class Task(TypedDict, total=False):
-    """Task structure passed from async_omni (stage.submit(task)).
+    """Task structure passed to ``StagePool.pick`` / ``LoadBalancer.select``.
 
-    Mirrors the dict built in AsyncOmni with request_id, engine_inputs,
-    sampling_params. Future load-balancing policies may use these fields.
+    Mirrors the dict built around a stage submission with request_id and any
+    payload-related fields a future load-balancing policy might inspect.
     """
 
     request_id: str
@@ -28,10 +28,7 @@ class LoadBalancingPolicy(str, Enum):
     """Enumeration for load balancing policies.
 
     These policies are used by :class:`LoadBalancer` implementations to route
-    tasks to a subset of available instances.
-
-    TODO(NumberWan): Map enum values to balancer classes when OmniCoordinator
-    integration lands. Tracked in https://github.com/vllm-project/vllm-omni/pull/2448
+    tasks to a subset of available replicas.
     """
 
     RANDOM = "random"
@@ -42,74 +39,60 @@ class LoadBalancingPolicy(str, Enum):
 class LoadBalancer(ABC):
     """Abstract base class for load balancers.
 
-    Subclasses implement :meth:`select` to choose an instance for a given task.
+    Subclasses implement :meth:`select` to choose a replica for a given task.
     """
 
     @abstractmethod
-    def select(self, task: Task, instances: list[InstanceInfo]) -> int:
-        """Route a task to one of the available instances.
+    def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:
+        """Route a task to one of the available replicas.
 
         Args:
             task: The task to route. Not used by the random policy but reserved
                 for future strategies that may inspect task metadata.
-            instances: List of available instances to choose from.
+            replicas: List of available replicas to choose from.
 
         Returns:
-            Index of the selected instance in ``instances``.
+            Index of the selected replica in ``replicas``.
 
         Raises:
-            ValueError: If ``instances`` is empty.
+            ValueError: If ``replicas`` is empty.
         """
 
         raise NotImplementedError
 
 
 class RandomBalancer(LoadBalancer):
-    """Load balancer that selects an instance uniformly at random.
+    """Load balancer that selects a replica uniformly at random."""
 
-    It intentionally ignores the task payload and chooses a random index from
-    the provided instance list. More sophisticated policies (e.g. round-robin,
-    least-queue-length) can be implemented as additional subclasses of
-    :class:`LoadBalancer`.
-    """
+    def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:  # noqa: ARG002
+        if not replicas:
+            raise ValueError("replicas must not be empty")
 
-    def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
-        if not instances:
-            raise ValueError("instances must not be empty")
-
-        return random.randrange(len(instances))
+        return random.randrange(len(replicas))
 
 
 class RoundRobinBalancer(LoadBalancer):
-    """Load balancer that selects instances in a round-robin fashion.
+    """Load balancer that selects replicas in a round-robin fashion.
 
-    This implementation keeps a running index modulo ``len(instances)``. It
-    therefore depends on the **order and stable meaning** of the ``instances``
+    This implementation keeps a running index modulo ``len(replicas)``. It
+    therefore depends on the **order and stable meaning** of the ``replicas``
     list between calls. If the list length or ordering changes, the sequence
     of picks may skip or repeat entries relative to a fixed set of backends.
 
-    When instance membership changes dynamically, callers should reset routing
-    state—for example by constructing a new ``RoundRobinBalancer`` or resetting
-    ``_next_index``—similar to rebuilding ``itertools.cycle`` after mutating
-    the instance list (as in vLLM's disaggregated proxy examples).
-
-    Concurrency: ``select`` is synchronous and is expected to run on the
-    coordinator asyncio event loop thread without ``await`` inside this
-    method, so a single invocation is not interleaved with another on that
-    thread. A :class:`threading.Lock` still serializes updates to
-    ``_next_index`` for callers that might invoke ``select`` from multiple
-    threads or alongside threaded infrastructure (e.g. ZMQ receive threads).
+    Concurrency: a ``threading.Lock`` serializes updates to ``_next_index``
+    for callers that invoke ``select`` from multiple threads or alongside
+    threaded infrastructure (e.g. ZMQ receive threads).
     """
 
     def __init__(self, start_index: int = 0) -> None:
         self._next_index = start_index
         self._lock = threading.Lock()
 
-    def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
-        if not instances:
-            raise ValueError("instances must not be empty")
+    def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:  # noqa: ARG002
+        if not replicas:
+            raise ValueError("replicas must not be empty")
 
-        n = len(instances)
+        n = len(replicas)
         with self._lock:
             idx = self._next_index % n
             self._next_index = (self._next_index + 1) % n
@@ -117,22 +100,22 @@ class RoundRobinBalancer(LoadBalancer):
 
 
 class LeastQueueLengthBalancer(LoadBalancer):
-    """Select the instance with the smallest ``queue_length``.
+    """Select the replica with the smallest ``queue_length``.
 
-    If multiple instances share the same minimum queue length, one of them is
+    If multiple replicas share the same minimum queue length, one of them is
     chosen uniformly at random.
 
     Raises:
-        ValueError: If any instance has a negative ``queue_length``.
+        ValueError: If any replica has a negative ``queue_length``.
     """
 
-    def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
-        if not instances:
-            raise ValueError("instances must not be empty")
+    def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:  # noqa: ARG002
+        if not replicas:
+            raise ValueError("replicas must not be empty")
 
-        queue_lengths = [inst.queue_length for inst in instances]
+        queue_lengths = [rep.queue_length for rep in replicas]
         if any(q < 0 for q in queue_lengths):
-            raise ValueError("queue_length must be non-negative for all instances")
+            raise ValueError("queue_length must be non-negative for all replicas")
         min_q = min(queue_lengths)
         candidates = [i for i, q in enumerate(queue_lengths) if q == min_q]
         return random.choice(candidates)

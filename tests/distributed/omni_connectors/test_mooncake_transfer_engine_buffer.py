@@ -15,8 +15,9 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     BufferAllocator,
     ManagedBuffer,
 )
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 
-# All tests in this file are pure-CPU unit tests for the memory allocator.
+# Most tests in this file are pure-CPU unit tests; CUDA smoke tests are skip-guarded.
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
 
@@ -225,3 +226,70 @@ class TestManagedBuffer:
         # Space should be reusable
         new_offset = self.allocator.alloc(128)
         assert new_offset == offset
+
+    def test_to_bytes_cpu_pool(self):
+        """Smoke-test Mooncake's ManagedBuffer byte extraction on CPU pools."""
+        expected = bytes(range(64))
+        offset = self.allocator.alloc(len(expected))
+        buf = ManagedBuffer(self.allocator, offset, len(expected), self.pool)
+        self.pool[offset : offset + len(expected)] = torch.tensor(list(expected), dtype=torch.uint8)
+
+        try:
+            assert buf.to_bytes() == expected
+        finally:
+            buf.release()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU pool smoke test")
+    def test_to_bytes_cuda_pool(self):
+        """Smoke-test Mooncake's existing CUDA pool D2H byte path."""
+        expected = bytes(range(64))
+        allocator = BufferAllocator(total_size=4096, alignment=64)
+        pool = torch.zeros(4096, dtype=torch.uint8, device="cuda:0")
+        offset = allocator.alloc(len(expected))
+        buf = ManagedBuffer(allocator, offset, len(expected), pool)
+        pool[offset : offset + len(expected)].copy_(torch.tensor(list(expected), dtype=torch.uint8, device="cuda:0"))
+
+        try:
+            assert buf.to_bytes() == expected
+        finally:
+            buf.release()
+
+
+def _make_kv_payload(device: str | torch.device = "cpu") -> tuple[KVCacheTransferData, torch.Tensor, torch.Tensor]:
+    key_tensor = torch.arange(12, dtype=torch.float32, device=device).reshape(3, 4)
+    value_tensor = key_tensor + 100
+    payload = KVCacheTransferData(
+        request_id="moon-smoke",
+        layer_blocks={"key_cache": [key_tensor], "value_cache": [value_tensor]},
+        block_ids=[1],
+        metadata={"seq_len": 3},
+    )
+    return payload, key_tensor, value_tensor
+
+
+class TestMooncakePackedPayloadSmoke:
+    """Smoke tests for Mooncake raw payload helpers without real Mooncake/RDMA."""
+
+    def test_load_header_from_cpu_tensor(self):
+        payload, _, _ = _make_kv_payload()
+        raw = payload.to_bytes()
+        packed = torch.tensor(list(raw), dtype=torch.uint8)
+        header, data_start = KVCacheTransferData._load_header_from_tensor(packed)
+
+        assert header["rid"] == "moon-smoke"
+        assert data_start == 4 + int.from_bytes(raw[:4], "big")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for packed CUDA smoke test")
+    def test_from_bytes_device_cuda_round_trip(self):
+        payload, key_tensor, value_tensor = _make_kv_payload(device="cuda:0")
+        packed = payload.to_gpu_tensor()
+
+        header, data_start = KVCacheTransferData._load_header_from_tensor(packed)
+        decoded = KVCacheTransferData.from_bytes_device(packed)
+
+        assert header["rid"] == "moon-smoke"
+        assert data_start == 4 + int.from_bytes(payload.to_bytes()[:4], "big")
+        assert decoded["layer_blocks"]["key_cache"][0].is_cuda
+        assert decoded["layer_blocks"]["value_cache"][0].is_cuda
+        assert torch.equal(decoded["layer_blocks"]["key_cache"][0].cpu(), key_tensor.cpu())
+        assert torch.equal(decoded["layer_blocks"]["value_cache"][0].cpu(), value_tensor.cpu())

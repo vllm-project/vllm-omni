@@ -23,7 +23,7 @@ from tests.helpers.media import (
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.omni,
 ]
 
@@ -35,6 +35,10 @@ QUANTIZED_MODEL = os.environ.get("QWEN2_5_OMNI_AUTOROUND_MODEL", QUANTIZED_MODEL
 BASELINE_MODEL = os.environ.get("QWEN2_5_OMNI_BASELINE_MODEL", BASELINE_MODEL)
 
 _CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
+
+_SKIP_ISSUE_4663 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/4663",
+)
 
 
 def _get_stage_config():
@@ -61,6 +65,7 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_4663
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler):
@@ -70,7 +75,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_omni_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -79,6 +84,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_4663
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler):
@@ -93,7 +99,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_omni_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -102,6 +108,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_4663
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler):
@@ -114,7 +121,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_omni_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -123,6 +130,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_4663
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler):
@@ -135,7 +143,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_omni_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -144,6 +152,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_4663
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler):
@@ -162,4 +171,4 @@ def test_mix_to_audio(omni_runner, omni_runner_handler):
         "modalities": ["audio"],
     }
     response = omni_runner_handler.send_omni_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"

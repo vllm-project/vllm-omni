@@ -14,13 +14,14 @@ from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
-MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2509"
+MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2511"
 WIDTH = 512
 HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
@@ -46,10 +47,9 @@ EDIT_2511_PROMPT = (
     "（帽子紧贴头顶，未贴合部分可调整帽子摆放角度达到完全贴合）， 头部与身体过渡必须自然，无拼接痕迹，"
     "无额外元素出现在头部四周，纯白背景，不要出现绿色圆圈"
 )
-EDIT_2511_ASSET_DIR = Path(__file__).resolve().parent / "assets"
 EDIT_2511_IMAGE_PATHS = [
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test1.png",
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test2.png",
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test1.png"),
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test2.png"),
 ]
 
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
@@ -253,37 +253,6 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
     )
 
 
-def _vllm_omni_output_multiple_image(
-    accuracy_artifact_root: Path,
-    qwen_bear_image: Image.Image,
-    rabbit_image: Image.Image,
-) -> Image.Image:
-    output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
-    output_path = output_dir / "vllm_omni_multiple.png"
-    with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS) as server:
-        output = _run_vllm_omni_image_edit(
-            omni_server=server,
-            prompt=PROMPT_MULTIPLE_IMAGE,
-            input_images=[qwen_bear_image, rabbit_image],
-            output_path=output_path,
-        )
-    return output
-
-
-def _diffusers_output_multiple_image(
-    accuracy_artifact_root: Path, qwen_bear_image: Image.Image, rabbit_image: Image.Image
-) -> Image.Image:
-    output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
-    output_path = output_dir / "diffusers_multiple.png"
-    return _run_diffusers_image_edit(
-        model=MULTIPLE_MODEL,
-        pipeline_class=QwenImageEditPlusPipeline,
-        prompt=PROMPT_MULTIPLE_IMAGE,
-        input_images=[qwen_bear_image, rabbit_image],
-        output_path=output_path,
-    )
-
-
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
@@ -300,37 +269,6 @@ def test_qwen_image_edit_single_matches_diffusers(
     )
     assert_similarity(
         model_name=SINGLE_MODEL,
-        vllm_image=vllm_image,
-        diffusers_image=diffusers_image,
-        width=WIDTH,
-        height=HEIGHT,
-        ssim_threshold=SSIM_THRESHOLD,
-        psnr_threshold=PSNR_THRESHOLD,
-    )
-
-
-@pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(
-    reason="Skipping as the second image seems to be ignored by the API. Will come back to this later after #2772 is merged."
-)
-def test_qwen_image_edit_multiple_matches_diffusers(
-    accuracy_artifact_root: Path,
-    qwen_bear_image: Image.Image,
-    rabbit_image: Image.Image,
-) -> None:
-    vllm_image = _vllm_omni_output_multiple_image(
-        accuracy_artifact_root=accuracy_artifact_root,
-        qwen_bear_image=qwen_bear_image,
-        rabbit_image=rabbit_image,
-    )
-    diffusers_image = _diffusers_output_multiple_image(
-        accuracy_artifact_root=accuracy_artifact_root,
-        qwen_bear_image=qwen_bear_image,
-        rabbit_image=rabbit_image,
-    )
-    assert_similarity(
-        model_name=MULTIPLE_MODEL,
         vllm_image=vllm_image,
         diffusers_image=diffusers_image,
         width=WIDTH,

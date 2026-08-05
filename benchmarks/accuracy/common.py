@@ -151,6 +151,9 @@ class VllmOmniImageClient:
         seed: int | None = None,
         negative_prompt: str | None = None,
         output_compression: int | None = None,
+        bot_task: str | None = None,
+        sys_type: str | None = None,
+        system_prompt: str | None = None,
     ) -> Image.Image:
         if not isinstance(images, list):
             images = [images]
@@ -170,6 +173,12 @@ class VllmOmniImageClient:
             data["negative_prompt"] = negative_prompt
         if output_compression is not None:
             data["output_compression"] = str(output_compression)
+        if bot_task is not None:
+            data["bot_task"] = bot_task
+        if sys_type is not None:
+            data["sys_type"] = sys_type
+        if system_prompt is not None:
+            data["system_prompt"] = system_prompt
 
         files = [
             (

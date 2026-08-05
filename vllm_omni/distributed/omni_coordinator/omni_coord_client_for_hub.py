@@ -9,16 +9,16 @@ from typing import Any
 
 import zmq
 
-from .messages import InstanceInfo, InstanceList, StageStatus
+from .messages import ReplicaInfo, ReplicaList, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
 
 class OmniCoordClientForHub:
-    """Client for AsyncOmni side to receive instance list updates.
+    """Client for AsyncOmni side to receive replica list updates.
 
     This client maintains a SUB socket connected to OmniCoordinator's PUB
-    endpoint and caches the latest :class:`InstanceList` in memory for use by
+    endpoint and caches the latest :class:`ReplicaList` in memory for use by
     the load balancer and routing logic.
     """
 
@@ -28,7 +28,7 @@ class OmniCoordClientForHub:
 
         self._ctx = zmq.Context()
         self._lock = threading.Lock()
-        self._instance_list: InstanceList | None = None
+        self._replica_list: ReplicaList | None = None
         self._closed = False
         self._stop_event = threading.Event()
         self._init_done = threading.Event()
@@ -41,29 +41,29 @@ class OmniCoordClientForHub:
         if self._init_error:
             raise RuntimeError(f"Failed to connect to coordinator at {self._coord_zmq_addr}") from self._init_error[0]
 
-    def _decode_instance_list(self, payload: dict[str, Any]) -> InstanceList:
-        """Convert a JSON-decoded dict into an :class:`InstanceList`."""
-        instances_payload = payload.get("instances", [])
-        instances: list[InstanceInfo] = []
-        for inst in instances_payload:
-            instances.append(
-                InstanceInfo(
-                    input_addr=inst["input_addr"],
-                    output_addr=inst["output_addr"],
-                    stage_id=int(inst["stage_id"]),
-                    status=StageStatus(inst["status"]),
-                    queue_length=int(inst["queue_length"]),
-                    last_heartbeat=float(inst["last_heartbeat"]),
-                    registered_at=float(inst["registered_at"]),
+    def _decode_replica_list(self, payload: dict[str, Any]) -> ReplicaList:
+        """Convert a JSON-decoded dict into a :class:`ReplicaList`."""
+        replicas_payload = payload.get("replicas", [])
+        replicas: list[ReplicaInfo] = []
+        for rep in replicas_payload:
+            replicas.append(
+                ReplicaInfo(
+                    input_addr=rep["input_addr"],
+                    output_addr=rep["output_addr"],
+                    stage_id=int(rep["stage_id"]),
+                    status=ReplicaStatus(rep["status"]),
+                    queue_length=int(rep["queue_length"]),
+                    last_heartbeat=float(rep["last_heartbeat"]),
+                    registered_at=float(rep["registered_at"]),
                 )
             )
 
         timestamp = float(payload.get("timestamp", time()))
-        return InstanceList(instances=instances, timestamp=timestamp)
+        return ReplicaList(replicas=replicas, timestamp=timestamp)
 
     def _recv_loop(self) -> None:
-        """Background loop that receives and caches instance lists."""
-        sub = None
+        """Background loop that receives and caches replica lists."""
+        sub: zmq.Socket | None = None
         try:
             sub = self._ctx.socket(zmq.SUB)
             sub.setsockopt(zmq.SUBSCRIBE, b"")
@@ -115,9 +115,9 @@ class OmniCoordClientForHub:
 
                 try:
                     payload = json.loads(data.decode("utf-8"))
-                    inst_list = self._decode_instance_list(payload)
+                    rep_list = self._decode_replica_list(payload)
                     with self._lock:
-                        self._instance_list = inst_list
+                        self._replica_list = rep_list
                 except (
                     json.JSONDecodeError,
                     KeyError,
@@ -125,7 +125,7 @@ class OmniCoordClientForHub:
                     TypeError,
                     AttributeError,
                 ) as e:
-                    logger.warning("Invalid instance list message, skipping: %s", e)
+                    logger.warning("Invalid replica list message, skipping: %s", e)
         finally:
             try:
                 if sub is not None:
@@ -137,22 +137,22 @@ class OmniCoordClientForHub:
             except zmq.ZMQError:
                 pass
 
-    def get_instance_list(self) -> InstanceList:
-        """Return the latest cached :class:`InstanceList`.
+    def get_replica_list(self) -> ReplicaList:
+        """Return the latest cached :class:`ReplicaList`.
 
         If no update has been received yet, returns an empty list with
         ``timestamp=0.0``.
         """
         with self._lock:
-            if self._instance_list is None:
-                return InstanceList(instances=[], timestamp=0.0)
-            return self._instance_list
+            if self._replica_list is None:
+                return ReplicaList(replicas=[], timestamp=0.0)
+            return self._replica_list
 
-    def get_instances_for_stage(self, stage_id: int) -> InstanceList:
-        """Return instances filtered by ``stage_id``."""
-        base = self.get_instance_list()
-        filtered = [inst for inst in base.instances if inst.stage_id == stage_id]
-        return InstanceList(instances=filtered, timestamp=base.timestamp)
+    def get_replicas_for_stage(self, stage_id: int) -> ReplicaList:
+        """Return replicas filtered by ``stage_id``."""
+        base = self.get_replica_list()
+        filtered = [rep for rep in base.replicas if rep.stage_id == stage_id]
+        return ReplicaList(replicas=filtered, timestamp=base.timestamp)
 
     def close(self) -> None:
         """Close the SUB socket and stop the background thread."""

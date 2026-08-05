@@ -72,7 +72,8 @@ def _extract_generated_image(omni_outputs: list[OmniRequestOutput]) -> Image.Ima
 
 def _generate_bagel_image(omni: Omni) -> Image.Image:
     params_list = _configure_sampling_params(omni)
-    params_list[1].lora_request = None
+    params_list[1].lora_requests = []
+    params_list[1].lora_scales = []
     outputs = list(
         omni.generate(
             prompts=[{"prompt": DEFAULT_PROMPT, "modalities": ["image"]}],
@@ -90,8 +91,8 @@ def _generate_bagel_image_with_lora(
     lora_scale: float = 1.0,
 ) -> Image.Image:
     params_list = _configure_sampling_params(omni)
-    params_list[1].lora_request = lora_request
-    params_list[1].lora_scale = lora_scale
+    params_list[1].lora_requests = [lora_request]
+    params_list[1].lora_scales = [lora_scale]
     outputs = list(
         omni.generate(
             prompts=[{"prompt": DEFAULT_PROMPT, "modalities": ["image"]}],

@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
 
 logger = init_logger(__name__)
 
@@ -94,20 +94,42 @@ def get_tp_world_size() -> int:
     return 1
 
 
+def get_omni_replica_id() -> int:
+    """Return the Omni replica id for this worker process."""
+    try:
+        replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
+    except (ValueError, TypeError):
+        return 0
+    return max(replica_id, 0)
+
+
 # ------------------------------------------------------------------ #
 #  ZMQ port computation
 # ------------------------------------------------------------------ #
 
 
-def kv_zmq_port(base_port: int, from_stage: int, local_rank: int = 0) -> int:
+def kv_zmq_port(
+    base_port: int,
+    from_stage: int,
+    local_rank: int = 0,
+    replica_id: int | None = None,
+) -> int:
     """Compute the ZMQ port for a KV-transfer connector.
 
-    Each TP rank gets its own port so that TP > 1 deployments do not
-    cause ``EADDRINUSE`` when multiple sender workers bind on the same
-    host.  The formula is backward-compatible: rank 0 produces the same
-    port as the previous ``base + OFFSET + stage`` formula.
+    Each Omni replica and TP rank gets its own port so multi-replica or
+    TP > 1 deployments do not cause ``EADDRINUSE`` when multiple sender
+    workers bind on the same host. The formula is backward-compatible:
+    replica 0 / rank 0 produces the previous ``base + OFFSET + stage`` port.
+
     """
-    return base_port + KV_TRANSFER_PORT_OFFSET + local_rank * KV_RANK_PORT_STRIDE + from_stage
+    replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
+    return (
+        base_port
+        + KV_TRANSFER_PORT_OFFSET
+        + replica * KV_REPLICA_PORT_STRIDE
+        + local_rank * KV_RANK_PORT_STRIDE
+        + from_stage
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -380,6 +402,7 @@ def normalize_layer_kv(
     *,
     req_id: str = "",
     layer_idx: int = -1,
+    block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Normalize one layer KV cache to a ``(key_blocks, value_blocks)`` tuple.
 
@@ -402,6 +425,10 @@ def normalize_layer_kv(
       dim-0 selects key / value.
     * **Stacked tensor** ``[num_blocks, 2, block_size, n_heads, head_dim]`` –
       dim-1 selects key / value.
+    * **Packed tensor** ``[num_blocks, n_heads, block_size, 2 * head_dim]`` –
+      vLLM >= 0.23 FlashAttention packs K and V into the last (content)
+      dimension.  Only recognized when *block_size* is provided and matches
+      dim 2, to avoid misreading other 4-D layouts.
     * **Tuple** ``(key_tensor, value_tensor)`` – returned as-is after
       validation.
 
@@ -409,13 +436,29 @@ def normalize_layer_kv(
         layer_kv: The raw KV cache (tensor or tuple) for the layer.
         req_id: Request ID used only for diagnostic log messages.
         layer_idx: Layer index used only for diagnostic log messages.
+        block_size: The paged-attention block size, required to recognize
+            the packed 4-D layout.
 
     Returns:
         ``(key_blocks, value_blocks)`` if *layer_kv* is valid, ``None``
         otherwise.
     """
     if isinstance(layer_kv, torch.Tensor):
-        if layer_kv.ndim >= 3 and layer_kv.shape[0] == 2:
+        if (
+            layer_kv.ndim == 4
+            and block_size is not None
+            and layer_kv.shape[2] == block_size
+            and layer_kv.shape[-1] % 2 == 0
+        ):
+            # vLLM >= 0.23 FlashAttention layout: (num_blocks, n_heads,
+            # block_size, 2 * head_dim).  Unpack the same way
+            # FlashAttentionImpl does: move block_size before heads, then
+            # split the content dim into the K and V halves.  Checked before
+            # the stacked layouts (which are 5-D in practice) so that a
+            # 2-KV-head packed tensor is not misread as a dim-1 stack.
+            head_dim = layer_kv.shape[-1] // 2
+            key_blocks, value_blocks = layer_kv.transpose(1, 2).split(head_dim, dim=-1)
+        elif layer_kv.ndim >= 3 and layer_kv.shape[0] == 2:
             key_blocks = layer_kv[0]
             value_blocks = layer_kv[1]
         elif layer_kv.ndim >= 3 and layer_kv.shape[1] == 2:
@@ -424,7 +467,8 @@ def normalize_layer_kv(
         else:
             logger.warning(
                 f"Layer {layer_idx} for request {req_id} has invalid stacked KV shape: "
-                f"expected [2, ...] or [..., 2, ...] at dim 0/1, got {tuple(layer_kv.shape)}"
+                f"expected [2, ...], [..., 2, ...] at dim 0/1, or packed "
+                f"[num_blocks, n_heads, block_size, 2*head_dim], got {tuple(layer_kv.shape)}"
             )
             return None
     elif isinstance(layer_kv, tuple):

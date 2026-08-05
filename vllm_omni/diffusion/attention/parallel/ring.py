@@ -10,7 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FA3, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FA4, HAS_FLASH_ATTN
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -110,13 +110,12 @@ class RingParallelAttention:
         if backend_pref is not None:
             backend_pref = backend_pref.lower()
 
-        # Determine attention type with fallback chain: FA3 -> FA2 -> SDPA
         # FP32 is not supported by Flash Attention, force SDPA
         if query.dtype == torch.float32:
             backend_pref = "sdpa"
-        elif not HAS_FA3 and not HAS_FLASH_ATTN:
+        elif not HAS_FA3 and not HAS_FLASH_ATTN and not HAS_AITER:
             if backend_pref != "sdpa":
-                logger.warning_once("Flash Attention (FA2/FA3) is not available! Force enabling SDPA.")
+                logger.warning_once("Flash Attention (FA2/FA3/AITER) is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
 
         # Extract joint tensors
@@ -146,8 +145,17 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
-        # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
-        attn_type = AttnType.FA3 if HAS_FA3 else AttnType.FA
+        # Prefer FA4 on Blackwell. An importable Hopper-only FA3 wheel can
+        # otherwise be selected and fail at launch with "no kernel image".
+        if HAS_FA4 and query.is_cuda and torch.cuda.get_device_capability(query.device)[0] >= 10:
+            attn_type = AttnType.FA4
+        # Prefer FA3 over FA2 on Ampere/Ada/Hopper. On ROCm, use AITER.
+        elif HAS_FA3:
+            attn_type = AttnType.FA3
+        elif HAS_AITER:
+            attn_type = AttnType.AITER
+        else:
+            attn_type = AttnType.FA
 
         return ring_flash_attn_func(
             query,

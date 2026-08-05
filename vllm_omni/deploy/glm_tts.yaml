@@ -1,0 +1,83 @@
+# GLM-TTS deploy: 2-stage AR -> DiT flow-matching.
+#
+# Default mode is async-chunk streaming through SharedMemoryConnector.
+# Stage 0 (AR LLM) streams speech token chunks to Stage 1 (DiT + vocoder)
+# via the shared-memory connector. Stage 1 runs as LLM_GENERATION type
+# to support chunk_transfer_adapter consumption.
+#
+# Stage 1 keeps vLLM eager scheduling but enables the GLM-TTS bucketed DiT
+# CUDA graph wrapper via hf_overrides.use_dit_cuda_graphs. Graph capture falls
+# back to eager if a dynamic shape exceeds the captured buckets.
+#
+# Verified on 1x A40 48GB (both stages share GPU 0).
+# Memory footprint ~16.6 GiB peak; fits 24GB cards with the settings below.
+async_chunk: true
+trust_remote_code: true
+
+connectors:
+  glm_tts_shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.002
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # Progressive chunk sizes matching original GLM-TTS defaults.
+      codec_chunk_frames: [25, 50, 200]
+      codec_left_context_frames: 25
+      crossfade_sec: 0.1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.55
+    # BF16 for AR decode: memory-bandwidth bound on single-batch decode,
+    # bf16 halves HBM reads per step (~1.7x throughput on L4/A40).
+    dtype: bfloat16
+    enforce_eager: false
+    async_scheduling: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 512
+    max_model_len: 2048
+    devices: "0"
+    output_connectors:
+      to_stage_1: glm_tts_shm
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 25
+      top_p: 0.8
+      max_tokens: 2048
+      min_tokens: 1
+      seed: 42
+      detokenize: false
+    hf_overrides:
+      sample_method: ras
+      ras_top_p: 0.8
+      ras_top_k: 25
+      ras_win_size: 10
+      ras_tau_r: 0.1
+      min_token_text_ratio: 2.0
+      max_token_text_ratio: 20.0
+    skip_mm_profiling: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    max_model_len: 8192
+    max_num_batched_tokens: 2048
+    # Force float32 for the flow-matching DiT stage.  The Euler ODE solver
+    # (10 steps × 2 forward passes each) accumulates rounding errors in half
+    # precision that manifest as audible hiss on H20/H100.  float32 matches
+    # the reference implementation and eliminates the noise floor.
+    dtype: float32
+    devices: "0"
+    enable_prefix_caching: false
+    input_connectors:
+      from_stage_0: glm_tts_shm
+    default_sampling_params:
+      max_tokens: 2048
+    hf_overrides:
+      use_dit_cuda_graphs: true
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

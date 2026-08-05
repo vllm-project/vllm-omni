@@ -21,7 +21,7 @@ models = [os.environ.get("AUDIOX_TEST_MODEL", "zhangj1an/audiox_random")]
 _OMNI_RUNNER_PARAMS = [(m, None, {"model_class_name": "AudioXPipeline"}) for m in models]
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True, ids=models),
 ]

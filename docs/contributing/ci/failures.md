@@ -69,6 +69,8 @@ If the failure is already tracked, leave a comment on your PR noting that the fa
 
 If the failure appears to be new, investigate whether your changes caused it.
 
+For resilience behavior under injected process signals/OOM pressure (validation scenarios, not root-cause equivalence), see [Failure Mode Injection Scenarios and Expected Behavior Matrix](../../user_guide/fault_injection_reliability_matrix.md).
+
 ### Reading Buildkite Logs
 
 1. Click **Details** next to the Buildkite check on your PR.
@@ -77,7 +79,7 @@ If the failure appears to be new, investigate whether your changes caused it.
 
 ### Running Tests Locally
 
-For instructions on running tests locally (including specific test files, functions, and markers), see the [Running Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_guide/#running-tests) section in the Test Guide.
+For instructions on running tests locally (including specific test files, functions, and markers), see the [Running Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_execution_guide/#running-tests) section in the Test Execution guide.
 
 ## Step 4: Raise an Issue or Fix It
 

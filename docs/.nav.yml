@@ -6,24 +6,22 @@ nav:
     - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
-      - Diffusion Chat API: serving/diffusion_chat_api.md
+      - Chat Completions API: serving/chat_completions_api.md
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
+      - Videos: serving/videos_api.md
       - Audio Generation: serving/audio_generate_api.md
       - Streaming Video Input: serving/video_stream_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
-      - Helios Video Generation: user_guide/examples/offline_inference/helios.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
-      - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
-      - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
+      - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
@@ -38,7 +36,7 @@ nav:
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
-      - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
+      - MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
@@ -56,6 +54,7 @@ nav:
     - Diffusion Features:
       - Overview: user_guide/diffusion_features.md
       - Feature Compatibility: user_guide/feature_compatibility.md
+      - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
@@ -68,10 +67,11 @@ nav:
         - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
-        - VAE Patch Parallel: user_guide/diffusion/parallelism/vae_patch_parallel.md
+        - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
+      - Request-Level Batching: user_guide/diffusion/request_batching.md
       - Step Execution: user_guide/diffusion/step_execution.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
@@ -79,11 +79,16 @@ nav:
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
+      - MXFP8 W8A8: user_guide/quantization/mxfp8.md
+      - MXFP4 W4A4: user_guide/quantization/mxfp4.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - GGUF: user_guide/quantization/gguf.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
     - ComfyUI: features/comfyui.md
+  - Fault Tolerance:
+    - Failure Modes: user_guide/fault_injection_reliability_matrix.md
 - Developer Guide:
   - General:
     - contributing/README.md
@@ -111,9 +116,12 @@ nav:
       - design/feature/hsdp.md
       - design/feature/cache_dit.md
       - design/feature/teacache.md
+      - design/feature/skip_softmax.md
       - design/feature/async_chunk.md
+      - design/feature/omni_async_output_materialization.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
+      - design/feature/diffusion_request_level_batching.md
       - design/feature/diffusion_continuous_batching.md
     - Module Design:
       - design/module/ar_module.md

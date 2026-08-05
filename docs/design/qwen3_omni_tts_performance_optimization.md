@@ -411,14 +411,15 @@ Notes:
 - `runtime.max_batch_size` controls stage-level batching.
 - Thinker/Talker commonly use `enforce_eager: false` for CUDA Graph paths.
 - Code2Wav often remains eager (`enforce_eager: true`) depending on runtime behavior.
+- Qwen3-Omni defaults `VLLM_USE_FLASHINFER_MOE_FP16=0`. The Triton has been more stable & faster
+ than the FlashInfer CUTLASS unquantized MoE backend on recent vLLM rebases.
 
 #### 2) Enable async chunk
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni \
-  --port 8091 \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+  --port 8091
 ```
 
 #### 3) Key config knobs
@@ -492,7 +493,7 @@ The default config (`qwen3_tts.yaml`) enables the full optimization stack:
 vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --omni \
   --port 8000 \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_no_async_chunk.yaml
+  --no-async-chunk
 ```
 
 #### 3) Key config knobs

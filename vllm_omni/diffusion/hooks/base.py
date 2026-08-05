@@ -15,29 +15,36 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
+from vllm.logger import init_logger
 
-
-class BaseState:
-    """Base class for hook state containers."""
-
-    def reset(self) -> None:  # pragma: no cover - default is no-op
-        pass
+logger = init_logger(__name__)
 
 
 class StateManager:
-    """Manage per-context hook state instances."""
+    """Manage per-context hook state instances.
 
-    def __init__(self, state_cls: Callable[[], BaseState]):
+    State classes (e.g. TeaCacheState, MagCacheState) are plain classes;
+    they only need to be constructible with the given init args.
+    """
+
+    def __init__(self, state_cls: Callable[..., Any], init_args: tuple = (), init_kwargs: dict | None = None):
         self._state_cls = state_cls
-        self._states: dict[str, BaseState] = {}
+        self._init_args = init_args
+        self._init_kwargs = init_kwargs or {}
+        self._states: dict[str, Any] = {}
         self._context: str = "default"
+
+    @property
+    def _current_context(self) -> str | None:
+        """Alias for _context for compatibility with diffusers hook code."""
+        return self._context if self._context != "default" else None
 
     def set_context(self, name: str) -> None:
         self._context = name or "default"
 
-    def get_state(self) -> BaseState:
+    def get_state(self) -> Any:
         if self._context not in self._states:
-            self._states[self._context] = self._state_cls()
+            self._states[self._context] = self._state_cls(*self._init_args, **self._init_kwargs)
         return self._states[self._context]
 
     def reset(self) -> None:
@@ -190,6 +197,22 @@ class HookRegistry:
 
         return registry
 
+    @classmethod
+    def check_if_exists_or_initialize(cls, module: nn.Module) -> HookRegistry:
+        """Get existing registry or create a new one for the module.
+
+        This method ensures a HookRegistry exists on the module and returns it.
+        If a registry doesn't exist, it creates one and attaches it to the module.
+        This is equivalent to get_or_create() for compatibility with diffusers API.
+
+        Args:
+            module: The module to get/create a registry for.
+
+        Returns:
+            The HookRegistry for this module.
+        """
+        return cls.get_or_create(module)
+
     def update_sorted_hooks(self):
         """Sort hooks by name, which dictates pre/post process order."""
         sorted_hooks = [self._hooks[k] for k in sorted(self._hooks) if self._hooks[k] != self._new_fwd_impl_hook]
@@ -205,7 +228,23 @@ class HookRegistry:
             name: Unique name for this hook.
             hook: The hook instance to register.
         """
+        if name in self._hooks:
+            logger.warning(f"Hook with name '{name}' already exists. Overwriting existing hook.")
+            self.remove_hook(name)
+
         hook.initialize_hook(self.module)
+
+        if hasattr(hook, "fn_ref"):
+            hook.fn_ref.original_forward = self.module._omni_original_forward
+        else:
+            original_forward = self.module._omni_original_forward  # type: ignore[attr-defined]
+
+            class _FnRef:
+                def __init__(self, orig_forward):
+                    self.original_forward = orig_forward
+
+            hook.fn_ref = _FnRef(original_forward)
+
         self._hooks[name] = hook
         # We can only have one hook that overrides new_forward,
         # since we don't currently have a mechanism for combining them.

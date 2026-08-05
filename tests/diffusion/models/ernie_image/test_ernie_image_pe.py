@@ -73,7 +73,7 @@ def test_should_apply_pe_respects_sampling_extra_args():
 
 
 def test_should_apply_pe_disables_dummy_warmup_request():
-    req = SimpleNamespace(request_ids=["dummy_req_id"], sampling_params=SimpleNamespace(extra_args={}))
+    req = SimpleNamespace(is_dummy_run=lambda: True, sampling_params=SimpleNamespace(extra_args={}))
 
     assert ErnieImagePipeline._should_apply_pe(req) is False
 

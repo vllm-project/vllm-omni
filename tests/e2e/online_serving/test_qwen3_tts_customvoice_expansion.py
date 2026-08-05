@@ -75,6 +75,7 @@ def test_voice_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "uncle_fu",

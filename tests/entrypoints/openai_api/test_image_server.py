@@ -9,24 +9,28 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 
 import base64
 import io
+import json
 from argparse import Namespace
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -120,6 +124,27 @@ class MockGenerationResult:
         self.peak_memory_mb = 0.0
 
 
+class MockStageResult:
+    """Mock multi-stage output for streaming image edit tests."""
+
+    def __init__(self, *, stage_id, final_output_type, text="", texts=None, images=None):
+        self.stage_id = stage_id
+        self.final_output_type = final_output_type
+        self.images = images or []
+        if texts is not None:
+            outputs = [SimpleNamespace(text=item, index=index) for index, item in enumerate(texts)]
+        elif text:
+            outputs = [SimpleNamespace(text=text, index=0)]
+        else:
+            outputs = []
+        self.request_output = SimpleNamespace(
+            outputs=outputs,
+            images=self.images,
+        )
+        self.stage_durations = {}
+        self.peak_memory_mb = 0.0
+
+
 class FakeAsyncOmni:
     """Fake AsyncOmni that yields a single diffusion output."""
 
@@ -133,7 +158,7 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
         if sampling_params_list is not None:
             self.captured_sampling_params_list = sampling_params_list
         else:
@@ -231,7 +256,7 @@ def async_omni_test_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -295,7 +320,7 @@ def async_omni_rgba_test_client():
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -359,7 +384,7 @@ def async_omni_stage_configs_only_client():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             if sampling_params_list is not None:
                 self.captured_sampling_params_list = sampling_params_list
             else:
@@ -384,6 +409,72 @@ def async_omni_stage_configs_only_client():
     chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
+        max_generated_image_size=1024 * 1792,
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def streaming_image_edit_client():
+    """Create a multi-stage client whose engine yields AR text before image output."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+            self.captured_prompt = prompt
+            self.captured_sampling_params_list = sampling_params_list or [sampling_params]
+            assert self.captured_sampling_params_list[0].output_kind == RequestOutputKind.DELTA
+            yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+            yield MockStageResult(stage_id=0, final_output_type="text", text=" done")
+            yield MockStageResult(
+                stage_id=1,
+                final_output_type="image",
+                images=[Image.new("RGB", (32, 24), color="purple")],
+            )
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
@@ -495,6 +586,25 @@ def test_generate_single_image(test_client):
     img_bytes = base64.b64decode(data["data"][0]["b64_json"])
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
+    assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
+
+
+def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
+    async def blocked_generate(**kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockGenerationResult([])  # pragma: no cover
+
+    mock_async_diffusion.generate = blocked_generate
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "blocked prompt",
+            "n": 1,
+            "size": "1024x1024",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
@@ -606,7 +716,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
             self.captured_sampling_params_list = (
                 sampling_params_list if sampling_params_list is not None else [sampling_params]
             )
@@ -678,6 +788,181 @@ def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
+
+
+def _parse_sse_payloads(body: str):
+    payloads = []
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line[len("data: ") :]
+        payloads.append(data if data == "[DONE]" else json.loads(data))
+    return payloads
+
+
+def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "size": "auto",
+            "stream": "true",
+            "output_format": "png",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    payloads = _parse_sse_payloads(response.text)
+    assert [p["type"] if isinstance(p, dict) and "type" in p else p for p in payloads] == [
+        "ar_delta",
+        "ar_delta",
+        "image",
+        "[DONE]",
+    ]
+    assert payloads[0]["delta"] == "recap"
+    assert payloads[0]["index"] == 0
+    assert payloads[1]["delta"] == " done"
+    assert payloads[2]["output_format"] == "png"
+    assert payloads[2]["size"] == "16x16"
+
+    image_payload = payloads[2]["data"][0]
+    img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
+    assert img.size == (32, 24)
+
+
+def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
+    async def generate_multi_output_delta(
+        prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs
+    ):
+        yield MockStageResult(stage_id=0, final_output_type="text", texts=["first", "second"])
+        yield MockStageResult(
+            stage_id=1,
+            final_output_type="image",
+            images=[Image.new("RGB", (32, 24), color="purple")],
+        )
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_multi_output_delta
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert [(payloads[0]["index"], payloads[0]["delta"]), (payloads[1]["index"], payloads[1]["delta"])] == [
+        (0, "first"),
+        (1, "second"),
+    ]
+
+
+def test_image_edits_streaming_errors_without_final_image(streaming_image_edit_client):
+    async def generate_without_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+        yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_without_image
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["type"] == "ar_delta"
+    assert payloads[1]["object"] == "error"
+    assert "without a final image" in payloads[1]["error"]["message"]
+    assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_errors_on_empty_final_image(streaming_image_edit_client):
+    async def generate_empty_image(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+        yield MockStageResult(stage_id=0, final_output_type="text", text="recap")
+        yield MockStageResult(stage_id=1, final_output_type="image", images=[])
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_empty_image
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["type"] == "ar_delta"
+    assert payloads[1]["object"] == "error"
+    assert "empty final image" in payloads[1]["error"]["message"]
+    assert payloads[2] == "[DONE]"
+
+
+def test_image_edits_streaming_guardrail_error_uses_400(streaming_image_edit_client):
+    async def generate_guardrail_error(prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+        raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
+        yield MockStageResult(stage_id=1, final_output_type="image", images=[])  # pragma: no cover
+
+    streaming_image_edit_client.app.state.engine_client.generate = generate_guardrail_error
+    img_bytes = make_test_image_bytes((16, 16))
+    response = streaming_image_edit_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "blocked prompt",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _parse_sse_payloads(response.text)
+    assert payloads[0]["object"] == "error"
+    assert payloads[0]["error"]["message"] == "Input was blocked by Cosmos3 guardrails."
+    assert payloads[0]["error"]["type"] == "BadRequestError"
+    assert payloads[0]["error"]["code"] == 400
+    assert payloads[1] == "[DONE]"
+
+
+def test_image_edits_streaming_rejects_single_stage(test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
+
+
+def test_image_edits_streaming_rejects_single_stage_before_loading_url(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "edit me",
+            "url": "https://example.invalid/not-fetched.png",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
 
 
 def test_generate_images_max_size_rejected(async_omni_test_client):
@@ -772,6 +1057,42 @@ def test_with_custom_parameters(test_client):
         },
     )
     assert response.status_code == 200
+
+
+def test_flow_shift_forwarded_to_extra_args(test_client):
+    """flow_shift must reach the diffusion sampling params via extra_args.
+
+    Regression: ``ImageGenerationRequest`` had no ``flow_shift`` field and the
+    single-stage handler never forwarded it, so a request like
+    ``{"flow_shift": 10.0}`` was silently dropped and Cosmos3 T2I always ran at
+    its hardcoded per-mode default shift. The pipeline reads
+    ``extra_args["flow_shift"]`` (via ``_get_sp_param``), so it must land there.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robot in a lab",
+            "size": "960x960",
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "flow_shift": 10.0,
+        },
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["flow_shift"] == 10.0
+
+
+def test_flow_shift_absent_when_not_requested(test_client):
+    """Omitting flow_shift must not inject an override, so the pipeline keeps
+    its per-mode default (e.g. Cosmos3 T2I shift=3.0)."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024"},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert "flow_shift" not in (captured.extra_args or {})
 
 
 def test_invalid_size(test_client):
@@ -923,7 +1244,7 @@ def test_parameter_validation():
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
-        ImageGenerationRequest(prompt="test", layers=2)
+        ImageGenerationRequest(prompt="test", layers=1)
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
@@ -978,6 +1299,117 @@ def test_generate_images_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("output_format", "expected_pil_format"),
+    [("png", "PNG"), ("jpeg", "JPEG"), ("webp", "WEBP")],
+)
+def test_image_file_response_format_multiple(test_client, output_format, expected_pil_format):
+    """Test response_format=file with n>1 returns ZIP archive"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 3,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert ".zip" in response.headers.get("content-disposition", "")
+
+    # Verify it's a valid ZIP with 3 correctly labelled image files
+    import zipfile
+
+    zip_buffer = io.BytesIO(response.content)
+    with zipfile.ZipFile(zip_buffer, "r") as zf:
+        files = zf.namelist()
+        assert len(files) == 3
+        assert all(f.endswith(f".{output_format}") for f in files)
+
+        # Verify each file's bytes match its advertised format
+        for filename in files:
+            img_bytes = zf.read(filename)
+            img = Image.open(io.BytesIO(img_bytes))
+            assert img.format == expected_pil_format
+
+
+@pytest.mark.parametrize(
+    ("output_format", "expected_media_type", "expected_pil_format"),
+    [
+        ("png", "image/png", "PNG"),
+        ("jpg", "image/jpeg", "JPEG"),
+        ("jpeg", "image/jpeg", "JPEG"),
+        ("webp", "image/webp", "WEBP"),
+    ],
+)
+def test_image_file_response_format_single(test_client, output_format, expected_media_type, expected_pil_format):
+    """Test response_format=file with n=1 returns a single image file."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 1,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert f".{output_format}" in response.headers.get("content-disposition", "")
+
+    img = Image.open(io.BytesIO(response.content))
+    assert img.format == expected_pil_format
+
+
+@pytest.mark.parametrize(
+    ("output_format", "image_count", "expected_media_type", "expected_pil_format"),
+    [
+        ("jpeg", 1, "image/jpeg", "JPEG"),
+        ("webp", 2, "application/zip", "WEBP"),
+    ],
+)
+def test_multistage_image_file_response_uses_requested_format(
+    async_omni_test_client,
+    output_format,
+    image_count,
+    expected_media_type,
+    expected_pil_format,
+):
+    engine = async_omni_test_client.app.state.engine_client
+    engine._images = [Image.new("RGB", (16, 16), color="green") for _ in range(image_count)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": image_count,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    if image_count == 1:
+        assert f".{output_format}" in response.headers["content-disposition"]
+        assert Image.open(io.BytesIO(response.content)).format == expected_pil_format
+        return
+
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(response.content), "r") as archive:
+        filenames = archive.namelist()
+        assert len(filenames) == image_count
+        assert all(filename.endswith(f".{output_format}") for filename in filenames)
+        for filename in filenames:
+            assert Image.open(io.BytesIO(archive.read(filename))).format == expected_pil_format
 
 
 def make_test_image_bytes(size=(64, 64)) -> bytes:
@@ -1189,6 +1621,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
             "output_format": "jpeg",
             "num_inference_steps": 20,
             "guidance_scale": 8.0,
+            "guidance_scale_2": 2.0,
             "seed": 1234,
             "negative_prompt": "negative",
             "n": 2,
@@ -1203,6 +1636,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
     assert captured_prompt["negative_prompt"] == "negative"
     assert captured_sampling_params.num_inference_steps == 20
     assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.guidance_scale_2 == 2.0
     assert captured_sampling_params.seed == 1234
     assert captured_sampling_params.num_outputs_per_prompt == 2
     assert captured_sampling_params.width == 16
@@ -1290,13 +1724,13 @@ def test_image_edit_invalid_layers(async_omni_test_client):
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 2,
+            "layers": 1,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
     # Test layers above the supported range
     response = async_omni_test_client.post(
@@ -1310,7 +1744,7 @@ def test_image_edit_invalid_layers(async_omni_test_client):
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
@@ -1657,6 +2091,56 @@ def test_extract_images_from_result():
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+# ---------------------------------------------------------------------------
+# _check_max_generated_image_size unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_width_height_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=)
+    _check_max_generated_image_size(args, 1024, 1024)
+    # Below limit
+    _check_max_generated_image_size(args, 512, 512)
+
+
+def test_width_height_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1025, 1024)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "1025x1024" in exc_info.value.detail
+    assert str(limit) in exc_info.value.detail
+
+
+def test_width_height_error_message_contains_size_hint():
+    args = SimpleNamespace(max_generated_image_size=512 * 512)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1024, 512)
+    assert "--max-generated-image-size" in exc_info.value.detail
+
+
+def test_resolution_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=): 1024*1024 == limit
+    _check_max_generated_image_size(args, None, None, resolution=1024)
+    # Below limit
+    _check_max_generated_image_size(args, None, None, resolution=512)
+
+
+def test_resolution_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, None, None, resolution=1025)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    detail = exc_info.value.detail
+    assert "1025" in detail
+    assert "1025x1025" in detail
+    assert str(limit) in detail
 
 
 def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):

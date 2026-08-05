@@ -49,9 +49,11 @@ class DistributedVaeExecutor:
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
+        self.parallel_mode = "tile"
 
-    def set_parallel_size(self, parallel_size: int):
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile"):
         self.parallel_size = parallel_size
+        self.parallel_mode = mode
 
     def gather_tensors(self, tensor: torch.Tensor):
         gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
@@ -125,7 +127,7 @@ class DistributedVaeExecutor:
 
         # 2. local decode
         assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank] if pp_size <= self.world_size else []
+        local_tasks = assigned[self.rank] if self.rank < pp_size else []
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
@@ -170,8 +172,8 @@ class DistributedVaeMixin:
     def init_distributed(self):
         self.distributed_executor = DistributedVaeExecutor()
 
-    def set_parallel_size(self, parallel_size: int) -> None:
-        self.distributed_executor.set_parallel_size(parallel_size)
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        self.distributed_executor.set_parallel_size(parallel_size, mode=mode)
 
     def is_distributed_enabled(self) -> bool:
         if (

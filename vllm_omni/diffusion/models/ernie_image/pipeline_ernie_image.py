@@ -27,6 +27,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -247,8 +248,10 @@ class ErnieImagePipeline(
 
     @staticmethod
     def _is_warmup_request(req: OmniDiffusionRequest) -> bool:
-        request_ids = getattr(req, "request_ids", None) or ()
-        return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
+        is_dummy_run = getattr(req, "is_dummy_run", None)
+        if callable(is_dummy_run):
+            return bool(is_dummy_run())
+        return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
 
     @staticmethod
     def _should_apply_pe(req: OmniDiffusionRequest) -> bool:
@@ -390,7 +393,7 @@ class ErnieImagePipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = "",
         height: int = 1024,

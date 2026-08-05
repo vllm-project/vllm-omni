@@ -12,6 +12,7 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
+| `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 
@@ -34,21 +35,17 @@ python text_to_video.py \
   --output t2v_out.mp4
 ```
 
-LTX2 example:
+### LTX-2
 
 ```bash
 python text_to_video.py \
-  --model "Lightricks/LTX-2" \
-  --prompt "A cinematic close-up of ocean waves at golden hour." \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --output ltx2_out.mp4
+  --model Lightricks/LTX-2 \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --output ltx2_output.mp4
 ```
+
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, I2V, defaults, and advanced options.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -110,6 +107,7 @@ python text_to_video.py \
 ### Common
 
 - `--model`: Diffusers model ID or local path.
+- `--model-class-name`: Optional explicit pipeline override.
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution. Default depends on model.
 - `--num-frames`: number of frames. Default depends on model.
@@ -124,7 +122,7 @@ python text_to_video.py \
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
+- `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
 

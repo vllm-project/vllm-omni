@@ -12,12 +12,13 @@ step, and step outputs are scattered back into request states by
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.prompt_update import prompt_update_versions
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
 def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
@@ -59,9 +60,9 @@ def _pad_mask(x: torch.Tensor, target_seq_len: int) -> torch.Tensor:
 
 
 def _select_states(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     idx_mapping: torch.Tensor | None,
-) -> tuple[list[DiffusionRequestState], torch.Tensor, np.ndarray]:
+) -> tuple[list[StepRequestState], torch.Tensor, np.ndarray]:
     if not states:
         raise ValueError("Cannot build InputBatch from empty states.")
 
@@ -73,7 +74,7 @@ def _select_states(
             raise ValueError("idx_mapping must be a 1D tensor.")
         idx_mapping = idx_mapping.to(dtype=torch.int32)
 
-    selected_states: list[DiffusionRequestState] = []
+    selected_states: list[StepRequestState] = []
     for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
@@ -81,12 +82,12 @@ def _select_states(
     return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
 
 
-def _prepare_req_ids(states: Sequence[DiffusionRequestState]) -> list[str]:
-    return [state.req_id for state in states]
+def _prepare_request_ids(states: Sequence[StepRequestState]) -> list[str]:
+    return [state.request_id for state in states]
 
 
 def _prepare_prompt_field_on_state(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -180,7 +181,7 @@ def _get_seq_lens_from_mask(mask: torch.Tensor) -> list[int]:
 
 
 def _get_request_prompt_seq_lens(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -192,11 +193,13 @@ def _get_request_prompt_seq_lens(
         mask_attr=mask_attr,
     )
     if embeds is None:
-        raise ValueError(f"{embeds_attr} is not initialized on request {state.req_id}.")
+        raise ValueError(f"{embeds_attr} is not initialized on request {state.request_id}.")
 
     if mask is not None:
         if mask.shape[0] != embeds.shape[0]:
-            raise ValueError(f"{mask_attr} batch dimension does not match {embeds_attr} for request {state.req_id}.")
+            raise ValueError(
+                f"{mask_attr} batch dimension does not match {embeds_attr} for request {state.request_id}."
+            )
         return _get_seq_lens_from_mask(mask)
 
     seq_lens = getattr(state, seq_lens_attr)
@@ -207,7 +210,7 @@ def _get_request_prompt_seq_lens(
 
 
 def _prepare_request_prompt_field(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -220,7 +223,7 @@ def _prepare_request_prompt_field(
         mask_attr=mask_attr,
     )
     if embeds is None:
-        raise ValueError(f"{embeds_attr} is not initialized on request {state.req_id}.")
+        raise ValueError(f"{embeds_attr} is not initialized on request {state.request_id}.")
 
     actual_seq_lens = _get_request_prompt_seq_lens(
         state,
@@ -248,16 +251,23 @@ def _prepare_request_prompt_field(
     if current_seq_len > target_seq_len:
         if max_actual_seq_len > target_seq_len:
             raise ValueError(
-                f"{embeds_attr} for request {state.req_id} requires seq_len "
+                f"{embeds_attr} for request {state.request_id} requires seq_len "
                 f"{max_actual_seq_len}, got target {target_seq_len}."
             )
-        return embeds[:, :target_seq_len], None if mask is None else mask[:, :target_seq_len]
+        embeds = embeds[:, :target_seq_len]
+        mask = None if mask is None else mask[:, :target_seq_len]
+        setattr(state, embeds_attr, embeds)
+        if mask is not None:
+            setattr(state, mask_attr, mask)
+        setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
+        return embeds, mask
 
+    setattr(state, seq_lens_attr, [int(embeds.shape[1])] * int(embeds.shape[0]))
     return embeds, mask
 
 
 def _prepare_padded_prompt_fields(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -328,7 +338,7 @@ def _prepare_padded_prompt_fields(
 
 
 def _prepare_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -343,13 +353,13 @@ def _prepare_latents(
 
 
 def _require_state_latents(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     for_field: str,
 ) -> torch.Tensor:
     latents = state.latents
     if latents is None:
-        raise ValueError(f"Request {state.req_id} has no latents while preparing {for_field}.")
+        raise ValueError(f"Request {state.request_id} has no latents while preparing {for_field}.")
     return latents
 
 
@@ -373,7 +383,7 @@ def _expand_scalar_or_vector(
 
 
 def _prepare_timesteps(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -401,9 +411,9 @@ def _prepare_timesteps(
 
 
 def _prepare_cfg_scalars(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
 ) -> tuple[bool, float, bool]:
-    def _cfg_scalars(state: DiffusionRequestState) -> tuple[bool, float, bool]:
+    def _cfg_scalars(state: StepRequestState) -> tuple[bool, float, bool]:
         true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
         cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
         return state.do_true_cfg, true_cfg_scale, cfg_normalize
@@ -416,7 +426,7 @@ def _prepare_cfg_scalars(
 
 
 def _prepare_guidance(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -452,7 +462,7 @@ def _prepare_guidance(
 
 
 def _prepare_image_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -469,7 +479,7 @@ def _prepare_image_latents(
 
 
 def _prepare_seq_lens(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     attr_name: str,
 ) -> list[int] | None:
     values = [getattr(state, attr_name) for state in states]
@@ -480,7 +490,7 @@ def _prepare_seq_lens(
     return [int(value[0]) for value in values if value is not None]
 
 
-def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
+def _prepare_img_shapes(states: Sequence[StepRequestState]) -> list | None:
     values = [state.img_shapes for state in states]
     if all(value is None for value in values):
         return None
@@ -490,11 +500,11 @@ def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
 
 
 def _prepare_prompt_embeds(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     prompt_embeds, prompt_embeds_mask = _prepare_padded_prompt_fields(
         states,
         embeds_attr="prompt_embeds",
@@ -503,13 +513,11 @@ def _prepare_prompt_embeds(
         embeds_out=embeds_out,
         mask_out=mask_out,
     )
-    if prompt_embeds is None:
-        raise ValueError("All requests must have `prompt_embeds` initialized.")
     return prompt_embeds, prompt_embeds_mask
 
 
 def _prepare_negative_prompt_embeds(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
@@ -526,18 +534,23 @@ def _prepare_negative_prompt_embeds(
 
 def _same_composition(
     cached_batch: InputBatch | None,
-    req_ids: list[str],
+    request_ids: list[str],
     idx_mapping_np: np.ndarray,
+    states: Sequence[StepRequestState],
 ) -> bool:
     if cached_batch is None:
         return False
-    if cached_batch.req_ids != req_ids:
+    if cached_batch.request_ids != request_ids:
         return False
-    return np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np)
+    if not np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np):
+        return False
+    # Midway prompt updates (typically for video generation) can change prompt_embeds without changing ids/mapping.
+    # In this case, each request state manages the embedding's "version". Use it to determine if cache is still valid.
+    return cached_batch._prompt_update_versions == prompt_update_versions(states)
 
 
 def _scatter_batch_tensor_by_mapping(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     idx_mapping_np: np.ndarray,
     *,
     attr_name: str,
@@ -575,13 +588,17 @@ class InputBatch:
     """Ephemeral step-level batch view.
 
     Static request-local tensors are normalized and padded onto
-    ``DiffusionRequestState`` itself, making the request state the persistent
+    ``StepRequestState`` itself, making the request state the persistent
     source of truth. ``InputBatch`` only assembles a contiguous view for the
     current step and refreshes dynamic fields in-place when composition is
     unchanged.
+
+    ``states`` is a narrow escape hatch for Hunyuan-style state-driven
+    pipelines that need request-private KV/cache metadata during denoise.
+    Other pipelines should continue to use the standard batch fields.
     """
 
-    req_ids: list[str]
+    request_ids: list[str]
     num_reqs: int
     num_reqs_after_padding: int
     idx_mapping: torch.Tensor
@@ -589,7 +606,7 @@ class InputBatch:
 
     latents: torch.Tensor
     timesteps: torch.Tensor
-    prompt_embeds: torch.Tensor
+    prompt_embeds: torch.Tensor | None
     prompt_embeds_mask: torch.Tensor | None
     negative_prompt_embeds: torch.Tensor | None
     negative_prompt_embeds_mask: torch.Tensor | None
@@ -602,25 +619,30 @@ class InputBatch:
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
+    states: Sequence[StepRequestState] = field(default_factory=tuple)
+
+    # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
+    # Keep a snapshot of the current per-request versions of prompt embeddings for later runtime comparison
+    _prompt_update_versions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        if len(self.req_ids) != int(self.idx_mapping.numel()):
-            raise ValueError("`req_ids` and `idx_mapping` must have the same length.")
-        if self.num_reqs != len(self.req_ids):
+        if len(self.request_ids) != int(self.idx_mapping.numel()):
+            raise ValueError("`request_ids` and `idx_mapping` must have the same length.")
+        if self.num_reqs != len(self.request_ids):
             raise ValueError("`num_reqs` must match the number of request ids.")
         if self.num_reqs_after_padding < self.num_reqs:
             raise ValueError("`num_reqs_after_padding` must be >= `num_reqs`.")
 
     def _refresh_dynamic_fields(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
     ) -> None:
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
 
     def _refresh_static_fields(
         self,
-        states: Sequence[DiffusionRequestState],
+        states: Sequence[StepRequestState],
     ) -> None:
         self.do_true_cfg, self.true_cfg_scale, self.cfg_normalize = _prepare_cfg_scalars(states)
         self.guidance = _prepare_guidance(states, out=self.guidance)
@@ -641,25 +663,30 @@ class InputBatch:
         self.img_shapes = _prepare_img_shapes(states)
         self.txt_seq_lens = _prepare_seq_lens(states, "txt_seq_lens")
         self.negative_txt_seq_lens = _prepare_seq_lens(states, "negative_txt_seq_lens")
+        self._prompt_update_versions = prompt_update_versions(states)
 
     def _repack_dynamic_fields(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
     ) -> None:
+        # Same-composition cache hits reuse static prompt fields; request ids
+        # must keep the same encoded prompt metadata for the batch lifetime.
+        self.states = tuple(selected_states)
         self._refresh_dynamic_fields(selected_states)
 
     def _rebuild(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
-        req_ids: list[str],
+        request_ids: list[str],
     ) -> InputBatch:
-        self.req_ids = req_ids
-        self.num_reqs = len(req_ids)
-        self.num_reqs_after_padding = len(req_ids)
+        self.request_ids = request_ids
+        self.num_reqs = len(request_ids)
+        self.num_reqs_after_padding = len(request_ids)
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
+        self.states = tuple(selected_states)
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
         self._refresh_static_fields(selected_states)
@@ -669,15 +696,15 @@ class InputBatch:
     @classmethod
     def make_batch(
         cls,
-        states: Sequence[DiffusionRequestState],
+        states: Sequence[StepRequestState],
         idx_mapping: torch.Tensor | None = None,
         cached_batch: InputBatch | None = None,
     ) -> InputBatch:
         """Build a temporary step-local batch view from request states."""
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
-        req_ids = _prepare_req_ids(selected_states)
+        request_ids = _prepare_request_ids(selected_states)
 
-        if _same_composition(cached_batch, req_ids, idx_mapping_np):
+        if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states):
             assert cached_batch is not None
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
@@ -687,14 +714,14 @@ class InputBatch:
                 selected_states,
                 idx_mapping,
                 idx_mapping_np,
-                req_ids,
+                request_ids,
             )
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
         negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(selected_states)
         do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
         return cls(
-            req_ids=req_ids,
+            request_ids=request_ids,
             num_reqs=len(selected_states),
             num_reqs_after_padding=len(selected_states),
             idx_mapping=idx_mapping,
@@ -716,11 +743,13 @@ class InputBatch:
                 selected_states,
                 "negative_txt_seq_lens",
             ),
+            states=tuple(selected_states),
+            _prompt_update_versions=prompt_update_versions(selected_states),
         )
 
 
 def scatter_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     input_batch: InputBatch,
 ) -> None:
     """Scatter the step-updated latents back into persistent request states.
@@ -737,4 +766,7 @@ def scatter_latents(
     )
 
 
-DiffusionInputBatch = InputBatch
+# Alias: InputBatch is the step/tensor-level batch.
+# DiffusionRequestBatch (in request_batch.py) is the request-level batch.
+StepInputBatch = InputBatch
+DiffusionInputBatch = StepInputBatch

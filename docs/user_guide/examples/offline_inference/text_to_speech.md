@@ -17,12 +17,13 @@ list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | — | continuation (`--ref-audio` + `--ref-text`) | 48 kHz |
-| VoxCPM | local model dir | split | ✓ | ✓ (`voxcpm_async_chunk.yaml`) | — | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
+| GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
+| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` (+ `k2-fsa/OmniVoice/audio_tokenizer/` codec) | 2 (talker + code2wav, DualFFN) | ✓ (`--ref-audio` + `--ref-text`) | — | — | 24 kHz |
 
 ## Common Quick Start
 
@@ -69,61 +70,6 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ### Notes
 - Output: 48 kHz mono WAV.
 - Stage config: `vllm_omni/model_executor/stage_configs/voxcpm2.yaml` (default).
-
----
-
-## VoxCPM
-
-Split-stage TTS. The hub example covers single TTS, single voice cloning, and streaming. Use `benchmarks/voxcpm/` for warmup, batch JSONL prompts, profiler injection, and offline TTFP / RTF measurement.
-
-### Prerequisites
-```bash
-pip install voxcpm soundfile
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` does not contain HF metadata such as `model_type`, prepare a persistent HF-compatible config directory and point the stage configs to it via `VLLM_OMNI_VOXCPM_HF_CONFIG_PATH`:
-
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Quick start
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a split-stage VoxCPM synthesis example running on vLLM Omni."
-```
-
-### Voice cloning
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text  "The exact transcript spoken in reference.wav."
-```
-
-### Streaming
-Pass the async-chunk stage config:
-```bash
-python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
-    --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
-```
-
-### Notes
-- `voxcpm.yaml` is the default non-streaming stage config; `voxcpm_async_chunk.yaml` enables streaming.
-- Streaming is currently single-request oriented.
-- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades quality.
-- For online serving, see [`examples/online_serving/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/voxcpm/README.md). For benchmark reporting, see [`benchmarks/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/voxcpm/README.md).
 
 ---
 
@@ -211,6 +157,35 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## GLM-TTS
+
+2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
+    --model zai-org/GLM-TTS \
+    --text "你好，这是语音合成测试。" \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "这是参考音频的文本内容。" \
+    --output-dir ./output
+```
+
+### Architecture
+```
+Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
+        (Llama-based)    (32k vocab)      (Flow Matching)
+```
+
+### Notes
+- `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
+- Reference audio should be 3-10 seconds.
+- First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
+- Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
+- The `--model` path should point to the repository root (not `llm/` subdirectory).
 
 ---
 
@@ -359,6 +334,46 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
 
+---
+
+## higgs-audio v2
+
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the shared-memory connector. Stage 1 builds on the HiggsAudio decoder kernel at `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_decoder.py`.
+
+### Prerequisites
+
+Voice clone uses HF's `HiggsAudioV2TokenizerModel`, instantiated from `k2-fsa/OmniVoice/audio_tokenizer/` — the boson-ai standalone tokenizer Hub repo's `model.safetensors` is actually the 3B talker LM, so we point HF at k2's repackaged codec weights instead. Only the `audio_tokenizer/` subdir (~806 MB) is downloaded.
+
+```bash
+pip install -U "transformers>=5.3.0"
+```
+
+### Quick start (plain TTS)
+
+```bash
+python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
+    --texts "Hello world." "The quick brown fox jumps over the lazy dog." \
+    --output-dir results/wavs
+```
+
+### Voice cloning
+
+Pass both `--ref-audio` and `--ref-text` together:
+
+```bash
+python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
+    --texts "Hello, this is a cloned voice." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "Exact transcript spoken in reference.wav." \
+    --output-dir results/wavs
+```
+
+### Notes
+
+- Deploy config auto-loads from `vllm_omni/deploy/higgs_audio_v2.yaml`.
+- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades cloned-voice quality.
+- Out of scope (rejected with 4xx by the request validator): multi-speaker `[SPEAKERn]` dialogue, `profile:` text-only speaker descriptions, the `ref_audio_in_system_message` system-block variant, chunked long-form generation, and per-request `voice` / `instructions` / `task_type` / `language` / `speed != 1.0` / `x_vector_only_mode` / `speaker_embedding`.
+
 ## Example materials
 
 ??? abstract "cosyvoice3/end2end.py"
@@ -368,6 +383,13 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 ??? abstract "fish_speech/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_speech/fish_speech/end2end.py"
+    ``````
+??? abstract "higgs_audio_v2/end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py"
+??? abstract "glm_tts/end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/text_to_speech/glm_tts/end2end.py"
     ``````
 ??? abstract "omnivoice/end2end.py"
     ``````py
@@ -380,10 +402,6 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 ??? abstract "qwen3_tts/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_speech/qwen3_tts/end2end.py"
-    ``````
-??? abstract "voxcpm/end2end.py"
-    ``````py
-    --8<-- "examples/offline_inference/text_to_speech/voxcpm/end2end.py"
     ``````
 ??? abstract "voxcpm2/end2end.py"
     ``````py

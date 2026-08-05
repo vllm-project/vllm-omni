@@ -73,6 +73,27 @@ class UrlImageReference(BaseModel):
 ImageReference = UrlImageReference | FileImageReference
 
 
+class FileVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_id: str
+
+
+class UrlVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    video_url: str
+
+
+VideoReference = UrlVideoReference | FileVideoReference
+
+
+class UrlAudioReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    audio_url: str
+
+
+AudioReference = UrlAudioReference
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -95,9 +116,20 @@ class VideoGenerationRequest(BaseModel):
         description="Video dimensions in WIDTHxHEIGHT format (e.g., '1280x720')",
     )
 
-    image_reference: ImageReference | None = Field(
+    image_reference: ImageReference | list[ImageReference] | None = Field(
         default=None,
-        description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
+        description=(
+            "Optional image reference or ordered list of references. MiniMax H3 uses the list order for "
+            "FL2VA first/last frames and Ref2VA image labels."
+        ),
+    )
+    video_reference: VideoReference | list[VideoReference] | None = Field(
+        default=None,
+        description="Optional video reference or ordered list of Ref2VA video references.",
+    )
+    audio_reference: AudioReference | list[AudioReference] | None = Field(
+        default=None,
+        description="Optional audio reference or ordered list of Ref2VA audio references.",
     )
 
     # Video params block for extensibility
@@ -111,6 +143,25 @@ class VideoGenerationRequest(BaseModel):
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
     fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
     num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
+    aspect_ratio: str | None = Field(
+        default=None,
+        description=(
+            "MiniMax H3 output ratio. T2VA requires 21:9, 16:9, 4:3, 1:1, 3:4, or 9:16; "
+            "FL2VA follows the input image; Ref2VA defaults to 16:9."
+        ),
+    )
+    short_edge: int | None = Field(default=None, ge=1, description="MiniMax H3 output short edge in pixels")
+    num_outputs_per_prompt: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Number of videos to generate. MiniMax H3 supports 1 through 10.",
+    )
+    start_time_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Start offset for a single MiniMax H3 reference video.",
+    )
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
@@ -149,6 +200,15 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    generate_sound: bool = Field(
+        default=False,
+        description="Request model-generated audio for video models that support sound generation.",
+    )
+    sound_duration: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Duration in seconds for model-generated audio. Defaults to the generated video duration.",
+    )
 
     # vllm-omni extensions for post-generation frame interpolation.
     enable_frame_interpolation: bool = Field(
@@ -212,12 +272,24 @@ class VideoGenerationRequest(BaseModel):
         return vp
 
 
+class VideoAction(BaseModel):
+    """Generated action sequence returned by action-capable video models."""
+
+    data: list[Any] = Field(..., description="JSON-serializable nested action values")
+    shape: list[int] = Field(..., description="Shape of the returned action data")
+    dtype: str | None = Field(default=None, description="Source action dtype, if available")
+    raw_action_dim: int | None = Field(default=None, description="Raw action dimension requested by the model")
+    action_mode: str | None = Field(default=None, description="Action generation mode")
+    domain_id: int | None = Field(default=None, description="Action embodiment domain id")
+
+
 class VideoData(BaseModel):
     """Single generated video data."""
 
     b64_json: str | None = Field(default=None, description="Base64-encoded MP4 video")
     url: str | None = Field(default=None, description="Video URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
 
 class VideoGenerationResponse(BaseModel):
@@ -290,6 +362,7 @@ class VideoResponse(BaseModel):
         default=0.0,
         description="Peak device memory usage in MB reported by the diffusion pipeline.",
     )
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
     @property
     def file_extension(self) -> str:

@@ -1,4 +1,4 @@
-# SenseNova-U1 Online Serving
+# SenseNova-U1: Online serving
 
 ## Launch the Server
 
@@ -6,11 +6,21 @@
 vllm serve SenseNova/SenseNova-U1-8B-MoT --omni --port 8091
 ```
 
+With cache acceleration (`cache_dit` or `tea_cache`):
+
+```bash
+vllm serve SenseNova/SenseNova-U1-8B-MoT --omni --port 8091 \
+    --cache-backend tea_cache
+```
+
 Or use the convenience script:
 
 ```bash
 cd examples/online_serving/sensenova_u1
 bash run_server.sh
+
+# Cache acceleration (cache_dit or tea_cache)
+CACHE_BACKEND=tea_cache bash run_server.sh
 ```
 
 ### Tensor Parallelism (TP)

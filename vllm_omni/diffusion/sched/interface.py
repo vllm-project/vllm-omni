@@ -4,21 +4,11 @@
 from __future__ import annotations
 
 import enum
-import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import Any, TypedDict
 
-from vllm.logger import init_logger
-
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
-
-logger = init_logger(__name__)
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -39,8 +29,8 @@ class DiffusionRequestStatus(enum.IntEnum):
 
 
 @dataclass(frozen=True, eq=True)
-class SamplingParamsKey:
-    """Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+class StepBatchSamplingParamsKey:
+    """Denoise step level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only requests with the same key can be batched together.
     Fields not included here are treated as request-local and do not
@@ -65,17 +55,72 @@ class SamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Output count. Requests with different num_outputs_per_prompt produce
+    # differently shaped outputs and cannot share a batch.
+    num_outputs_per_prompt: int = 1
+
+    # LoRA identity. Requests with different adapters or scales must run in
+    # separate batches so the worker can activate exactly one adapter per step.
+    # Tuples preserve adapter order; empty tuple means no LoRA.
+    lora_int_ids: tuple[int, ...] = ()
+    lora_scales: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, eq=True)
+class RequestBatchSamplingParamsKey:
+    """Request level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+
+    Only request-batch-wide fields belong here. Request-local values such as
+    seeds, generators, latent tensors, timesteps, and pipeline-specific
+    ``extra_args`` are read per request from
+    ``DiffusionRequestBatch.sampling_params_list``.
+    """
+
+    # Spatial / temporal shape.
+    height: int | None = None
+    width: int | None = None
+    num_frames: int = 1
+    resolution: int = 640
+    fps: int | None = None
+    frame_rate: float | None = None
+    boundary_ratio: float | None = None
+
+    # CFG / guidance.
+    do_classifier_free_guidance: bool = False
+    guidance_scale: float = 0.0
+    guidance_scale_provided: bool = False
+    guidance_scale_2: float | None = None
+    guidance_rescale: float = 0.0
+    true_cfg_scale: float | None = None
+    cfg_normalize: bool = False
+    strength: float | None = None
+
+    # Scheduling / output shape.
+    num_inference_steps: int | None = None
+    sigmas: list[float] | None = None
+    max_sequence_length: int | None = None
+    num_outputs_per_prompt: int = 1
+    eta: float = 0.0
+    decode_timestep: float | list[float] | None = None
+    decode_noise_scale: float | list[float] | None = None
+    output_type: str | None = None
+
+    # Model-specific batch defaults used by request-mode pipelines.
+    layers: int = 4
+    use_en_prompt: bool = False
+
+    # LoRA identity. Tuples preserve adapter order; empty tuple means no LoRA.
+    lora_int_ids: tuple[int, ...] = ()
+    lora_scales: tuple[float, ...] = ()
+
 
 @dataclass
-class DiffusionRequestState:
+class SchedulerRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
 
-    # Unique scheduler-owned request ID.
-    # NOTE: This identifies one OmniDiffusionRequest, which may contain multiple request_ids.
-    # TODO: Align this with OmniDiffusionRequest.request_ids once scheduler batching is supported.
-    sched_req_id: str
+    request_id: str
     req: OmniDiffusionRequest
-    sampling_params_key: SamplingParamsKey | None = None
+    sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -85,122 +130,69 @@ class DiffusionRequestState:
 
 @dataclass
 class NewRequestData:
-    """Full request payload for a newly scheduled diffusion request."""
+    """Payload for a newly scheduled diffusion request.
 
-    sched_req_id: str
+    Carries the already-initialized request object so executors and workers do
+    not re-run ``OmniDiffusionRequest.__post_init__`` and mutate sentinel-based
+    fields like ``guidance_scale_provided``.
+    """
+
+    request_id: str
     req: OmniDiffusionRequest
 
     @classmethod
-    def from_state(cls, state: DiffusionRequestState) -> NewRequestData:
-        return cls(sched_req_id=state.sched_req_id, req=state.req)
+    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
+        return cls(request_id=state.request_id, req=state.req)
 
 
 @dataclass
 class CachedRequestData:
-    """Cached diffusion requests that only need their scheduler ids resent."""
+    """Cached diffusion requests that only need their request ids resent."""
 
-    sched_req_ids: list[str]
+    request_ids: list[str]
 
     @classmethod
     def make_empty(cls) -> CachedRequestData:
-        return cls(sched_req_ids=[])
+        return cls(request_ids=[])
+
+
+class KVPrefetchJob(TypedDict):
+    """Descriptor for prefetching the next request's received KV cache."""
+
+    request_id: str
+    kv_sender_info: dict[str, Any]
 
 
 @dataclass
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
+    # Stable scheduler-cycle diagnostics for engines, injected schedulers, and
+    # instrumentation; they are intentionally retained even without a direct
+    # production consumer for every field.
     step_id: int  # global step index
     scheduled_new_reqs: list[NewRequestData]
     scheduled_cached_reqs: CachedRequestData
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # next request to background-prefetch KV
+    kv_prefetch_job: KVPrefetchJob | None = None
 
     @cached_property
-    def scheduled_req_ids(self) -> list[str]:
+    def scheduled_request_ids(self) -> list[str]:
         """
         All scheduled request ids in this cycle, including both new and cached ones.
-        NOTE:
-            This id is generated and owned by the scheduler,
-            and may be different from the OmniDiffusionRequest.request_ids.
         """
         return [
-            *(req.sched_req_id for req in self.scheduled_new_reqs),
-            *self.scheduled_cached_reqs.sched_req_ids,
+            *(req.request_id for req in self.scheduled_new_reqs),
+            *self.scheduled_cached_reqs.request_ids,
         ]
 
     @property
     def num_scheduled_reqs(self) -> int:
-        return len(self.scheduled_req_ids)
+        return len(self.scheduled_request_ids)
 
     @property
     def is_empty(self) -> bool:
         return self.num_scheduled_reqs == 0
-
-
-class SchedulerInterface(ABC):
-    """Abstract lifecycle contract for diffusion schedulers."""
-
-    def _make_sched_req_id(self, request: OmniDiffusionRequest) -> str:
-        """
-        Generate a unique scheduler request ID for the given request.
-            The default implementation uses the first request_id from the request if available,
-            otherwise generates a random one.
-        """
-        if request.request_ids:
-            base = request.request_ids[0]
-        else:
-            logger.warning("Request has no request_ids, generating a random one. Request: %s", request)
-            base = f"req_{uuid.uuid4().hex[:8]}"
-
-        sched_req_id = base
-        suffix = 1
-        while self.get_request_state(sched_req_id) is not None:
-            sched_req_id = f"{base}#{suffix}"
-            suffix += 1
-        return sched_req_id
-
-    @abstractmethod
-    def initialize(self, od_config: OmniDiffusionConfig) -> None:
-        """Initialize or reset scheduler state."""
-
-    @abstractmethod
-    def add_request(self, request: OmniDiffusionRequest) -> str:
-        """Add a request and return the scheduler-owned request id."""
-
-    @abstractmethod
-    def schedule(self) -> DiffusionSchedulerOutput:
-        """Run one scheduling cycle."""
-
-    @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        """Update scheduler state from executor output."""
-
-    @abstractmethod
-    def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
-        """Return request state if present."""
-
-    @abstractmethod
-    def has_requests(self) -> bool:
-        """Return whether the scheduler still owns runnable requests."""
-
-    @abstractmethod
-    def get_sched_req_id(self, request_id: str) -> str | None:
-        """Resolve a public request_id to the active scheduler request id."""
-
-    @abstractmethod
-    def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
-        """Remove and return request state if present."""
-
-    @abstractmethod
-    def preempt_request(self, sched_req_id: str) -> bool:
-        """Preempt a running request back to waiting."""
-
-    @abstractmethod
-    def finish_requests(self, sched_req_ids: str | list[str], status: DiffusionRequestStatus) -> None:
-        """Mark one or more requests finished."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Release scheduler-owned state."""

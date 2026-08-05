@@ -5,8 +5,8 @@
 Online serving tests for the Qwen-Image-Edit family (image-to-image via chat completions).
 
 - ``test_single_image_to_image_001``: ``Qwen/Qwen-Image-Edit`` — one reference image, fixed 512×512.
-- ``test_multi_images_to_image_001``: ``Qwen/Qwen-Image-Edit-2509`` — two reference images, fixed 512×512.
-- ``test_different_sizes_001``: ``Qwen/Qwen-Image-Edit-2509`` only, ``advanced_model`` — mixed input
+- ``test_multi_images_to_image_001``: ``Qwen/Qwen-Image-Edit-2511`` — two reference images, fixed 512×512.
+- ``test_different_sizes_001``: ``Qwen/Qwen-Image-Edit-2511`` only, ``advanced_model`` — mixed input
   resolutions; ``extra_body`` uses per-output ``width``/``height`` lists; the test client sends one
   scalar-size request per list index in parallel and merges images (see ``OpenAIClientHandler.send_diffusion_request``).
 
@@ -53,7 +53,6 @@ def _get_diffusion_feature_cases(model: str):
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -83,15 +82,16 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
     openai_client.send_diffusion_request(request_config)
 
 
+@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
     indirect=True,
 )
 def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Two-reference edit smoke for ``Qwen/Qwen-Image-Edit-2509``."""
+    """Two-reference edit smoke for ``Qwen/Qwen-Image-Edit-2511``."""
 
     image_data_url_list = [f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}" for _ in range(2)]
 
@@ -118,7 +118,7 @@ def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenA
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
+    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
     indirect=True,
 )
 def test_different_sizes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):

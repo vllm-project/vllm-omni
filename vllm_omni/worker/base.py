@@ -232,10 +232,10 @@ class OmniGPUWorkerBase(GPUWorker):
                 if hasattr(self.model_runner, "graph_runners"):
                     self.model_runner.graph_runners.clear()
                     logger.info(f"[LLM Worker {self.rank}] LLM CUDA Graphs cleared.")
-            mem_before = current_omni_platform.get_current_memory_usage(self.device)
+            mem_before = current_omni_platform.get_free_memory(self.device)
             self.sleep(level=task.level)
-            mem_after = current_omni_platform.get_current_memory_usage(self.device)
-            rank_freed = max(0, mem_before - mem_after)
+            mem_after = current_omni_platform.get_free_memory(self.device)
+            rank_freed = max(0, mem_after - mem_before)
             if torch.distributed.is_initialized():
                 t_freed = torch.tensor([float(rank_freed)], device=self.device)
                 torch.distributed.all_reduce(t_freed)
@@ -246,6 +246,11 @@ class OmniGPUWorkerBase(GPUWorker):
             if self.rank != 0:
                 return None
             current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            residual_gib = (total_mem - mem_after) / 1024**3
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
@@ -255,7 +260,7 @@ class OmniGPUWorkerBase(GPUWorker):
                 metadata={
                     "source": "omni_platform_audit",
                     "total_freed_gib": f"{total_freed / 1024**3:.2f}",
-                    "rank_residual_gib": f"{mem_after / 1024**3:.2f}",
+                    "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
             if hasattr(self, "result_mq") and self.result_mq:
@@ -281,7 +286,12 @@ class OmniGPUWorkerBase(GPUWorker):
                 torch.distributed.barrier()
             gc.collect()
             current_omni_platform.synchronize()
-            usage_now = current_omni_platform.get_current_memory_usage(self.device)
+            free_now = current_omni_platform.get_free_memory(self.device)
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            current_used_gib = (total_mem - free_now) / 1024**3
             if self.rank != 0:
                 return None
             current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
@@ -290,7 +300,7 @@ class OmniGPUWorkerBase(GPUWorker):
                 status="SUCCESS",
                 stage_id=current_stage_id,
                 rank=self.rank,
-                metadata={"state": "WARM", "current_vram_gib": f"{usage_now / 1024**3:.2f}"},
+                metadata={"state": "WARM", "current_vram_gib": f"{current_used_gib:.2f}"},
             )
             if hasattr(self, "result_mq") and self.result_mq:
                 self.result_mq.put(ack)

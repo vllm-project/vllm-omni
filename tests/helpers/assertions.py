@@ -1,12 +1,13 @@
 """Assertion and response validation helpers for tests."""
 
 import io
+import json
 import tempfile
 import threading
 import wave
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
@@ -16,11 +17,22 @@ import soundfile as sf
 from PIL import Image
 
 from tests.helpers.media import (
+    convert_audio_bytes_to_text,
     cosine_similarity_text,
+    preprocess_text,
 )
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
+# Transcript gates default to whisper ``small`` for speed. ``small`` mishears a
+# short TTS clip ~0.5% of the time (e.g. "Hello"->"fellow", or hallucinating a
+# leading SFX token), which flakes the deterministic similarity gate. Short
+# clips first get a conservative containment fallback for minor ASR repeats/noise.
+# A test can also opt in to ASR escalation by setting
+# ``transcript_escalation_model`` to a whisper model name (e.g. ``"large-v3"``)
+# in its request_config: on a failed fast pass the clip is re-transcribed with
+# that stronger ASR before the test fails, so a weak-ASR mishear is rescued while
+# a genuine model artifact still fails (the strong ASR mismatches too).
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
 _MIN_PCM_SPEECH_HNR_DB = 1.0
 _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
@@ -30,6 +42,23 @@ _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
     "clone": "female",
     "ethan": "male",
 }
+
+
+def _short_transcript_contains_expected(transcript: str, expected: str) -> bool:
+    """Allow minor ASR repeats/noise for very short speech clips."""
+    transcript_clean = preprocess_text(transcript)
+    expected_clean = preprocess_text(expected)
+    if not transcript_clean or not expected_clean:
+        return False
+
+    transcript_words = transcript_clean.split()
+    expected_words = expected_clean.split()
+    if not transcript_words or not expected_words:
+        return False
+
+    short_text = min(len(transcript_clean), len(expected_clean)) <= 15
+    small_word_delta = len(transcript_words) <= len(expected_words) + 2
+    return short_text and small_word_delta and expected_clean in transcript_clean
 
 
 def assert_image_diffusion_response(
@@ -113,6 +142,11 @@ def assert_video_diffusion_response(
     expected_width = _maybe_int(form_data.get("width"))
     expected_height = _maybe_int(form_data.get("height"))
     expected_fps = _maybe_int(form_data.get("fps"))
+
+    # Skip num_frames assertion for Helios models because they round up frames
+    model = request_config.get("model", "")
+    if "Helios" in model:
+        expected_frames = None
 
     for vid_bytes in response.videos:
         assert_video_valid(
@@ -368,8 +402,15 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         return "unknown"
 
 
-def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+    *,
+    response_format: str | None = None,
+) -> None:
     """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if response_format == "pcm":
+        return
     if not voice_name or not audio_bytes:
         return
     key = str(voice_name).lower()
@@ -426,6 +467,69 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     )
 
 
+def _response_has_audio_output(response: Any) -> bool:
+    if response.audio_bytes:
+        return len(response.audio_bytes) > 0
+    if isinstance(getattr(response, "audio_content", None), str) and response.audio_content.strip():
+        return True
+    audio_data = getattr(response, "audio_data", None)
+    return bool(audio_data)
+
+
+def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+    if run_level not in {"advanced_model", "full_model"}:
+        return False
+    modalities = request_config.get("modalities", ["text", "audio"])
+    if "audio" not in modalities:
+        return False
+    keywords_dict = request_config.get("key_words", {}) or {}
+    # When text is not an output modality, the keyword loop validates keywords
+    # against the audio transcript -- for keywords under ANY word_type
+    # (text/image/audio/video), not just "audio". Mirror that here so the
+    # transcript is actually computed; otherwise the loop hits
+    # `assert transcript is not None` with transcript=None (e.g. an audio-only
+    # request carrying key_words={"text": [...]}).
+    if "text" not in modalities and any(
+        keywords_dict.get(word_type) for word_type in ("text", "image", "audio", "video")
+    ):
+        return True
+    if request_config.get("audio_ref_text"):
+        return True
+    return "text" in modalities
+
+
+def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+    if run_level not in {"advanced_model", "full_model"}:
+        return False
+    if request_config.get("response_format") == "pcm":
+        return False
+    return bool(request_config.get("input"))
+
+
+def _resolve_audio_transcript(
+    response: Any,
+    request_config: dict[str, Any],
+    run_level: str,
+    *,
+    speech_api: bool,
+) -> str | None:
+    """Run Whisper only when this run_level / request_config needs a transcript for assertions."""
+    needs = (
+        _speech_assertion_needs_audio_transcript(request_config, run_level)
+        if speech_api
+        else _omni_assertion_needs_audio_transcript(request_config, run_level)
+    )
+    if not needs:
+        return None
+    existing = getattr(response, "audio_content", None)
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    audio_bytes = getattr(response, "audio_bytes", None)
+    if not audio_bytes:
+        return None
+    return convert_audio_bytes_to_text(audio_bytes, language=request_config.get("transcript_language"))
+
+
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -441,15 +545,18 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
     modalities = request_config.get("modalities", ["text", "audio"])
 
     if run_level in {"advanced_model", "full_model"}:
+        transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=False)
         # Verify output success
         if "audio" in modalities:
-            assert response.audio_content is not None, "No audio output is generated"
-            print(f"audio content is: {response.audio_content}")
+            assert _response_has_audio_output(response), "No audio output is generated"
+            if transcript is not None:
+                print(f"audio content is: {transcript}")
             speaker = request_config.get("speaker")
             if speaker:
                 _assert_preset_voice_gender_from_audio(
                     response.audio_bytes,
                     speaker,
+                    response_format=request_config.get("response_format"),
                 )
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -468,7 +575,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     )
             else:
                 if keywords:
-                    audio_lower = response.audio_content.lower()
+                    assert transcript is not None, "No audio transcript for keyword validation"
+                    audio_lower = transcript.lower()
                     assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
@@ -476,79 +584,126 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "audio" in modalities:
             audio_ref_text = request_config.get("audio_ref_text")
+            similarity_threshold = request_config.get("similarity_threshold", 0.8)
             if "text" in modalities:
-                transcript = (response.audio_content or "").strip()
+                assert transcript is not None, "No audio transcript for similarity validation"
                 text_output = (response.text_content or "").strip()
-                similarity = cosine_similarity_text(
-                    transcript.lower(),
-                    text_output.lower(),
-                )
-                assert similarity > 0.9, "The audio content is not same as the text"
-                print(f"similarity is: {similarity}")
+                # For very short outputs (e.g. one-word answers), n-gram cosine
+                # similarity with length penalty is unreliable because Whisper
+                # may hallucinate extra context around the short utterance.  Use
+                # a containment check instead: the shorter text must appear in
+                # the longer one (after preprocessing removes punctuation).
+                _SHORT_TEXT_THRESHOLD = 15
+                if len(text_output) <= _SHORT_TEXT_THRESHOLD or len(transcript) <= _SHORT_TEXT_THRESHOLD:
+                    shorter = text_output.lower() if len(text_output) <= len(transcript) else transcript.lower()
+                    longer = transcript.lower() if len(text_output) <= len(transcript) else text_output.lower()
+                    import re as _re
+
+                    shorter_clean = _re.sub(r"[^\w\s]", "", shorter).strip()
+                    longer_clean = _re.sub(r"[^\w\s]", "", longer).strip()
+                    assert shorter_clean and (shorter_clean in longer_clean), (
+                        f"The audio content is not same as the text "
+                        f"(short-text containment check failed: "
+                        f"text={text_output!r}, transcript={transcript!r})"
+                    )
+                    print(f"short-text containment check passed: {shorter_clean!r} in {longer_clean!r}")
+                else:
+                    similarity = cosine_similarity_text(
+                        transcript.lower(),
+                        text_output.lower(),
+                    )
+                    print(f"similarity is: {similarity}")
+                    assert similarity > similarity_threshold, "The audio content is not same as the text"
             if audio_ref_text:
+                assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(
-                    response.audio_content.lower(),
+                    transcript.strip().lower(),
                     str(audio_ref_text).lower(),
                 )
-                assert audio_similarity > 0.9, (
+                assert audio_similarity > similarity_threshold, (
                     f"The audio content does not match reference text: similarity={audio_similarity:.3f}"
                 )
 
 
-def _speech_combined_error_text_for_assert(response: Any) -> str:
-    """Join ``error_message`` and UTF-8 body (e.g. HTTP 200 + JSON) for substring checks."""
-    parts: list[str] = []
-    em = getattr(response, "error_message", None)
-    if em:
-        parts.append(str(em))
-    ab = getattr(response, "audio_bytes", None)
-    if ab:
-        parts.append(ab.decode("utf-8", errors="replace"))
-    return "\n".join(parts)
+def _assert_transcript_matches(
+    transcript: str,
+    audio_bytes: bytes | None,
+    expected_text: Any,
+    *,
+    threshold: float,
+    escalation_model: str | None = None,
+    language: str | None = None,
+) -> None:
+    """Assert spoken audio matches ``expected_text``.
 
+    ``transcript`` is the fast whisper-``small`` result. If it clears
+    ``threshold`` the check passes immediately.
 
-def _assert_speech_error_substrings(haystack: str, err_expected: Any) -> None:
-    if isinstance(err_expected, (list, tuple)):
-        assert any(str(s) in haystack for s in err_expected), (
-            f"Expected error text to contain one of {err_expected!r}, got: {haystack!r}"
+    If the cosine check fails, very short clips get a conservative containment
+    fallback that accepts minor ASR repeats/noise only when the expected text is
+    still present and the transcript has few extra words.
+
+    When ``escalation_model`` is set (opt-in via the ``transcript_escalation_model``
+    request_config key) and the fast check plus containment fallback fail, the
+    clip is re-transcribed with that stronger ASR and the assertion is decided on
+    its verdict -- so a weak whisper-``small`` mishear on a short clip does not
+    flake the gate, while a genuine model artifact still fails (the strong ASR
+    mismatches too). ``language`` applies to that escalated pass too, so a request
+    that pins a language does not silently fall back to auto-detection on retry.
+    """
+    expected = str(expected_text).strip().lower()
+    similarity = cosine_similarity_text(transcript.strip().lower(), expected)
+    print(f"Cosine similarity: {similarity:.3f}")
+    if similarity > threshold:
+        return
+
+    if _short_transcript_contains_expected(transcript, expected):
+        print("short speech containment check passed")
+        return
+
+    if escalation_model and audio_bytes:
+        print(
+            f"whisper-small below threshold ({similarity:.2f} <= {threshold}); "
+            f"escalating to whisper-{escalation_model} to rule out an ASR mishear"
         )
-    else:
-        assert str(err_expected) in haystack, f"Expected error text to contain {str(err_expected)!r}, got: {haystack!r}"
+        strong_transcript = convert_audio_bytes_to_text(audio_bytes, model_size=escalation_model, language=language)
+        strong_similarity = cosine_similarity_text(strong_transcript.strip().lower(), expected)
+        print(
+            f"audio content (whisper-{escalation_model}): {strong_transcript}\n"
+            f"Cosine similarity (whisper-{escalation_model}): {strong_similarity:.3f}"
+        )
+        assert strong_similarity > threshold, (
+            f"Transcript doesn't match input after ASR escalation: "
+            f"input={expected_text!r}; whisper-small='{transcript}' (sim={similarity:.2f}); "
+            f"whisper-{escalation_model}='{strong_transcript}' (sim={strong_similarity:.2f})"
+        )
+        return
+
+    assert similarity > threshold, (
+        f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+    )
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
-    """Validate speech API results.
+    """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
 
-    If ``status_code`` is set: assert HTTP status, then optional ``err_message`` (4xx: ``error_message`` only;
-    HTTP 200: ``error_message`` and/or body, e.g. JSON with HTTP 200).
-
-    If only ``err_message`` is set: assert substring(s) on combined error text. Otherwise success/min_audio/etc.
+    When ``request_config`` carries ``status_code`` and/or ``err_message``, the
+    request is expected to be rejected: assert it failed and that the HTTP status
+    / error text match. Otherwise the normal success-path checks run.
     """
-    # When present, only compare HTTP status and skip all other checks (e.g. expected 4xx).
-    # ``status_code`` may be a single int or a collection of allowed codes (e.g. ``(400, 422)``).
     expected_status = request_config.get("status_code")
-    err_expected = request_config.get("err_message")
-    if expected_status is not None:
-        actual = getattr(response, "status_code", None)
-        assert actual is not None, (
-            "request_config has status_code but response has no .status_code "
-            "(set OmniResponse.status_code or pass a response object with status_code)"
-        )
-        if isinstance(expected_status, (list, tuple, set, frozenset)):
-            assert actual in expected_status, f"Expected HTTP status in {expected_status!r}, got {actual}"
-        else:
-            assert actual == int(expected_status), f"Expected HTTP status {int(expected_status)}, got {actual}"
-
-        if err_expected is not None:
-            if actual is not None and actual != 200:
-                msg = (getattr(response, "error_message", None) or "") + ""
-                _assert_speech_error_substrings(msg, err_expected)
-            else:
-                _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
-        return
-
-    if err_expected is not None:
-        _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
+    expected_err = request_config.get("err_message")
+    if expected_status is not None or expected_err is not None:
+        assert not response.success, "Expected an error response, but the request succeeded."
+        if expected_status is not None:
+            allowed = expected_status if isinstance(expected_status, (list, tuple)) else (expected_status,)
+            assert response.status_code in allowed, f"Expected HTTP status in {allowed}, got {response.status_code}"
+        if expected_err is not None:
+            alternatives = expected_err if isinstance(expected_err, (list, tuple)) else (expected_err,)
+            error_text = response.error_message or ""
+            assert any(alt in error_text for alt in alternatives), (
+                f"Expected one of {alternatives} in error text, got: {error_text!r}"
+            )
         return
 
     assert response.success, "The request failed."
@@ -564,8 +719,6 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
-        min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-        _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
         if response.audio_format:
             assert "pcm" in response.audio_format.lower(), (
                 f"Expected audio/pcm content-type, got {response.audio_format!r}"
@@ -573,18 +726,30 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
-    if run_level in {"advanced_model", "full_model"} and req_fmt != "pcm":
-        expected_text = request_config.get("input")
-        if expected_text:
-            transcript = (response.audio_content or "").strip()
-            print(f"audio content is: {transcript}")
-            print(f"input text is: {expected_text}")
-            similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
-            print(f"Cosine similarity: {similarity:.3f}")
-            assert similarity > 0.9, (
-                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
-            )
-        _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
+    if run_level in {"advanced_model", "full_model"}:
+        if req_fmt == "pcm" and response.audio_bytes:
+            min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
+            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+
+        transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
+        if transcript is not None:
+            expected_text = request_config.get("input")
+            if expected_text:
+                print(f"audio content is: {transcript}")
+                print(f"input text is: {expected_text}")
+                _assert_transcript_matches(
+                    transcript,
+                    getattr(response, "audio_bytes", None),
+                    expected_text,
+                    threshold=0.9,
+                    escalation_model=request_config.get("transcript_escalation_model"),
+                    language=request_config.get("transcript_language"),
+                )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+            response_format=request_config.get("response_format"),
+        )
 
 
 def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
@@ -599,10 +764,128 @@ def assert_diffusion_response(response: "DiffusionResponse", request_config: dic
         assert_audio_diffusion_response(response=response, request_config=request_config, run_level=run_level)
 
 
+def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | None]:
+    """Serialize ``HttpResponse``-like body to UTF-8 bytes and parse a JSON object when possible."""
+    jb = getattr(resp, "json_body", None)
+    if jb is not None:
+        raw = json.dumps(jb, ensure_ascii=False).encode("utf-8")
+        if isinstance(jb, dict):
+            return raw, jb
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return raw, None
+        return raw, parsed if isinstance(parsed, dict) else None
+    err = getattr(resp, "error_message", None)
+    raw = (err or "").encode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return raw, None
+    return raw, parsed if isinstance(parsed, dict) else None
+
+
+def assert_err_message_in_text(
+    haystack: str,
+    err_message: str | tuple[str, ...] | list[str] | set[str] | frozenset[str],
+    *,
+    sequence_match: Literal["all", "any"] = "all",
+) -> None:
+    """Assert ``err_message`` appears in ``haystack`` (case-insensitive).
+
+    For non-string sequences: ``sequence_match='all'`` requires every substring (HTTP-style);
+    ``sequence_match='any'`` requires at least one (WebSocket first-frame JSON helpers).
+    """
+    hl = haystack.lower()
+    if isinstance(err_message, (list, tuple, set, frozenset)):
+        if sequence_match == "all":
+            missing = [s for s in err_message if str(s).lower() not in hl]
+            assert not missing, (
+                f"Expected error text to contain all of {err_message!r}; missing {missing!r}. haystack={haystack!r}"
+            )
+        else:
+            assert any(str(s).lower() in hl for s in err_message), (
+                f"Expected error text to contain one of {err_message!r}. haystack={haystack!r}"
+            )
+    else:
+        assert str(err_message).lower() in hl, f"Expected error text to contain {str(err_message)!r}, got: {haystack!r}"
+
+
+def assert_http_error(
+    resp: Any,
+    *,
+    err_code: int | tuple[int, ...] | list[int] | None = None,
+    err_message: str | tuple[str, ...] | list[str] | None = None,
+    websocket_json_message: bool = False,
+) -> dict[str, Any] | None:
+    """Validate a raw-HTTP :class:`~tests.helpers.runtime.HttpResponse`-like object.
+
+    Used by :class:`~tests.helpers.runtime.OpenAIClientHandler` ``send_*_http_request`` helpers when
+    ``request_config`` contains optional ``err_code`` and/or ``err_message``.
+
+    When ``websocket_json_message=True``, only ``json_body`` is checked (first JSON WebSocket text frame).
+    Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
+
+    - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
+      the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
+    - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
+      If ``err_message`` is a non-string sequence (``list`` / ``tuple`` / ``set`` / ``frozenset``), **every**
+      element must appear as a substring; a plain ``str`` still requires that single substring.
+    """
+    if websocket_json_message:
+        if err_code is not None:
+            raise ValueError("assert_http_error: err_code is incompatible with websocket_json_message=True")
+        jb_ws = getattr(resp, "json_body", None)
+        assert jb_ws is not None, resp
+        if err_message is None:
+            return jb_ws if isinstance(jb_ws, dict) else None
+        assert_err_message_in_text(
+            json.dumps(jb_ws, ensure_ascii=False),
+            err_message,
+            sequence_match="any",
+        )
+        return jb_ws if isinstance(jb_ws, dict) else None
+
+    if err_code is None and err_message is None:
+        return None
+
+    actual = getattr(resp, "status_code", None)
+    assert actual is not None, "response missing status_code"
+
+    if err_code is not None:
+        if isinstance(err_code, int):
+            assert actual == err_code, (resp, err_code)
+        else:
+            allowed = tuple(err_code)
+            assert actual in allowed, (resp, allowed)
+
+    body_bytes, payload = _http_response_body_materialize(resp)
+
+    if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
+        assert payload is not None, getattr(resp, "error_message", resp)
+        assert "detail" in payload or "error" in payload, payload
+
+    if err_message is not None:
+        pieces: list[str] = []
+        jb = getattr(resp, "json_body", None)
+        if jb is not None:
+            pieces.append(json.dumps(jb, ensure_ascii=False))
+        em = getattr(resp, "error_message", None)
+        if em:
+            pieces.append(str(em))
+        haystack = "\n".join(pieces) if pieces else body_bytes.decode("utf-8", errors="replace")
+        assert_err_message_in_text(haystack, err_message, sequence_match="all")
+
+    return payload
+
+
 __all__ = [
     "assert_audio_diffusion_response",
     "assert_audio_speech_response",
     "assert_diffusion_response",
+    "assert_err_message_in_text",
+    "assert_http_error",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",

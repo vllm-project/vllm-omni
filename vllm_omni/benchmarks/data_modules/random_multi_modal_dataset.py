@@ -123,10 +123,6 @@ class OmniRandomMultiModalDataset(RandomMultiModalDataset):
                 "23",
                 "-movflags",
                 "+faststart",
-                "-pix_fmt",
-                "yuv420p",
-                "-vf",
-                f"scale={width}:{height}",
             ],
         }
 

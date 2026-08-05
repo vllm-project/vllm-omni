@@ -9,7 +9,7 @@ import zmq
 
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
-    StageStatus,
+    ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator import (
     omni_coord_client_for_stage as stage_client_module,
@@ -47,7 +47,7 @@ def test_stage_client_auto_register_on_init():
     event = _recv_event(router)
 
     assert event["event_type"] == "update"
-    assert event["status"] == StageStatus.UP.value
+    assert event["status"] == ReplicaStatus.UP.value
     assert event["stage_id"] == stage_id
     assert event["input_addr"] == input_addr
     assert event["output_addr"] == output_addr
@@ -70,13 +70,13 @@ def test_stage_client_update_info_sends_correct_event():
     # Discard initial registration event.
     _recv_event(router)
 
-    client.update_info(status=StageStatus.ERROR)
+    client.update_info(status=ReplicaStatus.ERROR)
     client.update_info(queue_length=10)
 
     first = _recv_event(router)
     second = _recv_event(router)
 
-    assert first["status"] == StageStatus.ERROR.value
+    assert first["status"] == ReplicaStatus.ERROR.value
     assert first["stage_id"] == stage_id
     assert first["input_addr"] == input_addr
     assert first["output_addr"] == output_addr
@@ -107,7 +107,7 @@ def test_stage_client_close_sends_down_status():
     client.close()
 
     event = _recv_event(router)
-    assert event["status"] == StageStatus.DOWN.value
+    assert event["status"] == ReplicaStatus.DOWN.value
     assert event["stage_id"] == stage_id
     assert event["input_addr"] == input_addr
     assert event["output_addr"] == output_addr
@@ -274,6 +274,7 @@ def test_heartbeat_loop_retries_after_transient_send_failure():
     client._closed = False
     client._heartbeat_interval = 0.0
     client._stop_event = _FakeStopEvent()
+    client._on_heartbeat = None
 
     calls = {"count": 0}
 

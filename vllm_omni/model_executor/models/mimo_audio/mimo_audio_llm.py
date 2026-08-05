@@ -542,7 +542,23 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         )
 
         self.device = current_omni_platform.get_torch_device()
+        # global_sampler MUST stay greedy (do_sample=False) so its token decision
+        # matches vLLM's external sampler (SamplingParams temperature=0.0).  Both
+        # run argmax on the same logits, so they always agree on whether the next
+        # token is <|empty|> (audio step) or a real text token.  Enabling
+        # do_sample=True here without also routing vLLM's sampled token back into
+        # this gate check would cause the two to diverge and corrupt KV-cache state.
         self.global_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.95)
+        # local_sampler drives audio-code generation inside local_forward.  Keep
+        # it greedy (do_sample=False) so the CUDA-graph path (use_cg gate in
+        # local_forward) stays active AND so the audio codes — and therefore the
+        # `new_audio_emb` written into `_cached_new_audio_emb_by_req` — are
+        # deterministic.  That cache is fed back into `inputs_embeds` on the next
+        # decode step (see `_prepare_multimodal_embeddings_with_cache`), so any
+        # stochasticity here propagates into subsequent *text* logits via the
+        # audio-embedding feedback path and destabilises text continuations even
+        # though `global_sampler` is greedy.  Voice diversity must be tackled in
+        # the codec/vocoder path (stage-1), not by randomising local_sampler.
         self.local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
         self.removed_tokens = None
 
@@ -806,7 +822,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             device=tokens_device,
         )
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         past_key_values = DynamicCache()
         for t in range(delay_iters):
@@ -852,7 +868,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_sampler: MiMoSampler | None = None,
     ):
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         b = int(local_embeds.shape[0])
         use_cg = (local_sampler.do_sample is None or local_sampler.do_sample is False) and bool(
@@ -881,20 +897,28 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         input_ids: torch.Tensor,
         *,
         request_ids: list[str],
-        query_start_loc: torch.Tensor,
+        query_start_loc_list: list[int],
         kwargs: dict,
     ) -> tuple[dict[str, any], dict]:
         has_merge_mm_embedding = False
         merge_mm_embedding_info: dict[str, any] = {}
         seq_len = input_ids.shape[1] if input_ids.ndim == 2 else input_ids.shape[0]
 
-        for req_idx, req_id in enumerate(request_ids):
-            query_start_loc_by_req = int(query_start_loc[req_idx].item())
-            query_end_loc_by_req = int(query_start_loc[req_idx + 1].item())
-            input_ids_by_req = input_ids[query_start_loc_by_req:query_end_loc_by_req]
-            seq_len_by_req = input_ids_by_req.shape[1] if input_ids_by_req.ndim == 2 else input_ids_by_req.shape[0]
+        # Only each request's start token is ever read below, and only for
+        # single-token requests. Gather just those start offsets (num_reqs elements)
+        # to host instead of copying the whole flattened sequence every forward.
+        # query_start_loc entries are flat token offsets, so we index the flattened
+        # ids by the same offsets and derive per-request length from the boundaries.
+        flat_input_ids = input_ids.reshape(-1)
+        start_positions = query_start_loc_list[:-1]
+        start_is_empty_cpu = (flat_input_ids[start_positions] == self.empty_token_id).cpu().tolist()
 
-            if seq_len_by_req == 1 and bool(input_ids_by_req == self.empty_token_id):
+        for req_idx, req_id in enumerate(request_ids):
+            query_start_loc_by_req = query_start_loc_list[req_idx]
+            query_end_loc_by_req = query_start_loc_list[req_idx + 1]
+            seq_len_by_req = query_end_loc_by_req - query_start_loc_by_req
+
+            if seq_len_by_req == 1 and start_is_empty_cpu[req_idx]:
                 merge_mm_embedding_info[req_id] = {
                     "query_start_loc": query_start_loc_by_req,
                     "query_end_loc": query_end_loc_by_req,
@@ -1019,13 +1043,19 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # Materialize the request boundaries on the host once instead of one
+        # `.item()` sync per boundary in the loops below.
         _forward_context = get_forward_context()
-        _default_query_start_loc = torch.tensor([0, input_ids.shape[-1]], device=input_ids.device)
-        query_start_loc = (
-            next(iter(_forward_context.attn_metadata.values())).query_start_loc
-            if _forward_context.attn_metadata is not None
-            else _default_query_start_loc
-        )
+        if _forward_context.attn_metadata is not None:
+            query_start_loc = next(iter(_forward_context.attn_metadata.values())).query_start_loc
+            query_start_loc_list = query_start_loc.tolist()
+        else:
+            # Single implicit request over all tokens. Build the host boundaries
+            # directly (no .tolist() D2H); the small device tensor is still needed
+            # for logits_indices below.
+            n_tokens = int(input_ids.shape[-1])
+            query_start_loc_list = [0, n_tokens]
+            query_start_loc = torch.tensor([0, n_tokens], device=input_ids.device)
 
         runtime_additional_information = kwargs.get("runtime_additional_information", [])
         if runtime_additional_information:
@@ -1038,7 +1068,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         merge_mm_embedding_info, has_merge_mm_embedding, kwargs = self._collect_merge_mm_embedding_info(
             input_ids,
             request_ids=request_ids,
-            query_start_loc=query_start_loc,
+            query_start_loc_list=query_start_loc_list,
             kwargs=kwargs,
         )
 
@@ -1061,15 +1091,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         batch_next_speech_tokens: torch.Tensor | None = None
 
         if not is_capturing and next_ids is not None and num_reqs > 0:
-            if (next_ids == self.empty_token_id).any():
+            # Copy the empty-token mask to host once; the `.any()` gate and the
+            # per-request checks below then avoid a GPU sync each.
+            next_is_empty_cpu = (next_ids == self.empty_token_id).cpu()
+            if bool(next_is_empty_cpu.any()):
                 batch_hs_list = []
                 valid_mask = []
 
                 for req_idx in range(num_reqs):
-                    start = int(query_start_loc[req_idx].item())
-                    end = int(query_start_loc[req_idx + 1].item())
+                    start = query_start_loc_list[req_idx]
+                    end = query_start_loc_list[req_idx + 1]
                     hs_req = hidden_states[start:end][-1:, :]
-                    is_empty = bool(next_ids[req_idx] == self.empty_token_id)
+                    is_empty = bool(next_is_empty_cpu[req_idx])
                     valid_mask.append(is_empty)
 
                     if not is_empty:
@@ -1137,17 +1170,14 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         loaded_params: set[str] = set()
+        if self.quant_config is not None:
+            cache_scale_mapper = self.quant_config.get_cache_scale_mapper()
+            if cache_scale_mapper is not None:
+                weights = cache_scale_mapper.apply(weights)
+
         for name, loaded_weight in weights:
             if name.startswith("model."):
                 name = "model." + name
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.startswith("input_local_transformer.") or name.startswith("local_transformer."):

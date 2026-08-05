@@ -1,6 +1,11 @@
 import pytest
 
-from benchmarks.diffusion.backends import RequestFuncInput, async_request_chat_completions
+from benchmarks.diffusion.backends import (
+    RequestFuncInput,
+    async_request_chat_completions,
+    endpoint_filename_token,
+    normalize_endpoint,
+)
 
 
 class _MockResponse:
@@ -27,6 +32,32 @@ class _MockSession:
 
     def post(self, *args, **kwargs):
         return _MockResponse(self._payload)
+
+
+@pytest.mark.core_model
+@pytest.mark.benchmark
+@pytest.mark.cpu
+def test_endpoint_normalization_accepts_optional_leading_slash():
+    assert normalize_endpoint("v1/videos") == "/v1/videos"
+    assert normalize_endpoint("/v1/videos") == "/v1/videos"
+    assert normalize_endpoint("v1/chat/completions") == "/v1/chat/completions"
+    assert normalize_endpoint("v1/images/generations") == "/v1/images/generations"
+
+
+@pytest.mark.core_model
+@pytest.mark.benchmark
+@pytest.mark.cpu
+def test_endpoint_normalization_accepts_legacy_backend_aliases():
+    assert normalize_endpoint("vllm-omni") == "/v1/chat/completions"
+    assert normalize_endpoint("openai") == "/v1/images/generations"
+
+
+@pytest.mark.core_model
+@pytest.mark.benchmark
+@pytest.mark.cpu
+def test_endpoint_filename_token_drops_leading_slash():
+    assert endpoint_filename_token("/v1/videos") == "v1_videos"
+    assert endpoint_filename_token("v1/chat/completions") == "v1_chat_completions"
 
 
 @pytest.mark.core_model

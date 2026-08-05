@@ -8,8 +8,8 @@ import pytest
 import zmq
 
 from vllm_omni.distributed.omni_coordinator import (
-    InstanceList,
     OmniCoordClientForHub,
+    ReplicaList,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -32,8 +32,8 @@ def _wait_for_condition(cond, timeout: float = 2.0, interval: float = 0.01) -> b
     return False
 
 
-def test_hub_client_caches_instance_list_from_pub():
-    """Verify OmniCoordClientForHub receives instance list updates from OmniCoordinator and caches for get_instance_list()."""
+def test_hub_client_caches_replica_list_from_pub():
+    """Verify OmniCoordClientForHub receives replica list updates from OmniCoordinator and caches for get_replica_list()."""
     ctx, pub, endpoint = _bind_pub()
 
     client = OmniCoordClientForHub(endpoint)
@@ -41,7 +41,7 @@ def test_hub_client_caches_instance_list_from_pub():
     time.sleep(0.2)
 
     now = time.time()
-    instances_payload = [
+    replicas_payload = [
         {
             "input_addr": "tcp://stage:10001",
             "output_addr": "tcp://stage:10001-out",
@@ -71,37 +71,37 @@ def test_hub_client_caches_instance_list_from_pub():
         },
     ]
 
-    payload = {"instances": instances_payload, "timestamp": now}
+    payload = {"replicas": replicas_payload, "timestamp": now}
     pub.send(json.dumps(payload).encode("utf-8"))
 
-    assert _wait_for_condition(lambda: len(client.get_instance_list().instances) == 3)
+    assert _wait_for_condition(lambda: len(client.get_replica_list().replicas) == 3)
 
-    inst_list = client.get_instance_list()
-    assert isinstance(inst_list, InstanceList)
-    assert len(inst_list.instances) == 3
+    rep_list = client.get_replica_list()
+    assert isinstance(rep_list, ReplicaList)
+    assert len(rep_list.replicas) == 3
 
-    for src, inst in zip(instances_payload, inst_list.instances, strict=True):
-        assert inst.input_addr == src["input_addr"]
-        assert inst.output_addr == src["output_addr"]
-        assert inst.stage_id == src["stage_id"]
-        assert inst.status.value == src["status"]
+    for src, rep in zip(replicas_payload, rep_list.replicas, strict=True):
+        assert rep.input_addr == src["input_addr"]
+        assert rep.output_addr == src["output_addr"]
+        assert rep.stage_id == src["stage_id"]
+        assert rep.status.value == src["status"]
 
-    stage0 = client.get_instances_for_stage(0)
-    stage1 = client.get_instances_for_stage(1)
+    stage0 = client.get_replicas_for_stage(0)
+    stage1 = client.get_replicas_for_stage(1)
 
-    assert all(inst.stage_id == 0 for inst in stage0.instances)
-    assert all(inst.stage_id == 1 for inst in stage1.instances)
+    assert all(rep.stage_id == 0 for rep in stage0.replicas)
+    assert all(rep.stage_id == 1 for rep in stage1.replicas)
 
-    # Send an updated list with fewer instances and verify cache refresh.
+    # Send an updated list with fewer replicas and verify cache refresh.
     updated_payload = {
-        "instances": instances_payload[:2],
+        "replicas": replicas_payload[:2],
         "timestamp": now + 1.0,
     }
     pub.send(json.dumps(updated_payload).encode("utf-8"))
 
-    assert _wait_for_condition(lambda: len(client.get_instance_list().instances) == 2)
-    updated_list = client.get_instance_list()
-    assert len(updated_list.instances) == 2
+    assert _wait_for_condition(lambda: len(client.get_replica_list().replicas) == 2)
+    updated_list = client.get_replica_list()
+    assert len(updated_list.replicas) == 2
 
     client.close()
     pub.close(0)

@@ -15,8 +15,43 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
+def clear_pipeline_stage_durations(pipeline: Any) -> None:
+    clear_records = getattr(pipeline, "clear_profiler_records", None)
+    if getattr(pipeline, "enable_diffusion_pipeline_profiler", False) and callable(clear_records):
+        clear_records()
+
+
+def consume_pipeline_stage_durations(pipeline: Any) -> dict[str, float]:
+    if not getattr(pipeline, "enable_diffusion_pipeline_profiler", False):
+        return {}
+    stage_durations = getattr(pipeline, "stage_durations", None)
+    if not isinstance(stage_durations, dict):
+        return {}
+    result = {stage: float(duration) for stage, duration in stage_durations.items()}
+    clear_pipeline_stage_durations(pipeline)
+    return result
+
+
+def merge_stage_durations(
+    state: StepRequestState,
+    stage_durations: dict[str, float],
+) -> None:
+    if not stage_durations:
+        return
+    for stage, duration in stage_durations.items():
+        state.stage_durations[stage] = float(state.stage_durations.get(stage, 0.0)) + float(duration)
+
+
+def attach_stage_durations(
+    state: StepRequestState,
+    output: DiffusionOutput,
+) -> None:
+    if state.stage_durations:
+        output.stage_durations = dict(state.stage_durations)
+
+
 @dataclass
-class DiffusionRequestState:
+class StepRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
@@ -38,9 +73,10 @@ class DiffusionRequestState:
     """
 
     # ── Identity / request-level inputs ──
-    req_id: str
+    request_id: str
     sampling: OmniDiffusionSamplingParams
-    prompts: list[OmniPromptType] | None = None
+    prompt: OmniPromptType | None = None
+    kv_sender_info: dict | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
@@ -54,6 +90,12 @@ class DiffusionRequestState:
     # ── Timestep schedule (set once by prepare_encode) ──
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
+
+    # ── Optional chunked streaming progress ──
+    chunk_index: int = 0
+    step_in_chunk: int = 0
+    total_chunks: int = 1
+    chunk_num_steps: int | None = None
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -71,6 +113,12 @@ class DiffusionRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # ── Runner-owned profiling metadata ──
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # Peak device memory observed while this request is active in step mode.
+    peak_memory_mb: float = 0.0
 
     # ── Properties ──
 
@@ -104,15 +152,21 @@ class DiffusionRequestState:
         return self.step_index >= total_steps
 
     @property
-    def new_request(self) -> bool:
-        # TODO: this is only an approximation for current stepwise mode.
-        # A real "new request" signal should eventually come from scheduler/runner state transitions.
-        return self.step_index == 0 or self.timesteps is None
+    def chunk_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return False
+        return self.step_in_chunk >= self.chunk_num_steps
+
+    @property
+    def request_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return self.denoise_completed
+        return self.chunk_index >= self.total_chunks
 
 
 class BaseRunnerOutput(ABC):
     @abstractmethod
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
         pass
 
 
@@ -125,13 +179,14 @@ class RunnerOutput(BaseRunnerOutput):
     _request_state_cache.
     """
 
-    req_id: str
+    request_id: str
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+    async_output_id: str | None = None
 
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
-        return self if self.req_id == sched_req_id else None
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
+        return self if self.request_id == request_id else None
 
 
 @dataclass
@@ -140,18 +195,18 @@ class BatchRunnerOutput(BaseRunnerOutput):
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._id_to_idx = {out.req_id: i for i, out in enumerate(self.runner_outputs)}
+        self._id_to_idx = {out.request_id: i for i, out in enumerate(self.runner_outputs)}
 
-    def __getitem__(self, req_id: str) -> RunnerOutput | None:
-        """access single RunnerOutput by req_id"""
-        idx = self._id_to_idx.get(req_id)
+    def __getitem__(self, request_id: str) -> RunnerOutput | None:
+        """access single RunnerOutput by request_id"""
+        idx = self._id_to_idx.get(request_id)
         return self.runner_outputs[idx] if idx is not None else None
 
-    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
-        return self[sched_req_id]
+    def get_request_output(self, request_id: str) -> RunnerOutput | None:
+        return self[request_id]
 
     @property
-    def req_ids(self) -> list[str]:
+    def request_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
 
     def __len__(self) -> int:

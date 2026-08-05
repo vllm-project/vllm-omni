@@ -1,0 +1,10 @@
+ttsd001|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Hello and welcome to the show today. [S2] Thanks for having me, it's a pleasure to be here. [S1] Let's dive right in.
+ttsd002|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Did you finish the report? [S2] Almost — I'm just polishing the conclusion. [S1] Great, send it over when you're done.
+ttsd003|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Have you tried that new restaurant downtown? [S2] Yes, the pasta is amazing. [S1] I'll book a table for Friday.
+ttsd004|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] What did you think of yesterday's meeting? [S2] Productive, but a bit long. [S1] Agreed, we should set an hour cap next time.
+ttsd005|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] The weather is beautiful today. [S2] Perfect for a hike. [S1] Want to drive out to the trails this afternoon?
+ttsd006|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] How did the demo go? [S2] Better than expected — the client signed off on the prototype. [S1] Fantastic news!
+ttsd007|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Coffee or tea this morning? [S2] Coffee please, with a splash of milk. [S1] Coming right up.
+ttsd008|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Did you read the email about the deadline change? [S2] I did, we now have until next Friday. [S1] That should give us enough buffer.
+ttsd009|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Are you joining the team dinner tonight? [S2] I'll be there around seven. [S1] See you then.
+ttsd010|prompt-wavs/spk1.wav|prompt-wavs/spk2.wav|[S1] Have we backed up the database? [S2] Last backup ran two hours ago. [S1] Good, I'll trigger a fresh snapshot before the migration.

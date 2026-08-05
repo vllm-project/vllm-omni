@@ -349,12 +349,14 @@ class YourModelPipeline(nn.Module):
 - def __call__(
 + def forward(
     self,
-+   req: OmniDiffusionRequest,  # ← Add request parameter here
++   req: DiffusionRequestBatch,  # ← Add request-batch parameter here
 - ):
-+ ) -> DiffusionOutput:  # ← Add return type
++ ) -> list[DiffusionOutput]:  # ← Add return type
 ```
 
-[`OmniDiffusionRequest`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/request/#vllm_omni.diffusion.request.OmniDiffusionRequest) is a dataclass that contains the **prompts** and **sampling parameters** [`OmniDiffusionSamplingParams`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/inputs/data/#vllm_omni.inputs.data.OmniDiffusionSamplingParams) for the diffusion pipeline execution. It also contains a request_id for other components to trace this request and its outputs.
+[`OmniDiffusionRequest`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/request/#vllm_omni.diffusion.request.OmniDiffusionRequest) is a dataclass that contains one **prompt** and the **sampling parameters** [`OmniDiffusionSamplingParams`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/inputs/data/#vllm_omni.inputs.data.OmniDiffusionSamplingParams) for one logical diffusion request. It also contains a request_id for other components to trace this request and its outputs. Before pipeline execution, the runner wraps one or more independent requests into `DiffusionRequestBatch`.
+
+[`DiffusionRequestBatch`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/worker/request_batch/#vllm_omni.diffusion.worker.request_batch.DiffusionRequestBatch) exposes compatibility properties such as `prompts`, `sampling_params`, and `request_id`. Pipelines that can execute the whole request batch in one forward pass should set `supports_request_batch = True`; other pipelines still receive a single-request batch and return a one-element output list.
 
 See some parameters in `OmniDiffusionSamplingParams` as follows:
 
@@ -367,35 +369,36 @@ See some parameters in `OmniDiffusionSamplingParams` as follows:
 **Extract parameters from request:**
 
 ```python
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 def forward(
     self,
-    req: OmniDiffusionRequest,
-) -> DiffusionOutput:
-    # Extract prompts from request
-    if req.prompts is not None:
-        prompt = [
-            p if isinstance(p, str) else (p.get("prompt") or "")
-            for p in req.prompts
-        ]
+    req: DiffusionRequestBatch,
+) -> list[DiffusionOutput]:
+    # Extract prompts from the request batch
+    prompts = [
+        p if isinstance(p, str) else (p.get("prompt") or "")
+        for p in req.prompts
+    ]
 
-    # Extract sampling parameters
+    # Extract common sampling parameters
     sampling_params = req.sampling_params
     num_inference_steps = sampling_params.num_inference_steps or 50
     guidance_scale = sampling_params.guidance_scale or 7.5
     height = sampling_params.height or (self.default_sample_size * self.vae_scale_factor)
     width = sampling_params.width or (self.default_sample_size * self.vae_scale_factor)
 
-    # For image editing pipelines, extract images from multi_modal_data
-    if hasattr(req, 'multi_modal_data') and req.multi_modal_data:
-        input_images = req.multi_modal_data.get('image', [])
+    # For image editing pipelines, extract media from each prompt dict
+    input_images = []
+    for p in req.prompts:
+        multi_modal_data = p.get("multi_modal_data", {}) if isinstance(p, dict) else {}
+        input_images.append(multi_modal_data.get("image"))
 
     # ... rest of generation logic
 ```
 
-For an image editing model, an example `OmniDiffusionRequest` is like:
+For an image editing model, the request `prompt` can be a dict like:
 ```python
 {
     "prompt": "turn this cat to a dog",
@@ -472,12 +475,12 @@ def get_your_model_pre_process_func(
     def pre_process_func(
         request: OmniDiffusionRequest,
         ):
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            # image pre-processing
-            # after pre-processing, update the request attributes
-            ...
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        # image pre-processing
+        # after pre-processing, update the request attributes
+        ...
         return request
 
     return pre_process_func
@@ -635,7 +638,7 @@ mkdir -p examples/online_serving/your_model_name
 
 - Script: `examples/offline_inference/your_model_name/end2end.py`
   - Parse args like BAGEL (`--model`, `--modality`, optional `--image-path`, `--steps`, etc.)
-  - Use `from vllm_omni.entrypoints.omni import Omni` (or `OmniDiffusion` if your model is diffusion-only)
+  - Use `from vllm_omni.entrypoints.omni import Omni` for both multi-stage and diffusion-only models
   - Save outputs (images/audio/video/text) with deterministic filenames (e.g., `output_0_0.png`)
 - Doc: `examples/offline_inference/your_model_name/README.md`
   - Include at least one runnable command, e.g.:
@@ -650,7 +653,7 @@ python end2end.py --model your-org/your-model-name --modality text2img --prompts
 Mirror BAGEL’s online serving setup:
 
 - Server launcher: `examples/online_serving/your_model_name/run_server.sh`
-  - Wrap `vllm serve ... --omni --port ...` (and `--stage-configs-path ...` if needed)
+  - Wrap `vllm serve ... --omni --port ...` (and `--deploy-config ...` if needed)
 - Client: `examples/online_serving/your_model_name/openai_chat_client.py`
   - Send requests to `POST /v1/chat/completions`
   - Support multimodal inputs (e.g., base64 image) if your model needs it
@@ -682,7 +685,7 @@ For a fair comparison, keep the same **prompt**, **seed**, **resolution**, **num
 
 To ensure project maintainability and sustainable development, please submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
 
-For comprehensive testing guidelines and the definition of test levels (L1-L5), please refer to the [Multi-Level Automated Testing System Documentation](../ci/CI_5levels.md). You are at least required to add an L4 *functionality* test described in that document.
+For the definition of test levels (L1-L5), see [Test System Overview](../ci/test_system_overview.md). You are at least required to add an L4 *functionality* test as described in [Test Writing Guide](../ci/test_writing_guide.md#l4-level-testing-full-functionality-performance-and-documentation-testing).
 
 ---
 
@@ -923,11 +926,11 @@ When implementing a new pipeline, avoid putting all logic inside a single functi
 
 For example:
 ```
-def forward(self, req: OmniDiffusionRequest):
+def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
     prompt_embeds = self.encode_prompt(req)
     latents = self.diffuse(prompt_embeds, req)
     images = self.vae.decode(latents)
-    return DiffusionOutput(output=images)
+    return [DiffusionOutput(output=images)]
 ```
 This allows the timing utility to measure each stage (e.g., encode_prompt, diffuse, vae.decode) separately and helps identify performance bottlenecks more easily.
 

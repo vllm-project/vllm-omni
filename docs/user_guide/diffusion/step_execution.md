@@ -39,6 +39,11 @@ vllm serve Qwen/Qwen-Image --omni \
 For serving, `--step-execution` enables the step-wise runtime. Continuous
 batching only becomes relevant when `--max-num-seqs > 1`.
 
+`max_num_seqs` controls the step scheduler capacity:
+
+- `max_num_seqs=1` runs one request through the step-wise state machine.
+- `max_num_seqs>1` allows compatible active requests to share step waves.
+
 ## Supported Pipelines
 
 | Pipeline | Example models | Step execution |
@@ -51,7 +56,7 @@ batching only becomes relevant when `--max-num-seqs > 1`.
     the step-wise path can batch
     compatible requests together. This is experimental. Requests with
     incompatible sampling parameters are intentionally kept in separate batches,
-    and `max_num_seqs=1` remains the conservative default.
+    and `max_num_seqs=1` remains the conservative single-request step path.
 
 ## Current Limitations
 
@@ -60,6 +65,9 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 - `cache_backend` is not supported together with step execution.
 - Unsupported pipelines fail early during model loading.
 - Request-mode extras such as KV transfer are not wired into step mode yet.
+- LoRA is supported in step mode, but each batch must use a single adapter:
+  requests with different `lora_request` or `lora_scale` are scheduled into
+  separate batches.
 
 ## When To Use It
 

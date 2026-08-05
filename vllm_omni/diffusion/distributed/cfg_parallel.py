@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -80,6 +81,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
         output_slice: int | None = None,
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Predict noise with optional classifier-free guidance.
@@ -91,6 +93,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             negative_kwargs: Kwargs for negative/unconditional prediction
             cfg_normalize: Whether to normalize CFG output (default: True)
             output_slice: If set, slice each output to [:, :output_slice] for image editing
+            kwargs: Optional extra context for custom combine implementations.
 
         Returns:
             Predicted noise tensor or tuple of tensors.
@@ -110,8 +113,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 cfg_rank = get_classifier_free_guidance_rank()
 
                 # Each rank computes one branch
-                kwargs = positive_kwargs if cfg_rank == 0 else negative_kwargs
-                local_pred = _wrap(self.predict_noise(**kwargs))
+                if cfg_rank == 0:
+                    logger.debug("CFG Parallel: Rank 0 computing positive branch")
+                    local_pred = _wrap(self.predict_noise(**positive_kwargs))
+                else:
+                    logger.debug("CFG Parallel: Rank %d computing negative branch", cfg_rank)
+                    local_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -127,6 +134,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     negative_noise_pred,
                     true_cfg_scale,
                     cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
                 )
             else:
                 # Sequential CFG: compute both positive and negative
@@ -142,6 +150,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     negative_noise_pred,
                     true_cfg_scale,
                     cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
                 )
         else:
             # No CFG: only compute positive/conditional prediction
@@ -172,6 +181,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
         true_cfg_scale: float,
         cfg_normalize: bool = False,
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Combine conditional and unconditional noise predictions with CFG.
@@ -195,6 +205,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             negative_noise_pred: Negative/unconditional prediction(s) — Tensor or tuple
             true_cfg_scale: CFG scale factor
             cfg_normalize: Whether to normalize the combined prediction (default: False)
+            kwargs: Optional extra context for custom combine implementations.
 
         Returns:
             Combined noise prediction(s) — same type as inputs
@@ -275,7 +286,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         n_branches: int,
         cfg_world_size: int,
-        true_cfg_scale: float,
+        true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool,
         output_slice: int | None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -369,7 +380,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             results.append(comb)
         return _unwrap(tuple(results))
 
-    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -381,8 +392,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
             multi-output models (e.g., video + audio). Multi-output models
             must also override combine_cfg_noise() and set self.scheduler
             to a composite scheduler that handles tuples.
+            Non-last Pipeline Parallel stages return `IntermediateTensors`
+            instead of final noise tensors wrapped in a tuple.
         """
-        return self.transformer(*args, **kwargs)[0]
+        result = self.transformer(*args, **kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def diffuse(
         self,
@@ -448,6 +462,31 @@ class CFGParallelMixin(metaclass=ABCMeta):
         ```
         """
         raise NotImplementedError("Subclasses must implement diffuse")
+
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool) -> bool:
+        """
+        Check if CFG parallel configuration is valid.
+
+        Args:
+            true_cfg_scale: The classifier-free guidance scale value
+            has_neg_prompt: Whether a negative prompt is provided
+
+        Returns:
+            True if CFG parallel configuration is valid, False otherwise
+        """
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
 
     def scheduler_step(
         self,

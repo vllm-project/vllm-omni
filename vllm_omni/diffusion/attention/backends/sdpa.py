@@ -11,6 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.utils.attn_runtime_selector import can_sdpa_use_fused_gqa
 
 logger = init_logger(__name__)
 
@@ -30,10 +31,6 @@ def _maybe_reshape_attn_mask(
       - broadcast_k: [batch_size, 1, 1, seq_len_k]
       - full_qk: [batch_size, 1, seq_len_q, seq_len_k]
     """
-    # Skip Attention Mask if all values are 1, `None` mask can speedup the computation
-    if attn_mask is not None and torch.all(attn_mask != 0):
-        attn_mask = None
-
     # Reshape Attention Mask
     # 2D [batch_size, seq_len_k] mask only.
     if (
@@ -106,7 +103,24 @@ class SDPAImpl(AttentionImpl):
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
+        enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
+        # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
+        # cannot select a fused GQA kernel for the runtime shape/mask, expand
+        # K/V locally so it can use the better-supported equal-head path.
+        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
+            if query.shape[1] % key.shape[1] != 0:
+                raise ValueError(
+                    "GQA requires query heads to be a multiple of KV heads, "
+                    f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
+                )
+            repeat_num = query.shape[1] // key.shape[1]
+            key = key.repeat_interleave(repeat_num, dim=1)
+            value = value.repeat_interleave(repeat_num, dim=1)
+            enable_gqa = False
+            logger.debug(
+                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
+            )
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
@@ -115,6 +129,7 @@ class SDPAImpl(AttentionImpl):
             dropout_p=0.0,
             is_causal=self.causal,
             scale=self.softmax_scale,
+            enable_gqa=enable_gqa,
         )
         out = output.permute(0, 2, 1, 3)
         return out

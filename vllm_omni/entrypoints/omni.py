@@ -25,16 +25,25 @@ logger = init_logger(__name__)
 class Omni(OmniBase):
     """Synchronous entrypoint for offline generation."""
 
-    def _set_final_only_for_llm_stages(
+    def _maybe_force_final_only_for_llm_stages(
         self,
         sampling_params_list: Sequence[OmniSamplingParams],
     ) -> list[OmniSamplingParams]:
-        """Return per-stage params with LLM stages forced to FINAL_ONLY."""
+        """Return per-stage params with LLM stages forced to FINAL_ONLY.
+
+        The caller may explicitly request ``output_kind = DELTA`` on a stage to
+        opt into streaming; such stages are left alone.  All other LLM stages
+        are forced to FINAL_ONLY.
+        """
         effective_params: list[OmniSamplingParams] = []
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
-            if stage_meta.stage_type != "diffusion" and hasattr(sp, "output_kind"):
+            if (
+                stage_meta.stage_type != "diffusion"
+                and hasattr(sp, "output_kind")
+                and sp.output_kind != RequestOutputKind.DELTA
+            ):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
@@ -103,7 +112,7 @@ class Omni(OmniBase):
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
-            sampling_params_list = self._set_final_only_for_llm_stages(sampling_params_list)
+            sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
 
             if isinstance(prompts, str) or not isinstance(prompts, Sequence):
                 request_prompts: list[OmniPromptType] = [prompts]
@@ -121,6 +130,7 @@ class Omni(OmniBase):
             for req_id, prompt in zip(request_ids, request_prompts):
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
+                final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
                 req_final_stage_ids[req_id] = final_stage_id
 
                 metrics = OrchestratorMetrics(
@@ -145,6 +155,7 @@ class Omni(OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
+                    final_output_stage_ids=final_output_stage_ids,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts

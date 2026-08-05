@@ -21,6 +21,10 @@ from openpyxl.utils import get_column_letter
 LOGGER = logging.getLogger(__name__)
 
 GREY_BLOCK_FILL = PatternFill(start_color="D3D3D3", fill_type="solid")
+LEGACY_BACKEND_ENDPOINT_ALIASES = {
+    "vllm-omni": "/v1/chat/completions",
+    "openai": "/v1/images/generations",
+}
 
 # Diffusion sheet columns (Qwen-Image diffusion benchmark).
 # Per-stage latency metrics. Unpack from stage_durations_mean/p50/p99 dicts
@@ -60,7 +64,7 @@ DIFFUSION_SUMMARY_COLUMNS: tuple[str, ...] = (
     "date",
     "test_name",
     "model",
-    "backend",
+    "endpoint",
     "dataset",
     "task",
     "completed_requests",
@@ -141,6 +145,20 @@ def _omni_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
 
 def _diffusion_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
     return (record.get("test_name") or "",)
+
+
+def normalize_endpoint(value: str) -> str:
+    """Normalize legacy backend aliases and endpoint paths for report rows."""
+    endpoint = str(value).strip()
+    if not endpoint:
+        raise ValueError("endpoint must not be empty.")
+    endpoint = LEGACY_BACKEND_ENDPOINT_ALIASES.get(
+        endpoint,
+        LEGACY_BACKEND_ENDPOINT_ALIASES.get(endpoint.lstrip("/"), endpoint),
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    return endpoint
 
 
 def _load_summary_columns(script_dir: str) -> list[str]:
@@ -528,6 +546,12 @@ def _process_diffusion_record(record: dict[str, Any]) -> dict[str, Any]:
     """Normalize a diffusion record by merging `result` and flattening stage metrics."""
     flat = record.copy()
     flat.update(flat.pop("result", {}))
+    if flat.get("endpoint"):
+        flat["endpoint"] = normalize_endpoint(flat["endpoint"])
+    elif flat.get("backend"):
+        flat["endpoint"] = normalize_endpoint(flat["backend"])
+    flat.pop("backend", None)
+    flat.pop("API Backend", None)
     flat = _flatten_stage_durations(flat)
     flat.pop("benchmark_params", None)
     flat.pop("server_params", None)
@@ -752,6 +776,7 @@ _OMNI_SUMMARY_WIDTHS = {
 _DIFFUSION_SUMMARY_WIDTHS = {
     "test_name": 30,
     "model": 15,
+    "endpoint": 24,
 }
 
 

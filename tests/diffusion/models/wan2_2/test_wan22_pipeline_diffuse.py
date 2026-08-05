@@ -9,11 +9,20 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class _StubTransformer(nn.Module):
+    @property
+    def dtype(self) -> torch.dtype:
+        return torch.float32
+
+
+class _StubTextEncoder(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
         return torch.float32
@@ -40,12 +49,30 @@ def _noop_progress_bar(*args, **kwargs):
     yield _Bar()
 
 
+def _stub_encode_prompt(
+    prompt,
+    negative_prompt=None,
+    do_classifier_free_guidance=True,
+    num_videos_per_prompt=1,
+    max_sequence_length=512,
+    device=None,
+    dtype=None,
+):
+    del negative_prompt, do_classifier_free_guidance, device, dtype
+    batch_size = 1 if isinstance(prompt, str) else len(prompt)
+    n = batch_size * num_videos_per_prompt
+    hidden_size = 8
+    prompt_embeds = torch.zeros(n, max_sequence_length, hidden_size)
+    return prompt_embeds, None
+
+
 def _make_pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
+    pipeline.text_encoder = _StubTextEncoder()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
     pipeline.od_config = SimpleNamespace(flow_shift=5.0)
@@ -60,15 +87,27 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline._num_timesteps = None
     pipeline._current_timestep = None
     pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = _stub_encode_prompt  # type: ignore[method-assign]
     pipeline.prepare_latents = lambda **kwargs: torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
     pipeline.progress_bar = _noop_progress_bar
     return pipeline
 
 
-def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("sampling_params_kwargs", "expected_low", "expected_high"),
+    [
+        ({}, 4.0, 4.0),
+        ({"guidance_scale": 0.0}, 0.0, 0.0),
+        ({"guidance_scale": 1.0}, 1.0, 1.0),
+        ({"guidance_scale": 3.0, "guidance_scale_2": 5.0}, 3.0, 5.0),
+    ],
+)
+def test_forward_delegates_denoising_to_diffuse(
+    sampling_params_kwargs: dict[str, float],
+    expected_low: float,
+    expected_high: float,
+) -> None:
     pipeline = _make_pipeline()
-
-    prompt_embeds = torch.randn(1, 8)
     captured: dict[str, object] = {}
 
     def _fake_diffuse(**kwargs):
@@ -77,32 +116,26 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
 
     pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
 
-    req = SimpleNamespace(
-        prompts=["prompt"],
-        sampling_params=SimpleNamespace(
-            height=None,
-            width=None,
+    mock_req = OmniDiffusionRequest(
+        prompt="prompt",
+        request_id="test-req",
+        sampling_params=OmniDiffusionSamplingParams(
             num_frames=1,
             num_inference_steps=2,
-            guidance_scale_provided=False,
-            guidance_scale=None,
-            guidance_scale_2=None,
-            boundary_ratio=None,
-            generator=None,
-            seed=None,
-            num_outputs_per_prompt=1,
             max_sequence_length=32,
-            latents=None,
-            extra_args={},
+            output_type="latent",
+            **sampling_params_kwargs,
         ),
     )
+    batch = DiffusionRequestBatch(requests=[mock_req])
 
-    output = pipeline.forward(req, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
+    output = pipeline.forward(batch)
 
     assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
+    assert torch.equal(captured["prompt_embeds"], torch.zeros(1, 32, 8))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
-    assert captured["guidance_low"] == 1.0
-    assert captured["guidance_high"] == 1.0
+    assert captured["guidance_low"] == expected_low
+    assert captured["guidance_high"] == expected_high
     assert captured["boundary_timestep"] == pytest.approx(875.0)
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None

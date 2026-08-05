@@ -62,6 +62,12 @@ def detect_target_device() -> str:
         else:
             print(f"Warning: Invalid VLLM_OMNI_TARGET_DEVICE '{target_device}', falling back to auto-detection")
 
+    # Priority 1.5: ReadTheDocs builds use CPU requirements (no GPU, 1 GB RAM cap).
+    # Avoids pulling ~2 GB of CUDA libs that push the mkdocs build into swap.
+    if os.environ.get("READTHEDOCS"):
+        print("Detected READTHEDOCS=1; using cpu requirements for docs build")
+        return "cpu"
+
     # Priority 2: Torch backend detection
     # This is a code path for when user is using
     # --no-build-isolation flag

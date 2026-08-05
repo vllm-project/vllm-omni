@@ -15,7 +15,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -32,6 +31,13 @@ connectors:
       ref_code_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
+      # Chunk ramp (opt-in): gradual size increase for first N chunks to
+      # eliminate the IC→steady cliff (1→25). Uncomment to enable.
+      # Each entry is the size of that chunk index; indices past the table
+      # fall back to codec_chunk_frames. When enabled, ramp overrides
+      # initial_codec_chunk_frames (including the per-request API field).
+      # Example:
+      #   codec_chunk_ramp: [4, 4, 8, 16, 25]
       # Common Stage1 decode buckets:
       #   no-ref first/steady chunks: 25 / 97 frames
       #   Base ref-context first/steady chunks: 73 / 169 frames
@@ -60,7 +66,10 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 4096
-      seed: 42
+      # Official qwen-tts generates the talker with min_new_tokens=2; without
+      # it, checkpoints that sample codec EOS on the first frame return empty
+      # audio (HTTP 400). See #4962.
+      min_tokens: 2
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true
@@ -85,7 +94,6 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
-      seed: 42
       repetition_penalty: 1.0
 
 platforms:

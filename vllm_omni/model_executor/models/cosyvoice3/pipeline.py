@@ -4,8 +4,9 @@
 
 Stage 0: Talker   — text prompt → speech tokens (LLM autoregressive).
 Stage 1: Code2Wav — flow-matching decoder → acoustic features → waveform.
-  * ``sync_process_input_func`` runs when ``deploy.async_chunk=false``:
-    stage 1 builds full-sequence flow input via ``text2flow``.
+  * ``sync_process_input_func`` (``text2flow_token_only``) runs when
+    ``deploy.async_chunk=false``: stage 1 allocates placeholder slots while
+    bulk tensors arrive via ``text2flow_full_payload`` on the connector.
   * ``async_chunk_process_next_stage_input_func`` runs when
     ``deploy.async_chunk=true``: stage 0 streams codec chunks to stage 1
     through the shared-memory connector.
@@ -21,6 +22,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.cosyvoice3"
 
 COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
+    default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",
     stages=(
         StagePipelineConfig(
@@ -31,6 +33,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
+            custom_process_next_stage_input_func=f"{_PROC}.text2flow_full_payload",
             sampling_constraints={
                 # merged speech stop token (logsumexp of all 200 stop logits)
                 "stop_token_ids": [6562],
@@ -44,7 +47,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="latent",
-            sync_process_input_func=f"{_PROC}.text2flow",
+            sync_process_input_func=f"{_PROC}.text2flow_token_only",
         ),
     ),
 )

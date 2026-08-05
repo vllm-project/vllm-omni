@@ -2,14 +2,12 @@
 #      Start Token2Wav     #
 ############################
 
-import math
 from collections.abc import Iterable
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import Parameter
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniBigVGANConfig,
@@ -35,8 +33,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
-from vllm_omni.platforms import current_omni_platform
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -634,238 +633,9 @@ class DiTDecoderLayer(nn.Module):
         return hidden_states
 
 
-class SnakeBeta(nn.Module):
-    """
-    A modified Snake function which uses separate parameters for the magnitude
-    of the periodic components
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter that controls frequency
-        - beta - trainable parameter that controls magnitude
-    References:
-        - This activation function is a modified version based on this paper
-          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-        https://huggingface.co/papers/2006.08195
-    """
-
-    def __init__(self, in_features, alpha=1.0):
-        super().__init__()
-        self.in_features = in_features
-
-        # initialize alpha
-        self.alpha = Parameter(torch.zeros(in_features) * alpha)
-        self.beta = Parameter(torch.zeros(in_features) * alpha)
-
-        self.no_div_by_zero = 0.000000001
-
-    def forward(self, hidden_states):
-        """
-        Forward pass of the function.
-        Applies the function to the input elementwise.
-        SnakeBeta ∶= x + 1/b * sin^2 (xa)
-        """
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # line up with x to [B, C, T]
-        beta = self.beta.unsqueeze(0).unsqueeze(-1)
-        alpha = torch.exp(alpha)
-        beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
-            torch.sin(hidden_states * alpha), 2
-        )
-
-        return hidden_states
-
-
-def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> torch.Tensor:
-    """Generates a 1D Kaiser-windowed sinc filter.
-
-    Args:
-        cutoff (float): Normalized cutoff frequency (0 to 0.5).
-        half_width (float): Transition bandwidth.
-        kernel_size (int): Number of filter taps.
-
-    Returns:
-        torch.Tensor: A tensor of shape (1, 1, kernel_size) representing the filter.
-    """
-    is_even = kernel_size % 2 == 0
-    half_size = kernel_size // 2
-
-    # Compute Kaiser window parameters
-    delta_f = 4 * half_width
-    attenuation = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
-
-    if attenuation > 50.0:
-        beta = 0.1102 * (attenuation - 8.7)
-    elif attenuation >= 21.0:
-        beta = 0.5842 * (attenuation - 21) ** 0.4 + 0.07886 * (attenuation - 21.0)
-    else:
-        beta = 0.0
-
-    # TODO: When torch.kaiser_window supports NPU, remove the device="cpu" argument
-    if current_omni_platform.is_npu():
-        kaiser_window = torch.kaiser_window(
-            kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
-        ).to("npu")
-    elif current_omni_platform.is_xpu():
-        kaiser_window = torch.kaiser_window(
-            kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
-        ).to("xpu")
-    else:
-        kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
-
-    # Compute time indices
-    if is_even:
-        time_indices = torch.arange(-half_size, half_size) + 0.5
-    else:
-        time_indices = torch.arange(kernel_size) - half_size
-
-    # Compute sinc filter
-    if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32)
-
-    sinc_filter = torch.sinc(2 * cutoff * time_indices)
-    normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
-
-    # Normalize to ensure sum = 1 (avoid leakage of constant component)
-    normalized_filter /= normalized_filter.sum()
-
-    return normalized_filter.view(1, 1, kernel_size)
-
-
-def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: int) -> torch.Tensor:
-    """
-    Manual replicate padding to avoid replication_pad1d kernel limits on NPU.
-    TODO: remove when F.pad supports replicate mode on NPU.
-    """
-    # NOTE: a immature implementation for running in NPU. Need to discuss.
-    if pad_left == 0 and pad_right == 0:
-        return hidden_states
-
-    segments = []
-    if pad_left > 0:
-        left = hidden_states[..., :1].expand(*hidden_states.shape[:-1], pad_left)
-        segments.append(left)
-
-    segments.append(hidden_states)
-
-    if pad_right > 0:
-        right = hidden_states[..., -1:].expand(*hidden_states.shape[:-1], pad_right)
-        segments.append(right)
-
-    return torch.cat(segments, dim=-1)
-
-
-class UpSample1d(nn.Module):
-    def __init__(self, ratio=2, kernel_size=None):
-        super().__init__()
-        self.ratio = ratio
-        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        self.stride = ratio
-        self.pad = self.kernel_size // ratio - 1
-        self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
-        self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
-
-        filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
-        self.register_buffer("filter", filter, persistent=False)
-
-    def forward(self, hidden_states):
-        channels = hidden_states.shape[1]
-        if current_omni_platform.is_npu():
-            # TODO: When F.pad supports replicate mode on NPU, remove this branch
-            input_dtype = hidden_states.dtype
-            # F.pad in NPU doesn't support BF16 when mode is replicate.
-            # To ensure the accuracy, manually pad the input tensor.
-            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
-            filter_convert_dtype = self.filter.to(hidden_states.dtype)
-            hidden_states = self.ratio * F.conv_transpose1d(
-                hidden_states,
-                filter_convert_dtype.expand(channels, -1, -1),
-                stride=self.stride,
-                groups=channels,
-            ).to(input_dtype)
-        else:
-            hidden_states_dtype = hidden_states.dtype
-            hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(self.filter.dtype)
-            hidden_states = self.ratio * F.conv_transpose1d(
-                hidden_states,
-                self.filter.expand(channels, -1, -1),
-                stride=self.stride,
-                groups=channels,
-            ).to(hidden_states_dtype)
-        hidden_states = hidden_states[..., self.pad_left : -self.pad_right]
-
-        return hidden_states
-
-
-class DownSample1d(nn.Module):
-    def __init__(self, ratio=2, kernel_size=None):
-        super().__init__()
-        cutoff = 0.5 / ratio
-        half_width = 0.6 / ratio
-
-        if cutoff < 0.0:
-            raise ValueError("Minimum cutoff must be larger than zero.")
-        if cutoff > 0.5:
-            raise ValueError("A cutoff above 0.5 does not make sense.")
-
-        self.even = kernel_size % 2 == 0
-        self.pad_left = kernel_size // 2 - int(self.even)
-        self.pad_right = kernel_size // 2
-        self.stride = ratio
-        filter = kaiser_sinc_filter1d(cutoff, half_width, kernel_size)
-        self.register_buffer("filter", filter, persistent=False)
-
-    def forward(self, hidden_states):
-        channels = hidden_states.shape[1]
-        if current_omni_platform.is_npu():
-            input_dtype = hidden_states.dtype
-            # F.pad in NPU doesn't support BF16 when mode is replicate.
-            # To ensure the accuracy, manually pad the input tensor.
-            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right)
-            filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            out = F.conv1d(
-                hidden_states,
-                filter_on_device.expand(channels, -1, -1),
-                stride=self.stride,
-                groups=channels,
-            ).to(input_dtype)
-        else:
-            hidden_states_dtype = hidden_states.dtype
-            hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate").to(
-                self.filter.dtype
-            )
-            out = F.conv1d(
-                hidden_states,
-                self.filter.expand(channels, -1, -1),
-                stride=self.stride,
-                groups=channels,
-            ).to(hidden_states_dtype)
-        return out
-
-
-class TorchActivation1d(nn.Module):
-    def __init__(
-        self,
-        activation,
-        up_ratio: int = 2,
-        down_ratio: int = 2,
-        up_kernel_size: int = 12,
-        down_kernel_size: int = 12,
-    ):
-        super().__init__()
-        if not callable(activation):
-            raise TypeError("Activation function must be callable")
-        self.act = activation
-        self.upsample = UpSample1d(up_ratio, up_kernel_size)
-        self.downsample = DownSample1d(down_ratio, down_kernel_size)
-
-    def forward(self, hidden_states):
-        hidden_states = self.upsample(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.downsample(hidden_states)
-
-        return hidden_states
+# SnakeBeta, UpSample1d, DownSample1d, AliasFreeActivation1d (formerly
+# TorchActivation1d) are now provided by the shared ``common`` modules.
+# See: vllm_omni/model_executor/models/common/{snake_activation,alias_free_activation}.py
 
 
 class AMPBlock(torch.nn.Module):
@@ -938,7 +708,7 @@ class AMPBlock(torch.nn.Module):
         self.num_layers = len(self.convs1) + len(self.convs2)  # total number of conv layers
 
         self.activations = nn.ModuleList(
-            [TorchActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)]
+            [AliasFreeActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)]
         )
 
     def _get_padding(self, kernel_size, dilation=1):
@@ -1002,7 +772,7 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
             ]
         )
 
-        self.activation_post = TorchActivation1d(
+        self.activation_post = AliasFreeActivation1d(
             activation=SnakeBeta(config.upsample_initial_channel // (2**self.num_upsample_layers))
         )
         self.conv_post = nn.Conv1d(

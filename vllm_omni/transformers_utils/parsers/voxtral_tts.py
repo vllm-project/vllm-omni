@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 
 _VOXTRAL_TTS_ARCHS = frozenset({"VoxtralTTSForConditionalGeneration"})
 _VOXTRAL_TTS_MODEL_TYPE = "voxtral_tts"
+_VOXTRAL_TTS_DTYPE = "bfloat16"
 
 
 def _is_voxtral_tts_params(config_dict: dict) -> bool:
@@ -55,6 +56,10 @@ def _parse_voxtral_tts(config_dict: dict) -> tuple[dict, PretrainedConfig]:
         _remap_mistral_quantization_args,
     )
 
+    if config_dict.get("dtype") is None:
+        config_dict["dtype"] = _VOXTRAL_TTS_DTYPE
+    dtype = config_dict["dtype"]
+
     audio_config: dict[str, Any] = {}
     if (config_dict.get("multimodal") or {}).get("audio_model_args"):
         audio_config = _remap_voxtral_tts_audio_args(config_dict)
@@ -69,6 +74,7 @@ def _parse_voxtral_tts(config_dict: dict) -> tuple[dict, PretrainedConfig]:
         text_config=PretrainedConfig.from_dict(text_config),
         audio_config=audio_config,
         architectures=config_dict.get("architectures", ["VoxtralTTSForConditionalGeneration"]),
+        dtype=dtype,
     )
     return config_dict, config
 

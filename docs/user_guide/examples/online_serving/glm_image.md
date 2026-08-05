@@ -11,15 +11,15 @@ memory, sampling params) live in `vllm_omni/deploy/glm_image.yaml`.
 vllm serve zai-org/GLM-Image --omni --port 8091
 ```
 
-The config system auto-detects the pipeline from the model's `model_index.json` — no
-manual `--stage-configs-path` or `--deploy-config` needed.
+The config system auto-detects the pipeline from the model's `model_index.json`, so
+no manual `--deploy-config` is needed.
 
 By default, stage 0 (AR) runs on GPU 0 and stage 1 (Diffusion) on GPU 1. To colocate
 both stages on a single GPU, override per stage:
 
 ```bash
 vllm serve zai-org/GLM-Image --omni --port 8091 \
-    --stage-0-devices 0 --stage-1-devices 0
+    --stage-overrides '{"0": {"devices": "0"}, "1": {"devices": "0"}}'
 ```
 
 ## API Calls
@@ -101,7 +101,7 @@ guides.
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
 JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Diffusion Chat API guide](../../../serving/diffusion_chat_api.md)).
+[Chat Completions API guide](../../../serving/chat_completions_api.md)).
 When using the dedicated [`/v1/images/generations`](../../../serving/image_generation_api.md)
 or [`/v1/images/edits`](../../../serving/image_edit_api.md) endpoints, pass
 the supported generation controls as top-level fields directly. For image

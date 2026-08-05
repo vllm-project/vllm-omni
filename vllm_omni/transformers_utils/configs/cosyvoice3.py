@@ -42,6 +42,13 @@ class CosyVoice3Config(PretrainedConfig):
         self.qwen_pretrain_path = "CosyVoice-BlankEN"
         self.campplus_onxx_path = "campplus.onnx"
         self.speech_tokenizer_path = "speech_tokenizer_v3.onnx"
+        # Flow-decoder estimator ONNX for the optional TensorRT code2wav path.
+        # The fp16 (strongly-typed) ONNX gives an fp16 engine; if it is not in
+        # the model dir it is fetched from ``flow_estimator_onnx_repo``. Falls
+        # back to the bundled fp32 ONNX (fp32+TF32 engine) when unavailable.
+        self.flow_estimator_onnx_path = "flow.decoder.estimator.autocast_fp16.onnx"
+        self.flow_estimator_onnx_repo = "yuekai/Fun-CosyVoice3-0.5B-2512-FP16-ONNX"
+        self.flow_estimator_onnx_path_fp32 = "flow.decoder.estimator.fp32.onnx"
         self.spk2info_path = "spk2info.pt"
         self.version = "cosyvoice3"
         self.llm = {

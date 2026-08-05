@@ -28,7 +28,7 @@ class FakeAdapter:
             req = running.pop()
             self.waiting_for_chunk_running_requests.append(req)
 
-    def restore_queues(self, waiting, running):
+    def restore_queues(self, waiting, running, scheduler_requests=None):
         """Put requests back."""
         self.restore_called = True
         running.extend(self.waiting_for_chunk_running_requests)

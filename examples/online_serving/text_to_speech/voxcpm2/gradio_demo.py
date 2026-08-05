@@ -515,6 +515,8 @@ def create_app(api_base: str):
                 "response_format": "pcm" if stream_enabled else "wav",
                 "stream": stream_enabled,
             }
+            if stream_enabled:
+                payload["stream_format"] = "audio"
 
             # Reference audio for cloning
             ref_url_s = ref_url.strip() if ref_url else ""

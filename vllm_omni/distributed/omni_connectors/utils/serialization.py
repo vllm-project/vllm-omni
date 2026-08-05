@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -82,10 +83,12 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
-        t = tensor.detach().contiguous().cpu()
+        t = tensor.detach().cpu()
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             t = t.reshape(1)
+        if not t.is_contiguous():
+            t = t.contiguous()
         t = t.view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
@@ -148,10 +151,13 @@ class OmniMsgpackEncoder:
             "multi_modal_placeholders": getattr(obj, "multi_modal_placeholders", None),
             "kv_transfer_params": obj.kv_transfer_params,
         }
-        # Handle dynamically added multimodal_output attribute
+        # Handle multimodal_output attribute (MultimodalPayload or dict)
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
-            result["multimodal_output"] = mm_output
+            if isinstance(mm_output, Mapping):
+                result["multimodal_output"] = dict(mm_output)
+            else:
+                result["multimodal_output"] = mm_output
         return result
 
     def _encode_completion_output(self, obj: CompletionOutput) -> dict[str, Any]:
@@ -159,7 +165,11 @@ class OmniMsgpackEncoder:
         result = asdict(obj)
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
-            result["multimodal_output"] = mm_output
+            # Convert MultimodalPayload to plain dict for wire format
+            if isinstance(mm_output, Mapping):
+                result["multimodal_output"] = dict(mm_output)
+            else:
+                result["multimodal_output"] = mm_output
         return result
 
 

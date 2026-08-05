@@ -15,6 +15,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
 QWEN3_TTS_PIPELINE = PipelineConfig(
     model_type="qwen3_tts",
+    default_deploy_config_name="qwen3_tts.yaml",
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="Qwen3TTSTalkerForConditionalGeneration",
     stages=(
@@ -26,6 +27,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [2150],
@@ -40,7 +42,14 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="Qwen3TTSCode2Wav",
-            sync_process_input_func=f"{_PROC}.talker2code2wav",
+            # ``sync_process_input_func`` is the only input-proc override for
+            # this stage in sync (non-async-chunk) mode: a length-only
+            # ``_token_only`` placeholder.  The bulk codec payload itself
+            # ships via the worker connector from stage 0's
+            # ``talker2code2wav_full_payload`` producer.  Under async_chunk
+            # mode no pre-stage processing is needed -- chunks deliver
+            # directly to the consumer.
+            sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
         ),

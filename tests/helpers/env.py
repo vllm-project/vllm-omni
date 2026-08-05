@@ -27,6 +27,32 @@ def get_physical_device_indices(devices):
     return [index_mapping[i] for i in devices if i in index_mapping]
 
 
+def pick_least_used_device_indices(num_devices: int) -> list[int]:
+    """Return physical device indices for the least-used accelerators.
+
+    Args:
+        num_devices: Number of device indices to return.
+
+    Returns:
+        Physical device indices sorted from least to most used memory.
+    """
+    if num_devices <= 0:
+        raise ValueError(f"num_devices must be positive, got {num_devices}.")
+
+    logical_count = current_omni_platform.get_device_count()
+    if logical_count < num_devices:
+        raise RuntimeError(f"Need {num_devices} devices, but only {logical_count} are available.")
+
+    device_usage: list[tuple[int, int]] = []
+    for device_index in range(logical_count):
+        with current_omni_platform.device(device_index):
+            free_bytes, total_bytes = current_omni_platform.get_device_memory()
+        device_usage.append((total_bytes - free_bytes, device_index))
+    device_usage.sort()
+    logical_indices = [device_index for _, device_index in device_usage[:num_devices]]
+    return get_physical_device_indices(logical_indices)
+
+
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
@@ -160,8 +186,40 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
+def _cleanup_stale_device_locks() -> None:
+    """Remove stale device-initialization lock files whose recorded PID is dead.
+
+    Lock files at ``/tmp/vllm_omni_device_*_init.lock`` may persist after a
+    crashed / killed test run and block subsequent orchestrator startups.
+    """
+    import glob as _glob
+
+    for lock_file in _glob.glob("/tmp/vllm_omni_device_*_init.lock"):
+        try:
+            with open(lock_file) as fh:
+                content = fh.read().strip()
+            if not content:
+                continue
+            pid = int(content)
+        except (OSError, ValueError):
+            continue
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f"  Removing stale device lock {lock_file} (PID {pid} is dead)")
+            try:
+                os.unlink(lock_file)
+            except OSError:
+                pass
+        except PermissionError:
+            pass
+
+
 def run_pre_test_cleanup() -> None:
     print("Pre-test GPU status:")
+
+    _cleanup_stale_device_locks()
 
     num_gpus = current_omni_platform.device_count()
     if num_gpus > 0:
@@ -169,6 +227,7 @@ def run_pre_test_cleanup() -> None:
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),
                 threshold_ratio=0.05,
+                timeout_s=60,
             )
         except Exception as e:
             print(f"Pre-test cleanup note: {e}")
@@ -231,6 +290,7 @@ class DeviceMemoryMonitor:
 __all__ = [
     "DeviceMemoryMonitor",
     "get_physical_device_indices",
+    "pick_least_used_device_indices",
     "run_post_test_cleanup",
     "run_pre_test_cleanup",
     "wait_for_gpu_memory_to_clear",

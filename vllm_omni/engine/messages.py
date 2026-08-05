@@ -6,7 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -24,7 +24,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     final_stage_id: int
     preprocess_ms: float
+    request_timestamp: float
     enqueue_ts: float
+    final_output_stage_ids: list[int] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -42,6 +44,12 @@ class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     request_ids: list[str]
 
 
+class InteractionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["interaction"] = "interaction"
+    request_id: str
+    interaction: OmniInteractionPrompt
+
+
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc"] = "collective_rpc"
     rpc_id: str
@@ -56,18 +64,34 @@ class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["shutdown"] = "shutdown"
 
 
+class RegisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["register_remote_replica"] = "register_remote_replica"
+    stage_id: int
+    replica_id: int
+
+
+class UnregisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["unregister_remote_replica"] = "unregister_remote_replica"
+    stage_id: int
+    input_addr: str
+
+
 class ErrorMessage(EngineQueueMessage, kw_only=True):
     type: Literal["error"] = "error"
     error: str
+    status_code: int | None = None
+    error_type: str | None = None
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
+    event_id: str | None = None  # for interactions on diffusion generation requests
 
 
 class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     engine_outputs: OmniRequestOutput
     metrics: StageRequestMetrics | None = None
     finished: bool
@@ -78,6 +102,7 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     type: Literal["stage_metrics"] = "stage_metrics"
     request_id: str
     stage_id: int
+    replica_id: int | None = None
     metrics: StageRequestMetrics
     stage_submit_ts: float | None = None
 
@@ -88,3 +113,7 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     method: str
     stage_ids: list[int]
     results: list[object]
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("collective", self.rpc_id)

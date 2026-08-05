@@ -15,13 +15,16 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
+| IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | compat only, non-chunk | uploaded audio voice only; no presets | — |
+| Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
-| OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
+| OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
-| VoxCPM | `openbmb/VoxCPM-0.5B` | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
+| SoulX-Singer | `Soul-AILab/SoulX-Singer` | ✓ (prompt audio) | — (batch only) | — (prompt + target audio) | — (chat client) |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
@@ -33,7 +36,7 @@ Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization
 vllm serve <hf-repo-or-local-path> --omni --port 8091
 ```
 
-Send a TTS request via curl:
+Send a TTS request via curl. These generic snippets assume a model with a preset/default voice; voice-cloning-only models such as IndexTTS-2 require `ref_audio` or an uploaded audio `voice` (see model-specific sections below).
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -76,7 +79,7 @@ response = client.audio.speech.create(
 response.stream_to_file("output.wav")
 ```
 
-Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
+Streaming PCM output (where supported) — set `stream=true`, `stream_format="audio"`, and `response_format="pcm"`:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -85,13 +88,87 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Hello, how are you?",
         "voice": "default",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## GLM-TTS
+
+2-stage TTS (AR + DiT flow-matching) at 24 kHz. Every request requires `ref_audio` + `ref_text`.
+
+### Launch
+```bash
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+# or:
+bash examples/online_serving/text_to_speech/glm_tts/run_server.sh /path/to/GLM-TTS
+```
+
+### Sending requests
+```bash
+# Voice cloning (required)
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "你好，这是语音克隆测试。" \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "这是参考音频的文本内容。"
+
+# Custom format
+python examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py \
+    --text "Hello, this is a voice cloning test." \
+    --ref-audio file:///path/to/ref.wav \
+    --ref-text "Transcript of the reference audio." \
+    --response-format mp3 -o output.mp3
+```
+
+### Gradio demo
+```bash
+bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
+```
+
+### Notes
+- Output: 24 kHz mono WAV via HiFT vocoder.
+- `ref_audio` + `ref_text` are **required** together on every request. Reference audio should be 3-10 seconds.
+- Voice cloning feature extraction (WhisperVQ, CampPlus, mel) runs on the model side — no external dependency on the serving layer.
+
+---
+
+## IndexTTS-2
+
+2-stage TTS (GPT AR + S2Mel CFM DiT + BigVGAN) at 22.05 kHz. Requests use `ref_audio` for voice cloning, or an uploaded audio `voice` from `/v1/audio/voices`. Supports emotion conditioning via `emo_audio`, `emo_text`, or `emo_vector` passed in `extra_params`.
+
+### Launch
+```bash
+vllm serve IndexTeam/IndexTTS-2 --omni --trust-remote-code --port 8092
+# or, to pass the bundled deploy config explicitly:
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+```
+
+### Sending requests
+```bash
+# Voice cloning (ref_audio required)
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "你好，世界！" \
+    --ref-audio /path/to/reference.wav
+
+# With emotion audio
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --text "今天心情很好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-audio /path/to/happy.wav
+```
+
+### Notes
+- Output: 22.05 kHz mono WAV.
+- Provide `ref_audio` on the documented raw request path, or pass `voice` only when it names an uploaded audio voice; IndexTTS-2 does not provide a built-in text-only preset voice.
+- Emotion params (`emo_audio`, `emo_text`, `emo_vector`, `emo_alpha`, `use_emo_text`, `use_random`) are passed via the `extra_params` field. Official precedence is `use_emo_text` > `emo_vector` > `emo_audio` > same emotion as the speaker reference.
+- `stream=true` is accepted as an OpenAI-compatible response path, but IndexTTS-2 is not async-chunk streaming; audio is produced after S2Mel receives the full mel-code sequence.
+- Deploy config: `vllm_omni/deploy/indextts2.yaml` (auto-loaded).
 
 ---
 
@@ -102,6 +179,26 @@ For full request-shape documentation (all parameters, response formats, error co
 ### Prerequisites
 ```bash
 pip install fish-speech
+```
+
+### Kvcache attention fast path
+
+Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
+default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
+`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
+installed.
+
+```bash
+# Verify fast path availability.
+python - <<'PY'
+from vllm_omni.attention import fish_kvcache_attn
+
+print(fish_kvcache_attn.is_available())
+print(fish_kvcache_attn.load_error())
+PY
+
+# Optional: disable the runtime fast path.
+export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 ```
 
 ### Launch
@@ -140,6 +237,51 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## Ming-omni-tts
+
+Dense 0.5B two-stage TTS served through `/v1/audio/speech`. Ming uses the standard speech endpoint plus structured controls in `instructions`, `voice`, `language`, `ref_audio`, `ref_text`, and `speaker_embedding`.
+
+### Launch
+```bash
+bash examples/online_serving/text_to_speech/ming_tts/run_server.sh
+```
+Equivalent manual command:
+```bash
+vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --host 0.0.0.0 --port 8091 \
+    --enforce-eager --omni
+```
+
+### Sending requests
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "你好，这是 Ming 在线语音合成测试。"
+```
+
+Structured dialect control:
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "我觉得社会企业同个人都有责任" \
+    --instruction-json '{"方言":"广粤话"}' \
+    --ref-audio /path/to/yue_prompt.wav
+```
+
+Zero-shot cloning:
+```bash
+python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
+    --text "我们的愿景是构建未来服务业的数字化基础设施，为世界带来更多微小而美好的改变。" \
+    --ref-audio /path/to/10002287-00000094.wav \
+    --ref-text "在此奉劝大家别乱打美白针。"
+```
+
+### Notes
+- `run_curl.sh` keeps a small sanity subset; use the Ming README for the broader request cookbook.
+- Online serving is speech-shaped today; music-only `bgm` and text-to-audio `tta` remain offline examples.
+- Full request details live in [`ming_tts/README.md`](ming_tts/README.md).
 
 ---
 
@@ -194,7 +336,7 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
 # or:
 ./moss_tts_nano/run_server.sh
 ```
-The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no `--stage-configs-path`, `--trust-remote-code`, or `--enforce-eager` flags are needed.
+The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no `--deploy-config`, `--trust-remote-code`, or `--enforce-eager` flags are needed.
 
 ### Sending requests
 ```bash
@@ -222,6 +364,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
         \"stream\": true,
+        \"stream_format\": \"audio\",
         \"response_format\": \"pcm\"
     }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```
@@ -262,16 +405,29 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 ### CLI client
 ```bash
 cd examples/online_serving/text_to_speech/omnivoice
+# Text-only (auto voice)
 python speech_client.py --text "Hello, how are you?"
+
+# Language hint
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+# Voice cloning (reference audio + optional ref_text)
+python speech_client.py \
+--text "Bonjour, comment allez-vous?" \
+--ref-audio /path/to/ref_audio.wav \
+--ref-text "Bonjour, comment allez-vous?"
+
+# Style instruction (voice design-style control)
+python speech_client.py \
+--text "Bonjour, comment allez-vous?" \
+--language French \
+--instructions "loud voice"
+
+# Deterministic output with seed parameter
+python speech_client.py --text "Hello, how are you?" --seed 42
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
 
-### Notes
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](../../offline_inference/text_to_speech/README.md#omnivoice).
-
----
 
 ## Qwen3-TTS
 
@@ -294,10 +450,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh Base
 ```
 
-### Choosing an executor backend (uniproc vs mp)
-Stage configs ship with the chunked-streaming default. To use the uniproc executor (lower IPC overhead for the Base cloning task), pass `--stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml`. See [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) and [#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full investigation.
+### Executor backend
+Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
 
-To opt out of chunked streaming, pass `--no-async-chunk` instead — the pipeline auto-dispatches to the end-to-end codec processor.
+To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
 
 ### Sending requests
 ```bash
@@ -340,6 +496,31 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ```
 Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
 
+### Precomputed custom voices
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+```bash
+python qwen3_tts/precompute_custom_voice.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Original transcript of the reference audio" \
+    --mode icl \
+    --output-dir /path/to/custom_voices
+```
+`--mode icl` stores both `speaker_embedding` and `ref_code`; `--mode xvec` stores only the speaker embedding. Add the output directory to a deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+Then start the server with that config and call the Speech API with only the voice name:
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
+    --output alice.wav
+```
+
 ### Streaming PCM
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -349,17 +530,54 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "vivian",
         "language": "English",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
-Streaming requires `response_format="pcm"` and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
+Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
-The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at sentence boundaries, and emits one PCM stream per sentence:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
 ```
+
+`input.done` flushes without closing, so repeating `--text` synthesizes several utterances over one connection:
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "First utterance." \
+    --text "Second utterance, same connection."
+```
+
+To receive word-level timestamps, launch the server with a forced aligner:
+```bash
+vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --trust-remote-code \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B
+```
+Then request PCM JSON sidecar chunks:
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "Hello world. How are you?" \
+    --stream-audio \
+    --response-format pcm \
+    --word-timestamps
+```
+The client writes one PCM file per sentence and a matching
+`sentence_XXX_timestamps.json` sidecar.
+
+To *see* the alignment instead of reading a JSON sidecar, run the
+word-timestamp Gradio demo (server must be launched with `--forced-aligner`):
+```bash
+python qwen3_tts/word_timestamps_demo.py --api-base http://localhost:8091
+```
+Each sentence's audio plays in an `<audio>` element while its text is rendered
+as inline word spans; the current word highlights as `audio.currentTime`
+crosses each `start_ms`. The **Stop (barge-in)** button cuts playback and
+reports the last-spoken word, useful for the voice-agent barge-in case.
 
 ### Gradio demos
 ```bash
@@ -376,69 +594,8 @@ python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-de
 
 ### Notes
 - Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
+- With async chunking, Qwen3-TTS Base voice cloning sends the full reference context in the first Code2Wav packet, then caches that prefix on the Code2Wav stage for follow-up chunks in the same request.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
-
----
-
-## VoxCPM
-
-Split-stage TTS at 24 kHz.
-
-### Prerequisites
-```bash
-pip install voxcpm
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` lacks HF `model_type`, set up an HF-compatible config dir:
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Launch
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-./voxcpm/run_server.sh                # async-chunk streaming (default)
-./voxcpm/run_server.sh sync           # non-streaming
-```
-Or directly:
-```bash
-vllm serve "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
-    --trust-remote-code --enforce-eager --omni --port 8091
-```
-
-### Sending requests
-```bash
-# Basic TTS
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a VoxCPM online text-to-speech example."
-
-# Voice cloning
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text "The exact transcript spoken in reference.wav."
-
-# Streaming PCM
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a streaming VoxCPM request." \
-    --stream --output voxcpm_stream.pcm
-```
-
-### Notes
-- `voxcpm.yaml` for one-shot decode; `voxcpm_async_chunk.yaml` for single-request streaming. Do not use the async-chunk config for concurrent requests or `/v1/audio/speech/batch`.
-- Generic TTS fields not supported by VoxCPM: `voice`, `instructions`, `language`, `speaker_embedding`, `x_vector_only_mode`.
-- For benchmark measurement, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
 
 ---
 
@@ -464,11 +621,28 @@ python voxcpm2/openai_speech_client.py \
 ```
 The `ref_audio` field accepts local file paths (auto-base64), HTTP URLs, or `data:audio/wav;base64,...` data URIs.
 
+### Precomputed custom voices
+For repeated VoxCPM2 speakers, precompute the prompt cache and load it through `custom_voice_dir`:
+```bash
+python voxcpm2/precompute_custom_voice.py \
+    --model openbmb/VoxCPM2 \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --mode ref_continuation \
+    --prompt-text "Original transcript of the reference audio" \
+    --output-dir /path/to/custom_voices
+```
+Add the output directory to the deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use `voice="alice"` without sending `ref_audio`.
+
 ### Gradio demo (gapless streaming via AudioWorklet)
 ```bash
 python voxcpm2/gradio_demo.py
 ```
-Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Audio is streamed from the OpenAI Speech endpoint with `stream=true`.
+Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Raw PCM audio is streamed from the OpenAI Speech endpoint with `stream=true` and `stream_format="audio"`.
 
 ---
 
@@ -498,3 +672,65 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+
+---
+
+## SoulX-Singer
+
+Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Single-stage DiT with inline preprocess. Uses the `/v1/chat/completions` endpoint with multimodal input (`prompt_audio` + `target_audio`).
+
+### Prerequisites
+
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories and install dependencies as described in the [offline README](../../offline_inference/text_to_speech/README.md#soulx-singer). `config.json` `architectures` field is the single source of truth for SVS vs SVC — point `MODEL` at the matching directory.
+
+### Launch
+
+```bash
+# SVS (default)
+export MODEL=/path/to/SoulX-Singer
+export PREPROCESS=/path/to/SoulX-Singer-Preprocess
+bash examples/online_serving/text_to_speech/soulxsinger/run_server.sh
+
+# SVC
+export MODE=svc
+export MODEL=/path/to/SoulX-Singer-svc
+bash examples/online_serving/text_to_speech/soulxsinger/run_server.sh
+```
+
+Or equivalently, set `SOULX_PREPROCESS_WEIGHTS_DIR` and launch directly:
+```bash
+export SOULX_PREPROCESS_WEIGHTS_DIR=$PREPROCESS
+vllm serve $MODEL --omni \
+    --deploy-config vllm_omni/deploy/soulxsinger_${MODE}.yaml \
+    --port 8192 --trust-remote-code --enforce-eager
+```
+
+### Sending requests
+
+Audio paths must be reachable from the server host (local filesystem or data URL). The client sends prompt vocal via `input_audio` and target accompaniment via `extra_args['target_audio']`.
+
+```bash
+# Default demo audio: tests/assets/soulxsinger/zh_prompt.mp3 + music.mp3
+python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py \
+    --prompt-audio /path/on/server/zh_prompt.mp3 \
+    --target-audio /path/on/server/music.mp3 \
+    --preprocess-weights-dir /path/on/server/SoulX-Singer-Preprocess \
+    -o output.wav
+```
+
+Use precomputed metadata to skip online preprocess with following command:
+```bash
+python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py \
+    --prompt-metadata-path /path/on/server/zh_prompt.json \
+    --target-metadata-path /path/on/server/music.json \
+    --audio-path /path/on/server/zh_prompt.mp3 \
+    -o output.wav
+```
+
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. See `openai_chat_client.py --help` for `--vocal-sep`, `--language`, `--num-inference-steps`, `--guidance-scale`, and `--seed`.
+
+### Notes
+
+- Output: 24 kHz mono WAV; batch only.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
+- SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.

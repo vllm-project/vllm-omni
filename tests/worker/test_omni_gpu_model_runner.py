@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -22,6 +22,7 @@ class DummyInputBatch:
 
     def __init__(self, req_ids):
         self.req_ids = req_ids
+        self.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
 
 class DummyReqState:
@@ -80,6 +81,7 @@ class CaptureTalkerMTP(torch.nn.Module):
         top_k=None,
         top_p=None,
         generator=None,
+        generators=None,
     ):
         self.calls.append(
             {
@@ -89,16 +91,49 @@ class CaptureTalkerMTP(torch.nn.Module):
                 "top_k": top_k,
                 "top_p": top_p,
                 "generator": generator,
+                "generators": generators,
             }
         )
         codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
         return req_embeds, codes
 
 
+class StrictMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        raise NotImplementedError
+
+
+class FlexibleMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features=None, **kwargs):
+        raise NotImplementedError
+
+
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     """A no-op context manager to replace vLLM forward context in CPU tests."""
     yield
+
+
+def test_filter_mrope_kwargs_for_strict_model_signature():
+    kwargs = {
+        "mm_features": ["audio"],
+        "hf_config": object(),
+        "image_grid_thw": [],
+    }
+
+    assert _filter_mrope_kwargs_for_model(StrictMRoPEModel(), kwargs) == {
+        "mm_features": ["audio"],
+    }
+
+
+def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
+    kwargs = {
+        "mm_features": ["video"],
+        "hf_config": object(),
+        "video_grid_thw": [[1, 2, 3]],
+    }
+
+    assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
@@ -161,11 +196,10 @@ def _make_runner_for_mimo(req_id="r_mimo"):
 
 
 def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
-    # Patch the module-level `set_forward_context` symbol used inside
-    # OmniGPUModelRunner._talker_mtp_forward.
+    # `_talker_mtp_forward` dispatches through the active platform.
     import vllm_omni.worker.gpu_model_runner as mod  # Must be the same module that defines OmniGPUModelRunner
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
 
@@ -199,7 +233,7 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
@@ -215,7 +249,7 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(seed=42)
@@ -237,12 +271,12 @@ def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker
 def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=42,
-        extra_args={"qwen3_tts_request_seed": 42},
+        extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(
@@ -273,6 +307,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
             "top_k": 9,
             "top_p": 0.55,
             "generator": runner.talker_mtp.calls[0]["generator"],
+            "generators": None,
         }
     ]
     assert runner.talker_mtp.calls[0]["generator"] is not None
@@ -281,16 +316,16 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
 def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=11,
-        extra_args={"qwen3_tts_request_seed": 11},
+        extra_args={"tts_local_seed": 11},
     )
     runner.requests["r2"].sampling_params = SimpleNamespace(
         seed=22,
-        extra_args={"qwen3_tts_request_seed": 22},
+        extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
@@ -317,12 +352,63 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     assert torch.equal(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
 
 
+def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypatch):
+    """Models with talker_mtp_accepts_per_row_generators get one batched call (#4883)."""
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"tts_local_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=True,
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    # One batched call with distinct per-row generators, not two scalar calls.
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    row_generators = runner.talker_mtp.calls[0]["generators"]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert len(row_generators) == 2
+    assert all(generator is not None for generator in row_generators)
+    assert row_generators[0] is not row_generators[1]
+
+    # The per-request generator stream persists across steps...
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+    assert runner.talker_mtp.calls[1]["generators"][0] is row_generators[0]
+    assert runner.talker_mtp.calls[1]["generators"][1] is row_generators[1]
+
+    # ...and is evicted once its request finishes.
+    del runner.requests["r2"]
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
+    assert set(runner._talker_mtp_generators) == {"r1"}
+    assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
+
+
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
     """Validate that _update_intermediate_buffer writes to model_intermediate_buffer
     (forward path) and mirrors to additional_information_cpu setattr (backward compat)."""
     import vllm_omni.worker.gpu_model_runner as mod
 
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
@@ -354,6 +440,33 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_additional_information_deserializes_new_request_payload():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    conditioning = {
+        "tts_token_ids": torch.tensor([1, 2]),
+        "tts_hidden_states": torch.ones(2, 4),
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="r1",
+                additional_information=serialize_additional_information(conditioning),
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(),
+    )
+
+    OmniGPUModelRunner._update_additional_information(runner, scheduler_output)
+
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["tts_token_ids"], conditioning["tts_token_ids"])
+    assert torch.equal(
+        runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
+        conditioning["tts_hidden_states"],
+    )
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
@@ -372,44 +485,54 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     assert "unknown_req" not in runner.model_intermediate_buffer
 
 
-def test_maybe_run_batch_preprocess_calls_model_hook():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model_intermediate_buffer = {"r1": {"text": ["hello"]}}
-    calls = []
+def test_streaming_input_update_merges_model_intermediate_buffer():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_intermediate_buffer["r1"] = {
+        "duplex": {
+            "session_id": "sid",
+            "seq": 1,
+        }
+    }
+    runner.requests["r1"].additional_information_cpu = runner.model_intermediate_buffer["r1"]
+    new_req_data = SimpleNamespace(
+        model_intermediate_buffer={
+            "duplex": {
+                "session_id": "sid",
+                "seq": 2,
+                "payload": {"type": "audio"},
+            }
+        },
+        additional_information=None,
+    )
 
-    class DummyModel:
-        def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device):
-            calls.append((req_ids, model_intermediate_buffer, device))
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req_data, "r1")
 
-    runner.model = DummyModel()
-
-    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
-
-    assert calls == [(["r1"], runner.model_intermediate_buffer, torch.device("cpu"))]
-
-
-def test_maybe_run_batch_preprocess_skips_missing_hook():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model_intermediate_buffer = {}
-    runner.model = object()
-
-    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
+    info = runner.model_intermediate_buffer["r1"]
+    assert info["duplex"]["session_id"] == "sid"
+    assert info["duplex"]["seq"] == 2
+    assert info["duplex"]["payload"] == {"type": "audio"}
+    assert runner.requests["r1"].additional_information_cpu is info
 
 
 def _make_full_payload_accumulation_runner(
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     model_stage="talker",
     async_chunk=False,
+    final_output=False,
+    custom_process_next_stage_input_func="module.full_payload",
 ):
     runner = object.__new__(OmniConnectorModelRunnerMixin)
     runner.model_config = SimpleNamespace(
         model_arch=model_arch,
         model_stage=model_stage,
         async_chunk=async_chunk,
+        final_output=final_output,
+        custom_process_next_stage_input_func=custom_process_next_stage_input_func,
     )
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
     runner._stage_id = 1
+    runner._omni_connector = object()
     return runner
 
 
@@ -474,16 +597,23 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(model_stage="code2wav")._should_accumulate_full_payload_output()
+    assert not _make_full_payload_accumulation_runner(
+        model_stage="code2wav", final_output=True
+    )._should_accumulate_full_payload_output()
+    assert not _make_full_payload_accumulation_runner(
+        model_stage="token2audio",
+        custom_process_next_stage_input_func=None,
+    )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="talker", async_chunk=True
     )._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_arch="Qwen3TTSForConditionalGeneration"
-    )._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_arch="Qwen2_5OmniForConditionalGeneration"
-    )._should_accumulate_full_payload_output()
+    for model_arch in (
+        "Qwen3TTSForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
+    ):
+        runner = _make_full_payload_accumulation_runner(model_arch=model_arch)
+        runner._custom_process_func = None
+        assert not runner._should_accumulate_full_payload_output()
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():

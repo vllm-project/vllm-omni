@@ -4,15 +4,23 @@
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk, text2flow
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+    talker2code2wav_async_chunk,
+    text2flow_full_payload,
+    text2flow_token_only,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict):
+def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_ids,
+        finished=finished,
         outputs=[SimpleNamespace(token_ids=out_ids, cumulative_token_ids=out_ids, multimodal_output=mm)],
     )
 
@@ -43,19 +51,73 @@ def _transfer_manager(
     )
 
 
-def test_text2flow_supports_batched_source_outputs():
+def test_text2flow_token_only_supports_batched_source_outputs():
     source_outputs = [
-        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
-        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
+        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
+        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[6, 7]])}),
     ]
 
-    outputs = text2flow(source_outputs=source_outputs, prompt=None)
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
     assert outputs[1]["prompt_token_ids"] == [4, 5]
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
     assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
+
+
+def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids():
+    source_outputs = [
+        _source_output(
+            "req-strip",
+            [10, 11],
+            [4, 5, 1, 2, 3],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert len(outputs) == 1
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
+    assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
+
+
+def test_text2flow_token_only_does_not_mark_prompt_trim():
+    # The talker prompt is wrapped with the CosyVoice3 instruction template in
+    # _build_cosyvoice3_prompt, so the talker emits target-only speech and no
+    # prompt-trim offset is required; the flow stage trims prompt_feat itself
+    # (issue #4644). Confirm no talker_prefill_offset is set.
+    source_outputs = [
+        _source_output(
+            "req-stop",
+            [10, 11],
+            [4, 5, 1, 2, 6562],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
+    meta = outputs[0]["additional_information"].get("meta") or {}
+    assert "talker_prefill_offset" not in meta
+
+
+def test_text2flow_full_payload_does_not_send_codec_ids():
+    payload = text2flow_full_payload(
+        None,
+        {
+            "embed.speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+            "codes.audio": torch.tensor([7, 8, 9], dtype=torch.long),
+        },
+        SimpleNamespace(),
+    )
+
+    assert payload is not None
+    assert "codes" not in payload
+    assert "next_stage_prompt_len" not in payload["meta"]
+    assert torch.equal(payload["embed"]["speech_token"], torch.tensor([[1, 2]], dtype=torch.long))
 
 
 def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
@@ -75,7 +137,7 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -102,7 +164,7 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -123,13 +185,13 @@ def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
 
     payload1 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload2 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -151,14 +213,14 @@ def test_talker2code2wav_async_chunk_waits_for_prelookahead_and_emits_cumulative
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [1, 2, 3]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -181,14 +243,14 @@ def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [3, 4, 5, 6]
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -216,14 +278,14 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [8, 9, 10, 11]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -245,13 +307,13 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )

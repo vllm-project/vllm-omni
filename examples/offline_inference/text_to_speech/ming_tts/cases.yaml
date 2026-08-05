@@ -1,0 +1,110 @@
+style:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "我会一直在这里陪着你，直到你慢慢、慢慢地沉入那个最温柔的梦里……好吗？"
+  instruction:
+    风格: >-
+      这是一种ASMR耳语，属于一种旨在引发特殊感官体验的创意风格。这个女性使用轻柔的普通话进行耳语，声音气音成分重。音量极低，紧贴麦克风，语速极慢，旨在制造触发听者颅内快感的声学刺激。
+  use_zero_spk_emb: true
+  max_decode_steps: 200
+
+ip:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "这款产品的名字，叫变态坑爹牛肉丸。"
+  instruction:
+    IP: "灵小甄"
+  use_zero_spk_emb: true
+  max_decode_steps: 200
+
+bgm:
+  prompt: "Please generate music based on the following description.\n"
+  text: " Genre: 电子舞曲. Mood: 自信 / 坚定. Instrument: 架子鼓. Theme: 节日. Duration: 30s."
+  instruction: null
+  use_zero_spk_emb: false
+  max_decode_steps: 400
+
+tta:
+  prompt: "Please generate audio events based on given text.\n"
+  text: "Thunder and a gentle rain"
+  instruction: null
+  use_zero_spk_emb: false
+  max_decode_steps: 200
+  cfg: 4.5
+  sigma: 0.3
+  temperature: 2.5
+
+emotion:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "我竟然抢到了陈奕迅的演唱会门票！太棒了！终于可以现场听一听他的歌声了！"
+  instruction:
+    情感: "高兴"
+  requires_ref_audio: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+basic:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "简单地说，这相当于惠普把消费领域市场拱手相让了。"
+  instruction:
+    语速: "快速"
+    基频: "中"
+    音量: "中"
+  requires_ref_audio: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+dialect:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "我觉得社会企业同个人都有责任"
+  instruction:
+    方言: "广粤话"
+  requires_ref_audio: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+zero_shot:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "我们的愿景是构建未来服务业的数字化基础设施，为世界带来更多微小而美好的改变。"
+  instruction: null
+  requires_ref_audio: true
+  requires_ref_text: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+podcast:
+  prompt: "Please generate speech based on the following description.\n"
+  text: " speaker_1:你可以说一下，就大概说一下，可能虽然我也不知道，我看过那部电影没有。\n speaker_2:就是那个叫什么，变相一节课的嘛。\n speaker_1:嗯。\n speaker_2:一部搞笑的电影。\n speaker_1:一部搞笑的。\n"
+  instruction: null
+  prompt_text: " speaker_1:并且我们还要进行每个月还要考核 笔试的话还要进行笔试，做个，当服务员还要去笔试了\n speaker_2:对啊，这真的很奇怪，就是 单纯的因，单纯自己工资不高，只是因为可能人家那个店比较出名一点，就对你苛刻要求\n"
+  requires_ref_audio_count: 2
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+speech_bgm:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "此次业绩下滑原因，可归结为企业停止服务某些品牌，而带来的负面影响。"
+  instruction:
+    BGM:
+      Genre: "当代古典音乐."
+      Mood: "温暖 / 友善."
+      Instrument: "电吉他"
+      Theme: "节日."
+      SNR: 10.0
+      ENV: null
+  requires_ref_audio: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200
+
+speech_sound:
+  prompt: "Please generate speech based on the following description.\n"
+  text: "此次业绩下滑原因，可归结为企业停止服务某些品牌，而带来的负面影响。"
+  instruction:
+    BGM:
+      ENV: "Birds chirping"
+      SNR: 10.0
+      Genre: null
+      Mood: null
+      Instrument: null
+      Theme: null
+  requires_ref_audio: true
+  auto_extract_speaker_embeddings: true
+  max_decode_steps: 200

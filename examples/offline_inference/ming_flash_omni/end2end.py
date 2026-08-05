@@ -17,14 +17,13 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 # Imports the processor also registers itself
 from vllm_omni.transformers_utils.processors.ming import MingFlashOmniProcessor  # noqa: F401
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
 MODEL_NAME = "Jonathan1909/Ming-flash-omni-2.0"
@@ -397,7 +396,7 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Ming-flash-omni 2.0 offline inference example")
+    parser = TrackingArgumentParser(description="Ming-flash-omni 2.0 offline inference example")
     parser.add_argument(
         "--query-type",
         "-q",
@@ -496,7 +495,6 @@ def parse_args():
         help="Output directory for results.",
     )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

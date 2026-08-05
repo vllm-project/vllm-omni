@@ -1,11 +1,15 @@
 import pytest
+import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -63,6 +67,76 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     output_processor.add_request.assert_not_called()
 
 
+def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    output_processor = mocker.Mock()
+    engine.output_processors = [output_processor]
+
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    prompt = {
+        "prompt_token_ids": [1, 1, 1],
+        "model_intermediate_buffer": {
+            "ids": {"tts": [11, 12]},
+            "hidden_states": {"tts": hidden},
+        },
+    }
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    request = msg.prompt
+    assert isinstance(request, OmniEngineCoreRequest)
+    assert request.additional_information is not None
+    assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
+    assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
+    assert isinstance(request.model_intermediate_buffer, dict)
+    info = request.model_intermediate_buffer
+    assert info["ids"]["tts"] == [11, 12]
+    assert torch.equal(info["hidden_states"]["tts"], hidden)
+
+
+def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    engine._enqueue_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    message = engine.request_queue.sync_q.put.call_args.args[0]
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert metadata["omni_final_stage_id"] == 0
+    assert metadata["omni_force_kv_transfer"] is True
+
+
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
@@ -94,6 +168,44 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
 class _FakeStageClient:
     stage_type = "llm"
     final_output = False
+
+    def __init__(self, input_address: str | None = None):
+        if input_address is not None:
+            self.client_addresses = {"input_address": input_address}
+
+
+class _FakeHub:
+    def __init__(self, replicas: list[ReplicaInfo]):
+        self._replicas = replicas
+
+    def get_replicas_for_stage(self, stage_id: int):
+        return type(
+            "ReplicaList",
+            (),
+            {"replicas": [rep for rep in self._replicas if rep.stage_id == stage_id]},
+        )()
+
+
+class _RoundRobinLB:
+    def __init__(self):
+        self._next = 0
+
+    def select(self, task, replicas):  # noqa: ARG002
+        idx = self._next % len(replicas)
+        self._next += 1
+        return idx
+
+
+def _replica(input_addr: str) -> ReplicaInfo:
+    return ReplicaInfo(
+        input_addr=input_addr,
+        output_addr=input_addr.replace("input", "output"),
+        stage_id=0,
+        status=ReplicaStatus.UP,
+        queue_length=0,
+        last_heartbeat=0.0,
+        registered_at=0.0,
+    )
 
 
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
@@ -130,6 +242,93 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
+
+
+@pytest.mark.asyncio
+async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_replica(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+
+    addr0 = "tcp://host-a:1000/input"
+    addr1 = "tcp://host-b:1000/input"
+    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool.attach_hub(_FakeHub([_replica(addr0), _replica(addr1)]))
+    stage_pool.attach_load_balancer(_RoundRobinLB())
+    engine.stage_pools = [stage_pool]
+
+    seen_uuids: list[str] = []
+
+    def process_inputs(**kwargs):
+        prompt = kwargs["prompt"]
+        seen_uuids.append(prompt["multi_modal_uuids"]["image"][0])
+        return _make_engine_core_request(kwargs["request_id"])
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.side_effect = process_inputs
+    engine.input_processor = input_processor
+
+    for request_id in ("req-1", "req-2"):
+        engine._build_add_request_message(
+            request_id=request_id,
+            prompt={
+                "prompt": "describe",
+                "multi_modal_data": {"image": "same-image"},
+            },
+            sampling_params_list=[params],
+            final_stage_id=0,
+        )
+
+    assert seen_uuids[0].startswith("stage0:rep0:")
+    assert seen_uuids[1].startswith("stage0:rep1:")
+    assert stage_pool.get_bound_replica_id("req-1") == 0
+    assert stage_pool.get_bound_replica_id("req-2") == 1
+    assert await stage_pool.pick("req-1") == 0
+    assert await stage_pool.pick("req-2") == 1
+
+
+def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+
+    addr0 = "tcp://host-a:1000/input"
+    addr1 = "tcp://host-b:1000/input"
+    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool.attach_hub(_FakeHub([]))
+    stage_pool.attach_load_balancer(_RoundRobinLB())
+    engine.stage_pools = [stage_pool]
+
+    seen_prompt: dict | None = None
+
+    def process_inputs(**kwargs):
+        nonlocal seen_prompt
+        seen_prompt = kwargs["prompt"]
+        return _make_engine_core_request(kwargs["request_id"])
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.side_effect = process_inputs
+    engine.input_processor = input_processor
+
+    engine._build_add_request_message(
+        request_id="req-no-replica",
+        prompt={
+            "prompt": "describe",
+            "multi_modal_data": {"image": "same-image"},
+        },
+        sampling_params_list=[params],
+        final_stage_id=0,
+    )
+
+    assert seen_prompt is not None
+    assert "multi_modal_uuids" not in seen_prompt
+    assert stage_pool.get_bound_replica_id("req-no-replica") is None
 
 
 def test_stage_pool_replica_count_falls_back_to_clients():

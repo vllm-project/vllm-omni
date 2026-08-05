@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import re
 import textwrap
@@ -13,10 +14,19 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.model_extras import (
+    build_text_to_image_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -33,14 +43,18 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,7 +73,16 @@ def parse_args() -> argparse.Namespace:
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a YAML file containing stage configurations for Omni.",
+        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a deploy YAML (new pipeline/stages format). Required for multi-stage "
+            "text-to-image pipelines whose deploy config is not auto-loaded."
+        ),
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -161,7 +184,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -194,16 +222,11 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "int8", "gguf"],
+        choices=["fp8", "int8", "bitsandbytes"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), "
+        "'int8' (Int8 W8A8), 'bitsandbytes' (NF4 4-bit weight-only, CUDA SM 75+). "
         "Default: None (no quantization, uses BF16).",
-    )
-    parser.add_argument(
-        "--gguf-model",
-        type=str,
-        default=None,
-        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -227,8 +250,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help=(
+            "Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default of 1) wins. "
+            "Passing it always overrides the deploy YAML."
+        ),
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -314,6 +342,19 @@ def parse_args() -> argparse.Namespace:
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
     )
     parser.add_argument(
+        "--extra-body",
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
+        default=None,
+        help=(
+            "Model-specific generation params as a JSON object, e.g. "
+            '\'{"timestep_shift": 3.0, "cfg_text_scale": 4.0, "cfg_interval": [0.4, 1.0]}\'. '
+            "Each key is filtered against the model's declared extra_body_params "
+            "(see vllm_omni/model_extras), so unknown keys for the chosen model are "
+            "silently dropped. Values here take precedence over the equivalent "
+            "model-specific flags above."
+        ),
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
@@ -354,10 +395,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=("Custom system prompt. Used when --use-system-prompt is custom. "),
     )
+    parser.add_argument(
+        "--auxiliary-text-encoder",
+        type=str,
+        default=None,
+        help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
+    )
     current_omni_platform.pre_register_and_update(parser)
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -635,14 +679,7 @@ def main():
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization == "gguf":
-        if not args.gguf_model:
-            raise ValueError("--gguf-model is required when --quantization gguf is set.")
-        quant_kwargs["quantization_config"] = {
-            "method": "gguf",
-            "gguf_model": args.gguf_model,
-        }
-    elif args.quantization and ignored_layers:
+    if args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -662,10 +699,8 @@ def main():
         "ring_degree": args.ring_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
-        "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
@@ -673,15 +708,28 @@ def main():
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
+        "auxiliary_text_encoder": args.auxiliary_text_encoder,
         **lora_args,
         **quant_kwargs,
     }
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.stage_configs_path:
         omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni)
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -696,8 +744,9 @@ def main():
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
+    tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
     print(
-        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
@@ -718,19 +767,40 @@ def main():
         print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
 
-    extra_args = {
+    # Base layer: backward-compatible model-specific flags. New model params should
+    # instead be declared in vllm_omni/model_extras and passed via --extra-body, so
+    # this dict does not need to grow per-model.
+    user_extra = {
+        "cfg_scale": args.cfg_scale,
+        "cfg_text_scale": args.cfg_scale,
+        "negative_prompt": args.negative_prompt,
+        "timestep_shift": args.timesteps_shift,
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
         "use_system_prompt": args.use_system_prompt,
         "system_prompt": args.system_prompt,
     }
+    # Override layer: generic JSON passthrough wins over the flags above. Keys are
+    # still filtered against the model's declared extra_body_params downstream.
+    if args.extra_body:
+        user_extra.update(args.extra_body)
+
+    init_non_diffusion = should_init_extra_args_for_non_diffusion_stages(model_class_name)
 
     def _run_cell(prompt: str, cell: dict) -> list[Any]:
         gen = torch.Generator(device=current_omni_platform.device_type).manual_seed(cell["seed"])
-        sp = OmniDiffusionSamplingParams(
+        prompt_dict = build_text_to_image_prompt(
+            model_class_name=model_class_name,
+            prompt=prompt,
+            negative_prompt=args.negative_prompt,
             height=args.height,
             width=args.width,
+        )
+        diffusion_params = OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            seed=cell["seed"],
             generator=gen,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=cell["guidance_scale"],
@@ -739,15 +809,63 @@ def main():
             num_outputs_per_prompt=args.num_images_per_prompt,
             lora_requests=lora_requests if lora_is_per_request else [],
             lora_scales=cell["lora_scales"] if lora_is_per_request else [],
-            extra_args=extra_args,
         )
-        outs = omni.generate([{"prompt": prompt, "negative_prompt": args.negative_prompt}], sp)
-        if not outs or not getattr(outs[0], "request_output", None):
-            raise ValueError("Generate returned no request_output")
-        imgs = outs[0].request_output.images
-        if not imgs:
-            raise ValueError("Empty image list from generate")
-        return imgs
+        if declared_extra_body_params:
+            apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
+        else:
+            diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
+
+        # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
+        # or wrap single diffusion params for single-stage models.
+        defaults = list(omni.default_sampling_params_list or [])
+        sampling_params_list = [clone_sampling_params(p) for p in defaults]
+        if not sampling_params_list:
+            sampling_params_list = [diffusion_params]
+
+        diffusion_replaced = False
+        for idx, params in enumerate(sampling_params_list):
+            if isinstance(params, OmniDiffusionSamplingParams):
+                sampling_params_list[idx] = diffusion_params
+                diffusion_replaced = True
+            elif init_non_diffusion and hasattr(params, "extra_args"):
+                if params.extra_args is None:
+                    params.extra_args = {}
+                params.extra_args.update(diffusion_params.extra_args or {})
+                if cell["seed"] is not None and hasattr(params, "seed"):
+                    params.seed = cell["seed"]
+
+                # MammothModa2's AR stage emits one visual token per grid cell,
+                # one EOL token per row, and one final look-ahead token whose hidden
+                # state is unavailable. Size the first stage from the prompt metadata
+                # instead of SamplingParams' default of 16 tokens.
+                prompt_info = prompt_dict.get("additional_information", {})
+                if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
+                    ar_width = int(prompt_info.get("ar_width", [0])[0])
+                    ar_height = int(prompt_info.get("ar_height", [0])[0])
+                    if ar_width > 0 and ar_height > 0:
+                        params.max_tokens = ar_height * (ar_width + 1) + 1
+
+        if not diffusion_replaced and len(sampling_params_list) == 1:
+            sampling_params_list = [diffusion_params]
+
+        outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+
+        images = None
+        for output in outputs:
+            images = getattr(output, "images", None)
+            if images:
+                break
+            req_out = getattr(output, "request_output", None)
+            images = getattr(req_out, "images", None) if req_out is not None else None
+            if images:
+                break
+
+        if not images:
+            images = extract_images_from_outputs(outputs)
+
+        if not images:
+            raise ValueError("No images found in request_output")
+        return images
 
     defaults = {
         "prompt": prompts[0],
@@ -856,8 +974,15 @@ def main():
         only_images = next(iter(cell_images.values()))
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        only_images[0].save(output_path)
-        print(f"Saved generated image to {output_path}")
+        suffix = output_path.suffix or ".png"
+        if len(only_images) == 1:
+            only_images[0].save(output_path)
+            print(f"Saved generated image to {output_path}")
+        else:
+            for n_idx, img in enumerate(only_images):
+                save_path = output_path.with_name(f"{output_path.stem}_{n_idx}{suffix}")
+                img.save(save_path)
+                print(f"Saved {save_path}")
 
 
 if __name__ == "__main__":
