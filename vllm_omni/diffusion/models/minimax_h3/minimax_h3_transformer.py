@@ -37,6 +37,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 
 from .fused_ops import (
     fused_qknorm_rope_bf16_,
+    fused_rmsnorm_indexed_scale_shift_bf16,
     fused_rope_bf16_,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
@@ -205,6 +206,26 @@ def _modulate_scale_shift(
     if indexed_scale_shift_bf16_(x, shift, scale, indices):
         return x
     return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(dtype)
+
+
+def _norm_modulate_scale_shift(
+    norm: nn.RMSNorm,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    fused = fused_rmsnorm_indexed_scale_shift_bf16(
+        x,
+        norm.weight,
+        shift,
+        scale,
+        indices,
+        norm.eps,
+    )
+    if fused is not None:
+        return fused
+    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=_BF16_DTYPE)
 
 
 def _modulate_gate(
@@ -1004,8 +1025,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb, preactivated=t_emb_preactivated)
 
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE)
+        h = _norm_modulate_scale_shift(self.norm1, x, shift_msa, scale_msa, combined_indices)
         h = self.attn(
             h,
             rope_freqs=rope_freqs,
@@ -1017,8 +1037,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE)
+        h = _norm_modulate_scale_shift(self.norm2, x, shift_mlp, scale_mlp, combined_indices)
         h = self.mlp(h)
         return _modulate_gate(residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -1075,8 +1094,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         activations, cast to fp32, then apply both output heads to all rows.
         """
         shift, scale = self.adaln_proj(t_emb, preactivated=t_emb_preactivated)
-        h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        h = _norm_modulate_scale_shift(self.norm, x, shift, scale, inverse_indices)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)
