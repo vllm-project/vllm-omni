@@ -88,6 +88,79 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
 
 
+def test_packed_attention_reuses_precomputed_mask():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+        _build_packed_attention_mask,
+    )
+
+    class RecordingAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            del key, value
+            self.metadata = metadata
+            return query
+
+    mask = _build_packed_attention_mask(
+        used_seqlen=3,
+        packed_seqlen=4,
+        device=torch.device("cpu"),
+    )
+    assert mask is not None
+    assert mask.tolist() == [[True, True, True, False]]
+
+    attention = object.__new__(MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    recorder = RecordingAttention()
+    recorder.use_ring = False
+
+    class Backend:
+        supports_prefix_kv_slicing = False
+
+    recorder.attn_backend = Backend()
+    attention.attention = recorder
+    q = torch.randn(4, 2, 3)
+    cu_seqlens = torch.tensor([0, 3, 4], dtype=torch.int32)
+
+    actual = attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        packed_total=4,
+        attn_mask=mask,
+    )
+
+    torch.testing.assert_close(actual, q)
+    assert recorder.metadata.attn_mask is mask
+    assert recorder.metadata.extra == {
+        "cu_seqlens_q": cu_seqlens,
+        "cu_seqlens_k": cu_seqlens,
+        "max_seqlen_q": 3,
+        "max_seqlen_k": 3,
+        "valid_kv_length": 3,
+    }
+
+
+def test_packed_attention_mask_is_omitted_without_padding():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _build_packed_attention_mask,
+    )
+
+    assert (
+        _build_packed_attention_mask(
+            used_seqlen=4,
+            packed_seqlen=4,
+            device=torch.device("cpu"),
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("tp_size", "message"),
     [

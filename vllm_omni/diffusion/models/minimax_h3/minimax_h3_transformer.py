@@ -108,6 +108,18 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
 
+def _build_packed_attention_mask(
+    *,
+    used_seqlen: int,
+    packed_seqlen: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Build H3's padding mask from host-side packed-layout lengths."""
+    if used_seqlen >= packed_seqlen:
+        return None
+    return torch.arange(packed_seqlen, device=device)[None] < used_seqlen
+
+
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
     if key not in kwargs or kwargs[key] is None:
         raise ValueError(f"MiniMaxH3DiTModel.forward requires kwarg {key!r}")
@@ -382,6 +394,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        attn_mask: torch.Tensor | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -399,13 +412,16 @@ class MiniMaxH3Attention(nn.Module):
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
         used = min(max_seqlen, packed_total)
-        attn_mask = None
         # Ring attention can dispatch to a different implementation from the
         # configured backend, so this no-mask fast path is local-only.
         prefix_slice = (
             not getattr(self.attention, "use_ring", False) and self.attention.attn_backend.supports_prefix_kv_slicing
         )
-        if used < packed_total and not prefix_slice:
+        if prefix_slice:
+            attn_mask = None
+        elif used < packed_total and attn_mask is None:
+            # Preserve the direct-attention fallback for callers that have not
+            # precomputed the immutable request mask.
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -433,6 +449,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int | None = None,
+        attn_mask: torch.Tensor | None = None,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -474,6 +491,7 @@ class MiniMaxH3Attention(nn.Module):
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
+            attn_mask=attn_mask,
             video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
@@ -601,12 +619,14 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             rope_freqs=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            attn_mask=attn_mask,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -639,9 +659,15 @@ class MiniMaxH3TokenRefiner(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = block(
+                x,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                attn_mask=attn_mask,
+            )
         return self.final_norm(x)
 
 
@@ -687,6 +713,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        attn_mask: torch.Tensor | None,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -715,6 +742,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             packed_total=packed_total,
+            attn_mask=attn_mask,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
         )
@@ -1060,10 +1088,16 @@ class MiniMaxH3DiTModel(nn.Module):
 
         text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
         text_embed, _ = self.condition_proj(text_rows)
+        refiner_attn_mask = _build_packed_attention_mask(
+            used_seqlen=refiner_max_seqlen,
+            packed_seqlen=int(text_embed.shape[0]),
+            device=device,
+        )
         text_embed = self.token_refiner(
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
+            attn_mask=refiner_attn_mask,
         )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
@@ -1129,6 +1163,11 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
+        attn_mask = _build_packed_attention_mask(
+            used_seqlen=max_seqlen,
+            packed_seqlen=seq_len,
+            device=device,
+        )
         # Compute RoPE frequencies over the full packed sequence.
         rope_freqs = self.rope(img_position_ids).to(device)
 
@@ -1168,6 +1207,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                attn_mask=attn_mask,
                 video_layout=video_layout,
             )
         hidden = self.sp_gather(hidden)
