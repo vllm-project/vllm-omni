@@ -30,7 +30,7 @@ async def _run_single_turn_response_required(
     url: str,
     model: str,
     input_wav: Path,
-    timeout_s: float = 120.0,
+    timeout_s: float = 30.0,
 ) -> dict:
     session_id = f"qwen3-omni-duplex-ci-{uuid.uuid4().hex}"
     ws_url = build_realtime_url(url, model, autostart=False, session_id=session_id)
