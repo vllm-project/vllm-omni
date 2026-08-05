@@ -86,8 +86,34 @@ class TestCacheDiTBackend:
 
         # Verify cache-dit was enabled
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_cache_dit.enable_cache.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_and_refresh_every_declared_dit(self, mock_cache_dit, mock_block_adapter):
+        """Combined pipelines enable and refresh Cache-DiT for every DiT."""
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline._dit_modules = ["transformer", "transformers_ref"]
+        pipeline.transformer = Mock()
+        pipeline.transformers_ref = Mock()
+        for transformer in (pipeline.transformer, pipeline.transformers_ref):
+            transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+                block_forward_patterns={"blocks": ForwardPattern.Pattern_3}
+            )
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=20)
+
+        assert len(backend._refresh_funcs) == 2
+        assert mock_cache_dit.enable_cache.call_count == 2
+        assert mock_cache_dit.refresh_context.call_count == 2
+        assert {call.args[0] for call in mock_cache_dit.refresh_context.call_args_list} == {
+            pipeline.transformer,
+            pipeline.transformers_ref,
+        }
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -106,7 +132,7 @@ class TestCacheDiTBackend:
         backend.enable(pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         assert mock_cache_dit.enable_cache.call_args.args[0] is pipeline.transformer
         mock_logger.info.assert_any_call(
             "Transformer %s does not declare _cache_dit_adapter_config; "
@@ -138,7 +164,7 @@ class TestCacheDiTBackend:
 
         assert isinstance(exc_info.value.__cause__, ValueError)
         assert backend.enabled is False
-        assert backend._refresh_func is None
+        assert backend._refresh_funcs == []
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -245,7 +271,7 @@ class TestCacheDiTBackend:
         backend.enable(mock_pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_block_adapter.assert_called_once()
         adapter_kwargs = mock_block_adapter.call_args.kwargs
         assert adapter_kwargs["transformer"] is mock_pipeline.model
@@ -285,7 +311,7 @@ class TestCacheDiTBackend:
         backend.enable(mock_pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_block_adapter.assert_called_once()
         adapter_kwargs = mock_block_adapter.call_args.kwargs
         assert adapter_kwargs["transformer"] is mock_pipeline.transformer
