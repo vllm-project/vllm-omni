@@ -2426,7 +2426,7 @@ class Bagel(CFGParallelMixin, nn.Module):
 
             batched_sequence = packed_sequence.repeat(num_branches, 1)
             batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
-            batched_position_ids = torch.cat(cfg_branch_pids)
+            batched_position_ids = torch.cat(cfg_branch_pids, dim=1 if cfg_branch_pids[0].ndim == 2 else 0)
             batched_seqlens = packed_seqlens.repeat(num_branches)
             merged_cache = NaiveCache.merge(cfg_branch_caches)
 

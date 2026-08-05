@@ -164,6 +164,42 @@ command with:
 export MODEL="${MODEL_ROOT}/Ref2VA"
 ```
 
+### Online FP8 quantization
+
+MiniMax H3 supports load-time FP8 quantization of the DiT. The checkpoint
+remains BF16 on disk; vLLM-Omni quantizes eligible weights while loading and
+uses dynamic activation scaling during inference. By default, attention and
+MLP linears in the token refiner and main DiT blocks, the condition
+projection, and all AdaLN projections use FP8. Patch, timestep, and final
+projections remain FP32; the text encoder and VAEs are unchanged.
+
+Add this option to an existing H3 server command:
+
+```bash
+--quantization fp8
+```
+
+Use `ignored_layers` to keep any otherwise eligible linear in BF16. H3
+resolves the `transformer` component before constructing the DiT, so names do
+not start with `transformer.`. Entries are exact runtime linear prefixes; a
+parent name such as `blocks.0.attn` does not exclude its children.
+
+Eligible names are the `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, and
+`mlp.fc2` children under `token_refiner.blocks.<0-1>` or `blocks.<0-49>`.
+The other eligible names are `condition_proj`,
+`blocks.<0-49>.adaln_proj.linear`, and `final_layer.adaln_proj.linear`.
+For example, keep the first main block's attention projections in BF16 with:
+
+```bash
+--diffusion-quantization-config \
+  '{"transformer":{"method":"fp8","ignored_layers":["blocks.0.attn.qkv_proj","blocks.0.attn.out_proj"]}}'
+```
+
+The structured option replaces `--quantization fp8`. Online FP8 is currently
+incompatible with H3 layerwise offload because the offload path produces a
+weight stride rejected by the Cutlass FP8 kernel. Use resident FP8 with tensor
+parallelism and VAE tiling instead.
+
 ## HTTP API examples
 
 The following requests use the synchronous endpoint so the returned body can
@@ -310,12 +346,21 @@ throughput guarantee. Multi-video Ref2VA is much slower because the two
 reference videos expand both the Qwen3-VL vision sequence and the packed DiT
 attention sequence.
 
+## Validated FP8 evidence
+
+With eager DiT/text-encoder TP2 and VAE tiling, the 384x672, 107-frame,
+10-step quality case measured LPIPS 0.1156 (limit 0.20), PSNR 23.6316 dB,
+audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
+resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
+reduction.
+
 ## Known limitations
 
 - Each server process loads only one checkpoint partition.
 - H3 currently executes one generation request per diffusion batch.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
+- Online FP8 is not compatible with layerwise offload.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone
   audio reference.

@@ -48,8 +48,8 @@ vllm_omni/deploy/
 ```
 
 New in-tree models should register their `PipelineConfig` in
-`vllm_omni/config/pipeline_registry.py`; use `--stage-configs-path` only for
-custom legacy `stage_args` YAMLs.
+`vllm_omni/config/pipeline_registry.py`; use `--deploy-config` for custom
+deployment YAMLs.
 
 ## Step-by-Step Implementation
 
