@@ -175,28 +175,23 @@ def test_wakeup_engine_not_support(sleep_incapable_engine):
     assert "wake_up" in response.json()["detail"]
 
 
-def test_wakeup_after_level2_sleep_raises_not_implemented(sleep_capable_engine, mocker):
-    """#4473 Repro A message check without changing HTTP error mapping.
+def test_wakeup_route_propagates_not_implemented_error(sleep_capable_engine, mocker):
+    """``/v1/omni/wakeup`` must not swallow ``NotImplementedError`` from the engine.
 
-    Live servers return a generic 500 body for unhandled ``NotImplementedError``.
-    ``TestClient(raise_server_exceptions=True)`` re-raises in-process so we can
-    still assert the engine contract text.
+    Route exception-propagation only: the mock authors the exception on purpose.
+    The real level-2 discarded-weight path and live HTTP 501 mapping are covered by
+    ``test_wakeup_after_level2_sleep_fails``.
     """
-    sleep_capable_engine.wake_up = mocker.AsyncMock(
-        side_effect=NotImplementedError(
-            "wake_up() after sleep(level=2) is not yet implemented: weights were "
-            "discarded from GPU and reloading from disk is not yet supported. "
-            "Use sleep(level=1) instead, which offloads weights to CPU RAM "
-            "and supports fast DMA restore."
-        )
-    )
+    sleep_capable_engine.wake_up = mocker.AsyncMock(side_effect=NotImplementedError("engine wake_up refused"))
     app = _make_app(sleep_capable_engine)
     app.state.sleeping_stages = {0}
+    # Re-raise in-process; default TestClient would wrap this as a 500 response.
     client = TestClient(app, raise_server_exceptions=True)
 
-    with pytest.raises(NotImplementedError, match="sleep\\(level=2\\)"):
+    with pytest.raises(NotImplementedError, match="engine wake_up refused"):
         client.post("/v1/omni/wakeup", json={"stage_ids": [0]})
 
+    # Failed wake must not clear the sleeping set.
     assert app.state.sleeping_stages == {0}
 
 
