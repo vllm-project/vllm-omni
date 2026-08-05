@@ -17,7 +17,9 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 16
+    # Four-way concurrency matches the single-GPU memory shares below;
+    # larger batches make Code2Wav activations OOM on one H100.
+    max_num_seqs: 4
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
@@ -48,7 +50,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 16
+    max_num_seqs: 4
     gpu_memory_utilization: 0.15
     enforce_eager: false
     max_num_batched_tokens: 8192
@@ -70,7 +72,7 @@ stages:
       detokenize: false
 
   - stage_id: 2
-    max_num_seqs: 16
+    max_num_seqs: 4
     gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false

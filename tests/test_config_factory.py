@@ -2191,6 +2191,16 @@ class TestPlatformOverrides:
             replica_stages = merge_pipeline_deploy(pipeline, replica)
             assert "kv_cache_memory_bytes" not in replica_stages[1].yaml_engine_args
 
+    def test_minicpmo_4_5_single_gpu_admits_four_sequences(self):
+        """Single-GPU shares leave room for Code2Wav peak activations at bs<=4."""
+        deploy = load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml")))
+        assert [stage.max_num_seqs for stage in deploy.stages] == [4, 4, 4]
+        assert [stage.gpu_memory_utilization for stage in deploy.stages] == [
+            0.55,
+            0.15,
+            0.18,
+        ]
+
     def test_npu_overrides(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
