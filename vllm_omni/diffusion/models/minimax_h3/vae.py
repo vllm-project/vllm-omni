@@ -176,11 +176,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         patch-parallel group, which otherwise leaves ranks with empty task lists
         and hangs the remaining ranks in a collective.
         """
-        previous = bool(self.model.parallel_tiling)
-        enabled = previous
+        previous = self.model.parallel_tiling
+        enabled = bool(previous)
         splitter = getattr(self.model, "split_tiles", None)
         parallel_size = int(getattr(self, "parallel_size", 1))
-        if previous and parallel_size > 1 and splitter is not None:
+        if enabled and parallel_size > 1 and splitter is not None:
             y_idx, _, _ = splitter(int(height), is_decoder)
             x_idx, _, _ = splitter(int(width), is_decoder)
             num_tiles = len(y_idx) * len(x_idx)
