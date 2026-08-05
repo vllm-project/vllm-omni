@@ -67,7 +67,6 @@ def attach_aligner_audio(engine_input: Any, waveform: np.ndarray, sample_rate: i
 ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 _tokenizer: Any = None
-_logged_prompt = False
 
 
 def _aligner_tokenizer() -> Any:
@@ -133,18 +132,6 @@ def _tokens_input(src_prompt: dict[str, Any], words: list[str]) -> dict[str, Any
     tail = body.split(_processor.AUDIO_PLACEHOLDER, 1)[-1]
     tail_ids = tokenizer.encode(tail, add_special_tokens=False)
     token_ids = list(src_ids[:end]) + list(tail_ids)
-
-    global _logged_prompt
-    if not _logged_prompt:
-        _logged_prompt = True
-        # Cheap one-time sanity check that the reused prefix and the freshly
-        # tokenized tail actually join into the prompt the aligner expects.
-        logger.info(
-            "Aligner stage prompt: %d audio-prefix tokens + %d tail tokens; tail=%r",
-            end,
-            len(tail_ids),
-            tokenizer.decode(tail_ids)[:160],
-        )
 
     return {
         "prompt_token_ids": token_ids,

@@ -346,7 +346,7 @@ def _decode_aligner_output(output: Any, words: list[str], audio_duration_ms: flo
         logger.warning("No <|timestamp|> tokens found in prompt for words=%r", words[:8])
         return []
 
-    return _decode_timestamps(
+    return decode_timestamps(
         logits=output.outputs.data,  # [n_token, classify_num]
         words=words,
         timestamp_positions=timestamp_positions,
@@ -466,7 +466,7 @@ def _pcm_bytes_to_float32(audio: bytes) -> np.ndarray:
     return (pcm.astype(np.float32) / 32768.0).copy()
 
 
-def _decode_timestamps(
+def decode_timestamps(
     *,
     logits: Any,
     words: list[str],
@@ -526,6 +526,11 @@ def _decode_timestamps(
         out.append(WordTimestamp(word=word, start_ms=start_ms, end_ms=end_ms))
         prev_end_ms = end_ms
     return out
+
+
+#: Kept so existing callers and tests that reached for the private name keep
+#: working; ``decode_timestamps`` is the supported spelling.
+_decode_timestamps = decode_timestamps
 
 
 # Test hooks ---------------------------------------------------------------

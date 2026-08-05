@@ -40,7 +40,7 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_asr_align import (
     ALIGNER_STAGE_NAME,
     attach_aligner_audio,
 )
-from vllm_omni.utils.forced_aligner import ForcedAlignerConfig, ForcedAlignerLoadError, _decode_timestamps
+from vllm_omni.utils.forced_aligner import ForcedAlignerConfig, ForcedAlignerLoadError, decode_timestamps
 from vllm_omni.utils.forced_aligner import align as forced_align
 
 if TYPE_CHECKING:
@@ -494,7 +494,7 @@ class OmniServingTranscription(OpenAIServingTranscription):
         # function on this one string, which is what keeps them in step.
         words = segment_words(text, getattr(request, "language", None))
         try:
-            timestamps = _decode_timestamps(
+            timestamps = decode_timestamps(
                 logits=output.outputs[0].data,
                 words=words,
                 timestamp_positions=positions,
