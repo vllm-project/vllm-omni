@@ -316,13 +316,13 @@ class AsyncOmni(EngineClient, OmniBase):
         self,
         request_id: str,
         *,
-        response_stage_id: int | None = None,
+        final_output_stage_ids: set[int] | None = None,
         timeout: float | None = 10.0,
     ) -> list[OmniRequestOutput]:
         """Collect the next duplex data-plane output batch for a live request."""
         return await self._get_duplex_request_client().collect_registered_outputs(
             request_id,
-            response_stage_id=response_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             timeout=timeout,
         )
 
@@ -429,13 +429,13 @@ class AsyncOmni(EngineClient, OmniBase):
         request_id: str,
         req_state: ClientRequestState,
         *,
-        response_stage_id: int | None,
+        final_output_stage_ids: set[int] | None,
         timeout: float | None,
     ) -> list[OmniRequestOutput]:
         return await self._get_duplex_request_client().collect_outputs(
             request_id,
             req_state,
-            response_stage_id=response_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             timeout=timeout,
         )
 

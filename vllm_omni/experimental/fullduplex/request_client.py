@@ -163,10 +163,11 @@ class DuplexRequestClient:
             )
         if not collect_outputs:
             return result
+        final_output_stage_ids = {response_stage_id} if response_stage_id is not None else None
         outputs = await self.collect_outputs(
             request_id,
             request_state,
-            response_stage_id=response_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             timeout=timeout,
         )
         if outputs:
@@ -178,7 +179,7 @@ class DuplexRequestClient:
         self,
         request_id: str,
         *,
-        response_stage_id: int | None,
+        final_output_stage_ids: set[int] | None,
         timeout: float | None,
     ) -> list[OmniRequestOutput]:
         self.output_port.start_output_handler()
@@ -188,7 +189,7 @@ class DuplexRequestClient:
         return await self.collect_outputs(
             request_id,
             request_state,
-            response_stage_id=response_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             timeout=timeout,
         )
 
@@ -270,12 +271,14 @@ class DuplexRequestClient:
         request_id: str,
         request_state: ClientRequestState,
         *,
-        response_stage_id: int | None,
+        final_output_stage_ids: set[int] | None,
         timeout: float | None,
     ) -> list[OmniRequestOutput]:
         deadline = None if timeout is None else time.monotonic() + timeout
         wall_start_ts = request_state.request_arrival_ts or time.time()
-        final_stage_id = response_stage_id if response_stage_id is not None else max(0, self.output_port.num_stages - 1)
+        final_stage_id = (
+            max(final_output_stage_ids) if final_output_stage_ids else max(0, self.output_port.num_stages - 1)
+        )
         num_stages = max(self.output_port.num_stages, final_stage_id + 1)
         metrics = getattr(request_state, "metrics", None) or OrchestratorMetrics(
             num_stages,
@@ -299,7 +302,7 @@ class DuplexRequestClient:
             if not isinstance(message, OutputMessage):
                 continue
             engine_outputs = message.engine_outputs
-            is_response_stage = response_stage_id is None or message.stage_id >= response_stage_id
+            is_response_stage = final_output_stage_ids is None or message.stage_id in final_output_stage_ids
             is_direct_response = self.is_direct_response(engine_outputs)
             output_to_collect = None
             if isinstance(engine_outputs, OmniRequestOutput):

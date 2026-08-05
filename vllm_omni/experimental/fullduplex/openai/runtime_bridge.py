@@ -698,6 +698,9 @@ class NativeRuntimeBridgeMixin:
         if not callable(collect_outputs):
             return None
 
+        engine_client = self._chat_service.engine_client
+        final_output_stage_ids = set(engine_client._compute_final_output_stage_ids(session.config.modalities)) or None
+
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
@@ -713,7 +716,7 @@ class NativeRuntimeBridgeMixin:
                 return None
             outputs = await collect_outputs(
                 request_id,
-                response_stage_id=response_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
                 timeout=self._runtime_control_timeout_s(session),
             )
             if expected_epoch is not None and session.epoch != expected_epoch:

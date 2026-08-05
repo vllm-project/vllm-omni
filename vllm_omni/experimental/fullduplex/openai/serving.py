@@ -1159,8 +1159,7 @@ class OmniDuplexSessionHandler(
             payload["realtime_item_id"] = realtime_item_id
         return payload
 
-    @staticmethod
-    def _apply_session_update(session: DuplexSession, payload: dict[str, object]) -> dict[str, object] | None:
+    def _apply_session_update(self, session: DuplexSession, payload: dict[str, object]) -> dict[str, object] | None:
         model = payload.get("model")
         audio_config = payload.get("audio")
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
@@ -1235,6 +1234,14 @@ class OmniDuplexSessionHandler(
             )
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
+            engine_modalities = self._chat_service.engine_client.output_modalities
+            unsupported = [m for m in modalities if m not in engine_modalities]
+            if unsupported:
+                return NativeRealtimeSessionProtocol._realtime_error_payload(
+                    "modalities_unsupported",
+                    f"Unsupported modalities: {unsupported}. Supported: {engine_modalities}",
+                    param="modalities",
+                )
             session.config.modalities = list(modalities)
         if isinstance(payload.get("extra_body"), dict):
             session.config.extra_body.update(payload["extra_body"])
