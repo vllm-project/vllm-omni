@@ -87,19 +87,10 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
-        if not getattr(self, "_logged_to_list_once", False):
-            self._logged_to_list_once = True
-            logger.info(
-                "[sampled-override] _to_list first call: override_fn set=%s",
-                callable(override_fn),
-            )
         if callable(override_fn):
             sampled = override_fn(sampled_token_ids)
             if sampled is not None:
                 return sampled
-            if not getattr(self, "_logged_override_none_once", False):
-                self._logged_override_none_once = True
-                logger.info("[sampled-override] override returned None (deferring to default)")
         return super()._to_list(sampled_token_ids)
 
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
@@ -193,12 +184,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
-        logger.info(
-            "[sampled-override] load_model: model=%s supports=%s override_installed=%s",
-            type(model).__name__,
-            bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)),
-            override_fn is not None,
-        )
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
@@ -1933,11 +1918,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             if code_predictor_codes is not None:
                 update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
                 self._update_intermediate_buffer(req_id, update_dict)
-                if getattr(self.model, "_audio_debug", False):
-                    logger.info(
-                        "[longcat-audio] _talker_mtp_forward stored codes req=%s shape=%s",
-                        req_id, list(code_predictor_codes[idx : idx + 1].shape),
-                    )
 
     def _model_forward(
         self,

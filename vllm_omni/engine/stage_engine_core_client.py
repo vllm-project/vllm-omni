@@ -190,19 +190,14 @@ class StageEngineCoreClientBase(StageClientBase):
             if coordinator is not None:
                 self.resources.coordinator = coordinator
 
-            # Defensive check for the import-order regression the patch
-            # above exists to prevent: if vllm.v1.engine.core_client had
-            # already bound its own local reference to the *original*
-            # EngineCoreOutputs before this constructor ran (e.g. imported
-            # by some other code path first), super().__init__() would have
-            # built self.decoder against the base 14-field struct instead of
-            # OmniEngineCoreOutputs' 17-field extension (multimodal_output,
-            # is_segment_finished, new_prompt_len_snapshot appended). Decoding
-            # a genuinely Omni-shaped array-like struct with that decoder
-            # doesn't fail cleanly -- it desyncs field positions and surfaces
-            # as an opaque msgspec.ValidationError deep in a later poll,
-            # naming some unrelated field. Fail here instead, immediately and
-            # legibly, the first time this client is used.
+            # Defensive check for the import-order regression the patch above
+            # exists to prevent: if vllm.v1.engine.core_client had already bound
+            # its own reference to the base EngineCoreOutputs before this
+            # constructor ran, super().__init__() would have built the decoder
+            # against the 14-field base struct instead of OmniEngineCoreOutputs'
+            # 17-field extension. Decoding Omni-shaped output with it desyncs
+            # fields and surfaces as an opaque msgspec.ValidationError deep in a
+            # later poll. Fail here instead, immediately and legibly.
             decoded_type = getattr(getattr(self.decoder, "decoder", None), "type", None)
             if decoded_type is not None and not (
                 isinstance(decoded_type, type) and issubclass(decoded_type, OmniEngineCoreOutputs)

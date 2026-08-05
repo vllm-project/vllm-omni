@@ -55,13 +55,13 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_PIPELINE,
 )
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
+from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.longcat_next.pipeline import (
     LONGCAT_NEXT_PIPELINE,
     LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
     LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
     LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
 )
-from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
