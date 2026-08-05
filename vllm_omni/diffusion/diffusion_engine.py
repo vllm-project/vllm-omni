@@ -64,24 +64,19 @@ def _get_async_output_timeout() -> float:
         "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT",
         os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "30"),
     )
+    error = (
+        "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT (or fallback "
+        "VLLM_OMNI_VIDEO_SYNC_TIMEOUT) must be a positive finite number, "
+        f"got {raw_timeout!r}."
+    )
     try:
         timeout = float(raw_timeout)
     except ValueError as exc:
-        raise ValueError(
-            "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT (or fallback "
-            "VLLM_OMNI_VIDEO_SYNC_TIMEOUT) must be a positive finite number, "
-            f"got {raw_timeout!r}."
-        ) from exc
+        raise ValueError(error) from exc
     if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(
-            "VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT (or fallback "
-            "VLLM_OMNI_VIDEO_SYNC_TIMEOUT) must be a positive finite number, "
-            f"got {raw_timeout!r}."
-        )
+        raise ValueError(error)
     return timeout
 
-
-_ASYNC_OUTPUT_TIMEOUT = _get_async_output_timeout()
 
 __all__ = [
     "DiffusionEngine",
@@ -210,6 +205,7 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        self._async_output_timeout = _get_async_output_timeout()
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
@@ -349,7 +345,10 @@ class DiffusionEngine:
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
-                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                output = await asyncio.wait_for(
+                    asyncio.wrap_future(fut),
+                    timeout=self._async_output_timeout,
+                )
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time
@@ -816,7 +815,7 @@ class DiffusionEngine:
                     )
                     if output.async_output_id:
                         fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                        output = fut.result(timeout=self._async_output_timeout)
                     return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
