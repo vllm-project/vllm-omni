@@ -58,7 +58,6 @@ class _StubModel(nn.Module):
     here is what makes that class of bug reachable from a CPU test.
     """
 
-    _dbg_step = staticmethod(M._dbg_step)
     _sample_audio_code = M._sample_audio_code
     _sample_depth_head = M._sample_depth_head
     _sample_cfg_visual_codes = M._sample_cfg_visual_codes
@@ -73,10 +72,6 @@ class _StubModel(nn.Module):
         super().__init__()
         self._audio_gen: dict = {}
         self._visual_gen: dict = {}
-        self._audio_debug = False
-        self._dbg_sampled = 0
-        self._dbg_kept = 0
-        self._dbg_emitted = 0
         self.audio_codebook_sizes = list(CODEBOOK_SIZES)
         self.visual_codebook_sizes = list(VISUAL_CODEBOOK_SIZES)
         self.register_buffer("audio_offset_vals", offsets, persistent=False)

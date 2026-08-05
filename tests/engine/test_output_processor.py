@@ -145,7 +145,6 @@ def test_codes_nested_payload_accumulates_per_step():
     assert audio[0, 0].item() == 0 and audio[4, 0].item() == 4
 
 
-
 def test_finish_consolidates_hidden_states():
     """Ensure consolidation merges hidden-state tensor lists on finish."""
     s = _make_state(RequestOutputKind.CUMULATIVE)

@@ -34,7 +34,6 @@ def _model(**attrs):
     base = {
         "_audio_gen": {},
         "_visual_gen": {},
-        "_audio_debug": False,
         "_audio_delay_default": 0,
         "config": SimpleNamespace(hidden_size=HIDDEN),
     }
