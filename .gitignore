@@ -3,8 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# pbs/   # removed to track e2e test scripts
-
 # C extensions
 *.so
 
@@ -278,4 +276,3 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
-build.md
