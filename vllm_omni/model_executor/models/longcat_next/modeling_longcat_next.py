@@ -1996,12 +1996,62 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         )
         loaded = loader.load_weights(split(weights))
 
-        # Note: the LongCat-specific MLA input scales (mla_scale_q_lora,
-        # mla_scale_kv_lora) are already applied by the vllm fork's
-        # FlashModel.load_weights (longcat_flash.py), which scales
-        # q_a_layernorm.weight / kv_a_layernorm.weight in place, gated on the
-        # same config flags and idempotency-guarded via
-        # _mla_q_lora_scaled/_mla_kv_lora_scaled. Do not re-apply here.
+        # Reapply the LongCat-specific MLA LoRA input scales here,
+        # unconditionally, after AutoWeightsLoader has fully finished.
+        #
+        # The vllm fork's own FlashModel.load_weights (longcat_flash.py)
+        # also tries to apply this scale to q_a_layernorm/kv_a_layernorm.
+        # weight, guarded by a permanent "already scaled" flag per attn
+        # module -- but empirically (via a [longcat-stream-keys] audit
+        # logging every checkpoint key streamed into that function) it gets
+        # invoked more than once per model instance: an earlier pass whose
+        # incoming weights contain NO self_attn keys at all, followed by a
+        # later pass carrying the real checkpoint data. The fork's guard
+        # fires on that first, data-less pass -- multiplying whatever was
+        # already sitting in q_a_layernorm/kv_a_layernorm.weight (their
+        # un-loaded default-init value, since real data hadn't streamed
+        # yet) -- and then the later pass's real data lands via a plain
+        # copy_ (not additive), silently wiping out that first scaling
+        # without ever re-triggering it, since the guard is already
+        # permanently tripped. Net effect: the real checkpoint's layernorm
+        # weights end up completely unscaled by the time the fork's own
+        # load_weights returns.
+        #
+        # By the time loader.load_weights(...) above returns, every one of
+        # the fork's internal load_weights invocations -- however many
+        # there were -- has completed and the real weights are in place.
+        # Applying the scale exactly once here, gated by our OWN guard
+        # (distinct from the fork's), is correct regardless of how many
+        # internal passes happened upstream, and needs no changes to vLLM.
+        model = getattr(self, "model", None)
+        layers = getattr(model, "layers", None)
+        if layers is not None:
+            hf = getattr(self.config, "hidden_size", None) or 3072
+            q_lora = int(getattr(self.config, "q_lora_rank", 0) or 0)
+            kv_lora = int(getattr(self.config, "kv_lora_rank", 0) or 0)
+            do_q = bool(getattr(self.config, "mla_scale_q_lora", False)) and q_lora > 0
+            do_kv = bool(getattr(self.config, "mla_scale_kv_lora", False)) and kv_lora > 0
+            scale_q = (hf / q_lora) ** 0.5 if do_q else None
+            scale_kv = (hf / kv_lora) ** 0.5 if do_kv else None
+            scaled = 0
+            for layer in layers:
+                attns = getattr(layer, "self_attn", None)
+                if attns is None:
+                    continue
+                for attn in attns:
+                    if scale_q is not None and not getattr(attn, "_omni_mla_q_scaled", False):
+                        attn.q_a_layernorm.weight.data.mul_(scale_q)
+                        attn._omni_mla_q_scaled = True
+                        scaled += 1
+                    if scale_kv is not None and not getattr(attn, "_omni_mla_kv_scaled", False):
+                        attn.kv_a_layernorm.weight.data.mul_(scale_kv)
+                        attn._omni_mla_kv_scaled = True
+                        scaled += 1
+            logger.info(
+                "[longcat-mla-scale-omni] applied MLA LoRA scale to %d layernorm(s) "
+                "(scale_q=%s scale_kv=%s)",
+                scaled, scale_q, scale_kv,
+            )
 
         device = next(self.model.parameters()).device
         for ckpt_prefix, attr in self._SIDE_MODULE_PREFIXES:
