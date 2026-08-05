@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, ClassVar, NamedTuple
 
 import torch
@@ -366,30 +367,23 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
-_ROCM_VARLEN_FA: Callable[..., Any] | None = None
-_ROCM_VARLEN_FA_RESOLVED = False
-
-
+@cache
 def _rocm_varlen_fa() -> Callable[..., Any] | None:
     """aiter's varlen attention via vLLM's ``_aiter_ops``, or ``None`` off ROCm / without aiter.
 
     Ungated by ``VLLM_ROCM_USE_AITER``, like the provider itself (vllm-project/vllm#33749),
     since aiter is the only working kernel here. Resolved once: ``find_spec`` is not traceable.
+    Same pattern as ``diffusion/attention/selector.py``'s ``_cached_get_backend_cls``.
     """
-    global _ROCM_VARLEN_FA, _ROCM_VARLEN_FA_RESOLVED
-    if not _ROCM_VARLEN_FA_RESOLVED:
-        _ROCM_VARLEN_FA_RESOLVED = True
-        from vllm.platforms import current_platform
+    from vllm.platforms import current_platform
 
-        if current_platform.is_rocm():
-            try:
-                from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops
-            except ImportError:
-                pass
-            else:
-                if is_aiter_found():
-                    _ROCM_VARLEN_FA = rocm_aiter_ops.flash_attn_varlen_func
-    return _ROCM_VARLEN_FA
+    if not current_platform.is_rocm():
+        return None
+    try:
+        from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops
+    except ImportError:
+        return None
+    return rocm_aiter_ops.flash_attn_varlen_func if is_aiter_found() else None
 
 
 def _pack_paged_kv(
