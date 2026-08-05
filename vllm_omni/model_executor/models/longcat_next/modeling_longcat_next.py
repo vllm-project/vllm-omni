@@ -430,7 +430,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         )
 
         # Roll the context forward and bound the state dict.
-        self._ngram_ctx[request_id] = table[0, -self._ctx_len:].clone()
+        self._ngram_ctx[request_id] = table[0, -self._ctx_len :].clone()
         if len(self._ngram_ctx) > self._max_ctx_entries:
             for stale in list(self._ngram_ctx)[: len(self._ngram_ctx) - self._max_ctx_entries]:
                 self._ngram_ctx.pop(stale, None)
@@ -1269,7 +1269,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             audio_state = self._audio_gen.get(req_id)
             visual_state = self._visual_gen.get(req_id)
             last_hidden = (
-                last_talker_hidden[row:row+1] if row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
+                last_talker_hidden[row : row + 1] if row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
             )
 
             if audio_state is not None:
@@ -1354,7 +1354,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 # the text_end flag: once text_end is set compute_logits pins the
                 # token to pad anyway, so the two agree, but matching on the value
                 # keeps this correct even for a pad sampled before text_end.
-                text_tok = input_ids[row:row+1]
+                text_tok = input_ids[row : row + 1]
                 text_emb = self.model.embed_tokens(text_tok)
                 if int(text_tok.item()) == AUDIOTEXT_PAD_TOKEN_ID:
                     text_emb.zero_()
@@ -1373,13 +1373,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     for level in range(num_levels):
                         idx = (offset_codes[level] - self.audio_offset_vals[0]).item()
                         if 0 <= idx < replicated_emb.shape[0]:
-                            row_embs.append(replicated_emb[idx:idx+1])
+                            row_embs.append(replicated_emb[idx : idx + 1])
                     if row_embs:
                         audio_emb = torch.cat(row_embs, dim=0).sum(dim=0, keepdim=True)
 
                 # Sum the 3 streams
                 next_emb = ext_emb + text_emb + audio_emb
-                all_embeds[row:row+1] = next_emb.to(dtype=self.dtype)
+                all_embeds[row : row + 1] = next_emb.to(dtype=self.dtype)
 
                 if is_terminal:
                     state["terminal"] = True
@@ -1578,7 +1578,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 # the vision embedding at a real-pixel (IMAGE_PAD) position.
                 # No "ext" stream: IMAGE_PAD/IMAGE_NEWLINE simply ARE the
                 # visible token, not a side-channel like audiotext_start/pad.
-                text_tok = input_ids[row:row+1]
+                text_tok = input_ids[row : row + 1]
                 text_emb = self.model.embed_tokens(text_tok)
 
                 if frame_kept and deoff != 0:
@@ -1587,13 +1587,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     # the visual_embedding_layer bridge refinement. Zero-code
                     # (deoff == 0) is the clamped-invalid marker, same
                     # convention as audio's `deoff != 0` guard.
-                    offset_codes = (codes_row + self.visual_offset_vals[:num_levels].to(device)).unsqueeze(0)
+                    offset_codes = (codes_row + self.visual_offset_vals[:visual_num_levels].to(device)).unsqueeze(0)
                     vision_emb = self._code_embeddings(offset_codes)
                     vision_emb = self.visual_tokenizer.visual_embedding_layer(vision_emb.to(self.dtype))
                     next_emb = vision_emb
                 else:
                     next_emb = text_emb
-                all_embeds[row:row+1] = next_emb.to(dtype=self.dtype)
+                all_embeds[row : row + 1] = next_emb.to(dtype=self.dtype)
 
                 if is_terminal:
                     state["terminal"] = True
