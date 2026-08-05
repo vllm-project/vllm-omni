@@ -1,7 +1,7 @@
 # MiniMax H3 on Ascend NPU
 
-> Joint video and audio generation with text, first-frame, image/audio, or
-> multi-video conditions — Ascend NPU deployment guide
+> Joint video and audio generation with text, first/last keyframes, and mixed
+> image/video/audio references — Ascend NPU deployment guide
 
 ## Summary
 
@@ -149,9 +149,9 @@ throughput guarantee.
 - H3 currently executes one generation request per diffusion batch.
 - The first regional-compile request is a warmup and should not be included
   in steady-state performance measurements.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional
-  standalone audio reference.
+- The official H3 input matrix and media limits are documented in the [GPU
+  recipe](MiniMax-H3.md#official-input-matrix-and-limits); this NPU path uses
+  the same HTTP request contract.
 - VAE patch parallelism requires size 1 or the full DiT group size and
   supports the H3 native `tile` mode only.
 

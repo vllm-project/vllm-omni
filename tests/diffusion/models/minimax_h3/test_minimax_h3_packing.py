@@ -144,3 +144,20 @@ def test_condition_noise_is_seeded_and_keeps_clean_anchor_at_timestep_one():
         noise_aug=0.25,
     )
     torch.testing.assert_close(first, second)
+
+
+def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
+    from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
+        minimax_h3_imgvid_cond_noise_aug_rows,
+    )
+
+    rows = torch.zeros(4 * 2 * 2, 96)
+    result = minimax_h3_imgvid_cond_noise_aug_rows(
+        rows,
+        condition_shapes=[(4, 4, 4)],
+        target_latent_t=2,
+        imgvid_cond_num_frames=1,
+        seed=7,
+        noise_aug=0.5,
+    )
+    assert result.shape == rows.shape

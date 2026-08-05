@@ -117,6 +117,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_tiling = True
         self.use_slicing = False
         self.parallel_size = 1
+        self.device_module = torch.get_device_module()
 
     def set_parallel_size(
         self,
@@ -166,13 +167,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         previous_dtype = parameter.dtype
         if previous_dtype != torch.float32:
             self.to(torch.float32)
-        devices = [parameter.device] if parameter.device.type == "cuda" else []
+        devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
             with torch.random.fork_rng(devices=devices):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
-                    with torch.cuda.device(device):
-                        torch.cuda.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                    with self.device_module.device(device):
+                        self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 latent = self.model.encode_images(
                     image,
                     use_fp16_latent=True,
@@ -210,13 +211,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         previous_dtype = parameter.dtype
         if previous_dtype != torch.float32:
             self.to(torch.float32)
-        devices = [parameter.device] if parameter.device.type == "cuda" else []
+        devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
             with torch.random.fork_rng(devices=devices):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
-                    with torch.cuda.device(device):
-                        torch.cuda.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                    with self.device_module.device(device):
+                        self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 latent = self.model.encode_videos(
                     frames,
                     use_fp16_latent=True,
