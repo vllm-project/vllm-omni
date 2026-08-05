@@ -152,6 +152,37 @@ def _indexed_scale_shift_kernel(
 
 
 @triton.jit
+def _fused_rmsnorm_indexed_scale_shift_kernel(
+    output_ptr,
+    x_ptr,
+    weight_ptr,
+    scale_ptr,
+    shift_ptr,
+    indices_ptr,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+
+    x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
+
+    # Match the existing two-op path: RMSNorm stores BF16 before the indexed
+    # scale/shift kernel reloads and promotes the normalized values to FP32.
+    normalized = (x * inv_rms * weight).to(x_ptr.dtype.element_ty)
+    index = tl.load(indices_ptr + row)
+    parameter_offset = index * n_cols + cols
+    scale = tl.load(scale_ptr + parameter_offset, mask=mask, other=0.0).to(tl.float32)
+    shift = tl.load(shift_ptr + parameter_offset, mask=mask, other=0.0).to(tl.float32)
+    output = (normalized.to(tl.float32) * (1.0 + scale) + shift).to(output_ptr.dtype.element_ty)
+    tl.store(output_ptr + row * n_cols + cols, output, mask=mask)
+
+
+@triton.jit
 def _indexed_gate_kernel(
     x_ptr,
     gate_ptr,
@@ -433,6 +464,72 @@ def indexed_gate_bf16_(
         num_warps=4,
     )
     return True
+
+
+def _launch_fused_rmsnorm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    output = torch.empty_like(x)
+    if x.shape[0] == 0:
+        return output
+    block_size = triton.next_power_of_2(x.shape[1])
+    _fused_rmsnorm_indexed_scale_shift_kernel[(x.shape[0],)](
+        output,
+        x,
+        weight,
+        scale,
+        shift,
+        indices,
+        x.shape[1],
+        eps,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+    return output
+
+
+def fused_rmsnorm_indexed_scale_shift_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor | None:
+    """Fuse out-of-place RMSNorm and indexed AdaLN for H3's BF16 path."""
+    if not (
+        _can_use_indexed_common(x, scale, indices)
+        and weight.is_cuda
+        and shift.is_cuda
+        and indices.is_cuda
+        and weight.device == x.device
+        and shift.device == x.device
+        and scale.device == x.device
+        and indices.device == x.device
+        and weight.dtype == torch.bfloat16
+        and shift.dtype == torch.bfloat16
+        and weight.shape == (x.shape[1],)
+        and shift.shape == scale.shape
+        and weight.is_contiguous()
+        and shift.is_contiguous()
+        and 0 < x.shape[1] <= 65536
+    ):
+        return None
+    if torch.compiler.is_compiling():
+        return torch.ops.vllm_omni.minimax_h3_rmsnorm_indexed_scale_shift(
+            x,
+            weight,
+            shift,
+            scale,
+            indices,
+            eps,
+        )
+    return _launch_fused_rmsnorm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
 
 
 def pack_qkv_destination_major_bf16(
@@ -752,3 +849,32 @@ if not hasattr(torch.ops.vllm_omni, "minimax_h3_rope"):
     ) -> None:
         del q, k, rope_cache, rope_dim
         return None
+
+
+if not hasattr(torch.ops.vllm_omni, "minimax_h3_rmsnorm_indexed_scale_shift"):
+
+    @torch.library.custom_op(
+        "vllm_omni::minimax_h3_rmsnorm_indexed_scale_shift",
+        mutates_args=(),
+    )
+    def _minimax_h3_rmsnorm_indexed_scale_shift_op(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        return _launch_fused_rmsnorm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+    @_minimax_h3_rmsnorm_indexed_scale_shift_op.register_fake
+    def _minimax_h3_rmsnorm_indexed_scale_shift_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        del weight, shift, scale, indices, eps
+        return torch.empty_like(x)
