@@ -70,6 +70,30 @@ def test_float_frames_are_converted_without_stacking_full_video(monkeypatch):
     np.testing.assert_array_equal(frame, original)
 
 
+def test_two_dimensional_width_four_frames_are_not_treated_as_rgba():
+    frame = np.arange(8, dtype=np.float32).reshape(2, 4) / 8
+
+    frames = video_api_utils._coerce_video_to_uint8_frames([frame, frame])
+
+    expected = np.rint(frame * 255).astype(np.uint8)
+    assert frames.shape == (2, 2, 4)
+    np.testing.assert_array_equal(frames, np.stack([expected, expected]))
+
+
+def test_mixed_float_dtypes_preserve_stacked_rounding_semantics():
+    frames = [
+        np.full((1, 1, 3), 0.1, dtype=np.float16),
+        np.full((1, 1, 3), 0.2, dtype=np.float32),
+    ]
+    stacked = np.stack(frames)
+    expected = np.rint(np.clip(stacked, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    actual = video_api_utils._coerce_video_to_uint8_frames(frames)
+
+    assert expected[0, 0, 0, 0] == 25
+    np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("frame_count", [3, 4])
 def test_channel_last_video_tensor_preserves_channel_sized_frame_count(frame_count):
     video = torch.arange(frame_count * 2 * 5 * 3, dtype=torch.uint8).reshape(frame_count, 2, 5, 3)

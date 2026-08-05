@@ -429,8 +429,10 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
         raise ValueError("No frames found to encode.")
 
     frame_shape = frames[0].shape
-    output_shape = (*frame_shape[:-1], 3) if frame_shape[-1] == 4 else frame_shape
+    has_alpha = len(frame_shape) == 3 and frame_shape[-1] == 4
+    output_shape = (*frame_shape[:-1], 3) if has_alpha else frame_shape
     frames_u8 = np.empty((len(frames), *output_shape), dtype=np.uint8)
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
 
     # Convert one frame at a time instead of stacking the normalized float
     # payload first. Long videos can otherwise require another full-size
@@ -438,12 +440,15 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     for index, frame in enumerate(frames):
         if frame.shape != frame_shape:
             raise ValueError("All video frames must have the same shape.")
-        frame = frame[..., :3] if frame.shape[-1] == 4 else frame
+        frame = frame[..., :3] if has_alpha else frame
         if frame.dtype == np.uint8:
             frames_u8[index] = frame
             continue
 
-        scaled = np.clip(frame, 0.0, 1.0)
+        # np.stack(), used by the previous implementation, promoted mixed
+        # frame dtypes before scaling. Preserve those rounding semantics
+        # without allocating a full-video float buffer.
+        scaled = np.clip(frame.astype(common_dtype, copy=False), 0.0, 1.0)
         scaled *= 255.0
         np.rint(scaled, out=scaled)
         frames_u8[index] = scaled
