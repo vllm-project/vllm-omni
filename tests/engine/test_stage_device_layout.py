@@ -9,10 +9,9 @@ tensor_parallel_size=4 while still holding a single-GPU deploy default. Without
 ``--strategy-config`` the strategy-path device check never runs.
 """
 
-import types
-
 import json
 import re
+import types
 
 import pytest
 
