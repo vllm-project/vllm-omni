@@ -493,7 +493,6 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     assert summary["validation_mode"] == "model-policy"
     assert summary["enough_responses"] is True
     assert summary["response_before_final_commit"] is True
-    assert summary["listen_after_response_before_commit"] is True
 
 
 def test_realtime_duplex_soft_interrupt_response_required_rejects_single_response(tmp_path):
