@@ -24,6 +24,31 @@ except Exception as e:
     )
 
 
+if HAS_FLASHINFER and not hasattr(torch.ops.vllm_omni, "flashinfer_single_prefill_kv"):
+    # `single_prefill_with_kv_cache` accepts `otype` and `kv_cache_sf` as kwargs; only
+    # these two args control the output dtype and dimension. If `otype` or `kv_cache_sf`
+    # needs to be supported in the future, three things must change together: the op
+    # signature, the real implementation body, and the fake implementation.
+    @torch.library.custom_op("vllm_omni::flashinfer_single_prefill_kv", mutates_args=())
+    def _flashinfer_prefill_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        custom_mask: torch.Tensor | None,
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        kwargs: dict = {"sm_scale": softmax_scale, "causal": causal, "return_lse": False, "custom_mask": custom_mask}
+        return single_prefill_with_kv_cache(query, key, value, **kwargs)
+
+    @_flashinfer_prefill_op.register_fake
+    def _(query, key, value, custom_mask, softmax_scale, causal):
+        return torch.empty_like(query)
+
+
+_flashinfer_prefill_op = torch.ops.vllm_omni.flashinfer_single_prefill_kv if HAS_FLASHINFER else None
+
+
 class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -168,14 +193,11 @@ class FlashInferAttentionImpl(AttentionImpl):
 
         outputs = []
         for b in range(batch_size):
-            kwargs: dict = {
-                "sm_scale": self.softmax_scale,
-                "causal": self.causal,
-                "return_lse": False,
-            }
             if custom_mask is not None:
-                kwargs["custom_mask"] = custom_mask if custom_mask.dim() == 2 else custom_mask[b]
-            out = single_prefill_with_kv_cache(query[b], key[b], value[b], **kwargs)
+                sample_mask = custom_mask if custom_mask.dim() == 2 else custom_mask[b]
+            else:
+                sample_mask = None
+            out = _flashinfer_prefill_op(query[b], key[b], value[b], sample_mask, self.softmax_scale, self.causal)
             outputs.append(out)
 
         if batch_size == 1:
