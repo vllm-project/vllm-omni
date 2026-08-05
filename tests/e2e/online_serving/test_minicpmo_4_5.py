@@ -19,7 +19,7 @@ _MODEL = "openbmb/MiniCPM-o-4_5"
 _CI_DEPLOY = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5.yaml"),
     updates={
-        "stages": {0: {"default_sampling_params.max_tokens": 128}, 1: {"default_sampling_params.max_tokens": 512}}
+        "stages": {0: {"default_sampling_params.max_tokens": 128}, 1: {"default_sampling_params.max_tokens": 1024}}
     },
 )
 
