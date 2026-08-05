@@ -152,13 +152,14 @@ class TestAsyncOutputLoopLogic:
         """The real _async_output_loop packs via SHM with d2h_stream and
         enqueues an OUTPUT_READY message."""
         import threading
-        import time
 
         proc = _make_worker_proc(step_execution=False)
 
         mock_pack = mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
         )
+        packed = threading.Event()
+        mock_pack.side_effect = lambda *_args, **_kwargs: packed.set()
         # Mock torch to avoid device initialization
         mock_torch = mocker.MagicMock()
         mock_stream = mocker.MagicMock()
@@ -178,16 +179,98 @@ class TestAsyncOutputLoopLogic:
         t = threading.Thread(target=proc._async_output_loop, daemon=True)
         t.start()
 
-        # Give the loop time to process, then unblock and stop.
-        time.sleep(0.5)
-        proc._running = False
-        proc._async_output_queue.put((DiffusionOutput(), "sentinel", None))
-        t.join(timeout=2.0)
+        assert packed.wait(timeout=2.0)
+        proc._async_output_thread = t
+        proc._stop_async_output_thread()
 
         mock_pack.assert_called()
+        assert not t.is_alive()
+        assert proc._async_output_thread is None
+        assert proc._async_output_queue is None
         # Verify an OUTPUT_READY with the correct async_output_id was enqueued.
         output_ready_enqueued = any(
             c[0][0].kind == AsyncOutputKind.OUTPUT_READY and c[0][0].async_output_id == "abc123"
             for c in proc.result_mq.enqueue.call_args_list
         )
         assert output_ready_enqueued, "Expected OUTPUT_READY with async_output_id='abc123' in enqueue calls"
+
+    def test_stop_async_output_thread_drains_pending_outputs(self, mocker):
+        import threading
+
+        proc = _make_worker_proc(step_execution=False)
+        first_pack_started = threading.Event()
+        release_first_pack = threading.Event()
+        pack_count = 0
+
+        def blocking_pack(*_args, **_kwargs):
+            nonlocal pack_count
+            pack_count += 1
+            if pack_count == 1:
+                first_pack_started.set()
+                assert release_first_pack.wait(timeout=5.0)
+
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
+            side_effect=blocking_pack,
+        )
+        mock_torch = mocker.MagicMock()
+        mock_torch.Stream.return_value = mocker.MagicMock()
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mock_torch.device.return_value = mocker.MagicMock()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.torch",
+            mock_torch,
+        )
+
+        proc._async_output_queue.put((DiffusionOutput(output="first"), "first-id", None))
+        proc._async_output_queue.put((DiffusionOutput(output="second"), "second-id", None))
+        output_thread = threading.Thread(target=proc._async_output_loop, daemon=True)
+        proc._async_output_thread = output_thread
+        output_thread.start()
+        assert first_pack_started.wait(timeout=2.0)
+
+        stop_started = threading.Event()
+
+        def stop_output_thread():
+            stop_started.set()
+            proc._stop_async_output_thread()
+
+        stop_thread = threading.Thread(target=stop_output_thread)
+        stop_thread.start()
+        assert stop_started.wait(timeout=2.0)
+        assert stop_thread.is_alive()
+
+        release_first_pack.set()
+        stop_thread.join(timeout=2.0)
+
+        assert not stop_thread.is_alive()
+        assert not output_thread.is_alive()
+        assert pack_count == 2
+        ready_ids = {
+            call.args[0].async_output_id
+            for call in proc.result_mq.enqueue.call_args_list
+            if call.args[0].kind == AsyncOutputKind.OUTPUT_READY
+        }
+        assert ready_ids == {"first-id", "second-id"}
+
+    def test_stop_async_output_thread_is_noop_without_async_state(self):
+        proc = _make_worker_proc(step_execution=True)
+
+        assert proc._stop_async_output_thread()
+
+        assert proc._running is False
+        assert proc._async_output_thread is None
+        assert proc._async_output_queue is None
+
+    def test_stop_async_output_thread_timeout_is_bounded(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        output_thread = mocker.MagicMock()
+        output_thread.is_alive.return_value = True
+        proc._async_output_thread = output_thread
+        mocker.patch.object(WorkerProc, "_ASYNC_OUTPUT_JOIN_TIMEOUT_S", 0.01)
+
+        assert not proc._stop_async_output_thread()
+
+        output_thread.join.assert_called_once_with(timeout=0.01)
+        assert proc._async_output_thread is output_thread
+        assert proc._async_output_queue.get_nowait() is WorkerProc._ASYNC_OUTPUT_STOP
