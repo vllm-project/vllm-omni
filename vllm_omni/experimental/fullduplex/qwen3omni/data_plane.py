@@ -202,11 +202,15 @@ class Qwen3OmniDataPlaneSession(BaseDataPlaneSession):
             )
             return
 
+        delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+        if not delta_text and not unit_end_of_turn:
+            return
+
         yield _runtime_result(
             stage_role="llm",
             is_listen=False,
             data_plane_request_id=request_id,
-            text=text if isinstance(text, str) else "",
+            text=delta_text,
             audio_data="",
             end_of_turn=unit_end_of_turn,
         )
