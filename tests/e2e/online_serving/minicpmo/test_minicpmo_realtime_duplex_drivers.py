@@ -1120,7 +1120,6 @@ def test_realtime_duplex_demo_continuous_input_omits_browser_commit(monkeypatch)
             chunk_ms=200,
             timeout_s=0.1,
             require_audio=True,
-            validation_mode="response-required",
             commit_input=False,
         )
     )
