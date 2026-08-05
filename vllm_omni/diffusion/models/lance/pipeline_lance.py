@@ -495,15 +495,6 @@ class LancePipeline(BagelPipeline):
             dtype=self.od_config.dtype,
         )
 
-    def _new_gen_context(self) -> dict:
-        from .lance_transformer import NaiveCache
-
-        return {
-            "kv_lens": [0],
-            "ropes": [0],
-            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
-        }
-
     @staticmethod
     def _segment_strings(task: str, modality: str) -> tuple[str, str]:
         sys_prompt = SYSTEM_PROMPTS[(task, modality)]
@@ -1661,9 +1652,7 @@ class LancePipeline(BagelPipeline):
         extra_args = first_prompt.get("extra_args") or {}
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
-        max_text_tokens = int(extra_args.get("max_think_tokens", 200))
-        do_sample = bool(extra_args.get("do_sample", False))
-        text_temperature = float(extra_args.get("text_temperature", 0.3))
+        max_text_tokens, do_sample, text_temperature = self._x2t_decode_params(req, extra_args, default_max_tokens=200)
 
         prefix_text, suffix_text = self._split_x2t_prompt(
             first_prompt.get("prompt") or "",
@@ -1755,9 +1744,7 @@ class LancePipeline(BagelPipeline):
         extra_args = first_prompt.get("extra_args") or {}
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
-        max_text_tokens = int(extra_args.get("max_think_tokens", 256))
-        do_sample = bool(extra_args.get("do_sample", False))
-        text_temperature = float(extra_args.get("text_temperature", 0.3))
+        max_text_tokens, do_sample, text_temperature = self._x2t_decode_params(req, extra_args, default_max_tokens=256)
 
         prefix_text, suffix_text = self._split_x2t_prompt(
             first_prompt.get("prompt") or "",
@@ -1813,6 +1800,16 @@ class LancePipeline(BagelPipeline):
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+
+    @staticmethod
+    def _x2t_decode_params(req, extra_args: dict, *, default_max_tokens: int) -> tuple[int, bool, float]:
+        sp = req.sampling_params
+        sp_max = getattr(sp, "max_tokens", None)
+        sp_temp = getattr(sp, "temperature", None)
+        max_text_tokens = int(extra_args.get("max_think_tokens", sp_max if sp_max else default_max_tokens))
+        text_temperature = float(extra_args.get("text_temperature", sp_temp if sp_temp is not None else 0.3))
+        do_sample = bool(extra_args.get("do_sample", text_temperature > 0.0))
+        return max_text_tokens, do_sample, text_temperature
 
     @staticmethod
     def _split_x2t_prompt(

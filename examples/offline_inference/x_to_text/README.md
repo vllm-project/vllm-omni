@@ -12,10 +12,14 @@ Generate text from text or image inputs with vLLM-Omni's shared offline entrypoi
 | `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | `vllm_omni/deploy/hunyuan_image3_ar.yaml` |
 | `bytedance-research/MammothModa2-Preview` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
 | `bytedance-research/MammothModa2-Dev` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
+| `bytedance-research/Lance` | No | Yes | `vllm_omni/deploy/lance.yaml` |
 
 The script recognizes these model families from `config.json`, applies the
 model-specific prompt format, and selects an AR-only deploy for HunyuanImage-3
-and MammothModa2. BAGEL uses its registered default deploy.
+and MammothModa2. BAGEL uses its registered default deploy. Lance likewise
+auto-resolves and loads its bundled default deploy, so `--deploy-config` is
+optional; it supports I2T only here (see
+[`recipes/ByteDance/Lance.md`](../../../recipes/ByteDance/Lance.md)).
 
 ## Text-To-Text
 
@@ -81,6 +85,19 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 
 Use `bytedance-research/MammothModa2-Dev` in the same command to run I2T with
 the Dev checkpoint.
+
+Lance requires its deploy config and benefits from sampling (its greedy decoder
+often emits an immediate EOS):
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model bytedance-research/Lance \
+  --deploy-config vllm_omni/deploy/lance.yaml \
+  --trust-remote-code \
+  --image image.png \
+  --prompt "Describe this image in detail." \
+  --temperature 0.8
+```
 
 ## Key Arguments
 

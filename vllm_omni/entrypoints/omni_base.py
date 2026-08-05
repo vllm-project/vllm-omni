@@ -33,6 +33,16 @@ from vllm_omni.utils.tracking_parser import TrackingNamespace
 logger = init_logger(__name__)
 
 
+def _split_hf_model_subfolder(model_id: str) -> tuple[str, str | None]:
+    """Split ``namespace/repo/subfolder`` without changing normal repo IDs."""
+    if "://" in model_id or model_id.startswith(("/", "./", "../")):
+        return model_id, None
+    parts = model_id.split("/", 2)
+    if len(parts) != 3 or not all(parts):
+        return model_id, None
+    return "/".join(parts[:2]), parts[2]
+
+
 class OmniEngineDeadError(EngineDeadError):
     _DEFAULT_MESSAGE = EngineDeadError().args[0]
     error_stage_id: int | None
@@ -73,9 +83,10 @@ def omni_snapshot_download(model_id: str) -> str:
 
         return snapshot_download(model_id)
 
+    hf_model_id, subfolder = _split_hf_model_subfolder(model_id)
     try:
-        download_weights_from_hf_specific(
-            model_name_or_path=model_id,
+        hf_folder = download_weights_from_hf_specific(
+            model_name_or_path=hf_model_id,
             cache_dir=None,
             allow_patterns=["*"],
             require_all=True,
@@ -88,12 +99,21 @@ def omni_snapshot_download(model_id: str) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         raise ValueError(f"Repository not found for '{model_id}'. Please check the model name or path.")
-    except PermissionError:
+    except PermissionError as exc:
+        if subfolder is not None:
+            raise ValueError(
+                f"Permission denied while resolving subfolder '{subfolder}' in Hugging Face repository '{hf_model_id}'."
+            ) from exc
         logger.warning(
             "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
             model_id,
         )
 
+    if subfolder is not None:
+        local_model_path = os.path.join(hf_folder, subfolder)
+        if not os.path.isdir(local_model_path):
+            raise ValueError(f"Subfolder '{subfolder}' was not found in Hugging Face repository '{hf_model_id}'.")
+        return local_model_path
     return model_id
 
 

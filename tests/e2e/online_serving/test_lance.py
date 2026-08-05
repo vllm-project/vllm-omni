@@ -1,35 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end online serving test for Lance (single-stage).
-
-Verifies that the Lance pipeline can serve text-to-image and image-edit
-requests via the OpenAI-compatible chat completions API exposed by
-``vllm-omni serve``.
-
-Equivalent to running:
-
-    vllm-omni serve "bytedance-research/Lance" --omni \\
-        --pipeline lance --enforce-eager --trust-remote-code --port 8091
-
-    # text2img
-    python3 examples/online_serving/lance/openai_chat_client.py \\
-        --prompt "A cute corgi astronaut" --modality text2img
-"""
 
 import base64
 import os
 from io import BytesIO
 
 import pytest
+from PIL import Image
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from vllm_omni.diffusion.models.lance.prompts import (
-    VIDEO_PAD,
-    VISION_END,
-    VISION_START,
-    render_lance_prompt,
+from vllm_omni.model_extras.lance import (
+    build_image_to_image_prompt,
+    build_text_to_image_prompt,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -39,12 +23,6 @@ MODEL = "bytedance-research/Lance"
 TEXT2IMG_PROMPT = "A cute corgi astronaut on the moon, cinematic"
 IMG2IMG_PROMPT = "Convert this into a vibrant cartoon-style illustration"
 
-# Lance vision block: <|vision_start|><|video_pad|><|vision_end|>
-_VISION_BLOCK = f"{VISION_START}{VIDEO_PAD}{VISION_END}"
-
-# Lance is single-stage diffusion — no deploy YAML.  Pass the engine
-# knobs that used to live in ``vllm_omni/deploy/lance.yaml`` via CLI
-# flags so ``create_default_diffusion`` builds the stage config.
 _LANCE_SERVE_ARGS = [
     "--pipeline",
     "lance",
@@ -68,8 +46,7 @@ test_params = [
 
 
 def _build_text2img_messages(prompt: str) -> list[dict]:
-    """Build OpenAI-format messages for text2img generation."""
-    rendered = render_lance_prompt("t2i", prompt)
+    rendered = build_text_to_image_prompt(prompt, negative_prompt=None)["prompt"]
     return [
         {
             "role": "user",
@@ -78,9 +55,8 @@ def _build_text2img_messages(prompt: str) -> list[dict]:
     ]
 
 
-def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
-    """Build OpenAI-format messages for img2img generation."""
-    rendered = render_lance_prompt("image_edit", prompt, vision_token=_VISION_BLOCK)
+def _build_img2img_messages(prompt: str, image_b64: str, input_image: Image.Image) -> list[dict]:
+    rendered = build_image_to_image_prompt(prompt, negative_prompt=None, input_image=input_image)["prompt"]
     return [
         {
             "role": "user",
@@ -101,7 +77,6 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_lance_text2img_online(omni_server, openai_client) -> None:
-    """Lance text2img via the OpenAI-compatible chat completions API."""
     request_config = {
         "model": omni_server.model,
         "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
@@ -124,7 +99,6 @@ def test_lance_text2img_online(omni_server, openai_client) -> None:
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_lance_img2img_online(omni_server, openai_client) -> None:
-    """Lance image_edit via the OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -132,7 +106,7 @@ def test_lance_img2img_online(omni_server, openai_client) -> None:
 
     request_config = {
         "model": omni_server.model,
-        "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
+        "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64, input_image),
         "modalities": ["image"],
         "extra_body": {
             "num_inference_steps": 2,

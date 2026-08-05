@@ -5,13 +5,19 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 from vllm_omni import Omni
-from vllm_omni.model_extras import build_x_to_text_prompt, get_x_to_text_model_family
+from vllm_omni.model_extras import (
+    build_x_to_text_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+    get_x_to_text_model_family,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HUNYUAN_AR_DEPLOY_CONFIG = _REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml"
@@ -39,9 +45,51 @@ def _extract_text(outputs: list[Any]) -> str:
     chunks: list[str] = []
     for output in outputs:
         request_output = getattr(output, "request_output", output)
-        for completion in getattr(request_output, "outputs", None) or []:
-            chunks.append(getattr(completion, "text", "") or "")
+        output_chunks = [
+            getattr(completion, "text", "") or "" for completion in getattr(request_output, "outputs", None) or []
+        ]
+        if not any(output_chunks):
+            multimodal_output = getattr(output, "multimodal_output", None)
+            if isinstance(multimodal_output, Mapping):
+                multimodal_text = multimodal_output.get("text")
+                if isinstance(multimodal_text, str):
+                    output_chunks.append(multimodal_text)
+                elif isinstance(multimodal_text, (list, tuple)):
+                    output_chunks.extend(text for text in multimodal_text if isinstance(text, str))
+        chunks.extend(output_chunks)
     return "".join(chunks).strip()
+
+
+def _configure_sampling_params(
+    params: Any,
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    seed: int,
+    stop_token_ids: list[int] | None,
+    extra_body_params: frozenset[str],
+) -> None:
+    """Apply shared CLI sampling flags to AR or diffusion text decoders."""
+    for attr, value in (
+        ("max_tokens", max_tokens),
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("seed", seed),
+    ):
+        if hasattr(params, attr):
+            setattr(params, attr, value)
+    if stop_token_ids is not None and hasattr(params, "stop_token_ids"):
+        params.stop_token_ids = stop_token_ids
+
+    diffusion_overrides = {
+        "max_think_tokens": max_tokens,
+        "text_temperature": temperature,
+        "do_sample": temperature > 0.0,
+    }
+    declared_overrides = {key: value for key, value in diffusion_overrides.items() if key in extra_body_params}
+    if declared_overrides and hasattr(params, "extra_args"):
+        params.extra_args = {**(params.extra_args or {}), **declared_overrides}
 
 
 def main() -> None:
@@ -77,17 +125,17 @@ def main() -> None:
     omni = Omni(**omni_kwargs)
     try:
         sampling_params = list(omni.default_sampling_params_list or [])
+        extra_body_params = get_extra_body_params(get_model_class_name(omni))
         for params in sampling_params:
-            if hasattr(params, "max_tokens"):
-                params.max_tokens = args.max_tokens
-            if hasattr(params, "temperature"):
-                params.temperature = args.temperature
-            if hasattr(params, "top_p"):
-                params.top_p = args.top_p
-            if hasattr(params, "seed"):
-                params.seed = args.seed
-            if stop_token_ids is not None and hasattr(params, "stop_token_ids"):
-                params.stop_token_ids = stop_token_ids
+            _configure_sampling_params(
+                params,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                seed=args.seed,
+                stop_token_ids=stop_token_ids,
+                extra_body_params=extra_body_params,
+            )
         outputs = list(omni.generate([prompt_dict], sampling_params_list=sampling_params or None))
     finally:
         omni.close()

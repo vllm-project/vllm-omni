@@ -82,3 +82,22 @@ def test_unset_defaults_to_huggingface(monkeypatch, download_backend):
     monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
 
     assert download_backend() == "huggingface"
+
+
+def test_huggingface_subfolder_model_id_resolves_locally(monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
+    envs.disable_envs_cache()
+    video_dir = tmp_path / "Lance_3B_Video"
+    video_dir.mkdir()
+    downloaded: list[str] = []
+
+    def fake_download(**kwargs):
+        downloaded.append(kwargs["model_name_or_path"])
+        return str(tmp_path)
+
+    monkeypatch.setattr(omni_base, "download_weights_from_hf_specific", fake_download)
+
+    result = omni_base.omni_snapshot_download("bytedance-research/Lance/Lance_3B_Video")
+
+    assert downloaded == ["bytedance-research/Lance"]
+    assert result == str(video_dir)

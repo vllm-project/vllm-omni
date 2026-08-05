@@ -36,6 +36,20 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.lance import (
+    LANCE_EXTRA_BODY_PARAMS,
+    LANCE_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.lance import (
+    build_image_to_image_prompt as build_lance_image_to_image_prompt,
+)
+from vllm_omni.model_extras.lance import (
+    build_image_to_video_prompt as build_lance_image_to_video_prompt,
+)
+from vllm_omni.model_extras.lance import (
+    build_text_to_image_prompt as build_lance_text_to_image_prompt,
+)
+from vllm_omni.model_extras.lance import build_x_to_text_prompt as build_lance_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
@@ -110,6 +124,7 @@ def default_x_to_text_prompt(
 _X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
     "bagel": build_bagel_x_to_text_prompt,
     "hunyuan_image3": build_hunyuan_x_to_text_prompt,
+    "lance": build_lance_x_to_text_prompt,
     "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
 }
 
@@ -127,6 +142,10 @@ def get_x_to_text_model_family(model: str) -> str:
         return "hunyuan_image3"
     if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
         return "mammoth_moda2"
+    model_name = str(config.get("model_name", "")).lower()
+    task_names = {str(task).lower() for task in (config.get("task_names") or [])}
+    if model_name == "lance" or {"x2t_image", "x2t_video"} & task_names or "lance" in str(model).lower():
+        return "lance"
     return "generic"
 
 
@@ -198,6 +217,13 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "SenseNovaU1Pipeline": {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
         "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
+    },
+    "LancePipeline": {
+        "extra_body_params": LANCE_EXTRA_BODY_PARAMS,
+        "extra_output_params": LANCE_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_lance_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_lance_image_to_image_prompt,
+        "image_to_video_prompt_builder": build_lance_image_to_video_prompt,
     },
     "Cosmos3OmniDiffusersPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,

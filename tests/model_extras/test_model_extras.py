@@ -485,6 +485,29 @@ def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
     }
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lance_image_to_video_maps_standard_dimensions() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+
+    result = build_image_to_video_prompt(
+        "LancePipeline",
+        prompt="animate it",
+        negative_prompt=None,
+        media_inputs={"image": dummy_image},
+        height=480,
+        width=848,
+        num_frames=61,
+    )
+
+    assert result["multi_modal_data"] == {"first_frame": dummy_image}
+    assert result["extra_args"] == {
+        "video_height": 480,
+        "video_width": 848,
+        "num_frames": 61,
+    }
+
+
 def _build_vace_prompt(media_inputs: dict[str, object], *, num_frames: int = 5) -> dict:
     return build_image_to_video_prompt(
         "WanVACEPipeline",
