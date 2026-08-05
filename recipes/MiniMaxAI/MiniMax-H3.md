@@ -407,6 +407,10 @@ than one is requested.
 | `start_time_seconds` | `0` | Reference-video segment start; use a list in `extra_params` for multiple videos |
 | `width`, `height` | Multiples of 32 | Output aspect ratio must be between 1:4 and 4:1 |
 
+## ComfyUI Frontend
+
+Users can also use a ComfyUI frontend to interact with a hosted MiniMax-H3 service. The ComfyUI frontend can run in a separate environment or machine. Refer to [vLLM-Omni ComfyUI Integration](../../docs/features/comfyui.md) for details.
+
 ## Validated four-GPU evidence
 
 The four-GPU recommendation was measured on four NVIDIA B300 GPUs with one
