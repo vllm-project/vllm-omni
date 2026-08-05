@@ -61,9 +61,10 @@ def attach_aligner_audio(engine_input: Any, waveform: np.ndarray, sample_rate: i
     additional[ALIGNER_AUDIO_KEY] = payload
 
 
-#: The aligner checkpoint, whose tokenizer knows the ``<timestamp>`` marker that
-#: the ASR tokenizer does not carry.
-_ALIGNER_TOKENIZER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
+#: The aligner checkpoint. Its tokenizer knows the ``<timestamp>`` marker that
+#: the ASR tokenizer does not carry, and its config holds the decode constants
+#: (classify_num, timestamp_token_id, timestamp_segment_time).
+ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 _tokenizer: Any = None
 _logged_prompt = False
@@ -79,7 +80,7 @@ def _aligner_tokenizer() -> Any:
     if _tokenizer is None:
         from transformers import AutoTokenizer
 
-        _tokenizer = AutoTokenizer.from_pretrained(_ALIGNER_TOKENIZER_MODEL, trust_remote_code=True)
+        _tokenizer = AutoTokenizer.from_pretrained(ALIGNER_MODEL, trust_remote_code=True)
     return _tokenizer
 
 

@@ -22,6 +22,7 @@ import multiprocessing
 import threading
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -35,10 +36,11 @@ from vllm.entrypoints.speech_to_text.transcription.serving import OpenAIServingT
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.stage_input_processors.qwen3_asr_align import (
+    ALIGNER_MODEL,
     ALIGNER_STAGE_NAME,
     attach_aligner_audio,
 )
-from vllm_omni.utils.forced_aligner import ForcedAlignerConfig, ForcedAlignerLoadError
+from vllm_omni.utils.forced_aligner import ForcedAlignerConfig, ForcedAlignerLoadError, _decode_timestamps
 from vllm_omni.utils.forced_aligner import align as forced_align
 
 if TYPE_CHECKING:
@@ -58,6 +60,11 @@ ALIGNER_SAMPLE_RATE = 16000
 
 #: How often to log decode-reuse hit/miss stats.
 _REUSE_STATS_EVERY = 50
+
+#: Per-request collector for the aligner stage's pooling results. Set by the
+#: request coroutine, appended to by the output filter running in the same
+#: task, so no request-id bookkeeping is needed to pair them.
+_pooling_sink: ContextVar[list[Any] | None] = ContextVar("_omni_aligner_pooling_sink", default=None)
 
 #: Recycle a decode worker after this many clips, to bound any per-decode leak
 #: in the audio stack. High enough that respawn cost is noise.
@@ -159,7 +166,9 @@ class _AlignerOutputFilter:
                 # than importing PoolingOutput keeps this tolerant of the
                 # several shapes the omni layer can hand back.
                 if first is not None and not hasattr(first, "text") and hasattr(first, "data"):
-                    self._sink(getattr(out, "request_id", None), first)
+                    # Whole output, not just the pooling payload: the decode
+                    # needs prompt_token_ids to locate the timestamp markers.
+                    self._sink(out)
                     continue
                 yield out
 
@@ -197,6 +206,7 @@ class OmniServingTranscription(OpenAIServingTranscription):
         self._aligner_stage_cache: bool | None = None
         self._pooling_results: OrderedDict[str, Any] = OrderedDict()
         self._aligned_count = 0
+        self._decode_constants: tuple[int, int, float] | tuple[()] | None = None
         if self._has_aligner_stage:
             self.engine_client = _AlignerOutputFilter(self.engine_client, self._capture_pooling_output)
 
@@ -362,17 +372,21 @@ class OmniServingTranscription(OpenAIServingTranscription):
             logger.info("Forced-aligner stage detected: %s", self._aligner_stage_cache)
         return self._aligner_stage_cache
 
-    def _capture_pooling_output(self, request_id: str | None, pooling_output: Any) -> None:
-        """Hold the aligner stage's logits until the request assembles its response."""
-        if request_id is None:
-            return
+    def _capture_pooling_output(self, output: Any) -> None:
+        """Route the aligner stage's result to the request that is waiting for it.
+
+        A context-local sink rather than a request-id lookup: the engine's id
+        for the aligner stage's result is not the one this method could match
+        against, and the sink is set by the same task that will consume it, so
+        the handoff cannot pair the wrong request with the wrong logits.
+        """
         with self._decoded_lock:
             self._aligned_count += 1
             if self._aligned_count % _REUSE_STATS_EVERY == 0:
                 logger.info("Aligner stage: %d requests aligned", self._aligned_count)
-            self._pooling_results[request_id] = pooling_output
-            while len(self._pooling_results) > self._MAX_PENDING_DECODES:
-                self._pooling_results.popitem(last=False)
+        sink = _pooling_sink.get()
+        if sink is not None:
+            sink.append(output)
 
     @property
     def _aligner_enabled(self) -> bool:
@@ -420,6 +434,83 @@ class OmniServingTranscription(OpenAIServingTranscription):
                 logger.debug("No reusable decode for %s; aligner stage will skip", request_id)
         return engine_inputs, duration
 
+    def _aligner_decode_constants(self) -> tuple[int, int, float] | None:
+        """``(classify_num, timestamp_token_id, timestamp_segment_time_ms)``.
+
+        Read from the aligner checkpoint's config rather than hard-coded: the
+        marker grid is a property of the weights, and a mismatch would silently
+        shift every timestamp rather than fail.
+        """
+        if self._decode_constants is None:
+            try:
+                from transformers import AutoConfig
+
+                cfg = AutoConfig.from_pretrained(ALIGNER_MODEL, trust_remote_code=True)
+                thinker = getattr(cfg, "thinker_config", None)
+                self._decode_constants = (
+                    int(thinker.classify_num),
+                    int(cfg.timestamp_token_id),
+                    float(cfg.timestamp_segment_time),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not read aligner decode constants; word timestamps disabled")
+                self._decode_constants = ()
+        return self._decode_constants or None
+
+    def _words_from_stage(
+        self,
+        result: TranscriptionResponseVerbose,
+        request: TranscriptionRequest,
+        text: str,
+        duration_ms: float,
+    ) -> TranscriptionResult:
+        """Decode the aligner stage's logits into OpenAI ``words``.
+
+        Degrades to a transcript without words rather than failing a request
+        whose text is already correct; a missing alignment is worth strictly
+        less than the transcript it would otherwise take down.
+        """
+        from vllm_omni.utils.qwen3_force_align_processor import segment_words
+
+        sink = _pooling_sink.get() or []
+        if not sink:
+            logger.warning("Aligner stage produced no result for this request; returning transcript without words")
+            return result
+
+        constants = self._aligner_decode_constants()
+        if constants is None:
+            return result
+        classify_num, timestamp_token_id, segment_time_ms = constants
+
+        output = sink[0]
+        prompt_token_ids = getattr(output, "prompt_token_ids", None) or []
+        positions = [i for i, tid in enumerate(prompt_token_ids) if tid == timestamp_token_id]
+        if not positions:
+            logger.warning("No timestamp markers in the aligner prompt; returning transcript without words")
+            return result
+
+        # Re-segment the same post-processed transcript the stage segmented, so
+        # the word list and the marker pairs line up. Both sides call this one
+        # function on this one string, which is what keeps them in step.
+        words = segment_words(text, getattr(request, "language", None))
+        try:
+            timestamps = _decode_timestamps(
+                logits=output.outputs[0].data,
+                words=words,
+                timestamp_positions=positions,
+                classify_num=classify_num,
+                audio_duration_ms=duration_ms,
+                timestamp_segment_time_ms=segment_time_ms,
+            )
+        except (ValueError, IndexError, RuntimeError):
+            logger.exception("word alignment decode failed; returning transcript without words")
+            return result
+
+        result.words = [
+            TranscriptionWord(word=t.word, start=t.start_ms / 1000.0, end=t.end_ms / 1000.0) for t in timestamps
+        ]
+        return result
+
     @staticmethod
     def _wants_word_timestamps(request: TranscriptionRequest) -> bool:
         return "word" in (request.timestamp_granularities or []) and request.response_format == "verbose_json"
@@ -444,6 +535,12 @@ class OmniServingTranscription(OpenAIServingTranscription):
         # when the inner call raises, or a failing request parks its waveform
         # until the size cap evicts it.
         decoded = None
+        # Fresh per-request collector for the aligner stage's output; the
+        # filter appends into whichever sink is current when it runs. No reset:
+        # each request handler runs in its own task context, so the binding dies
+        # with the request rather than leaking into the next one.
+        if self._has_aligner_stage:
+            _pooling_sink.set([])
         try:
             result = await super().create_transcription(
                 audio_data=audio_data,
@@ -472,14 +569,21 @@ class OmniServingTranscription(OpenAIServingTranscription):
         # streaming surface.
         if not isinstance(result, TranscriptionResponseVerbose):
             return result
+        text = (result.text or "").strip()
+        if not text:
+            result.words = []
+            return result
+
+        if self._has_aligner_stage:
+            # The aligner already ran inside the pipeline; its logits are
+            # waiting, so this is a decode rather than a second inference pass.
+            duration_ms = (decoded[1] if decoded is not None else float(result.duration or 0.0)) * 1000.0
+            return self._words_from_stage(result, request, text, duration_ms)
+
         if self.forced_aligner_config is None:
             logger.warning(
                 "word timestamps requested but no forced aligner configured; pass --forced-aligner to enable them."
             )
-            return result
-        text = (result.text or "").strip()
-        if not text:
-            result.words = []
             return result
 
         try:
