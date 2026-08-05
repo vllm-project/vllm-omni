@@ -19,7 +19,8 @@ import sys as _sys
 def _trace_calls(frame, event, arg):
     if event == "call":
         co = frame.f_code
-        _sys.stderr.write(f"[trace pid={_os.getpid()}] {co.co_filename}:{co.co_firstlineno} {co.co_name}\n")
+        if "vllm" in co.co_filename:
+            _sys.stderr.write(f"[trace pid={_os.getpid()}] {co.co_filename}:{co.co_firstlineno} {co.co_name}\n")
     return _trace_calls
 
 
