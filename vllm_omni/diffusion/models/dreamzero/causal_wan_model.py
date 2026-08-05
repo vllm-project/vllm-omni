@@ -119,8 +119,7 @@ def rope_action_apply(
     return x
 
 
-def causal_rope_action_apply(
-    x: torch.Tensor,
+def causal_rope_action_freqs(
     freqs: torch.Tensor,
     freqs_action: torch.Tensor,
     freqs_state: torch.Tensor,
@@ -129,27 +128,26 @@ def causal_rope_action_apply(
     num_state_per_block: int,
     action_state_index: int,
 ) -> torch.Tensor:
-    """RoPE for single inference step (causal / KV-cache mode)."""
-    B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
-    if action_register_length is not None:
-        expected_length = num_action_per_block + num_state_per_block
-        if action_register_length != expected_length:
-            raise ValueError(
-                f"action_register_length must equal num_action_per_block + num_state_per_block "
-                f"({expected_length}), got {action_register_length}."
-            )
-        freqs_action = freqs_action[
-            action_state_index * num_action_per_block : (action_state_index + 1) * num_action_per_block
-        ]
-        freqs_state = freqs_state[
-            action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
-        freqs = torch.cat([freqs, freqs_1d], dim=0)
-    freqs = freqs.unsqueeze(0)
-    x = torch.view_as_real(x * freqs).flatten(3)
-    return x
+    """Video RoPE table with the current step's action/state rows appended.
+
+    Single inference step (causal / KV-cache mode). A function of the step index
+    only, so all layers and both q and k share one build -- see ``_forward_blocks``,
+    which calls this once per forward and passes the result down.
+    """
+    if action_register_length is None:
+        return freqs
+    expected_length = num_action_per_block + num_state_per_block
+    if action_register_length != expected_length:
+        raise ValueError(
+            f"action_register_length must equal num_action_per_block + num_state_per_block "
+            f"({expected_length}), got {action_register_length}."
+        )
+    freqs_action = freqs_action[
+        action_state_index * num_action_per_block : (action_state_index + 1) * num_action_per_block
+    ]
+    freqs_state = freqs_state[action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block]
+    freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
+    return torch.cat([freqs, freqs_1d], dim=0)
 
 
 # ── Normalization ───────────────────────────────────────────────────
@@ -521,14 +519,15 @@ class CausalWanSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
         action_register_length: int | None,
         kv_cache: torch.Tensor | Any | None = None,
-        current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Inference-only forward (KV cache path)."""
+        """Inference-only forward (KV cache path).
+
+        ``freqs`` already carries this step's action/state rows (built once per
+        forward by ``causal_rope_action_freqs``).
+        """
         n, d = self.tp_num_heads, self.head_dim
 
         # Single fused QKV GEMM, then split into the per-rank q/k/v shards.
@@ -546,28 +545,8 @@ class CausalWanSelfAttention(nn.Module):
         if kv_cache is None:
             raise RuntimeError("Inference only: kv_cache is required.")
 
-        action_state_index = max(0, (current_start_frame - 1) // self.num_frame_per_block)
-
-        roped_query = causal_rope_action_apply(
-            q,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            self.num_action_per_block,
-            self.num_state_per_block,
-            action_state_index,
-        ).type_as(v)
-        roped_key = causal_rope_action_apply(
-            k,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            self.num_action_per_block,
-            self.num_state_per_block,
-            action_state_index,
-        ).type_as(v)
+        roped_query = rope_apply(q, freqs).type_as(v)
+        roped_key = rope_apply(k, freqs).type_as(v)
 
         roped_action_query = None
         roped_action_key = None
@@ -676,13 +655,10 @@ class CausalWanAttentionBlock(nn.Module):
         x: torch.Tensor,
         e: torch.Tensor,
         freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
         context: torch.Tensor,
         action_register_length: int | None = None,
         kv_cache: torch.Tensor | Any | None = None,
         crossattn_cache: dict | None = None,
-        current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -690,12 +666,9 @@ class CausalWanAttentionBlock(nn.Module):
         y, updated_kv_cache = self.self_attn(
             x=(self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)),
             freqs=freqs,
-            freqs_action=freqs_action,
-            freqs_state=freqs_state,
             action_register_length=action_register_length,
             kv_cache=kv_cache,
             is_tf=is_tf,
-            current_start_frame=current_start_frame,
         )
         x = x + (y * e[2].squeeze(2))
 
@@ -1021,19 +994,28 @@ class CausalWanModel(nn.Module):
             )
             kv_cache = [c.to_layer_inputs() for c in kv_cache]
 
+        # Append this step's action/state RoPE rows once, outside the compiled blocks:
+        # the table is the same for all 40 layers and for both q and k.
+        freqs = causal_rope_action_freqs(
+            freqs,
+            self.freqs_action,
+            self.freqs_state,
+            action_register_length,
+            self.num_action_per_block,
+            self.num_state_per_block,
+            max(0, (current_start_frame - 1) // self.num_frame_per_block),
+        )
+
         updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
                 freqs=freqs,
-                freqs_action=self.freqs_action,
-                freqs_state=self.freqs_state,
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index] if kv_cache else None,
                 crossattn_cache=crossattn_cache[block_index] if crossattn_cache else None,
-                current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
 
