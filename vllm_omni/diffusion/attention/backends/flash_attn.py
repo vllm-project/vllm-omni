@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from functools import partial
 
 import torch
@@ -17,6 +18,12 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
 )
 
 logger = init_logger(__name__)
+
+# When enabled, NPU attention uses npu_fused_infer_attention_score (FIA) in
+# TND varlen mode instead of fused_attn_score + full-QK-mask, avoiding the
+# O(S^2) mask/workspace for long packed sequences. Off by default: it changes
+# the attention operator and may shift numerics at ~1e-3.
+ENABLE_NPU_FIA_VARLEN = os.getenv("VLLM_OMNI_NPU_FIA_VARLEN", "0") == "1"
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -390,6 +397,16 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        # Optional varlen fast path (VLLM_OMNI_NPU_FIA_VARLEN=1); falls back
+        # to fused_attn_score when metadata or the varlen contract is absent.
+        if ENABLE_NPU_FIA_VARLEN and attn_metadata is not None and attn_metadata.extra:
+            cu_q = attn_metadata.extra.get("cu_seqlens_q")
+            cu_k = attn_metadata.extra.get("cu_seqlens_k")
+            if cu_q is not None and cu_k is not None:
+                v3_out = self._forward_fa_varlen_npu(query, key, value, cu_q, cu_k)
+                if v3_out is not None:
+                    return v3_out
+
         try:
             from mindiesd import attention_forward
         except ImportError:
@@ -417,3 +434,38 @@ class FlashAttentionImpl(AttentionImpl):
             op_type="fused_attn_score",
             layout=layout,
         )
+
+    def _forward_fa_varlen_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """FIA TND varlen path, mirroring CUDA ``_forward_varlen_packed``.
+
+        vLLM cu_seqlens (prefix-accumulated, leading 0) map directly onto the
+        op's ``actual_seq_lengths``; torch_npu accepts device int32 tensors
+        there. Returns None to fall back on contract mismatch.
+        """
+        if query.dim() != 4 or len(cu_seqlens_q) < 2 or len(cu_seqlens_kv) < 2:
+            return None
+        B, S, N, D = query.shape
+
+        q = query.reshape(-1, N, D)
+        k = key.reshape(key.shape[0] * key.shape[1], N, D)
+        v = value.reshape(value.shape[0] * value.shape[1], N, D)
+        out = torch.ops.npu.npu_fused_infer_attention_score(
+            q,
+            k,
+            v,
+            num_heads=N,
+            num_key_value_heads=N,
+            scale=self.softmax_scale,
+            input_layout="TND",
+            actual_seq_lengths=cu_seqlens_q,
+            actual_seq_lengths_kv=cu_seqlens_kv,
+            sparse_mode=0,
+        )[0]
+        return out.reshape(B, S, N, D)
