@@ -10,10 +10,11 @@ embeddings so the whole body runs on CPU, which is where that class of
 runtime-only AttributeError/shape bug is cheap to catch.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
-from types import SimpleNamespace
 
 from vllm_omni.model_executor.models.longcat_next import modeling_longcat_next as mln
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
@@ -118,19 +119,18 @@ def _depth_head_fn(codebook_sizes):
 def model(monkeypatch):
     monkeypatch.setattr(mln, "get_tp_group", lambda: _FakeTPGroup())
 
-    offsets = torch.cumsum(
-        torch.tensor([AUDIO_OFFSET] + CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0
-    )
-    visual_offsets = torch.cumsum(
-        torch.tensor([VISUAL_OFFSET] + VISUAL_CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0
-    )
+    offsets = torch.cumsum(torch.tensor([AUDIO_OFFSET] + CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0)
+    visual_offsets = torch.cumsum(torch.tensor([VISUAL_OFFSET] + VISUAL_CODEBOOK_SIZES[:-1], dtype=torch.long), dim=0)
 
     def embed_tokens(tok):
         return torch.zeros(int(tok.reshape(-1).shape[0]), HIDDEN)
 
     return _StubModel(
-        _depth_head_fn(CODEBOOK_SIZES), _depth_head_fn(VISUAL_CODEBOOK_SIZES),
-        embed_tokens, offsets, visual_offsets,
+        _depth_head_fn(CODEBOOK_SIZES),
+        _depth_head_fn(VISUAL_CODEBOOK_SIZES),
+        embed_tokens,
+        offsets,
+        visual_offsets,
     )
 
 
@@ -259,6 +259,7 @@ def test_talker_mtp_none_sampling_params_sample_not_greedy(model):
     """The runner passes explicit None sampling keys when subtalker_sampling_params
     is unset; talker_mtp must coalesce them to the checkpoint defaults. Otherwise
     do_sample=None collapses to greedy argmax (the single-repeated-code run)."""
+
     # level-0 logits peaked on two near-equal codes: argmax is always 0, but
     # top_k/top_p sampling (audio defaults) must spread draws over {0, 1}.
     def rigged_head(hidden, tokens, emb_layers, level):
@@ -286,9 +287,7 @@ def test_talker_mtp_none_sampling_params_sample_not_greedy(model):
             top_p=None,
         )
         seen.add(int(codes[0, 0]))
-    assert 0 in seen and 1 in seen, (
-        f"None sampling params must sample both top codes, got {sorted(seen)}"
-    )
+    assert 0 in seen and 1 in seen, f"None sampling params must sample both top codes, got {sorted(seen)}"
 
 
 def test_codes_stay_in_range_for_every_level(model):
@@ -303,9 +302,7 @@ def test_codes_stay_in_range_for_every_level(model):
 def test_text_end_and_ext_start_paths_execute(model):
     """Exercise the two masking branches (ext_id==audiotext_start, text_end)
     so neither can regress into a runtime error."""
-    _, codes = _call(
-        model, _state(text_end=True, ext_id=AUDIOTEXT_START_TOKEN_ID), text_token=AUDIOTEXT_PAD_TOKEN_ID
-    )
+    _, codes = _call(model, _state(text_end=True, ext_id=AUDIOTEXT_START_TOKEN_ID), text_token=AUDIOTEXT_PAD_TOKEN_ID)
 
     assert codes.shape == (1, len(CODEBOOK_SIZES))
 
@@ -429,7 +426,7 @@ def test_visual_mtp_masks_end_sentinel(model):
         if level == 0:
             logits = torch.full((1, VISUAL_CODEBOOK_SIZES[0] + 1), -100.0)
             logits[0, VISUAL_CODEBOOK_SIZES[0]] = 100.0  # sentinel: masked
-            logits[0, 0] = 50.0                          # next-best survivor
+            logits[0, 0] = 50.0  # next-best survivor
             return logits
         return torch.zeros(1, VISUAL_CODEBOOK_SIZES[level])
 
@@ -491,6 +488,7 @@ def test_visual_cfg_cfg_scale_combines_logits(model):
     """cfg_scale * (cond - uncond) + uncond must steer sampling: rig cond to
     peak at code A and uncond at code B; greedy argmax over the combined
     logits must pick A (the conditional wins for cfg_scale > 1)."""
+
     def rigged_head(hidden, tokens, emb_layers, level):
         logits = torch.zeros(1, VISUAL_CODEBOOK_SIZES[level])
         if level == 0:
@@ -568,12 +566,13 @@ def test_audio_mtp_masks_nonzero_level_sentinels(model):
     sampleable so chunks can still end -- here level-0 peaks at a normal code
     (non-terminal kept frame), levels >= 1 peak at their sentinel which must
     be forced down to the survivor."""
+
     def rigged_head(hidden, tokens, emb_layers, level):
         # Head emits vq_size + 1 classes.
         logits = torch.full((1, CODEBOOK_SIZES[level] + 1), -100.0)
         if level >= 1:
             logits[0, CODEBOOK_SIZES[level]] = 100.0  # sentinel: must be masked
-        logits[0, 0] = 50.0                           # survivor
+        logits[0, 0] = 50.0  # survivor
         return logits
 
     model.audio_head = rigged_head
@@ -593,9 +592,14 @@ def test_advance_visual_gen_grid_bound_terminates(model):
     stream closes the image."""
     model.config = SimpleNamespace(hidden_size=HIDDEN)
     M._advance_visual_gen(
-        model, "r0", last_token=IMG_START_TOKEN_ID,
-        device=torch.device("cpu"), dtype=torch.float32,
-        token_w=2, token_h=2, decode_eligible=False,
+        model,
+        "r0",
+        last_token=IMG_START_TOKEN_ID,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        token_w=2,
+        token_h=2,
+        decode_eligible=False,
     )
     state = model._visual_gen["r0"]
     assert state["token_w"] == 2 and state["token_h"] == 2
@@ -607,15 +611,22 @@ def test_advance_visual_gen_grid_bound_terminates(model):
     exts = []
     for _ in range(6):
         M._advance_visual_gen(
-            model, "r0", last_token=IMG_PAD_TOKEN_ID,
-            device=torch.device("cpu"), dtype=torch.float32,
+            model,
+            "r0",
+            last_token=IMG_PAD_TOKEN_ID,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
             decode_eligible=True,
         )
         exts.append(state["ext_id"])
 
     assert exts == [
-        IMG_PAD_TOKEN_ID, IMG_PAD_TOKEN_ID, IMG_NEWLINE_TOKEN_ID,
-        IMG_PAD_TOKEN_ID, IMG_PAD_TOKEN_ID, IMG_END_TOKEN_ID,
+        IMG_PAD_TOKEN_ID,
+        IMG_PAD_TOKEN_ID,
+        IMG_NEWLINE_TOKEN_ID,
+        IMG_PAD_TOKEN_ID,
+        IMG_PAD_TOKEN_ID,
+        IMG_END_TOKEN_ID,
     ]
     assert state["terminal"] is True
 
@@ -640,9 +651,14 @@ def test_advance_visual_gen_skips_advance_when_prefill(model):
 
     # <longcat_img_start> arrives as the last token of a prefill chunk.
     update = M._advance_visual_gen(
-        model, "r0", last_token=IMG_START_TOKEN_ID,
-        device=torch.device("cpu"), dtype=torch.float32,
-        token_w=37, token_h=37, decode_eligible=False,
+        model,
+        "r0",
+        last_token=IMG_START_TOKEN_ID,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        token_w=37,
+        token_h=37,
+        decode_eligible=False,
     )
     state = model._visual_gen["r0"]
     assert state["gen_step"] == 0, "prefill step must not advance gen_step"
@@ -653,8 +669,11 @@ def test_advance_visual_gen_skips_advance_when_prefill(model):
 
     # First real decode step: this is the one that must perform 0->1.
     update = M._advance_visual_gen(
-        model, "r0", last_token=IMG_PAD_TOKEN_ID,
-        device=torch.device("cpu"), dtype=torch.float32,
+        model,
+        "r0",
+        last_token=IMG_PAD_TOKEN_ID,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
         decode_eligible=True,
     )
     assert state["gen_step"] == 1, "first real decode step must be gen_step 1"
@@ -665,6 +684,7 @@ def test_talker_mtp_audio_repetition_penalty_changes_greedy_code(model):
     """Audio repetition penalty (default 1.3) is plumbed end-to-end: per-request
     past_codes accumulate across kept frames and the level-0 argmax flips away
     from a code once it enters the history (before the fix it repeated forever)."""
+
     def rigged_head(hidden, tokens, emb_layers, level):
         if level == 0:
             logits = torch.full((1, CODEBOOK_SIZES[0]), -100.0)
@@ -697,6 +717,7 @@ def test_talker_mtp_audio_repetition_penalty_changes_greedy_code(model):
 def test_visual_mtp_defaults_to_no_rep_penalty(model):
     """Visual repetition_penalty defaults to 1.0, so with a head peaking at one
     code the greedy choice repeats (matching the reference's image-case 1.0)."""
+
     def rigged_head(hidden, tokens, emb_layers, level):
         if level == 0:
             logits = torch.full((1, VISUAL_CODEBOOK_SIZES[0]), -100.0)
@@ -808,8 +829,7 @@ class TestSampleAudioCode:
         with temperature=None would raise TypeError. All-None must resolve to
         the audio defaults (temperature=0.5/top_k=5/top_p=0.85) and sample."""
         codes = [
-            int(self._call(model, logits, do_sample=None, temperature=None, top_k=None, top_p=None))
-            for _ in range(50)
+            int(self._call(model, logits, do_sample=None, temperature=None, top_k=None, top_p=None)) for _ in range(50)
         ]
         assert all(0 <= c < self.VOCAB for c in codes)
         assert len(set(codes)) > 1, "all-None params must sample, not greedy argmax"
@@ -827,10 +847,18 @@ class TestSampleAudioCode:
         logits[9] = 0.45
 
         assert int(self._call(model, logits, do_sample=False)) == 7
-        assert int(self._call(
-            model, logits, do_sample=False, repetition_penalty=1.3,
-            past_codes=torch.tensor([7]),
-        )) == 9
+        assert (
+            int(
+                self._call(
+                    model,
+                    logits,
+                    do_sample=False,
+                    repetition_penalty=1.3,
+                    past_codes=torch.tensor([7]),
+                )
+            )
+            == 9
+        )
 
     def test_repetition_penalty_1p0_is_noop(self, model, logits):
         """penalty == 1.0 (visual default) must not change the greedy choice
@@ -838,17 +866,27 @@ class TestSampleAudioCode:
         logits = torch.full((self.VOCAB,), -100.0)
         logits[7] = 0.5
         logits[9] = 0.45
-        code = int(self._call(
-            model, logits, do_sample=False, repetition_penalty=1.0,
-            past_codes=torch.tensor([7]),
-        ))
+        code = int(
+            self._call(
+                model,
+                logits,
+                do_sample=False,
+                repetition_penalty=1.0,
+                past_codes=torch.tensor([7]),
+            )
+        )
         assert code == 7
 
     def test_repetition_penalty_empty_history_is_noop(self, model, logits):
-        code = int(self._call(
-            model, logits, do_sample=False, repetition_penalty=1.3,
-            past_codes=torch.tensor([]),
-        ))
+        code = int(
+            self._call(
+                model,
+                logits,
+                do_sample=False,
+                repetition_penalty=1.3,
+                past_codes=torch.tensor([]),
+            )
+        )
         argmax = int(self._call(model, logits, do_sample=False))
         assert code == argmax
 
@@ -878,17 +916,14 @@ class TestSampleAudioCode:
     # -- combined top-k + top-p -------------------------------------------- #
 
     def test_top_k_top_p_produces_valid_code(self, model, logits):
-        code = self._call(
-            model, logits, do_sample=True, temperature=1.0, top_k=50, top_p=0.9
-        )
+        code = self._call(model, logits, do_sample=True, temperature=1.0, top_k=50, top_p=0.9)
         assert 0 <= int(code) < self.VOCAB
 
     # -- multinomial returns valid range ----------------------------------- #
 
     def test_multinomial_samples_within_range(self, model, logits):
         codes = [
-            int(self._call(model, logits, do_sample=True, temperature=0.8, top_k=0, top_p=1.0))
-            for _ in range(100)
+            int(self._call(model, logits, do_sample=True, temperature=0.8, top_k=0, top_p=1.0)) for _ in range(100)
         ]
         assert all(0 <= c < self.VOCAB for c in codes)
         assert len(set(codes)) > 1, "multinomial should not be deterministic"
@@ -909,8 +944,7 @@ class TestSampleAudioCode:
         cold_unique = len(set(cold))
         hot_unique = len(set(hot))
         assert hot_unique >= cold_unique, (
-            f"higher temperature should spread mass wider "
-            f"(cold={cold_unique} unique vs hot={hot_unique})"
+            f"higher temperature should spread mass wider (cold={cold_unique} unique vs hot={hot_unique})"
         )
 
 

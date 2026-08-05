@@ -65,9 +65,7 @@ class LongcatNextAudioProcessor(FeatureExtractionMixin):
         cls, input_length: int, kernel_size: int, stride_size: int, avg_pooler: int
     ) -> tuple[int, int]:
         encoder_length = (input_length + 2 * (kernel_size // 2) - kernel_size) // 1 + 1
-        encoder_length = (
-            encoder_length + 2 * (kernel_size // 2) - kernel_size
-        ) // stride_size + 1
+        encoder_length = (encoder_length + 2 * (kernel_size // 2) - kernel_size) // stride_size + 1
         bridge_length = encoder_length // avg_pooler if avg_pooler > 1 else encoder_length
         return encoder_length, bridge_length
 
@@ -85,9 +83,7 @@ class LongcatNextAudioProcessor(FeatureExtractionMixin):
         else:
             waveform = waveform[:, : self.max_audio_seconds * self.sampling_rate]
 
-        stft = torch.stft(
-            waveform, self.n_fft, self.hop_length, window=self.window, return_complex=True
-        )
+        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=self.window, return_complex=True)
         magnitudes = stft[..., :-1].abs() ** 2
 
         mel_filters = torch.from_numpy(self.mel_filters).type(torch.float32)

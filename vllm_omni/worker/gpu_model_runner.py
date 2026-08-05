@@ -1761,8 +1761,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         decode_start_offsets.append(s)
                     elif not getattr(self.model, "omits_talker_mtp_inputs_when_idle", False):
                         raise KeyError(
-                            "mtp_inputs missing for talker_mtp model that must "
-                            "emit it on every span_len==1 decode step"
+                            "mtp_inputs missing for talker_mtp model that must emit it on every span_len==1 decode step"
                         )
 
                 # TODO(Peiqi): the merge stage could move out from the critical path

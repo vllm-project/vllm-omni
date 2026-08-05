@@ -46,9 +46,7 @@ def _frame(value: int) -> torch.Tensor:
 
 
 def _make_omni_output(model, hidden, buffer):
-    return LongcatNextForCausalLM.make_omni_output(
-        model, hidden, model_intermediate_buffer=buffer
-    )
+    return LongcatNextForCausalLM.make_omni_output(model, hidden, model_intermediate_buffer=buffer)
 
 
 def _advance(model, req_id, last_token):
@@ -156,17 +154,20 @@ def test_make_omni_output_stashes_per_request_hidden_with_spans():
         _audio_gen={"rA": {"terminal": False}},
         _visual_gen={"rB": {"terminal": False}},
     )
-    hidden = torch.tensor([
-        [1.0, 1.0, 1.0, 1.0],
-        [2.0, 2.0, 2.0, 2.0],
-    ])
+    hidden = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0, 2.0],
+        ]
+    )
     buffer = [
         {"req_id": "rA", "codes": {"audio": _frame(3)}},
         {"req_id": "rB", "codes": {"audio": _frame(9)}},
     ]
 
     LongcatNextForCausalLM.make_omni_output(
-        model, hidden,
+        model,
+        hidden,
         model_intermediate_buffer=buffer,
         request_token_spans=[(0, 1), (1, 2)],
     )

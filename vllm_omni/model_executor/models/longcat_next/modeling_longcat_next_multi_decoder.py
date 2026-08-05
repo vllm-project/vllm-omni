@@ -95,9 +95,7 @@ class LongcatNextMultiDecoder(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.image_decoder.embed_input_ids(input_ids, **kwargs)
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
-    ) -> None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
     def forward(
@@ -109,18 +107,12 @@ class LongcatNextMultiDecoder(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         model_intermediate_buffer = (
-            kwargs.get("model_intermediate_buffer")
-            or kwargs.get("runtime_additional_information")
-            or {}
+            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            info_dicts = [
-                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
         else:
-            info_dicts = [
-                info for info in model_intermediate_buffer if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         if len(info_dicts) > 1:
             logger.warning(
                 "LongcatNextMultiDecoder got %d requests in one batch; only the "
@@ -142,14 +134,10 @@ class LongcatNextMultiDecoder(nn.Module):
             )
 
         if has_visual:
-            out = self.image_decoder.forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-            )
+            out = self.image_decoder.forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
             return _retag_model_outputs(out, "image")
         if has_audio:
-            out = self.audio_decoder.forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-            )
+            out = self.audio_decoder.forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
             return _retag_model_outputs(out, "audio")
 
         logger.warning("No visual_token_ids or audio_token_ids provided for multi decoder")

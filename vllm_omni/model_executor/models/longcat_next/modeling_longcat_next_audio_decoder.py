@@ -53,18 +53,14 @@ class LongcatNextAudioDecoder(nn.Module):
 
         self.hf_config = load_remote_hf_config(self.model_path)
         vocoder_cfg = self.hf_config.audio_config.cosy24kvocoder_config
-        self.vocoder_weight_path = resolve_checkpoint_relative_path(
-            vocoder_cfg.weight_path, self.model_path
-        )
+        self.vocoder_weight_path = resolve_checkpoint_relative_path(vocoder_cfg.weight_path, self.model_path)
         if not os.path.isfile(self.vocoder_weight_path):
             raise FileNotFoundError(
                 f"Cosy24k vocoder weights not found at {self.vocoder_weight_path}; "
                 "the checkpoint download may be incomplete."
             )
 
-        tokenizer_cls = get_remote_attr(
-            self.model_path, "modular_longcat_next_audio", "LongcatNextAudioTokenizer"
-        )
+        tokenizer_cls = get_remote_attr(self.model_path, "modular_longcat_next_audio", "LongcatNextAudioTokenizer")
         self.audio_tokenizer = tokenizer_cls(self.hf_config)
         self._vocoder = None
         self._weights_loaded = False
@@ -76,13 +72,9 @@ class LongcatNextAudioDecoder(nn.Module):
             with open(gen_cfg_path) as f:
                 custom = json.load(f).get("audio_generation_config", {}).get("custom_params", {})
             self.sample_rate = int(custom.get("sampling_rate", self.sample_rate))
-            self.wave_concat_overlap = int(
-                custom.get("wave_concat_overlap", self.wave_concat_overlap)
-            )
+            self.wave_concat_overlap = int(custom.get("wave_concat_overlap", self.wave_concat_overlap))
 
-        self.codebook_sizes = [
-            int(s) for s in self.hf_config.audio_config.vq_config.codebook_sizes
-        ]
+        self.codebook_sizes = [int(s) for s in self.hf_config.audio_config.vq_config.codebook_sizes]
         self.chunk_end_code = self.codebook_sizes[0]
 
     def _ensure_weights(self) -> None:
@@ -108,9 +100,7 @@ class LongcatNextAudioDecoder(nn.Module):
             return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
         return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
-    ) -> None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
     def _split_chunks(self, codes: torch.Tensor) -> list[torch.Tensor]:
@@ -126,9 +116,7 @@ class LongcatNextAudioDecoder(nn.Module):
         """
         if codes.shape[0] == 0:
             return []
-        limit = torch.tensor(
-            self.codebook_sizes, device=codes.device, dtype=codes.dtype
-        )
+        limit = torch.tensor(self.codebook_sizes, device=codes.device, dtype=codes.dtype)
         # Only non-boundary rows are dropped: a level-0 chunk-end marker row is
         # a split boundary whose non-zero-level codes are never decoded, so it
         # must survive the guard (and may legitimately carry any value there).
@@ -167,18 +155,12 @@ class LongcatNextAudioDecoder(nn.Module):
         del input_ids, positions, intermediate_tensors, inputs_embeds
 
         model_intermediate_buffer = (
-            kwargs.get("model_intermediate_buffer")
-            or kwargs.get("runtime_additional_information")
-            or {}
+            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            info_dicts = [
-                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
         else:
-            info_dicts = [
-                info for info in model_intermediate_buffer if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         if len(info_dicts) > 1:
             # The decoder emits a single waveform via OmniOutput; with more
             # than one request in the batch only the first is decoded. All

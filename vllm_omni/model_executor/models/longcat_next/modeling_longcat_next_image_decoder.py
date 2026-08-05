@@ -8,6 +8,7 @@ VisionTransformerDecoder -> flow-matching refiner (DiT + VAE). Only the
 remote code lazily pulls in on first decode.
 """
 
+import json
 import os
 import tempfile
 from collections.abc import Iterable
@@ -16,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
@@ -56,13 +58,10 @@ class LongcatNextImageDecoder(nn.Module):
         vdc.weight_path = resolve_checkpoint_relative_path(vdc.weight_path, self.model_path)
         if not os.path.isfile(vdc.weight_path):
             raise FileNotFoundError(
-                f"Image decoder weights not found at {vdc.weight_path}; "
-                "the checkpoint download may be incomplete."
+                f"Image decoder weights not found at {vdc.weight_path}; the checkpoint download may be incomplete."
             )
 
-        tokenizer_cls = get_remote_attr(
-            self.model_path, "modular_longcat_next_visual", "LongcatNextVisualTokenizer"
-        )
+        tokenizer_cls = get_remote_attr(self.model_path, "modular_longcat_next_visual", "LongcatNextVisualTokenizer")
         self.visual_tokenizer = tokenizer_cls(self.hf_config)
         self._weights_loaded = False
 
@@ -70,8 +69,6 @@ class LongcatNextImageDecoder(nn.Module):
         default_w = _DEFAULT_TOKEN_HW
         gen_cfg_path = os.path.join(self.model_path, "generation_config.json")
         if os.path.isfile(gen_cfg_path):
-            import json
-
             with open(gen_cfg_path) as f:
                 custom = json.load(f).get("visual_generation_config", {}).get("custom_params", {})
             default_h = int(custom.get("token_h", default_h))
@@ -98,9 +95,7 @@ class LongcatNextImageDecoder(nn.Module):
             return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
         return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
-    ) -> None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
     def forward(
@@ -114,18 +109,12 @@ class LongcatNextImageDecoder(nn.Module):
         del input_ids, positions, intermediate_tensors, inputs_embeds
 
         model_intermediate_buffer = (
-            kwargs.get("model_intermediate_buffer")
-            or kwargs.get("runtime_additional_information")
-            or {}
+            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
         )
         if isinstance(model_intermediate_buffer, dict):
-            info_dicts = [
-                info for info in model_intermediate_buffer.values() if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
         else:
-            info_dicts = [
-                info for info in model_intermediate_buffer if isinstance(info, dict)
-            ]
+            info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         if len(info_dicts) > 1:
             logger.warning(
                 "LongcatNextImageDecoder got %d requests in one batch; only the "
@@ -165,7 +154,9 @@ class LongcatNextImageDecoder(nn.Module):
                 "Image decoder got %d code frames, expected token_h*token_w=%d "
                 "-- generation ran past the intended grid; truncating to the "
                 "first %d frames",
-                codes.shape[0], expected_positions, expected_positions,
+                codes.shape[0],
+                expected_positions,
+                expected_positions,
             )
             codes = codes[:expected_positions]
         elif codes.shape[0] < expected_positions:
@@ -185,7 +176,8 @@ class LongcatNextImageDecoder(nn.Module):
                 "(e.g. max_tokens exhausted before <longcat_img_end>); "
                 "skipping image output for this request instead of crashing "
                 "the reference decoder.",
-                codes.shape[0], expected_positions,
+                codes.shape[0],
+                expected_positions,
             )
             return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
@@ -204,8 +196,6 @@ class LongcatNextImageDecoder(nn.Module):
                 image_paths = self.visual_tokenizer.lazy_decode_and_save(
                     codes, token_h, token_w, f"{save_prefix}_0.png"
                 )
-            from PIL import Image
-
             pil = Image.open(image_paths[0]).convert("RGB")
             image = torch.from_numpy(np.asarray(pil)).permute(2, 0, 1).float() / 255.0
 

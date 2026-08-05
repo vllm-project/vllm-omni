@@ -60,9 +60,9 @@ from .longcat_next_processor import (
     LongcatNextProcessingInfo,
 )
 from .longcat_next_utils import (
+    AUDIO_PAD_TOKEN_ID,
     AUDIOGEN_END_TOKEN_ID,
     AUDIOGEN_START_TOKEN_ID,
-    AUDIO_PAD_TOKEN_ID,
     AUDIOTEXT_PAD_TOKEN_ID,
     AUDIOTEXT_START_TOKEN_ID,
     IMG_END_TOKEN_ID,
@@ -166,9 +166,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         ngram_ratio = hf.ngram_vocab_size_ratio
         hf.ngram_vocab_size_ratio = None
         try:
-            self.model = FlashNgramModel(
-                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-            )
+            self.model = FlashNgramModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         finally:
             hf.ngram_vocab_size_ratio = ngram_ratio
         if get_pp_group().is_first_rank:
@@ -176,9 +174,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             ngram_cfg.vocab_size = self.text_vocab_hash_size
             self.model.ngram_embeddings = NgramEmbedding(ngram_cfg, self.model.embed_tokens)
 
-        self.text_vocab_size = int(
-            getattr(hf, "text_vocab_plus_multimodal_special_token_size", 131125)
-        )
+        self.text_vocab_size = int(getattr(hf, "text_vocab_plus_multimodal_special_token_size", 131125))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.text_vocab_size,
@@ -193,15 +189,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         # --- multimodal encoders + depth heads (remote code, replicated) ---
         remote_config = load_remote_hf_config(self.model_path)
-        visual_tok_cls = get_remote_attr(
-            self.model_path, "modular_longcat_next_visual", "LongcatNextVisualTokenizer"
-        )
-        audio_tok_cls = get_remote_attr(
-            self.model_path, "modular_longcat_next_audio", "LongcatNextAudioTokenizer"
-        )
-        head_cls = get_remote_attr(
-            self.model_path, "modular_longcat_next", "CasualDepthTransformerHead"
-        )
+        visual_tok_cls = get_remote_attr(self.model_path, "modular_longcat_next_visual", "LongcatNextVisualTokenizer")
+        audio_tok_cls = get_remote_attr(self.model_path, "modular_longcat_next_audio", "LongcatNextAudioTokenizer")
+        head_cls = get_remote_attr(self.model_path, "modular_longcat_next", "CasualDepthTransformerHead")
         self.visual_tokenizer = visual_tok_cls(remote_config)
         self.audio_tokenizer = audio_tok_cls(remote_config)
         vc, ac = remote_config.visual_config, remote_config.audio_config
@@ -251,9 +241,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self._eos_id = int(getattr(hf, "eos_token_id", 2))
         self._ngram_ctx: dict[str, torch.Tensor] = {}
         self._ngram_disabled = int(os.environ.get("LONGCAT_NGRAM_DISABLE", "0")) != 0
-        self._max_ctx_entries = 4 * max(
-            int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64
-        )
+        self._max_ctx_entries = 4 * max(int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64)
         assert ngram is not None, "LongCat-Next requires ngram embeddings"
 
         # --- audio generation state (talker_mtp) ---
@@ -318,9 +306,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         """[n, num_levels] offset code ids -> [n, hidden] summed embeddings."""
         return self.model.embed_tokens(code_ids).sum(dim=1)
 
-    def _encode_images(
-        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
-    ) -> list[torch.Tensor]:
+    def _encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> list[torch.Tensor]:
         # `pixel_values` is a single flat [total_patches, D] tensor holding
         # every image's patches concatenated on dim 0 (per
         # MultiModalFieldConfig.flat_from_sizes); `grid_thw` is [num_images, 3].
@@ -334,12 +320,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # reads `config.merge_size` with a `2` fallback and stores it as
         # `self.merge_size`; read the constructed module's own attribute.
         merge_size = getattr(self.visual_tokenizer.visual_model, "merge_size", 2)
-        sizes = (grid_thw.prod(dim=-1) // (merge_size ** 2)).tolist()
+        sizes = (grid_thw.prod(dim=-1) // (merge_size**2)).tolist()
 
         with torch.inference_mode():
-            ids = self.visual_tokenizer.encode(
-                pixel_values.to(device=device, dtype=self.dtype), grid_thw
-            )
+            ids = self.visual_tokenizer.encode(pixel_values.to(device=device, dtype=self.dtype), grid_thw)
             ids = ids.long() + self.visual_offset_vals
             emb = self._code_embeddings(ids)
             emb = self.visual_tokenizer.visual_embedding_layer(emb.to(self.dtype))
@@ -398,9 +382,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def _neg_eos(self, tokens: torch.Tensor) -> torch.Tensor:
         return torch.where(tokens == self._eos_id, -tokens, tokens)
 
-    def _span_oe_ids(
-        self, request_id: str, span_ids: torch.Tensor, fresh: bool
-    ) -> torch.Tensor:
+    def _span_oe_ids(self, request_id: str, span_ids: torch.Tensor, fresh: bool) -> torch.Tensor:
         """Global n-gram ids [span, num_embedders] for one request span."""
         ngram = self.model.ngram_embeddings
         device = span_ids.device
@@ -438,7 +420,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return oe_ids.long()
 
     def _advance_audio_gen(
-        self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
+        self,
+        request_id: str,
+        last_token: int,
+        device: torch.device,
+        dtype: torch.dtype,
         decode_eligible: bool = True,
     ) -> dict[str, Any]:
         """Update audio-gen state based on the last emitted visible token.
@@ -500,27 +486,26 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             # that step's codes were already discarded, so the first real frame
             # lands on delay+1 — hence the strict '>' rather than '>='.
             delay = state["delay"]
-            state["ext_id"] = (
-                AUDIOTEXT_START_TOKEN_ID if gen_step == delay else AUDIOTEXT_PAD_TOKEN_ID
-            )
+            state["ext_id"] = AUDIOTEXT_START_TOKEN_ID if gen_step == delay else AUDIOTEXT_PAD_TOKEN_ID
             state["audio_start"] = gen_step > delay
             # Emit mtp_inputs so the runner calls talker_mtp this step.
             # last_hidden from previous forward (stashed by make_omni_output),
             # or zeros if this is the first step after audio_gen creation.
             last_hidden = state.get("last_hidden")
             if last_hidden is None:
-                last_hidden = torch.zeros(
-                    1, self.config.hidden_size, device=device, dtype=dtype
-                )
-            text_step = torch.zeros(
-                1, self.config.hidden_size, device=device, dtype=dtype
-            )
+                last_hidden = torch.zeros(1, self.config.hidden_size, device=device, dtype=dtype)
+            text_step = torch.zeros(1, self.config.hidden_size, device=device, dtype=dtype)
             update["mtp_inputs"] = (last_hidden, text_step)
         return update
 
     def _advance_visual_gen(
-        self, request_id: str, last_token: int, device: torch.device, dtype: torch.dtype,
-        token_w: int | None = None, token_h: int | None = None,
+        self,
+        request_id: str,
+        last_token: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        token_w: int | None = None,
+        token_h: int | None = None,
         cfg_scale: float | None = None,
         decode_eligible: bool = True,
     ) -> dict[str, Any]:
@@ -588,7 +573,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                         "additional_information={'token_w': ..., 'token_h': ...} "
                         "and the <longcat_img_token_size>{h} {w}</longcat_img_token_size> "
                         "prompt prefix to match the reference behavior.",
-                        request_id, self._default_token_w, self._default_token_h,
+                        request_id,
+                        self._default_token_w,
+                        self._default_token_h,
                     )
             self._visual_gen[request_id] = {
                 "gen_step": 0,
@@ -681,21 +668,33 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         last_token = int(input_ids[-1])
         is_prefill = bool(info.get("_omni_is_prefill", False))
         decode_eligible = (not is_prefill) and int(input_ids.shape[0]) == 1
-        update_dict.update(self._advance_audio_gen(
-            request_id, last_token, device=input_ids.device, dtype=self.dtype,
-            decode_eligible=decode_eligible,
-        ))
+        update_dict.update(
+            self._advance_audio_gen(
+                request_id,
+                last_token,
+                device=input_ids.device,
+                dtype=self.dtype,
+                decode_eligible=decode_eligible,
+            )
+        )
         additional_information = info.get("additional_information")
         if not isinstance(additional_information, dict):
             additional_information = info
         token_w = additional_information.get("token_w")
         token_h = additional_information.get("token_h")
         cfg_scale = additional_information.get("cfg_scale")
-        update_dict.update(self._advance_visual_gen(
-            request_id, last_token, device=input_ids.device, dtype=self.dtype,
-            token_w=token_w, token_h=token_h, cfg_scale=cfg_scale,
-            decode_eligible=decode_eligible,
-        ))
+        update_dict.update(
+            self._advance_visual_gen(
+                request_id,
+                last_token,
+                device=input_ids.device,
+                dtype=self.dtype,
+                token_w=token_w,
+                token_h=token_h,
+                cfg_scale=cfg_scale,
+                decode_eligible=decode_eligible,
+            )
+        )
 
         return input_ids, out.to(self.dtype), update_dict
 
@@ -864,7 +863,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         base = int(self.audio_offset_vals[0].item())
         total = sum(self.audio_codebook_sizes)
         audio_id_range = torch.arange(
-            base, base + total, device=device, dtype=torch.long,
+            base,
+            base + total,
+            device=device,
+            dtype=torch.long,
         )
         # All ranks participate in this embed_tokens call (matched collective).
         emb = self.model.embed_tokens(audio_id_range).detach().float()
@@ -991,9 +993,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    -1, sorted_indices, sorted_indices_to_remove
-                )
+                indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -1071,8 +1071,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     level_logits = level_logits.clone()
                     level_logits[sentinel_idx] = float("-inf")
                 code = self._sample_audio_code(
-                    level_logits, do_sample=do_sample, temperature=temperature,
-                    top_k=top_k, top_p=top_p,
+                    level_logits,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
                     repetition_penalty=repetition_penalty,
                     past_codes=None if past_codes is None else past_codes[:, level],
                 )
@@ -1137,8 +1140,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     combined = combined.clone()
                     combined[sentinel_idx] = float("-inf")
                 code = self._sample_audio_code(
-                    combined, do_sample=do_sample, temperature=temperature,
-                    top_k=top_k, top_p=top_p,
+                    combined,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
                     repetition_penalty=repetition_penalty,
                     past_codes=None if past_codes is None else past_codes[:, level],
                 )
@@ -1192,12 +1198,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         audio_top_p = kwargs.get("audio_top_p", kwargs.get("top_p", 0.85))
         visual_top_k = kwargs.get("visual_top_k", kwargs.get("top_k", 1024))
         visual_top_p = kwargs.get("visual_top_p", kwargs.get("top_p", 0.75))
-        audio_rep_penalty = kwargs.get(
-            "audio_repetition_penalty", kwargs.get("repetition_penalty", 1.3)
-        )
-        visual_rep_penalty = kwargs.get(
-            "visual_repetition_penalty", kwargs.get("repetition_penalty", 1.0)
-        )
+        audio_rep_penalty = kwargs.get("audio_repetition_penalty", kwargs.get("repetition_penalty", 1.3))
+        visual_rep_penalty = kwargs.get("visual_repetition_penalty", kwargs.get("repetition_penalty", 1.0))
         if do_sample is None:
             do_sample = True
         if temperature is None:
@@ -1284,13 +1286,22 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     continue
 
                 past_codes = state.get("past_codes")
-                past_codes_t = (
-                    torch.stack(past_codes).to(device) if past_codes else None
-                )
+                past_codes_t = torch.stack(past_codes).to(device) if past_codes else None
                 codes_row = self._sample_depth_head(
-                    self.audio_head, audio_code_embed, self.audio_offset_vals, num_levels,
-                    last_hidden, rank, tp_group, device, do_sample, temperature,
-                    audio_top_k, audio_top_p, audio_rep_penalty, past_codes_t,
+                    self.audio_head,
+                    audio_code_embed,
+                    self.audio_offset_vals,
+                    num_levels,
+                    last_hidden,
+                    rank,
+                    tp_group,
+                    device,
+                    do_sample,
+                    temperature,
+                    audio_top_k,
+                    audio_top_p,
+                    audio_rep_penalty,
+                    past_codes_t,
                     mask_audio_sentinels=True,
                 )
 
@@ -1439,8 +1450,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 t_state = self._visual_gen.get(twin_req_id) if twin_req_id is not None else None
                 both_visual_active = (
                     parent_req_id is not None
-                    and p_row is not None and t_row is not None
-                    and p_state is not None and t_state is not None
+                    and p_row is not None
+                    and t_row is not None
+                    and p_state is not None
+                    and t_state is not None
                     and not bool(p_state.get("terminal", False))
                     and not bool(t_state.get("terminal", False))
                 )
@@ -1466,9 +1479,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                         "twin=%s(row=%s,state=%s,terminal=%s) -- falling back to independent "
                         "(non-CFG) sampling for this step",
                         req_id,
-                        parent_req_id, p_row, p_state is not None,
+                        parent_req_id,
+                        p_row,
+                        p_state is not None,
                         bool(p_state.get("terminal", False)) if p_state is not None else None,
-                        twin_req_id, t_row, t_state is not None,
+                        twin_req_id,
+                        t_row,
+                        t_state is not None,
                         bool(t_state.get("terminal", False)) if t_state is not None else None,
                     )
 
@@ -1476,20 +1493,33 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     # ---- combined CFG path (drives both streams) ----
                     p_last_hidden = (
                         last_talker_hidden[p_row : p_row + 1]
-                        if p_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
+                        if p_row < last_talker_hidden.shape[0]
+                        else last_talker_hidden[-1:]
                     )
                     t_last_hidden = (
                         last_talker_hidden[t_row : t_row + 1]
-                        if t_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
+                        if t_row < last_talker_hidden.shape[0]
+                        else last_talker_hidden[-1:]
                     )
                     p_past = p_state.get("past_codes")
                     p_past_t = torch.stack(p_past).to(device) if p_past else None
                     cfg_scale = float(p_state.get("cfg_scale", _DEFAULT_CFG_SCALE))
                     codes_row = self._sample_cfg_visual_codes(
-                        visual_code_embed, self.visual_offset_vals, visual_num_levels,
-                        p_last_hidden, t_last_hidden, rank, tp_group, device,
-                        do_sample, temperature, visual_top_k, visual_top_p,
-                        visual_rep_penalty, p_past_t, cfg_scale,
+                        visual_code_embed,
+                        self.visual_offset_vals,
+                        visual_num_levels,
+                        p_last_hidden,
+                        t_last_hidden,
+                        rank,
+                        tp_group,
+                        device,
+                        do_sample,
+                        temperature,
+                        visual_top_k,
+                        visual_top_p,
+                        visual_rep_penalty,
+                        p_past_t,
+                        cfg_scale,
                     )
 
                     deoff = int(codes_row[0].item())
@@ -1542,13 +1572,22 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     continue
 
                 past_codes = state.get("past_codes")
-                past_codes_t = (
-                    torch.stack(past_codes).to(device) if past_codes else None
-                )
+                past_codes_t = torch.stack(past_codes).to(device) if past_codes else None
                 codes_row = self._sample_depth_head(
-                    self.visual_head, visual_code_embed, self.visual_offset_vals, visual_num_levels,
-                    last_hidden, rank, tp_group, device, do_sample, temperature,
-                    visual_top_k, visual_top_p, visual_rep_penalty, past_codes_t,
+                    self.visual_head,
+                    visual_code_embed,
+                    self.visual_offset_vals,
+                    visual_num_levels,
+                    last_hidden,
+                    rank,
+                    tp_group,
+                    device,
+                    do_sample,
+                    temperature,
+                    visual_top_k,
+                    visual_top_p,
+                    visual_rep_penalty,
+                    past_codes_t,
                     mask_sentinel=True,
                 )
 
@@ -1685,9 +1724,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        side_state: dict[str, dict[str, torch.Tensor]] = {
-            attr: {} for _, attr in self._SIDE_MODULE_PREFIXES
-        }
+        side_state: dict[str, dict[str, torch.Tensor]] = {attr: {} for _, attr in self._SIDE_MODULE_PREFIXES}
 
         def split(weights):
             for name, tensor in weights:

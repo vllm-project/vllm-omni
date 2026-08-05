@@ -27,9 +27,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _IMAGE_SENTINEL = OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": "image"})
-_AUDIO_SENTINEL = OmniOutput(
-    text_hidden_states=None, multimodal_outputs={"model_outputs": "audio", "sr": 24000}
-)
+_AUDIO_SENTINEL = OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": "audio", "sr": 24000})
 
 
 def _decoder(**attrs) -> SimpleNamespace:

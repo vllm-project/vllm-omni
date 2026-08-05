@@ -96,12 +96,10 @@ class LongcatNextDummyInputsBuilder(BaseDummyInputsBuilder[LongcatNextProcessing
 
         mm_data: MultiModalDataDict = {
             "image": [
-                np.random.randint(0, 255, (image_height, image_width, 3), dtype=np.uint8)
-                for _ in range(num_images)
+                np.random.randint(0, 255, (image_height, image_width, 3), dtype=np.uint8) for _ in range(num_images)
             ],
             "audio": [
-                (np.random.randn(audio_length).astype(np.float32), _AUDIO_SAMPLING_RATE)
-                for _ in range(num_audios)
+                (np.random.randn(audio_length).astype(np.float32), _AUDIO_SAMPLING_RATE) for _ in range(num_audios)
             ],
         }
         return mm_data
@@ -173,9 +171,7 @@ class LongcatNextMultiModalProcessor(BaseMultiModalProcessor[LongcatNextProcessi
         tokenizer = self.info.get_tokenizer()
 
         data: dict[str, Any] = {}
-        data["input_ids"] = torch.tensor(
-            [tokenizer.encode(prompt, add_special_tokens=False)], dtype=torch.long
-        )
+        data["input_ids"] = torch.tensor([tokenizer.encode(prompt, add_special_tokens=False)], dtype=torch.long)
 
         images = mm_data.get("images") or mm_data.get("image")
         if images:
@@ -249,9 +245,7 @@ class LongcatNextMultiModalProcessor(BaseMultiModalProcessor[LongcatNextProcessi
         image_grid_thw = hf_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             config["image_grid_thw"] = MultiModalFieldConfig.batched("image")
-            config["pixel_values"] = MultiModalFieldConfig.flat_from_sizes(
-                "image", image_grid_thw.prod(-1)
-            )
+            config["pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", image_grid_thw.prod(-1))
 
         chunk_counts = hf_inputs.get("audio_chunk_counts")
         if chunk_counts is not None:

@@ -62,7 +62,9 @@ def test_thinker2image_decoder_skips_unfinished():
 
 
 def _source_output_with_mm(
-    mm_output: dict | None, finished: bool = True, out_ids: list[int] | None = None,
+    mm_output: dict | None,
+    finished: bool = True,
+    out_ids: list[int] | None = None,
 ):
     """Like _source_output, but with a real multimodal_output payload --
     matching what talker_mtp's accumulated codes look like on a finished
@@ -84,9 +86,7 @@ def test_thinker2audio_decoder_token_only():
     # talker_mtp's codes are de-offset raw indices, not offset-carrying --
     # see modeling_longcat_next.py::talker_mtp's docstring for why.
     codes = [[3] * 8, [5] * 8]
-    prompts = thinker2audio_decoder_token_only(
-        [_source_output_with_mm({"codes": {"audio": codes}})]
-    )
+    prompts = thinker2audio_decoder_token_only([_source_output_with_mm({"codes": {"audio": codes}})])
     assert len(prompts) == 1
     assert prompts[0]["additional_information"]["audio_token_ids"] == codes
 

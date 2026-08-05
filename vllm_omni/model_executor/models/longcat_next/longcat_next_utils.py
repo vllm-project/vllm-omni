@@ -148,9 +148,7 @@ def load_weight_subtree(
     if missing:
         logger.warning("load_weight_subtree(%s): %d missing keys (e.g. %s)", prefix, len(missing), missing[:3])
     if unexpected:
-        logger.warning(
-            "load_weight_subtree(%s): %d unexpected keys (e.g. %s)", prefix, len(unexpected), unexpected[:3]
-        )
+        logger.warning("load_weight_subtree(%s): %d unexpected keys (e.g. %s)", prefix, len(unexpected), unexpected[:3])
     return list(missing), list(unexpected)
 
 
