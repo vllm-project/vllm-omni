@@ -1300,11 +1300,23 @@ class MiniMaxH3Pipeline(
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
+        text_len = int(packed["text_pos"].view(-1).shape[0])
+        static_conditioning = self.transformer.prepare_static_conditioning(
+            prompt_embeds=text_embeddings.to(self.device),
+            img_position_ids=packed["img_position_ids"][None].to(self.device),
+            refiner_cu_seqlens=torch.tensor(
+                [0, text_len, text_len],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            refiner_max_seqlen=text_len,
+        )
         branch = MiniMaxH3DenoiseBranch(
             packed=packed,
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
+            static_conditioning=static_conditioning,
         )
 
         visual_anchor = visual_condition

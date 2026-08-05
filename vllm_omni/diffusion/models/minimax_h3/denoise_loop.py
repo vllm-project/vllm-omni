@@ -17,6 +17,10 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 
+from .minimax_h3_transformer import (
+    MINIMAX_H3_STATIC_CONDITIONING_KWARG,
+    MiniMaxH3StaticConditioning,
+)
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -46,6 +50,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        static_conditioning: MiniMaxH3StaticConditioning | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -72,11 +77,9 @@ class MiniMaxH3DenoiseBranch:
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
         self.static_kwargs: dict[str, Any] = {
-            "img_position_ids": packed["img_position_ids"][None].to(device),
             "update_mask": self.update_mask_dev,
             "token_tags": token_tags.view(-1).to(torch.long).to(device),
             "skip_mask_out_condition": False,
-            "prompt_embeds": text_embeddings.to(device),
             "img_pos_info": {"position_ids": self.img_pos_dev},
             "audio_pos_info": {"position_ids": self.audio_pos_dev},
             "text_pos_info": {"position_ids": text_pos_dev},
@@ -84,10 +87,6 @@ class MiniMaxH3DenoiseBranch:
             "packed_seq_params": {
                 "cu_seqlens_q": cu.to(device),
                 "max_seqlen_q": int(cu[1]),
-            },
-            "refiner_packed_seq_params": {
-                "cu_seqlens_q": torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device),
-                "max_seqlen_q": text_len,
             },
         }
         # Where the video segment sits in the packed sequence. Resolved to plain
@@ -97,6 +96,24 @@ class MiniMaxH3DenoiseBranch:
             prefix_len=int(packed["video_row_start"]),
             latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
         )
+        if static_conditioning is not None:
+            self.static_kwargs[MINIMAX_H3_STATIC_CONDITIONING_KWARG] = static_conditioning
+        else:
+            # Preserve the raw conditioning path for direct branch users.
+            self.static_kwargs.update(
+                {
+                    "img_position_ids": packed["img_position_ids"][None].to(device),
+                    "prompt_embeds": text_embeddings.to(device),
+                    "refiner_packed_seq_params": {
+                        "cu_seqlens_q": torch.tensor(
+                            [0, text_len, text_len],
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        "max_seqlen_q": text_len,
+                    },
+                }
+            )
 
     def forward_kwargs(
         self,
