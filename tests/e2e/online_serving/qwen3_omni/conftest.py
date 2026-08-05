@@ -11,7 +11,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-DEPLOY_CONFIG = get_deploy_config_path("qwen3_omni_moe_duplex.yaml")
+DEPLOY_CONFIG = get_deploy_config_path("qwen3_omni_moe_duplex_1gpu.yaml")
 
 DUPLEX_SERVER_PARAMS = [
     pytest.param(
