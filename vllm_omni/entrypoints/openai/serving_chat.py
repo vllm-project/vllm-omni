@@ -587,7 +587,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         mm_token_counts: dict[str, int] | None = None
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                mm_token_counts = _get_mm_token_counts(engine_prompt)
+                if self.enable_prompt_tokens_details:
+                    mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:

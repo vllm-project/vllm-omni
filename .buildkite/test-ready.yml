@@ -277,6 +277,8 @@ steps:
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_qwen3_omni.py
+          - tests/helpers/runtime.py
+          - vllm_omni/entrypoints/openai/serving_chat.py
           - vllm_omni/model_executor/models/qwen3_omni/
           - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
           - vllm_omni/deploy/qwen3_omni_moe.yaml
