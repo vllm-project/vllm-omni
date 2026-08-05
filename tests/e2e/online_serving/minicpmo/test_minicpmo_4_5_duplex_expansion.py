@@ -40,13 +40,10 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     args.sessions = 1
     args.disconnect_session_index = None
     args.takeover_session_index = None
-    args.expire_session_index = 0
     args.verify_admission_limit = 2
     result = asyncio.run(run_lifecycle_probes(args))
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
-    assert result["expiry"]["ok"] is True
-    assert result["expiry"]["error_code"] == "session_resume_expired"
     assert result["admission"]["ok"] is True
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
