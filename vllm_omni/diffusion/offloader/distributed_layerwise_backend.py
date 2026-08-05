@@ -330,7 +330,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
                 for dtype, local_shard in gpu_shards.items():
-                    gw = gpu_weights[dtype]
+                    # Slice the shared (max-sized) output buffer down to this
+                    # block's actual AllGather output size.  The buffers are
+                    # sized to the *largest* block across all groups, so for
+                    # any smaller block the full buffer would violate the
+                    # all_gather_into_tensor contract
+                    # (output.numel() == world_size * input.numel()).
+                    # Repoint offsets are relative to the block's flattened
+                    # buffer, so a prefix slice is safe.
+                    gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
                     torch.distributed.all_gather_into_tensor(
                         gw,
                         local_shard,

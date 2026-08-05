@@ -61,6 +61,8 @@ def test_minimax_h3_t2va_ulysses8_smoke():
                 output_type="np",
                 extra_args={
                     "task": "t2va",
+                    "duration": 4.0,
+                    "aspect_ratio": "16:9",
                     "flow_shift": 12.0,
                     "audio_flow_shift": 3.0,
                 },
@@ -70,7 +72,14 @@ def test_minimax_h3_t2va_ulysses8_smoke():
     finally:
         engine.close()
 
-    _assert_joint_output(outputs)
+    assert len(outputs) == 1
+    frames = np.asarray(outputs[0].images[0])
+    assert frames.shape == (107, 256, 448, 3)
+    multimodal = outputs[0].multimodal_output
+    assert multimodal is not None
+    assert np.asarray(multimodal["audio"]).shape[1] == 2
+    assert multimodal["audio_sample_rate"] == 32000
+    assert multimodal["fps"] == 24
 
 
 @pytest.mark.skipif(

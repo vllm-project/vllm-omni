@@ -504,6 +504,81 @@ class TestCrossGroupSharedBuffer:
         assert not sync_called[0], "Should skip sync-prefetch when slot_group matches (non-contaminated)"
 
 
+class TestAllGatherOutputSlicing:
+    """Regression test: with heterogeneous block sizes (e.g. MiniMax H3's
+    token_refiner with blocks of ~1231MB and ~239MB), the shared AllGather
+    output buffers are sized to the *largest* block across all groups.
+    prefetch_layer must slice the output buffer down to each block's actual
+    AllGather output size, otherwise output.numel() != dp_size * input.numel()
+    and all_gather_into_tensor raises during enable()'s first prefetch.
+    """
+
+    def test_prefetch_slices_shared_output_buffer_to_block_size(self, dist_group, patched_offload_runtime, monkeypatch):
+        dp_size = 2
+
+        # Heterogeneous block sizes: 8 vs 32 elements.
+        small_block = nn.Module()
+        small_block.weight = nn.Parameter(torch.arange(8, dtype=torch.float32))
+        large_block = nn.Module()
+        large_block.weight = nn.Parameter(torch.arange(100, 132, dtype=torch.float32))
+
+        def make_hook(next_block: nn.Module) -> DistributedLayerwiseOffloadHook:
+            hook = DistributedLayerwiseOffloadHook(
+                next_block=next_block,
+                device=torch.device("cpu"),
+                dp_group=dist.group.WORLD,  # non-None -> AllGather path (mocked below)
+                dp_size=dp_size,
+                rank=0,
+                pin_memory=False,
+            )
+            current_block = nn.Module()
+            current_block.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            hook.initialize_hook(current_block)
+            return hook
+
+        hook_small = make_hook(small_block)
+        hook_large = make_hook(large_block)
+        hooks = [hook_small, hook_large]
+
+        # Assign max-sized shared buffers exactly as backend.enable() does.
+        shared_buffers = DistributedLayerwiseOffloadBackend._allocate_shared_buffers(hooks)
+        shared_shard_buffers = DistributedLayerwiseOffloadBackend._allocate_shared_shard_buffers(hooks)
+        for hook in hooks:
+            hook.gpu_buffers = shared_buffers
+            hook.gpu_shard_buffers = shared_shard_buffers
+
+        # Shared output buffer must be sized to the largest block (32).
+        assert shared_buffers[0][torch.float32].numel() == 32
+
+        # Fake AllGather that enforces the real torch size contract and
+        # emulates reconstruction of the full block from all ranks' shards.
+        full_values = {
+            8: torch.arange(8, dtype=torch.float32),
+            32: torch.arange(100, 132, dtype=torch.float32),
+        }
+        ag_output_numels: list[int] = []
+
+        def fake_all_gather(output, input, group=None):
+            assert output.numel() == dp_size * input.numel(), (
+                f"AllGather contract violated: output.numel()={output.numel()} "
+                f"!= {dp_size} * input.numel()={input.numel()}"
+            )
+            ag_output_numels.append(output.numel())
+            output.copy_(full_values[output.numel()])
+
+        monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+
+        # Small block: output must be sliced to dp_size * shard = 8, not 32.
+        hook_small.prefetch_layer(slot=0, non_blocking=False)
+        assert ag_output_numels[-1] == 8
+        assert torch.equal(small_block.weight, full_values[8])
+
+        # Large block: uses the full max-sized buffer.
+        hook_large.prefetch_layer(slot=1, non_blocking=False)
+        assert ag_output_numels[-1] == 32
+        assert torch.equal(large_block.weight, full_values[32])
+
+
 class TestOffloadPlan:
     """Test declarative OffloadPlan metadata."""
 

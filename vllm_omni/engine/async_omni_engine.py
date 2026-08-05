@@ -315,8 +315,16 @@ class AsyncOmniEngine:
             from types import SimpleNamespace
 
             from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
+            model_class_name = resolve_model_class_name(self.model)
+            metadata = get_diffusion_model_metadata(model_class_name)
+            self._diffusion_od_config_view = SimpleNamespace(
+                model_class_name=model_class_name,
+                supports_multimodal_inputs=metadata.supports_multimodal_inputs,
+                max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
+                supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+            )
         return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:

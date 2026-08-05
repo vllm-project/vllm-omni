@@ -102,6 +102,52 @@ def test_reference_image_resize_contract():
         _reference_image_shape(Image.new("RGB", (100, 501)))
 
 
+def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_fl2va_keyframe_indices,
+    )
+
+    assert _resolve_fl2va_keyframe_indices({}, 1) == [0]
+    assert _resolve_fl2va_keyframe_indices({}, 2) == [0, -1]
+    assert _resolve_fl2va_keyframe_indices({"frame_index": -1}, 1) == [-1]
+    assert _resolve_fl2va_keyframe_indices({"frame_indices": [0, -1]}, 2) == [0, -1]
+    with pytest.raises(ValueError, match="frame_indices"):
+        _resolve_fl2va_keyframe_indices({"frame_indices": [0, 1]}, 2)
+
+
+def test_minimax_h3_uses_the_official_output_canvas_policy():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_output_canvas,
+    )
+
+    assert _resolve_output_canvas(21 / 9, 768) == (672, 1536)
+    assert _resolve_output_canvas(16 / 9, 768) == (768, 1344)
+    assert _resolve_output_canvas(9 / 16, 768) == (1344, 768)
+    with pytest.raises(ValueError, match="short_edge"):
+        _resolve_output_canvas(16 / 9, 720)
+
+
+def test_minimax_h3_accepts_sglang_auto_aspect_ratio_alias():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    sampling = SimpleNamespace(
+        fps=24,
+        num_frames=1,
+        height=None,
+        width=None,
+        extra_args={"duration": 5.0, "aspect_ratio": "auto"},
+    )
+    height, width, *_ = pipeline._resolve_shape("ref2va", sampling, None)
+    assert (height, width) == (768, 1344)
+
+
+def test_minimax_h3_advertises_the_official_ref2va_image_limit():
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
+
+
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -373,3 +419,360 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
     )
     assert shapes == [(1, 2, 3), (2, 2, 3)]
+
+
+@pytest.mark.parametrize(
+    ("case", "extra", "image_count", "expected"),
+    [
+        ("F1", {"frame_index": -1}, 1, [-1]),
+        ("F2", {"frame_indices": [0, -1]}, 2, [0, -1]),
+    ],
+)
+def test_f1_f2_official_fl2va_keyframe_matrix(case, extra, image_count, expected):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_fl2va_keyframe_indices,
+    )
+
+    assert case in {"F1", "F2"}
+    assert _resolve_fl2va_keyframe_indices(extra, image_count) == expected
+
+
+@pytest.mark.parametrize(
+    ("case", "counts"),
+    [
+        ("R1", (3, 0, 0)),
+        ("R2", (1, 0, 0)),
+        ("R3", (1, 1, 0)),
+        ("R4", (0, 1, 1)),
+        ("R5", (1, 1, 1)),
+        ("R6", (1, 0, 2)),
+    ],
+)
+def test_r1_r6_ref2va_reference_count_matrix(case, counts):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _validate_ref2va_reference_counts,
+    )
+
+    assert case.startswith("R")
+    _validate_ref2va_reference_counts(*counts)
+
+
+def test_ref2va_reference_count_validation_preserves_client_error_metadata():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _validate_ref2va_reference_counts,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match="at least one image or video"):
+        _validate_ref2va_reference_counts(0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("case", "start_time", "expected_duration"),
+    [
+        ("R7", None, 10.0),
+        ("R8", 4.0, 6.0),
+    ],
+)
+def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_time, expected_duration):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    source = tmp_path / f"{case}.mp4"
+    source.touch()
+    metadata = {
+        "width": 1280,
+        "height": 720,
+        "fps": 24.0,
+        "frame_count": 240,
+        "duration": 10.0,
+        "format_names": ("mp4",),
+        "video_codec": "h264",
+        "audio_codecs": (),
+        "file_size": 1024,
+    }
+    transcode_calls = []
+    monkeypatch.setattr(reference_video_module, "_probe_video", lambda _path: metadata)
+    monkeypatch.setattr(
+        reference_video_module,
+        "_transcode_reference_video",
+        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or "prepared.mp4",
+    )
+
+    prepared = reference_video_module.prepare_reference_videos(
+        [str(source)],
+        target_frame_count=209,
+        workdir=str(tmp_path / "work"),
+        start_time_seconds=start_time,
+    )
+
+    assert prepared[0]["duration_seconds"] == pytest.approx(expected_duration)
+    assert prepared[0]["start_time_seconds"] == pytest.approx(start_time or 0.0)
+    assert transcode_calls[0][1]["duration_seconds"] == pytest.approx(expected_duration)
+
+
+def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.touch()
+    second.touch()
+    metadata = {
+        str(first): {
+            "width": 1280,
+            "height": 720,
+            "fps": 24.0,
+            "frame_count": 241,
+            "duration": 10.041667,
+            "format_names": ("mp4",),
+            "video_codec": "h264",
+            "audio_codecs": (),
+            "file_size": 1024,
+        },
+        str(second): {
+            "width": 1280,
+            "height": 720,
+            "fps": 24.0,
+            "frame_count": 120,
+            "duration": 4.966667,
+            "format_names": ("mp4",),
+            "video_codec": "h264",
+            "audio_codecs": (),
+            "file_size": 1024,
+        },
+    }
+    transcode_calls = []
+    monkeypatch.setattr(reference_video_module, "_probe_video", lambda path: metadata[str(path)])
+    monkeypatch.setattr(
+        reference_video_module,
+        "_transcode_reference_video",
+        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or f"{source}.prepared.mp4",
+    )
+
+    prepared = reference_video_module.prepare_reference_videos(
+        [str(first), str(second)],
+        target_frame_count=124,
+        workdir=str(tmp_path / "work"),
+    )
+
+    assert [item["duration_seconds"] for item in prepared] == pytest.approx([10.041667, 4.958333])
+    assert sum(item["duration_seconds"] for item in prepared) == pytest.approx(15.0)
+    assert transcode_calls[1][1]["duration_seconds"] == pytest.approx(4.958333)
+
+
+def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.errors import OmniClientError
+
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.touch()
+    second.touch()
+    metadata = {
+        str(first): {
+            "width": 1280,
+            "height": 720,
+            "fps": 24.0,
+            "frame_count": 240,
+            "duration": 10.0,
+            "format_names": ("mp4",),
+            "video_codec": "h264",
+            "audio_codecs": (),
+            "file_size": 1024,
+        },
+        str(second): {
+            "width": 1280,
+            "height": 720,
+            "fps": 24.0,
+            "frame_count": 120,
+            "duration": 5.02,
+            "format_names": ("mp4",),
+            "video_codec": "h264",
+            "audio_codecs": (),
+            "file_size": 1024,
+        },
+    }
+    monkeypatch.setattr(reference_video_module, "_probe_video", lambda path: metadata[str(path)])
+    monkeypatch.setattr(reference_video_module, "_transcode_reference_video", lambda source, **kwargs: "prepared.mp4")
+
+    with pytest.raises(OmniClientError, match="15 seconds"):
+        reference_video_module.prepare_reference_videos(
+            [str(first), str(second)],
+            target_frame_count=124,
+            workdir=str(tmp_path / "work"),
+        )
+
+
+@pytest.mark.parametrize("duration", [4.0, 15.0])
+def test_g2_output_duration_accepts_official_boundaries(duration):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    sampling = SimpleNamespace(
+        fps=24,
+        num_frames=1,
+        height=None,
+        width=None,
+        extra_args={"duration": duration},
+    )
+
+    height, width, *_ = pipeline._resolve_shape("ref2va", sampling, None)
+    assert height > 0 and width > 0
+
+
+@pytest.mark.parametrize("duration", [3.99, 15.01, float("nan"), "not-a-duration"])
+def test_g2_output_duration_rejects_out_of_contract_values(duration):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    sampling = SimpleNamespace(
+        fps=24,
+        num_frames=1,
+        height=None,
+        width=None,
+        extra_args={"duration": duration},
+    )
+    with pytest.raises(ValueError, match="duration"):
+        pipeline._resolve_shape("ref2va", sampling, None)
+
+
+def test_g1_fanout_uses_incrementing_output_seeds():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_output_seeds,
+        _resolve_minimax_h3_num_outputs,
+    )
+
+    assert _resolve_minimax_h3_num_outputs(3) == 3
+    assert _minimax_h3_output_seeds(100, 3) == [100, 101, 102]
+    with pytest.raises(ValueError, match="num_outputs_per_prompt"):
+        _resolve_minimax_h3_num_outputs(11)
+
+
+def test_g3_task_specific_aspect_ratio_policy():
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_aspect_ratio,
+    )
+
+    image = Image.new("RGB", (1280, 720))
+    assert _resolve_minimax_h3_aspect_ratio("fl2va", "9:16", image) == pytest.approx(16 / 9)
+    assert _resolve_minimax_h3_aspect_ratio("ref2va", None, None) == pytest.approx(16 / 9)
+    assert _resolve_minimax_h3_aspect_ratio("ref2va", "auto", None) == pytest.approx(16 / 9)
+    with pytest.raises(ValueError, match="requires an explicit"):
+        _resolve_minimax_h3_aspect_ratio("t2va", None, None)
+    with pytest.raises(ValueError, match="one of"):
+        _resolve_minimax_h3_aspect_ratio("t2va", "2:1", None)
+
+
+def test_g3_t2va_shape_requires_a_named_ratio_and_fl2va_ignores_override():
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    t2va_sampling = SimpleNamespace(
+        fps=24,
+        num_frames=1,
+        height=None,
+        width=None,
+        extra_args={"duration": 5.0},
+    )
+    with pytest.raises(ValueError, match="requires an explicit aspect_ratio"):
+        pipeline._resolve_shape("t2va", t2va_sampling, None)
+
+    fl2va_sampling = SimpleNamespace(
+        fps=24,
+        num_frames=1,
+        height=None,
+        width=None,
+        extra_args={"duration": 5.0, "aspect_ratio": "9:16"},
+    )
+    height, width, *_ = pipeline._resolve_shape("fl2va", fl2va_sampling, Image.new("RGB", (1280, 720)))
+    assert (height, width) == (768, 1344)
+
+
+def test_g4_reference_image_boundaries_and_aspect_ratio():
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _validate_reference_image,
+    )
+
+    _validate_reference_image(Image.new("RGB", (256, 256)))
+    _validate_reference_image(Image.new("RGB", (5760, 2304)))
+    with pytest.raises(ValueError, match="dimensions"):
+        _validate_reference_image(Image.new("RGB", (255, 255)))
+    with pytest.raises(ValueError, match="aspect ratio"):
+        _validate_reference_image(Image.new("RGB", (256, 641)))
+
+
+def test_g4_reference_image_file_format_and_size_contract(tmp_path):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _load_image,
+    )
+
+    valid_path = tmp_path / "reference.png"
+    Image.new("RGB", (256, 256)).save(valid_path)
+    assert _load_image(valid_path).size == (256, 256)
+
+    invalid_path = tmp_path / "reference.bmp"
+    Image.new("RGB", (256, 256)).save(invalid_path)
+    with pytest.raises(ValueError, match="must use"):
+        _load_image(invalid_path)
+
+
+def test_g4_standalone_audio_duration_and_total_duration_contract():
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+        validate_reference_audio_waveforms,
+    )
+
+    sample_rate = 16000
+    validate_reference_audio_waveforms(
+        [
+            (torch.zeros(1, 2 * sample_rate), sample_rate),
+            (torch.zeros(1, 13 * sample_rate), sample_rate),
+        ]
+    )
+    with pytest.raises(ValueError, match="duration"):
+        validate_reference_audio_waveforms([(torch.zeros(1, int(1.9 * sample_rate)), sample_rate)])
+    with pytest.raises(ValueError, match="at most 15 seconds in total"):
+        validate_reference_audio_waveforms(
+            [
+                (torch.zeros(1, 8 * sample_rate), sample_rate),
+                (torch.zeros(1, 8 * sample_rate), sample_rate),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("fps", 23.0, "FPS"),
+        ("duration", 1.0, "duration"),
+        ("format_names", ("avi",), "container"),
+        ("video_codec", "vp9", "H.264"),
+        ("audio_codecs", ("opus",), "AAC"),
+        ("file_size", 50 * 1024 * 1024 + 1, "size"),
+    ],
+)
+def test_g4_reference_video_metadata_validation(field, value, message, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+        _validate_reference_video_metadata,
+    )
+
+    metadata = {
+        "width": 1280,
+        "height": 720,
+        "fps": 24.0,
+        "duration": 10.0,
+        "format_names": ("mp4",),
+        "video_codec": "h264",
+        "audio_codecs": ("aac",),
+        "file_size": 1024,
+    }
+    metadata[field] = value
+    with pytest.raises(ValueError, match=message):
+        _validate_reference_video_metadata(metadata, index=0, source=str(tmp_path / "reference.mp4"))
