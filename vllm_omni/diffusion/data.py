@@ -787,6 +787,7 @@ class OmniDiffusionConfig:
     # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
 
     log_level: str = "info"
 
@@ -1121,6 +1122,7 @@ class OmniDiffusionConfig:
         metadata = get_diffusion_model_metadata(self.model_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:

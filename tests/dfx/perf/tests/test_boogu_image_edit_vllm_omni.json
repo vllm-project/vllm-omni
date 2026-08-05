@@ -24,10 +24,12 @@
                 "warmup-num-inference-steps": 28,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": {"1": 0.0303, "2": 0.0302, "4": 0.0302},
-                    "latency_mean": {"1": 32.6, "2": 62.2, "4": 111.7},
-                    "peak_memory_mb_max": 40500,
-                    "peak_memory_mb_mean": 40500
+                    "H100": {
+                        "throughput_qps": {"1": 0.0303, "2": 0.0302, "4": 0.0302},
+                        "latency_mean": {"1": 32.6, "2": 62.2, "4": 111.7},
+                        "peak_memory_mb_max": 40500,
+                        "peak_memory_mb_mean": 40500
+                    }
                 }
             }
         ]

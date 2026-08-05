@@ -1179,13 +1179,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # ``gate_proj``/``up_proj`` → ``gate_up_proj``. ``default_weight_loader``
         # alone leaves those fused params un-initialised, which silently turns
         # the backbone into a slightly-corrupted model that never emits EOS.
-        # The local depth transformer (shared ``CodePredictorBaseModel``) has
-        # the exact same hazard: its ``qkv_proj``/``gate_up_proj`` are fused,
-        # so its shards must go through ``CodePredictorBaseModel.load_weights``
-        # (via ``MossTTSRealtimeLocalTransformer.load_weights``), which re-packs
-        # them and raises on incomplete/missing fused parameters.
         backbone_weights: list[tuple[str, torch.Tensor]] = []
-        local_weights: list[tuple[str, torch.Tensor]] = []
         skipped: list[str] = []
         for name, tensor in weights:
             if name.startswith("language_model."):
@@ -1200,9 +1194,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     continue  # non-persistent buffer, recomputed at runtime
                 if sub.startswith("embed_tokens."):
                     sub = "codec_embedding." + sub[len("embed_tokens.") :]
-                local_weights.append((f"model.{sub}", tensor))
-                continue
-            if name.startswith("local_transformer.local_lm_heads."):
+                tgt = "local_transformer.model." + sub
+            elif name.startswith("local_transformer.local_lm_heads."):
                 tgt = "local_lm_heads." + name[len("local_transformer.local_lm_heads.") :]
             else:
                 tgt = name
@@ -1216,11 +1209,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         backbone_loaded = self.model.load_weights(iter(backbone_weights))
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
-
-        # Delegate depth-transformer weights to the shared fused loader.
-        local_loaded = self.local_transformer.load_weights(iter(local_weights))
-        for n in local_loaded:
-            loaded.add(f"local_transformer.{n}")
 
         # Build stacked embedding cache for vectorised decode ops.
         # embed_tokens[0] is the text embedding; [1..n_vq] are audio codebooks.

@@ -116,17 +116,20 @@ class VideoGenerationRequest(BaseModel):
         description="Video dimensions in WIDTHxHEIGHT format (e.g., '1280x720')",
     )
 
-    image_reference: ImageReference | None = Field(
+    image_reference: ImageReference | list[ImageReference] | None = Field(
         default=None,
-        description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
+        description=(
+            "Optional image reference or ordered list of references. MiniMax H3 uses the list order for "
+            "FL2VA first/last frames and Ref2VA image labels."
+        ),
     )
-    video_reference: VideoReference | None = Field(
+    video_reference: VideoReference | list[VideoReference] | None = Field(
         default=None,
-        description="Optional JSON-safe video reference that guides generation. Provide either video_url or file_id.",
+        description="Optional video reference or ordered list of Ref2VA video references.",
     )
-    audio_reference: AudioReference | None = Field(
+    audio_reference: AudioReference | list[AudioReference] | None = Field(
         default=None,
-        description="Optional audio reference for speech-to-video. Provide audio_url (http(s) or data URL).",
+        description="Optional audio reference or ordered list of Ref2VA audio references.",
     )
 
     # Video params block for extensibility
@@ -140,6 +143,25 @@ class VideoGenerationRequest(BaseModel):
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
     fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
     num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
+    aspect_ratio: str | None = Field(
+        default=None,
+        description=(
+            "MiniMax H3 output ratio. T2VA requires 21:9, 16:9, 4:3, 1:1, 3:4, or 9:16; "
+            "FL2VA follows the input image; Ref2VA defaults to 16:9."
+        ),
+    )
+    short_edge: int | None = Field(default=None, ge=1, description="MiniMax H3 output short edge in pixels")
+    num_outputs_per_prompt: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Number of videos to generate. MiniMax H3 supports 1 through 10.",
+    )
+    start_time_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Start offset for a single MiniMax H3 reference video.",
+    )
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
