@@ -1,30 +1,14 @@
-# LongCat-Next deploy: thinker (bf16, TP=4) + ONE combined multi-decoder
-# stage (LongcatNextMultiDecoder, holding both image and audio decode paths)
-# on 4x A100-80GB (or H100-80GB, etc.). GPUs 0-2: thinker TP=4 bf16 (~37
-# GB/GPU, ~37-40 GiB free for KV cache + activations). GPU 3: thinker rank 3
-# + multi_decoder (image decoder ~15-20 GiB estimated, audio decoder ~3.33
-# GiB measured -- both weights can end up resident simultaneously over the
-# service's lifetime, since each lazily loads on its own first use and
-# nothing evicts the other, so this budgets for BOTH being loaded at once,
-# not just whichever ran most recently). Combined with thinker rank 3's ~37
-# GiB weights, GPU 3 needs headroom for ~37 + ~20-24 GiB = ~57-61 GiB,
-# comfortably under 80 GiB.
+# LongCat-Next deploy: thinker (bf16, TP=4) + combined multi-decoder
+# stage on 4x A100-80GB. GPUs 0-2: thinker TP=4 bf16 (~37 GiB/GPU).
+# GPU 3: thinker rank 3 + multi_decoder (~57-61 GiB total, fits 80 GiB;
+# image ~15-20 GiB + audio ~3.33 GiB, both can be resident simultaneously).
 #
-# Uses the 2-stage "longcat_next_thinker_multi_decoder" pipeline
-# (pipeline.py's LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE), NOT the
-# 3-stage "longcat_next" pipeline used by
-# longcat_next_4gpu_80gb_image_audio.yaml. The 3-stage
-# thinker->image_decoder->audio_decoder chain has a real, unconditional bug:
-# the orchestrator's _forward_to_next_stage always forwards a stage's own
-# output to src_stage_id + 1, never consulting a stage's declared
-# input_sources -- so the audio decoder (stage 2) always receives the image
-# decoder's output (stage 1), never the thinker's (stage 0), and can never
-# see real audio codes regardless of which modality was actually generated.
-# Collapsing both decoders into one LongcatNextMultiDecoder stage sidesteps
-# this at the root: thinker(0) -> multi_decoder(1) is a 2-stage chain, so
-# stage 1 always receives stage 0's real output. See
-# modeling_longcat_next_multi_decoder.py's module docstring for the full
-# writeup.
+# Uses the 2-stage longcat_next_thinker_multi_decoder pipeline. The 3-stage
+# thinker->image_decoder->audio_decoder pipeline is broken: the orchestrator
+# always forwards to src_stage_id + 1, ignoring declared input_sources, so
+# the audio decoder always gets image output. Collapsing both decoders into
+# one LongcatNextMultiDecoder stage sidesteps this at the root. See
+# modeling_longcat_next_multi_decoder.py for details.
 pipeline: longcat_next_thinker_multi_decoder
 async_chunk: false
 
@@ -34,12 +18,9 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    # >= 2 so a request's visual-CFG unconditional twin (admitted with
-    # affinity to its parent) can be batched in the SAME decode step as the
-    # parent -- the model combines the two streams' depth-head logits per
-    # step, which requires both rows in one talker_mtp call. With
-    # max_num_seqs=1 the twin would decode in separate steps and CFG would
-    # silently no-op (twin output is discarded either way).
+    # >= 2 so a request's visual-CFG twin decodes in the same step as its
+    # parent (the model combines both streams' logits per step). With
+    # max_num_seqs=1 the twin decodes separately and CFG silently no-ops.
     max_num_seqs: 2
     tensor_parallel_size: 4
     devices: "0,1,2,3"
