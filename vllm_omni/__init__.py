@@ -12,11 +12,25 @@ Architecture:
   processing
 """
 
+import os as _os
+import sys as _sys
+
+
+def _trace_calls(frame, event, arg):
+    if event == "call":
+        co = frame.f_code
+        _sys.stderr.write(f"[trace pid={_os.getpid()}] {co.co_filename}:{co.co_firstlineno} {co.co_name}\n")
+    return _trace_calls
+
+
+if _os.environ.get("VLLM_OMNI_TRACE"):
+    _sys.settrace(_trace_calls)
+
 # We import version early, because it will warn if vLLM / vLLM Omni
 # are not using the same major + minor version (if vLLM is installed).
 # We should do this before applying patch, because vLLM imports might
 # throw in patch if the versions differ.
-from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
+from .version import __version__, __version_tuple__  # isort:skip # noqa: F401, E402
 
 try:
     from . import patch  # noqa: F401
@@ -36,7 +50,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     pass
 
-from .config import OmniModelConfig
+from .config import OmniModelConfig  # noqa: E402
 
 
 def __getattr__(name: str):
