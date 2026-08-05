@@ -194,7 +194,7 @@ async def test_registry_resume_sends_activation_then_replay_before_new_live_even
 
     async def new_send(payload):
         wire.append(payload["type"])
-        if payload["type"] == "session.resumed":
+        if payload["type"] == "session.updated":
             activation_started.set()
             await release_activation.wait()
 
@@ -209,7 +209,7 @@ async def test_registry_resume_sends_activation_then_replay_before_new_live_even
             last_received_server_event_seq=0,
             send=new_send,
             close=close,
-            activation_payload_factory=lambda _token, _generation: {"type": "session.resumed"},
+            activation_payload_factory=lambda _token, _generation: {"type": "session.updated"},
         )
     )
     await activation_started.wait()
@@ -218,7 +218,7 @@ async def test_registry_resume_sends_activation_then_replay_before_new_live_even
     release_activation.set()
     await asyncio.gather(resume_task, live_task)
 
-    assert wire == ["session.resumed", "replayed", "live"]
+    assert wire == ["session.updated", "replayed", "live"]
 
 
 @pytest.mark.asyncio
@@ -250,7 +250,7 @@ async def test_registry_resume_delivery_failure_keeps_one_shot_old_token_recover
             send=failing_send,
             close=close,
             activation_payload_factory=lambda token, generation: {
-                "type": "session.resumed",
+                "type": "session.updated",
                 "resume_token": token.plaintext,
                 "attachment_generation": generation,
             },
@@ -378,7 +378,7 @@ async def test_registry_repr_never_contains_plaintext_tokens() -> None:
     await registry.detach("sid-repr", attachment_generation=1)
     entry = await registry.send_event(
         "sid-repr",
-        {"type": "session.resumed", "resume_token": created.resume_token.plaintext},
+        {"type": "session.updated", "resume_token": created.resume_token.plaintext},
     )
 
     assert entry is not None

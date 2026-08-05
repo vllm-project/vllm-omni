@@ -41,7 +41,8 @@ class RealtimeOutputProjector:
             "session.expired",
             "session.resync_required",
         }:
-            return [dict(event)]
+            message = event.get("reason") or event_type
+            return [self._realtime_error_payload(event_type, str(message))]
         if event_type == "response.created":
             response_id = event.get("response_id")
             if isinstance(response_id, str) and response_id:
@@ -68,17 +69,7 @@ class RealtimeOutputProjector:
                 payloads.extend(self._ensure_response_audio_part_added(response_id))
             return payloads
         if event_type == "overlap.decision":
-            return [
-                {
-                    "type": "overlap.decision",
-                    "session_id": event.get("session_id"),
-                    "epoch": event.get("epoch"),
-                    "policy": event.get("policy"),
-                    "action": event.get("action"),
-                    "reason": event.get("reason"),
-                    "metadata": event,
-                }
-            ]
+            return []
         if event_type == "response.output_audio.delta":
             response_id = event.get("response_id")
             audio = event.get("audio", "")
@@ -264,7 +255,7 @@ class RealtimeOutputProjector:
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
             return [self._realtime_error_payload(code, message)]
-        return [{"type": f"duplex.{event_type}", "event": event}]
+        return []
 
     @staticmethod
     def _user_item_content_from_duplex_message(message: object) -> list[dict[str, object]]:

@@ -97,9 +97,8 @@ class DuplexSessionRunnerMixin:
                 self._resync_required_sessions.add(session_id)
                 if first_overflow:
                     resync_payload: dict[str, object] = {
-                        "type": "session.resync_required",
-                        "session_id": session_id,
-                        "reason": "journal_overflow",
+                        "type": "error",
+                        "error": {"type": "server_error", "message": "session resync required"},
                     }
                     if realtime_protocol is not None:
                         resync_payload = realtime_protocol.encode_outbound_event(resync_payload)[0]
@@ -223,7 +222,7 @@ class DuplexSessionRunnerMixin:
                             {"type": "error", "error": "Duplex event missing string type", "code": "bad_event"}
                         )
                         continue
-                    if event_type in {"input.commit", "input_audio_buffer.commit"}:
+                    if event_type == "input_audio_buffer.commit":
                         if not session.reserve_pending_turn(
                             limit=self._duplex_session_config.max_pending_turns_per_session
                         ):
@@ -701,33 +700,8 @@ class DuplexSessionRunnerMixin:
                 if not isinstance(event_type, str):
                     continue
 
-                if event_type == "session.event_ack":
-                    acknowledged = event.get("server_event_seq")
-                    if not isinstance(acknowledged, int) or acknowledged < 0:
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "session.event_ack requires a non-negative server_event_seq",
-                                "code": "invalid_event_ack",
-                            }
-                        )
-                        continue
-                    try:
-                        await self._attachment_registry.acknowledge(session.session_id, acknowledged)
-                    except ValueError as exc:
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": str(exc),
-                                "code": "invalid_event_ack",
-                            }
-                        )
-                    continue
-
                 if event_type == "turn.signal" and event.get("event") in {
-                    "input.cancel",
                     "response.cancel",
-                    "barge_in",
                 }:
                     payload = event.get("payload")
                     normalized_event = dict(payload) if isinstance(payload, dict) else {}
@@ -754,11 +728,7 @@ class DuplexSessionRunnerMixin:
                     )
                     continue
 
-                if event_type == "barge_in" and not session.capabilities.supports_barge_in:
-                    await emit_event(self._barge_in_unsupported_error(session))
-                    continue
-
-                if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
+                if event_type in {"response.cancel", "output_audio_buffer.clear"}:
                     cancel_reason = (
                         "output_audio_buffer_clear" if event_type == "output_audio_buffer.clear" else "barge_in"
                     )
@@ -803,12 +773,6 @@ class DuplexSessionRunnerMixin:
                         and not native.audio_buffer.has_pending()
                     )
                     playback_was_active = self._assistant_playback_active(session)
-                    if event_type in {"input.cancel", "barge_in"}:
-                        native.audio_buffer.clear()
-                        session.release_all_input_bytes()
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                        native.clear_committed_audio()
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
@@ -1018,33 +982,6 @@ class DuplexSessionRunnerMixin:
                         await emit_event(self._turn_controller.signal(session, turn_event, event))
                     else:
                         await emit_event({"type": "error", "error": "turn.signal requires event", "code": "bad_event"})
-                    continue
-
-                if event_type == "input.text.append":
-                    session.mark_user_input_activity()
-                    text = event.get("text")
-                    if not isinstance(text, str):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "input.text.append requires text",
-                                "code": "bad_event",
-                            }
-                        )
-                        continue
-                    if self._uses_native_input_append(session):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "The selected native duplex runtime accepts audio append only",
-                                "code": "native_text_append_unsupported",
-                            }
-                        )
-                        continue
-                    else:
-                        session.append_text(text)
-                    if session.capabilities.supports_input_append:
-                        await start_runtime_append(text, final=False, mode="append_tokens")
                     continue
 
                 if event_type == "input_audio_buffer.append":
@@ -1275,7 +1212,7 @@ class DuplexSessionRunnerMixin:
                         await start_runtime_append(payload, final=False, mode="append_audio_chunk")
                     continue
 
-                if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
+                if event_type in {"input_audio_buffer.commit", "response.create"}:
                     realtime_item_id = event.get("realtime_item_id")
                     realtime_validated_audio_commit = (
                         event_type == "input_audio_buffer.commit"
@@ -1284,7 +1221,7 @@ class DuplexSessionRunnerMixin:
                     )
                     if (
                         self._uses_native_input_append(session)
-                        and event_type in {"input.commit", "input_audio_buffer.commit"}
+                        and event_type == "input_audio_buffer.commit"
                         and not await wait_for_native_append_tail()
                     ):
                         continue
@@ -1308,11 +1245,11 @@ class DuplexSessionRunnerMixin:
                         continue
                     should_create_response = (
                         event_type == "response.create"
-                        or bool(event.get("response_create", event_type == "input.commit"))
+                        or bool(event.get("response_create", False))
                         or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
                     )
                     precreate_response_requested = event_type == "response.create" or bool(
-                        event.get("response_create", event_type == "input.commit")
+                        event.get("response_create", False)
                     )
                     if event_type == "response.create":
                         response_payload = event.get("response")
@@ -1539,7 +1476,7 @@ class DuplexSessionRunnerMixin:
                                 operation_id=uuid.uuid4().hex,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                             )
-                            if event_type in {"input.commit", "input_audio_buffer.commit"}
+                            if event_type == "input_audio_buffer.commit"
                             else None
                         )
                         flushed_buffer_reserved_bytes = (
@@ -1622,10 +1559,7 @@ class DuplexSessionRunnerMixin:
                         or realtime_validated_audio_commit
                     )
                     committed = session.commit_user_input()
-                    if self._uses_native_input_append(session) and event_type in {
-                        "input_audio_buffer.commit",
-                        "input.commit",
-                    }:
+                    if self._uses_native_input_append(session) and event_type == "input_audio_buffer.commit":
                         native.input_since_commit = False
                         native.speech_since_commit = False
                     if committed is None and event_type != "response.create":

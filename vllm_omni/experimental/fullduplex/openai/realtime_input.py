@@ -667,7 +667,7 @@ class RealtimeInputTranslator:
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
         return {
-            "type": "session.create",
+            "type": "session.update",
             "session_id": session_payload.get("session_id") or session_payload.get("id"),
             "session": {
                 "model": model,

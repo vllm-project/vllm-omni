@@ -23,32 +23,17 @@ def _load_demo_module():
     return module
 
 
-def test_post_commit_decision_ignores_streaming_listens_before_commit_ack():
+def test_post_commit_decision_returns_none_without_model_response():
     demo = _load_demo_module()
     events = [
         {"type": "session.created"},
-        {"type": "response.listen"},
-        {"type": "response.listen"},
         {"type": "input_audio_buffer.committed"},
     ]
 
     commit_index = demo._input_committed_index(events, after_index=0)
 
-    assert commit_index == 3
+    assert commit_index == 1
     assert demo._post_commit_model_decision(events, commit_index) is None
-
-
-def test_post_commit_decision_accepts_listen_after_commit_ack():
-    demo = _load_demo_module()
-    events = [
-        {"type": "response.listen"},
-        {"type": "input_audio_buffer.committed"},
-        {"type": "response.listen"},
-    ]
-
-    commit_index = demo._input_committed_index(events, after_index=0)
-
-    assert demo._post_commit_model_decision(events, commit_index) == "listen"
 
 
 def test_post_commit_decision_accepts_drained_speak_after_commit_ack():
@@ -81,7 +66,7 @@ def test_commit_ack_search_starts_after_stream_cursor():
     demo = _load_demo_module()
     events = [
         {"type": "input_audio_buffer.committed"},
-        {"type": "response.listen"},
+        {"type": "response.done"},
         {"type": "input_audio_buffer.committed"},
     ]
 
@@ -100,17 +85,6 @@ def test_partial_model_unit_requires_a_post_commit_decision():
     unit_bytes = demo.PCM16_SAMPLE_RATE * demo.PCM16_BYTES_PER_SAMPLE
 
     assert demo._has_residual_model_unit(b"\0" * (unit_bytes * 6 + 512), chunk_period_ms=1000)
-
-
-def test_latest_streaming_decision_is_used_at_exact_boundary():
-    demo = _load_demo_module()
-    events = [
-        {"type": "response.listen"},
-        {"type": "response.listen"},
-        {"type": "input_audio_buffer.committed"},
-    ]
-
-    assert demo._latest_model_decision(events, after_index=0) == "listen"
 
 
 def test_ref_audio_data_url_encodes_explicit_wav(tmp_path):

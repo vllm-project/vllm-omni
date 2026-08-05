@@ -145,12 +145,8 @@ def _compact_sequence(events: list[dict[str, object]]) -> list[str]:
         event_type = event.get("type")
         response_id = _event_response_id(event)
         suffix = f" {response_id[-8:]}" if response_id else ""
-        if event_type == "response.listen":
-            sequence.append("listen")
-        elif event_type == "response.created":
+        if event_type == "response.created":
             sequence.append(f"response.created{suffix}")
-        elif event_type == "response.speak":
-            sequence.append(f"speak{suffix}")
         elif event_type in AUDIO_DELTA_EVENTS:
             sequence.append(f"audio.delta{suffix}")
         elif event_type in TRANSCRIPT_DELTA_EVENTS:
@@ -238,21 +234,11 @@ def summarize_artifacts(
         (summary["created_index"] for summary in response_summaries if isinstance(summary.get("created_index"), int)),
         None,
     )
-    first_done_index = (
-        response_summaries[0]["done_indices"][0]
-        if response_summaries and response_summaries[0]["done_indices"]
-        else None
-    )
     second_created_index = (
         response_summaries[1]["created_index"]
         if len(response_summaries) >= 2 and isinstance(response_summaries[1].get("created_index"), int)
         else None
     )
-    last_done_index = next(
-        (summary["done_indices"][0] for summary in reversed(response_summaries) if summary.get("done_indices")),
-        None,
-    )
-    listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
     effective_min_responses = min_responses if validation_mode == "response-required" else 1
     enough_responses = len(response_summaries) >= effective_min_responses
     response_lifecycle_ok = enough_responses and all(bool(summary.get("one_done")) for summary in response_summaries)
@@ -269,21 +255,6 @@ def summarize_artifacts(
     second_response_before_final_commit = (
         second_created_index is not None and commit_index is not None and second_created_index < commit_index
     )
-    listen_before_first_response = first_created_index is not None and any(
-        index < first_created_index for index in listen_indices
-    )
-    listen_between_responses = (
-        first_done_index is not None
-        and second_created_index is not None
-        and any(first_done_index < index < second_created_index for index in listen_indices)
-    )
-    listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
-    listen_after_response_before_commit = (
-        last_done_index is not None
-        and commit_index is not None
-        and any(last_done_index < index < commit_index for index in listen_indices)
-    )
-    final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
     followup_response_transcripts = [
         str(summary.get("transcript") or "")
@@ -323,14 +294,9 @@ def summarize_artifacts(
         and multi_delta_ok
         and response_audio_contract_ok
         and response_before_final_commit
-        and listen_after_response_before_commit
-        and final_listen_after_commit
     )
     mode_contract_ok = validation_mode == "model-policy" or (
-        second_response_before_final_commit
-        and listen_before_first_response
-        and listen_after_last_done
-        and followup_response_transcript_ok
+        second_response_before_final_commit and followup_response_transcript_ok
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -349,11 +315,6 @@ def summarize_artifacts(
         "response_audio_contract_ok": response_audio_contract_ok,
         "response_before_final_commit": response_before_final_commit,
         "second_response_before_final_commit": second_response_before_final_commit,
-        "listen_before_first_response": listen_before_first_response,
-        "listen_between_responses": listen_between_responses,
-        "listen_after_last_done": listen_after_last_done,
-        "listen_after_response_before_commit": listen_after_response_before_commit,
-        "final_listen_after_commit": final_listen_after_commit,
         "transcript": transcript,
         "followup_response_transcripts": followup_response_transcripts,
         "followup_response_transcript_ok": followup_response_transcript_ok,

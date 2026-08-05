@@ -151,14 +151,14 @@ async def _run_realtime_audio_roundtrip(
                     incremental.append(base64.b64decode(audio_b64))
                 continue
 
-            if event_type == "transcription.delta":
+            if event_type == "response.output_audio_transcript.delta":
                 d = event.get("delta", "")
                 if d:
                     text_chunks.append(d)
                 continue
 
-            if event_type == "transcription.done":
-                final_text = event.get("text", "") or "".join(text_chunks)
+            if event_type == "response.output_audio_transcript.done":
+                final_text = event.get("transcript", "") or "".join(text_chunks)
                 continue
 
             if event_type == "response.output_audio.done":

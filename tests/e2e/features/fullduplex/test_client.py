@@ -203,7 +203,7 @@ def test_response_timing_ignores_unowned_session_level_metrics():
     )
     collector.add(
         {
-            "type": "response.listen",
+            "type": "response.done",
             "metadata": {
                 "vllm_omni": {
                     "stage_metrics": {

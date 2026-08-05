@@ -137,7 +137,7 @@ def test_realtime_explicit_query_native_duplex_flag_is_available_before_autostar
 
     event = json.loads(asyncio.run(protocol.receive_internal_event_text(None)))
 
-    assert event["type"] == "session.create"
+    assert event["type"] == "session.update"
 
 
 def test_duplex_session_registry_advances_incarnation_when_id_is_reused():

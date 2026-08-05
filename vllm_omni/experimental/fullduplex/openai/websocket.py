@@ -12,9 +12,7 @@ from fastapi import WebSocketDisconnect
 
 INPUT_EVENTS = frozenset(
     {
-        "input.text.append",
         "input_audio_buffer.append",
-        "input.commit",
         "input_audio_buffer.commit",
         "response.create",
     }
@@ -35,17 +33,14 @@ MODEL_OUTPUT_EVENTS = frozenset(
         "response.output_audio.done",
         "response.output_text.delta",
         "response.output_text.done",
-        "response.message",
         "response.output_item.done",
         "response.content_part.done",
         "response.done",
-        "runtime.control",
     }
 )
 DOMAIN_TERMINAL_EVENTS = frozenset(
     {
         "response.done",
-        "input.cancelled",
     }
 )
 
@@ -185,7 +180,7 @@ class DuplexWebSocketActor:
             return False
         if event_type not in MODEL_OUTPUT_EVENTS:
             return False
-        if self.closing and event_type != "runtime.control":
+        if self.closing:
             return True
         expected_epoch = self.current_epoch() if self.current_epoch is not None else None
         epoch = payload.get("epoch")

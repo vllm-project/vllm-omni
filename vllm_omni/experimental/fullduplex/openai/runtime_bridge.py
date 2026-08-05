@@ -568,10 +568,12 @@ class NativeRuntimeBridgeMixin:
             return
         await send_json(
             {
-                "type": "runtime.control",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "result": self._redact_runtime_control_result(result),
+                "type": "error",
+                "error": {
+                    "type": "runtime_error",
+                    "message": "runtime control operation failed",
+                    "code": "runtime_control_error",
+                },
             }
         )
 

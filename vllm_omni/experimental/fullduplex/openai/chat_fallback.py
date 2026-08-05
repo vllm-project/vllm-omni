@@ -195,11 +195,11 @@ class ChatFallbackProjectorMixin:
         if not isinstance(choices, list):
             await send_json(
                 {
-                    "type": "response.message",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": epoch,
-                    "payload": payload,
+                    "type": "error",
+                    "error": {
+                        "type": "server_error",
+                        "message": "chat fallback response contained no choices",
+                    },
                 }
             )
             return

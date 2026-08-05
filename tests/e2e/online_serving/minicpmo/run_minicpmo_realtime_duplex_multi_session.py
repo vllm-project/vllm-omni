@@ -10,10 +10,8 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -26,28 +24,9 @@ from minicpmo_realtime_duplex_scenarios import (  # noqa: E402
 )
 
 
-def _with_resume_mode(url: str) -> str:
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["resume"] = "1"
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
 def _response_ids(result: dict[str, object]) -> set[str]:
     values = result.get("completed_response_ids")
     return {value for value in values if isinstance(value, str)} if isinstance(values, list) else set()
-
-
-def _event_session_id(event: dict[str, object]) -> str | None:
-    session_id = event.get("session_id")
-    if isinstance(session_id, str):
-        return session_id
-    inner = event.get("event")
-    if isinstance(inner, dict):
-        nested_session_id = inner.get("session_id")
-        if isinstance(nested_session_id, str):
-            return nested_session_id
-    return None
 
 
 def _error_code(event: dict[str, object]) -> str | None:
@@ -219,201 +198,7 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
                 await ws.close()
 
 
-async def _resume_probe(
-    args: argparse.Namespace,
-    *,
-    session_id: str,
-    expect_expired: bool = False,
-) -> dict[str, object]:
-    url = _url_with_model(
-        args.url,
-        args.model,
-        autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=session_id,
-    )
-    async with websockets.connect(url, max_size=64 * 1024 * 1024) as first:
-        await first.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "session_id": session_id,
-                        "model": args.model,
-                        "modalities": ["audio", "text"],
-                        "extra_body": {},
-                        **(
-                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
-                            if getattr(args, "ref_audio", None)
-                            else {}
-                        ),
-                    },
-                }
-            )
-        )
-        created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
-        token = created.get("resume_token")
-        incarnation = created.get("incarnation")
-        generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int):
-            raise RuntimeError("session.created omitted resumable credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
-
-    delay_s = args.expire_after_s if expect_expired else args.resume_after_ms / 1000
-    if delay_s > 0:
-        await asyncio.sleep(delay_s)
-
-    resume_url = _with_resume_mode(url)
-    async with websockets.connect(resume_url, max_size=64 * 1024 * 1024) as second:
-        await second.send(
-            json.dumps(
-                {
-                    "type": "session.resume",
-                    "session_id": session_id,
-                    "incarnation": incarnation,
-                    "resume_token": token,
-                    "last_received_server_event_seq": last_seq,
-                }
-            )
-        )
-        if expect_expired:
-            error, error_events = await _receive_until(second, "error", timeout_s=args.timeout_s)
-            error_payload = error.get("error")
-            code = error_payload.get("code") if isinstance(error_payload, dict) else error.get("code")
-            return {
-                "ok": code == "session_resume_expired",
-                "session_id": session_id,
-                "expired": True,
-                "error_code": code,
-                "event_count": len(error_events),
-            }
-        resumed, replay = await _receive_until(second, "session.resumed", timeout_s=args.timeout_s)
-        rotated = resumed.get("resume_token")
-        if not isinstance(rotated, str) or rotated == token:
-            raise RuntimeError("session.resume did not rotate the resume token")
-    replay_sequences = [event["server_event_seq"] for event in replay if isinstance(event.get("server_event_seq"), int)]
-    return {
-        "ok": (
-            resumed.get("session_id") == session_id
-            and isinstance(generation, int)
-            and resumed.get("attachment_generation") == generation + 1
-            and replay_sequences == sorted(replay_sequences)
-        ),
-        "session_id": session_id,
-        "resumed_session_id": resumed.get("session_id"),
-        "initial_attachment_generation": generation,
-        "resumed_attachment_generation": resumed.get("attachment_generation"),
-        "replayed_event_count": len(replay_sequences),
-        "replayed_event_sequences": replay_sequences,
-        "token_rotated": True,
-    }
-
-
-async def _takeover_probe(
-    args: argparse.Namespace,
-    *,
-    session_id: str,
-) -> dict[str, object]:
-    url = _url_with_model(
-        args.url,
-        args.model,
-        autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=session_id,
-    )
-    first = await websockets.connect(url, max_size=64 * 1024 * 1024)
-    second = None
-    try:
-        await first.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "session_id": session_id,
-                        "model": args.model,
-                        "modalities": ["audio", "text"],
-                        "extra_body": {},
-                        **(
-                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
-                            if getattr(args, "ref_audio", None)
-                            else {}
-                        ),
-                    },
-                }
-            )
-        )
-        created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
-        token = created.get("resume_token")
-        incarnation = created.get("incarnation")
-        generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int) or not isinstance(generation, int):
-            raise RuntimeError("session.created omitted takeover credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
-
-        second = await websockets.connect(_with_resume_mode(url), max_size=64 * 1024 * 1024)
-        await second.send(
-            json.dumps(
-                {
-                    "type": "session.resume",
-                    "session_id": session_id,
-                    "incarnation": incarnation,
-                    "resume_token": token,
-                    "last_received_server_event_seq": last_seq,
-                }
-            )
-        )
-        resumed, replay_events = await _receive_until(second, "session.resumed", timeout_s=args.timeout_s)
-        replaced, replaced_events = await _receive_until(first, "session.replaced", timeout_s=args.timeout_s)
-        await asyncio.wait_for(first.wait_closed(), timeout=args.timeout_s)
-
-        rejected_old_writes = 0
-        for _ in range(4):
-            try:
-                await first.send(json.dumps({"type": "session.heartbeat"}))
-            except ConnectionClosed:
-                rejected_old_writes += 1
-
-        rotated_token = resumed.get("resume_token")
-        return {
-            "ok": (
-                resumed.get("session_id") == session_id
-                and resumed.get("attachment_generation") == generation + 1
-                and isinstance(rotated_token, str)
-                and rotated_token != token
-                and _event_session_id(replaced) == session_id
-                and replaced.get("attachment_generation") == generation
-                and rejected_old_writes == 4
-            ),
-            "session_id": session_id,
-            "initial_attachment_generation": generation,
-            "resumed_attachment_generation": resumed.get("attachment_generation"),
-            "replaced_attachment_generation": replaced.get("attachment_generation"),
-            "token_rotated": isinstance(rotated_token, str) and rotated_token != token,
-            "old_attachment_closed": True,
-            "rejected_old_writes": rejected_old_writes,
-            "replay_event_count": len(replay_events),
-            "replaced_event_count": len(replaced_events),
-        }
-    finally:
-        if second is not None:
-            await second.close()
-        await first.close()
-
-
 def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
-    validation_mode = "response-required" if args.response_required else "model-policy"
     input_wav = args.session_input_wav[index] if args.session_input_wav else args.input_wav
     return SimpleNamespace(
         url=args.url,
@@ -430,7 +215,7 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         turn_duration_ms=list(args.turn_duration_ms),
         first_turn_transcript=f"session {index} input",
         omit_transcript_hints=True,
-        validation_mode=validation_mode,
+        validation_mode="response-required",
         temperature=args.temperature,
         scenario="sequential",
         require_audio=args.response_required,
@@ -439,7 +224,6 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         short_ack_ms=350,
         turns=args.turns,
         timeout_s=args.timeout_s,
-        model_policy_settle_ms=args.model_policy_settle_ms,
     )
 
 
@@ -448,22 +232,6 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--sessions must be positive")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    resume_result = None
-    if args.disconnect_session_index is not None:
-        if not 0 <= args.disconnect_session_index < args.sessions:
-            raise ValueError("--disconnect-session-index is outside the session range")
-        resume_result = await _resume_probe(
-            args,
-            session_id=f"resume-{args.disconnect_session_index}-{uuid.uuid4().hex}",
-        )
-    takeover_result = None
-    if args.takeover_session_index is not None:
-        if not 0 <= args.takeover_session_index < args.sessions:
-            raise ValueError("--takeover-session-index is outside the session range")
-        takeover_result = await _takeover_probe(
-            args,
-            session_id=f"takeover-{args.takeover_session_index}-{uuid.uuid4().hex}",
-        )
     lifecycle_result = await run_lifecycle_probes(args)
 
     session_results = await asyncio.gather(
@@ -485,15 +253,11 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             and all(item.get("ok") is True for item in completed)
             and identity_isolation_ok
             and semantic_isolation_ok
-            and (resume_result is None or resume_result.get("ok") is True)
-            and (takeover_result is None or takeover_result.get("ok") is True)
             and lifecycle_result["ok"] is True
         ),
         "session_count": args.sessions,
         "identity_isolation_ok": identity_isolation_ok,
         "semantic_isolation_ok": semantic_isolation_ok,
-        "resume": resume_result,
-        "takeover": takeover_result,
         "expiry": lifecycle_result["expiry"],
         "admission": lifecycle_result["admission"],
         "failures": failures,
@@ -507,29 +271,17 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
 
 
 async def run_lifecycle_probes(args: argparse.Namespace) -> dict[str, object]:
-    """Run expiry and admission probes without requiring model output."""
+    """Run admission probes without requiring model output."""
     if args.sessions < 1:
         raise ValueError("--sessions must be positive")
-    expiry_result = None
-    if args.expire_session_index is not None:
-        if not 0 <= args.expire_session_index < args.sessions:
-            raise ValueError("--expire-session-index is outside the session range")
-        expiry_result = await _resume_probe(
-            args,
-            session_id=f"expire-{args.expire_session_index}-{uuid.uuid4().hex}",
-            expect_expired=True,
-        )
     admission_result = (
         await _admission_probe(args, limit=args.verify_admission_limit)
         if args.verify_admission_limit is not None
         else None
     )
     return {
-        "ok": (
-            (expiry_result is None or expiry_result.get("ok") is True)
-            and (admission_result is None or admission_result.get("ok") is True)
-        ),
-        "expiry": expiry_result,
+        "ok": admission_result is None or admission_result.get("ok") is True,
+        "expiry": None,
         "admission": admission_result,
     }
 
@@ -553,13 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-duration-ms", type=int, action="append", default=[])
     parser.add_argument("--response-required", action="store_true")
     parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--disconnect-session-index", type=int)
-    parser.add_argument("--takeover-session-index", type=int)
-    parser.add_argument("--resume-after-ms", type=int, default=1000)
-    parser.add_argument("--expire-session-index", type=int)
-    parser.add_argument("--expire-after-s", type=float, default=6.0)
     parser.add_argument("--verify-admission-limit", type=int)
-    parser.add_argument("--model-policy-settle-ms", type=int, default=600)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     args = parser.parse_args()
     if args.base_url:

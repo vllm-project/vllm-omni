@@ -383,7 +383,7 @@ async def test_native_realtime_protocol_drains_internal_conversation_item_contro
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-delete"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     ws.put(
         {
@@ -429,7 +429,7 @@ async def test_native_realtime_protocol_conversation_item_create_commits_user_te
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-item-create"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     ws.put(
         {
@@ -469,7 +469,7 @@ async def test_native_realtime_protocol_audio_commit_requires_non_empty_buffer()
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-audio-commit"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     ws.put({"type": "input_audio_buffer.commit", "final": True})
     with pytest.raises(WebSocketDisconnect):
@@ -487,7 +487,7 @@ async def test_native_realtime_protocol_audio_commit_does_not_auto_create_respon
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-audio-commit-full"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     pcm = struct.pack("<2h", 1024, -1024)
     ws.put({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii"), "format": "pcm16"})
@@ -509,7 +509,7 @@ async def test_native_realtime_protocol_rejects_invalid_sample_rate_without_clos
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-invalid-rate"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     ws.put(
         {
@@ -536,7 +536,7 @@ async def test_native_realtime_protocol_audio_clear_is_not_barge_in_cancel():
 
     ws.put({"type": "session.update", "model": "test-model", "session_id": "rt-audio-clear"})
     session_create = json.loads(await protocol.receive_internal_event_text(ws))
-    assert session_create["type"] == "session.create"
+    assert session_create["type"] == "session.update"
 
     ws.put({"type": "input_audio_buffer.clear"})
     clear_event = json.loads(await protocol.receive_internal_event_text(ws))
@@ -583,7 +583,7 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
     )
     translated = json.loads(await protocol.receive_internal_event_text(ws))
 
-    assert translated["type"] == "session.create"
+    assert translated["type"] == "session.update"
     assert translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"] is None
 
 
@@ -1229,7 +1229,7 @@ def _pcm16_b64(samples: int = 1, *, value: int = 1000) -> str:
 
 def _session_create(session_id: str = "duplex-test") -> dict[str, Any]:
     return {
-        "type": "session.create",
+        "type": "session.update",
         "session_id": session_id,
         "session": {
             "model": "test-model",
@@ -3865,7 +3865,7 @@ async def test_realtime_journal_overflow_degrades_to_live_resync_without_closing
     await handler.handle_realtime_session(ws)
 
     assert "session.created" in ws.sent_types()
-    assert "session.resync_required" in ws.sent_types()
+    assert "error" in ws.sent_types()
     assert engine.closed == [("sid-journal-overflow", "client_disconnect")]
     assert handler._registry.get("sid-journal-overflow") is None
 
@@ -3989,27 +3989,6 @@ async def test_duplex_handler_control_close_failure_does_not_crash_server():
 
     assert ws.sent_types() == ["session.created"]
     assert engine.closed == [("sid-control-close-fail", "client_disconnect")]
-
-
-@pytest.mark.asyncio
-async def test_turn_signal_input_cancel_uses_epoch_fence_transition():
-    engine = FakeEngineClient()
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(engine),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    ws = TimedWebSocket()
-    ws.put(_session_create("sid-turn-signal-cancel"))
-    ws.put({"type": "input.text.append", "text": "discard me"})
-    ws.put({"type": "turn.signal", "event": "input.cancel"})
-    await ws.close()
-
-    await handler.handle_session(ws)
-
-    assert engine.signal_fences[-1] == DuplexFence("sid-turn-signal-cancel")
-    assert engine.signal_next_fences[-1] == DuplexFence("sid-turn-signal-cancel", epoch=1)
-    assert any(message.get("type") == "input.cancelled" for message in ws.sent)
 
 
 @pytest.mark.asyncio
@@ -4192,7 +4171,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
             "is_speech": True,
         }
     )
-    ws.put({"type": "input.cancel"})
+    ws.put({"type": "response.cancel"})
     await ws.close()
 
     handler_task = asyncio.create_task(handler.handle_session(ws))
@@ -4579,7 +4558,7 @@ async def test_minicpmo_native_duplex_audio_append_does_not_retain_pending_audio
     ws.put(_native_session_create("sid-native-no-pending"))
     short_chunk = base64.b64encode(b"\x00" * (800 * 4)).decode("ascii")
     ws.put({"type": "input_audio_buffer.append", "audio": short_chunk, "format": "pcm_f32le"})
-    ws.put({"type": "input.cancel", "reason": "barge_in"})
+    ws.put({"type": "response.cancel", "reason": "barge_in"})
     await ws.close()
 
     await handler.handle_session(ws)
@@ -4587,23 +4566,6 @@ async def test_minicpmo_native_duplex_audio_append_does_not_retain_pending_audio
     cancelled = next(m for m in ws.sent if m.get("type") == "input.cancelled")
     assert cancelled["cancelled"] == {"text_chunks": 0, "audio_chunks": 0}
     assert cancelled["epoch"] == 1
-
-
-@pytest.mark.asyncio
-async def test_minicpmo_native_duplex_rejects_text_append_before_runtime_call():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    ws = TimedWebSocket()
-    ws.put(_native_session_create("sid-native-text"))
-    ws.put({"type": "input.text.append", "text": "hello"})
-    await ws.close()
-
-    await handler.handle_session(ws)
-
-    error = next(m for m in ws.sent if m.get("type") == "error")
-    assert error["code"] == "native_text_append_unsupported"
-    assert engine.appended == []
 
 
 @pytest.mark.asyncio
@@ -6313,7 +6275,7 @@ async def test_minicpmo_native_duplex_cancel_interrupts_background_data_plane_st
     ws = TimedWebSocket()
     ws.put(_native_session_create("sid-native-cancel-stream"))
     ws.put({"type": "input_audio_buffer.append", "audio": "AAAA", "format": "pcm_f32le"})
-    ws.put({"type": "input.cancel"})
+    ws.put({"type": "response.cancel"})
     await ws.close()
 
     await handler.handle_session(ws)

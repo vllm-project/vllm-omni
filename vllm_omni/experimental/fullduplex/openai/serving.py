@@ -191,10 +191,11 @@ class OmniDuplexSessionHandler(
             return
         protocol = self._realtime_protocols.get(session.session_id)
         expired_payload: dict[str, object] = {
-            "type": "session.expired",
-            "session_id": session.session_id,
-            "incarnation": session.incarnation,
-            "reason": message.reason,
+            "type": "error",
+            "error": {
+                "type": "session_expired",
+                "message": str(message.reason or "session expired"),
+            },
         }
         if protocol is not None:
             expired_payload = protocol.encode_outbound_event(expired_payload)[0]
@@ -824,15 +825,7 @@ class OmniDuplexSessionHandler(
         session: DuplexSession,
         decision: dict[str, object],
     ) -> None:
-        await send_json(
-            {
-                "type": "overlap.decision",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "policy": session.config.overlap_policy,
-                **decision,
-            }
-        )
+        pass
 
     async def _open_session(
         self,
@@ -849,18 +842,18 @@ class OmniDuplexSessionHandler(
             realtime_protocol=realtime_protocol,
         )
         if raw is None:
-            await send_json({"type": "error", "error": "Timeout waiting for session.create", "code": "config_timeout"})
+            await send_json({"type": "error", "error": "Timeout waiting for session.update", "code": "config_timeout"})
             return None
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
-            await send_json({"type": "error", "error": "Invalid JSON in session.create", "code": "invalid_json"})
+            await send_json({"type": "error", "error": "Invalid JSON in session.update", "code": "invalid_json"})
             return None
-        if not isinstance(event, dict) or event.get("type") not in {"session.create", "open_session", "session.config"}:
+        if not isinstance(event, dict) or event.get("type") not in {"session.update"}:
             await send_json(
                 {
                     "type": "error",
-                    "error": f"Expected session.create, got: {event.get('type') if isinstance(event, dict) else None}",
+                    "error": f"Expected session.update, got: {event.get('type') if isinstance(event, dict) else None}",
                     "code": "bad_event",
                 }
             )
@@ -1035,13 +1028,6 @@ class OmniDuplexSessionHandler(
             return None
 
         if td_raw is None:
-            if session.capabilities.supports_model_native_turn_policy:
-                return NativeRealtimeSessionProtocol._realtime_error_payload(
-                    "unsupported_turn_detection",
-                    "This model requires model-native turn detection "
-                    "(server_vad); turn_detection cannot be set to null.",
-                    param="turn_detection",
-                )
             return None
 
         if not isinstance(td_raw, dict):

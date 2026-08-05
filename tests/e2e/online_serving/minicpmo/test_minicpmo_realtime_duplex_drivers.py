@@ -372,9 +372,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     first_response_id = "resp-first"
     second_response_id = "resp-second"
     events = [
-        {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
-        {"type": "response.speak", "response_id": first_response_id, "_client_received_at_s": 2.0},
         {
             "type": "response.output_audio.delta",
             "response_id": first_response_id,
@@ -401,7 +399,6 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
         },
         {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
-        {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
         {
             "type": "response.output_audio.delta",
             "response_id": second_response_id,
@@ -427,9 +424,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
             "_client_received_at_s": 4.6,
         },
         {"type": "response.done", "response_id": second_response_id, "_client_received_at_s": 5.0},
-        {"type": "response.listen", "_client_received_at_s": 5.2},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 6.0},
-        {"type": "response.listen", "_client_received_at_s": 6.1},
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -463,7 +458,6 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     output.mkdir()
     response_id = "resp-only"
     events = [
-        {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
         {
             "type": "response.output_audio.delta",
@@ -478,9 +472,7 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
             "_client_received_at_s": 2.15,
         },
         {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
-        {"type": "response.listen", "_client_received_at_s": 2.3},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
-        {"type": "response.listen", "_client_received_at_s": 3.1},
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -512,7 +504,6 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
     output.mkdir()
     response_id = "resp-only"
     events = [
-        {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
         {
             "type": "response.output_audio.delta",
@@ -527,9 +518,7 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
             "_client_received_at_s": 2.15,
         },
         {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
-        {"type": "response.listen", "_client_received_at_s": 2.3},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
-        {"type": "response.listen", "_client_received_at_s": 3.1},
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -559,7 +548,6 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
     first_response_id = "resp-first"
     second_response_id = "resp-second"
     events = [
-        {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
         {
             "type": "response.output_audio.delta",
@@ -580,7 +568,6 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
             "_client_received_at_s": 2.2,
         },
         {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 2.3},
-        {"type": "response.listen", "_client_received_at_s": 2.4},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 3.0},
         {
             "type": "response.output_audio.delta",
@@ -601,9 +588,7 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
             "_client_received_at_s": 3.2,
         },
         {"type": "response.done", "response_id": second_response_id, "_client_received_at_s": 3.3},
-        {"type": "response.listen", "_client_received_at_s": 3.4},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 4.0},
-        {"type": "response.listen", "_client_received_at_s": 4.1},
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -647,16 +632,6 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
     assert missing_transcript_summary["followup_response_transcript_ok"] is False
 
 
-def test_realtime_duplex_multi_session_resume_url_disables_autostart():
-    demo = _load_multi_demo_module()
-
-    url = demo._with_resume_mode("ws://localhost:8113/v1/realtime?duplex=1&model=openbmb%2FMiniCPM-o-4_5")
-
-    query = parse_qs(urlsplit(url).query)
-    assert query["model"] == ["openbmb/MiniCPM-o-4_5"]
-    assert query["resume"] == ["1"]
-
-
 def test_realtime_duplex_multi_session_rejects_cross_session_response_identity():
     demo = _load_multi_demo_module()
 
@@ -672,12 +647,6 @@ def test_realtime_duplex_multi_session_rejects_cross_session_response_identity()
             {"completed_response_ids": ["resp-shared"]},
         ]
     )
-
-
-def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
-    demo = _load_multi_demo_module()
-
-    assert demo._event_session_id({"type": "session.heartbeat_ack", "session_id": "sid"}) == "sid"
 
 
 def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
@@ -850,43 +819,6 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
     assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] is None
 
 
-def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "session.created"})
-    for turn in range(3):
-        state.add({"type": "input_audio_buffer.speech_started", "turn": turn})
-        state.add(
-            {
-                "type": "response.listen",
-                "response": {
-                    "status": "listening",
-                    "metadata": {"model_listen": True},
-                },
-            }
-        )
-        state.add({"type": "input_audio_buffer.committed", "turn": turn})
-
-    assert state.model_policy_event_order_ok(expected_turns=3)
-
-
-def test_realtime_duplex_demo_model_policy_accepts_continuous_input_without_commits():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "session.created"})
-    state.add({"type": "input_audio_buffer.speech_started"})
-    for _ in range(3):
-        state.add(
-            {
-                "type": "response.listen",
-                "response": {"metadata": {"model_listen": True}},
-            }
-        )
-
-    assert not state.model_policy_event_order_ok(expected_turns=3)
-    assert state.model_policy_event_order_ok(expected_turns=3, require_input_commit=False)
-
-
 def test_realtime_duplex_demo_distinguishes_late_and_missing_commit():
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -898,7 +830,6 @@ def test_realtime_duplex_demo_distinguishes_late_and_missing_commit():
         {"type": "conversation.item.added", "item": {"id": item_id}},
         {"type": "response.output_item.added", "response_id": response_id},
         {"type": "response.content_part.added", "response_id": response_id},
-        {"type": "response.speak", "response_id": response_id},
         {"type": "response.output_audio.delta", "response_id": response_id, "delta": "AAAA"},
         {"type": "response.output_audio.done", "response_id": response_id},
         {"type": "response.content_part.done", "response_id": response_id},
@@ -917,28 +848,6 @@ def test_realtime_duplex_demo_distinguishes_late_and_missing_commit():
     assert not state.event_order_ok(
         require_input_commit=True,
         require_commit_before_response=False,
-    )
-
-
-def test_realtime_duplex_demo_accepts_overlap_unit_terminating_continuous_response():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response_id": "resp-1"})
-    state.add({"type": "response.done", "response_id": "resp-1"})
-
-    assert demo._continuous_overlap_terminal_is_outcome(
-        state,
-        validation_mode="model-policy",
-        model_unit_ready_while_active=True,
-        before_created=1,
-        before_model_listen=0,
-    )
-    assert not demo._continuous_overlap_terminal_is_outcome(
-        state,
-        validation_mode="response-required",
-        model_unit_ready_while_active=True,
-        before_created=1,
-        before_model_listen=0,
     )
 
 
@@ -1014,52 +923,6 @@ def test_realtime_duplex_demo_gate_checks_delta_done_and_turn_independence():
 
     assert result["transcript_delta_done_ok"] is True
     assert result["cross_turn_independent_ok"] is True
-
-
-def test_realtime_duplex_demo_speak_gate_accepts_one_decision_event_per_response():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response": {"id": "resp-1"}})
-    state.add(
-        {
-            "type": "response.speak",
-            "response_id": "resp-1",
-            "metadata": {"model_speak": True},
-        }
-    )
-
-    assert demo._evaluate_response_speak_contract(state)["response_speak_contract_ok"] is True
-
-
-def test_realtime_duplex_demo_speak_gate_rejects_duplicate_event():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response": {"id": "resp-1"}})
-    state.add({"type": "response.speak", "response_id": "resp-1"})
-    state.add({"type": "response.speak", "response_id": "resp-1"})
-
-    result = demo._evaluate_response_speak_contract(state)
-
-    assert result["response_speak_contract_ok"] is False
-    assert result["duplicate_response_speak_ids"] == ["resp-1"]
-
-
-def test_realtime_duplex_demo_speak_gate_rejects_text_channel():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response": {"id": "resp-1"}})
-    state.add(
-        {
-            "type": "response.speak",
-            "response_id": "resp-1",
-            "text": "must be emitted through response.audio_transcript.delta",
-        }
-    )
-
-    result = demo._evaluate_response_speak_contract(state)
-
-    assert result["response_speak_contract_ok"] is False
-    assert result["text_bearing_response_speak_count"] == 1
 
 
 def test_realtime_duplex_demo_gate_rejects_cross_turn_tail_reuse():
@@ -1232,50 +1095,6 @@ def test_realtime_duplex_demo_response_required_skips_audio_only_model_turn(monk
     assert outcome == "speak"
 
 
-def test_realtime_duplex_demo_no_hint_realtime_turn_omits_transcript_hint(monkeypatch):
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    captured = {}
-
-    async def fake_send_pcm16(*args, **kwargs):
-        del args
-        captured.update(kwargs)
-        state.add(
-            {
-                "type": "response.listen",
-                "response": {"metadata": {"model_listen": True}},
-            }
-        )
-
-    class FakeWebSocket:
-        async def send(self, payload):
-            del payload
-
-    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
-
-    response_id, outcome = asyncio.run(
-        demo._send_clean_turn(
-            FakeWebSocket(),
-            state,
-            b"\x00\x00",
-            transcript="turn label only",
-            duration_ms=None,
-            chunk_ms=200,
-            timeout_s=0.1,
-            require_audio=False,
-            validation_mode="model-policy",
-            send_transcript_hint=False,
-            realtime_input=True,
-            model_policy_settle_s=0.01,
-        )
-    )
-
-    assert response_id is None
-    assert outcome == "listen"
-    assert captured["hints"] == {}
-    assert captured["realtime_delay"] is True
-
-
 def test_realtime_duplex_demo_continuous_input_omits_browser_commit(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -1333,51 +1152,6 @@ def test_realtime_duplex_demo_gate_rejects_server_errors():
     assert errors == [{"type": "error", "code": "runtime_signal_failed", "error": "signal failed"}]
 
 
-def test_realtime_duplex_demo_model_policy_waits_for_speak_after_intermediate_listen(monkeypatch):
-    demo = _load_demo_module()
-    state = demo.DemoState()
-
-    async def fake_send_pcm16(*args, **kwargs):
-        del args, kwargs
-        state.add(
-            {
-                "type": "response.listen",
-                "response": {"metadata": {"model_listen": True}},
-            }
-        )
-
-        async def delayed_speak():
-            await asyncio.sleep(0.01)
-            state.add({"type": "response.created", "response": {"id": "resp-delayed"}})
-            _add_response_transcript(state, "resp-delayed", transcript="延迟回答", audio=False)
-
-        asyncio.create_task(delayed_speak())
-
-    class FakeWebSocket:
-        async def send(self, payload):
-            del payload
-
-    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
-
-    response_id, outcome = asyncio.run(
-        demo._send_clean_turn(
-            FakeWebSocket(),
-            state,
-            b"\x00\x00",
-            transcript="fixture",
-            duration_ms=None,
-            chunk_ms=200,
-            timeout_s=0.2,
-            require_audio=False,
-            validation_mode="model-policy",
-            model_policy_settle_s=0.05,
-        )
-    )
-
-    assert response_id == "resp-delayed"
-    assert outcome == "speak"
-
-
 def test_realtime_duplex_demo_model_policy_does_not_assume_one_response_per_physical_input():
     demo = _load_demo_module()
 
@@ -1408,62 +1182,6 @@ def test_realtime_duplex_demo_only_requires_cross_turn_independence_for_response
         validation_mode="response-required",
         distinct_inputs_required=False,
     )
-
-
-def test_realtime_duplex_demo_drains_late_model_response_before_close():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response": {"id": "resp-first"}})
-    state.add({"type": "response.done", "response": {"id": "resp-first"}})
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.messages = []
-
-        async def send(self, payload):
-            self.messages.append(demo.json.loads(payload))
-
-    async def run_fixture():
-        async def finish_late_response():
-            await asyncio.sleep(0.01)
-            state.add({"type": "response.created", "response": {"id": "resp-late"}})
-            await asyncio.sleep(0.01)
-            state.add({"type": "response.done", "response": {"id": "resp-late"}})
-
-        late_response = asyncio.create_task(finish_late_response())
-        ws = FakeWebSocket()
-        await demo._drain_model_policy_responses(
-            ws,
-            state,
-            timeout_s=0.2,
-            settle_s=0.03,
-        )
-        await late_response
-        return ws
-
-    asyncio.run(run_fixture())
-
-    assert state.completed_response_ids() == ["resp-first", "resp-late"]
-
-
-def test_realtime_duplex_demo_model_response_drain_times_out_with_active_ids():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    state.add({"type": "response.created", "response": {"id": "resp-active"}})
-
-    class FakeWebSocket:
-        async def send(self, payload):
-            del payload
-
-    with pytest.raises(TimeoutError, match="resp-active"):
-        asyncio.run(
-            demo._drain_model_policy_responses(
-                FakeWebSocket(),
-                state,
-                timeout_s=0.03,
-                settle_s=0.01,
-            )
-        )
 
 
 def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
@@ -1498,69 +1216,6 @@ def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
 
     assert model_unit_message_counts == [5, 10]
     assert len(ws.messages) == 10
-
-
-def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_first_done(monkeypatch):
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    send_calls = 0
-
-    async def fake_send_pcm16(*args, **kwargs):
-        nonlocal send_calls
-        send_calls += 1
-        if send_calls == 1:
-            assert len(args[1]) == 2 + demo.PCM16_SAMPLE_RATE * demo.PCM16_BYTES_PER_SAMPLE
-            state.add({"type": "input_audio_buffer.speech_started", "turn": 1})
-            state.add({"type": "response.created", "response": {"id": "resp-first"}})
-            state.add(
-                {
-                    "type": "response.output_audio.delta",
-                    "response_id": "resp-first",
-                    "delta": "YQ==",
-                }
-            )
-            assert await kwargs["on_model_unit_ready"]() is False
-            return
-
-        del args
-        assert not state.response_done("resp-first")
-        kwargs["on_model_unit_ready"]()
-        _add_response_transcript(state, "resp-first", transcript="第一轮完成", audio=False)
-        state.add({"type": "response.created", "response": {"id": "resp-second"}})
-        _add_response_transcript(state, "resp-second", transcript="第二轮完成", audio=True)
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.messages = []
-
-        async def send(self, payload):
-            self.messages.append(payload)
-
-    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
-    ws = FakeWebSocket()
-
-    response_ids, outcomes, overlap_ok = asyncio.run(
-        demo._send_listen_only_overlap_pair(
-            ws,
-            state,
-            b"\x00\x00",
-            b"\x00\x00",
-            transcripts=("first", "second"),
-            durations_ms=(None, None),
-            chunk_ms=200,
-            timeout_s=0.2,
-            send_transcript_hint=False,
-            realtime_input=True,
-            model_policy_settle_s=0.01,
-            validation_mode="response-required",
-            silence_ms=1000,
-        )
-    )
-
-    assert response_ids == ["resp-first", "resp-second"]
-    assert outcomes == ["speak", "speak"]
-    assert overlap_ok is True
-    assert sum(demo.json.loads(message)["type"] == "input_audio_buffer.commit" for message in ws.messages) == 2
 
 
 def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
