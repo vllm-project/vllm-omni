@@ -205,62 +205,6 @@ def _extract_codes_from_output(source_output: Any, modality_key: str) -> list[li
     return [row for row in rows if row and all(c >= 0 for c in row)]
 
 
-def thinker2image_decoder_token_only(
-    source_outputs: Sequence[Any],
-    prompt: Any = None,
-    _requires_multimodal_data: bool = True,
-) -> list[OmniTokensPrompt]:
-    del prompt
-    engine_inputs: list[OmniTokensPrompt] = []
-    for source_output in source_outputs:
-        if not source_output.finished:
-            continue
-        additional_information: dict[str, Any] = {
-            "visual_token_ids": _extract_codes_from_output(source_output, "visual"),
-        }
-        # infer_visual_grid counts visible IMG_PAD placeholders per row (one
-        # per real-pixel step, forced in compute_logits) -- it was ALSO
-        # fixed alongside extract_visual_codes: an earlier version divided
-        # by NUM_CODEBOOKS, matching the same wrong assumption that the real
-        # per-level codes rode this stream directly.
-        grid = infer_visual_grid(_generated_ids(source_output))
-        if grid is not None:
-            additional_information["token_h"] = grid[0]
-            additional_information["token_w"] = grid[1]
-        engine_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information=additional_information,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-    return engine_inputs
-
-
-def thinker2audio_decoder_token_only(
-    source_outputs: Sequence[Any],
-    prompt: Any = None,
-    _requires_multimodal_data: bool = True,
-) -> list[OmniTokensPrompt]:
-    del prompt
-    engine_inputs: list[OmniTokensPrompt] = []
-    for source_output in source_outputs:
-        if not source_output.finished:
-            continue
-        engine_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information={
-                    "audio_token_ids": _extract_codes_from_output(source_output, "audio"),
-                },
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-    return engine_inputs
-
-
 def thinker2multi_decoder_token_only(
     source_outputs: Sequence[Any],
     prompt: Any = None,

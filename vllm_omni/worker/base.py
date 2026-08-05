@@ -121,7 +121,6 @@ class OmniGPUWorkerBase(GPUWorker):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
-        self.total_consumed = profile_result.total_consumed
 
         process_memory = (
             get_process_gpu_memory(self.local_rank)
