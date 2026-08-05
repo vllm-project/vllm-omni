@@ -216,9 +216,7 @@ class OmniModelConfig(ModelConfig):
             return
         if self.task_type not in _QWEN3_TTS_TASK_TYPES:
             supported = ", ".join(sorted(_QWEN3_TTS_TASK_TYPES))
-            raise ValueError(
-                f"Qwen3-TTS --task-type must be one of {supported}; got {self.task_type!r}"
-            )
+            raise ValueError(f"Qwen3-TTS --task-type must be one of {supported}; got {self.task_type!r}")
 
     def _patch_qwen3_tts(self):
         """Patches the value of `position_id_per_seconds` in Qwen3's
