@@ -1,11 +1,9 @@
 """LongCat-Next image decoder stage (visual codes -> RGB image).
 
-Instantiates the checkpoint's remote-code ``LongcatNextVisualTokenizer`` and
-drives its decode path: RQ codebook dequantisation -> 32-layer
-VisionTransformerDecoder -> flow-matching refiner (DiT + VAE). Only the
-``model.visual_tokenizer.*`` subtree of the sharded checkpoint is loaded
-(shards 7/8/15), plus ``image_decoder/image_decoder.safetensors`` which the
-remote code lazily pulls in on first decode.
+Runs the checkpoint's remote-code LongcatNextVisualTokenizer decode path
+(RQ dequant -> VisionTransformerDecoder -> flow-matching DiT/VAE refiner),
+loading only the model.visual_tokenizer.* subtree plus the image decoder's
+own safetensors, which the remote code pulls in lazily on first decode.
 """
 
 import json
@@ -49,10 +47,8 @@ class LongcatNextImageDecoder(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-        # The vllm-omni config shim lacks the nested visual configs; use the
-        # checkpoint's own remote config and resolve its weight-path
-        # placeholders against the local model directory (never editing the
-        # checkpoint itself).
+        # vllm-omni's config shim lacks the nested visual configs; use the
+        # checkpoint's own remote config instead.
         self.hf_config = load_remote_hf_config(self.model_path)
         vdc = self.hf_config.visual_config.visual_decoder_config
         vdc.weight_path = resolve_checkpoint_relative_path(vdc.weight_path, self.model_path)
@@ -134,20 +130,11 @@ class LongcatNextImageDecoder(nn.Module):
         if codes.ndim == 1:
             codes = codes.reshape(-1, NUM_CODEBOOKS)
 
-        # The reference's own GEN_IMAGE_STAGE (output_processor.py:204-216)
-        # reads token_h but never uses it -- only token_w gates per-row
-        # IMAGE_NEWLINE forcing, so there is no analogous forced-termination
-        # transition once token_h rows are complete (unlike audio's max_gen
-        # cap). A thinker call with a loose max_tokens keeps sampling frames
-        # past the intended grid until the token budget runs out or the
-        # model happens to naturally sample IMAGE_END (observed NOT to
-        # happen reliably -- job 15032548 produced 51 frames for a
-        # requested 4x4=16 grid). VisionTransformerDecoder.forward's
-        # positions_2d assert requires exactly token_h*s * token_w*s
-        # positions, so passing every kept frame through unconditionally
-        # crashes decoding (`AssertionError: positions_2d != L`) the moment
-        # generation overruns. The intended image is always the *first*
-        # token_h*token_w kept frames.
+        # Nothing forces generation to stop exactly at the grid boundary (the
+        # thinker keeps sampling past it until max_tokens runs out), and
+        # VisionTransformerDecoder's positions_2d assert requires exactly
+        # token_h*token_w positions -- so trim to the first token_h*token_w
+        # kept frames, which is always the intended image.
         expected_positions = token_h * token_w
         if codes.shape[0] > expected_positions:
             logger.warning(
@@ -160,16 +147,10 @@ class LongcatNextImageDecoder(nn.Module):
             )
             codes = codes[:expected_positions]
         elif codes.shape[0] < expected_positions:
-            # The mirror-image failure: fewer real pixel frames than the
-            # grid needs (e.g. the thinker's max_tokens cut generation short
-            # before <longcat_img_end>, or any other frame-accounting bug).
-            # VisionTransformerDecoder.forward's positions_2d assert requires
-            # EXACTLY token_h*s * token_w*s positions -- handing it a short
-            # `codes` crashes the assert, which kills this stage's whole GPU
-            # worker process (and cascades into the scheduler losing track
-            # of the request). Fail this one request cleanly instead: no
-            # image is recoverable from a short, incomplete grid, so return
-            # empty output rather than let the process die.
+            # Fewer frames than the grid needs (e.g. max_tokens cut
+            # generation short) would hit the same positions_2d assert and
+            # crash the whole GPU worker process -- no image is recoverable
+            # from a short grid, so fail this one request cleanly instead.
             logger.warning(
                 "Image decoder got %d code frames, expected token_h*token_w=%d "
                 "-- generation was cut short before the grid completed "
@@ -183,13 +164,9 @@ class LongcatNextImageDecoder(nn.Module):
 
         self._ensure_weights()
 
-        # lazy_decode_and_save indexes each level's codebook directly
-        # (embed[data[..., idx]] in modular_longcat_next_visual.py's
-        # LongcatNextVisualTokenizer.lazy_decode_and_save) -- it wants raw
-        # per-level codebook indices (0..codebook_size-1), not global-vocab
-        # offset ids. Adding visual_offset_vals here (as an earlier version
-        # of this code did) pushes indices past each level's embedding table
-        # size and triggers an out-of-bounds device-side assert.
+        # lazy_decode_and_save indexes each level's codebook directly, so it
+        # wants raw per-level indices (0..codebook_size-1), not global-vocab
+        # offset ids -- adding visual_offset_vals here would OOB the embed.
         with tempfile.TemporaryDirectory(prefix="longcat_imgdec_") as tmp_dir:
             save_prefix = os.path.join(tmp_dir, "out")
             with torch.inference_mode():
@@ -207,8 +184,7 @@ class LongcatNextImageDecoder(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # This stage loads its own weight subtree (model.visual_tokenizer.* +
-        # image_decoder.safetensors) lazily on first decode; the engine-side
-        # loader has nothing to place here.
+        # Weights are loaded lazily on first decode (_ensure_weights); the
+        # engine-side loader has nothing to place here.
         consumed = {name for name, _ in weights}
         return consumed | {name for name, _ in self.named_parameters()}

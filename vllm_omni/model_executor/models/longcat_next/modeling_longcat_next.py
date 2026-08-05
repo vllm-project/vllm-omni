@@ -1,31 +1,22 @@
 """LongCat-Next thinker stage — native vLLM port.
 
-The 74B MoE+MLA backbone runs on vLLM's native ``FlashNgramModel``
-(``vllm/model_executor/models/longcat_flash_ngram.py``), so tensor parallelism,
-paged KV cache and the fused MoE kernels all apply. On top of the backbone:
+The 74B MoE+MLA backbone runs on vLLM's native FlashNgramModel, so TP, paged
+KV cache and fused MoE all apply. On top of that:
 
-- **n-gram embedding fusion** — upstream's ``LongcatFlashNgramForCausalLM``
-  computes it in an MRV2 ``ModelState``, but vllm-omni forces the V1 runner.
-  Here it runs in the omni runner's per-request ``preprocess`` hook, which
-  provides ``request_id`` + per-span token ids each step; per-request left
-  context (last n-1 tokens, EOS-negated) lives on the model and is cleaned up
-  via ``on_requests_finished``. Ids are computed with the same
-  ``ngram_compute_n_gram_ids`` CUDA kernel the native model state uses.
-- **multimodal understanding** — the checkpoint's remote-code visual/audio
-  tokenizers (encoders + VQ bridges) run per rank; code embeddings are
-  ``embed_tokens(ids).sum(levels)`` (+ the visual bridge), merged at
-  ``<longcat_img_pad>`` / ``<longcat_audio_pad>`` positions through vLLM's
-  standard is_multimodal mask path. Placeholder positions keep the pure
-  multimodal embedding (no n-gram fusion), matching the HF forward.
-- **lm_head** is 131125-wide (text + special tokens) per the checkpoint.
-- **Audio generation** (speech synthesis) uses ``talker_mtp``: when the model
-  emits ``<longcat_audiogen_start>``, ``preprocess`` emits ``mtp_inputs`` so
-  the runner calls ``talker_mtp()`` each decode step. ``talker_mtp`` runs the
-  checkpoint's 8-level ``audio_head`` (rank 0 only + broadcast to avoid TP
-  deadlock from the checkpoint's hardcoded ``cuda:0``) and accumulates
-  per-frame codes into ``model_intermediate_buffer["codes"]["audio"]``.
-  Visible-token control (EOS suppression, audiotext_pad forcing) lives in
-  ``compute_logits`` to work on the async-scheduling path.
+- n-gram embedding fusion runs per-request in the omni runner's preprocess
+  hook (vllm-omni forces the V1 runner, so it can't live in an MRV2
+  ModelState like upstream); left context lives on the model, cleaned up
+  via on_requests_finished.
+- multimodal understanding: remote-code visual/audio tokenizers produce code
+  embeddings merged at the mm placeholder positions via vLLM's standard
+  is_multimodal mask path.
+- lm_head is 131125-wide (text + special tokens only).
+- audio generation uses talker_mtp: preprocess emits mtp_inputs once
+  <longcat_audiogen_start> is seen, the runner calls talker_mtp() per decode
+  step, which runs the 8-level audio_head (rank 0 + broadcast, since the
+  checkpoint hardcodes cuda:0) and accumulates codes into
+  model_intermediate_buffer["codes"]["audio"]. EOS suppression / forced
+  tokens live in compute_logits to work on the async-scheduling path.
 """
 
 import os
@@ -77,11 +68,8 @@ logger = init_logger(__name__)
 
 _DEFAULT_PAD_TOKEN_ID = 3  # generation_config.json; config.json omits it
 
-# Visual CFG twin-stream suffix: the companion request admitted by the
-# engine's CFG expansion carries request_id = f"{parent_id}__cfg_visual"
-# (see stage_input_processors/longcat_next.py::expand_longcat_cfg_prompts).
-# The model uses it to pair the unconditional stream with its parent so it can
-# combine the two depth-head logit streams per step.
+# CFG twin request_id suffix (see expand_longcat_cfg_prompts); used to pair
+# the unconditional stream with its parent for per-step logit combination.
 _CFG_VISUAL_SUFFIX = "__cfg_visual"
 _DEFAULT_CFG_SCALE = 3.0  # generation_config.json custom_params.cfg_scale
 
@@ -106,14 +94,12 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     has_postprocess = True
     have_multimodal_outputs = True
     talker_mtp_accepts_req_infos = True
-    # This model shares one backbone for text and audio: it emits "mtp_inputs"
-    # only while in audio-generation mode, so the runner must skip the talker
-    # decode on text-only steps (gpu_model_runner._talker_mtp_forward).
+    # Shares one backbone for text and audio: only emits "mtp_inputs" while
+    # in audio-gen mode, so the runner must skip talker decode on text-only
+    # steps (gpu_model_runner._talker_mtp_forward).
     omits_talker_mtp_inputs_when_idle = True
-    # preprocess() needs raw token ids (n-gram hashing operates on token ids,
-    # not embeddings) even on the supports_mm_inputs path, where upstream
-    # vLLM's _prepare_mm_inputs otherwise sets input_ids=None and passes only
-    # embeddings (vllm/v1/worker/gpu_model_runner.py::_prepare_mm_inputs).
+    # n-gram hashing needs raw token ids, not embeddings -- upstream's
+    # _prepare_mm_inputs otherwise sets input_ids=None on the mm path.
     requires_raw_input_tokens = True
 
     @classmethod
@@ -133,21 +119,16 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.model_path: str = model_config.model
 
         hf = model_config.hf_config
-        # FlashModel/FlashConfig field alignment: the checkpoint names the MLP
-        # width ffn_hidden_size and omits pad_token_id (generation_config has 3).
+        # FlashModel/FlashConfig field alignment: checkpoint names the MLP
+        # width ffn_hidden_size and omits pad_token_id.
         hf.intermediate_size = getattr(hf, "ffn_hidden_size", getattr(hf, "intermediate_size", None))
         if getattr(hf, "pad_token_id", None) is None:
             hf.pad_token_id = _DEFAULT_PAD_TOKEN_ID
-        # With deploy-config `quantization: fp8` (needed to fit the ~68GB MoE
-        # experts on 40GB-class GPUs), FP8/Marlin online quantization applies
-        # to every ColumnParallelLinear/RowParallelLinear by default —
-        # including MLA's kv_b_proj. FlashDecoderLayer's native weight-loading
-        # fixup (longcat_flash.py) unflattens/splits kv_b_proj.weight into
-        # w_kc/w_vc assuming an unpacked bf16 layout; Marlin's packed FP8
-        # layout breaks that reshape. FlashDecoderLayer already supports
-        # excluding modules from quantization via `disable_quant_module`
-        # (checked for "self_attn" and "mlps"); keep MLA attention in native
-        # bf16 and let the MoE experts (the actual memory driver) quantize.
+        # With quantization: fp8, FP8/Marlin would also quantize MLA's
+        # kv_b_proj, but FlashDecoderLayer's weight-loading fixup unflattens
+        # it into w_kc/w_vc assuming an unpacked bf16 layout -- excluding
+        # self_attn keeps MLA in native bf16 and only quantizes the MoE
+        # experts (the actual memory driver).
         disable_quant_module = list(getattr(hf, "disable_quant_module", []) or [])
         if "self_attn" not in disable_quant_module:
             disable_quant_module.append("self_attn")
@@ -156,12 +137,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.quant_config = vllm_config.quant_config
 
         # --- native TP-sharded backbone -------------------------------------
-        # LongCat-Next sizes/hashes the n-gram tables with text_vocab_size
-        # (131072), not the full 282624 vocab (the checkpoint's
-        # modeling_longcat_ngram.py literally comments out the vocab_size
-        # variant). The native NgramEmbedding uses config.vocab_size, which
-        # here would allocate a ~135 GB table and break every hash — so skip
-        # the base class's ngram build and attach a correctly-sized one.
+        # n-gram tables hash with text_vocab_size (131072), not the full
+        # 282624 vocab -- the native NgramEmbedding uses config.vocab_size,
+        # which would allocate a ~135 GB table, so attach a correctly-sized
+        # one instead of the base class's default.
         self.text_vocab_hash_size = int(getattr(hf, "text_vocab_size", 131072))
         ngram_ratio = hf.ngram_vocab_size_ratio
         hf.ngram_vocab_size_ratio = None
@@ -210,11 +189,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             transformer_ffn_scale=ac.audio_head_transformer_ffn_scale,
         )
 
-        # Cache the audio codebook sizes off the *remote* config. self.config
-        # is vllm-omni's registered shim, whose audio_config/visual_config are
-        # plain dicts (see load_remote_hf_config's docstring), so
-        # self.config.audio_config.vq_config would raise AttributeError at
-        # decode time -- only the remote config carries real sub-config objects.
+        # Cache codebook sizes off the *remote* config: self.config's
+        # audio_config/visual_config are plain dicts, so this would raise
+        # AttributeError there.
         self.audio_codebook_sizes = list(ac.vq_config.codebook_sizes)
         self.visual_codebook_sizes = list(vc.vq_config.codebook_sizes)
 
@@ -255,22 +232,15 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         # --- image generation state (talker_mtp dispatches to this too) ---
         self._visual_gen: dict[str, dict[str, Any]] = {}
-        # generation_config.json's image_generation_config is None -- the
-        # checkpoint does not declare a default grid size at all (confirmed:
-        # `json.load(...)['image_generation_config']` is None). The reference
-        # reads token_h/token_w per REQUEST (req.input_extra_infos[0]), so
-        # this is a caller-supplied parameter, not an internal constant.
-        # This fallback (37x37, matching the image DECODER stage's own
-        # generation_config-default grid) only applies if a request doesn't
-        # supply one via sampling_params.extra_args; real callers should
-        # supply token_w explicitly once this path is GPU-verified.
+        # The checkpoint declares no default grid size; token_h/token_w are
+        # normally caller-supplied per request. This 37x37 fallback only
+        # applies when a request omits them.
         self._default_token_w = 37
         self._default_token_h = 37
-        # NOT pre-declared here (e.g. `= None`): nn.Module.register_buffer
-        # raises KeyError("attribute already exists") if the name is already
-        # a plain instance attribute, even if its value is None. It must stay
-        # entirely absent from __dict__/_buffers until the first real
-        # register_buffer call in _ensure_replicated_audio_code_embedding.
+        # _replicated_audio_code_embedding is NOT pre-declared here (e.g.
+        # `= None`): register_buffer raises KeyError if the name is already a
+        # plain instance attribute, so it must stay absent from __dict__
+        # until the first real register_buffer call.
 
     # ------------------------------------------------------------------ #
     # embeddings
@@ -307,18 +277,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return self.model.embed_tokens(code_ids).sum(dim=1)
 
     def _encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> list[torch.Tensor]:
-        # `pixel_values` is a single flat [total_patches, D] tensor holding
-        # every image's patches concatenated on dim 0 (per
-        # MultiModalFieldConfig.flat_from_sizes); `grid_thw` is [num_images, 3].
-        # The vision encoder consumes/produces the whole flat batch in one
-        # call, so we split its *output* back into per-image chunks rather
-        # than looping the encoder per image.
+        # pixel_values is every image's patches flat-concatenated on dim 0;
+        # the vision encoder consumes the whole batch in one call, so split
+        # its output back into per-image chunks via grid_thw.
         device = self.visual_offset_vals.device
         grid_thw = grid_thw.reshape(-1, 3).to(device)
-        # Not a `visual_config` field (checked: absent from config.json under
-        # both "merge_size" and "spatial_merge_size") — `VisualEncoder.__init__`
-        # reads `config.merge_size` with a `2` fallback and stores it as
-        # `self.merge_size`; read the constructed module's own attribute.
+        # merge_size isn't a visual_config field -- read it off the
+        # constructed encoder module, which defaults it to 2.
         merge_size = getattr(self.visual_tokenizer.visual_model, "merge_size", 2)
         sizes = (grid_thw.prod(dim=-1) // (merge_size**2)).tolist()
 
@@ -335,10 +300,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         encoder_lengths: torch.Tensor,
         bridge_lengths: torch.Tensor,
     ) -> list[torch.Tensor]:
-        # `features` is [num_chunks, mel_bins, T] — every audio clip's chunks
-        # concatenated on dim 0 (per flat_from_sizes); `encoder_lengths` /
-        # `bridge_lengths` are [num_chunks]. The audio encoder consumes the
-        # whole flat batch in one call; split its output per bridge_length.
+        # features is every clip's chunks flat-concatenated on dim 0; the
+        # audio encoder consumes the whole batch in one call, so split its
+        # output per bridge_length.
         device = self.audio_offset_vals.device
         bridge_lengths = bridge_lengths.reshape(-1).to(device)
 
@@ -353,13 +317,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return list(emb.split([int(s) for s in bridge_lengths.tolist()], dim=0))
 
     def embed_multimodal(self, **kwargs: Any) -> tuple[torch.Tensor, ...]:
-        # SupportsMultiModal's abstract method in this vLLM tree is
-        # `embed_multimodal` (called directly by gpu_model_runner.py, incl.
-        # profile_run's dummy-batch pass) — an earlier `get_multimodal_embeddings`
-        # name here was never invoked, silently falling through to the
-        # interface's `...`-bodied stub (implicit `None` return), which broke
-        # engine profiling with "Expected multimodal embeddings to be a
-        # list/tuple ... but got NoneType".
+        # Must be named embed_multimodal, not get_multimodal_embeddings: the
+        # latter falls through to SupportsMultiModal's stub (implicit None),
+        # which breaks engine profiling.
         embeds: list[torch.Tensor] = []
 
         pixel_values = kwargs.get("pixel_values")
@@ -431,24 +391,12 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         Returns update_dict entries for the runner.
 
         ``decode_eligible`` must mirror the runner's own talker_mtp dispatch
-        gate (``span_len == 1 and not is_prefill``, gpu_model_runner.py
-        ~line 1744/1767): when ``<longcat_audiogen_start>`` lands as the
-        LAST token of a multi-token prefill chunk (e.g. it was written
-        literally into the prompt, as every debug script does), preprocess()
-        still runs and still sees last_token==AUDIOGEN_START_TOKEN_ID, but
-        the runner will NOT call talker_mtp for this same step (prefill
-        steps never go through the decode/talker_mtp path). Unconditionally
-        advancing gen_step here (as an earlier version did) desyncs the
-        state machine's step counter from the number of talker_mtp calls
-        that actually happen: gen_step race ahead by 1 for a step whose
-        code was never sampled, permanently losing that frame with no error
-        -- silently producing one fewer real frame than the reference
-        expects for the rest of the request. Guarding the whole advance
-        block on decode_eligible defers gen_step's first 0->1 transition to
-        the first REAL decode step, keeping it 1:1 with talker_mtp
-        invocations. The freshly created state's default ext_id
-        (AUDIOTEXT_PAD_TOKEN_ID) is already the correct forced token for
-        this ineligible step, so skipping the advance costs nothing.
+        gate (span_len == 1 and not is_prefill): if <longcat_audiogen_start>
+        lands as the last token of a multi-token prefill chunk, the runner
+        won't call talker_mtp that step even though preprocess() sees the
+        token. Advancing gen_step unconditionally would then desync it from
+        the actual number of talker_mtp calls, silently dropping a frame.
+        Gating the advance on decode_eligible keeps them 1:1.
         """
         update: dict[str, Any] = {}
         if last_token == AUDIOGEN_START_TOKEN_ID:
@@ -465,32 +413,25 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         state = self._audio_gen.get(request_id)
         if state is not None and not state["terminal"] and decode_eligible:
-            # 0-based index of *this* step. The reference captures gen_step
-            # before advancing the state machine (output_processor.py:218) and
-            # compares that pre-increment value against delay, so every
-            # comparison below uses it rather than the incremented counter.
+            # 0-based index of this step, captured before advancing (the
+            # reference compares its pre-increment value against delay).
             gen_step = state["gen_step"]
             state["gen_step"] = gen_step + 1
 
-            # The first AUDIOTEXT_PAD sampled as the visible token marks the
-            # end of the spoken transcript (reference output_processor.py:
-            # 233-237). From then on compute_logits pins the text stream to
-            # pad, and for a deferred (inf) delay this is also where audio
-            # starts.
+            # First AUDIOTEXT_PAD sampled marks end of the spoken transcript;
+            # from then on compute_logits pins the text stream to pad.
             if not state["text_end"] and last_token == AUDIOTEXT_PAD_TOKEN_ID:
                 state["text_end"] = True
                 state["delay"] = min(state["delay"], gen_step)
 
-            # ext stream + audio gating (reference output_processor.py:242-251).
-            # The reference enables audio at the *end* of step == delay, after
-            # that step's codes were already discarded, so the first real frame
-            # lands on delay+1 — hence the strict '>' rather than '>='.
+            # Audio enables at the END of step == delay (codes already
+            # discarded that step), so the first real frame is delay+1 --
+            # hence '>' not '>='.
             delay = state["delay"]
             state["ext_id"] = AUDIOTEXT_START_TOKEN_ID if gen_step == delay else AUDIOTEXT_PAD_TOKEN_ID
             state["audio_start"] = gen_step > delay
-            # Emit mtp_inputs so the runner calls talker_mtp this step.
-            # last_hidden from previous forward (stashed by make_omni_output),
-            # or zeros if this is the first step after audio_gen creation.
+            # Emit mtp_inputs so the runner calls talker_mtp this step;
+            # last_hidden comes from the previous forward, zeros if new.
             last_hidden = state.get("last_hidden")
             if last_hidden is None:
                 last_hidden = torch.zeros(1, self.config.hidden_size, device=device, dtype=dtype)
@@ -511,55 +452,29 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> dict[str, Any]:
         """Update image-gen state based on the last emitted visible token.
 
-        ``decode_eligible`` mirrors the runner's talker_mtp dispatch gate
-        (``span_len == 1 and not is_prefill``): see _advance_audio_gen's
-        docstring for the full rationale -- the identical bug applies here.
-        When ``<longcat_img_start>`` is the last token of a multi-token
-        prefill chunk (true whenever it's written into the prompt itself,
-        as longcat_next_debug_quality.py's run_image does), advancing
-        gen_step unconditionally raced the step counter one step ahead of
-        the number of talker_mtp calls the runner actually makes, silently
-        dropping the FIRST pixel's code (observed: 1368 kept codes vs the
-        expected 37x37=1369, crashing the reference image decoder's
-        positions_2d assert). Gating the advance on decode_eligible defers
-        gen_step's 0->1 transition to the first real decode step, which is
-        exactly 1:1 with talker_mtp invocations.
+        ``decode_eligible`` mirrors the runner's talker_mtp dispatch gate --
+        same rationale as _advance_audio_gen's docstring, to keep gen_step
+        1:1 with actual talker_mtp calls.
 
-        Mirrors _advance_audio_gen's role, but the reference's image state
-        machine (state_machine.py's GenImageStageStage) is a simpler, single
-        continuous stage -- no delay/text_end/NEXT_*_STAGE loop-back like
-        audio has. It tracks a 2D grid instead: every (token_w + 1)-th step
-        is a row boundary, forced to IMAGE_NEWLINE with its sampled pixel
-        discarded (output_processor.py:204-216); every other step is a real
-        pixel, forced to IMAGE_PAD.
-
-        Termination is the grid bound: once gen_step reaches
-        token_h * (token_w + 1), all rows are emitted, so the step is marked
-        terminal and its visible token forced to IMAGE_END (in compute_logits).
-        The reference instead terminates on ``multi_ids[0] ==
-        IMAGE_END_TOKEN_ID`` (state_machine.py:84), but that is unreachable
-        because the level-0 end-of-image sentinel class is masked out of the
-        head output (output_processor.py:312), so a request only ends when the
-        caller's max_new_tokens runs out -- the source of the image overrun.
+        Unlike audio, the reference's image state machine has no delay/
+        text_end loop-back -- it just tracks a 2D grid: every
+        (token_w + 1)-th step is a row boundary (forced IMAGE_NEWLINE, pixel
+        discarded); every other step is a real pixel (forced IMAGE_PAD).
+        Termination is the grid bound (gen_step reaches token_h*(token_w+1)),
+        forcing IMAGE_END -- the reference's own end-of-image sentinel is
+        masked out of the head output, so without this bound generation
+        would only stop when max_new_tokens runs out.
         """
         update: dict[str, Any] = {}
         if last_token == IMG_START_TOKEN_ID:
-            # The checkpoint's visual_generation_config defaults to a 37x37
-            # token grid, but the real canvas is supplied per-request via
-            # additional_information (token_w/token_h) AND via the
-            # "<longcat_img_token_size>{h} {w}</longcat_img_token_size>"
-            # anyres prefix in the prompt. A missing token_w/token_h means
-            # the caller also omitted the prefix, so the model is generating
-            # without knowing its canvas -- the #1 cause of image content
-            # drifting from the description.
+            # token_w/token_h should come from additional_information (and
+            # match the prompt's anyres prefix); missing them means the
+            # model generates without knowing its canvas.
             is_cfg_twin = request_id.endswith(_CFG_VISUAL_SUFFIX)
             if token_w is None or token_h is None:
                 # The uncond CFG twin has no additional_information of its
-                # own; inherit the parent's canvas (and cfg_scale) so both
-                # streams decode the same grid. If the parent's state is not
-                # visible yet (batch ordering), the defaults below apply and
-                # talker_mtp's CFG sync corrects the twin on the first
-                # combined step anyway.
+                # own; inherit the parent's canvas/cfg_scale so both streams
+                # decode the same grid.
                 parent_id = request_id[: -len(_CFG_VISUAL_SUFFIX)]
                 parent_state = self._visual_gen.get(parent_id)
                 if is_cfg_twin and parent_state is not None:
@@ -619,20 +534,15 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         request_id = str(info.get("request_id", "default"))
         num_computed = int(info.get("_omni_num_computed_tokens", 0))
 
-        # oe_ignored ids (all special tokens >= text_vocab_size, incl. the
-        # mm pad markers) are hash-segment boundaries and take *pure* word
-        # embeddings — no n-gram fusion, per the HF NgramEmbedding forward.
-        # In the kernel's table convention a boundary is a negative entry.
+        # Special tokens (incl. mm pad markers) are hash-segment boundaries
+        # and take pure word embeddings, no n-gram fusion -- a negative
+        # entry in the kernel's table convention.
         ignored = input_ids >= self.text_vocab_hash_size
         boundary = ignored | (input_ids == 0)
         table_ids = torch.where(boundary, torch.full_like(input_ids, -1), input_ids)
 
-        # A/B bypass (LONGCAT_NGRAM_DISABLE=1): pure word embeddings for every
-        # token, no n-gram fusion. If the port-with-ngram matches the
-        # reference-with-ngram and only the *with-ngram* variant drifts, the
-        # divergence is in this fused path (hashing or streaming), not in
-        # attention/MLA. Compare against a reference run with its own ngram
-        # disabled; matching outputs there isolates the fused path as the bug.
+        # LONGCAT_NGRAM_DISABLE=1: A/B bypass for isolating whether a
+        # divergence is in n-gram fusion vs. attention/MLA.
         if self._ngram_disabled:
             out = self.model.embed_tokens(input_ids)
         else:
@@ -647,23 +557,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if input_embeds is not None and pad_mask.any():
             out = torch.where(pad_mask.unsqueeze(-1), input_embeds.to(out.dtype), out)
 
-        # Audio/image-gen state advance: check the LAST token of this span.
-        # A request is in at most one of _audio_gen/_visual_gen at a time
-        # (the reference's state machine treats GEN_AUDIO_STAGE/
-        # GEN_IMAGE_STAGE as mutually exclusive), so both advance calls are
-        # safe to run unconditionally -- each only creates/updates its own
-        # state dict when it sees its own start/end marker.
-        #
-        # decode_eligible mirrors the runner's own talker_mtp dispatch gate
-        # (gpu_model_runner.py: `span_len == 1 and not is_prefill`, checked
-        # both before batching into decode_batch_items and again when
-        # popping "mtp_inputs"). It must be threaded into both advance calls
-        # so gen_step only advances on a step where the runner will actually
-        # invoke talker_mtp -- see _advance_audio_gen's docstring for why an
-        # unconditional advance silently drops a frame whenever
-        # <longcat_audiogen_start>/<longcat_img_start> lands as the last
-        # token of a multi-token prefill chunk (e.g. written into the
-        # prompt itself).
+        # Advance audio/image-gen state off the LAST token of this span. A
+        # request is in at most one of _audio_gen/_visual_gen at a time, so
+        # both calls are safe unconditionally. decode_eligible must mirror
+        # the runner's talker_mtp dispatch gate -- see _advance_audio_gen.
         update_dict: dict[str, Any] = {}
         last_token = int(input_ids[-1])
         is_prefill = bool(info.get("_omni_is_prefill", False))
@@ -728,20 +625,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def make_omni_output(self, model_output: torch.Tensor, **kwargs: Any) -> OmniOutput:
         """Stash hidden states for the next step and emit this step's codes.
 
-        model_output is the backbone's hidden states [num_tokens, hidden_size].
-
-        Returning an ``OmniOutput`` (rather than the bare tensor) is what makes
-        audio codes reach the request at all: the runner's
-        ``extract_multimodal_outputs`` reads ``multimodal_outputs`` only off an
-        ``OmniOutput`` instance and yields ``{}`` for a plain tensor, so a
-        tensor return silently drops every frame talker_mtp produces.
-
-        Ordering: ``_preprocess`` (which runs talker_mtp) precedes
-        ``_model_forward`` (which calls this) within a step, so the codes
-        sampled this step are already in ``model_intermediate_buffer`` and go
-        out on this same step's output. The output processor concatenates the
-        per-step rows (CONCAT_DIM0 for the thinker stage's ``latent`` modality)
-        into the final [T, 8] tensor the audio decoder consumes.
+        Must return an OmniOutput, not a bare tensor: the runner's
+        extract_multimodal_outputs only reads multimodal_outputs off an
+        OmniOutput instance, so a tensor return silently drops every frame
+        talker_mtp produces. _preprocess (which runs talker_mtp) precedes
+        _model_forward (which calls this) within a step, so this step's
+        codes are already in model_intermediate_buffer; the output processor
+        concatenates per-step rows into the final [T, 8] tensor.
         """
         # Non-last pipeline ranks forward IntermediateTensors, which carry no
         # hidden states to stash and no codes to emit.
@@ -752,11 +642,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
 
-        # Stash each active request's own last-position hidden state. During
-        # decode model_output is flat [num_tokens, hidden]; the runner passes
-        # request_token_spans (aligned 1:1 with info_dicts, each carrying its
-        # req_id) so a multi-request batch gets the right row instead of
-        # everyone inheriting model_output[-1:] from the last request.
+        # Stash each active request's own last-position hidden state, using
+        # request_token_spans to pick the right row per request in a
+        # multi-request batch (rather than everyone inheriting the last row).
         spans = kwargs.get("request_token_spans")
         active_ids = list(self._audio_gen.keys()) + list(self._visual_gen.keys())
         if active_ids and isinstance(spans, list) and len(spans) == len(info_dicts):
@@ -779,20 +667,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 state = self._audio_gen.get(req_id) or self._visual_gen.get(req_id)
                 state["last_hidden"] = model_output[-1:].detach().clone()
 
-        # The runner's talker_mtp_output_key is a single fixed ("codes",
-        # "audio") destination (gpu_model_runner.py) regardless of which
-        # modality's branch inside talker_mtp actually produced a row's
-        # codes -- there is no per-row modality tag on that wire. What DOES
-        # identify each row's request is the info dict it arrived in: every
-        # entry gathered by _gather_runtime_additional_information carries
-        # its own "req_id" (added there specifically to support this), so
-        # each frame is routed by looking up which of _audio_gen/_visual_gen
-        # that request actually belongs to, rather than guessing one
-        # modality for the whole step's batch. This is what makes a batch
-        # mixing an audio-gen request and an image-gen request route
-        # correctly instead of one modality silently overwriting the other's
-        # key. The fallback (no usable req_id, e.g. older callers/tests) only
-        # applies to a batch that is not already mixed.
+        # The runner's talker_mtp output key doesn't carry a per-row modality
+        # tag, so each frame is routed by looking up which of
+        # _audio_gen/_visual_gen its req_id belongs to -- this is what lets a
+        # batch mixing audio-gen and image-gen requests route correctly. The
+        # fallback only applies to a batch that isn't already mixed.
         fallback_modality = "visual" if (self._visual_gen and not self._audio_gen) else "audio"
 
         frames_by_modality: dict[str, list[torch.Tensor]] = {"audio": [], "visual": []}
@@ -802,18 +681,15 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             codes = info.get("codes")
             if not isinstance(codes, dict):
                 continue
-            # Consumed, not just read: the buffer entry persists across steps,
-            # so leaving it would re-emit the same frame on every later step
-            # where talker_mtp did not run (e.g. after terminal) and duplicate
-            # audio.
+            # Pop (not just read): leaving it would re-emit the same frame on
+            # every later step where talker_mtp didn't run, duplicating audio.
             frame = codes.pop("audio", None)
             if not isinstance(frame, torch.Tensor) or frame.numel() == 0:
                 continue
             frame = frame.reshape(1, -1) if frame.dim() == 1 else frame
-            # talker_mtp marks discarded frames (pre-audio_start/row-boundary,
-            # chunk/image-end sentinel, rows of requests not generating) with
-            # an all -1 row so the returned tensor stays batch-aligned; those
-            # are not real codes and must not reach the decoder.
+            # talker_mtp marks discarded rows (pre-audio_start, row-boundary,
+            # chunk/image-end sentinel) with all -1 to stay batch-aligned;
+            # those must not reach the decoder.
             frame = frame[(frame >= 0).all(dim=1)]
             if frame.numel() == 0:
                 continue
@@ -856,21 +732,14 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         existing = getattr(self, "_replicated_audio_code_embedding", None)
         if existing is not None:
             return existing
-        # Materialize a replicated (non-TP) copy of the audio-code embedding
-        # rows [AUDIO_OFFSET, AUDIO_OFFSET + sum(codebook_sizes)). This avoids
-        # the TP all-reduce in VocabParallelEmbedding when audio_head indexes
-        # embeddings inside the rank-0-only code path.
+        # Replicated (non-TP) copy of the audio-code embedding rows, so
+        # audio_head's rank-0-only code path avoids VocabParallelEmbedding's
+        # TP all-reduce. All ranks participate in this embed_tokens call
+        # (matched collective) before each stores its own local copy.
         base = int(self.audio_offset_vals[0].item())
         total = sum(self.audio_codebook_sizes)
-        audio_id_range = torch.arange(
-            base,
-            base + total,
-            device=device,
-            dtype=torch.long,
-        )
-        # All ranks participate in this embed_tokens call (matched collective).
+        audio_id_range = torch.arange(base, base + total, device=device, dtype=torch.long)
         emb = self.model.embed_tokens(audio_id_range).detach().float()
-        # Now each rank has the same embedding; store a local copy.
         self.register_buffer(
             "_replicated_audio_code_embedding", emb.to(device=device, dtype=self.dtype), persistent=False
         )
@@ -880,16 +749,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def _ensure_audio_code_embed_module(self, device: torch.device) -> nn.Module:
         """Callable embedding over the audio-code rows, for audio_head.
 
-        The checkpoint's ``CasualDepthTransformerHead.forward(x, visual_tokens,
-        visual_emb_layers, level)`` does ``visual_emb_layers.to("cuda:0")`` and
-        then ``visual_emb_layers(visual_tokens[..., i])`` -- i.e. it wants a
-        single callable ``nn.Module`` (it is the *checkpoint's* variant; the
-        SGLang reference's ``image_head.py`` instead indexes a list per level).
-        Passing ``None`` raises AttributeError on the ``.to()``.
-
-        Indices are relative to AUDIO_OFFSET so this stays a compact table
-        rather than the full vocab, which also keeps the hardcoded ``cuda:0``
-        move off the TP-sharded ``embed_tokens``.
+        CasualDepthTransformerHead.forward calls .to("cuda:0") then invokes
+        this argument directly, so it needs a real callable nn.Module (not
+        None). Indices are relative to AUDIO_OFFSET to stay a compact table
+        instead of the full TP-sharded embed_tokens.
         """
         holder = self.__dict__.setdefault("_audio_embed_holder", {})
         module = holder.get("module")
@@ -904,12 +767,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _ensure_replicated_visual_code_embedding(self, device: torch.device) -> torch.Tensor:
         """Visual-code analog of _ensure_replicated_audio_code_embedding.
-
-        Used only as the depth-head's OWN internal ``visual_emb_layers``
-        argument (see _ensure_visual_code_embed_module) -- NOT the outer
-        next-step feedback embedding, which reuses the already-proven
-        _code_embeddings + visual_embedding_layer path (same one image
-        *understanding* uses in _encode_images).
+        Used only for the depth-head's own internal embedding argument --
+        NOT the outer next-step feedback embedding, which reuses
+        _code_embeddings + visual_embedding_layer (same as _encode_images).
         """
         existing = getattr(self, "_replicated_visual_code_embedding", None)
         if existing is not None:
@@ -926,12 +786,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _ensure_visual_code_embed_module(self, device: torch.device) -> nn.Module:
         """Callable embedding over the visual-code rows, for visual_head.
-
-        Same rationale as _ensure_audio_code_embed_module: the checkpoint's
-        CasualDepthTransformerHead (the same class backs both audio_head and
-        visual_head) calls this argument's ``.to()`` and invokes it directly,
-        so it needs a real nn.Module, not None.
-        """
+        Same rationale as _ensure_audio_code_embed_module."""
         holder = self.__dict__.setdefault("_visual_embed_holder", {})
         module = holder.get("module")
         if module is not None:
@@ -953,17 +808,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         repetition_penalty: float = 1.0,
         past_codes: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Sample one audio code from logits, matching generation_config defaults.
-
-        ``None`` sampling keys are coalesced to the defaults (the runner passes
-        explicit ``None`` when subtalker_sampling_params is unset; ``None``
-        would otherwise fall through to greedy argmax or raise on temperature).
-
-        ``repetition_penalty``/``past_codes`` implement the reference's
-        code-level penalty (output_processor.py:369-397): each code already
-        sampled for this level is penalised (score<0 * penalty, else /penalty)
-        on the raw logits, before temperature. No-op when penalty==1.0 or the
-        level has no history.
+        """Sample one audio code from logits, matching generation_config
+        defaults. None sampling keys coalesce to defaults (the runner passes
+        explicit None when unset). repetition_penalty/past_codes implement
+        the reference's code-level penalty on raw logits, before
+        temperature; no-op when penalty==1.0 or no history.
         """
         if do_sample is None:
             do_sample = True
@@ -1018,54 +867,32 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         mask_sentinel: bool = False,
         mask_audio_sentinels: bool = False,
     ) -> torch.Tensor:
-        """Shared rank-0+broadcast depth-head sampling loop.
+        """Shared rank-0+broadcast depth-head sampling loop, used by both
+        audio_head and visual_head (same checkpoint class, hardcoded
+        cuda:0). Returns the broadcast codes_row [num_levels].
 
-        Used by both audio_head and visual_head -- same checkpoint class
-        (CasualDepthTransformerHead), same hardcoded-cuda:0 workaround, same
-        autoregressive per-level accumulator. Returns the broadcast
-        codes_row [num_levels], already visible on every rank.
-
-        ``repetition_penalty``/``past_codes`` are forwarded per level to
-        _sample_audio_code (each level penalises its own history, mirroring
-        the reference's ``past_multi_ids[:, :, i]``). ``mask_sentinel`` zeroes
-        the level-0 end-of-image class for the visual head only (reference
-        output_processor.py:312), so the image can never self-terminate early
-        and the grid bound in _advance_visual_gen is the sole terminator.
-
-        ``mask_audio_sentinels`` zeroes each level >= 1's own sentinel class
-        (index ``codebook_sizes[i]``). The depth head is
-        ``nn.Linear(transformer_dim, vq_size + 1)``, so EVERY level has a
-        ``+1`` sentinel class, but only level-0's is the real chunk-end marker
-        (the reference splits chunks on ``audio_ids[:, 0] == codebook_sizes[0]``
-        and its ``decode_wave_vocoder2`` truncates there). A non-zero-level
-        sentinel would leak into a kept frame and OOB the VQ codebook gather
-        (``codebook.embed[indices]``) at decode time -- the exact GPU assert
-        seen once audio-termination let generation run long. Masking levels
-        >= 1 keeps level-0's chunk-end sentinel available while guaranteeing
-        no out-of-range code is ever emitted.
+        mask_sentinel zeroes the level-0 end-of-image class for the visual
+        head so the grid bound in _advance_visual_gen is the sole
+        terminator. mask_audio_sentinels zeroes each level >= 1's own
+        sentinel class -- the depth head emits a +1 sentinel per level, but
+        only level-0's is the real chunk-end marker; a non-zero-level
+        sentinel would OOB the VQ codebook gather at decode time.
         """
         codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
         if rank == 0:
             sampled_codes = []
             base = offset_vals[0]
             hid = last_hidden.to(dtype=self.dtype)
-            # Accumulator fed into the head, in indices relative to the
-            # modality's own offset (see _ensure_*_code_embed_module). Level
-            # L's logits read hidden_states[:, L], built from the cumulative
-            # embedding of levels 0..L-1 -- filling one slot per iteration is
-            # what makes the depth loop autoregressive.
+            # Accumulator relative to the modality's own offset; filling one
+            # slot per iteration makes the depth loop autoregressive.
             cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
             for level in range(num_levels):
                 logits = head(hid, cum_ids.to(hid.device), code_embed, level)
                 level_logits = logits[0]
                 sentinel_idx = None
                 if mask_sentinel and level == 0:
-                    # codebook_sizes[0] is the end-of-image class (OmniImageHead),
-                    # masked per the reference so it can never be sampled.
                     sentinel_idx = self.visual_codebook_sizes[0]
                 elif mask_audio_sentinels and level >= 1:
-                    # Non-zero-level sentinels are meaningless and OOB the VQ
-                    # codebook at decode; only level-0's is the chunk-end marker.
                     sentinel_idx = self.audio_codebook_sizes[level]
                 if sentinel_idx is not None and sentinel_idx < level_logits.shape[-1]:
                     level_logits = level_logits.clone()
@@ -1103,20 +930,12 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         past_codes: torch.Tensor | None = None,
         cfg_scale: float = _DEFAULT_CFG_SCALE,
     ) -> torch.Tensor:
-        """Sample visual codes with classifier-free guidance from a cond/uncond pair.
-
-        Mirrors _sample_depth_head's rank-0+broadcast structure (the
-        CasualDepthTransformerHead's hardcoded cuda:0 workaround), but drives
-        the autoregressive depth loop with the reference's CFG combination: at
-        every level,
-
-            combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
-
-        where cond_logits come from the parent's hidden state and uncond_logits
-        from the twin's (separate KV cache, so the uncond stream never attends
-        to the user instruction). Both streams share one sampled code per
-        level, keeping the two streams locked to the same pixel sequence.
-        Returns the broadcast codes_row [num_levels] visible on every rank.
+        """Sample visual codes with classifier-free guidance from a cond/uncond
+        pair. Mirrors _sample_depth_head's rank-0+broadcast structure, but at
+        every level combines cond/uncond logits as
+        ``cfg_scale * (cond - uncond) + uncond`` (cond from the parent's
+        hidden state, uncond from the twin's separate-KV-cache stream). Both
+        streams share one sampled code per level to stay locked in sequence.
         """
         codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
         if rank == 0:
@@ -1132,9 +951,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
                 sentinel_idx = None
                 if level == 0:
-                    # Level-0 end-of-image class, masked per the reference
-                    # (output_processor.py:312) so the image can never
-                    # self-terminate early; the grid bound is the terminator.
+                    # Masked so the image can never self-terminate early --
+                    # the grid bound in _advance_visual_gen is the terminator.
                     sentinel_idx = self.visual_codebook_sizes[0]
                 if sentinel_idx is not None and sentinel_idx < combined.shape[-1]:
                     combined = combined.clone()
@@ -1182,16 +1000,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         codebook_sizes = self.audio_codebook_sizes
         num_levels = len(codebook_sizes)
 
-        # Sampling params from the runner's subtalker_sampling_params.
-        # _talker_mtp_forward passes explicit None for every key when
-        # subtalker_sampling_params is unset, so `dict.get(key, default)`
-        # yields None (key present), which would fall through to greedy argmax
-        # or raise. Coalesce None to the checkpoint's generation_config
-        # defaults, per modality (audio top_k=5/top_p=0.85/rep=1.3; visual
-        # top_k=1024/top_p=0.75/rep=1.0). Modality-specific keys
-        # (audio_top_k/visual_top_k, ...) win; the generic key applies to
-        # both only as a fallback, so an audio-tuned value can't silently
-        # override the visual default.
+        # Sampling params from subtalker_sampling_params; keys are explicit
+        # None when unset (not absent), so coalesce below to the checkpoint's
+        # per-modality generation_config defaults. Modality-specific keys win
+        # over the generic fallback.
         do_sample = kwargs.get("do_sample", True)
         temperature = kwargs.get("temperature", 0.5)
         audio_top_k = kwargs.get("audio_top_k", kwargs.get("top_k", 5))
@@ -1216,14 +1028,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             audio_rep_penalty = 1.3
         if visual_rep_penalty is None:
             visual_rep_penalty = 1.0
-        # Diagnostic override: the reference's own default is 1.0 (no
-        # penalty), so this is NOT a claim that visual generation should
-        # normally use a penalty -- it's to test the hypothesis that the
-        # visual CFG collapse (argmax frozen on one class for the whole
-        # image once cfg_scale != 1.0, see [longcat-cfg-logits] audit) is an
-        # autoregressive trajectory-divergence issue that a repetition
-        # penalty could interrupt, since nothing currently discourages
-        # repeating the same code once a collapsed loop starts.
+        # Diagnostic override for testing whether a repetition penalty
+        # interrupts visual CFG collapse; the reference's own default is 1.0.
         _visual_rep_override = os.environ.get("LONGCAT_VISUAL_REP_PENALTY")
         if _visual_rep_override:
             visual_rep_penalty = float(_visual_rep_override)
@@ -1232,27 +1038,18 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         all_codes = torch.full((batch_size, num_levels), -1, dtype=torch.long, device=device)
         all_embeds = inputs_embeds.clone()
 
-        # Materialise BOTH modalities' code embedding tables on EVERY rank,
-        # before the per-row loop and outside any rank-0 guard. Both are
-        # built from self.model.embed_tokens -- a VocabParallelEmbedding
-        # whose forward all-reduces across the TP group -- so building
-        # either lazily inside a rank-0-only sampling block leaves ranks
-        # 1..N-1 out of that collective and deadlocks the group (observed
-        # for audio: RPC TimeoutError with a c10d::Work stack, zero mtp log
-        # lines). Every rank must reach both unconditionally, regardless of
-        # which modality any given row in this batch is actually using.
+        # Materialise both modalities' code embedding tables on EVERY rank,
+        # unconditionally: self.model.embed_tokens all-reduces across the TP
+        # group, so building either lazily inside a rank-0-only block would
+        # leave other ranks out of that collective and deadlock.
         audio_code_embed = self._ensure_audio_code_embed_module(device)
         visual_code_embed = self._ensure_visual_code_embed_module(device)
 
-        # Visual CFG twin pairing. The engine's prompt expansion admits one
-        # unconditional companion per image request with
-        # request_id = f"{parent_id}__cfg_visual" (see
-        # expand_longcat_cfg_prompts). The two streams share the same batch
-        # (admitted with affinity), each with its OWN KV cache / hidden state,
-        # so when both are in visual-gen state in this step we can combine
-        # their depth-head logits per the reference's CFG formula. All ranks
-        # derive the same pairing from the same req_ids/states, keeping the
-        # rank-0 broadcast counts aligned.
+        # Visual CFG twin pairing: the engine admits one unconditional
+        # companion per image request as f"{parent_id}__cfg_visual", sharing
+        # the batch with its own KV cache/hidden state. When both are in
+        # visual-gen state this step, combine their depth-head logits per
+        # the CFG formula. All ranks derive the same pairing.
         row_of: dict[str, int] = {}
         for i, rid in enumerate(req_ids):
             if i < batch_size:
@@ -1305,40 +1102,20 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     mask_audio_sentinels=True,
                 )
 
-                # Detect terminal conditions (reference state_machine.py:97-106)
                 deoff = int(codes_row[0].item())
-                # Condition 1: end-of-chunk marker — model emitted chunk_end_code
                 eoc_terminal = audio_start and (deoff >= codebook_sizes[0])
-                # Condition 2: max_gen safety cap — force-end to prevent infinite gen
                 max_gen_terminal = audio_start and gen_step >= self.max_gen
                 is_terminal = eoc_terminal or max_gen_terminal
 
-                # Every terminal row becomes an explicit chunk-end MARKER row
-                # (level-0 = codebook_sizes[0], the same value _split_chunks
-                # in modeling_longcat_next_audio_decoder.py splits on; other
-                # levels are never decoded for a boundary row, so 0 is a safe
-                # placeholder) instead of the -1 discard sentinel.
-                #
-                # -1 rows are stripped entirely by _extract_codes_from_output
-                # before reaching the decoder -- fine for a single natural
-                # eoc in isolation, but our earlier fix (forcing a clean
-                # <longcat_audiogen_end> close on BOTH eoc_terminal AND
-                # max_gen_terminal, instead of leaving the row unconstrained
-                # and letting the whole request end on real EOS) lets one
-                # request legitimately produce multiple audio segments -- the
-                # model can resume and re-enter <longcat_audiogen_start>
-                # after a max_gen-forced close. Previously a max_gen close
-                # kept the row as an ordinary real frame (reference
-                # behavior, which never continues past max_gen) and an eoc
-                # close discarded it as -1 -- neither survives as a boundary
-                # marker once _extract_codes_from_output strips negatives, so
-                # multiple segments' codes concatenate with NO surviving
-                # boundary between them. LongcatNextAudioDecoder's
-                # _split_chunks then sees one giant merged chunk instead of
-                # several bounded ones and overflows the checkpoint's
-                # fixed-size positional embedding table (observed:
-                # `tensor a (5731) != tensor b (3000)` in
-                # modular_longcat_next_audio.py's audio_decoder.forward).
+                # A terminal row becomes an explicit chunk-end marker row
+                # (level-0 = codebook_sizes[0], same value _split_chunks
+                # splits on) instead of a -1 discard sentinel -- -1 rows are
+                # stripped before reaching the decoder, so without a real
+                # boundary marker, a request that produces multiple audio
+                # segments (max_gen can force a close and let generation
+                # resume) would have its segments' codes concatenate with no
+                # surviving boundary, overflowing the audio decoder's
+                # fixed-size positional embedding table.
                 frame_kept = audio_start and not is_terminal
                 if is_terminal:
                     boundary_row = torch.zeros_like(codes_row)
@@ -1348,34 +1125,26 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
 
                 if frame_kept:
-                    # Repetition-penalty history: kept frames only (the
-                    # reference filters discarded rows, output_processor.py:349).
+                    # Repetition-penalty history: kept frames only.
                     state.setdefault("past_codes", []).append(codes_row.detach().cpu())
 
-                # Build 3-stream next-step embedding (reference's get_audio_embeddings)
-                # Stream 1: ext_id embedding — audiotext_start/pad/audiogen_end
+                # Build the 3-stream next-step embedding.
+                # Stream 1: ext_id (audiotext_start/pad/audiogen_end).
                 ext_tok = torch.tensor([ext_id], device=device, dtype=torch.long)
                 ext_emb = self.model.embed_tokens(ext_tok)
                 if ext_id == AUDIOTEXT_PAD_TOKEN_ID:
                     ext_emb.zero_()
 
-                # Stream 2: visible text token embedding — masked to 0 when the
-                # token itself is audiotext_pad. The reference keys this off the
-                # token value (input_ids_mask, input_processor.py:126,134), not off
-                # the text_end flag: once text_end is set compute_logits pins the
-                # token to pad anyway, so the two agree, but matching on the value
-                # keeps this correct even for a pad sampled before text_end.
+                # Stream 2: visible text token, zeroed when it's audiotext_pad
+                # (keyed off the token value so it's correct even for a pad
+                # sampled before text_end is set).
                 text_tok = input_ids[row : row + 1]
                 text_emb = self.model.embed_tokens(text_tok)
                 if int(text_tok.item()) == AUDIOTEXT_PAD_TOKEN_ID:
                     text_emb.zero_()
 
-                # Stream 3: audio code embeddings — masked to 0 for invalid rows.
-                # The reference additionally drops rows whose level-0 code is 0 or
-                # the chunk-end sentinel (multi_ids_row_mask,
-                # input_processor.py:129-132,145); code 0 doubles as its
-                # clamped-invalid value, so an embedding is only summed in for a
-                # kept frame with a non-zero level-0 code.
+                # Stream 3: audio code embeddings, zeroed for invalid rows --
+                # code 0 doubles as the clamped-invalid value.
                 audio_emb = torch.zeros_like(ext_emb)
                 if frame_kept and deoff != 0:
                     replicated_emb = self._ensure_replicated_audio_code_embedding(device)
@@ -1394,20 +1163,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 if is_terminal:
                     state["terminal"] = True
-                    # Force the closing tag on the terminal step itself,
-                    # mirroring _advance_visual_gen's IMG_END forcing
-                    # (grid-bound termination). Without this, compute_logits
-                    # used to `continue` entirely once terminal -- fully
-                    # unbanning EOS with no forced closure -- so the model
-                    # was free to (and observed to) end the WHOLE request via
-                    # real EOS within a few tokens of chunk_end/max_gen,
-                    # instead of just closing this audio segment and
-                    # resuming normal generation. Setting ext_id here means
-                    # compute_logits' terminal branch (below) forces
-                    # <longcat_audiogen_end> for exactly this one step; once
-                    # the model emits it, _advance_audio_gen's
-                    # AUDIOGEN_END_TOKEN_ID branch pops the state next step,
-                    # returning full freedom only after a clean close.
+                    # Force the closing tag on the terminal step itself, so
+                    # compute_logits' terminal branch emits
+                    # <longcat_audiogen_end> instead of leaving EOS unbanned
+                    # with no forced closure (which let the model end the
+                    # whole request instead of just this audio segment).
                     state["ext_id"] = AUDIOGEN_END_TOKEN_ID
 
             elif visual_state is not None:
@@ -1429,11 +1189,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 if row in cfg_handled_rows:
                     continue
 
-                # Resolve the (parent, twin) pair this visual row belongs to,
-                # if any. Only combine when BOTH streams are present in this
-                # batch AND both are non-terminal visual-gen rows; otherwise
-                # fall back to independent sampling (identical to the
-                # no-CFG path).
+                # Resolve the (parent, twin) pair this row belongs to, if
+                # any; only combine when both are present and non-terminal,
+                # otherwise fall back to independent sampling.
                 parent_req_id: str | None = None
                 twin_req_id: str | None = None
                 if req_id in cfg_parent_of_twin:
@@ -1458,21 +1216,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     and not bool(t_state.get("terminal", False))
                 )
 
-                # Diagnostic for CFG desync: this row belongs to a cond/uncond
-                # pair, but the two streams aren't both active this step, so
-                # the code below falls back to independent (non-CFG) sampling
-                # for whichever side IS present. That fallback is intentional
-                # (the parent/twin are two independently-scheduled engine
-                # requests linked only by affinity to the same replica, not a
-                # hard same-step scheduling guarantee like the reference's
-                # own group_size=2 batching contract -- see
-                # expand_longcat_cfg_prompts's docstring), but it was
-                # previously silent: nothing distinguished "CFG combined
-                # every step" from "CFG never actually combined" short of
-                # noticing degraded image quality. Logged unconditionally
-                # (not gated behind _audio_debug) since it only fires on an
-                # actual desync, not every step -- a real anomaly signal for
-                # any CFG-enabled request, not per-step noise.
+                # This row belongs to a cond/uncond pair but both streams
+                # aren't active this step (parent/twin are independently
+                # scheduled, not a hard same-step guarantee), so it falls
+                # back to independent sampling. Log unconditionally since
+                # this only fires on a real desync, not every step.
                 if parent_req_id is not None and not both_visual_active:
                     logger.warning(
                         "[longcat-image] CFG desync: req=%s parent=%s(row=%s,state=%s,terminal=%s) "
@@ -1490,7 +1238,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     )
 
                 if both_visual_active and row == p_row:
-                    # ---- combined CFG path (drives both streams) ----
+                    # Combined CFG path (drives both streams).
                     p_last_hidden = (
                         last_talker_hidden[p_row : p_row + 1]
                         if p_row < last_talker_hidden.shape[0]
@@ -1529,13 +1277,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     if frame_kept:
                         p_state.setdefault("past_codes", []).append(codes_row.detach().cpu())
 
-                    # Both streams share the combined sample (lockstep) and the
-                    # twin's grid state mirrors the parent's so both terminate
-                    # on the same step and compute_logits forces the same
-                    # visible token on both rows. Keys present on the parent's
-                    # state are copied over (defensive: production states
-                    # always carry all of these, but a desynced/older state
-                    # must not crash the sync).
+                    # Both streams share the combined sample; mirror the
+                    # twin's grid state onto the parent's so both terminate
+                    # on the same step and see the same forced visible token.
                     for _sync_key in ("gen_step", "ext_id", "token_w", "token_h"):
                         if _sync_key in p_state:
                             t_state[_sync_key] = p_state[_sync_key]
@@ -1544,10 +1288,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     for rr in (p_row, t_row):
                         all_codes[rr] = codes_row if frame_kept else torch.full_like(codes_row, -1)
 
-                    # 2-stream next-step embedding, built once from the shared
-                    # codes and applied to both rows (the twin's visible token
-                    # is forced to the same value as the parent's, so reusing
-                    # the parent's text token keeps both streams aligned).
+                    # Next-step embedding built once from the shared codes
+                    # and applied to both rows.
                     text_tok = input_ids[p_row : p_row + 1]
                     text_emb = self.model.embed_tokens(text_tok)
                     if frame_kept and deoff != 0:
@@ -1591,17 +1333,13 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     mask_sentinel=True,
                 )
 
-                # The level-0 end-of-image sentinel class (codebook_sizes[0])
-                # is masked in _sample_depth_head (reference output_processor.py:312)
-                # and so never fires here; the deterministic terminator is the
-                # grid bound in _advance_visual_gen. This check is a defensive
-                # guard for any non-masked path.
+                # The level-0 sentinel is masked in _sample_depth_head so this
+                # never fires; the grid bound in _advance_visual_gen is the
+                # real terminator. Defensive guard for any non-masked path.
                 deoff = int(codes_row[0].item())
                 eoc_terminal = deoff >= visual_codebook_sizes[0]
 
-                # A row-boundary (newline) step never carries a real pixel,
-                # regardless of what was sampled -- mirrors output_processor.py
-                # discarding tmp_multi_ids at row boundaries (filled -999997).
+                # A row-boundary (newline) step never carries a real pixel.
                 frame_kept = not is_row_boundary and not eoc_terminal
                 all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
 
@@ -1609,23 +1347,15 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 if frame_kept:
                     state.setdefault("past_codes", []).append(codes_row.detach().cpu())
 
-                # 2-stream next-step embedding (reference's
-                # get_visual_embed_given_tokens / get_multimodal_embed): unlike
-                # audio's 3-way SUM, this is a MASKED REPLACE -- the visible
-                # text token (IMAGE_PAD or IMAGE_NEWLINE) gets its normal
-                # embedding at a newline position, or gets fully replaced by
-                # the vision embedding at a real-pixel (IMAGE_PAD) position.
-                # No "ext" stream: IMAGE_PAD/IMAGE_NEWLINE simply ARE the
-                # visible token, not a side-channel like audiotext_start/pad.
+                # Unlike audio's 3-way sum, this is a masked replace: the
+                # visible token (IMAGE_PAD/IMAGE_NEWLINE) keeps its normal
+                # embedding at a newline, or is fully replaced by the vision
+                # embedding at a real pixel. No "ext" stream here.
                 text_tok = input_ids[row : row + 1]
                 text_emb = self.model.embed_tokens(text_tok)
 
                 if frame_kept and deoff != 0:
-                    # Reuses the already-proven understanding-direction path
-                    # (_encode_images): embed_tokens per level summed, then
-                    # the visual_embedding_layer bridge refinement. Zero-code
-                    # (deoff == 0) is the clamped-invalid marker, same
-                    # convention as audio's `deoff != 0` guard.
+                    # Reuses the understanding-direction path (_encode_images).
                     offset_codes = (codes_row + self.visual_offset_vals[:visual_num_levels].to(device)).unsqueeze(0)
                     vision_emb = self._code_embeddings(offset_codes)
                     vision_emb = self.visual_tokenizer.visual_embedding_layer(vision_emb.to(self.dtype))
@@ -1640,27 +1370,19 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             else:
                 continue
 
-        # Return *this step's* codes (not an accumulation): the runner stores
-        # them under ``codes.audio`` per request, make_omni_output emits them
-        # on this step's OmniOutput, and the output processor concatenates the
-        # per-step rows into the final [T, 8] tensor. Returning the running
-        # accumulation instead would re-send every earlier frame each step and
-        # grow the result quadratically.
+        # Return this step's codes, not an accumulation -- the output
+        # processor concatenates per-step rows into the final [T, 8] tensor;
+        # returning the running total would grow the result quadratically.
         return all_embeds, all_codes
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None or not (self._audio_gen or self._visual_gen):
             return logits
-        # During audio/image-gen mode, suppress EOS and force visible tokens
-        # per the reference's parallel model.
-        # Row-to-request alignment: during decode (1 token/request), logits
-        # rows == len(_audio_gen)+len(_visual_gen) == 1 in single-request
-        # mode. During prefill logits has many rows but at most 1 active-gen
-        # request; skip forcing in prefill to avoid misaligning row 0 with
-        # the wrong position. A request is in at most one of the two dicts
-        # (mutually exclusive per the reference's state machine), so simple
-        # dict union order is a safe, unambiguous row->request mapping.
+        # Suppress EOS and force visible tokens during audio/image-gen. Skip
+        # in prefill (logits has many rows but at most 1 active-gen request)
+        # to avoid misaligning row 0. A request is in at most one of the two
+        # dicts, so dict union order gives an unambiguous row->request map.
         req_ids = list(self._audio_gen.keys()) + list(self._visual_gen.keys())
         if not req_ids:
             return logits
@@ -1673,18 +1395,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             visual_state = self._visual_gen.get(req_id)
             if audio_state is not None:
                 if audio_state.get("terminal"):
-                    # Force the closing tag instead of leaving this row
-                    # totally unconstrained: an earlier version `continue`d
-                    # here, unbanning EOS with no forced replacement, which
-                    # let the model end the WHOLE request via real EOS
-                    # within a few tokens of chunk_end/max_gen instead of
-                    # just closing this audio segment (observed: audio
-                    # truncating to a handful of frames, finish_reason=stop,
-                    # with generation ending only ~30 visible tokens after
-                    # <longcat_audiogen_start>). talker_mtp sets
-                    # ext_id=AUDIOGEN_END_TOKEN_ID the moment it marks
-                    # terminal (see the is_terminal branch above), so this
-                    # mirrors the visual branch's IMAGE_END forcing below.
+                    # Force the closing tag instead of leaving EOS unbanned
+                    # with no replacement, which would end the whole request
+                    # instead of just closing this audio segment.
                     if self._eos_id < logits.shape[-1]:
                         logits[row, self._eos_id] = float("-inf")
                     forced_id = audio_state.get("ext_id", AUDIOGEN_END_TOKEN_ID)
@@ -1745,30 +1458,16 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # Reapply the LongCat-specific MLA LoRA input scales here,
         # unconditionally, after AutoWeightsLoader has fully finished.
         #
-        # The vllm fork's own FlashModel.load_weights (longcat_flash.py)
-        # also tries to apply this scale to q_a_layernorm/kv_a_layernorm.
-        # weight, guarded by a permanent "already scaled" flag per attn
-        # module -- but empirically (via a [longcat-stream-keys] audit
-        # logging every checkpoint key streamed into that function) it gets
-        # invoked more than once per model instance: an earlier pass whose
-        # incoming weights contain NO self_attn keys at all, followed by a
-        # later pass carrying the real checkpoint data. The fork's guard
-        # fires on that first, data-less pass -- multiplying whatever was
-        # already sitting in q_a_layernorm/kv_a_layernorm.weight (their
-        # un-loaded default-init value, since real data hadn't streamed
-        # yet) -- and then the later pass's real data lands via a plain
-        # copy_ (not additive), silently wiping out that first scaling
-        # without ever re-triggering it, since the guard is already
-        # permanently tripped. Net effect: the real checkpoint's layernorm
-        # weights end up completely unscaled by the time the fork's own
-        # load_weights returns.
-        #
-        # By the time loader.load_weights(...) above returns, every one of
-        # the fork's internal load_weights invocations -- however many
-        # there were -- has completed and the real weights are in place.
-        # Applying the scale exactly once here, gated by our OWN guard
-        # (distinct from the fork's), is correct regardless of how many
-        # internal passes happened upstream, and needs no changes to vLLM.
+        # The vllm fork's own FlashModel.load_weights also applies this
+        # scale, guarded by a permanent "already scaled" flag -- but it gets
+        # invoked more than once per model instance, and the guard trips on
+        # an earlier pass whose weights contain no self_attn keys at all
+        # (scaling the un-loaded default-init value), before the real data
+        # lands via a plain copy_ later and silently wipes that scaling out,
+        # with the guard never re-triggering. Applying the scale exactly
+        # once here, after the loader is fully done and gated by our own
+        # (distinct) guard, is correct regardless of how many internal
+        # passes happened upstream, with no vLLM changes needed.
         model = getattr(self, "model", None)
         layers = getattr(model, "layers", None)
         if layers is not None:
@@ -1807,10 +1506,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             module.eval()
             loaded.update(f"{ckpt_prefix}{k}" for k in state)
 
-        # Mark remote-code submodules as loaded — their weights come from the
-        # checkpoint's own lazy loading path, not from the thinker's sharded
-        # weight iter. Without this, vLLM's track_weights_loading raises:
-        #   ValueError: Following weights were not initialized from checkpoint
+        # Mark remote-code submodules as loaded (weights come from this
+        # method's own state dict above, not vLLM's tracked loader), so
+        # track_weights_loading doesn't raise for "uninitialized" weights.
         _skip_substrs = ("visual_tokenizer", "audio_tokenizer", "visual_head", "audio_head")
         for name, _ in self.named_parameters():
             if any(s in name for s in _skip_substrs):

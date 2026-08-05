@@ -1,14 +1,10 @@
 """LongCat-Next audio decoder stage (audio codes -> 24 kHz waveform).
 
-Instantiates the checkpoint's remote-code ``LongcatNextAudioTokenizer`` and
-runs its decode path: VQ bridger dequantisation -> audio decoder ->
-conditional flow matching -> Cosy24k HiFT vocoder. Only the
-``model.audio_tokenizer.*`` subtree of the sharded checkpoint is loaded
-(shards 7/8/15) plus ``cosy24k_vocoder/hift.pt``.
-
-Chunking mirrors the checkpoint's ``lazy_decode_and_save``: level-0 code
-16384 marks a chunk boundary; chunks are decoded independently and
-cross-faded with ``wave_concat_overlap`` samples.
+Runs the checkpoint's remote-code LongcatNextAudioTokenizer decode path (VQ
+dequant -> audio decoder -> flow matching -> Cosy24k HiFT vocoder), loading
+only the model.audio_tokenizer.* subtree plus cosy24k_vocoder/hift.pt.
+Chunking mirrors lazy_decode_and_save: level-0 code 16384 marks a chunk
+boundary; chunks decode independently and cross-fade at the seams.
 """
 
 import json
@@ -106,20 +102,17 @@ class LongcatNextAudioDecoder(nn.Module):
     def _split_chunks(self, codes: torch.Tensor) -> list[torch.Tensor]:
         """Split [n, 8] codes into per-chunk tensors at level-0 end markers.
 
-        Defensive: drop rows carrying a sentinel code at a level >= 1
-        (index == codebook_sizes[i]). The depth head emits ``vq_size + 1``
-        classes per level, so a non-zero-level sentinel can be sampled; only
-        level-0's sentinel is a chunk boundary, and any other level's sentinel
-        would OOB that codebook's embed lookup during decode. Level 0 is
-        excluded here: its ``codebook_sizes[0]`` value is the legitimate
-        chunk-end marker this method splits on.
+        Drops rows with a sentinel code at level >= 1 (the depth head emits
+        vq_size+1 classes per level, so non-zero-level sentinels can be
+        sampled but would OOB that codebook's embed lookup at decode) --
+        only level-0's sentinel is a real chunk boundary.
         """
         if codes.shape[0] == 0:
             return []
         limit = torch.tensor(self.codebook_sizes, device=codes.device, dtype=codes.dtype)
-        # Only non-boundary rows are dropped: a level-0 chunk-end marker row is
-        # a split boundary whose non-zero-level codes are never decoded, so it
-        # must survive the guard (and may legitimately carry any value there).
+        # A level-0 chunk-end marker row is a split boundary, not a real
+        # frame, so its non-zero-level values are never decoded and must
+        # survive the sentinel guard below.
         is_boundary = codes[:, 0] == self.chunk_end_code
         oob = codes >= limit
         oob[:, 0] = False  # level-0 chunk-end marker is valid here
@@ -162,10 +155,9 @@ class LongcatNextAudioDecoder(nn.Module):
         else:
             info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         if len(info_dicts) > 1:
-            # The decoder emits a single waveform via OmniOutput; with more
-            # than one request in the batch only the first is decoded. All
-            # shipped deploy YAMLs set max_num_seqs: 1, so this is latent --
-            # warn instead of silently dropping the other requests.
+            # Only the first request in a batch is decoded; deploy YAMLs set
+            # max_num_seqs: 1 for this stage, so this is latent -- warn
+            # rather than silently dropping the rest.
             logger.warning(
                 "LongcatNextAudioDecoder got %d requests in one batch; only the "
                 "first is decoded (max_num_seqs should be 1 for this stage).",
@@ -198,13 +190,10 @@ class LongcatNextAudioDecoder(nn.Module):
             logger.warning("Audio decoder produced no valid chunks")
             return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
-        # Cross-fade consecutive chunks, mirroring decode_save_concat2. The
-        # blended seam REPLACES both the previous chunk's tail and the next
-        # chunk's head (they cover the same audio by construction of the
-        # chunked tokenizer decode), so the seam is emitted once and each
-        # chunk's overlap margin is trimmed -- appending the full wave (as
-        # the reference's decode_save_concat does) replays the seam and
-        # stutters at every chunk boundary for long audio. We diverge.
+        # Cross-fade consecutive chunks: the blended seam replaces both the
+        # previous chunk's tail and the next chunk's head (they cover the
+        # same audio), trimming each chunk's overlap margin instead of
+        # appending full waves, which would replay the seam and stutter.
         overlap = self.wave_concat_overlap
         parts: list[torch.Tensor] = []
         prev = waves[0]
@@ -230,8 +219,7 @@ class LongcatNextAudioDecoder(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # This stage loads its own weight subtree (model.audio_tokenizer.* +
-        # cosy24k_vocoder/hift.pt) lazily on first decode; the engine-side
-        # loader has nothing to place here.
+        # Weights are loaded lazily on first decode (_ensure_weights); the
+        # engine-side loader has nothing to place here.
         consumed = {name for name, _ in weights}
         return consumed | {name for name, _ in self.named_parameters()}

@@ -1,22 +1,10 @@
 """vLLM multimodal processor for LongCat-Next.
 
-The checkpoint's ``__call__`` (not vendored — see
-``vllm.transformers_utils.processors.longcat_next``) only accepts *file
-paths* embedded in the prompt text (it regex-scans for
-``<longcat_img_start>PATH<longcat_img_end>``), which does not fit vLLM's
-in-memory multimodal data flow. This processor therefore drives the HF
-sub-processors directly:
-
-- images -> ``hf_processor.image_processor`` (Qwen2VLImageProcessor) with PIL
-  images, producing ``pixel_values`` / ``image_grid_thw``;
-- audio  -> the fbank pipeline of ``LongcatNextAudioProcessor``
-  (split_with_overlap + extract_fbank_features + inference_output_length)
-  applied to resampled 16 kHz waveforms.
-
-Prompts use the checkpoint's placeholder grammar: each image is
-``<longcat_img_start><longcat_img_pad><longcat_img_end>`` and each audio clip
-``<longcat_audio_start><longcat_audio_pad><longcat_audio_end>``; the single
-pad token is expanded to the item's real token count.
+The checkpoint's own ``__call__`` only accepts file paths embedded in the
+prompt text, which doesn't fit vLLM's in-memory data flow, so this drives
+the HF sub-processors directly: images via Qwen2VLImageProcessor, audio via
+LongcatNextAudioProcessor's fbank pipeline. Each mm item's single pad token
+placeholder is expanded to its real token count.
 """
 
 from collections.abc import Mapping, Sequence
@@ -109,14 +97,9 @@ def _extract_audio_features(
     audio_processor: LongcatNextAudioProcessor,
     audios: Sequence[np.ndarray],
 ) -> dict[str, torch.Tensor]:
-    """Run LongcatNextAudioProcessor's fbank pipeline on in-memory waveforms.
-
-    Drives the vendored processor's split_with_overlap/extract_fbank_features/
-    inference_output_length directly (its own process()/__call__, which read
-    audio from file paths, are not vendored): each waveform is split into
-    <=30 s chunks, each chunk becomes a (num_mel_bins, 3000) log-mel matrix
-    with encoder/bridge lengths.
-    """
+    """Run LongcatNextAudioProcessor's fbank pipeline on in-memory waveforms:
+    split into <=30s chunks, each becoming a log-mel matrix with encoder/
+    bridge lengths."""
     features: list[torch.Tensor] = []
     encoder_lengths: list[int] = []
     bridge_lengths: list[int] = []

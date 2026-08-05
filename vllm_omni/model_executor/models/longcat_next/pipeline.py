@@ -19,16 +19,10 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
-            # Stays "latent", NOT "audio": OutputModality.AUDIO maps to the
-            # CONCAT_LAST accumulation strategy (waveform-shaped, concat along
-            # the last dim) and MultimodalPayload.from_raw remaps this stage's
-            # routine "hidden" pooler-payload key onto the SAME "audio" name
-            # as our own data -- both wrong for our [1, 8] per-step code rows,
-            # which need CONCAT_DIM0 and a "hidden" key that doesn't collide
-            # with "codes.audio". The actual fix for the single-stage-as-final
-            # override this depends on lives in gpu_ar_model_runner.py's
-            # _resolve_pooler_payload_req_ids, widened to also accept
-            # "latent", so this field can keep its correct modality tag.
+            # "latent", not "audio": OutputModality.AUDIO's CONCAT_LAST/"hidden"
+            # remap is wrong for our [1, 8] per-step code rows (need CONCAT_DIM0,
+            # no collision with "codes.audio"). See gpu_ar_model_runner.py's
+            # _resolve_pooler_payload_req_ids for the matching "latent" support.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
             prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
@@ -36,33 +30,16 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
     ),
 )
 
-# Thinker + ONE combined decoder stage that holds both the image and audio
-# decode paths internally (LongcatNextMultiDecoder), dispatching per request
-# on whichever of visual_token_ids/audio_token_ids talker_mtp populated --
-# mirroring the reference's own PostProcessor.decode_multi(gen_image,
-# gen_audio), a single conditional dispatch in one process, not a chain of
-# services.
+# Thinker + one combined decoder stage (LongcatNextMultiDecoder) that holds
+# both image and audio decode paths, dispatching per request on whichever of
+# visual_token_ids/audio_token_ids talker_mtp populated -- mirrors the
+# reference's PostProcessor.decode_multi. A 3-stage thinker->image->audio
+# chain doesn't work here: the orchestrator only forwards stage N's output to
+# N+1 (ignoring input_sources), so the audio stage would always get the image
+# stage's output instead of the thinker's. 2-stage avoids that ambiguity.
 #
-# This exists instead of a 3-stage
-# thinker->image_decoder->audio_decoder chain because the orchestrator's
-# _forward_to_next_stage only ever forwards a stage's own output to
-# src_stage_id + 1 -- it does NOT consult a stage's declared input_sources
-# to fetch data from an earlier stage. So in the 3-stage chain, the audio
-# decoder (stage 2) receives the IMAGE decoder's output (stage 1), never the
-# thinker's (stage 0) -- audio is unconditionally broken there, not just
-# when image-gen happened to run. A 2-stage chain has no such ambiguity:
-# stage 1 is always the immediate successor of stage 0, so it always
-# receives the thinker's real output regardless of which modality it
-# generated.
-#
-# final_output_type is statically "audio" here for schema purposes even
-# though a given response may actually be an image -- this only affects (a)
-# the rarely-hit terminal-empty-output shape when a request finishes with
-# no downstream input at all, and (b) get_final_stage_id_for_e2e's
-# output_modalities matching heuristic (a client hint, not authoritative
-# here since which modality a request produces is decided by the prompt's
-# trigger token, not by client-requested modalities). Neither affects
-# whether the real audio/image is produced or which key it lands under.
+# final_output_type is statically "audio" for schema purposes only -- the
+# real modality is decided by the prompt's trigger token, not this field.
 LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE = PipelineConfig(
     model_type="longcat_next_thinker_multi_decoder",
     model_arch="LongcatNextForCausalLM",

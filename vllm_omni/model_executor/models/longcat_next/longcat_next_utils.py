@@ -1,20 +1,13 @@
 """Shared helpers for the LongCat-Next stages.
 
-Token-id layout (verified against the checkpoint's config.json and
-tokenizer_config.json):
-
-- Text + special tokens occupy [0, 131125).
-- Visual codes start at 150581, 8 codebook levels of 16384 entries each.
-- Audio codes start at 131125, 8 codebook levels of NON-uniform size (see
-  ``modeling_longcat_next.py``'s own offset table) -- level-0 code 16384 is
-  the audio chunk-end marker.
-
-The real per-level codes for both modalities never ride the visible output
-token stream -- they're produced by talker_mtp and surface via
-``multimodal_output["codes"]`` (see stage_input_processors/longcat_next.py's
-module docstring). The visible stream only carries one placeholder id per
-generation step, which is all the helpers below (e.g. ``infer_visual_grid``)
-read from it.
+Token-id layout: text + special tokens occupy [0, 131125); visual codes
+start at 150581 (8 levels x 16384 each); audio codes start at 131125 (8
+levels, non-uniform sizes -- see modeling_longcat_next.py's offset table).
+Per-level codes never ride the visible token stream -- they come from
+talker_mtp via ``multimodal_output["codes"]`` (see
+stage_input_processors/longcat_next.py). The visible stream only carries
+one placeholder id per generation step, which is all ``infer_visual_grid``
+below reads.
 """
 
 from __future__ import annotations
@@ -49,12 +42,9 @@ _WEIGHT_PATH_PLACEHOLDER = "WEIGHT_PATH_TO_LONGCAT_NEXT"
 
 
 def resolve_checkpoint_relative_path(configured_path: str, model_path: str) -> str:
-    """Resolve the checkpoint's WEIGHT_PATH_TO_LONGCAT_NEXT placeholder.
-
-    The released config.json stores auxiliary weight paths as
-    ``WEIGHT_PATH_TO_LONGCAT_NEXT/<subpath>``; resolve them against the
-    local model directory instead of requiring users to edit the checkpoint.
-    """
+    """Resolve config.json's WEIGHT_PATH_TO_LONGCAT_NEXT placeholder against
+    the local model directory, instead of requiring users to edit the
+    checkpoint."""
     if configured_path.startswith(_WEIGHT_PATH_PLACEHOLDER):
         relative = configured_path[len(_WEIGHT_PATH_PLACEHOLDER) :].lstrip("/")
         return os.path.join(model_path, relative)
@@ -64,15 +54,10 @@ def resolve_checkpoint_relative_path(configured_path: str, model_path: str) -> s
 
 
 def _apply_transformers_qwen2_5_vl_compat() -> None:
-    """Alias renamed transformers internals the checkpoint's remote code expects.
-
-    The checkpoint's ``modular_longcat_next_visual.py`` was written against an
-    older transformers release and imports ``Qwen2RMSNorm`` from
-    ``transformers.models.qwen2_5_vl.modeling_qwen2_5_vl``. Newer transformers
-    (5.x) renamed that class to ``Qwen2_5_VLRMSNorm``. Patching the installed
-    transformers module (not the checkpoint) so the remote code's import
-    resolves; safe to call repeatedly.
-    """
+    """The checkpoint's remote code imports ``Qwen2RMSNorm`` from
+    ``transformers.models.qwen2_5_vl.modeling_qwen2_5_vl``, renamed to
+    ``Qwen2_5_VLRMSNorm`` in newer transformers. Alias it back; safe to call
+    repeatedly."""
     try:
         from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as _mod
     except ImportError:
@@ -90,16 +75,12 @@ def get_remote_attr(model_path: str, module_file: str, attr_name: str) -> Any:
 
 
 def load_remote_hf_config(model_path: str) -> Any:
-    """Load the checkpoint's own LongcatNextConfig (with nested sub-configs).
+    """Load the checkpoint's own LongcatNextConfig, bypassing AutoConfig.
 
-    Bypasses ``AutoConfig``: vllm-omni's registered ``longcat_next`` config
-    shim (``transformers_utils/configs/longcat_next.py``) always wins over
-    the remote one once its model_type is registered, even with
-    ``trust_remote_code=True``, and its plain-dict ``visual_config``/
-    ``audio_config`` break the checkpoint's remote code (e.g.
-    ``VisualEncoder.__init__`` expects a real config object). Loading the
-    checkpoint's own config class directly keeps those as its own
-    ``LongcatNextVisualConfig``/``LongcatNextAudioConfig`` objects.
+    vllm-omni's registered config shim always wins over the remote one, but
+    its plain-dict visual_config/audio_config break the checkpoint's remote
+    code (which expects real config objects). Load the checkpoint's own
+    config class directly instead.
     """
     config_cls = get_remote_attr(model_path, "configuration_longcat_next", "LongcatNextConfig")
     return config_cls.from_pretrained(model_path)
@@ -113,12 +94,8 @@ def load_weight_subtree(
     dtype: torch.dtype | None = None,
     strict: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Load only the ``prefix``-scoped tensors from a sharded checkpoint.
-
-    Reads model.safetensors.index.json to locate the shards holding
-    ``prefix.*`` keys and pulls just those tensors via safe_open, so a decoder
-    stage never materialises the 74B backbone shards in memory.
-    """
+    """Load only the ``prefix``-scoped tensors from a sharded checkpoint, so
+    a decoder stage never materialises the full backbone in memory."""
     from safetensors import safe_open
 
     index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -153,15 +130,10 @@ def load_weight_subtree(
 
 
 def infer_visual_grid(output_ids: Sequence[int]) -> tuple[int, int] | None:
-    """Infer (token_h, token_w) from newline structure of the first image segment.
-
-    Counts VISIBLE placeholder tokens per row directly (row_len), with no
-    NUM_CODEBOOKS division: each real-pixel generation step contributes
-    exactly one IMG_PAD_TOKEN_ID to the visible stream (forced in
-    compute_logits, modeling_longcat_next.py), not NUM_CODEBOOKS ids -- the
-    real per-level codes ride multimodal_output, not this stream (see this
-    module's docstring).
-    """
+    """Infer (token_h, token_w) from the newline structure of the first
+    image segment. Counts visible IMG_PAD placeholders per row -- one per
+    real-pixel step -- not the real per-level codes, which ride
+    multimodal_output instead of this stream."""
     in_segment = False
     row_len = 0
     width: int | None = None
