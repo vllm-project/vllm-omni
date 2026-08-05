@@ -4,14 +4,17 @@ Token-id layout (verified against the checkpoint's config.json and
 tokenizer_config.json):
 
 - Text + special tokens occupy [0, 131125).
-- Audio codes occupy 8 codebook levels of 16384 entries each, with level
-  offsets ``cumsum([131125] + [16384] * 7)``.
-- Visual codes likewise start at 150581 with the same per-level layout.
-- Level-0 code ``16384`` (== codebook size) is the audio chunk-end marker.
+- Visual codes start at 150581, 8 codebook levels of 16384 entries each.
+- Audio codes start at 131125, 8 codebook levels of NON-uniform size (see
+  ``modeling_longcat_next.py``'s own offset table) -- level-0 code 16384 is
+  the audio chunk-end marker.
 
-In the flattened thinker output stream, each multimodal position contributes
-``NUM_CODEBOOKS`` consecutive ids (one per level, each carrying its level
-offset), delimited by the start/end marker tokens below.
+The real per-level codes for both modalities never ride the visible output
+token stream -- they're produced by talker_mtp and surface via
+``multimodal_output["codes"]`` (see stage_input_processors/longcat_next.py's
+module docstring). The visible stream only carries one placeholder id per
+generation step, which is all the helpers below (e.g. ``infer_visual_grid``)
+read from it.
 """
 
 from __future__ import annotations
@@ -41,28 +44,6 @@ AUDIOGEN_START_TOKEN_ID = 131123  # <longcat_audiogen_start>
 AUDIOGEN_END_TOKEN_ID = 131124  # <longcat_audiogen_end>
 
 NUM_CODEBOOKS = 8
-CODEBOOK_SIZE = 16384  # visual codebook only -- every level is 16384-wide.
-
-VISUAL_OFFSET = 150581
-AUDIO_OFFSET = 131125
-
-# Audio codebook sizes are NOT uniform across levels (unlike visual's flat
-# 16384), per config.json's audio_config.vq_config.codebook_sizes.
-AUDIO_CODEBOOK_SIZES = [8192, 4096, 2048, 1024, 1024, 1024, 1024, 1024]
-
-
-def _cumulative_offsets(base: int, codebook_sizes: Sequence[int]) -> list[int]:
-    """cumsum([base] + codebook_sizes[:-1]), mirroring the model's
-    visual_offset_vals/audio_offset_vals buffers (modeling_longcat_next.py)."""
-    offsets = [base]
-    for size in codebook_sizes[:-1]:
-        offsets.append(offsets[-1] + size)
-    return offsets
-
-# Per-level cumulative offsets, mirroring the model's visual/audio_offset_vals
-# buffers (cumsum of [base] + codebook_sizes[:-1]).
-VISUAL_LEVEL_OFFSETS = [VISUAL_OFFSET + level * CODEBOOK_SIZE for level in range(NUM_CODEBOOKS)]
-AUDIO_LEVEL_OFFSETS = [AUDIO_OFFSET + level * CODEBOOK_SIZE for level in range(NUM_CODEBOOKS)]
 
 _WEIGHT_PATH_PLACEHOLDER = "WEIGHT_PATH_TO_LONGCAT_NEXT"
 
@@ -173,76 +154,15 @@ def load_weight_subtree(
     return list(missing), list(unexpected)
 
 
-def _extract_code_segments(
-    output_ids: Sequence[int],
-    start_id: int,
-    end_id: int,
-    level_offsets: Sequence[int],
-    skip_ids: frozenset[int],
-) -> tuple[list[list[int]], list[list[int]]]:
-    """Split a flat id stream into per-segment [n, NUM_CODEBOOKS] code grids.
-
-    Returns (codes, raw_rows): ``codes`` holds de-offset codebook indices,
-    ``raw_rows`` the original ids (used by callers that need markers back).
-    Ids inside a segment that are not codes (e.g. newline markers) must be
-    listed in ``skip_ids``.
-    """
-    segments: list[list[int]] = []
-    current: list[int] | None = None
-    for tid in output_ids:
-        if tid == start_id:
-            current = []
-        elif tid == end_id:
-            if current is not None:
-                segments.append(current)
-            current = None
-        elif current is not None and tid not in skip_ids:
-            current.append(tid)
-
-    codes: list[list[int]] = []
-    raw_rows: list[list[int]] = []
-    for segment in segments:
-        usable = len(segment) - len(segment) % NUM_CODEBOOKS
-        if usable != len(segment):
-            logger.warning(
-                "Multimodal segment length %d is not a multiple of %d codebook levels; truncating",
-                len(segment),
-                NUM_CODEBOOKS,
-            )
-        for row_start in range(0, usable, NUM_CODEBOOKS):
-            row = segment[row_start:row_start + NUM_CODEBOOKS]
-            raw_rows.append(list(row))
-            codes.append([tid - level_offsets[level] for level, tid in enumerate(row)])
-    return codes, raw_rows
-
-
-def extract_visual_codes(output_ids: Sequence[int]) -> list[list[int]]:
-    """Pull visual codebook indices out of a flat thinker output stream.
-
-    Visual code rows live between <longcat_img_start> and <longcat_img_end>;
-    <longcat_img_newline> markers are structural and skipped.
-    """
-    codes, _ = _extract_code_segments(
-        output_ids,
-        IMG_START_TOKEN_ID,
-        IMG_END_TOKEN_ID,
-        VISUAL_LEVEL_OFFSETS,
-        frozenset({IMG_NEWLINE_TOKEN_ID, IMG_PAD_TOKEN_ID}),
-    )
-    return codes
-
-
 def infer_visual_grid(output_ids: Sequence[int]) -> tuple[int, int] | None:
     """Infer (token_h, token_w) from newline structure of the first image segment.
 
     Counts VISIBLE placeholder tokens per row directly (row_len), with no
     NUM_CODEBOOKS division: each real-pixel generation step contributes
     exactly one IMG_PAD_TOKEN_ID to the visible stream (forced in
-    compute_logits, modeling_longcat_next.py), not NUM_CODEBOOKS ids --
-    the real per-level codes ride multimodal_output, not this stream (see
-    extract_visual_codes's docstring for the same point). An earlier
-    version of this function divided by NUM_CODEBOOKS, matching
-    extract_visual_codes's now-corrected wrong assumption.
+    compute_logits, modeling_longcat_next.py), not NUM_CODEBOOKS ids -- the
+    real per-level codes ride multimodal_output, not this stream (see this
+    module's docstring).
     """
     in_segment = False
     row_len = 0
@@ -272,20 +192,3 @@ def infer_visual_grid(output_ids: Sequence[int]) -> tuple[int, int] | None:
         else:
             row_len += 1
     return None
-
-
-def extract_audio_codes(output_ids: Sequence[int]) -> list[list[int]]:
-    """Pull audio codebook indices out of a flat thinker output stream.
-
-    Audio-generation rows live between <longcat_audiogen_start> and
-    <longcat_audiogen_end>. Level-0 code 16384 (chunk-end) rows are kept —
-    the audio decoder uses them for chunking, mirroring lazy_decode_and_save.
-    """
-    codes, _ = _extract_code_segments(
-        output_ids,
-        AUDIOGEN_START_TOKEN_ID,
-        AUDIOGEN_END_TOKEN_ID,
-        AUDIO_LEVEL_OFFSETS,
-        frozenset({AUDIO_PAD_TOKEN_ID}),
-    )
-    return codes
