@@ -186,13 +186,6 @@ class ImageGenerationRequest(BaseModel):
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
 
-    @field_validator("output_format")
-    @classmethod
-    def validate_output_format(cls, v):
-        valid = {"png", "jpeg", "webp"}
-        if v is not None and v not in valid:
-            raise ValueError(f"output_format must be one of {sorted(valid)}, got: '{v}'")
-        return v
 
 
 class ImageData(BaseModel):
