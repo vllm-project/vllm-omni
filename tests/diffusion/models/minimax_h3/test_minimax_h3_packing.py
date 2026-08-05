@@ -101,6 +101,62 @@ def test_ref2va_packing_tracks_video_and_audio_update_masks():
     assert packed["cu_seqlens"].tolist() == [0, 30, 64]
 
 
+def test_packed_modalities_partition_every_used_row():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    common = dict(
+        text_len=4,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+    )
+    layouts = [
+        minimax_h3_packed_sequence(
+            **common,
+            include_keyframe_cond=False,
+        ),
+        minimax_h3_packed_sequence(
+            **common,
+            include_keyframe_cond=True,
+            keyframe_frame_indices=[0, -1],
+            frame_count=5,
+        ),
+        minimax_h3_packed_sequence_ref2va_blocks(
+            **common,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 4, "latent_w": 4},
+                {"kind": "audio", "ref_audio_t": 2},
+                {
+                    "kind": "video_audio",
+                    "ref_audio_t": 2,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 4,
+                },
+            ],
+        ),
+    ]
+
+    for packed in layouts:
+        positions = torch.cat(
+            [
+                packed["text_pos"],
+                packed["img_pos"],
+                packed["audio_pos"],
+            ]
+        )
+        used = int(packed["cu_seqlens"][1])
+        assert positions.numel() == used
+        torch.testing.assert_close(
+            positions.sort().values,
+            torch.arange(used),
+        )
+
+
 def test_condition_noise_is_seeded_and_keeps_clean_anchor_at_timestep_one():
     from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
         minimax_h3_audio_cond_noise_aug_rows,
