@@ -145,6 +145,7 @@ def test_duplex_single_turn_response_required(omni_server) -> None:
             input_wav=RESPONSE_REQUIRED_WAV,
         )
     )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     assert result["ok"], json.dumps(result, ensure_ascii=False, indent=2)
     assert result["audio_delta_count"] > 0
     assert result["done_count"] == 1
