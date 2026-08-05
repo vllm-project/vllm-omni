@@ -236,13 +236,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 post_commit_decision = _post_commit_model_decision(client.events.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
-        await client.acknowledge_playback()
-        close_error: str | None = None
-        try:
-            await client.close_session(timeout_s=args.timeout_s)
-        except TimeoutError as exc:
-            close_error = str(exc)
-
         audio = client.events.audio_bytes()
         first_text_at_s = client.events.first_received_at(
             "response.output_audio_transcript.delta",
@@ -285,8 +278,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         errors = client.events.errors()
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
-        if close_error:
-            errors.append({"type": "client.timeout", "message": close_error})
         model_decision = post_commit_decision or stream_decision
         (output_dir / "events.jsonl").write_text(
             "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
