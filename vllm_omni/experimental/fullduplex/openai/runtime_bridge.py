@@ -1022,7 +1022,7 @@ class NativeRuntimeBridgeMixin:
                 "session_id": session.session_id,
                 "response_id": response_id,
                 "epoch": session.epoch,
-                "text": text,
+                "delta": text,
                 "end_of_turn": end_of_turn,
             }
         else:
