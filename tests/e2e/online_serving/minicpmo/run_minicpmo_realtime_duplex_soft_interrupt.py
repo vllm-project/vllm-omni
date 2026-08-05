@@ -19,7 +19,7 @@ import uuid
 import wave
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
 AUDIO_DELTA_EVENTS = {"response.output_audio.delta", "response.output_audio.delta"}
 TRANSCRIPT_DELTA_EVENTS = {
