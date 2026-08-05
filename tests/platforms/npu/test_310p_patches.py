@@ -489,6 +489,14 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     _install_fake_module(monkeypatch, "vllm")
     _install_fake_module(monkeypatch, "vllm.logger", init_logger=lambda _name: SimpleNamespace(debug=lambda *_: None))
 
+    rotary_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "layers" / "rotary_embedding.py"
+    rotary_module = _load_source_module("vllm_omni_test_npu_rotary_embedding", rotary_path)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.layers.rotary_embedding",
+        rotary_module,
+    )
+
     class FakeRMSNorm(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -536,7 +544,7 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     norm_out = norm(torch.ones(1, 2))
 
     assert len(rotary_calls) == 2
-    assert rotary_calls[0][1].shape == (1, 1, 3, 2)
+    assert rotary_calls[0][1].shape == (1, 3, 1, 2)
     torch.testing.assert_close(q_out, q + 1)
     torch.testing.assert_close(k_out, k + 1)
     assert len(rms_calls) == 1

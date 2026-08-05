@@ -1,7 +1,7 @@
 # MiniMax H3
 
-> Joint video and audio generation with text, first-frame, image/audio, or
-> multi-video conditions
+> Joint video and audio generation with text, first/last keyframes, and
+> mixed image/video/audio references
 
 ## Summary
 
@@ -16,8 +16,8 @@ checkpoint has two independently served partitions:
 
 - `FL2VA`: text-to-video+audio (`t2va`) and first-frame-to-video+audio
   (`fl2va`)
-- `Ref2VA`: image+audio or one-or-more-video reference-to-video+audio
-  (`ref2va`)
+- `Ref2VA`: up to 9 images, 3 videos, and 3 audio references in supported
+  image/video/audio combinations (`ref2va`; audio-only is rejected)
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
@@ -85,7 +85,8 @@ The best validated four-GPU configuration on four NVIDIA B300 GPUs is:
 - Ulysses sequence parallelism degree 4;
 - native tiled VAE patch parallelism degree 4;
 - regional `torch.compile` for the repeated DiT blocks;
-- FlashAttention, with Ring and TP left at 1.
+- CuTe FlashAttention-4 through the `FLASH_ATTN` backend, with Ring and TP
+  left at 1.
 
 ```bash
 export MODEL="${MODEL_ROOT}/FL2VA"
@@ -108,6 +109,9 @@ vllm serve "${MODEL}" \
   --vae-use-tiling \
   --diffusion-attention-backend FLASH_ATTN
 ```
+
+On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
+`Using CuTe FlashAttention-4 on Blackwell` before recording measurements.
 
 Do not add `--enforce-eager` to this performance configuration. The first
 request includes regional compilation; warm the server once before measuring
@@ -164,6 +168,42 @@ command with:
 export MODEL="${MODEL_ROOT}/Ref2VA"
 ```
 
+### Online FP8 quantization
+
+MiniMax H3 supports load-time FP8 quantization of the DiT. The checkpoint
+remains BF16 on disk; vLLM-Omni quantizes eligible weights while loading and
+uses dynamic activation scaling during inference. By default, attention and
+MLP linears in the token refiner and main DiT blocks, the condition
+projection, and all AdaLN projections use FP8. Patch, timestep, and final
+projections remain FP32; the text encoder and VAEs are unchanged.
+
+Add this option to an existing H3 server command:
+
+```bash
+--quantization fp8
+```
+
+Use `ignored_layers` to keep any otherwise eligible linear in BF16. H3
+resolves the `transformer` component before constructing the DiT, so names do
+not start with `transformer.`. Entries are exact runtime linear prefixes; a
+parent name such as `blocks.0.attn` does not exclude its children.
+
+Eligible names are the `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, and
+`mlp.fc2` children under `token_refiner.blocks.<0-1>` or `blocks.<0-49>`.
+The other eligible names are `condition_proj`,
+`blocks.<0-49>.adaln_proj.linear`, and `final_layer.adaln_proj.linear`.
+For example, keep the first main block's attention projections in BF16 with:
+
+```bash
+--diffusion-quantization-config \
+  '{"transformer":{"method":"fp8","ignored_layers":["blocks.0.attn.qkv_proj","blocks.0.attn.out_proj"]}}'
+```
+
+The structured option replaces `--quantization fp8`. Online FP8 is currently
+incompatible with H3 layerwise offload because the offload path produces a
+weight stride rejected by the Cutlass FP8 kernel. Use resident FP8 with tensor
+parallelism and VAE tiling instead.
+
 ## HTTP API examples
 
 The following requests use the synchronous endpoint so the returned body can
@@ -189,6 +229,7 @@ curl -sS -X POST "${API_URL}" \
   -F 'prompt=In a snowy blue-purple forest, Ori carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes and softly snorts.' \
   -F 'width=1344' \
   -F 'height=768' \
+  -F 'aspect_ratio=16:9' \
   -F 'fps=24' \
   -F 'num_inference_steps=50' \
   -F 'flow_shift=12' \
@@ -217,11 +258,31 @@ curl -sS -X POST "${API_URL}" \
   -o fl2va.mp4
 ```
 
-### 3. Ref2VA: image and audio reference
+Use the same `FL2VA` partition for the official tail-keyframe forms. A single
+image with `frame_indices=[-1]` conditions the last frame; two ordered images
+with `frame_indices=[0,-1]` condition the first and last frames:
 
-Run this request against the `Ref2VA` partition. `audio_reference` accepts an
-HTTP(S) URL or a `data:` URL. In one terminal, expose the local reference
-assets to the serving host:
+```bash
+export LAST_FRAME=/path/to/fl2va_last_frame.png
+export FIRST_FRAME=/path/to/fl2va_first_frame.png
+
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=The subject moves naturally from the first image to the last image.' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=2102' \
+  -F 'extra_params={"task":"fl2va","duration":8.7,"frame_indices":[0,-1],"audio_flow_shift":3.0}' \
+  -F "input_references=@${FIRST_FRAME};type=image/png" \
+  -F "input_references=@${LAST_FRAME};type=image/png" \
+  -o fl2va_first_last.mp4
+```
+
+### 3. Ref2VA: image-only, image/audio, or mixed references
+
+Run these requests against the `Ref2VA` partition. Image-only Ref2VA omits
+`audio_reference`; adding one or more audio references is optional. The typed
+fields accept one object or an ordered JSON list. `audio_reference` accepts an
+HTTP(S) URL or a `data:` URL.
 
 ```bash
 python -m http.server 8092 \
@@ -229,7 +290,24 @@ python -m http.server 8092 \
   --directory /path/to/reference_assets
 ```
 
-Then submit the image and audio request from another terminal:
+Then submit an image-only request from another terminal:
+
+```bash
+export REF_IMAGE=/path/to/reference_assets/ref2va_image.png
+
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=A white cat sits on a beige couch and slowly looks toward the camera.' \
+  -F 'aspect_ratio=adaptive' \
+  -F 'short_edge=768' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=3100' \
+  -F 'extra_params={"task":"ref2va","duration":8.0,"audio_flow_shift":3.0}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -o ref2va_image_only.mp4
+```
+
+An image-plus-audio request is:
 
 ```bash
 export REF_IMAGE=/path/to/reference_assets/ref2va_image.png
@@ -252,7 +330,7 @@ curl -sS -X POST "${API_URL}" \
 The requested duration should cover the complete audio. If `duration` is
 shorter, the reference soundtrack is truncated to the generated clip.
 
-### 4. Ref2VA: two video references
+### 4. Ref2VA: video, separate audio, and mixed references
 
 Run this request against the `Ref2VA` partition. Repeat the
 `input_references` multipart field once per source video. H3 consumes the
@@ -277,10 +355,40 @@ curl -sS -X POST "${API_URL}" \
   -o ref2va_video_video.mp4
 ```
 
-The server stores uploaded multi-video references only for the lifetime of the
-request and deletes the temporary files after generation. Video Ref2VA uses
-the source-video soundtracks and does not accept a separate
-`audio_reference`.
+The server stores uploaded references only for the lifetime of the request and
+deletes temporary files after generation. A video may use its embedded
+soundtrack, a separate `audio_reference`, or both. To send a mixed multipart
+request, repeat `input_references` for each image, video, or audio file; the
+server classifies them by MIME type and preserves the per-type order.
+
+Reference videos must be MP4/MOV with H.264/H.265 video, optional AAC/MP3
+audio, 2–15 seconds each, and at most 15 seconds combined. They may still be
+longer than the generated clip. Use `start_time_seconds` to select a
+synchronized segment; for multiple typed video references, pass one value per
+video in `extra_params.start_time_seconds`.
+
+Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
+audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
+at most 15 seconds combined.
+
+## Official input matrix and limits
+
+| Task | Supported references | Limits |
+|------|----------------------|--------|
+| T2VA | text only | prompt must be non-empty |
+| FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
+| Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
+
+The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
+`16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
+image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
+`16:9`; `adaptive` and SGLang's `auto` spelling are accepted aliases for that
+default. `short_edge` controls the 768-pixel canvas and must be `768`.
+`num_outputs_per_prompt` accepts 1–10 and derives each output seed as
+`seed + output_index`. The asynchronous endpoint returns all
+outputs; the synchronous raw-MP4 endpoint returns the first output when more
+than one is requested.
 
 ## Key parameters
 
@@ -293,7 +401,11 @@ the source-video soundtracks and does not accept a separate
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
-| `width`, `height` | Multiples of 32 | Aspect ratio must be between 1:4 and 4:1 |
+| `aspect_ratio` | Task-specific | T2VA requires a named ratio; FL2VA follows the input image; Ref2VA defaults to `16:9` |
+| `short_edge` | `768` | H3 shape policy requires exactly 768 when `width`/`height` are omitted |
+| `num_outputs_per_prompt` | `1` | 1–10; async API returns every output |
+| `start_time_seconds` | `0` | Reference-video segment start; use a list in `extra_params` for multiple videos |
+| `width`, `height` | Multiples of 32 | Output aspect ratio must be between 1:4 and 4:1 |
 
 ## Validated four-GPU evidence
 
@@ -310,12 +422,21 @@ throughput guarantee. Multi-video Ref2VA is much slower because the two
 reference videos expand both the Qwen3-VL vision sequence and the packed DiT
 attention sequence.
 
+## Validated FP8 evidence
+
+With eager DiT/text-encoder TP2 and VAE tiling, the 384x672, 107-frame,
+10-step quality case measured LPIPS 0.1156 (limit 0.20), PSNR 23.6316 dB,
+audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
+resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
+reduction.
+
 ## Known limitations
 
 - Each server process loads only one checkpoint partition.
 - H3 currently executes one generation request per diffusion batch.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
+- Online FP8 is not compatible with layerwise offload.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone
   audio reference.
