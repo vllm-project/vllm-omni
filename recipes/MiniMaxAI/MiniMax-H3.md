@@ -96,9 +96,7 @@ For a combined service on four high-memory GPUs, use:
   left at 1.
 
 Both DiTs remain resident in this no-offload configuration. If they do not fit,
-use model-level CPU offload. The latency figures later in this recipe were
-collected with one partition loaded and do not include the combined service's
-additional memory footprint.
+use model-level CPU offload.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
