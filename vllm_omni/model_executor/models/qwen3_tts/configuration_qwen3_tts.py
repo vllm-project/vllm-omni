@@ -173,13 +173,16 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
     model_type = "qwen3_tts_talker_code_predictor"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # The code predictor currently runs TP=1.  Do not advertise a tensor
-    # parallel plan for the packed qkv/gate_up projections until the fused
-    # loader and ``_split_qkv`` path are taught TP-aware packing/sharding:
-    # a generic colwise split of the plain ``nn.Linear`` would split the
-    # packed [q, k, v] layout across ranks instead of preserving each rank's
-    # local q/k/v groups.
-    base_model_tp_plan = {}
+    # Default tensor parallel plan for base model `Qwen3TTSTalkerCodePredictor`
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),

@@ -157,9 +157,11 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
     def prepare_qkv_weights(self) -> None:
         # Pack QKV once so each graph replay uses one matmul and consumes the
         # weight directly in the 310P matmul layout.
-        self._fused_qkv_weight = maybe_trans_nz(self.qkv_proj.weight.contiguous())
-        if self.qkv_proj.bias is not None:
-            self._fused_qkv_bias = self.qkv_proj.bias
+        self._fused_qkv_weight = maybe_trans_nz(
+            torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0).contiguous()
+        )
+        if self.q_proj.bias is not None:
+            self._fused_qkv_bias = torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0)
 
     def forward(
         self,
@@ -168,17 +170,11 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
-        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
-        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-        # ``prepare_qkv_weights`` packs qkv_proj into the 310P matmul layout;
-        # split it back out the same way before re-applying the 310P
-        # flash-attention path.
         qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
-        q_raw, k_raw, v_raw = self._split_qkv(qkv)
-        q = self.q_norm(q_raw.view(hidden_shape_q)).transpose(1, 2)
-        k = self.k_norm(k_raw.view(hidden_shape_kv)).transpose(1, 2)
-        v = v_raw.view(hidden_shape_kv).transpose(1, 2)
+        q, k, v = qkv.split((self._q_size, self._kv_size, self._kv_size), dim=-1)
+        q = self.q_norm(q.view(bsz, seq_len, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.view(bsz, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
@@ -308,7 +304,7 @@ class _Qwen3TTSTalkerCodePredictor310P(
             for layer in self.model.layers:
                 attention = layer.self_attn
                 attention.prepare_qkv_weights()
-                qkv_projections.add(attention.qkv_proj)
+                qkv_projections.update((attention.q_proj, attention.k_proj, attention.v_proj))
 
             for module in self.modules():
                 if isinstance(module, nn.Linear) and module not in qkv_projections:

@@ -414,21 +414,6 @@ def test_qwen3_tts_code_predictor_forward_uses_projected_embedding_and_sampling(
     assert sample_calls == [{0: generator}]
 
 
-def test_310p_attention_forward_uses_fused_qkv(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fused code predictor dropped q_proj/k_proj/v_proj in favor of a single
-    ``qkv_proj`` (+ ``_split_qkv``). The 310P attention override must follow
-    suit, otherwise its NPU flash-attention path raises AttributeError on 310P.
-    The NPU path itself cannot run in CPU CI, so guard the contract statically."""
-    import inspect
-
-    module, _ = _load_qwen3_tts_patch(monkeypatch)
-    source = inspect.getsource(module._Qwen3CodePredictorAttention310P.forward)
-    assert "qkv_proj" in source and "_split_qkv" in source
-    assert "self.q_proj" not in source
-    assert "self.k_proj" not in source
-    assert "self.v_proj" not in source
-
-
 def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
     talker = module._Qwen3TTSTalker310P(vllm_config=object())
@@ -504,6 +489,14 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     _install_fake_module(monkeypatch, "vllm")
     _install_fake_module(monkeypatch, "vllm.logger", init_logger=lambda _name: SimpleNamespace(debug=lambda *_: None))
 
+    rotary_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "layers" / "rotary_embedding.py"
+    rotary_module = _load_source_module("vllm_omni_test_npu_rotary_embedding", rotary_path)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.layers.rotary_embedding",
+        rotary_module,
+    )
+
     class FakeRMSNorm(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -551,7 +544,7 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     norm_out = norm(torch.ones(1, 2))
 
     assert len(rotary_calls) == 2
-    assert rotary_calls[0][1].shape == (1, 1, 3, 2)
+    assert rotary_calls[0][1].shape == (1, 3, 1, 2)
     torch.testing.assert_close(q_out, q + 1)
     torch.testing.assert_close(k_out, k + 1)
     assert len(rms_calls) == 1

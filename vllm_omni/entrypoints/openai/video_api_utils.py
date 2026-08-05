@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections import deque
 from io import BytesIO
 from typing import Any, Literal
 
@@ -16,6 +15,12 @@ import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm.multimodal.video import (
+    VIDEO_LOADER_REGISTRY,
+    VideoBackend,
+    VideoSourceMetadata,
+    VideoTargetMetadata,
+)
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -58,6 +63,30 @@ def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
 
+@VIDEO_LOADER_REGISTRY.register("omni")
+class OmniVideoBackend(VideoBackend):
+    """Video backend that selects sequential first-N or last-N frames."""
+
+    @classmethod
+    def compute_frames_index_to_sample(
+        cls,
+        source: VideoSourceMetadata,
+        target: VideoTargetMetadata,
+        *,
+        keep: Literal["first", "last"] = "first",
+        **kwargs,
+    ) -> list[int]:
+        num_frames_to_sample = source.total_frames_num
+        if target.num_frames > 0:
+            num_frames_to_sample = min(num_frames_to_sample, target.num_frames)
+        num_frames_to_sample = max(1, num_frames_to_sample)
+        if num_frames_to_sample >= source.total_frames_num:
+            return list(range(source.total_frames_num))
+        if keep == "last":
+            return list(range(source.total_frames_num - num_frames_to_sample, source.total_frames_num))
+        return list(range(num_frames_to_sample))
+
+
 def _decode_video_bytes(
     video_bytes: bytes,
     *,
@@ -65,45 +94,29 @@ def _decode_video_bytes(
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
 ) -> VideoFrames:
-    try:
-        import av
-    except ImportError as exc:  # pragma: no cover - av is a serving dependency via media_utils
-        raise InvalidInputReferenceError(f"Invalid {source}: video decoding requires PyAV.") from exc
-
     if keep not in {"first", "last"}:
         raise InvalidInputReferenceError(f"Invalid {source}: video frame selection must be 'first' or 'last'.")
     if max_frames is not None and max_frames <= 0:
         raise InvalidInputReferenceError(f"Invalid {source}: max video frames must be positive.")
 
-    frames: list[Image.Image] = []
-    tail_frames: deque[Image.Image] | None = (
-        deque(maxlen=max_frames) if keep == "last" and max_frames is not None else None
-    )
-    fps: float | None = None
+    loader = VIDEO_LOADER_REGISTRY.load("omni")
+    num_frames = max_frames if max_frames is not None else -1
     try:
-        with av.open(BytesIO(video_bytes)) as container:
-            video_stream = container.streams.video[0] if container.streams.video else None
-            if video_stream is not None:
-                fps = (
-                    positive_float(getattr(video_stream, "average_rate", None))
-                    or positive_float(getattr(video_stream, "base_rate", None))
-                    or positive_float(getattr(video_stream, "guessed_rate", None))
-                )
-            for frame in container.decode(video=0):
-                image = frame.to_image().convert("RGB")
-                if tail_frames is not None:
-                    tail_frames.append(image)
-                else:
-                    frames.append(image)
-                if keep == "first" and max_frames is not None and len(frames) >= max_frames:
-                    break
+        frames_array, metadata = loader.load_bytes(
+            video_bytes,
+            num_frames=num_frames,
+            backend="pyav",
+            keep=keep,
+        )
     except Exception as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.") from exc
 
-    if tail_frames is not None:
-        frames = list(tail_frames)
+    fps: float | None = positive_float(metadata.get("fps"))
+
+    frames = [Image.fromarray(f, "RGB") for f in frames_array]
     if not frames:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.")
+
     return VideoFrames(frames, fps=fps)
 
 
