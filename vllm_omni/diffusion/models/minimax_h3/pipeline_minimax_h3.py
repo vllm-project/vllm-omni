@@ -697,7 +697,11 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
     ) -> str:
         if requested is None:
-            if multi_modal_data.get("video") is not None or multi_modal_data.get("audio") is not None:
+            # A Ref2VA-only startup has no FL2VA transformer; preserve its
+            # historical implicit default even for image-only references.
+            if self.partition == "ref2va":
+                requested = "ref2va"
+            elif multi_modal_data.get("video") is not None or multi_modal_data.get("audio") is not None:
                 requested = "ref2va"
             elif multi_modal_data.get("image") is not None:
                 requested = "fl2va"

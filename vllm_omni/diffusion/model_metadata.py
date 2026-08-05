@@ -42,9 +42,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
     ),
+    # The modular alias is served by MiniMaxH3Pipeline and has the same
+    # Ref2VA request contract. Keep admission limits in sync with it.
     "MiniMaxH3ModularPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=1,
+        max_multimodal_image_inputs=9,
+        supports_mixed_reference_inputs=True,
     ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),

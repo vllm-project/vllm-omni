@@ -76,7 +76,8 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
     config.enrich_config()
     assert config.model_class_name == "MiniMaxH3ModularPipeline"
     assert config.supports_multimodal_inputs
-    assert config.max_multimodal_image_inputs == 1
+    assert config.max_multimodal_image_inputs == 9
+    assert config.supports_mixed_reference_inputs
 
 
 @pytest.mark.parametrize(
@@ -129,6 +130,12 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    pipeline.partition = "ref2va"
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
+
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     assert pipeline._transformer_for_task("fl2va") is pipeline.transformer
     assert pipeline._transformer_for_task("ref2va") is pipeline.transformers_ref
 
