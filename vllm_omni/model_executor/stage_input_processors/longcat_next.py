@@ -176,7 +176,7 @@ def _generated_ids(source_output: Any) -> list[int]:
     )
     prefix = _ensure_list(getattr(source_output, "prompt_token_ids", None))
     if prefix and output_ids[: len(prefix)] == prefix:
-        output_ids = output_ids[len(prefix):]
+        output_ids = output_ids[len(prefix) :]
     return output_ids
 
 
