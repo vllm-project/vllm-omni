@@ -34,6 +34,7 @@ class LoadBalancingPolicy(str, Enum):
     RANDOM = "random"
     ROUND_ROBIN = "round-robin"
     LEAST_QUEUE_LENGTH = "least-queue-length"
+    TOPOLOGY_AWARE = "topology-aware"
 
 
 class LoadBalancer(ABC):
@@ -121,6 +122,46 @@ class LeastQueueLengthBalancer(LoadBalancer):
         return random.choice(candidates)
 
 
+class TopologyAwareBalancer(LoadBalancer):
+    """Select replicas preferring the same ``topology_domain`` as the consumer.
+
+    When a task carries a ``topology_domain`` hint (the domain of the
+    downstream/consumer stage replica that will receive this stage's KV
+    output), this balancer restricts the candidate set to replicas sharing
+    that domain — exploiting the large bandwidth gap (NVLink ~900 GB/s vs
+    InfiniBand ~50 GB/s vs TCP ~12.5 GB/s, see arXiv:2607.28633).
+
+    Among same-domain candidates it picks the one with the smallest
+    ``queue_length`` (ties broken uniformly at random). If no replica shares
+    the requested domain, or no hint is provided, it falls back to
+    :class:`LeastQueueLengthBalancer` behaviour over all replicas.
+
+    The hint is read from ``task["topology_domain"]`` (optional, str).
+    """
+
+    def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:
+        if not replicas:
+            raise ValueError("replicas must not be empty")
+
+        preferred_domain: str | None = task.get("topology_domain") if task else None
+
+        candidates = list(range(len(replicas)))
+        if preferred_domain is not None:
+            same_domain = [
+                i for i in candidates
+                if getattr(replicas[i], "topology_domain", None) == preferred_domain
+            ]
+            if same_domain:
+                candidates = same_domain
+
+        queue_lengths = [replicas[i].queue_length for i in candidates]
+        if any(q < 0 for q in queue_lengths):
+            raise ValueError("queue_length must be non-negative for all replicas")
+        min_q = min(queue_lengths)
+        best = [candidates[i] for i, q in enumerate(queue_lengths) if q == min_q]
+        return random.choice(best)
+
+
 __all__ = [
     "Task",
     "LoadBalancingPolicy",
@@ -128,4 +169,5 @@ __all__ = [
     "RandomBalancer",
     "RoundRobinBalancer",
     "LeastQueueLengthBalancer",
+    "TopologyAwareBalancer",
 ]

@@ -382,7 +382,7 @@ class OmniServeCommand(CLISubcommand):
             "--omni-lb-policy",
             type=str,
             default="random",
-            choices=["random", "round-robin", "least-queue-length"],
+            choices=["random", "round-robin", "least-queue-length", "topology-aware"],
             help=(
                 "Per-stage load-balancing policy used by the head's StagePool to "
                 "route requests across UP replicas. Only consulted on the head runtime."

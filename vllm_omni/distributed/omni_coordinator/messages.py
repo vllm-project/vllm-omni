@@ -46,6 +46,7 @@ class ReplicaInfo:
     queue_length: int  # Current queue length of this replica
     last_heartbeat: float  # Timestamp of the last heartbeat received (seconds)
     registered_at: float  # Timestamp when the replica was registered (seconds)
+    topology_domain: str | None = None  # NVLink/NUMA/IB domain for topology-aware routing
 
 
 @dataclass

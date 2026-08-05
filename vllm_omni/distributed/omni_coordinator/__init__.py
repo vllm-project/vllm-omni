@@ -8,6 +8,7 @@ from .load_balancer import (
     RandomBalancer,
     RoundRobinBalancer,
     Task,
+    TopologyAwareBalancer,
 )
 from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
 from .omni_coord_client_for_hub import OmniCoordClientForHub
@@ -34,4 +35,5 @@ __all__ = [
     "RandomBalancer",
     "RoundRobinBalancer",
     "LeastQueueLengthBalancer",
+    "TopologyAwareBalancer",
 ]
