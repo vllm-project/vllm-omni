@@ -3487,12 +3487,12 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
 
 
 class OmniSleepRequest(BaseModel):
-    stage_ids: list[int] = Field(..., min_length=1)
+    stage_ids: list[int]
     level: int = Field(default=2, ge=0)
 
 
 class OmniWakeupRequest(BaseModel):
-    stage_ids: list[int] = Field(..., min_length=1)
+    stage_ids: list[int]
 
 
 @router.post("/v1/omni/sleep")

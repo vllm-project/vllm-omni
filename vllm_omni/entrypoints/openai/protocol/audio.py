@@ -460,13 +460,6 @@ class SpeechBatchItem(BaseModel):
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
     non_streaming_mode: bool | None = None
 
-    @field_validator("input")
-    @classmethod
-    def validate_input_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("input cannot be empty")
-        return v
-
     @field_validator("voice")
     @classmethod
     def validate_voice(cls, v: str | None) -> str | None:
