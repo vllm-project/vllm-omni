@@ -64,7 +64,6 @@ def main(args):
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
     )
 
     # Stage 0: fused_thinker_talker

@@ -1,4 +1,5 @@
 import pytest
+import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
@@ -6,7 +7,9 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,6 +65,76 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    output_processor = mocker.Mock()
+    engine.output_processors = [output_processor]
+
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    prompt = {
+        "prompt_token_ids": [1, 1, 1],
+        "model_intermediate_buffer": {
+            "ids": {"tts": [11, 12]},
+            "hidden_states": {"tts": hidden},
+        },
+    }
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    request = msg.prompt
+    assert isinstance(request, OmniEngineCoreRequest)
+    assert request.additional_information is not None
+    assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
+    assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
+    assert isinstance(request.model_intermediate_buffer, dict)
+    info = request.model_intermediate_buffer
+    assert info["ids"]["tts"] == [11, 12]
+    assert torch.equal(info["hidden_states"]["tts"], hidden)
+
+
+def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    engine._enqueue_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    message = engine.request_queue.sync_q.put.call_args.args[0]
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert metadata["omni_final_stage_id"] == 0
+    assert metadata["omni_force_kv_transfer"] is True
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):

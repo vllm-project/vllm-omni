@@ -119,8 +119,10 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    duplex_max_sessions: int = 1
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None
@@ -146,7 +148,10 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def architectures(self) -> list[str]:
-        if self.model_arch is not None:
+        # Falsy (None or "") means "no stage override": fall back to the
+        # checkpoint config's own architectures. The stage-config builder
+        # emits None; "" is tolerated for legacy callers.
+        if self.model_arch:
             return [self.model_arch]
         return super().architectures
 

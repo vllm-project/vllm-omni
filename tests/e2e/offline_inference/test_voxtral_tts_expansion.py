@@ -58,7 +58,7 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
 
 
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
     """Offline sync path; function-scoped runner so AsyncOmni test does not overlap a live Omni."""
     omni = omni_runner_function.omni

@@ -147,7 +147,7 @@ class OmniServeCommand(CLISubcommand):
                 raise ValueError(
                     "The following CLI args are not supported under --omni: "
                     f"{', '.join(offenders)}. Configure parallelism through the "
-                    "per-stage YAML (`--deploy-config` / `--stage-configs-path`) "
+                    "per-stage YAML (`--deploy-config`) "
                     "and replica count via the per-stage `num_replicas` config field "
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
@@ -240,20 +240,11 @@ class OmniServeCommand(CLISubcommand):
                 "flag, when set, overrides the YAML model field."
             ),
         )
-        # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
-        omni_config_group.add_argument(
-            "--stage-configs-path",
-            type=str,
-            default=None,
-            help="[Deprecated — will be removed in a future release] Path to a legacy "
-            "stage configs YAML (stage_args format). Prefer --deploy-config for new-format deploy YAMLs.",
-        )
         omni_config_group.add_argument(
             "--deploy-config",
             type=str,
             default=None,
-            help="Path to a deploy config YAML (new format with stages/engine_args). "
-            "Mutually exclusive with --stage-configs-path.",
+            help="Path to a deploy config YAML (new format with stages/engine_args).",
         )
         omni_config_group.add_argument(
             "--strategy-config",
@@ -410,7 +401,7 @@ class OmniServeCommand(CLISubcommand):
             dest="model_class_name",
             type=str,
             default=None,
-            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+            help="Override the diffusion pipeline class name (e.g. LTX2Pipeline).",
         )
         omni_config_group.add_argument(
             "--diffusion-load-format",
@@ -421,6 +412,25 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "How to load the diffusion pipeline: native/registry (default), "
                 "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-granularity",
+            choices=["regional", "full"],
+            default=None,
+            help=(
+                "Compilation scope for the generic diffusion model runner. "
+                "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
+                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-dynamic",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Use dynamic shapes for the selected generic diffusion compile scope. "
+                "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
             ),
         )
         omni_config_group.add_argument(
@@ -472,6 +482,14 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
+        )
+        omni_config_group.add_argument(
+            "--allgather-degree",
+            dest="allgather_degree",
+            type=int,
+            default=None,
+            help="AllGather-KV Sequence Parallelism degree for non-causal diffusion attention. "
+            "Equivalent to setting DiffusionParallelConfig.allgather_degree.",
         )
         omni_config_group.add_argument(
             "--diffusion-quantization-config",
@@ -534,7 +552,8 @@ class OmniServeCommand(CLISubcommand):
             help="Diffusion attention config. Accepts JSON or vLLM-style dotted flags. "
             "Examples: "
             "--diffusion-attention-config.default.backend FLASH_ATTN, "
-            "--diffusion-attention-config.per_role.self.backend SPARSE_BLOCK, "
+            "--diffusion-attention-config.default.backend TRTLLM_ATTN "
+            "--diffusion-attention-config.default.skip_softmax.target_sparsity 0.5, "
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
@@ -613,6 +632,30 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
+        omni_config_group.add_argument(
+            "--enable-distributed-layerwise-offload",
+            action="store_true",
+            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
+            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
+            "and overlaps H2D transfers and AllGather with computation. "
+            "DP size is automatically derived from the parallel configuration.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-use-allgather",
+            dest="dlo_use_allgather",
+            action="store_true",
+            default=True,
+            help="Use shard + AllGather for weight reconstruction (default: True). "
+            "When disabled (--dlo-no-use-allgather), each rank loads full weights "
+            "via H2D only — no sharding, no AllGather, no concurrent request "
+            "requirement, but N× CPU memory.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-no-use-allgather",
+            dest="dlo_use_allgather",
+            action="store_false",
+            help="Disable AllGather: each rank loads full weights independently.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
@@ -650,8 +693,7 @@ class OmniServeCommand(CLISubcommand):
             "--cfg-parallel-size",
             type=int,
             default=1,
-            choices=[1, 2],
-            help="Number of devices for CFG parallel computation for diffusion models. "
+            help="Number of devices used to execute diffusion guidance passes in parallel. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
         )
         omni_config_group.add_argument(
@@ -661,6 +703,15 @@ class OmniServeCommand(CLISubcommand):
             help="VAE Patch Parallelism degree for diffusion models. "
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--text-encoder-tp-size",
+            type=int,
+            default=1,
+            help="Tensor-parallel degree for the diffusion text encoder. "
+            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
+            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(
             "--vae-parallel-mode",
@@ -786,7 +837,6 @@ def run_headless(args: TrackingNamespace) -> None:
     omni_master_address: str | None = args.omni_master_address
     omni_master_port: int | None = args.omni_master_port
     worker_backend: str | None = args.worker_backend
-    stage_configs_path: str | None = args.stage_configs_path
     omni_replica_address: str | None = getattr(args, "omni_replica_address", None)
     omni_dp_size_local: int = max(1, int(getattr(args, "omni_dp_size_local", 1) or 1))
 
@@ -822,8 +872,12 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        stage_configs_path,
+        # The serve CLI no longer accepts legacy stage_args YAMLs.
+        None,
         args_dict,
+        # store_true cannot express an explicit False: absent maps to None
+        # ("not specified") so the deploy yaml's per-stage value applies.
+        trust_remote_code=getattr(args, "trust_remote_code", None) or None,
         deploy_config_path=args_dict.get("deploy_config"),
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),
@@ -863,7 +917,7 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
+        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's

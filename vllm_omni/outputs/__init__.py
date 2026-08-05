@@ -58,6 +58,18 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
 
+    @classmethod
+    def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
+        return cls(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+        )
+
 
 @dataclass
 class OmniRequestOutput:
@@ -71,6 +83,7 @@ class OmniRequestOutput:
         request_id: Unique identifier for this request
         finished: Whether generation is complete
         stage_id: Identifier of the stage that produced this output (pipeline mode)
+        replica_id: Identifier of the stage replica that produced this output
         final_output_type: Type of output ("text", "image", "audio", "latents")
         request_output: The underlying RequestOutput from the stage (pipeline mode)
         images: List of generated PIL images (diffusion mode)
@@ -84,6 +97,7 @@ class OmniRequestOutput:
 
     # Pipeline stage fields
     stage_id: int | None = None
+    replica_id: int | None = None
     final_output_type: str = "text"
     request_output: RequestOutput | None = None
 
@@ -142,6 +156,7 @@ class OmniRequestOutput:
         stage_id: int,
         final_output_type: str,
         request_output: RequestOutput,
+        replica_id: int | None = None,
     ) -> "OmniRequestOutput":
         """Create output from pipeline stage.
 
@@ -156,6 +171,7 @@ class OmniRequestOutput:
         return cls(
             request_id=getattr(request_output, "request_id", ""),
             stage_id=stage_id,
+            replica_id=replica_id,
             final_output_type=final_output_type,
             request_output=request_output,
             finished=True,

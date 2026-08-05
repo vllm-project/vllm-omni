@@ -5,17 +5,8 @@ Provides factories for a minimal serving-chat instance, chat requests, and
 OmniRequestOutput objects, plus SSE stream collection/parsing utilities.
 """
 
-import enum
 import json
 from unittest.mock import MagicMock
-
-# Python 3.10 compat: StrEnum was added in 3.11
-if not hasattr(enum, "StrEnum"):
-
-    class _StrEnum(str, enum.Enum):
-        """Minimal StrEnum backport for Python 3.10."""
-
-    enum.StrEnum = _StrEnum  # type: ignore[attr-defined]
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,

@@ -26,7 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -765,6 +765,7 @@ class Flux2Transformer2DModel(nn.Module):
     )
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     _sp_plan = {
         "": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),

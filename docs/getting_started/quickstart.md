@@ -19,10 +19,10 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA
-uv pip install vllm==0.25.0 --torch-backend=auto
+uv pip install vllm==0.26.0 --torch-backend=auto
 
 # On ROCm
-uv pip install vllm==0.25.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.25.0/rocm723
+uv pip install vllm==0.26.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
@@ -34,7 +34,7 @@ For additional installation methods — please see the [installation guide](inst
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
 
-    If you are seeing strange behavior with the `vllm` command not handling the `--omni` flag correctly, you most likely have a version mismatch with vLLM < `0.25.0` and vLLM Omni `0.25.0`, as vLLM Omni no longer hijacks the vLLM entrypoint. Updating vLLM should resolve this issue.
+    If you are seeing strange behavior with the `vllm` command not handling the `--omni` flag correctly, you most likely have a version mismatch with vLLM < `0.26.0` and vLLM Omni `0.26.0`, as vLLM Omni no longer hijacks the vLLM entrypoint. Updating vLLM should resolve this issue.
 
 ## Offline Inference
 
@@ -87,9 +87,8 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion request-level batching controls such as `max_num_seqs` and
-    `request_batch_max_wait_ms`, see
-    [Request-Level Batching](../user_guide/diffusion/request_batching.md).
+    For diffusion request batching, step execution, and streaming controls, see
+    [Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 

@@ -21,6 +21,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_omni"
 
 QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
+    default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     endpoint_restrictions=(
         EndpointRestriction(
@@ -87,7 +88,7 @@ QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             hf_config_name="thinker_config",
-            engine_output_type="latent",
+            engine_output_type="text",
             sampling_constraints={"detokenize": True},
         ),
     ),

@@ -8,11 +8,26 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, OffloadStrategy
+from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
+from .distributed_layerwise_backend import (
+    DistributedLayerwiseOffloadBackend,
+    DistributedLayerwiseOffloadHook,
+    apply_distributed_block_hook,
+    remove_distributed_block_hook,
+)
 from .layerwise_backend import LayerWiseOffloadBackend
+from .offload_plan import OffloadPlan, get_offload_plan, supports_mmap_loading
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
     remove_sequential_offload,
+)
+from .tensor_utils import (
+    dtype_size,
+    is_dtensor,
+    is_materialized_tensor,
+    make_offload_placeholder,
+    set_tensor_storage,
 )
 
 logger = init_logger(__name__)
@@ -20,12 +35,27 @@ logger = init_logger(__name__)
 __all__ = [
     "OffloadBackend",
     "OffloadConfig",
+    "OffloadPlan",
     "OffloadStrategy",
     "LayerWiseOffloadBackend",
+    "DistributedLayerwiseOffloadBackend",
+    "DistributedLayerwiseOffloadHook",
     "ModelLevelOffloadBackend",
     "apply_sequential_offload",
     "remove_sequential_offload",
+    "apply_distributed_block_hook",
+    "remove_distributed_block_hook",
     "get_offload_backend",
+    "get_offload_plan",
+    "supports_mmap_loading",
+    "get_blocks_attr_names",
+    "get_blocks_from_dit",
+    "set_blocks_attr_names",
+    "dtype_size",
+    "is_dtensor",
+    "is_materialized_tensor",
+    "make_offload_placeholder",
+    "set_tensor_storage",
 ]
 
 
@@ -75,6 +105,8 @@ def get_offload_backend(
         return ModelLevelOffloadBackend(config, device)
     elif config.strategy == OffloadStrategy.LAYER_WISE:
         return LayerWiseOffloadBackend(config, device)
+    elif config.strategy == OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+        return DistributedLayerwiseOffloadBackend(config, device)
     else:
         logger.error("Unknown offload strategy: %s", config.strategy)
         return None

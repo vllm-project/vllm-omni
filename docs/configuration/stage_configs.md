@@ -1,9 +1,9 @@
-# Deploy and legacy stage configurations
+# Pipeline and deploy configurations
 
-In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while a deploy configuration controls how those stages run. Models that have not migrated to this split still use legacy stage configurations with a `stage_args` schema.
+In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while a deploy configuration controls how those stages run.
 
 !!! note
-    Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when neither `--stage-configs-path` nor `--deploy-config` is provided — the model registry resolves the right pipeline + deploy YAML by `model_type`. The bundled defaults have been verified on 1xH100 for Qwen2.5-Omni and 2xH100 for Qwen3-Omni. Models that have not yet migrated to the new schema continue to use the legacy `vllm_omni/model_executor/stage_configs/<model>.yaml` files via `--stage-configs-path`.
+    Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The model registry resolves the right pipeline and deploy YAML by `model_type`.
 
 ## Deploy configuration schema
 
@@ -65,7 +65,7 @@ connectors:
 
 | Connector class | Use case | `extra` keys |
 |-----------------|----------|--------------|
-| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | `shm_threshold_bytes` (int, default `65536`). |
+| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | None. All payloads use shared memory. |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
@@ -86,10 +86,9 @@ stages:
 
 | Flag | Description |
 |------|-------------|
-| `--deploy-config PATH` | Load a new-schema deploy YAML. It is mutually exclusive with `--stage-configs-path`. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
+| `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
-| `--stage-configs-path` | **Deprecated.** Load a legacy `stage_args` YAML. New-schema YAMLs passed to this flag are auto-detected for compatibility, but should use `--deploy-config`. It is mutually exclusive with `--deploy-config` and will be removed in a future release. |
 
 ### Stage-Based CLI Paradigm
 
@@ -119,8 +118,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --omni-master-port 26000
 ```
 
-When instantiating a custom deployment YAML conforming to the updated schema, append the `--deploy-config /path/to/override.yaml` directive
-to all node invocations. For legacy architectures (e.g., BAGEL) configured via deprecated `stage_args:` schemas, continue to specify the relevant configuration via `--stage-configs-path /path/to/config.yaml`.
+When instantiating a custom deployment YAML, append the `--deploy-config /path/to/override.yaml` directive to all node invocations.
 
 In the context of standard initialization architectures, utilizing the `--stage-overrides` parameter operates as the optimal methodology
 for delineating stage-specific tuning from the CLI interface:
@@ -220,8 +218,7 @@ Therefore, as a core part of vLLM-Omni, a model's pipeline and deployment config
 
 To override specific parameters, explicitly inject the customized configuration schema
 in both online and offline instantiation flows. Use the `--deploy-config` flag
-when loading a deploy configuration, reserving the `--stage-configs-path` parameter
-exclusively to maintain compatibility with legacy `stage_args` YAML constructs.
+when loading a deploy configuration.
 
 Examples:
 
@@ -236,11 +233,6 @@ For online serving:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
-Legacy online serving:
-
-```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
-```
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
 
@@ -377,7 +369,12 @@ Default: `"0"`
 
 #### `engine_args.max_num_seqs`
 
-The maximum number of sequences for concurrent processing in this stage. For LLM stages, this controls the vLLM scheduler's maximum concurrent sequences. For all stage types, this also controls how many tasks can be batched together in the task processing loop.
+The maximum number of sequences for concurrent processing in this stage. For
+LLM stages, this controls the vLLM scheduler's maximum concurrent sequences.
+For diffusion stages, this controls scheduler wave capacity in both request
+batch mode and step batch mode. `max_num_seqs: 1` is the serial/conservative
+path; values above `1` allow compatible requests to batch when the selected
+diffusion pipeline supports that batching mode.
 
 Default: `1`
 
@@ -390,8 +387,8 @@ that support request-level batching with `step_execution` disabled.
 
 Use this together with `max_num_seqs > 1` for bursty serving traffic. `0`
 disables admission waiting and preserves the lowest first-request latency.
-For diffusion request-level batching tuning, see
-[Request-Level Batching](../user_guide/diffusion/request_batching.md).
+For diffusion execution and batching tuning, see
+[Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 Default: `0.0`
 
