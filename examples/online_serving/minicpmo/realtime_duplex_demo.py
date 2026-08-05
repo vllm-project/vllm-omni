@@ -227,16 +227,20 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             committed_index = _input_committed_index(client.events.events, commit_event_cursor)
             stream_decision = _latest_model_decision(client.events.events[: committed_index + 1], stream_event_cursor)
-            wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
-                client.events.events[: committed_index + 1]
-            )
+            response_in_progress = _response_in_progress(client.events.events[: committed_index + 1])
+            wait_for_post_commit_decision = input_has_residual_model_unit or response_in_progress
             if wait_for_post_commit_decision:
                 await wait_for(
-                    lambda: _post_commit_model_decision(client.events.events, committed_index) is not None,
+                    lambda: (
+                        _post_commit_model_decision(client.events.events, committed_index) is not None
+                        or not _response_in_progress(client.events.events)
+                    ),
                     timeout_s=args.timeout_s,
                     label="post-commit model decision or response drain",
                 )
                 post_commit_decision = _post_commit_model_decision(client.events.events, committed_index)
+                if post_commit_decision is None and not _response_in_progress(client.events.events):
+                    post_commit_decision = "speak"
         except TimeoutError as exc:
             wait_error = str(exc)
         audio = client.events.audio_bytes()
