@@ -250,11 +250,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self._ctx_len = self._ngram_n - 1
         self._eos_id = int(getattr(hf, "eos_token_id", 2))
         self._ngram_ctx: dict[str, torch.Tensor] = {}
-        self._ngram_audited = False
         self._ngram_disabled = int(os.environ.get("LONGCAT_NGRAM_DISABLE", "0")) != 0
-        self._logits_audited = False
-        self._layer_rms: list[tuple[int, float]] | None = None
-        self._layer_rms_audited = False
         self._max_ctx_entries = 4 * max(
             int(getattr(vllm_config.scheduler_config, "max_num_seqs", 64)), 64
         )
@@ -268,9 +264,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # validation runs (a full 30 s chunk is ~750 decode steps, which can
         # outlast a short job walltime); unset it for full-length audio.
         self.max_gen = int(os.environ.get("LONGCAT_MAX_GEN") or max_audio_seconds * 25)
-        self._audio_debug = int(os.environ.get("LONGCAT_AUDIO_DEBUG", "0")) != 0
-        if self._audio_debug:
-            self._attach_layer_rms_audit()
 
         # --- image generation state (talker_mtp dispatches to this too) ---
         self._visual_gen: dict[str, dict[str, Any]] = {}
@@ -290,81 +283,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # a plain instance attribute, even if its value is None. It must stay
         # entirely absent from __dict__/_buffers until the first real
         # register_buffer call in _ensure_replicated_audio_code_embedding.
-        # Debug tallies: every frame sampled by talker_mtp should be either
-        # kept or explicitly discarded, and every kept frame should be emitted
-        # by make_omni_output exactly once. Divergence between these three
-        # numbers localises a drop to a specific boundary.
-        self._dbg_sampled = 0
-        self._dbg_kept = 0
-        self._dbg_emitted = 0
-
-    @staticmethod
-    def _dbg_step(step: int) -> bool:
-        """Log the first few steps in full, then sample, to bound log size."""
-        return step < 12 or step % 100 == 0
-
-    def _attach_layer_rms_audit(self) -> None:
-        """Capture residual-stream RMS after every flash layer.
-
-        The port logs a ~0.6x compressed final-logit span vs the reference, but
-        a single head scalar would compress magnitudes while preserving rank --
-        the run also *re-ranks* the top-10, so the divergence accrues across
-        layers. Hooking each slot delivers the post-every-layer RMS curve for
-        the last step (the decode step whose logits we dump), which the pod can
-        diff against the reference HF model's per-layer RMS to localise the
-        first layer where the curves split.
-
-        Records are cleared/reset per step in _audit_layer_rms so each forward
-        overwrites the previous curve; it is read once at the first single-token
-        text decode then disabled.
-        """
-        self._layer_rms_hooks: list = []
-        self._layer_rms: list[tuple[int, float]] | None = []
-        self._layer_rms_audited = False
-
-        model = getattr(self, "model", None)
-        if model is None or not hasattr(model, "layers"):
-            return
-
-        def make_hook(idx: int):
-            def _h(module, args, output):
-                if self._layer_rms_audited or not self._audio_debug:
-                    return
-                # Hooks are armed once in __init__, before vLLM's own
-                # internal memory-profiling pass (a dummy, large-batch,
-                # zero-valued forward run used to size the KV cache before
-                # any real request). Nothing else resets this list between
-                # forward calls, so without this, the profiling pass's
-                # all-zero hidden states silently sit in _layer_rms until
-                # compute_logits reads it -- producing the exact
-                # `max_abs=0.0 rms=0.0` reading observed, not a real decode
-                # step's curve. Reset on every layer-0 hit so each new
-                # forward pass starts clean; since compute_logits reads
-                # _layer_rms immediately after the same forward pass
-                # completes, this guarantees it only ever sees that pass's
-                # real data.
-                if idx == 0:
-                    self._layer_rms = []
-                if isinstance(output, (tuple, list)):
-                    hidden = output[0]
-                else:
-                    hidden = output
-                hidden_f = hidden.float()
-                # Diagnostic for the zero-RMS anomaly: dump shape + max-abs
-                # alongside the RMS itself so a degenerate (e.g. warmup/dummy,
-                # or wrongly-indexed) capture is visible instead of silently
-                # producing a 0.0 that reads as a real (implausible) value.
-                logger.info(
-                    "[longcat-layers] layer=%d shape=%s max_abs=%.6f rms=%.6f",
-                    idx, tuple(hidden_f.shape), float(hidden_f.abs().max()),
-                    float(hidden_f.pow(2).mean().sqrt()),
-                )
-                self._layer_rms.append((idx, float(hidden_f.pow(2).mean().sqrt())))
-
-            return _h
-
-        for idx, layer in enumerate(model.layers):
-            self._layer_rms_hooks.append(layer.register_forward_hook(make_hook(idx)))
 
     # ------------------------------------------------------------------ #
     # embeddings
@@ -517,22 +435,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             for stale in list(self._ngram_ctx)[: len(self._ngram_ctx) - self._max_ctx_entries]:
                 self._ngram_ctx.pop(stale, None)
 
-        # n-gram audit: the reference runs the SAME kernel over the full
-        # prompt in one call; this port streams it span-by-span with a rolling
-        # _ctx_len left context. A mismatch in that streaming (fresh ctx
-        # init, _neg_eos sign convention, or span boundaries) would shift the
-        # fused embedding for every token and produce "coherent but generic"
-        # text even with identical input_ids. Log the first span's computed
-        # oe_ids (token x num_embedders) so a pod run can diff them against
-        # the reference kernel's output for the same prompt.
-        if self._audio_debug and fresh and not self._ngram_audited:
-            self._ngram_audited = True
-            logger.info(
-                "[longcat-ngram] req=%s first-span oe_ids[:4]=%s ngram_n=%d ctx_len=%d "
-                "num_embedders=%d",
-                request_id, oe_ids[:4].tolist(), self._ngram_n, self._ctx_len,
-                int(oe_ids.shape[1]),
-            )
         return oe_ids.long()
 
     def _advance_audio_gen(
@@ -572,13 +474,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 "ext_id": AUDIOTEXT_PAD_TOKEN_ID,
                 "terminal": False,
             }
-            if self._audio_debug:
-                logger.info("[longcat-audio] req=%s audio_gen created (delay=%d)",
-                            request_id, self._audio_delay_default)
         elif last_token == AUDIOGEN_END_TOKEN_ID:
             self._audio_gen.pop(request_id, None)
-            if self._audio_debug:
-                logger.info("[longcat-audio] req=%s audio_gen ended", request_id)
 
         state = self._audio_gen.get(request_id)
         if state is not None and not state["terminal"] and decode_eligible:
@@ -597,11 +494,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if not state["text_end"] and last_token == AUDIOTEXT_PAD_TOKEN_ID:
                 state["text_end"] = True
                 state["delay"] = min(state["delay"], gen_step)
-                if self._audio_debug:
-                    logger.info(
-                        "[longcat-audio] req=%s TEXT_END at gen_step=%d (delay->%s)",
-                        request_id, gen_step, state["delay"],
-                    )
 
             # ext stream + audio gating (reference output_processor.py:242-251).
             # The reference enables audio at the *end* of step == delay, after
@@ -612,13 +504,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 AUDIOTEXT_START_TOKEN_ID if gen_step == delay else AUDIOTEXT_PAD_TOKEN_ID
             )
             state["audio_start"] = gen_step > delay
-            if self._audio_debug and self._dbg_step(gen_step):
-                logger.info(
-                    "[longcat-audio] req=%s advance step=%d last_token=%d "
-                    "ext_id=%d audio_start=%s text_end=%s delay=%s",
-                    request_id, gen_step, last_token, state["ext_id"],
-                    state["audio_start"], state["text_end"], delay,
-                )
             # Emit mtp_inputs so the runner calls talker_mtp this step.
             # last_hidden from previous forward (stashed by make_omni_output),
             # or zeros if this is the first step after audio_gen creation.
@@ -713,14 +598,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 "ext_id": IMG_PAD_TOKEN_ID,
                 "terminal": False,
             }
-            if self._audio_debug:
-                logger.info("[longcat-image] req=%s visual_gen created (token_w=%s, token_h=%s)",
-                            request_id, self._visual_gen[request_id]["token_w"],
-                            self._visual_gen[request_id]["token_h"])
         elif last_token == IMG_END_TOKEN_ID:
             self._visual_gen.pop(request_id, None)
-            if self._audio_debug:
-                logger.info("[longcat-image] req=%s visual_gen ended", request_id)
 
         state = self._visual_gen.get(request_id)
         if state is not None and not state["terminal"] and decode_eligible:
@@ -734,20 +613,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 # forced in compute_logits; the state pops next step).
                 state["terminal"] = True
                 state["ext_id"] = IMG_END_TOKEN_ID
-                if self._audio_debug:
-                    logger.info(
-                        "[longcat-image] req=%s advance step=%d GRID-END terminal "
-                        "(token_h=%d token_w=%d grid_end=%d)",
-                        request_id, gen_step, state["token_h"], token_w, grid_end,
-                    )
             else:
                 is_row_boundary = state["gen_step"] % (token_w + 1) == 0
                 state["ext_id"] = IMG_NEWLINE_TOKEN_ID if is_row_boundary else IMG_PAD_TOKEN_ID
-                if self._audio_debug and self._dbg_step(gen_step):
-                    logger.info(
-                        "[longcat-image] req=%s advance step=%d last_token=%d ext_id=%d row_boundary=%s",
-                        request_id, gen_step, last_token, state["ext_id"], is_row_boundary,
-                    )
             last_hidden = state.get("last_hidden")
             if last_hidden is None:
                 last_hidden = torch.zeros(1, self.config.hidden_size, device=device, dtype=dtype)
@@ -763,21 +631,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         request_id = str(info.get("request_id", "default"))
         num_computed = int(info.get("_omni_num_computed_tokens", 0))
-
-        # Tokenization audit: the reference HF path tokenizes text prompts
-        # with add_special_tokens=True (HF default), which prepends BOS when
-        # the tokenizer config defines one. vLLM-omni's text-only path may
-        # differ, and a 1-token shift changes every n-gram hash context --
-        # producing "coherent but generic" text (observed: reference answers
-        # properly, port emits filler). Log the first span's raw ids once per
-        # request so a pod run can compare against the reference's tokenizer
-        # output directly.
-        if self._audio_debug and num_computed == 0:
-            logger.info(
-                "[longcat-text] req=%s first-span input_ids[:16]=%s span=%d ignored_first=%d",
-                request_id, input_ids[:16].tolist(), int(input_ids.shape[0]),
-                int((input_ids[0] >= self.text_vocab_hash_size).item()) if input_ids.numel() else -1,
-            )
 
         # oe_ignored ids (all special tokens >= text_vocab_size, incl. the
         # mm pad markers) are hash-segment boundaries and take *pure* word
@@ -850,18 +703,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         for req_id in finished_req_ids:
             req_id = str(req_id)
             self._ngram_ctx.pop(req_id, None)
-            state = self._audio_gen.pop(req_id, None)
-            if self._audio_debug:
-                # Final tally per request. sampled == kept + discarded, and
-                # emitted should equal kept; any mismatch points at the
-                # boundary that dropped frames.
-                logger.info(
-                    "[longcat-audio] req=%s FINISHED audio_gen=%s gen_step=%s "
-                    "terminal=%s | sampled=%d kept=%d emitted=%d",
-                    req_id, state is not None,
-                    (state or {}).get("gen_step"), (state or {}).get("terminal"),
-                    self._dbg_sampled, self._dbg_kept, self._dbg_emitted,
-                )
+            self._audio_gen.pop(req_id, None)
             self._visual_gen.pop(req_id, None)
 
     # ------------------------------------------------------------------ #
@@ -991,16 +833,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 continue
             codes_out = torch.cat(frames, dim=0)
             codes_out_by_modality[modality] = codes_out
-            if self._audio_debug:
-                self._dbg_emitted += int(codes_out.shape[0])
-                if self._dbg_step(self._dbg_emitted):
-                    logger.info(
-                        "[longcat-%s] make_omni_output emitting %s row(s) "
-                        "(emitted_total=%d vs kept_total=%d) first_row=%s",
-                        "image" if modality == "visual" else "audio",
-                        list(codes_out.shape), self._dbg_emitted, self._dbg_kept,
-                        codes_out[0].tolist(),
-                    )
         if not codes_out_by_modality:
             return OmniOutput(text_hidden_states=model_output, multimodal_outputs={})
         return OmniOutput(
@@ -1295,20 +1127,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 cond_logits = head(cond_hid, cum_ids.to(cond_hid.device), code_embed, level)[0]
                 uncond_logits = head(uncond_hid, cum_ids.to(uncond_hid.device), code_embed, level)[0]
                 combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
-                if self._audio_debug and level == 0:
-                    delta = cond_logits - uncond_logits
-                    logger.info(
-                        "[longcat-cfg-logits] cfg_scale=%s level=0 "
-                        "cond[min=%.3f max=%.3f argmax=%d] "
-                        "uncond[min=%.3f max=%.3f argmax=%d] "
-                        "delta[min=%.3f max=%.3f absmax=%.3f] "
-                        "combined[min=%.3f max=%.3f argmax=%d]",
-                        cfg_scale,
-                        float(cond_logits.min()), float(cond_logits.max()), int(cond_logits.argmax()),
-                        float(uncond_logits.min()), float(uncond_logits.max()), int(uncond_logits.argmax()),
-                        float(delta.min()), float(delta.max()), float(delta.abs().max()),
-                        float(combined.min()), float(combined.max()), int(combined.argmax()),
-                    )
                 sentinel_idx = None
                 if level == 0:
                     # Level-0 end-of-image class, masked per the reference
@@ -1518,28 +1336,10 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 else:
                     all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
 
-                self._dbg_sampled += 1
                 if frame_kept:
-                    self._dbg_kept += 1
                     # Repetition-penalty history: kept frames only (the
                     # reference filters discarded rows, output_processor.py:349).
                     state.setdefault("past_codes", []).append(codes_row.detach().cpu())
-                if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
-                    logger.info(
-                        "[longcat-audio] req=%s mtp step=%d codes0=%d kept=%s "
-                        "(audio_start=%s eoc=%s max_gen=%s) codes=%s sampled=%d kept_total=%d",
-                        req_id, gen_step, deoff, frame_kept, audio_start,
-                        eoc_terminal, max_gen_terminal, codes_row.tolist(),
-                        self._dbg_sampled, self._dbg_kept,
-                    )
-                if is_terminal and self._audio_debug:
-                    logger.info(
-                        "[longcat-audio] req=%s TERMINAL at step=%d reason=%s "
-                        "(total sampled=%d kept=%d)",
-                        req_id, gen_step,
-                        "chunk_end" if eoc_terminal else "max_gen",
-                        self._dbg_sampled, self._dbg_kept,
-                    )
 
                 # Build 3-stream next-step embedding (reference's get_audio_embeddings)
                 # Stream 1: ext_id embedding — audiotext_start/pad/audiogen_end
@@ -1696,17 +1496,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     eoc_terminal = deoff >= visual_codebook_sizes[0]
                     frame_kept = not is_row_boundary and not eoc_terminal
                     is_terminal = eoc_terminal
-                    self._dbg_sampled += 1
                     if frame_kept:
-                        self._dbg_kept += 1
                         p_state.setdefault("past_codes", []).append(codes_row.detach().cpu())
-                    if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
-                        logger.info(
-                            "[longcat-image] req=%s mtp step=%d CFG codes0=%d kept=%s "
-                            "(row_boundary=%s eoc=%s) codes=%s sampled=%d kept_total=%d",
-                            req_id, gen_step, deoff, frame_kept, is_row_boundary,
-                            eoc_terminal, codes_row.tolist(), self._dbg_sampled, self._dbg_kept,
-                        )
 
                     # Both streams share the combined sample (lockstep) and the
                     # twin's grid state mirrors the parent's so both terminate
@@ -1776,22 +1567,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 all_codes[row] = codes_row if frame_kept else torch.full_like(codes_row, -1)
 
                 is_terminal = eoc_terminal
-                self._dbg_sampled += 1
                 if frame_kept:
-                    self._dbg_kept += 1
                     state.setdefault("past_codes", []).append(codes_row.detach().cpu())
-                if self._audio_debug and (self._dbg_step(gen_step) or is_terminal):
-                    logger.info(
-                        "[longcat-image] req=%s mtp step=%d codes0=%d kept=%s "
-                        "(row_boundary=%s eoc=%s) codes=%s sampled=%d kept_total=%d",
-                        req_id, gen_step, deoff, frame_kept, is_row_boundary,
-                        eoc_terminal, codes_row.tolist(), self._dbg_sampled, self._dbg_kept,
-                    )
-                if is_terminal and self._audio_debug:
-                    logger.info(
-                        "[longcat-image] req=%s TERMINAL at step=%d (total sampled=%d kept=%d)",
-                        req_id, gen_step, self._dbg_sampled, self._dbg_kept,
-                    )
 
                 # 2-stream next-step embedding (reference's
                 # get_visual_embed_given_tokens / get_multimodal_embed): unlike
@@ -1834,74 +1611,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
-        # Logits audit: capture the first single-token decode step's top-k for
-        # a pure-text request (no audio/visual gen active). All the cheap
-        # checks pass (tokenization, ngram, MLA/RoPE config, weights), so the
-        # divergence must live in the forward pass or the sampler. Dumping the
-        # raw pre-sampling logits lets a pod run diff them directly against
-        # the reference HF model's logits for the identical input_ids -- the
-        # two possibilities are (a) logits differ -> forward-pass bug, or (b)
-        # logits match but samples diverge -> sampler-param application.
-        if (
-            self._audio_debug
-            and not self._logits_audited
-            and not (self._audio_gen or self._visual_gen)
-            and logits is not None
-            and logits.shape[0] == 1
-        ):
-            # vLLM's own startup memory-profiling dummy run also drives a full
-            # forward pass (including compute_logits, to size the logits
-            # tensor) through an all-zero hidden-state batch, and it can
-            # present with logits.shape[0] == 1 just like a real single-token
-            # decode step -- so "first qualifying call" alone does not mean
-            # "first real decode step". A genuine forward pass essentially
-            # never lands on an *exact* 0.0 RMS at every layer (RMSNorm,
-            # bias-free linear layers, and attention over an all-zero V all
-            # map zero to zero, which is exactly the dummy-run signature we
-            # keep seeing). Use that as the discriminator: if the captured
-            # curve is degenerate, this was a dummy pass -- don't disarm the
-            # audit, so the hooks (already reset per forward pass) get to
-            # capture the next, hopefully-real, pass instead.
-            curve = self._layer_rms
-            is_dummy_pass = curve is not None and all(v == 0.0 for _, v in curve)
-            if not is_dummy_pass:
-                self._logits_audited = True
-                # Dump the per-layer steam RMS curve for this same decode step
-                # so the pod can bisect the compression: if layer-0 RMS
-                # already differs from the reference, it's upstream
-                # (embedding/rotary); if it tracks until a late layer, it's
-                # localized there.
-                if curve is not None:
-                    self._layer_rms = None
-                    # Fix: this used to only null out _layer_rms without ever
-                    # setting _layer_rms_audited, so the hooks' guard
-                    # (`if self._layer_rms_audited or not self._audio_debug`)
-                    # never short-circuited -- the very next layer-forward
-                    # call hit `self._layer_rms.append(...)` on a None and
-                    # crashed every TP worker with AttributeError: 'NoneType'
-                    # object has no attribute 'append'. Must be set here,
-                    # alongside nulling the list, so the hooks actually stop
-                    # after the one read.
-                    self._layer_rms_audited = True
-                    logger.info(
-                        "[longcat-layers] per-slot RMS curve for first decode step: %s",
-                        [round(v, 4) for _, v in curve],
-                    )
-                topk_vals, topk_ids = torch.topk(logits[0], 10)
-                logger.info(
-                    "[longcat-logits] first decode step top10 ids=%s vals=%s "
-                    "eos=%s logits_range=[%.3f, %.3f]",
-                    topk_ids.tolist(),
-                    [round(float(v), 3) for v in topk_vals],
-                    self._eos_id,
-                    float(logits[0].min()), float(logits[0].max()),
-                )
-            else:
-                logger.info(
-                    "[longcat-logits] skipped degenerate (all-zero RMS) pass, "
-                    "likely vLLM's profiling/warmup dummy run -- waiting for "
-                    "a real decode step"
-                )
         if logits is None or not (self._audio_gen or self._visual_gen):
             return logits
         # During audio/image-gen mode, suppress EOS and force visible tokens
@@ -2033,7 +1742,6 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             do_kv = bool(getattr(self.config, "mla_scale_kv_lora", False)) and kv_lora > 0
             scale_q = (hf / q_lora) ** 0.5 if do_q else None
             scale_kv = (hf / kv_lora) ** 0.5 if do_kv else None
-            scaled = 0
             for layer in layers:
                 attns = getattr(layer, "self_attn", None)
                 if attns is None:
@@ -2042,16 +1750,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     if scale_q is not None and not getattr(attn, "_omni_mla_q_scaled", False):
                         attn.q_a_layernorm.weight.data.mul_(scale_q)
                         attn._omni_mla_q_scaled = True
-                        scaled += 1
                     if scale_kv is not None and not getattr(attn, "_omni_mla_kv_scaled", False):
                         attn.kv_a_layernorm.weight.data.mul_(scale_kv)
                         attn._omni_mla_kv_scaled = True
-                        scaled += 1
-            logger.info(
-                "[longcat-mla-scale-omni] applied MLA LoRA scale to %d layernorm(s) "
-                "(scale_q=%s scale_kv=%s)",
-                scaled, scale_q, scale_kv,
-            )
 
         device = next(self.model.parameters()).device
         for ckpt_prefix, attr in self._SIDE_MODULE_PREFIXES:
