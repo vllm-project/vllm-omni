@@ -1,4 +1,3 @@
-
 # Diffusion Serving Benchmark (Image/Video)
 
 This folder contains an online-serving benchmark script for diffusion models.
@@ -148,4 +147,21 @@ For example, a run with `--max-concurrency 8` should usually also use
 batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
-[`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+[`recipes/qwen_image_serving_performance.md`](./recipes/qwen_image_serving_performance.md).
+
+## 4. GLM-Image Benchmarks
+
+The [`glm-image/`](./glm-image/) subdirectory contains benchmarks for GLM-Image T2I and I2I across three backends
+
+See [`glm-image/README.md`](./glm-image/README.md) for full usage and CLI reference.
+
+## 5. Extra Benchmarks
+
+The [`extra-benches/`](./extra-benches/) subdirectory contains standalone diagnostics that use offline inference (not the serving endpoint):
+
+| Script | Description |
+|--------|-------------|
+| `quantization_quality.py` | Measures perceptual quality loss (LPIPS) from quantization by comparing BF16 baseline outputs against quantized outputs using the same seed |
+| `bench_sage_attn3_matrix.sh` | 2x2 timing matrix (SAGE_ATTN_3 vs TORCH_SDPA) x (compiled vs uncompiled) on HunyuanVideo-1.5 and Wan2.2; requires a Blackwell GPU |
+
+Consult the docstring in each script for example usage.

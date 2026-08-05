@@ -58,7 +58,7 @@ _TASK_TO_DATASET: dict[str, str] = {
 }
 
 # Default design dataset path (bundled with the repo)
-_DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
+_DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "tts" / "datasets" / "seed_tts_design")
 
 
 def load_model_configs(path: Path) -> dict[str, Any]:

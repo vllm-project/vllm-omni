@@ -8,12 +8,12 @@ Downloads source images for I2I from image_url on first run and caches locally.
 
 Usage:
     # T2I mode
-    python benchmarks/glm_image/vllm-omni/inference.py \
+    python benchmarks/diffusion/glm-image/vllm-omni/inference.py \
         --model-path zai-org/GLM-Image \
         --mode t2i --num-prompts 10
 
     # I2I mode (downloads source images)
-    python benchmarks/glm_image/vllm-omni/inference.py \
+    python benchmarks/diffusion/glm-image/vllm-omni/inference.py \
         --model-path zai-org/GLM-Image \
         --mode i2i --num-prompts 10
 """
@@ -479,7 +479,7 @@ def main() -> None:
     parser.add_argument("--num-inference-steps", type=int, default=NUM_INFERENCE_STEPS)
     parser.add_argument("--guidance-scale", type=float, default=GUIDANCE_SCALE)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--output-dir", type=str, default="benchmarks/glm_image/vllm-omni/outputs")
+    parser.add_argument("--output-dir", type=str, default="benchmarks/diffusion/glm-image/vllm-omni/outputs")
     parser.add_argument("--output-file", type=str, default=None, help="JSON file for metrics")
     parser.add_argument("--stage-init-timeout", type=int, default=600)
     parser.add_argument(

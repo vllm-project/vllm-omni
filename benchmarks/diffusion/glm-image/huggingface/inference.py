@@ -8,17 +8,17 @@ Downloads source images for I2I from image_url on first run and caches locally.
 
 Usage:
     # T2I mode (text-to-image, no source images needed)
-    python benchmarks/glm_image/huggingface/inference.py \
+    python benchmarks/diffusion/glm-image/huggingface/inference.py \
         --model-path zai-org/GLM-Image \
         --mode t2i --num-prompts 10
 
     # I2I mode (image-to-image, downloads source images)
-    python benchmarks/glm_image/huggingface/inference.py \
+    python benchmarks/diffusion/glm-image/huggingface/inference.py \
         --model-path zai-org/GLM-Image \
         --mode i2i --num-prompts 10
 
     # With custom prompt.json
-    python benchmarks/glm_image/huggingface/inference.py \
+    python benchmarks/diffusion/glm-image/huggingface/inference.py \
         --model-path zai-org/GLM-Image \
         --mode i2i --dataset-path prompts.json --num-prompts 5
 """
@@ -281,7 +281,7 @@ def main() -> None:
     parser.add_argument("--num-inference-steps", type=int, default=NUM_INFERENCE_STEPS)
     parser.add_argument("--guidance-scale", type=float, default=GUIDANCE_SCALE)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--output-dir", type=str, default="benchmarks/glm_image/huggingface/outputs")
+    parser.add_argument("--output-dir", type=str, default="benchmarks/diffusion/glm-image/huggingface/outputs")
     parser.add_argument("--output-file", type=str, default=None, help="JSON file for metrics")
     args = parser.parse_args()
     benchmark(args)

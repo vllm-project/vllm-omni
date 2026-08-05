@@ -12,9 +12,9 @@ CUDNN_ATTN underperforms on some SKUs. Two typical causes:
       walking CUDNN -> FLASH -> MATH.
 
 Run:
-    python benchmarks/diffusion/bench_attention_backends.py --preset hv15
-    python benchmarks/diffusion/bench_attention_backends.py --preset wan22
-    python benchmarks/diffusion/bench_attention_backends.py \
+    python benchmarks/kernels/bench_attention_backends.py --preset hv15
+    python benchmarks/kernels/bench_attention_backends.py --preset wan22
+    python benchmarks/kernels/bench_attention_backends.py \
         --batch 1 --heads 24 --seq 14336 --head-dim 128
 
 Optional extras:

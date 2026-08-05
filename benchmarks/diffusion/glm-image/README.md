@@ -16,11 +16,11 @@ Single-request sequential inference using the reference HuggingFace pipeline.
 
 ```bash
 # T2I
-CUDA_VISIBLE_DEVICES=0 python benchmarks/glm_image/huggingface/inference.py \
+CUDA_VISIBLE_DEVICES=0 python benchmarks/diffusion/glm-image/huggingface/inference.py \
     --model-path /path/to/GLM-Image --mode t2i --num-prompts 10
 
 # I2I
-CUDA_VISIBLE_DEVICES=0 python benchmarks/glm_image/huggingface/inference.py \
+CUDA_VISIBLE_DEVICES=0 python benchmarks/diffusion/glm-image/huggingface/inference.py \
     --model-path /path/to/GLM-Image --mode i2i --num-prompts 10
 ```
 
@@ -34,7 +34,7 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/glm_image/huggingface/inference.py \
 | `--num-prompts` | `10` | Number of images to generate |
 | `--width` / `--height` | `1024` | Output image size |
 | `--num-inference-steps` | `50` | Diffusion denoising steps |
-| `--output-dir` | `benchmarks/glm_image/huggingface/outputs` | Output directory |
+| `--output-dir` | `benchmarks/diffusion/glm-image/huggingface/outputs` | Output directory |
 | `--output-file` | - | JSON file for metrics |
 
 ## vLLM-Omni Offline
@@ -43,11 +43,11 @@ Multi-GPU offline inference with pipeline parallelism and continuous batching.
 
 ```bash
 # T2I
-CUDA_VISIBLE_DEVICES=0,1 python benchmarks/glm_image/vllm-omni/inference.py \
+CUDA_VISIBLE_DEVICES=0,1 python benchmarks/diffusion/glm-image/vllm-omni/inference.py \
     --model-path /path/to/GLM-Image --mode t2i --num-prompts 10
 
 # I2I
-CUDA_VISIBLE_DEVICES=0,1 python benchmarks/glm_image/vllm-omni/inference.py \
+CUDA_VISIBLE_DEVICES=0,1 python benchmarks/diffusion/glm-image/vllm-omni/inference.py \
     --model-path /path/to/GLM-Image --mode i2i --num-prompts 10
 ```
 
@@ -62,7 +62,7 @@ CUDA_VISIBLE_DEVICES=0,1 python benchmarks/glm_image/vllm-omni/inference.py \
 | `--num-prompts` | `10` | Number of images to generate |
 | `--width` / `--height` | `1024` | Output image size |
 | `--num-inference-steps` | `50` | Diffusion denoising steps |
-| `--output-dir` | `benchmarks/glm_image/vllm-omni/outputs` | Output directory |
+| `--output-dir` | `benchmarks/diffusion/glm-image/vllm-omni/outputs` | Output directory |
 | `--output-file` | - | JSON file for metrics |
 | `--stage-init-timeout` | `600` | Stage initialization timeout (s) |
 
@@ -84,15 +84,15 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/GLM-Image \
 
 ```bash
 # T2I
-python benchmarks/glm_image/benchmark_glm_image.py \
+python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
     --mode t2i --num-prompts 10 --model glm-image
 
 # I2I
-python benchmarks/glm_image/benchmark_glm_image.py \
+python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
     --mode i2i --num-prompts 10 --model glm-image
 
 # Custom dataset
-python benchmarks/glm_image/benchmark_glm_image.py \
+python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
     --mode i2i --dataset custom \
     --dataset-path prompts.json --num-prompts 5
 ```

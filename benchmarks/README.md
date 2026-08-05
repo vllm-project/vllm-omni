@@ -1,32 +1,45 @@
 # Benchmarks
 
-This directory contains benchmark suites for evaluating different model families and infrastructure components in vLLM-Omni. Each subfolder targets a different benchmark family with its own scripts, configs, and metrics. See the per-subfolder READMEs for detailed usage.
+Benchmark suites for evaluating model families and infrastructure components in vLLM-Omni, organized by modality. See per-directory READMEs for detailed usage.
+
+## Directory layout
+
+```
+benchmarks/
+├── tts/              Text-to-speech serving benchmarks + model-specific tests
+├── diffusion/        Image/video generation serving benchmarks + model-specific tests
+├── accuracy/         Image generation/editing quality benchmarks
+├── distributed/      RDMA connector transfer tests
+└── kernels/          Kernel-level micro-benchmarks and auto-tuners
+```
 
 ## Benchmark families
 
 ### [TTS](tts/README.md) — Text-to-Speech
 
-Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM2.
+Serving benchmarks for TTS models
 
-- **Layout**: `tts/bench_tts.py` (serving benchmark driver), `tts/model_configs.yaml` (model registry), `tts/plot_results.py` (result plotting)
-- **Dataset**: Seed-TTS full or text-only datasets, plus bundled smoke/design prompts under `build_dataset/`
-- **Key metrics**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor), throughput (audio seconds / wall-clock second)
+- **Serving benchmark**: `tts/bench_tts.py` (wraps `vllm bench serve --omni`)
+- **Model registry**: `tts/model_configs.yaml` (model-specific benchmark configurations)
+- **Datasets**: `tts/datasets/` (bundled smoke/design prompt sets, download instructions for full Seed-TTS corpus)
+- **Key metrics**: TTFP, E2E latency, RTF, audio throughput, optional quality metrics (WER, SIM, UTMOS)
+- **Model-specific directories**: `tts/fish-speech` for DAC-code cache performance
 
 ### [Diffusion](diffusion/README.md) — Image and Video Generation
 
-Online-serving benchmark for diffusion image/video models, sending requests to the configured vLLM serving endpoint (`/v1/chat/completions`, `/v1/images/generations`, or `/v1/videos`, depending on backend/task).
+Benchmarks for diffusion image/video models
 
-- **Tasks**: text-to-image, text-to-video, image-to-image, image-to-video, text+image-to-image, text+image-to-video
-- **Datasets**: `vbench`, `trace`, `random`
-- **Key metrics**: request throughput, latency percentiles, optional SLO attainment
+- **Serving benchmark**: `diffusion/diffusion_benchmark_serving.py`
+- **Key metrics**: request throughput, latency percentiles, SLO attainment, per-stage durations
+- **Recipes**: `diffusion/recipes/` (reference results and directions for Qwen-Image, Wan2.2)
+- **Model-specific directories**: `diffusion/glm-image/` for HuggingFace baseline and offline benchmarks
 
-### [GLM-Image](glm_image/README.md) — Text-to-Image and Image-to-Image
+### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
 
-Benchmarks for GLM-Image performance across HuggingFace baseline, vLLM-Omni offline inference, and vLLM-Omni online serving.
+Accuracy benchmarks for image generation/editing models, adapting external suites to vLLM-Omni serving and local judge-evaluation flows.
 
-- **Layout**: `glm_image/huggingface/` (HF baseline), `glm_image/vllm-omni/` (offline inference), `glm_image/benchmark_glm_image.py` (online serving)
-- **Tasks**: text-to-image and image-to-image
-- **Key metrics**: request/image throughput, latency percentiles, optional per-stage pipeline timings
+- **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
+- **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
 
 ### [LingBot-Video](lingbot_video/README.md) — Dense and MoE Parity
 
@@ -43,12 +56,12 @@ RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`,
 - **Transfer modes**: `copy`, `zerocopy`, `gpu` (GPUDirect)
 - **Supports**: single-node pytest suites and manual multi-node/cross-node transfer testing
 
-### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
+### [Kernels](kernels/README.md) — Kernel Micro-Benchmarks
 
-Accuracy benchmarks for image generation/editing models, adapting external suites to vLLM-Omni serving and local judge-evaluation flows.
+Kernel-level micro-benchmarks and auto-tuners for custom operators.
 
-- **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
-- **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
+- **MoT GEMM**: `kernels/mot_linear_benchmarks.py` (Triton kernel auto-tuner for Mixture-of-Tokens GEMM operations)
+- **Attention backends**: `kernels/bench_attention_backends.py` (diffusion attention kernel comparison across SDPA, cuDNN, Flash, FA4, FlashInfer, SageAttn3)
 
 ### Common serving metrics framework
 
@@ -62,7 +75,9 @@ See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wra
 
 ## Adding a new benchmark
 
-1. Create a subfolder under `benchmarks/<name>/` with scripts, configs if needed, and a `README.md`.
-2. If comparing against another runtime, use clear backend subfolders where applicable, such as `huggingface/` and `vllm-omni/`, or follow the shared TTS serving benchmark pattern in `tts/`.
-3. Add reusable dataset or prompt-building utilities to `build_dataset/` if applicable.
-4. Update this README with a link to the new benchmark family.
+When adding a new benchmark, make sure to maintain the current structure of `benchmarks/`. This includes:
+
+1. Include benchmarks in appropriate modality (`tts/`, `diffusion/`) or other directory (`distributed/`, `kernels/`, `accuracy/`) or add a new top-level directory.
+2. For model-specific benchmarks within an existing modality, create a subdirectory under the modality (e.g., `tts/fish-speech/`, `diffusion/glm-image/`).
+3. Update the subdirectory's `README.md` with: new benchmark purpose, any additional prerequisites, usage examples, CLI arguments table, and key metrics
+4. For any new datasets or prompt files, place under the modality's `datasets/` directory if applicable.

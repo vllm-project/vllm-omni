@@ -50,7 +50,7 @@ def _guess_mime_type(path: str) -> str:
     return mime or "application/octet-stream"
 
 
-def _encode_image_as_data_url(path: str) -> str:
+def encode_image_as_data_url(path: str) -> str:
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     mime = _guess_mime_type(path)
@@ -182,7 +182,7 @@ async def async_request_chat_completions(
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": _encode_image_as_data_url(img_path)},
+                    "image_url": {"url": encode_image_as_data_url(img_path)},
                 }
             )
         messages = [{"role": "user", "content": content}]

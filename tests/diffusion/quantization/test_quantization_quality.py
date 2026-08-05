@@ -48,8 +48,8 @@ from PIL import Image
 from tests.helpers.mark import hardware_marks
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_BENCH_MODULE_PATH = _REPO_ROOT / "benchmarks" / "diffusion" / "quantization_quality.py"
-_BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
+_BENCH_MODULE_PATH = _REPO_ROOT / "benchmarks" / "diffusion" / "extra-benches" / "quantization_quality.py"
+_BENCH_MODULE_NAME = "benchmarks.diffusion.extra_benches.quantization_quality"
 
 if _BENCH_MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
@@ -381,7 +381,7 @@ def _generate_video(omni, config: QualityTestConfig):
 
 def _compute_lpips(baseline, quantized, task: str) -> float:
     """Compute LPIPS between baseline and quantized outputs."""
-    from benchmarks.diffusion.quantization_quality import (
+    from benchmarks.diffusion.extra_benches.quantization_quality import (
         compute_lpips_images,
         compute_lpips_video,
     )
@@ -434,7 +434,8 @@ def _free_gpu_memory():
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
-    from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
+    from benchmarks.diffusion.extra_benches.quantization_quality import _generate_image as benchmark_generate_image
+
     from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 

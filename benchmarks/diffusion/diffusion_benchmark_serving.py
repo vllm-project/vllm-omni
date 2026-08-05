@@ -93,7 +93,6 @@ import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any
 
@@ -106,6 +105,7 @@ from backends import (
     backends_function_mapping,
     normalize_endpoint,
 )
+from bench_utils import calculate_metrics, iter_requests
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -979,27 +979,6 @@ def _populate_slo_ms_from_warmups(
     return updated
 
 
-async def iter_requests(
-    requests_list: list[RequestFuncInput],
-    request_rate: float,
-) -> AsyncGenerator[RequestFuncInput, None]:
-    """Yield requests using a Poisson process if request_rate is set.
-
-    - If request_rate is inf, all requests are yielded immediately (no sleep).
-    - Otherwise, inter-arrival times follow an exponential distribution.
-    """
-
-    if request_rate != float("inf"):
-        if request_rate <= 0:
-            raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
-
-    for i, req in enumerate(requests_list):
-        if request_rate != float("inf") and i > 0:
-            interval_s = random.expovariate(request_rate)
-            await asyncio.sleep(interval_s)
-        yield req
-
-
 def _make_warmup_request(
     requests_list: list[RequestFuncInput],
     index: int,
@@ -1044,73 +1023,6 @@ async def _run_warmups(
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
     warmup_outputs = await asyncio.gather(*warmup_tasks)
     return list(zip(warmup_requests, warmup_outputs))
-
-
-def calculate_metrics(
-    outputs: list[RequestFuncOutput],
-    total_duration: float,
-    requests_list: list[RequestFuncInput],
-    args,
-    slo_enabled: bool,
-):
-    success_outputs = [o for o in outputs if o.success]
-    error_outputs = [o for o in outputs if not o.success]
-
-    num_success = len(success_outputs)
-    latencies = [o.latency for o in success_outputs]
-    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
-
-    # Aggregate per-stage durations across all successful requests that reported them.
-    stage_duration_lists: dict[str, list[float]] = {}
-    for o in success_outputs:
-        for stage, duration in (o.stage_durations or {}).items():
-            stage_duration_lists.setdefault(stage, []).append(duration)
-    stage_durations_mean = {s: float(np.mean(v)) for s, v in stage_duration_lists.items()}
-    stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
-    stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
-
-    metrics = {
-        "duration": total_duration,
-        "completed_requests": num_success,
-        "failed_requests": len(error_outputs),
-        "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
-        "latency_mean": np.mean(latencies) if latencies else 0,
-        "latency_median": np.median(latencies) if latencies else 0,
-        "latency_p99": np.percentile(latencies, 99) if latencies else 0,
-        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
-        "latency_p50": np.percentile(latencies, 50) if latencies else 0,
-        "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
-        "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
-        "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
-        "stage_durations_mean": stage_durations_mean,
-        "stage_durations_p50": stage_durations_p50,
-        "stage_durations_p99": stage_durations_p99,
-    }
-
-    if slo_enabled:
-        slo_defined_total = 0
-        slo_met_success = 0
-
-        for req, out in zip(requests_list, outputs):
-            if req.slo_ms is None:
-                continue
-            slo_defined_total += 1
-            if out.slo_achieved is None:
-                continue
-            if out.slo_achieved:
-                slo_met_success += 1
-
-        slo_attain_all = (slo_met_success / slo_defined_total) if slo_defined_total > 0 else 0.0
-
-        metrics.update(
-            {
-                "slo_attainment_rate": slo_attain_all,
-                "slo_met_success": slo_met_success,
-                "slo_scale": getattr(args, "slo_scale", 3.0),
-            }
-        )
-
-    return metrics
 
 
 def _save_generated_outputs(
@@ -1316,7 +1228,7 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+        async for req in iter_requests(requests_list, args.request_rate):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -1326,7 +1238,13 @@ async def benchmark(args):
     pbar.close()
 
     # Calculate metrics
-    metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
+    metrics = calculate_metrics(
+        outputs,
+        total_duration,
+        requests_list,
+        slo_enabled=args.slo,
+        slo_scale=getattr(args, "slo_scale", 3.0),
+    )
 
     # Add configuration info to metrics for JSON output
     metrics["endpoint"] = args.endpoint

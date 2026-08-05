@@ -5,7 +5,7 @@
 # 2x2 timing matrix (backend x compile mode) for SAGE_ATTN_3 vs TORCH_SDPA,
 # on HunyuanVideo-1.5 480p T2V and Wan 2.2 TI2V-5B. Run from the repo root:
 #
-#     bash benchmarks/diffusion/bench_sage_attn3_matrix.sh
+#     bash benchmarks/diffusion/extra-benches/bench_sage_attn3_matrix.sh
 #
 # Requires: sageattn3 installed (for SAGE_ATTN_3 rows) and a Blackwell GPU.
 

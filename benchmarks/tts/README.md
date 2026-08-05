@@ -53,7 +53,7 @@ vllm bench serve --omni \
     --backend openai-audio-speech \
     --endpoint /v1/audio/speech \
     --dataset-name seed-tts-text \
-    --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+    --dataset-path benchmarks/tts/datasets/seed_tts_smoke \
     --seed-tts-locale en \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}' \
@@ -71,7 +71,7 @@ vllm bench serve --omni \
     --backend openai-audio-speech \
     --endpoint /v1/audio/speech \
     --dataset-name seed-tts-design \
-    --dataset-path benchmarks/build_dataset/seed_tts_design \
+    --dataset-path benchmarks/tts/datasets/seed_tts_design \
     --seed-tts-locale en \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"VoiceDesign","language":"English"}' \
@@ -184,15 +184,15 @@ Then add the model's Deploy YAML under `vllm_omni/deploy/<model>.yaml`
 
 | Dataset            | Bundled? | Format            | Source                                                         |
 |--------------------|----------|-------------------|----------------------------------------------------------------|
-| `seed-tts-design`  | ✅       | 5-field meta.lst  | `benchmarks/build_dataset/seed_tts_design/en/meta.lst` (20 prompts) |
-| `seed_tts_smoke`   | ✅       | 4-field meta.lst  | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only) |
+| `seed-tts-design`  | ✅       | 5-field meta.lst  | `benchmarks/tts/datasets/seed_tts_design/en/meta.lst` (20 prompts) |
+| `seed_tts_smoke`   | ✅       | 4-field meta.lst  | `benchmarks/tts/datasets/seed_tts_smoke/en/meta.lst` (20 text-only) |
 | `seed-tts`         | ❌       | 4-field meta.lst + WAVs | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB) |
 | `seed-tts-text`    | ❌       | 4-field meta.lst  | Same archive as `seed-tts` (wav column unused)                 |
 
 [seedtts]: https://github.com/BytedanceSpeech/seed-tts-eval
 
 For manual voice_clone / default_voice runs against the full corpus, follow
-`benchmarks/build_dataset/download_process_data_seedtts.md` and point
+`benchmarks/tts/datasets/download_process_data_seedtts.md` and point
 `--dataset-path` at the extracted `seedtts_testset` directory.
 
 ## DFX nightly CI
@@ -234,7 +234,18 @@ benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
 ├── plot_results.py            Generate per-task / per-concurrency curves
-└── model_configs.yaml         Model registry (supported tasks + extra body)
+├── model_configs.yaml         Model registry (supported tasks + extra body)
+├── datasets/                  Bundled smoke/design prompt sets + download docs
+│   ├── extract_tts_prompts.py Utility to extract prompts from meta.lst files
+│   ├── download_process_data_seedtts.md
+│   ├── seed_tts_design/       Voice design prompts (5-field meta.lst)
+│   ├── seed_tts_smoke/        Text-only smoke prompts (4-field meta.lst)
+│   ├── sound_effect_smoke/    Sound effect prompts
+│   └── ttsd_smoke/            Dialogue prompts (multi-speaker)
+└── fish-speech/               Fish Speech model-specific benchmarks
+    ├── README.md
+    ├── bench_speaker_cache.py DAC-code cache A/B test
+    └── fish_bench_utils.py    Async benchmark infra (streaming client, metrics)
 ```
 
 ## Related

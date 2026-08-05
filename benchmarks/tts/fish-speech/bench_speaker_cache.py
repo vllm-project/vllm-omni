@@ -29,7 +29,7 @@ from pathlib import Path
 
 import aiohttp
 
-# Allow imports from benchmarks/fish-speech/
+# Allow imports from benchmarks/tts/fish-speech/
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fish_bench_utils import (  # noqa: E402

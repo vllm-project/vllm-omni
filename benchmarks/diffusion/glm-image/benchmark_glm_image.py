@@ -15,26 +15,25 @@ Supports three dataset types:
 
 Usage:
     # T2I with prompt.json (default)
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode t2i --num-prompts 10
 
     # I2I with prompt.json (downloads source images automatically)
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode i2i --num-prompts 10
 
     # Random dataset
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode t2i --dataset random --num-prompts 20
 
     # Custom dataset
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode i2i --dataset custom \
         --dataset-path my_prompts.json --num-prompts 5
 """
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -45,14 +44,14 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-import numpy as np
 import requests as sync_requests
 from PIL import Image
 from tqdm.asyncio import tqdm
 
 # Import backends from the diffusion benchmark (add parent dirs to path)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "diffusion"))
-from backends import RequestFuncOutput
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from backends import RequestFuncOutput, encode_image_as_data_url
+from bench_utils import calculate_metrics, iter_requests
 
 BENCHMARK_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
@@ -115,15 +114,6 @@ def download_image(url: str) -> str:
     resp.raise_for_status()
     local_path.write_bytes(resp.content)
     return str(local_path)
-
-
-def encode_image_as_data_url(path: str) -> str:
-    """Encode a local image file as a base64 data URL."""
-    with open(path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-    ext = Path(path).suffix.lower()
-    mime = {"png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
-    return f"data:{mime};base64,{encoded}"
 
 
 # ---------------------------------------------------------------------------
@@ -318,41 +308,6 @@ async def async_glm_image_request(
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
-
-
-async def iter_requests(n: int, request_rate: float) -> Any:
-    import random as _random
-
-    for i in range(n):
-        if request_rate != float("inf") and i > 0:
-            await asyncio.sleep(_random.expovariate(request_rate))
-        yield i
-
-
-def calculate_metrics(outputs: list[RequestFuncOutput], total_duration: float) -> dict[str, Any]:
-    success = [o for o in outputs if o.success]
-    errors = [o for o in outputs if not o.success]
-    latencies = [o.latency for o in success]
-    peak_mems = [o.peak_memory_mb for o in success if o.peak_memory_mb > 0]
-
-    stage_duration_lists: dict[str, list[float]] = {}
-    for o in success:
-        for stage, dur in (o.stage_durations or {}).items():
-            stage_duration_lists.setdefault(stage, []).append(dur)
-
-    return {
-        "duration": total_duration,
-        "completed_requests": len(success),
-        "failed_requests": len(errors),
-        "throughput_qps": len(success) / total_duration if total_duration > 0 else 0,
-        "latency_mean": float(np.mean(latencies)) if latencies else 0,
-        "latency_median": float(np.median(latencies)) if latencies else 0,
-        "latency_p99": float(np.percentile(latencies, 99)) if latencies else 0,
-        "latency_p95": float(np.percentile(latencies, 95)) if latencies else 0,
-        "peak_memory_mb_max": max(peak_mems) if peak_mems else 0,
-        "stage_durations_mean": {s: float(np.mean(v)) for s, v in stage_duration_lists.items()},
-        "stage_durations_p50": {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()},
-    }
 
 
 async def benchmark(args: argparse.Namespace) -> None:

@@ -12,7 +12,7 @@ Requirements:
     pip install lpips Pillow numpy
 
 Image example (text-to-image):
-    python benchmarks/diffusion/quantization_quality.py \
+    python benchmarks/diffusion/extra-benches/quantization_quality.py \
         --model Tongyi-MAI/Z-Image-Turbo \
         --task t2i \
         --quantization fp8 \
@@ -24,7 +24,7 @@ Image example (text-to-image):
         --num-inference-steps 50 --seed 42
 
 Video example (text-to-video):
-    python benchmarks/diffusion/quantization_quality.py \
+    python benchmarks/diffusion/extra-benches/quantization_quality.py \
         --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
         --task t2v \
         --quantization fp8 \
@@ -35,7 +35,7 @@ Video example (text-to-video):
         --num-frames 81 --num-inference-steps 40 --seed 42
 
 LTX-2 example (text-to-video; audio output is generated but not scored by LPIPS):
-    python benchmarks/diffusion/quantization_quality.py \
+    python benchmarks/diffusion/extra-benches/quantization_quality.py \
         --model Lightricks/LTX-Video-2 \
         --task t2v \
         --quantization fp8 int8 \
@@ -45,7 +45,7 @@ LTX-2 example (text-to-video; audio output is generated but not scored by LPIPS)
         --num-frames 121 --num-inference-steps 40 --seed 42
 
 Multiple quantization methods:
-    python benchmarks/diffusion/quantization_quality.py \
+    python benchmarks/diffusion/extra-benches/quantization_quality.py \
         --model Tongyi-MAI/Z-Image-Turbo \
         --task t2i \
         --quantization fp8 int8 bitsandbytes \

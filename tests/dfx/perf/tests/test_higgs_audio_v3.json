@@ -36,7 +36,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           20
         ],
@@ -60,7 +60,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           500
         ],

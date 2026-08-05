@@ -63,7 +63,7 @@ For a reproducible replay flow using the bundled serving benchmark, see the
 Qwen-Image replay commands in
 [`benchmarks/diffusion/README.md`](gh-file:benchmarks/diffusion/README.md)
 and
-[`benchmarks/diffusion/performance_dashboard/qwen_image_serving_performance.md`](gh-file:benchmarks/diffusion/performance_dashboard/qwen_image_serving_performance.md).
+[`benchmarks/diffusion/recipes/qwen_image_serving_performance.md`](gh-file:benchmarks/diffusion/recipes/qwen_image_serving_performance.md).
 
 ## Scheduler
 

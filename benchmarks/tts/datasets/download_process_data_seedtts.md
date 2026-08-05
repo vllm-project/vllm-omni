@@ -13,7 +13,7 @@ This guide describes how to download and prepare the SeedTTS test dataset for be
 ### 1. Navigate to the Dataset Directory
 
 ```bash
-cd benchmarks/build_dataset
+cd benchmarks/tts/datasets
 ```
 
 ### 2. Install Dependencies
@@ -72,7 +72,7 @@ rm meta.lst
 
 ```bash
 # Full setup and benchmark
-cd benchmarks/build_dataset
+cd benchmarks/tts/datasets
 pip install gdown
 gdown  1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 tar -xf seedtts_testset.tar
