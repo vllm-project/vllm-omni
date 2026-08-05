@@ -427,6 +427,12 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · MiniMax H3 T2VA Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_t2va_similarity.py -m full_model --run-level full_model
+        mirror_hardwares: h100_4
+
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
         timeout_in_minutes: 180
         commands:
@@ -455,35 +461,46 @@ steps:
         mirror_hardwares: h100_2
 
   - group: ":card_index_dividers: Diffusion Test"
+    key: nightly-diffusion-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion · Distributed Test with L4"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
+        mirror_hardwares: l4_4
+
+      - label: ":full_moon: Diffusion · Distributed Test with H100"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100' --run-level "full_model"
+        mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion · Offloader Test"
-        timeout_in_minutes: 40
+        timeout_in_minutes: 60
         commands:
-          - timeout 40m pytest -s -v tests/diffusion/offloader -m "full_model and cuda"
+          - pytest -sv tests/diffusion/offloader -m "full_model and cuda"
         mirror_hardwares: l4_1
 
-      - label: ":full_moon: Diffusion · Quantization Test with H100"
+      - label: ":full_moon: Diffusion · Quantization Test with H100 · Single-GPU"
+        timeout_in_minutes: 60
         commands:
-          - timeout 60m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
+          - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         mirror_hardwares: h100_1
+
+      - label: ":full_moon: Diffusion · MiniMax H3 FP8 Quality Test with H100 · 2-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/models/minimax_h3/test_minimax_h3_quantization_quality.py -m 'full_model and cuda and H100' --run-level "full_model"
+        mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion · Quantization Test with L4"
         timeout_in_minutes: 60
         commands:
+          - pip install "vllm-gguf-plugin>=0.0.3"
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_1
-
-      - label: ":full_moon: Diffusion · Wan VAE Spatial Shard Correctness Test"
-        timeout_in_minutes: 60
-        commands:
-          - >-
-            pytest -sv tests/diffusion/distributed/test_wan_spatial_shard.py
-            -m "full_model and diffusion and H100 and distributed_cuda"
-            --run-level "full_model"
-        mirror_hardwares: h100_2
 
   - label: ":bar_chart: Testcase Statistics"
     key: nightly-testcase-statistics

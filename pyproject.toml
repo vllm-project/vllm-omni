@@ -70,11 +70,11 @@ dev = [
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
     "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
-    "step-audio2==1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
+    "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
 demo = [
+    "gradio>=6.7.0",
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
@@ -93,6 +93,12 @@ local = [
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [
     "quack-kernels>=0.3.11",
+]
+
+# Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
+# the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
+fa4 = [
+    "flash-attn-4[cu13]==4.0.0b18",
 ]
 
 docs = [

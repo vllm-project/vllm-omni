@@ -10,12 +10,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
+    get_cfg_group as get_guidance_parallel_group,
 )
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank as get_guidance_parallel_rank,
+)
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size as get_guidance_parallel_world_size,
+)
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
@@ -109,10 +116,6 @@ class LTXGuidancePlan:
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(item.name for item in self.passes)
-
-    @property
-    def cfg_parallel_compatible(self) -> bool:
-        return self.names == ("cond", "uncond") and not self.spec.do_rescale
 
 
 def x0_from_velocity(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -212,23 +215,69 @@ class LTXGuidanceExecutor:
     """Build and execute official LTX multi-guidance Transformer passes."""
 
     @staticmethod
-    def validate_cfg_world_size(plan: LTXGuidancePlan, cfg_world_size: int) -> None:
-        if cfg_world_size == 1:
+    def validate_guidance_world_size(plan: LTXGuidancePlan, guidance_world_size: int) -> None:
+        del plan
+        if guidance_world_size < 1:
+            raise ValueError(f"LTX guidance parallelism requires a positive parallel size, got {guidance_world_size}.")
+
+    @staticmethod
+    def _parallel_assignments(pass_count: int, world_size: int) -> list[list[int]]:
+        assignments: list[list[int]] = [[] for _ in range(world_size)]
+        for pass_index in range(pass_count):
+            assignments[pass_index % world_size].append(pass_index)
+        return assignments
+
+    @classmethod
+    def _model_pass_count(
+        cls,
+        plan: LTXGuidancePlan,
+        guidance_parallel_ready: bool,
+        guidance_world_size: int,
+    ) -> int:
+        if not guidance_parallel_ready:
+            return len(plan.passes)
+        assignments = cls._parallel_assignments(len(plan.passes), guidance_world_size)
+        return max(len(indices) for indices in assignments)
+
+    @classmethod
+    def warn_if_imbalanced(
+        cls,
+        plan: LTXGuidancePlan,
+        guidance_world_size: int,
+        phase_name: str,
+    ) -> None:
+        pass_count = len(plan.passes)
+        if guidance_world_size <= 1 or pass_count % guidance_world_size == 0 or get_guidance_parallel_rank() != 0:
             return
-        if cfg_world_size != 2:
-            raise ValueError(f"LTX CFG parallelism supports cfg_parallel_size 1 or 2, got {cfg_world_size}.")
-        if not plan.cfg_parallel_compatible:
-            raise ValueError("LTX CFG parallelism only supports CFG-only guidance without rescale.")
+        slots_per_rank = math.ceil(pass_count / guidance_world_size)
+        total_slots = slots_per_rank * guidance_world_size
+        wasted_slots = total_slots - pass_count
+        utilization = 100.0 * pass_count / total_slots
+        logger.warning_once(
+            "LTX guidance parallelism is imbalanced for phase %r: %d guidance passes across %d ranks. "
+            "%d padded/discarded rank slot(s); expected guidance-slot utilization is %.1f%%.",
+            phase_name,
+            pass_count,
+            guidance_world_size,
+            wasted_slots,
+            utilization,
+        )
 
     @staticmethod
     def prepare_denoise_context(
         plan: LTXGuidancePlan,
-        cfg_parallel_ready: bool,
+        guidance_parallel_ready: bool,
+        guidance_world_size: int,
         denoise_ctx: LTXDenoiseContext,
     ) -> LTXDenoiseContext:
-        if len(plan.passes) > 1 and not cfg_parallel_ready:
-            denoise_ctx.video_coords = _repeat_batch(denoise_ctx.video_coords, len(plan.passes))
-            denoise_ctx.audio_coords = _repeat_batch(denoise_ctx.audio_coords, len(plan.passes))
+        model_pass_count = LTXGuidanceExecutor._model_pass_count(
+            plan,
+            guidance_parallel_ready,
+            guidance_world_size,
+        )
+        if model_pass_count > 1:
+            denoise_ctx.video_coords = _repeat_batch(denoise_ctx.video_coords, model_pass_count)
+            denoise_ctx.audio_coords = _repeat_batch(denoise_ctx.audio_coords, model_pass_count)
         return denoise_ctx
 
     @staticmethod
@@ -265,7 +314,30 @@ class LTXGuidanceExecutor:
         )
         return velocity_from_x0(sample, guided_x0, sigma)
 
-    def predict_parallel_cfg(
+    @staticmethod
+    def _guide_modality(
+        sample: torch.Tensor,
+        splits: dict[str, torch.Tensor],
+        sigma: torch.Tensor,
+        guidance: LTXModalityGuidance,
+        *,
+        model_sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        model_sigma = sigma if model_sigma is None else model_sigma
+        # Official guidance reduces contiguous BSC tensors. The fused
+        # transformer output may be channel-major after splitting, which
+        # changes fp32 reduction order and can cross bf16 rounding bounds.
+        x0 = {name: x0_from_velocity(sample, value, model_sigma).contiguous() for name, value in splits.items()}
+        guided = combine_guided_x0(
+            cond=x0["cond"],
+            uncond_text=x0.get("uncond", 0.0),
+            uncond_perturbed=x0.get("ptb", 0.0),
+            uncond_modality=x0.get("mod", 0.0),
+            guidance=guidance,
+        )
+        return velocity_from_x0(sample, guided, sigma)
+
+    def predict_parallel_guidance(
         self,
         pipeline: Any,
         plan: LTXGuidancePlan,
@@ -275,54 +347,93 @@ class LTXGuidanceExecutor:
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.validate_cfg_world_size(plan, get_classifier_free_guidance_world_size())
+        guidance_world_size = get_guidance_parallel_world_size()
+        self.validate_guidance_world_size(plan, guidance_world_size)
+        guidance_rank = get_guidance_parallel_rank()
+        assignments = self._parallel_assignments(len(plan.passes), guidance_world_size)
+        local_pass_indices = assignments[guidance_rank]
+        model_pass_count = max(len(indices) for indices in assignments)
+
+        # Every rank executes and gathers the same number of slots. Shorter
+        # assignments use a conditional pass whose output is discarded.
+        padded_pass_indices: list[int | None] = local_pass_indices + [None] * (
+            model_pass_count - len(local_pass_indices)
+        )
+        local_passes = tuple(
+            plan.passes[0] if pass_index is None else plan.passes[pass_index] for pass_index in padded_pass_indices
+        )
+        local_plan = LTXGuidancePlan(spec=plan.spec, passes=local_passes)
+
         prompt = forward_ctx.prompt_context
-        negative = get_classifier_free_guidance_rank() == 1
-        video_context = (
-            prompt.negative_connector_prompt_embeds
-            if negative and plan.spec.video.do_cfg
-            else prompt.positive_connector_prompt_embeds
+        video_contexts: list[torch.Tensor] = []
+        audio_contexts: list[torch.Tensor] = []
+        for denoise_pass in local_passes:
+            video_context = (
+                prompt.negative_connector_prompt_embeds
+                if denoise_pass.negative_video_context
+                else prompt.positive_connector_prompt_embeds
+            )
+            audio_context = (
+                prompt.negative_connector_audio_prompt_embeds
+                if denoise_pass.negative_audio_context
+                else prompt.positive_connector_audio_prompt_embeds
+            )
+            if video_context is None or audio_context is None:
+                raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
+            video_contexts.append(video_context)
+            audio_contexts.append(audio_context)
+
+        video_input = _repeat_batch(state.video, model_pass_count).to(prompt.positive_connector_prompt_embeds.dtype)
+        audio_input = _repeat_batch(state.audio, model_pass_count).to(
+            prompt.positive_connector_audio_prompt_embeds.dtype
         )
-        audio_context = (
-            prompt.negative_connector_audio_prompt_embeds
-            if negative and plan.spec.audio.do_cfg
-            else prompt.positive_connector_audio_prompt_embeds
-        )
-        if video_context is None or audio_context is None:
-            raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
-        video_input = state.video.to(prompt.positive_connector_prompt_embeds.dtype)
-        audio_input = state.audio.to(prompt.positive_connector_audio_prompt_embeds.dtype)
+        attention_kwargs = dict(forward_ctx.attention_kwargs or {})
+        perturbations = build_perturbation_kwargs(local_plan, state.video.shape[0], video_input)
+        if perturbations:
+            attention_kwargs["ltx_perturbation_kwargs"] = perturbations
         kwargs = pipeline._build_transformer_kwargs(
             forward_ctx,
             denoise_ctx,
             hidden_states=video_input,
             audio_hidden_states=audio_input,
-            encoder_hidden_states=video_context,
-            audio_encoder_hidden_states=audio_context,
+            encoder_hidden_states=torch.cat(video_contexts),
+            audio_encoder_hidden_states=torch.cat(audio_contexts),
             encoder_attention_mask=None,
             audio_encoder_attention_mask=None,
             ts=timestep.expand(video_input.shape[0]),
+            attention_kwargs=attention_kwargs,
         )
-        local_video, local_audio = pipeline.predict_noise(**kwargs)
-        group = get_cfg_group()
-        video = group.all_gather(local_video, separate_tensors=True)
-        audio = group.all_gather(local_audio, separate_tensors=True)
+        with pipeline._transformer_cache_context("guided"):
+            local_video, local_audio = pipeline.transformer(**kwargs)
+        local_video_slots = local_video.chunk(model_pass_count)
+        local_audio_slots = local_audio.chunk(model_pass_count)
+
+        group = get_guidance_parallel_group()
+        gathered_video_slots = [group.all_gather(value, separate_tensors=True) for value in local_video_slots]
+        gathered_audio_slots = [group.all_gather(value, separate_tensors=True) for value in local_audio_slots]
+
+        video_splits: dict[str, torch.Tensor] = {}
+        audio_splits: dict[str, torch.Tensor] = {}
+        for pass_index, denoise_pass in enumerate(plan.passes):
+            owner_rank = pass_index % guidance_world_size
+            slot_index = pass_index // guidance_world_size
+            video_splits[denoise_pass.name] = gathered_video_slots[slot_index][owner_rank]
+            audio_splits[denoise_pass.name] = gathered_audio_slots[slot_index][owner_rank]
+
         video_sigma = pipeline.scheduler.sigmas[index]
         return (
-            self.combine_cfg_velocity(
+            self._guide_modality(
                 state.video,
-                video[0],
-                video[1],
+                video_splits,
                 video_sigma,
-                plan.spec.video.cfg_scale,
+                plan.spec.video,
                 model_sigma=pipeline._video_guidance_model_sigma(video_sigma, denoise_ctx),
             ),
-            self.combine_cfg_velocity(
+            self._guide_modality(
                 state.audio,
-                audio[0],
-                audio[1],
+                audio_splits,
                 forward_ctx.audio_scheduler.sigmas[index],
-                plan.spec.audio.cfg_scale,
+                plan.spec.audio,
             ),
         )
 
@@ -336,8 +447,8 @@ class LTXGuidanceExecutor:
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if forward_ctx.cfg_parallel_ready:
-            return self.predict_parallel_cfg(pipeline, plan, index, timestep, state, forward_ctx, denoise_ctx)
+        if forward_ctx.guidance_parallel_ready:
+            return self.predict_parallel_guidance(pipeline, plan, index, timestep, state, forward_ctx, denoise_ctx)
 
         prompt = forward_ctx.prompt_context
         video_contexts: list[torch.Tensor] = []
@@ -382,30 +493,8 @@ class LTXGuidanceExecutor:
         video_splits = dict(zip(plan.names, video_velocity.chunk(pass_count), strict=True))
         audio_splits = dict(zip(plan.names, audio_velocity.chunk(pass_count), strict=True))
 
-        def guide_modality(
-            sample: torch.Tensor,
-            splits: dict[str, torch.Tensor],
-            sigma: torch.Tensor,
-            guidance: LTXModalityGuidance,
-            *,
-            model_sigma: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            model_sigma = sigma if model_sigma is None else model_sigma
-            # Official guidance reduces contiguous BSC tensors. The fused
-            # transformer output may be channel-major after splitting, which
-            # changes fp32 reduction order and can cross bf16 rounding bounds.
-            x0 = {name: x0_from_velocity(sample, value, model_sigma).contiguous() for name, value in splits.items()}
-            guided = combine_guided_x0(
-                cond=x0["cond"],
-                uncond_text=x0.get("uncond", 0.0),
-                uncond_perturbed=x0.get("ptb", 0.0),
-                uncond_modality=x0.get("mod", 0.0),
-                guidance=guidance,
-            )
-            return velocity_from_x0(sample, guided, sigma)
-
         return (
-            guide_modality(
+            self._guide_modality(
                 state.video,
                 video_splits,
                 pipeline.scheduler.sigmas[index],
@@ -415,7 +504,7 @@ class LTXGuidanceExecutor:
                     denoise_ctx,
                 ),
             ),
-            guide_modality(
+            self._guide_modality(
                 state.audio,
                 audio_splits,
                 forward_ctx.audio_scheduler.sigmas[index],

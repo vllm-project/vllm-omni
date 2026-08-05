@@ -25,7 +25,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    get_stage_connector_role,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -44,6 +47,19 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _should_create_payload_connector(model_config: Any) -> bool:
+    """Whether this stage owns runner payload transport for its edge.
+
+    Sender edges may instead be owned solely by KV transfer. Receivers still
+    need a connector even though they do not declare a downstream payload hook.
+    """
+    if get_stage_connector_role(model_config) != "sender":
+        return True
+
+    next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+    return isinstance(next_stage_func, str) and bool(next_stage_func)
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -96,7 +112,9 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        self._omni_connector: OmniConnectorBase | None = (
+            self._create_connector(model_config) if _should_create_payload_connector(model_config) else None
+        )
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -122,6 +140,19 @@ class OmniConnectorModelRunnerMixin:
 
         # -- heterogeneous TP rank support --
         rank_cfg = self._parse_rank_mapping(model_config)
+        if self._kv_transfer_manager is not None:
+            topology = getattr(self._kv_transfer_manager, "tp_topology", None)
+            effective_mapping = (
+                getattr(topology, "source_tp_size", None),
+                getattr(topology, "target_tp_size", None),
+                getattr(topology, "local_rank", None),
+            )
+            if all(isinstance(value, int) for value in effective_mapping):
+                rank_cfg = {
+                    "from_tp": effective_mapping[0],
+                    "to_tp": effective_mapping[1],
+                    "local_rank": effective_mapping[2],
+                }
         self._from_tp: int = rank_cfg["from_tp"]
         self._to_tp: int = rank_cfg["to_tp"]
         self._local_rank: int = rank_cfg["local_rank"]
@@ -1275,6 +1306,10 @@ class OmniConnectorModelRunnerMixin:
         For heterogeneous TP receive, the local rank is the target rank and must
         fetch one or more source-rank shards keyed as ``from_rank -> to_rank``.
         """
+        if self._from_tp <= 1 and self._to_tp <= 1:
+            resolved_to_stage = self._next_stage_id if to_stage is None else to_stage
+            return [f"omni_{from_stage}_to_{resolved_to_stage}_kv_cache_{req_id}"]
+
         remote_ranks = self.get_kv_remote_ranks()
         return [
             self.get_kv_connector_key(
@@ -1307,6 +1342,10 @@ class OmniConnectorModelRunnerMixin:
         chunk_id: int = 0,
     ) -> list[str]:
         """Build send-side connector keys for this rank's KV shard(s)."""
+        if self._from_tp <= 1 and self._to_tp <= 1:
+            resolved_to_stage = self._next_stage_id if to_stage is None else to_stage
+            return [f"omni_{from_stage}_to_{resolved_to_stage}_kv_cache_{req_id}"]
+
         target_ranks = self.get_kv_target_ranks_for_send()
         return [
             self.get_kv_connector_key(

@@ -47,6 +47,44 @@ def test_skip_config_pure_resolution():
     assert cfg.resolve_factor(4096, timestep=None) == pytest.approx(0.01 * 4096)
 
 
+def test_quant_config_from_backend_kwargs():
+    from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
+
+    assert not QuantConfig.from_backend_kwargs(None).enabled
+    assert not QuantConfig.from_backend_kwargs({}).enabled
+    assert QuantConfig.from_backend_kwargs({"quant": {"dtype_qk": "fp8_e4m3"}}) == QuantConfig("fp8_e4m3", 1, 16)
+    qc = QuantConfig.from_backend_kwargs({"quant": {"dtype_qk": "int8", "q_block_size": 4, "k_block_size": 16}})
+    assert qc.enabled and (qc.dtype_qk, qc.q_block_size, qc.k_block_size) == ("int8", 4, 16)
+
+
+def test_quant_rejects_non_sage_dtype():
+    with pytest.raises(RuntimeError, match="supports dtype_qk"):
+        _impl(quant={"dtype_qk": "bfloat16"})
+
+
+def test_quant_quantize_requires_flashinfer_routine(monkeypatch):
+    import vllm_omni.diffusion.attention.backends.trtllm_attn as mod
+
+    monkeypatch.setattr(mod, "_sage_kernel_available", lambda: True)
+    monkeypatch.setattr(mod, "_sage_quantize_fn", lambda: None)
+    with pytest.raises(RuntimeError, match="trtllm_sage_attention_quantize"):
+        _impl(quant={"dtype_qk": "int8"})
+
+
+def test_quant_quantize_calls_routine_and_shapes_sfs():
+    from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
+
+    captured = {}
+
+    def fake_quantize(q, k, v, q_block_size, k_block_size, qk_quant_dtype):
+        captured.update(q_block_size=q_block_size, k_block_size=k_block_size, qk_quant_dtype=qk_quant_dtype)
+        return "qq", "kq", "vq", "qsfs", "ksfs", "vsfs"
+
+    q_q, k_q, v_q, sfs, blk = QuantConfig(dtype_qk="int8").quantize(object(), object(), object(), fake_quantize)
+    assert (q_q, k_q, v_q, sfs, blk) == ("qq", "kq", "vq", ("qsfs", "ksfs", None, "vsfs"), (1, 16, 0, 1))
+    assert captured == {"q_block_size": 1, "k_block_size": 16, "qk_quant_dtype": torch.int8}
+
+
 def test_skip_factor_none_without_curve():
     assert _impl(target_sparsity=0.5)._resolve_skip_factor(4096) is None
 
@@ -255,6 +293,32 @@ def test_bf16_dense_matches_sdpa():
     ref = _sdpa_ref(q, k, v, scale)
     rel = (out - ref).abs().mean() / ref.abs().mean()
     assert rel < 0.01, f"BF16 dense rel err {rel:.4f} too high"
+
+
+requires_sage = pytest.mark.skipif(
+    not (_has_trtllm_attn() and tg._sage_quantize_fn() is not None),
+    reason="requires Blackwell SM100+ GPU with flashinfer >= 0.6.16rc1 (trtllm_sage_attention_quantize)",
+)
+
+
+@requires_sage
+@pytest.mark.parametrize("dtype_qk", ["fp8_e4m3", "int8"])
+def test_sage_quant_matches_sdpa(dtype_qk):
+    torch.manual_seed(0)
+    B, S, H, D = 2, 256, 8, 128
+    scale = 1.0 / math.sqrt(D)
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    impl = _impl(quant={"dtype_qk": dtype_qk, "q_block_size": 1, "k_block_size": 16})
+    try:
+        out = impl.forward_cuda(q, k, v, None)
+    except RuntimeError as e:  # pragma: no cover - arch-dependent (int8 is SM100-only)
+        if "Missing TRTLLM-GEN kernel" in str(e):
+            pytest.skip(f"no trtllm-gen SAGE kernel for dtype_qk={dtype_qk} on this GPU arch")
+        raise
+    assert out.shape == (B, S, H, D) and torch.isfinite(out).all()
+    ref = _sdpa_ref(q, k, v, scale)
+    rel = (out.float() - ref).abs().mean() / ref.abs().mean()
+    assert rel < 0.1, f"SAGE({dtype_qk}) rel err {rel:.4f} too high"
 
 
 @requires_trtllm_attn

@@ -8,21 +8,25 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "Simple · Diffusion & Model Executor Test"
+      - label: "Simple · Model Executor Test"
         commands:
-          - "timeout 20m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Diffusion Test"
+        commands:
+          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Engine&Entrypoints Test"
+        commands:
+          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
         commands:
-          - "timeout 20m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         mirror_hardwares: l4_1
-
-  - label: "Custom Pipeline Test"
-    depends_on: upload-ready-pipeline
-    commands:
-      - timeout 20m pytest -s -v tests/e2e/offline_inference/custom_pipeline/ -m "core_model"
-    mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
@@ -104,11 +108,34 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-ready-pipeline
     steps:
+      - label: "Custom Pipeline Test"
+        source_file_dependencies:
+          - tests/e2e/features/custom_pipeline/
+          - tests/e2e/features/helpers/custom_pipeline.py
+          - vllm_omni/diffusion/
+          - vllm_omni/engine/
+          - vllm_omni/entrypoints/
+          - vllm_omni/inputs/
+          - vllm_omni/outputs/
+        commands:
+          - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "RLHF · VeRL-Omni E2E Test"
         source_file_dependencies:
-          - tests/e2e/offline_inference/rlhf_test/test_verl_omni_e2e.py
-          - tests/e2e/offline_inference/custom_pipeline/
+          - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+          - tests/e2e/features/helpers/verl_omni_server.py
+          - tests/e2e/features/helpers/custom_pipeline.py
           - vllm_omni/diffusion/
           - vllm_omni/engine/
           - vllm_omni/entrypoints/
@@ -117,7 +144,7 @@ steps:
         commands:
           - |
             timeout 20m bash -c "
-              pytest -s -v tests/e2e/offline_inference/rlhf_test/test_verl_omni_e2e.py
+              pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
             "
         mirror_hardwares: l4_1
 
@@ -143,34 +170,7 @@ steps:
             timeout 20m bash -c "
               pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
             "
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2
 
       - label: "Omni · MiniCPM-o 4.5 Online Test"
         source_file_dependencies:
@@ -181,34 +181,7 @@ steps:
             timeout 20m bash -c "
               pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
             "
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 2
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+        mirror_hardwares: h100_2
 
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies:
@@ -371,13 +344,3 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
-
-      - label: "Diffusion · GGUF Plugin Test"
-        soft_fail: true
-        source_file_dependencies:
-          - tests/plugin/test_gguf_diffusion.py
-          - vllm_omni/diffusion/model_loader
-        commands:
-          - pip install "vllm-gguf-plugin>=0.0.3"
-          - timeout 30m pytest -sv tests/plugin/test_gguf_diffusion.py
-        mirror_hardwares: l4_1

@@ -334,6 +334,7 @@ def main():
     is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
     is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
+    is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -347,7 +348,19 @@ def main():
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
-    if is_cosmos:
+    if is_cosmos_edge:
+        # Cosmos3-Edge native defaults: 480x832, gs 5.0, flow_shift 3.0 — NOT the Nano/Super
+        # 720p / gs 6.0 / flow_shift 10.0 below, which produce degenerate output on Edge.
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            5.0,
+            189,
+            35,
+            3.0,
+            480 * 832,
+            16,
+        )
+    elif is_cosmos:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             24,
             6.0,

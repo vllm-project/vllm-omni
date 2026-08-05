@@ -9,7 +9,9 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -91,7 +93,20 @@ def _make_pipeline() -> Wan22Pipeline:
     return pipeline
 
 
-def test_forward_delegates_denoising_to_diffuse() -> None:
+@pytest.mark.parametrize(
+    ("sampling_params_kwargs", "expected_low", "expected_high"),
+    [
+        ({}, 4.0, 4.0),
+        ({"guidance_scale": 0.0}, 0.0, 0.0),
+        ({"guidance_scale": 1.0}, 1.0, 1.0),
+        ({"guidance_scale": 3.0, "guidance_scale_2": 5.0}, 3.0, 5.0),
+    ],
+)
+def test_forward_delegates_denoising_to_diffuse(
+    sampling_params_kwargs: dict[str, float],
+    expected_low: float,
+    expected_high: float,
+) -> None:
     pipeline = _make_pipeline()
     captured: dict[str, object] = {}
 
@@ -101,25 +116,15 @@ def test_forward_delegates_denoising_to_diffuse() -> None:
 
     pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
 
-    mock_req = SimpleNamespace(
+    mock_req = OmniDiffusionRequest(
         prompt="prompt",
         request_id="test-req",
-        sampling_params=SimpleNamespace(
-            height=None,
-            width=None,
+        sampling_params=OmniDiffusionSamplingParams(
             num_frames=1,
             num_inference_steps=2,
-            guidance_scale_provided=True,
-            guidance_scale=1.0,
-            guidance_scale_2=None,
-            boundary_ratio=None,
-            generator=None,
-            seed=None,
-            num_outputs_per_prompt=1,
             max_sequence_length=32,
-            latents=None,
             output_type="latent",
-            extra_args={},
+            **sampling_params_kwargs,
         ),
     )
     batch = DiffusionRequestBatch(requests=[mock_req])
@@ -129,8 +134,8 @@ def test_forward_delegates_denoising_to_diffuse() -> None:
     assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
     assert torch.equal(captured["prompt_embeds"], torch.zeros(1, 32, 8))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
-    assert captured["guidance_low"] == 1.0
-    assert captured["guidance_high"] == 1.0
+    assert captured["guidance_low"] == expected_low
+    assert captured["guidance_high"] == expected_high
     assert captured["boundary_timestep"] == pytest.approx(875.0)
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None

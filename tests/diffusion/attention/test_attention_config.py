@@ -52,6 +52,44 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the TRTLLM_ATTN"):
             AttentionSpec(backend="TORCH_SDPA", skip_softmax={"target_sparsity": 0.5})
 
+    def test_quant_serialized_with_defaults_and_overrides(self):
+        assert AttentionSpec(backend="TRTLLM_ATTN", quant={"dtype_qk": "fp8_e4m3"}).backend_kwargs()["quant"] == {
+            "dtype_qk": "fp8_e4m3",
+            "q_block_size": 1,
+            "k_block_size": 16,
+        }
+        assert AttentionSpec(
+            backend="TRTLLM_ATTN", quant={"dtype_qk": "int8", "q_block_size": 4, "k_block_size": 16}
+        ).backend_kwargs()["quant"] == {"dtype_qk": "int8", "q_block_size": 4, "k_block_size": 16}
+
+    def test_quant_superset_fields_passed_through(self):
+        # FLASHINFER_ATTN-style config (dtype_vo / flashinfer_backend) round-trips on the shared spec.
+        bk = AttentionSpec(
+            backend="FLASHINFER_ATTN",
+            quant={"dtype_qk": "bfloat16", "dtype_vo": "fp8_e4m3", "flashinfer_backend": "trtllm-gen"},
+        ).backend_kwargs()["quant"]
+        assert bk["dtype_qk"] == "bfloat16"
+        assert bk["dtype_vo"] == "fp8_e4m3"
+        assert bk["flashinfer_backend"] == "trtllm-gen"
+
+    def test_quant_and_skip_softmax_coexist(self):
+        bk = AttentionSpec(
+            backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
+        ).backend_kwargs()
+        assert bk["target_sparsity"] == 0.5 and bk["quant"]["dtype_qk"] == "int8"
+
+    @pytest.mark.parametrize(
+        "spec, match",
+        [
+            ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "only supported by the TRTLLM_ATTN"),
+            ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int4"}}, "quant.dtype_qk"),
+            ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8", "k_block_size": 8}}, "quant.k_block_size"),
+        ],
+    )
+    def test_quant_validation_rejects(self, spec, match):
+        with pytest.raises(ValueError, match=match):
+            AttentionSpec(**spec)
+
 
 class TestAttentionConfig:
     def test_empty_config(self):
@@ -287,6 +325,13 @@ class TestBuildAttentionConfig:
 
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_diffusion_attention_backend_env(self, monkeypatch):
+        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
+        # build_attention_config(); clear it so these tests assert config defaults,
+        # not whatever the process inherited from CI / sibling tests.
+        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")

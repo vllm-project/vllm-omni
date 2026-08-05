@@ -100,6 +100,16 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         torch.xpu.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.xpu.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record XPU device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.xpu.mem_get_info(device)
         return free
