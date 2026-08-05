@@ -1,23 +1,8 @@
-from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next import (
-    LongcatNextForCausalLM,
-)
-from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next_image_decoder import (
-    LongcatNextImageDecoder,
-)
-from vllm_omni.model_executor.models.longcat_next.modeling_longcat_next_audio_decoder import (
-    LongcatNextAudioDecoder,
-)
-from vllm_omni.model_executor.models.longcat_next.pipeline import (
-    LONGCAT_NEXT_PIPELINE,
-    LONGCAT_NEXT_THINKER_AUDIO_PIPELINE,
-    LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
-)
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-__all__ = [
-    "LongcatNextForCausalLM",
-    "LongcatNextImageDecoder",
-    "LongcatNextAudioDecoder",
-    "LONGCAT_NEXT_PIPELINE",
-    "LONGCAT_NEXT_THINKER_AUDIO_PIPELINE",
-    "LONGCAT_NEXT_THINKER_ONLY_PIPELINE",
-]
+# NOTE: Do not import model classes in this file. Importing any
+# submodule in this package triggers __init__.py execution, and
+# both the model registry and pipeline registry import submodules
+# directly — heavy imports here would be loaded as a side effect
+# even though nothing depends on these re-exports.
