@@ -1402,6 +1402,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stop_reason_emitted: list[bool] = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        num_cache_creation_tokens = None
         if self.use_harmony:
             harmony_parsers = [get_streamable_parser_for_assistant() for _ in range(num_choices)]
             harmony_tools_streamed = [False] * num_choices
@@ -1498,6 +1499,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
                     num_cached_tokens = res.num_cached_tokens
+                    num_cache_creation_tokens = res.num_cache_creation_tokens
                     # Send first response for each choice with role
                     # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
@@ -2232,6 +2234,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_usage.prompt_tokens_details = _make_prompt_tokens_details(
                     self.enable_prompt_tokens_details,
                     num_cached_tokens,
+                    num_cache_creation_tokens,
                     mm_token_counts,
                 )
 
@@ -2702,6 +2705,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         usage.prompt_tokens_details = _make_prompt_tokens_details(
             self.enable_prompt_tokens_details,
             final_res.num_cached_tokens,
+            final_res.num_cache_creation_tokens,
             mm_token_counts,
         )
 
