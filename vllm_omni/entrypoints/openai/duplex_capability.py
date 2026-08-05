@@ -10,8 +10,11 @@ def should_enable_duplex_endpoint(
     stage_configs: list | None,
     *,
     config_path: str | None = None,
+    engine_client: object | None = None,
 ) -> bool:
-    """Enable duplex routes only for deployments that explicitly opt in."""
+    """Enable duplex routes when the pipeline or deploy config declares duplex support."""
+    if getattr(engine_client, "duplex_serving_adapter_path", None):
+        return True
     if stage_configs:
         for stage in stage_configs:
             session_mode = (

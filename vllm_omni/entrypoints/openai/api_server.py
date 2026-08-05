@@ -1118,6 +1118,7 @@ async def omni_init_app_state(
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
         config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+        engine_client=engine_client,
     ):
         from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
 
