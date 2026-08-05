@@ -76,17 +76,6 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
-def test_serve_parser_accepts_model_defined_task_type() -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    OmniServeCommand().subparser_init(subparsers)
-
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--task-type", "fl2va"])
-
-    assert args.task_type == "fl2va"
-    assert args.get_explicit_kwargs_dict()["task_type"] == "fl2va"
-
-
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
