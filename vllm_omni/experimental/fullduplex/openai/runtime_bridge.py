@@ -1015,21 +1015,32 @@ class NativeRuntimeBridgeMixin:
             text_chars=mark_text_chars if mark_duration_ms is not None else None,
             audio_text_marks=audio_text_marks,
         )
-        payload = {
-            "type": "response.output_audio.delta",
-            "session_id": session.session_id,
-            "response_id": response_id,
-            "epoch": session.epoch,
-            "text": text if isinstance(text, str) else "",
-            "audio": audio if isinstance(audio, str) else "",
-            "format": (
-                native_result.get("audio_format")
-                if isinstance(native_result.get("audio_format"), str)
-                else session.response_config.response_format
-            ),
-            "end_of_turn": end_of_turn,
-            "model_speak": True,
-        }
+        is_text_only = has_text and not has_audio and native_result.get("stage_role") != "tts"
+        if is_text_only:
+            payload = {
+                "type": "response.output_text.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "text": text,
+                "end_of_turn": end_of_turn,
+            }
+        else:
+            payload = {
+                "type": "response.output_audio.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "text": text if isinstance(text, str) else "",
+                "audio": audio if isinstance(audio, str) else "",
+                "format": (
+                    native_result.get("audio_format")
+                    if isinstance(native_result.get("audio_format"), str)
+                    else session.response_config.response_format
+                ),
+                "end_of_turn": end_of_turn,
+                "model_speak": True,
+            }
         if mark_duration_ms is not None:
             payload["audio_duration_ms"] = mark_duration_ms
         if audio_text_marks:

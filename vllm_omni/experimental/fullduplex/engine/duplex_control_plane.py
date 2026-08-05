@@ -262,7 +262,9 @@ class DuplexControlPlane:
             session_id=session.session_id,
             fence=effective_fence,
             stage_id=stage_id,
-            final_stage_id=self._stage_port.stage_count - 1,
+            final_stage_id=self._stage_port.compute_final_stage_id(
+                session.session_config.get("modalities"),
+            ),
             config_generation=session.config_generation,
             sampling_params=tuple(self.sampling_params_for_config(session.runtime_config)),
             session_config=session.session_config,

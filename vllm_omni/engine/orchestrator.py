@@ -253,6 +253,16 @@ class _OrchestratorDuplexStagePort:
         except Exception:
             return None
 
+    def compute_final_stage_id(self, modalities: list[str] | None) -> int:
+        last = len(self._stage_pools) - 1
+        if not modalities:
+            return last
+        for sid in range(last, -1, -1):
+            pool = self._stage_pools[sid]
+            if pool.final_output and getattr(pool.stage_client, "final_output_type", None) in modalities:
+                return sid
+        return last
+
     @staticmethod
     def _sync_bridge_state(
         request_state: OrchestratorRequestState,
