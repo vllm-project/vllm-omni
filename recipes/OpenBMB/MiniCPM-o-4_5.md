@@ -31,9 +31,7 @@ also provided.
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
   - Recommended 2-GPU continuous-batching layout:
-    [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
-  - 2-GPU and 3-GPU layouts:
-    [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
+    [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
   - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
@@ -69,8 +67,8 @@ Code2Wav consumes them through a shared-memory async connector.
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
 request-local codec generation and Code2Wav owns waveform state and
 reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
-single-GPU entry point; `minicpmo_4_5_batching.yaml` is the recommended
-two-GPU profile. The removed fused two-stage implementation is not retained as
+single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
+two-GPU continuous-batching profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
 
 ## GPU
@@ -80,9 +78,9 @@ a fallback because it would duplicate state machines and correctness paths.
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
-`gpu_memory_utilization` budgets are 0.55, 0.22, and 0.22. All stages admit
-up to four sequences. Startup video profiling is bounded to 32 frames per
-video. Use the two-GPU profile for production throughput.
+`gpu_memory_utilization` budgets are 0.55, 0.15, and 0.18 so concurrent
+Code2Wav activations keep residual headroom. All stages admit up to four
+sequences. Use the two-GPU profile for production throughput.
 
 #### Environment
 
@@ -106,7 +104,7 @@ The deploy config is auto-loaded by the model registry — no
 For the recommended two-GPU layout, add:
 
 ```bash
---deploy-config vllm_omni/deploy/minicpmo_4_5_batching.yaml
+--deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
 
 #### Performance comparison
@@ -205,8 +203,8 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.22, and
-  0.22 of GPU 0. The larger Thinker share protects its multimodal KV cache;
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.15, and
+  0.18 of GPU 0 so concurrent Code2Wav activations keep residual headroom;
   all three model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
@@ -217,14 +215,13 @@ speech output (TTS)"** checkbox on / off.
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
   exact-shape-compatible chunks and does not fall back to serial decode.
-- `limit_mm_per_prompt.video.num_frames: 32` bounds startup dummy profiling,
-  not runtime media decoding. Use `media_io_kwargs.video.num_frames` when a
-  matching URL/file video sampling limit is required.
+- Stage 0 pins `interleave_mm_strings=true` and
+  `media_io_kwargs.video={fps:1,num_frames:128}` for Daily-Omni MiniCPM packs.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1
   CUDA Graph replay and eager Stage 2 vocoder kernels compete across three
-  CUDA contexts. Use the 8x4090 config or a custom multi-GPU mapping for
+  CUDA contexts. Use `minicpmo_4_5_2gpu.yaml` or a custom multi-GPU mapping for
   throughput-sensitive serving.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)

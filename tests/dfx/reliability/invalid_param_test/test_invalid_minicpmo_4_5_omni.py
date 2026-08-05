@@ -14,7 +14,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni, pytest.mark.full_model]
 
-_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
+_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
 
 _MINICPMO_SERVER = [
     pytest.param(

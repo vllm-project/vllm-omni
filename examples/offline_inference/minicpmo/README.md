@@ -1,8 +1,9 @@
 # MiniCPM-o 4.5: Offline inference
 
-Two-stage pipeline: **thinker** (multimodal understanding) → **talker + Token2Wav**
+Three-stage pipeline: **Thinker** → **Talker** (codec) → **Code2Wav**
 (24 kHz speech). Deploy config auto-loads from
-`vllm_omni/deploy/minicpmo_4_5.yaml` (2-GPU default).
+`vllm_omni/deploy/minicpmo_4_5.yaml` (single-GPU default). For higher
+throughput, pass `--deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`.
 
 ## Setup
 
@@ -72,7 +73,7 @@ Supported `--query-type` values:
 
 ```bash
 python end2end.py --query-type text \
-    --deploy-config /path/to/vllm_omni/deploy/minicpmo_4_5_8x4090.yaml
+    --deploy-config /path/to/vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
 
 ## Notes
@@ -83,7 +84,8 @@ python end2end.py --query-type text \
 - Output WAV is **24 kHz mono**.
 - Placeholders in the prompt are MiniCPM-style:
   `(<image>./</image>)`, `(<audio>./</audio>)`, `(<video>./</video>)`.
-- Default layout needs **2 GPUs**. Async chunking is off in the bundled YAMLs.
+- Default layout needs **1 GPU**. Use `minicpmo_4_5_2gpu.yaml` for the
+  recommended two-GPU continuous-batching layout.
 
 ## Online serving
 
