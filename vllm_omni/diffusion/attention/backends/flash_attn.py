@@ -397,15 +397,25 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        # Optional varlen fast path (VLLM_OMNI_NPU_FIA_VARLEN=1); falls back
-        # to fused_attn_score when metadata or the varlen contract is absent.
-        if ENABLE_NPU_FIA_VARLEN and attn_metadata is not None and attn_metadata.extra:
+        # Optional varlen fast path (VLLM_OMNI_NPU_FIA_VARLEN=1). Only for
+        # non-causal attention with a trivial/absent mask: a 2D row-level mask
+        # (e.g. H3's alignment-padding prefix) is redundant with cu_seqlens and
+        # safe to drop, but a causal or 3D/4D-masked NPU model must not
+        # silently lose its mask. Falls back to fused_attn_score otherwise.
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        if (
+            ENABLE_NPU_FIA_VARLEN
+            and not self.causal
+            and (attention_mask is None or attention_mask.dim() == 2)
+            and attn_metadata is not None
+            and attn_metadata.extra
+        ):
             cu_q = attn_metadata.extra.get("cu_seqlens_q")
             cu_k = attn_metadata.extra.get("cu_seqlens_k")
             if cu_q is not None and cu_k is not None:
-                v3_out = self._forward_fa_varlen_npu(query, key, value, cu_q, cu_k)
-                if v3_out is not None:
-                    return v3_out
+                out = self._forward_fa_varlen_npu(query, key, value, cu_q, cu_k)
+                if out is not None:
+                    return out
 
         try:
             from mindiesd import attention_forward
@@ -416,7 +426,6 @@ class FlashAttentionImpl(AttentionImpl):
                 "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
 
         # NPU aclnnFlashAttentionScore requires mask shape to be one of:
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
@@ -449,19 +458,20 @@ class FlashAttentionImpl(AttentionImpl):
         op's ``actual_seq_lengths``; torch_npu accepts device int32 tensors
         there. Returns None to fall back on contract mismatch.
         """
-        if query.dim() != 4 or len(cu_seqlens_q) < 2 or len(cu_seqlens_kv) < 2:
+        if query.dim() != 4 or key.dim() != 4 or len(cu_seqlens_q) < 2 or len(cu_seqlens_kv) < 2:
             return None
         B, S, N, D = query.shape
+        kv_heads = key.shape[2]
 
         q = query.reshape(-1, N, D)
-        k = key.reshape(key.shape[0] * key.shape[1], N, D)
-        v = value.reshape(value.shape[0] * value.shape[1], N, D)
+        k = key.reshape(key.shape[0] * key.shape[1], kv_heads, D)
+        v = value.reshape(value.shape[0] * value.shape[1], kv_heads, D)
         out = torch.ops.npu.npu_fused_infer_attention_score(
             q,
             k,
             v,
             num_heads=N,
-            num_key_value_heads=N,
+            num_key_value_heads=kv_heads,
             scale=self.softmax_scale,
             input_layout="TND",
             actual_seq_lengths=cu_seqlens_q,
