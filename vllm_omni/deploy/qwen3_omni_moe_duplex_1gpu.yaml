@@ -8,6 +8,7 @@ stages:
   - stage_id: 0
     devices: "0"
     gpu_memory_utilization: 0.7
+    max_model_len: 32768
   - stage_id: 1
     devices: "0"
     gpu_memory_utilization: 0.15
