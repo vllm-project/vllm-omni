@@ -20,11 +20,13 @@ def _trace_calls(frame, event, arg):
     if event == "call":
         co = frame.f_code
         if "vllm" in co.co_filename and "<" not in co.co_name:
-            _sys.stderr.write(f"[trace pid={_os.getpid()}] {co.co_filename}:{co.co_firstlineno} {co.co_name}\n")
+            _trace_log.write(f"[trace pid={_os.getpid()}] {co.co_filename}:{co.co_firstlineno} {co.co_name}\n")
+            _trace_log.flush()
     return _trace_calls
 
 
 if _os.environ.get("VLLM_OMNI_TRACE"):
+    _trace_log = open("/tmp/server-calls.log", "a")  # noqa: SIM115
     _sys.settrace(_trace_calls)
 
 # We import version early, because it will warn if vLLM / vLLM Omni
