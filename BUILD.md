@@ -307,23 +307,16 @@ even are. Divergence must accrue across layers, not live in one place at the
 head. So the bisect target is the per-layer residual-stream RMS curve, not
 a head-level scalar.
 
-**In progress (commit `9d523742`)**: forward hooks on every `FlashDecoderLayer`
-record `RMS(hidden_out)` per step; `[longcat-layers]` prints the full
-post-every-layer RMS curve for the same decode step the logits are dumped
-for. Reference-side equivalent (register a forward hook per
-`model.model.layers[i]`, record `hidden.float().pow(2).mean().sqrt()`) is
-written but **not yet run** — the pod was preempted (`EXITED`, community
-cloud) before this comparison could execute. Interpretation once both curves
-exist:
-- Curves split at layer 0 → upstream of the backbone (embedding / n-gram
-  input scale / RoPE feature scale). Since n-gram and weights are already
-  confirmed clean, this would point at embedding scale or rotary application.
-- Curves track then diverge at layer N → localized bug at that layer
-  (attention output-proj or norm); diff that layer's sub-outputs next.
-- Curves match all the way through → compression is purely at the final
-  norm + head (RMSNorm eps, `ParallelLMHead` bias/scale). This is the only
-  scenario consistent with a head-only fix, and it's the least likely given
-  the re-ranking observed in the logits.
+**ROOT-CAUSED AND FIXED — see §11.** The per-layer RMS bisect (forward hooks
+on every `FlashDecoderLayer`, `[longcat-layers]`) found the port's curve
+already ~10x too large at layer 0 and shaped completely differently from the
+reference's (reference climbs smoothly 0.54→10.2 across layers, port starts
+at 5.6 and crashes to a 0.5-0.9 plateau) — pointing well upstream of any
+per-layer attention/MoE bug. Root cause: the MLA LoRA input scale
+(`mla_scale_q_lora`/`mla_scale_kv_lora`) was never actually reaching the real
+checkpoint weights (§11). Fixed in commit (this session, vllm-omni only, no
+vLLM changes) — post-fix top-10 is a 9/10 exact match against the reference
+with matching rank order (§11).
 
 ### Audio
 
@@ -354,13 +347,17 @@ exist:
   of a `-1` discard row, so `_split_chunks` can actually see the boundary.
 
 **Current state**: mechanically clean — `verdict: PASS`, 89 rounds, 1433
-kept frames, decodes without crashing. **Not yet root-caused**: 108.6s of
-audio for a ~5s sentence ("明天的meeting在三楼的Conference Room举行"). The
-model re-enters `<longcat_audiogen_start>` far more than expected instead of
-speaking the sentence once and stopping — a segment-level repetition loop,
-not a token-level one. Deprioritized in favor of the text/image leads since
-those looked more tractable; the text logit-divergence investigation may
-turn out to be the same root cause (see image section below).
+kept frames, decodes without crashing. The 108.6s-for-a-5s-sentence
+repetition-loop symptom, and a separate `RPC call to sample_tokens timed
+out` / `EngineDeadError` hang seen later in this session, both stopped
+reproducing once the MLA scale bug (§11) was fixed — a full English-prompt
+re-run post-fix produced a correctly-timed 5.58s clip for a comparable
+sentence with no hang. Consistent with the same shared upstream cause as
+Text/Image: garbage backbone hidden states driving the autoregressive
+audio-code sampling into a self-reinforcing loop (or, in the timeout case,
+some downstream numerical state that never resolved). Not independently
+root-caused beyond that — if it resurfaces, re-check with `LONGCAT_AUDIO_DEBUG=1`
+before assuming it's a new bug.
 
 ### Image
 
@@ -410,16 +407,19 @@ failure mode, distinct from the continuous-diffusion CFG intuition. Fix:
 `1.0`); testing with `1.5` broke the frozen-argmax pattern (verified: argmax
 now varies step to step) and produced a structured, non-grey image.
 
-**Still open — prompt adherence**: with the collapse fixed, the image is
-coherent and structured but doesn't match the prompt ("请生成一张图片，内容是
-一只猫" / "generate a picture of a cat" → user-reported result: "a painting
-with flowers and stuff", no cat). Same *shape* of symptom as the text
+**FIXED — was the same shared upstream cause.** With the MLA scale bug (§11)
+fixed, a re-run of "please generate a picture of a cat sitting in a garden"
+produced correct, on-prompt image content (previously: unrelated content —
+one run described as "a bed and some fingers and some other random stuff").
+Confirms the hypothesis below: prompt adherence was never an image-decoder
+or CFG-specific bug, it was the thinker backbone producing near-garbage
+conditioning for every downstream decoder.
+
+(Original note, kept for context): same *shape* of symptom as the text
 finding above (coherent but generic/off-target), and the `cond`/`uncond`
 logit delta being small in the first place (weak differentiation from the
-prompt) is consistent with the same shared upstream cause suspected for
-text — likely the same backbone-level divergence the per-layer RMS bisect
-(see Text section) is chasing. Not confirmed; the two investigations hadn't
-been unified before the pod was preempted.
+prompt) was consistent with a shared upstream cause rather than anything
+CFG- or image-decoder-specific.
 
 ### Environment notes learned the hard way
 
@@ -479,3 +479,159 @@ been unified before the pod was preempted.
   (`status: EXITED` via the RunPod API) without any prompt-visible warning
   mid-session — this is the tradeoff of choosing community over secure
   cloud pricing.
+
+## 11. Root cause found and fixed: MLA LoRA scale never reached real weights
+
+The §10 investigation resumed on a fresh pod with a custom pre-baked Docker
+image (see §12). Three more instrumentation bugs had to be fixed before the
+per-layer RMS/logit audit could be trusted at all:
+
+- The audit's read side (`compute_logits`) disarmed itself on the *first*
+  qualifying call, assuming that meant the first real decode step. It
+  didn't: vLLM's own startup memory-profiling run also drives a full
+  forward pass (including `compute_logits`, to size the logits tensor)
+  through an all-zero hidden-state batch, and can present the same
+  single-token logits shape. Every prior capture in §10 was silently this
+  dummy pass, not real generation. Fix: a genuine forward pass can't land on
+  an *exact* 0.0 RMS at every layer (RMSNorm, bias-free linears, and
+  attention over an all-zero V all map zero to zero exactly) — use that as
+  the discriminator, and don't disarm the audit on a degenerate capture.
+- Ngram speculative decoding (`FlashNgramModel`) runs its own separate
+  small-batch dummy warm-up pass that the layer-RMS hooks (reset only on
+  `idx==0` of each forward call) couldn't distinguish from a real one either.
+  `LONGCAT_NGRAM_DISABLE=1` sidesteps this for isolated captures.
+- The RunPod base image's `CMD` must stay `["/start.sh"]` — overriding it
+  (even to `["/bin/bash"]`) silently disables the sshd bootstrap and the pod
+  never accepts SSH connections. A `PUBLIC_KEY` env var must also be set at
+  pod-creation time or `/start.sh` never seeds `authorized_keys`.
+
+With those fixed, a real per-layer RMS curve finally came through:
+
+```
+Reference: [0.54, 3.78, 6.38, 7.21, 8.13, 8.75, 9.24, 9.62, 9.99, 10.03, 10.10, 10.18, 5.95, 1.50]
+Port:      [5.63, 2.40, 0.66, 0.89, 0.92, 0.68, 0.59, 0.60, 0.56, 0.52, 0.45, 0.68, 4.62, 6.68]
+```
+
+Not just wrong magnitude — inverted shape. The reference climbs smoothly
+(normal residual-stream growth); the port starts ~10x too high, crashes to a
+low plateau, then spikes at the end. Diverging already at layer 0 ruled out
+"the bug compounds slowly across layers" and pointed upstream — either the
+embedding step or layer 0 itself.
+
+**Root cause**: `FlashModel.load_weights` (`vllm/model_executor/models/
+longcat_flash.py`) applies the LongCat-specific MLA LoRA input scale
+(`mla_scale_q_lora`/`mla_scale_kv_lora`) to `q_a_layernorm`/
+`kv_a_layernorm.weight` in place, guarded by a permanent per-attn-module
+"already scaled" flag (`_mla_q_lora_scaled`/`_mla_kv_lora_scaled`) meant to
+prevent double-scaling across repeated `load_weights` calls. Auditing every
+checkpoint key actually streamed into that function (a temporary
+`[longcat-stream-keys]` log) showed it fires more than once per model
+instance: an earlier pass whose incoming weights contain **zero**
+`self_attn` keys at all, followed by a later pass carrying the real
+checkpoint data. The guard trips on that first, data-less pass — multiplying
+whatever default-init value (`1.0`) was sitting in the layernorm weights at
+that point — and the later pass's real data then overwrites them via a
+plain `copy_` (not additive), silently wiping out that scaling without ever
+re-triggering it, since the guard is already permanently tripped. Net
+effect: the real checkpoint's `q_a_layernorm`/`kv_a_layernorm` weights ended
+up completely unscaled, every layer, every run.
+
+(This also explains the earlier, confusing §10-era back-and-forth: the
+originally-committed `_apply_mla_scale_fold()` in vllm-omni was removed
+mid-session on the theory that it double-applied on top of the vLLM fork's
+own scaling — reasonable, since a checksum showed the fork's logic *does*
+fire and *does* set its guard. But "fires" isn't "fires on the right data".
+Removing the fold left the real weights with **zero** scaling instead of
+**double** scaling — worse in a different way, which is why that removal
+made the port's logits regress rather than improve.)
+
+**Fix** (commit this session, `vllm_omni/model_executor/models/longcat_next/
+modeling_longcat_next.py`, no vLLM changes): reapply the scale in
+vllm-omni's own `load_weights`, gated by vllm-omni's own guard, immediately
+after `AutoWeightsLoader.load_weights()` returns — guaranteed to run after
+every one of the fork's internal `load_weights` invocations has completed
+and the real weights are in their final place, regardless of how many
+internal passes happened upstream. Deliberately kept out of the vLLM fork
+entirely: the bug is in a generic, shared-across-many-DeepSeek-family-models
+class that has no reason to know about a LongCat-specific quirk, and fixing
+it downstream in vllm-omni means no vLLM patch to maintain.
+
+**Verified fix, layer by layer**:
+```
+Reference top-10: ids=[23958, 7600, 9400, 44408, 49488, 2909, 25044, 56992, 31553, 78636]
+                  span ~45.4
+Port (post-fix):  ids=[23958, 7600, 44408, 49488, 9400, 56992, 25044, 2909, 31553, 60059]
+                  span ~45.75
+```
+9/10 top tokens match exactly, values within ~1%, span within 1% of the
+reference. The one prior "confirmed" side-track — that n-gram embedding
+fusion might itself be buggy, based on tracing `embed_input_ids` down to a
+plain `self.embed_tokens()` call with no fusion — turned out to be a red
+herring: `embed_input_ids` is an unused `SupportsMultiModal` interface
+fallback. The actual path (`preprocess()` → `_span_oe_ids` →
+`ngram_embeddings.embed_batched`) was correct the whole time; a debug audit
+already built into that function (`[longcat-ngram]`) confirmed its computed
+`oe_ids` once a genuinely clean run captured them.
+
+**End-to-end confirmation**: reran text/image/audio with simple English
+prompts post-fix (`scripts/run_english_demo.py`, not checked in — repo's
+`scripts/` is gitignored). All three now pass on content, not just pipeline
+shape:
+- Text: coherent, on-topic, factually correct multi-paragraph answer
+  (previously: grammatically broken filler).
+- Image: correct prompt-matching content (previously: unrelated scenes, e.g.
+  "a bed and some fingers").
+- Audio: correct-length clip (5.58s for a comparable sentence), no
+  repetition loop, no `EngineDeadError` timeout (previously: either
+  ~100s+ of repeated segments, or an outright hang/crash).
+
+## 12. Custom Docker image for fast pod respin
+
+Building the whole toolchain from scratch (§1-§5) costs ~15-20 min of
+GPU-billed idle time on every fresh pod, worse on every community-cloud
+preemption. A prebuilt image collapses that to the checkpoint download only.
+
+`Dockerfile` (repo root) bakes in: `uv`, both repos at their pinned
+branches, the vllm editable install (`--torch-backend=cu130` pinned
+explicitly — `auto` relies on detecting a live GPU/driver, which fails
+silently under the cross-arch emulation needed to build this on a Mac, and
+silently falls back to CPU-only torch), vllm-omni editable + requirements,
+and flash-attn. The checkpoint itself is deliberately **not** baked in —
+stays on the runtime `/workspace` volume.
+
+Build/push (from a Mac, cross-compiling for the pod's amd64):
+```bash
+docker buildx build --platform linux/amd64 --push \
+    -t <dockerhub-user>/longcat-next-dev:latest -f Dockerfile .
+```
+
+Then create the pod straight from that image instead of the base
+`runpod/pytorch` one, with a `PUBLIC_KEY` env var set (see §11's note on
+why) so SSH works immediately:
+```
+imageName: <dockerhub-user>/longcat-next-dev:latest
+env: {"PUBLIC_KEY": "<contents of your SSH pubkey>"}
+```
+
+Things that broke building this, in order found:
+- **flash-attn from source OOMs under cross-arch (QEMU) emulation** on a
+  Mac, even at `MAX_JOBS=2` (cutlass/CUTLASS template instantiation is
+  memory-hungry even natively; emulation multiplies it further). Fixed by
+  using a prebuilt wheel from `https://wheels.astral.sh/simple/cu130/`
+  instead (exact match available: `flash-attn==2.8.3.post1`, `cu13.0`,
+  `torch.2.11`, `cp311`) — skips compilation entirely.
+- `nvidia-cuda-nvcc` + the `lib64`/`libcudart` symlink dance (§1's
+  BUILD.md, unchanged) is still needed in the image even without building
+  flash-attn from source: flashinfer JIT-compiles its sampling kernel
+  lazily on the *first real inference call on the GPU pod*, not at image
+  build time, and needs that toolchain present then.
+- Overriding the base image's `CMD` (to `["/bin/bash"]`, seemingly harmless)
+  silently disables the base image's `/start.sh`, which is what launches
+  sshd — the pod comes up but never accepts SSH. Keep `CMD ["/start.sh"]`.
+- BuildKit cache mounts (`RUN --mount=type=cache,target=/root/.cache/uv`,
+  needs `# syntax=docker/dockerfile:1.7` at the top of the Dockerfile) keep
+  `uv`'s package cache out of the pushed image layers entirely — cut push
+  size/time by ~30% (928s → 642s) on this image. Ordering layers with the
+  most-frequently-changed one (vllm-omni's own clone+install, iterated on
+  throughout this session) *last* means changing only that file reuses
+  every earlier cached layer (uv, vllm, flash-attn, nvcc) on rebuild.
