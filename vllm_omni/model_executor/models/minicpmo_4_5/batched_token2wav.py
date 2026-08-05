@@ -60,11 +60,35 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(self, token2wav: Any, trt_stepper: Any | None = None):
         super().__init__()
         self._token2wav = token2wav
+        # Optional TrtDiTStepper (step_audio2_dit_trt): replaces only the
+        # per-timestep DiT estimator call; encoder and HiFT stay on torch.
+        self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        hift_parameter = next(self.hift.parameters(), None)
+        if hift_parameter is not None and hift_parameter.device.type == "cuda":
+            # Prime the CUDA state used by HiFT during backend construction.
+            # Otherwise, the first live audio chunk can fail when async stages
+            # share one GPU.
+            device = hift_parameter.device
+            dtype = hift_parameter.dtype
+            mel_channels = int(self.hift.conv_pre.in_channels)
+            with (
+                torch.inference_mode(),
+                torch.random.fork_rng(devices=[device]),
+                _autocast_disabled(device),
+            ):
+                # 50 mel frames match the default first streamed vocoder chunk.
+                speech, source = self.hift(
+                    torch.zeros((1, mel_channels, 50), device=device, dtype=dtype),
+                    torch.zeros((1, 1, 0), device=device, dtype=dtype),
+                )
+            torch.accelerator.synchronize(device)
+            del speech, source
+            torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
@@ -179,6 +203,17 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._trt_stepper is not None:
+            out, new_cnn, new_att = self._trt_stepper.step(
+                x=x,
+                mu=mu,
+                t=time,
+                spks=speakers,
+                cond=cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+            return out.to(mu.dtype), new_cnn, new_att
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)

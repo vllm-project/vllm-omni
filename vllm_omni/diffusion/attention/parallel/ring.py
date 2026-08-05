@@ -10,7 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FA4, HAS_FLASH_ATTN
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -145,9 +145,12 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
-        # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
-        # On ROCm, use AITER
-        if HAS_FA3:
+        # Prefer FA4 on Blackwell. An importable Hopper-only FA3 wheel can
+        # otherwise be selected and fail at launch with "no kernel image".
+        if HAS_FA4 and query.is_cuda and torch.cuda.get_device_capability(query.device)[0] >= 10:
+            attn_type = AttnType.FA4
+        # Prefer FA3 over FA2 on Ampere/Ada/Hopper. On ROCm, use AITER.
+        elif HAS_FA3:
             attn_type = AttnType.FA3
         elif HAS_AITER:
             attn_type = AttnType.AITER

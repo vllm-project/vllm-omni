@@ -17,6 +17,7 @@ Key invariants tested:
 """
 
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -80,28 +81,37 @@ def _make_audio_omni_output(
     request_id: str = "test-req",
     index: int = 0,
     num_prompt_tokens: int = 3,
+    stage_id: int | None = None,
+    replica_id: int | None = None,
+    audio_samples: int = 0,
 ) -> OmniRequestOutput:
     """Build an OmniRequestOutput for audio (no torch dependency)."""
+    completion = CompletionOutput(
+        index=index,
+        text="",
+        token_ids=[],
+        cumulative_logprob=0.0,
+        logprobs=None,
+        finish_reason="stop",
+        stop_reason=None,
+    )
+    if audio_samples > 0:
+        completion.multimodal_output = {
+            "audio": [MagicMock(numel=MagicMock(return_value=audio_samples))],
+            "sr": 24000,
+        }
     res = RequestOutput(
         request_id=request_id,
         prompt="test",
         prompt_token_ids=list(range(num_prompt_tokens)),
         prompt_logprobs=None,
-        outputs=[
-            CompletionOutput(
-                index=index,
-                text="",
-                token_ids=[],
-                cumulative_logprob=0.0,
-                logprobs=None,
-                finish_reason="stop",
-                stop_reason=None,
-            )
-        ],
+        outputs=[completion],
         finished=True,
     )
     return OmniRequestOutput(
         request_id=request_id,
+        stage_id=stage_id,
+        replica_id=replica_id,
         final_output_type="audio",
         request_output=res,
         finished=True,
@@ -319,6 +329,74 @@ async def test_single_modality_audio_only_one_stop():
 
     assert finish_reasons.count("stop") == 1
     assert finish_reasons[-1] == "stop"
+
+
+@pytest.mark.parametrize(
+    ("output_replica_id", "pool_replica_id", "expected_replica_id", "pool_lookup"),
+    [
+        (7, None, 7, False),
+        (None, 5, 5, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_streaming_audio_metrics_resolve_replica_id(
+    monkeypatch,
+    output_replica_id,
+    pool_replica_id,
+    expected_replica_id,
+    pool_lookup,
+):
+    import vllm_omni.entrypoints.openai.serving_chat as serving_chat_mod
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["audio"])
+    req_state = ClientRequestState(
+        request_id="internal-req",
+        external_request_id="test-req",
+    )
+    req_state.request_arrival_ts = time.time() - 1.0
+    serving_chat.engine_client.request_states = {"internal-req": req_state}
+    serving_chat.engine_client.mod_metrics = object()
+    serving_chat.engine_client.engine = MagicMock()
+    serving_chat.engine_client.engine.stage_pools = [MagicMock(), MagicMock(), MagicMock()]
+    serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.return_value = pool_replica_id
+
+    first_packet_calls = []
+    finalize_calls = []
+
+    def fake_observe_audio_first_packet(*args, **kwargs):
+        first_packet_calls.append(kwargs)
+
+    def fake_observe_audio_streaming_finalize(*args, **kwargs):
+        finalize_calls.append(kwargs)
+
+    monkeypatch.setattr(serving_chat_mod, "observe_audio_first_packet", fake_observe_audio_first_packet)
+    monkeypatch.setattr(serving_chat_mod, "observe_audio_streaming_finalize", fake_observe_audio_streaming_finalize)
+
+    async def result_generator():
+        yield _make_audio_omni_output(stage_id=2, replica_id=output_replica_id, audio_samples=2400)
+
+    await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    if pool_lookup:
+        serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.assert_called_once_with("internal-req")
+    else:
+        serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.assert_not_called()
+    assert first_packet_calls[0]["stage_id"] == 2
+    assert first_packet_calls[0]["replica_id"] == expected_replica_id
+    assert finalize_calls[0]["stage_id"] == 2
+    assert finalize_calls[0]["replica_id"] == expected_replica_id
 
 
 # ---------------------------------------------------------------------------

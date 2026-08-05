@@ -79,6 +79,10 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
+    #     variable-length query/key sequences for FlashAttention.
+    #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
+    #     the packed cu_seqlens tensors.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.

@@ -2062,15 +2062,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     now_ts = time.time()
                     if req_state is not None and req_state.first_audio_ts is None:
                         req_state.first_audio_ts = now_ts
-                        stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
-                        # The orchestrator binds requests by their internal id,
-                        # not the user-visible external id, so look up the
-                        # replica with req_state.request_id (internal).
-                        replica_id = (
-                            stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
-                            if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
-                            else None
-                        )
+                        replica_id = getattr(omni_res, "replica_id", None)
+                        if replica_id is None:
+                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                            # Fallback for older outputs. The orchestrator binds
+                            # requests by internal id, but can release that
+                            # binding before the API sees the final audio chunk,
+                            # so prefer the OutputMessage replica copied onto
+                            # OmniRequestOutput above.
+                            replica_id = (
+                                stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
+                                if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
+                                else None
+                            )
                         req_state.audio_emit_stage_id = omni_res.stage_id
                         req_state.audio_emit_replica_id = replica_id
                         observe_audio_first_packet(

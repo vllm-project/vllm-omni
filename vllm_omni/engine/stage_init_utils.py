@@ -372,7 +372,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_args["attention_backend"] = "TRITON_ATTN"
 
     runtime_cfg = stage_config.runtime
-    engine_input_source: list[int] = stage_config.engine_input_source
+    engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
     final_output: bool = stage_config.final_output
     final_output_type: str | None = stage_config.final_output_type
 
