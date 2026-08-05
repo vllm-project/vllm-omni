@@ -4,7 +4,6 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
-import os
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -189,9 +188,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             # suppress tokens by setting their probability to ~1e-9 (finite very small)
             self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
-            self._talker_dump_dir = "/tmp/talker_forward_inputs"
-            os.makedirs(self._talker_dump_dir, exist_ok=True)
-            self._talker_dump_counter = 0
             # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
             self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
                 ("hidden_states", "last"),
@@ -562,19 +558,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
-
-            # Serialize talker forward() inputs to disk
-            dump_path = os.path.join(self._talker_dump_dir, f"{self._talker_dump_counter:06d}.pt")
-            torch.save(
-                {
-                    "input_ids": input_ids.detach().cpu(),
-                    "positions": positions.detach().cpu(),
-                    "inputs_embeds": inputs_embeds.detach().cpu(),
-                },
-                dump_path,
-            )
-            logger.debug("[talker] saved forward inputs to %s", dump_path)
-            self._talker_dump_counter += 1
 
             # Run talker forward
             with torch.inference_mode():
