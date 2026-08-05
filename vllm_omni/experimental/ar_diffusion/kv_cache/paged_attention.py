@@ -25,6 +25,25 @@ def set_current_paged_kv_cache(kv_cache: Any) -> None:
     _CURRENT_PAGED_KV_CACHE = kv_cache
 
 
+# Packed-varlen gather index published by prepare() on the aiter path, same lifetime as
+# the pool registry above. It depends only on (block_table, seq_lens, page), which every
+# layer of one forward shares, so one build serves all of them. Kept next to the tensors
+# it was built from because ar_diffusion_paged_attention() is also reachable without a
+# prepare() (tests call it directly), and those calls must not pick up a stale index.
+_CURRENT_PACKED_KV_INDEX: tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor] | None = None
+
+
+def set_current_packed_kv_index(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page: int,
+    flat: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> None:
+    global _CURRENT_PACKED_KV_INDEX
+    _CURRENT_PACKED_KV_INDEX = (block_table, seq_lens, page, flat, cu_seqlens_k)
+
+
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
@@ -217,6 +236,11 @@ class ARDiffusionPagedForwardContext:
         the padded block-table metadata ONCE for all layers, and publishes the
         pool registry for the fused custom op. The compiled per-layer code then
         only consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
+
+        On the aiter path it also builds the packed-varlen gather index here, for
+        the same reason and with the same reach: it is a function of the block
+        table, so rebuilding it per layer costs 40x its 22 kernels and 3 host
+        syncs for an identical answer.
         """
         if getattr(self, "_prepared", False):
             return
@@ -230,6 +254,10 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
+        if device.type == "cuda" and _rocm_varlen_fa() is not None:
+            page = self.block_size
+            flat, cu_seqlens_k = _build_packed_kv_index(self.block_table, self.seq_lens, page)
+            set_current_packed_kv_index(self.block_table, self.seq_lens, page, flat, cu_seqlens_k)
         set_current_paged_kv_cache(self.kv_cache)
         self._prepared = True
 
@@ -386,6 +414,55 @@ def _rocm_varlen_fa() -> Callable[..., Any] | None:
     return rocm_aiter_ops.flash_attn_varlen_func if is_aiter_found() else None
 
 
+def _build_packed_kv_index(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat gather index into the K/V pool, plus ``cu_seqlens_k``, for the packed layout.
+
+    Pure function of the block table, the sequence lengths and the page size, so one
+    build serves every layer of a forward. ``prepare()`` calls this; ``_pack_paged_kv``
+    falls back to it when there is no prepared index to reuse.
+    """
+    lens = seq_lens.to(torch.int64)
+    cu_seqlens_k = torch.cat([lens.new_zeros(1), lens.cumsum(0)])
+    total = int(cu_seqlens_k[-1])
+    seq_id = torch.repeat_interleave(
+        torch.arange(lens.numel(), device=lens.device),
+        lens,
+    )
+    pos = torch.arange(total, device=lens.device) - cu_seqlens_k[seq_id]
+    logical = torch.div(pos, page, rounding_mode="floor")
+    flat = block_table[seq_id, logical].to(torch.int64) * page + pos % page
+    return flat, cu_seqlens_k.to(torch.int32)
+
+
+def _prepared_packed_kv_index(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The index ``prepare()`` published for these metadata tensors, or ``None``.
+
+    Matched on storage rather than object identity: the compiled block hands the op
+    whatever inductor holds for those graph inputs, which need not be the same python
+    object ``prepare()`` stored. Holding a reference to the originals keeps their
+    storage alive, so a matching ``data_ptr`` cannot be a recycled address.
+    """
+    prepared = _CURRENT_PACKED_KV_INDEX
+    if prepared is None:
+        return None
+    kept_block_table, kept_seq_lens, kept_page, flat, cu_seqlens_k = prepared
+    if kept_page != page:
+        return None
+    if kept_block_table.data_ptr() != block_table.data_ptr() or kept_block_table.shape != block_table.shape:
+        return None
+    if kept_seq_lens.data_ptr() != seq_lens.data_ptr() or kept_seq_lens.shape != seq_lens.shape:
+        return None
+    return flat, cu_seqlens_k
+
+
 def _pack_paged_kv(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -397,25 +474,16 @@ def _pack_paged_kv(
     KV is gathered because aiter has no usable paged path for this cache -- passing it a
     ``block_table`` faults the GPU on gfx950. The copy runs at HBM bandwidth, 3-7% of
     attention time.
-
-    TODO: build the index once per forward rather than per layer. It depends only on the block
-    table, and per layer its flat ~0.055ms is 1-22% of attention time, worst at small windows.
     """
     page = key_cache.shape[1]
-    lens = seq_lens.to(torch.int64)
-    cu_seqlens_k = torch.cat([lens.new_zeros(1), lens.cumsum(0)])
-    total = int(cu_seqlens_k[-1])
-    seq_id = torch.repeat_interleave(
-        torch.arange(lens.numel(), device=lens.device),
-        lens,
-    )
-    pos = torch.arange(total, device=lens.device) - cu_seqlens_k[seq_id]
-    logical = torch.div(pos, page, rounding_mode="floor")
-    flat = block_table[seq_id, logical].to(torch.int64) * page + pos % page
+    index = _prepared_packed_kv_index(block_table, seq_lens, page)
+    if index is None:
+        index = _build_packed_kv_index(block_table, seq_lens, page)
+    flat, cu_seqlens_k = index
     return (
         key_cache.flatten(0, 1)[flat],
         value_cache.flatten(0, 1)[flat],
-        cu_seqlens_k.to(torch.int32),
+        cu_seqlens_k,
     )
 
 

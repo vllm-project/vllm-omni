@@ -354,6 +354,63 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
     assert i0.video_slots is i1.video_slots
 
 
+def test_packed_kv_index_is_published_once_and_reused_by_every_layer():
+    """The packed-varlen gather index is a function of the block table, so
+    prepare() builds it for all layers. Reusing it must give exactly what an
+    inline per-layer build gives, and metadata that was not the published one
+    must fall back rather than gather through a foreign index."""
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as pa
+
+    device = torch.device("cpu")
+    _, st = make_state(num_layers=2, window_chunks=2)
+    contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+    fctx = contexts[0].forward_ctx
+    fctx.prepare(device=device, action_len=0, query_len=BLOCK)
+
+    page = fctx.block_size
+    block_table, seq_lens = fctx.block_table, fctx.seq_lens
+    num_blocks = int(block_table.max()) + 1
+    key_cache = torch.randn(num_blocks, page, N_HEADS, HEAD_DIM)
+    value_cache = torch.randn(num_blocks, page, N_HEADS, HEAD_DIM)
+
+    saved = pa._CURRENT_PACKED_KV_INDEX
+    try:
+        pa._CURRENT_PACKED_KV_INDEX = None
+        k_inline, v_inline, cu_inline = pa._pack_paged_kv(key_cache, value_cache, block_table, seq_lens)
+
+        flat, cu = pa._build_packed_kv_index(block_table, seq_lens, page)
+        pa.set_current_packed_kv_index(block_table, seq_lens, page, flat, cu)
+        k_hit, v_hit, cu_hit = pa._pack_paged_kv(key_cache, value_cache, block_table, seq_lens)
+
+        assert torch.equal(k_hit, k_inline)
+        assert torch.equal(v_hit, v_inline)
+        assert torch.equal(cu_hit, cu_inline)
+        assert pa._prepared_packed_kv_index(block_table, seq_lens, page) is not None
+
+        # Another forward's metadata, or another pool's page size, is not a hit.
+        assert pa._prepared_packed_kv_index(block_table.clone(), seq_lens, page) is None
+        assert pa._prepared_packed_kv_index(block_table, seq_lens.clone(), page) is None
+        assert pa._prepared_packed_kv_index(block_table, seq_lens, page * 2) is None
+    finally:
+        pa._CURRENT_PACKED_KV_INDEX = saved
+
+
+def test_prepare_publishes_the_index_only_on_the_aiter_path():
+    """CPU and non-ROCm CUDA reach the reference / vllm_flash_attn paths, which
+    never pack, so prepare() must not leave an index behind for them."""
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as pa
+
+    saved = pa._CURRENT_PACKED_KV_INDEX
+    try:
+        pa._CURRENT_PACKED_KV_INDEX = None
+        _, st = make_state()
+        fctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+        fctx.prepare(device=torch.device("cpu"), action_len=0, query_len=BLOCK)
+        assert pa._CURRENT_PACKED_KV_INDEX is None
+    finally:
+        pa._CURRENT_PACKED_KV_INDEX = saved
+
+
 def test_layer_inputs_before_prepare_raises():
     _, st = make_state()
     layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
