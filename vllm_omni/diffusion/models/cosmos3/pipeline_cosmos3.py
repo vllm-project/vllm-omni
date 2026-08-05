@@ -920,19 +920,20 @@ class Cosmos3OmniDiffusersPipeline(
 
         # Opt-in: route the per-CFG-branch UND text K/V through the shared
         # SessionStateManager (RFC #4480) instead of the transformer-instance
-        # cache, which has no session keying and lets concurrent requests clobber
-        # each other. Default off -> the bespoke transformer-instance path below
-        # is byte-identical to before.
+        # cache. This establishes request-keyed state isolation; it does not by
+        # itself make the mutable pipeline safe for concurrent execution.
+        # Default off -> the bespoke transformer-instance path below is unchanged.
         self._use_session_state, mm_max_sessions = resolve_session_state_config(
             enable=od_config.enable_session_state_manager,
         )
         self._memory_manager: SessionStateManager | None = (
             SessionStateManager(max_sessions=mm_max_sessions) if self._use_session_state else None
         )
-        # Set per-forward by the runner when the BDE paged path is active (Stage C/D);
-        # None means the dense session-adapter path (Stage B) or the bespoke path.
+        # Forward declaration for the future BDE paged path (Stage C/D). Nothing
+        # writes this field in Phase 0; a non-None value is rejected by the guards
+        # below. None means the dense session adapter or the bespoke path.
         self._bde_kv_state = None
-        if self._use_session_state:
+        if getattr(self, "_use_session_state", False):
             logger.info("Cosmos3: session state manager enabled (max_sessions=%d)", mm_max_sessions)
 
         # --- Scheduler ---
@@ -1489,6 +1490,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp: OmniDiffusionSamplingParams,
         inputs: RoboLabPolicyInputs,
         pipeline_start: float,
+        session_id: str | None = None,
     ) -> DiffusionOutput:
         if self.is_distilled_model:
             raise self._distilled_unsupported_error("RoboLab/action policy requests are unsupported.")
@@ -1602,6 +1604,7 @@ class Cosmos3OmniDiffusersPipeline(
             guidance_interval=None,
             raw_action_dim=raw_action_dim,
             scheduler=scheduler,
+            session_id=session_id,
             generator=generator,
         )
 
@@ -2544,17 +2547,6 @@ class Cosmos3OmniDiffusersPipeline(
         kv_state = self._new_cosmos3_state(session_id)
         self._kv_reset_und(kv_state)
 
-        def _denoise_steps():
-            """Yield denoise steps and release request-scoped state on every exit."""
-            try:
-                yield from self.progress_bar(timesteps)
-            finally:
-                # Cosmos3 currently receives a unique request_id rather than a
-                # reusable rollout session id. Retaining its state would only
-                # pin K/V buffers on device after this generation finishes.
-                if kv_state is not None:
-                    self._memory_manager.drop_session(session_id)
-
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
                 return True
@@ -2689,22 +2681,57 @@ class Cosmos3OmniDiffusersPipeline(
             if sound_latents is not None:
                 sound_latents = step_out[idx]
 
-        if cfg_parallel:
-            # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
-            # else uncond), so session keying loads/stores only this rank's branch.
-            cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
-            for t in _denoise_steps():
-                timestep = t.unsqueeze(0)
-                # Out-of-interval steps run with effective scale 1.0 so the
-                # combined output equals the cond branch (uncond is dropped).
-                # All ranks still execute both branches; no CFG-Parallel
-                # divergence.
-                step_scale = guidance_scale if _cfg_active_at(t) else 1.0
-                self._kv_load_und(kv_state, is_negative=cfg_rank_is_negative)
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale=step_scale,
-                    positive_kwargs=dict(
+        try:
+            if cfg_parallel:
+                # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
+                # else uncond), so session keying loads/stores only this rank's branch.
+                cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
+                for t in self.progress_bar(timesteps):
+                    timestep = t.unsqueeze(0)
+                    # Outside the interval, scale=1 makes the combined output equal
+                    # the cond branch. Every rank remains on the same iteration and
+                    # collective schedule.
+                    step_scale = guidance_scale if _cfg_active_at(t) else 1.0
+                    self._kv_load_und(kv_state, is_negative=cfg_rank_is_negative)
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=step_scale,
+                        positive_kwargs=dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=cond_ids,
+                            text_mask=cond_mask,
+                            action_latents=action_latents,
+                            sound_latents=sound_latents,
+                            **shared_kwargs,
+                        ),
+                        negative_kwargs=dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            action_latents=action_latents,
+                            sound_latents=sound_latents,
+                            **shared_kwargs,
+                        ),
+                        cfg_normalize=False,
+                    )
+                    if kv_state is not None:
+                        self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+
+            elif do_cfg:
+                cond_cache: tuple = (None, None)
+                uncond_cache: tuple = (None, None)
+                keep_uncond_for_cache = self._cache_requires_paired_cfg()
+
+                for t in self.progress_bar(timesteps):
+                    timestep = t.unsqueeze(0)
+                    cfg_active = _cfg_active_at(t)
+
+                    if not self._kv_load_und(kv_state, is_negative=False):
+                        self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
+                    noise_cond = self.transformer(
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2712,92 +2739,67 @@ class Cosmos3OmniDiffusersPipeline(
                         action_latents=action_latents,
                         sound_latents=sound_latents,
                         **shared_kwargs,
-                    ),
-                    negative_kwargs=dict(
+                    )
+                    if kv_state is not None:
+                        self._kv_capture_und(kv_state, is_negative=False)
+                    elif cond_cache[0] is None:
+                        cond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+
+                    if cfg_active or keep_uncond_for_cache:
+                        if not self._kv_load_und(kv_state, is_negative=True):
+                            self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
+                        noise_uncond = self.transformer(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            action_latents=action_latents,
+                            sound_latents=sound_latents,
+                            **shared_kwargs,
+                        )
+                        if kv_state is not None:
+                            self._kv_capture_und(kv_state, is_negative=True)
+                        elif uncond_cache[0] is None:
+                            uncond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+                        # Outside the interval, scale=1.0 makes the combined result
+                        # equal to noise_cond; the uncond pass is computed only to
+                        # preserve cache-dit's cond/uncond parity.
+                        step_scale = guidance_scale if cfg_active else 1.0
+                        noise_pred = self.combine_cfg_noise(
+                            noise_cond,
+                            noise_uncond,
+                            step_scale,
+                            cfg_normalize=False,
+                        )
+                    else:
+                        noise_pred = noise_cond
+
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+
+            else:
+                # No CFG: a single cond branch per step. Bespoke (state None) keeps
+                # using the transformer-instance cache exactly as before.
+                for t in self.progress_bar(timesteps):
+                    timestep = t.unsqueeze(0)
+                    self._kv_load_und(kv_state, is_negative=False)
+                    noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep,
-                        text_ids=uncond_ids,
-                        text_mask=uncond_mask,
-                        action_latents=action_latents,
-                        sound_latents=sound_latents,
-                        **shared_kwargs,
-                    ),
-                    cfg_normalize=False,
-                )
-                if kv_state is not None:
-                    self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
-                _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
-
-        elif do_cfg:
-            cond_cache: tuple = (None, None)
-            uncond_cache: tuple = (None, None)
-
-            keep_uncond_for_cache = self._cache_requires_paired_cfg()
-
-            for t in _denoise_steps():
-                timestep = t.unsqueeze(0)
-                cfg_active = _cfg_active_at(t)
-
-                if not self._kv_load_und(kv_state, is_negative=False):
-                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                noise_cond = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_ids=cond_ids,
-                    text_mask=cond_mask,
-                    action_latents=action_latents,
-                    sound_latents=sound_latents,
-                    **shared_kwargs,
-                )
-                if kv_state is not None:
-                    self._kv_capture_und(kv_state, is_negative=False)
-                elif cond_cache[0] is None:
-                    cond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
-
-                if cfg_active or keep_uncond_for_cache:
-                    if not self._kv_load_und(kv_state, is_negative=True):
-                        self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                    noise_uncond = self.transformer(
-                        hidden_states=latents,
-                        timestep=timestep,
-                        text_ids=uncond_ids,
-                        text_mask=uncond_mask,
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
                         action_latents=action_latents,
                         sound_latents=sound_latents,
                         **shared_kwargs,
                     )
                     if kv_state is not None:
-                        self._kv_capture_und(kv_state, is_negative=True)
-                    elif uncond_cache[0] is None:
-                        uncond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
-                    # Outside the interval, scale=1.0 makes the combined result
-                    # equal to noise_cond; the uncond pass is computed only to
-                    # preserve cache-dit's cond/uncond parity.
-                    step_scale = guidance_scale if cfg_active else 1.0
-                    noise_pred = self.combine_cfg_noise(noise_cond, noise_uncond, step_scale, cfg_normalize=False)
-                else:
-                    noise_pred = noise_cond
-
-                _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
-
-        else:
-            # No CFG: a single cond branch per step. Bespoke (state None) keeps
-            # using the transformer-instance cache exactly as before.
-            for t in _denoise_steps():
-                timestep = t.unsqueeze(0)
-                self._kv_load_und(kv_state, is_negative=False)
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_ids=cond_ids,
-                    text_mask=cond_mask,
-                    action_latents=action_latents,
-                    sound_latents=sound_latents,
-                    **shared_kwargs,
-                )
-                if kv_state is not None:
-                    self._kv_capture_und(kv_state, is_negative=False)
-                _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                        self._kv_capture_und(kv_state, is_negative=False)
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+        finally:
+            # Cosmos3 currently receives a unique request_id rather than a
+            # reusable rollout session id. Retaining its state would only pin
+            # K/V buffers on device after this generation finishes.
+            if kv_state is not None:
+                self._memory_manager.drop_session(session_id)
 
         outputs = [latents]
         if action_latents is not None:
@@ -2894,6 +2896,13 @@ class Cosmos3OmniDiffusersPipeline(
         guidance_interval: tuple[float, float] | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
+        if getattr(self, "_use_session_state", False):
+            raise NotImplementedError(
+                "Cosmos3 transfer does not yet support SessionStateManager: "
+                "its control/text CFG branches require richer cache keys. "
+                "Disable the session state manager for transfer requests."
+            )
+
         def _active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
             if interval is None:
                 return True
@@ -3278,7 +3287,12 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
-            return self._forward_robolab_policy(sp, robolab_inputs, pipeline_start)
+            return self._forward_robolab_policy(
+                sp,
+                robolab_inputs,
+                pipeline_start,
+                session_id=getattr(req, "request_id", None),
+            )
 
         if isinstance(prompt_data, str):
             prompt = prompt_data
