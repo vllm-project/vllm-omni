@@ -92,6 +92,13 @@ stages:
       detokenize: true
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Four Talker streams need much less KV than automatic sizing.
+        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
+        kv_cache_memory_bytes: 2147483648  # 2 GiB
+
   npu:
     stages:
       - stage_id: 0

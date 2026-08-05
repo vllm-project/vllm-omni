@@ -19,10 +19,28 @@ DEPLOY_CONFIG = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-        # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
-        # is left automatic so duplex matches the simplex deploy profiles.
+        # Cap per-stage KV so Thinker/Talker/Code2Wav share one GPU with
+        # max_sessions=2. Talker must stay within its 4096 context so the
+        # 0.5 GiB budget passes vLLM's min-KV check at init.
         "stages": {
-            1: {"max_model_len": 4096},
+            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
+            1: {
+                "max_model_len": 4096,
+                "kv_cache_memory_bytes": 512 * 1024 * 1024,
+            },
+            2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
+        },
+        # Platform overrides apply after ordinary stage settings and would
+        # otherwise reinstate the base CUDA 2 GiB Talker default.
+        "platforms": {
+            "cuda": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "kv_cache_memory_bytes": 512 * 1024 * 1024,
+                    }
+                ]
+            }
         },
     },
 )
@@ -47,7 +65,7 @@ SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
         id="three-stage-single-gpu",
@@ -58,7 +76,7 @@ CORE_SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=CORE_DEPLOY_CONFIG,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
         id="three-stage-single-gpu",

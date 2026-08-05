@@ -2224,8 +2224,7 @@ class TestPlatformOverrides:
 
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        # Talker KV is left to automatic sizing (no hard kv_cache_memory_bytes cap).
-        assert "kv_cache_memory_bytes" not in cuda_stages[1].yaml_engine_args
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
 
         # The CUDA memory budget must not leak into the existing NPU profile.
         npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
@@ -2233,7 +2232,7 @@ class TestPlatformOverrides:
         assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
 
         # Multi-GPU replica profiles place Talker on dedicated devices and
-        # also leave KV sizing automatic.
+        # preserve their previous automatic KV-cache sizing.
         for filename in (
             "minicpmo_4_5_3gpu_stage1_replicas.yaml",
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
@@ -2242,7 +2241,8 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            assert "kv_cache_memory_bytes" not in replica_stages[1].yaml_engine_args
+            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
