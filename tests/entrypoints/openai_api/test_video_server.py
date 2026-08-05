@@ -548,6 +548,23 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
     assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
 
 
+def test_decode_video_bytes_can_keep_first_frames():
+    from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
+
+    frames = _decode_video_bytes(
+        _make_test_video_bytes((32, 24), num_frames=6),
+        source="input_reference",
+        max_frames=2,
+        keep="first",
+    )
+
+    assert len(frames) == 2
+    assert frames.fps == pytest.approx(8.0)
+    red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
+    assert red_means[0] < red_means[1]
+    assert red_means[1] < 100
+
+
 def test_decode_video_bytes_can_keep_last_frames():
     from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
 
