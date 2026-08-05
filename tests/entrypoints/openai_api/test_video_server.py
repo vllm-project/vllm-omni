@@ -1445,6 +1445,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
+    assert req.quality == "lossless"
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
@@ -1464,6 +1465,8 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", frame_interpolation_scale=0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", sound_duration=0)
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", quality="medium")
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -1975,6 +1978,7 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
             "num_inference_steps": "30",
             "guidance_scale": "6.5",
             "seed": "42",
+            "quality": "high",
         },
     )
     assert response.status_code == 200
@@ -1983,6 +1987,11 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.num_inference_steps == 30
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
+    assert captured.quality == "high"
+
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    assert MiniMaxH3Pipeline._resolve_request_quality(captured) == "high"
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):

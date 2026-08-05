@@ -55,6 +55,10 @@ class StepBatchSamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Request-scoped execution policy. A batch must use one quality mode
+    # because model acceleration hooks are shared by the whole worker batch.
+    quality: str = "lossless"
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
@@ -107,6 +111,10 @@ class RequestBatchSamplingParamsKey:
     # Model-specific batch defaults used by request-mode pipelines.
     layers: int = 4
     use_en_prompt: bool = False
+
+    # Request-scoped execution policy. Keep accelerated and reference-path
+    # requests in separate worker batches.
+    quality: str = "lossless"
 
     # LoRA identity.
     lora_int_id: int | None = None
