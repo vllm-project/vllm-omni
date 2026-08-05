@@ -56,7 +56,7 @@ async def _run_single_turn_response_required(
                         "modalities": ["audio", "text"],
                         "input_audio_format": "pcm16",
                         "output_audio_format": "pcm16",
-                        "turn_detection": {"type": "server_vad"},
+                        "turn_detection": None,
                         "temperature": 0.0,
                         "extra_body": {},
                     },
@@ -85,6 +85,7 @@ async def _run_single_turn_response_required(
             )
 
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+        await ws.send(json.dumps({"type": "response.create"}))
 
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
