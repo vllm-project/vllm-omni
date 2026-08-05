@@ -14,8 +14,7 @@
 This recipe adapts [MiniMax-H3.md](MiniMax-H3.md) for MUSA environments.
 The modular H3 pipeline can load both task-specific DiTs, but this MUSA recipe
 uses a **single task partition**: `FL2VA` for `t2va`/`fl2va`, or `Ref2VA` for
-`ref2va`. This avoids loading both DiTs; combined serving has not been
-validated on MUSA.
+`ref2va`. This avoids loading both DiTs.
 
 ## Prerequisites
 
@@ -132,8 +131,8 @@ Keep `--vae-use-tiling` enabled for this serving profile.
 - Keep Ring Attention at degree 1. The current Ring path does not preserve
   MiniMax H3 packed padding boundaries.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
-- This MUSA recipe is validated only for an explicitly selected single task
-  partition; combined serving loads both DiTs and is not yet MUSA-qualified.
+- This MUSA recipe uses an explicitly selected single task partition; combined
+  serving loads both DiTs.
 - H3 currently executes one generation request per diffusion batch.
 - FP8 quantization has not been enabled for MiniMax H3.
 - MP3, M4A, MP4, and reference-video audio fallback requires `ffmpeg` on

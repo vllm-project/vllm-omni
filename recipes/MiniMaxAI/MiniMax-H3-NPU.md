@@ -80,10 +80,6 @@ sharing the tokenizer, processor, text encoder, and VAEs from `FL2VA`.
 Use Ulysses sequence parallelism degree 8, text-encoder tensor parallelism
 degree 8, native tiled VAE patch parallelism degree 8, and layerwise offload:
 
-The evidence later in this recipe was collected with one partition loaded.
-Combined serving uses the same execution path but keeps both DiTs in host
-memory and has not yet been separately performance-qualified.
-
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PORT=9098
