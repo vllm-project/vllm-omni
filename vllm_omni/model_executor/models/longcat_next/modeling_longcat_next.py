@@ -1475,11 +1475,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 if both_visual_active and row == p_row:
                     # ---- combined CFG path (drives both streams) ----
                     p_last_hidden = (
-                        last_talker_hidden[p_row:p_row + 1]
+                        last_talker_hidden[p_row : p_row + 1]
                         if p_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
                     )
                     t_last_hidden = (
-                        last_talker_hidden[t_row:t_row + 1]
+                        last_talker_hidden[t_row : t_row + 1]
                         if t_row < last_talker_hidden.shape[0] else last_talker_hidden[-1:]
                     )
                     p_past = p_state.get("past_codes")
@@ -1518,7 +1518,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     # codes and applied to both rows (the twin's visible token
                     # is forced to the same value as the parent's, so reusing
                     # the parent's text token keeps both streams aligned).
-                    text_tok = input_ids[p_row:p_row + 1]
+                    text_tok = input_ids[p_row : p_row + 1]
                     text_emb = self.model.embed_tokens(text_tok)
                     if frame_kept and deoff != 0:
                         offset_codes = (codes_row + self.visual_offset_vals[:visual_num_levels].to(device)).unsqueeze(0)
@@ -1528,7 +1528,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     else:
                         next_emb = text_emb
                     for rr in (p_row, t_row):
-                        all_embeds[rr:rr + 1] = next_emb.to(dtype=self.dtype)
+                        all_embeds[rr : rr + 1] = next_emb.to(dtype=self.dtype)
 
                     if is_terminal:
                         p_state["terminal"] = True
@@ -1693,7 +1693,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             for name, tensor in weights:
                 for ckpt_prefix, attr in self._SIDE_MODULE_PREFIXES:
                     if name.startswith(ckpt_prefix):
-                        side_state[attr][name[len(ckpt_prefix):]] = tensor
+                        side_state[attr][name[len(ckpt_prefix) :]] = tensor
                         break
                 else:
                     yield name, tensor

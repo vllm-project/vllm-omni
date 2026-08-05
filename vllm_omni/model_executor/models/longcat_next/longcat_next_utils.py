@@ -56,7 +56,7 @@ def resolve_checkpoint_relative_path(configured_path: str, model_path: str) -> s
     local model directory instead of requiring users to edit the checkpoint.
     """
     if configured_path.startswith(_WEIGHT_PATH_PLACEHOLDER):
-        relative = configured_path[len(_WEIGHT_PATH_PLACEHOLDER):].lstrip("/")
+        relative = configured_path[len(_WEIGHT_PATH_PLACEHOLDER) :].lstrip("/")
         return os.path.join(model_path, relative)
     if os.path.isabs(configured_path):
         return configured_path
@@ -142,7 +142,7 @@ def load_weight_subtree(
                 tensor = f.get_tensor(key)
                 if dtype is not None and tensor.is_floating_point():
                     tensor = tensor.to(dtype)
-                state_dict[key[len(dotted):]] = tensor
+                state_dict[key[len(dotted) :]] = tensor
 
     missing, unexpected = module.load_state_dict(state_dict, strict=strict)
     if missing:
