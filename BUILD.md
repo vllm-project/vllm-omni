@@ -167,10 +167,11 @@ uvx --with hf_xet hf download meituan-longcat/LongCat-Next \
 
 ## 7. Deploy config
 
-The repo ships 5-GPU (`longcat_next_5gpu_a40_multi_decoder.yaml`) and 4-GPU
-80GB variants for the 3-stage pipeline, but no 4-GPU 80GB variant of the
-**2-stage** `multi_decoder` pipeline — which is the one you actually want,
-because the 3-stage `longcat_next` pipeline has a real bug: the
+Several other deploy variants (5-GPU A40, additional 4-GPU 80GB configs) were
+tried during setup and later pruned from the repo — the only one kept is
+`longcat_next_4gpu_80gb_multi_decoder.yaml` (used throughout this doc), for
+the **2-stage** `multi_decoder` pipeline, because the alternative 3-stage
+`longcat_next` pipeline has a real bug: the
 orchestrator's `_forward_to_next_stage` always forwards `src_stage_id + 1`'s
 own output, never consulting a stage's declared `input_sources`, so the
 audio decoder (stage 2) always receives the image decoder's output (stage
@@ -212,12 +213,16 @@ python pbs/scripts/longcat_next_wired_e2e.py \
     /workspace/results --modality audio   # or --modality image
 ```
 
+(`pbs/` was a scratch directory of one-off HPC job/debug scripts, removed
+from the repo before this PR — the command above is preserved here as a
+historical record of what was run, not a script you can invoke today.)
+
 Both modalities reach `verdict: PASS` (correct output *shape*/*file
 written*) with this setup, but that only validates pipeline wiring — see
-`pbs/scripts/longcat_next_debug_quality.py` for evidence that generation
-*quality* has separate, unresolved bugs (garbage text on a plain
-non-multimodal prompt, and an audio-codes accumulation bug that drops all
-but the last generated frame before it reaches the client).
+`pbs/scripts/longcat_next_debug_quality.py` (also removed, see above) for
+evidence that generation *quality* has separate, unresolved bugs (garbage
+text on a plain non-multimodal prompt, and an audio-codes accumulation bug
+that drops all but the last generated frame before it reaches the client).
 
 ## 10. Quality debugging log (post-wiring)
 
@@ -237,8 +242,8 @@ branch — check `git log` for the commit named in each item).
 - Deploy YAML stage-0 `default_sampling_params` were `0.4/–/0.9/1.05`
   (temperature/top_k/top_p/repetition_penalty); the reference's own
   `test_cases.yaml` uses `0.4/20/0.85/1.1` for this exact text-generation
-  profile. `pbs/scripts/longcat_next_debug_quality.py`'s `run_text` had the
-  same gap — it used `0.4/20/0.85` but omitted `repetition_penalty`
+  profile. `pbs/scripts/longcat_next_debug_quality.py`'s (removed, see §9)
+  `run_text` had the same gap — it used `0.4/20/0.85` but omitted `repetition_penalty`
   entirely, silently falling back to vLLM's default of `1.0` (no penalty).
   This alone was the fix for the *original* symptom (`finish_reason=length`,
   output degenerating into a repeated-digit loop): with `repetition_penalty=1.1`
