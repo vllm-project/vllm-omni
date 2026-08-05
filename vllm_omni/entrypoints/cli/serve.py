@@ -147,7 +147,7 @@ class OmniServeCommand(CLISubcommand):
                 raise ValueError(
                     "The following CLI args are not supported under --omni: "
                     f"{', '.join(offenders)}. Configure parallelism through the "
-                    "per-stage YAML (`--deploy-config` / `--stage-configs-path`) "
+                    "per-stage YAML (`--deploy-config`) "
                     "and replica count via the per-stage `num_replicas` config field "
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
@@ -240,20 +240,11 @@ class OmniServeCommand(CLISubcommand):
                 "flag, when set, overrides the YAML model field."
             ),
         )
-        # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
-        omni_config_group.add_argument(
-            "--stage-configs-path",
-            type=str,
-            default=None,
-            help="[Deprecated — will be removed in a future release] Path to a legacy "
-            "stage configs YAML (stage_args format). Prefer --deploy-config for new-format deploy YAMLs.",
-        )
         omni_config_group.add_argument(
             "--deploy-config",
             type=str,
             default=None,
-            help="Path to a deploy config YAML (new format with stages/engine_args). "
-            "Mutually exclusive with --stage-configs-path.",
+            help="Path to a deploy config YAML (new format with stages/engine_args).",
         )
         omni_config_group.add_argument(
             "--strategy-config",
@@ -714,6 +705,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
+            "--text-encoder-tp-size",
+            type=int,
+            default=1,
+            help="Tensor-parallel degree for the diffusion text encoder. "
+            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
+            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
+        )
+        omni_config_group.add_argument(
             "--vae-parallel-mode",
             type=str,
             default="tile",
@@ -837,7 +837,6 @@ def run_headless(args: TrackingNamespace) -> None:
     omni_master_address: str | None = args.omni_master_address
     omni_master_port: int | None = args.omni_master_port
     worker_backend: str | None = args.worker_backend
-    stage_configs_path: str | None = args.stage_configs_path
     omni_replica_address: str | None = getattr(args, "omni_replica_address", None)
     omni_dp_size_local: int = max(1, int(getattr(args, "omni_dp_size_local", 1) or 1))
 
@@ -873,7 +872,8 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        stage_configs_path,
+        # The serve CLI no longer accepts legacy stage_args YAMLs.
+        None,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.

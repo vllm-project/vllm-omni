@@ -598,7 +598,7 @@ class OmniServerStageCli(OmniServer):
             "serve",
             self.model,
             "--omni",
-            "--stage-configs-path",
+            "--deploy-config",
             self.stage_config_path,
             "--stage-id",
             str(stage_id),
@@ -3135,7 +3135,7 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
+            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -3151,7 +3151,7 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
+                server_args += ["--deploy-config", stage_config_path]
 
             with (
                 OmniServer(

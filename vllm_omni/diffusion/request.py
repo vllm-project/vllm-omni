@@ -41,11 +41,10 @@ class OmniDiffusionRequest:
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
-        # Detect whether user explicitly provided guidance_scale.
-        # The unset sentinel is None (see OmniDiffusionSamplingParams); any value
-        # the caller set -- including an explicit 0.0 (disable CFG) -- must be
-        # honored. Resolve before auto-filling guidance_scale_2, else the sentinel
-        # leaks into guidance_scale_2.
+        # Detect whether the caller explicitly provided guidance_scale before
+        # resolving the omitted value.  ``0.0`` is API-valid and must not be
+        # treated as omission because that would unexpectedly enable CFG in
+        # pipelines with a model-specific default above zero.
         if self.sampling_params.guidance_scale is not None:
             self.sampling_params.guidance_scale_provided = True
         else:

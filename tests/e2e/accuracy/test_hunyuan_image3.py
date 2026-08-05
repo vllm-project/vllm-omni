@@ -359,12 +359,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     return image, cot_text, elapsed
 
 
-def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_online(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
     server_args = [
-        "--stage-configs-path",
-        stage_configs_path,
+        "--deploy-config",
+        deploy_config_path,
         "--stage-init-timeout",
         "300",
         "--init-timeout",

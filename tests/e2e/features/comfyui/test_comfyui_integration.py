@@ -25,9 +25,15 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateVideo,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
+    VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
 )
-from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams, WanModelSpecificParams
+from comfyui_vllm_omni.utils.types import (
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    MiniMaxH3ModelSpecificParams,
+    WanModelSpecificParams,
+)
 from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
@@ -68,6 +74,8 @@ class SamplingKind(str, Enum):
     TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
+    VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
+    VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
 
 
 # Pre-defined arguments to be used in function calls during the tests
@@ -126,6 +134,15 @@ AR_LIST_SAMPLING_PARAMS = [
 ]
 
 VIDEO_MODEL_PARAMS = WanModelSpecificParams({"guidance_scale_2": 5.0, "boundary_ratio": 0.98, "flow_shift": 12.0})
+
+# Matches MiniMax-H3 recipe Ref2VA defaults (task is auto-routed by the client).
+H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
+    {
+        "type": "minimax_h3",
+        "audio_flow_shift": 3.0,
+        "flow_shift": 12.0,
+    }
+)
 
 LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
 
@@ -306,6 +323,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
         received_sampling_params_list: Sequence[OmniSamplingParams] | None = (
             args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
         )
+        prompt = args[0] if len(args) > 0 else kwargs.get("prompt")
 
         assert received_sampling_params_list is not None, (
             "In the current codebase, the API layer always provides not-None sampling parameter list when calling `AsyncOmni.generate`"
@@ -372,6 +390,59 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 LORA_PARAMS,
             )
             _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
+            assert len(received_sampling_params_list) == 1
+            assert isinstance(prompt, dict)
+            multi_modal_data = prompt.get("multi_modal_data")
+            assert isinstance(multi_modal_data, dict)
+            assert isinstance(multi_modal_data.get("image"), Image.Image)
+            assert isinstance(multi_modal_data.get("audio"), str)
+            assert "video" not in multi_modal_data
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_NUM_FRAMES,
+                    "fps": VIDEO_FPS,
+                },
+            )
+            _assert_model_param_values(
+                received_sampling_params_list[0],
+                {
+                    "flow_shift": 12.0,
+                    "task": "ref2va",
+                    "audio_flow_shift": 3.0,
+                },
+            )
+        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_MULTI_VIDEO:
+            assert len(received_sampling_params_list) == 1
+            assert isinstance(prompt, dict)
+            multi_modal_data = prompt.get("multi_modal_data")
+            assert isinstance(multi_modal_data, dict)
+            input_videos = multi_modal_data.get("video")
+            assert isinstance(input_videos, list)
+            assert len(input_videos) == 2
+            assert all(isinstance(path, str) for path in input_videos)
+            assert "image" not in multi_modal_data
+            assert "audio" not in multi_modal_data
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_NUM_FRAMES,
+                    "fps": VIDEO_FPS,
+                },
+            )
+            _assert_model_param_values(
+                received_sampling_params_list[0],
+                {
+                    "flow_shift": 12.0,
+                    "task": "ref2va",
+                    "audio_flow_shift": 3.0,
+                },
+            )
         else:
             raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
 
@@ -775,13 +846,89 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
         "model_params": VIDEO_MODEL_PARAMS,
     }
     if image_input:
-        kwargs["image"] = torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+        kwargs["frame"] = torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
     if sampling_case.sampling_params is not None:
         kwargs["sampling_params"] = sampling_case.sampling_params
     if sampling_case.lora:
         kwargs["lora"] = sampling_case.lora
 
     result = await node.generate(**kwargs)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case,sampling_case,ref_mode",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
+            "image_audio",
+            id="ref2va-image-audio",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
+            "multi_video",
+            id="ref2va-multi-video",
+        ),
+    ],
+    indirect=["server_case", "sampling_case"],
+)
+async def test_video_generation_node_minimax_h3_ref2va(
+    api_server: str,
+    sampling_case: SamplingCase,
+    ref_mode: str,
+):
+    """MiniMax-H3 Ref2VA paths matching recipes/MiniMaxAI/MiniMax-H3.md."""
+    node = VLLMOmniGenerateVideo()
+    refs_node = VLLMOmniVideoReferences()
+
+    if ref_mode == "image_audio":
+        (references,) = refs_node.get_references(
+            image_1=torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32),
+            audio_1={"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},
+        )
+        prompt = (
+            "A white cat with black mustache and eyebrow markings sits on a beige couch, "
+            "lip-syncing precisely to the complete reference audio."
+        )
+    elif ref_mode == "multi_video":
+        (references,) = refs_node.get_references(
+            video_1=VideoInput(b"subject-video"),  # type: ignore[reportAbstractUsage]
+            video_2=VideoInput(b"background-video"),  # type: ignore[reportAbstractUsage]
+        )
+        prompt = (
+            "Remove the green screen background of Video 1 and replace it with the fairytale environment from Video 2."
+        )
+    else:
+        raise AssertionError(f"Unknown ref_mode: {ref_mode}")
+
+    result = await node.generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-H3",
+        prompt=prompt,
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        num_frames=VIDEO_NUM_FRAMES,
+        references=references,
+        model_params=H3_MODEL_PARAMS,
+    )
 
     assert isinstance(result, tuple)
     assert len(result) == 1
