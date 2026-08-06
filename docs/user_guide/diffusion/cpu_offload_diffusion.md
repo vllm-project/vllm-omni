@@ -355,6 +355,7 @@ reasoner/generator components inside the model forward pass.
 |--------------|----------------|-----------|---------------------|-------------------|-------------------------------|-----------------------------------|
 | Flux2Pipeline | `black-forest-labs/FLUX.2-dev` | `Flux2Transformer2DModel` | ✓ | ✓ | - | `"transformer_blocks"`, `"single_transformer_blocks"` |
 | LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | - | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| JoyImageEditPipeline | `jdopensource/JoyAI-Image-Edit-Diffusers` | `JoyImageEditTransformer3DModel` | ✓ | ✓ | `"double_blocks"` |
 | NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | - | `"layers"` |
 | OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | - | `"transformer"` |
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | - | `"transformer_blocks"` |
