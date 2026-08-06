@@ -125,10 +125,24 @@ def _get_eval_device() -> str:
         return explicit
     try:
         import torch
-
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda:0"
+
+    # Ascend: ``torch.npu`` only exists once ``torch_npu`` has been imported, which does
+    # not necessarily happen in the benchmark client process. Without this branch the
+    # eval silently lands on CPU, where Whisper-large-v3 needs hours for a full Seed-TTS
+    # run and the CI job is killed by its timeout instead of reporting a WER.
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        pass
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu:0"
+
+    return "cpu"
 
 
 def _punctuation_all() -> str:

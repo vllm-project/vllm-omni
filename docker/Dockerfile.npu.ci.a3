@@ -44,6 +44,7 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "jiwer>=4.0.0" \
       "zhon>=2.1.1" \
       "zhconv>=1.4.3" \
+      "datasets>=3.0.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \
