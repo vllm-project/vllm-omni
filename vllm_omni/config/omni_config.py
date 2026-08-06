@@ -449,6 +449,7 @@ class _DiffusionConfigProjection:
     model: str | None = None
     model_class_name: str | None = None
     model_arch: str | None = None
+    task_type: str | None = None
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
@@ -679,6 +680,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "stage_id",
         "model",
         "model_arch",
+        "task_type",
         "dtype",
         "trust_remote_code",
         "revision",

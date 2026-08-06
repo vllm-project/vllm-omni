@@ -311,6 +311,8 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        role: str = "self",
+        role_category: str | None = None,
         skip_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -351,8 +353,9 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             # Packed rows reach the impl as [B, S, N, D].
             qkv_layout="BSND",
+            role=role,
+            role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
-            role="self",
             prefix=prefix,
         )
 
@@ -582,6 +585,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
             skip_sequence_parallel=True,
         )
         self.mlp = MiniMaxH3MLP(

@@ -68,12 +68,12 @@ nav:
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
         - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
-      - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+      - CPU Offloading: user_guide/diffusion/cpu_offload.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
       - Execution Modes: user_guide/diffusion/execution_modes.md
     - Quantization:
-      - Overview: user_guide/quantization/overview.md
+      - Quantization: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
@@ -106,7 +106,6 @@ nav:
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
-        - Ray-based Execution: design/feature/ray_based_execution.md
         - Async Chunk: design/feature/async_chunk.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
@@ -130,10 +129,11 @@ nav:
           - VAE Patch Parallelism: design/feature/vae_parallel.md
         - Attention Backends:
           - Skip-Softmax: design/feature/skip_softmax.md
-        - Quantization: user_guide/quantization/overview.md
+        - Quantization: design/feature/quantization.md
         - Cache-DiT: design/feature/cache_dit.md
         - TeaCache: design/feature/teacache.md
         - Diffusion Continuous Batching: design/feature/diffusion_continuous_batching.md
+        - Distributed Layerwise Offload: design/feature/distributed_layerwise_offload.md
     - Infrastructure and Performance:
       - Prometheus Metrics: design/metrics.md
       - Speech Generation Performance Optimizations: design/qwen3_omni_tts_performance_optimization.md
