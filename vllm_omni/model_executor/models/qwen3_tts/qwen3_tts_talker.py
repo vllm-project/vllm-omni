@@ -831,44 +831,46 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # (request-independent buffer) — no per-request fetch needed.
 
         tail = hs.get("trailing_text")
+        if not isinstance(tail, torch.Tensor) or tail.ndim != 2:
+            raise RuntimeError(
+                "Missing hidden_states['trailing_text'] for Qwen3-TTS decode; "
+                "the prefill/decode runtime state handoff is incomplete."
+            )
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
         trailing_text_update = None
-        if isinstance(tail, torch.Tensor) and tail.ndim == 2:
-            tail_len = int(tail.shape[0])
-            if text_offset < tail_len:
-                text_step = (
-                    tail[text_offset : text_offset + 1]
-                    .to(
-                        device=input_ids.device,
-                        dtype=dtype,
-                    )
-                    .reshape(1, -1)
+        tail_len = int(tail.shape[0])
+        if text_offset < tail_len:
+            text_step = (
+                tail[text_offset : text_offset + 1]
+                .to(
+                    device=input_ids.device,
+                    dtype=dtype,
                 )
-                next_text_offset = text_offset + 1
-                should_compact_tail = next_text_offset >= tail_len or (
-                    next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
-                )
-                if should_compact_tail:
-                    if next_text_offset >= tail_len:
-                        trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
-                    else:
-                        trailing_text_update = tail[next_text_offset:].contiguous()
-                    next_text_offset = 0
-            else:
-                text_step = tts_pad_embed
-                next_text_offset = 0
-                if tail.numel() > 0:
+                .reshape(1, -1)
+            )
+            next_text_offset = text_offset + 1
+            should_compact_tail = next_text_offset >= tail_len or (
+                next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
+            )
+            if should_compact_tail:
+                if next_text_offset >= tail_len:
                     trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
+                else:
+                    trailing_text_update = tail[next_text_offset:].contiguous()
+                next_text_offset = 0
         else:
             text_step = tts_pad_embed
-            next_text_offset = text_offset
+            next_text_offset = 0
+            if tail.numel() > 0:
+                trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
 
         last_hidden = hs.get("last")
-        if isinstance(last_hidden, torch.Tensor):
-            past_hidden = last_hidden.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
-        else:
-            # Defensive: EOS step row is zeroed by the invalid-layer-0 mask and filtered downstream.
-            past_hidden = torch.zeros_like(text_step)
+        if not isinstance(last_hidden, torch.Tensor):
+            raise RuntimeError(
+                "Missing hidden_states['last'] for Qwen3-TTS decode; "
+                "the prefill/decode runtime state handoff is incomplete."
+            )
+        past_hidden = last_hidden.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
@@ -1002,6 +1004,44 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return {}
         last = hidden_states[-1, :].detach()
         return {"hidden_states": {"last": last}}
+
+    def export_pd_decode_state(self, info_dict: dict[str, Any]) -> dict[str, Any]:
+        """Snapshot the non-KV state required to resume a PD decode worker."""
+        hidden_states = info_dict.get("hidden_states")
+        meta = info_dict.get("meta")
+        codes = info_dict.get("codes")
+        if not isinstance(hidden_states, dict) or not isinstance(meta, dict):
+            raise RuntimeError("Qwen3-TTS PD prefill did not produce runtime state")
+
+        last = hidden_states.get("last")
+        trailing_text = hidden_states.get("trailing_text")
+        if not isinstance(last, torch.Tensor) or not isinstance(trailing_text, torch.Tensor):
+            raise RuntimeError("Qwen3-TTS PD prefill state is missing hidden_states.last or trailing_text")
+
+        def _to_wire_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            # AdditionalInformationPayload serializes via Tensor.numpy(), which
+            # does not support bfloat16. Decode casts these back to its model
+            # dtype, so use FP32 only at this cross-process wire boundary.
+            tensor = tensor.detach()
+            if tensor.is_floating_point():
+                tensor = tensor.to(dtype=torch.float32)
+            return tensor.to("cpu").contiguous()
+
+        state: dict[str, Any] = {
+            "hidden_states": {
+                "last": _to_wire_tensor(last),
+                "trailing_text": _to_wire_tensor(trailing_text),
+            },
+            "meta": {
+                "talker_text_offset": int(meta.get("talker_text_offset", 0) or 0),
+                "codec_streaming": bool(meta.get("codec_streaming", False)),
+            },
+        }
+        if isinstance(codes, dict) and isinstance(codes.get("ref"), torch.Tensor):
+            state["codes"] = {"ref": _to_wire_tensor(codes["ref"])}
+        if meta.get("ref_code_len") is not None:
+            state["meta"]["ref_code_len"] = int(meta["ref_code_len"])
+        return state
 
     @torch.inference_mode()
     def preprocess_batch(
@@ -1311,3 +1351,4 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
+

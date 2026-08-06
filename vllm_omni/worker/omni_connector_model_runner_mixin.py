@@ -147,6 +147,25 @@ class OmniConnectorModelRunnerMixin:
         # -- next stage ID (from connector config or default stage_id + 1) --
         self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
+        # -- fan-in source candidates (multiple engine_input_source) --
+        # A fan-in receiver (e.g. 1P3D code2wav reading from decode stages
+        # [1, 2, 3]) cannot rely on the single ``stage_id - 1`` default: with
+        # round-robin routing each request comes from a different upstream, so
+        # a fixed ``stage_id - 1`` default would deadlock waiting on an upstream
+        # that never sends this request. Use the full candidate list instead.
+        omni_kv_config = getattr(model_config, "omni_kv_config", None)
+        if not isinstance(omni_kv_config, dict):
+            omni_kv_config = {}
+        raw_sources = omni_kv_config.get("engine_input_source") or []
+        source_candidates: list[int] = []
+        for src in raw_sources:
+            coerced = self._coerce_stage_id(src)
+            if coerced is not None and coerced not in source_candidates:
+                source_candidates.append(coerced)
+        self._source_stage_candidates: list[int] = source_candidates
+        # req_id -> upstream stage id, pinned after the first successful pull.
+        self._pinned_source_stage: dict[str, int] = {}
+
         # -- heterogeneous TP rank support --
         rank_cfg = self._parse_rank_mapping(model_config)
         if self._kv_transfer_manager is not None:
@@ -226,11 +245,8 @@ class OmniConnectorModelRunnerMixin:
         # -- KV transfer lifecycle (absorbed from scheduler) --
         # Requests marked for KV transfer: {req_id: {seq_len, block_ids}}
         self._kv_pending_transfers: dict[str, dict[str, Any]] = {}
-        # Requests whose KV transfer has been submitted but not yet acked
         self._kv_active_transfers: set[str] = set()
-        # Requests whose KV transfer is complete (acked by kv_extracted_req_ids)
         self._kv_completed_transfers: set[str] = set()
-        # Dedup guard: requests that have already triggered KV transfer
         self._kv_triggered_requests: set[str] = set()
 
         self._lock = threading.Lock()
@@ -368,6 +384,7 @@ class OmniConnectorModelRunnerMixin:
         self._finished_load_reqs.discard(req_id)
         self._chunk_ready_req_ids.discard(req_id)
         self._chunk_finished_req_ids.discard(req_id)
+        self._pinned_source_stage.pop(req_id, None)
         self._chunk_stream_completed.discard(req_id)
         self._stage_recv_req_ids.discard(req_id)
         self._full_payload_pending_broadcast_req_ids.discard(req_id)
@@ -1782,25 +1799,50 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        target_stage_id = self._stage_id - 1
+        with self._lock:
+            pending_request = self._pending_load_reqs.get(req_id)
+        configured_from_stage = self._stage_id - 1
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        if self._async_chunk:
-            result = self._recv_async_chunk_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
+        # Decide which upstream source(s) to poll for this request:
+        #   1. explicit ``omni_source_stage_id`` carried on the request,
+        #   2. a source already pinned from a prior chunk of this request,
+        #   3. fan-in discovery across every candidate source (probe all),
+        #   4. legacy single-source default (``stage_id - 1``).
+        explicit_source = self._request_source_stage_id_optional(pending_request)
+        pinned_source = self._pinned_source_stage.get(req_id)
+        if explicit_source is not None:
+            poll_targets = [explicit_source]
+        elif pinned_source is not None:
+            poll_targets = [pinned_source]
+        elif len(self._source_stage_candidates) > 1:
+            poll_targets = list(self._source_stage_candidates)
         else:
-            result = self._recv_full_payload_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
+            poll_targets = [configured_from_stage]
+
+        result = None
+        for candidate in poll_targets:
+            candidate_key = f"{external_req_id}_{candidate}_{chunk_id}"
+            if self._async_chunk:
+                candidate_result = self._recv_async_chunk_result(
+                    connector,
+                    str(candidate),
+                    str(self._stage_id),
+                    candidate_key,
+                )
+            else:
+                candidate_result = self._recv_full_payload_result(
+                    connector,
+                    str(candidate),
+                    str(self._stage_id),
+                    candidate_key,
+                )
+            if candidate_result is not None:
+                result = candidate_result
+                if pinned_source is None:
+                    self._pinned_source_stage[req_id] = candidate
+                break
 
         if result is None:
             return False
@@ -1810,11 +1852,10 @@ class OmniConnectorModelRunnerMixin:
             return False
         if isinstance(payload_data, dict):
             logger.debug(
-                "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
+                "[Stage-%s] recv_chunk_result: req=%s ext=%s keys=%s finished=%s",
                 self._stage_id,
                 req_id,
                 external_req_id,
-                connector_get_key,
                 sorted(payload_data.keys()),
                 self._payload_finished(payload_data),
             )
@@ -1886,14 +1927,12 @@ class OmniConnectorModelRunnerMixin:
                 self._full_payload_pending_broadcast_req_ids.add(req_id)
                 self._pending_load_reqs.pop(req_id, None)
             logger.debug(
-                "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
+                "[Stage-%s] full_payload recv complete: req=%s payload_type=%s",
                 self._stage_id,
                 req_id,
-                connector_get_key,
                 type(engine_inputs).__name__,
             )
 
-        logger.debug("[Stage-%s] Received data for key %s", self._stage_id, connector_get_key)
         return True
 
     def _build_custom_process_payload(
@@ -2238,6 +2277,42 @@ class OmniConnectorModelRunnerMixin:
                 return ext
         return fallback_req_id
 
+    @staticmethod
+    def _coerce_stage_id(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _request_source_stage_id_optional(self, request: Any | None) -> int | None:
+        """Return the explicit ``omni_source_stage_id`` on a request, or None.
+
+        Unlike :meth:`_request_source_stage_id` this never falls back to a
+        default; callers use ``None`` to trigger fan-in source discovery.
+        """
+        info = getattr(request, "additional_information", None) if request is not None else None
+        if info is not None and not isinstance(info, dict):
+            try:
+                from vllm_omni.engine.serialization import deserialize_additional_information
+
+                info = deserialize_additional_information(info)
+            except Exception:
+                info = None
+        if isinstance(info, dict):
+            value = info.get("omni_source_stage_id")
+            if isinstance(value, list) and value:
+                value = value[0]
+            return self._coerce_stage_id(value)
+        return None
+
+    def _request_source_stage_id(self, request: Any | None, default: int) -> int:
+        parsed = self._request_source_stage_id_optional(request)
+        if parsed is not None:
+            return parsed
+        return default
+
     def _resolve_next_stage_id(self, model_config: Any) -> int:
         """Determine the downstream stage ID from connector config.
 
@@ -2254,6 +2329,17 @@ class OmniConnectorModelRunnerMixin:
                 return to_stage
             if isinstance(to_stage, str) and to_stage.strip():
                 return int(to_stage)
+
+        output_connectors = getattr(model_config, "output_connectors", None)
+        if isinstance(output_connectors, dict) and len(output_connectors) == 1:
+            name = next(iter(output_connectors))
+            if isinstance(name, str):
+                prefix = "to_stage_"
+                if name.startswith(prefix):
+                    parsed = self._coerce_stage_id(name[len(prefix) :])
+                    if parsed is not None:
+                        return parsed
+
         return self._stage_id + 1
 
     @staticmethod
@@ -2339,3 +2425,4 @@ class OmniConnectorModelRunnerMixin:
     ) -> str:
         """Build connector key that includes rank info for KV transfers."""
         return f"{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}"
+
