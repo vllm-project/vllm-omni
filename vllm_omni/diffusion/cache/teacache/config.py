@@ -83,6 +83,14 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # MiniMax-H3 FL2VA coefficients.
+    "MiniMaxH3DiTModel": [
+        2.210461643219394e03,
+        -6.747740038005920e02,
+        6.979341505760931e01,
+        -2.043813595649431e00,
+        1.535414497110105e-01,
+    ],
 }
 
 

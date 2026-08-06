@@ -354,6 +354,51 @@ audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
 resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
 reduction.
 
+## TeaCache acceleration
+
+TeaCache reuses DiT block residuals across denoising steps when consecutive
+timestep embeddings are similar. H3 is CFG-distilled, so TeaCache hooks the
+single `MiniMaxH3DiTModel` forward per step.
+
+TeaCache and Cache-DiT are mutually exclusive; pick one cache backend per server.
+
+### Offline (Python API)
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model=f"{MODEL_ROOT}/FL2VA",
+    cache_backend="tea_cache",
+    cache_config={"rel_l1_thresh": 0.2},
+    trust_remote_code=True,
+    enable_cpu_offload=True,
+)
+outputs = omni.generate(
+    "A quiet cinematic night scene with matching ambient sound.",
+    OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=29,
+        fps=24,
+        num_inference_steps=50,
+        seed=42,
+        extra_args={"task": "t2va", "flow_shift": 12.0, "audio_flow_shift": 3.0},
+    ),
+)
+```
+
+### Online serving
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.2}'
+```
+
 ## Known limitations
 
 - Each server process loads only one checkpoint partition.
@@ -361,6 +406,7 @@ reduction.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
 - Online FP8 is not compatible with layerwise offload.
+- TeaCache and Cache-DiT cannot be enabled on the same server.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone
   audio reference.
