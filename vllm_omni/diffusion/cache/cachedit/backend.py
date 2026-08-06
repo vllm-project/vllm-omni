@@ -3,10 +3,13 @@
 
 """Generic Cache-DiT backend lifecycle and integration."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import cache_dit
+import torch.nn as nn
 from cache_dit import BlockAdapter, DBCacheConfig
 from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from vllm.logger import init_logger
@@ -18,6 +21,9 @@ from vllm_omni.diffusion.cache.cachedit.config import (
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+
 logger = init_logger(__name__)
 
 RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
@@ -27,7 +33,7 @@ CacheDiTEnabler: TypeAlias = Callable[[Any, DiffusionCacheConfig], RefreshCacheC
 CUSTOM_DIT_ENABLERS: dict[str, CacheDiTEnabler] = {}
 
 
-def _dit_module_names(pipeline: Any) -> tuple[str, ...]:
+def _dit_module_names(pipeline: SupportsComponentDiscovery) -> tuple[str, ...]:
     """Return the pipeline DiT attributes that are present at runtime."""
     names = getattr(pipeline, "_dit_modules", None)
     if not isinstance(names, (list, tuple)):
@@ -35,7 +41,7 @@ def _dit_module_names(pipeline: Any) -> tuple[str, ...]:
     return tuple(name for name in names if isinstance(name, str) and getattr(pipeline, name, None) is not None)
 
 
-def cache_summary(pipeline: Any, details: bool = True) -> None:
+def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) -> None:
     """Log Cache-DiT statistics for every transformer on the pipeline."""
 
     transformers = [getattr(pipeline, name) for name in _dit_module_names(pipeline)]
@@ -46,26 +52,34 @@ def cache_summary(pipeline: Any, details: bool = True) -> None:
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
-def _default_get_pipeline_transformer(pipeline: Any) -> Any:
-    return pipeline.transformer
+def _default_get_pipeline_transformer(
+    pipeline: SupportsComponentDiscovery,
+) -> nn.Module:
+    return cast(nn.Module, getattr(pipeline, "transformer"))
 
 
-def _make_pipeline_transformer_getter(name: str) -> Callable[[Any], Any]:
-    def get_pipeline_transformer(pipeline: Any) -> Any:
-        return getattr(pipeline, name)
+def _make_pipeline_transformer_getter(
+    name: str,
+) -> Callable[[SupportsComponentDiscovery], nn.Module]:
+    def get_pipeline_transformer(
+        pipeline: SupportsComponentDiscovery,
+    ) -> nn.Module:
+        return cast(nn.Module, getattr(pipeline, name))
 
     return get_pipeline_transformer
 
 
 def _build_cache_context_refresh(
     cache_config: DiffusionCacheConfig,
-    get_pipeline_transformer: Callable[[Any], Any] = _default_get_pipeline_transformer,
+    get_pipeline_transformer: Callable[[SupportsComponentDiscovery], nn.Module] = _default_get_pipeline_transformer,
 ) -> RefreshCacheContextFunc:
     """Build the cache context refresh callback for one transformer."""
 
     projected_config = CacheDiTConfig.from_diffusion_config(cache_config)
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         transformer = get_pipeline_transformer(pipeline)
 
         # Cache-DiT has no predefined SCM mask for these small step counts.
@@ -91,11 +105,11 @@ def _build_cache_context_refresh(
 
 
 def enable_cache_for_dit(
-    pipeline: Any,
+    pipeline: SupportsComponentDiscovery,
     cache_config: DiffusionCacheConfig,
     block_adapter: BlockAdapter | None = None,
     adapter_cls: type[CachedAdapter] | None = None,
-    get_pipeline_transformer: Callable[[Any], Any] = _default_get_pipeline_transformer,
+    get_pipeline_transformer: Callable[[SupportsComponentDiscovery], nn.Module] = _default_get_pipeline_transformer,
 ) -> RefreshCacheContextFunc:
     """Enable Cache-DiT for a standard single-transformer DiT pipeline."""
 
@@ -144,8 +158,8 @@ def enable_cache_for_dit(
 
 
 def _maybe_build_block_adapter(
-    pipeline: Any,
-    get_pipeline_transformer: Callable[[Any], Any] = _default_get_pipeline_transformer,
+    pipeline: SupportsComponentDiscovery,
+    get_pipeline_transformer: Callable[[SupportsComponentDiscovery], nn.Module] = _default_get_pipeline_transformer,
 ) -> BlockAdapter | None:
     """Build the model-declared block adapter, when one is configured."""
 
@@ -176,8 +190,8 @@ def _maybe_build_block_adapter(
 
 
 def _maybe_get_cached_adapter_cls(
-    pipeline: Any,
-    get_pipeline_transformer: Callable[[Any], Any] = _default_get_pipeline_transformer,
+    pipeline: SupportsComponentDiscovery,
+    get_pipeline_transformer: Callable[[SupportsComponentDiscovery], nn.Module] = _default_get_pipeline_transformer,
 ) -> type[CachedAdapter] | None:
     """Return the custom cached adapter declared by the transformer."""
 
@@ -200,7 +214,7 @@ class CacheDiTBackend(CacheBackend):
         super().__init__(config)
         self._refresh_funcs: list[RefreshCacheContextFunc] = []
 
-    def enable(self, pipeline: Any) -> None:
+    def enable(self, pipeline: SupportsComponentDiscovery) -> None:
         pipeline_name = type(pipeline).__name__
         custom_enabler = CUSTOM_DIT_ENABLERS.get(pipeline_name)
         if custom_enabler is not None:
@@ -227,7 +241,7 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
         if not self.enabled or not self._refresh_funcs:
             logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
             return
