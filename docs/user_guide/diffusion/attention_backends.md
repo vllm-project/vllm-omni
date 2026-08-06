@@ -14,7 +14,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 
 | Value | Notes |
 |---|---|
-| `TRTLLM_ATTN` | FlashInfer's trtllm-gen FMHA (TensorRT-LLM's generated kernels, vendored by FlashInfer). BF16, GQA native, `head_dim=128`. Datacenter Blackwell only (sm_100 / sm_103). Supports **Skip-Softmax** sparse attention — see below. Requires `flashinfer`. |
+| `TRTLLM_ATTN` | FlashInfer's trtllm-gen FMHA (TensorRT-LLM's generated kernels, vendored by FlashInfer). Dense BF16, GQA native, `head_dim=128`. Datacenter Blackwell only (sm_100 / sm_103). Packed paths can provide `cu_seqlens` directly. Supports optional **Skip-Softmax** sparse attention — see below. Requires `flashinfer`. |
 | `FLASH_ATTN` | Wraps FlashAttention 4 on Blackwell when `flash-attn-4` is installed, then falls back to FlashAttention 3/2. Default on Hopper / Ada / Ampere when a compatible FlashAttention package is installed. |
 | `CUDNN_ATTN` | Pins `sdpa_kernel([CUDNN_ATTENTION])`. Default on Blackwell (sm_10x / sm_12x) with cuDNN ≥ 9.5. Wins on mask-heavy DiTs (HunyuanVideo-1.5: 2× e2e vs SDPA). |
 | `FLASHINFER_ATTN` | Calls FlashInfer's dense `single_prefill_with_kv_cache` directly with `custom_mask` for non-causal masked attention. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer`. |
@@ -105,7 +105,7 @@ A plain dict is also accepted and normalized to `AttentionConfig`.
 
 Auto-route preference, in order:
 
-1. `TRTLLM_ATTN` — on **datacenter** Blackwell (sm_100 / sm_103) when `flashinfer` is installed, the model's `head_dim` is 128, **and the model is mask-free** (see below)
+1. `TRTLLM_ATTN` — on **datacenter** Blackwell (sm_100 / sm_103) when `flashinfer` is installed, the model's `head_dim` is 128, **and the model declares a compatible packed/mask-free path**
 2. `CUDNN_ATTN` — when cuDNN ≥ 9.5 is available (ships in PyTorch 2.5+ wheels)
 3. `FLASHINFER_ATTN` — when `flashinfer` is installed but cuDNN < 9.5
 4. `FLASH_ATTN` — when `flash-attn` is installed with the Blackwell CUTE kernel
@@ -113,7 +113,7 @@ Auto-route preference, in order:
 
 `TRTLLM_ATTN` is skipped on workstation Blackwell (sm_120 / sm_121) and for any `head_dim != 128`, so those GPUs keep the `CUDNN_ATTN` route described below.
 
-`TRTLLM_ATTN` outranks `CUDNN_ATTN` on datacenter Blackwell because it is the only backend that can enable Skip-Softmax, not because its dense kernel is faster — dense, the two are comparable. It cannot honor an attention mask, so the auto-default only applies to pipelines verified mask-free (the Wan family); mask-using pipelines keep `CUDNN_ATTN`. `TRTLLM_ATTN` stays available everywhere via explicit `--diffusion-attention-backend TRTLLM_ATTN` (which raises clearly if a mask is received).
+`TRTLLM_ATTN` outranks `CUDNN_ATTN` on datacenter Blackwell for compatible packed/mask-free pipelines. Workstation Blackwell (sm_120 / sm_121) and pipelines that require attention masks retain their normal fallback.
 
 The startup log line `Defaulting to diffusion attention backend CUDNN_ATTN (Blackwell sm_120, cuDNN 91002)` confirms the route.
 
