@@ -75,11 +75,18 @@ def _create_hsdp_mesh(
 
     # Create DeviceMesh with the shard ProcessGroup
     # For the shard dimension, we reuse the existing FS ProcessGroup
-    device_mesh = init_device_mesh(
-        device_type,
-        mesh_shape=(replicate_size, shard_size),
-        mesh_dim_names=("replicate", "shard"),
-    )
+    if replicate_size > 1:
+        device_mesh = init_device_mesh(
+            device_type,
+            mesh_shape=(replicate_size, shard_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+    else:
+        device_mesh = init_device_mesh(
+            device_type,
+            mesh_shape=(shard_size,),
+            mesh_dim_names=("shard",),
+        )
 
     # Note: init_device_mesh creates new ProcessGroups internally.
     # For consistency, we verify the mesh structure matches our FS group.
