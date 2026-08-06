@@ -13,7 +13,6 @@ while the source paths remain stable so existing links continue to work.
 ### Runtime and stage execution
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
-- [Ray-based Execution](feature/ray_based_execution.md)
 - [Async Chunk](feature/async_chunk.md)
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
@@ -48,11 +47,12 @@ while the source paths remain stable so existing links continue to work.
 
 #### Quantization
 
-- [Quantization Overview](../user_guide/quantization/overview.md)
+- [Quantization](feature/quantization.md)
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
+- [Distributed Layerwise Offload](feature/distributed_layerwise_offload.md)
 
 ## Infrastructure and Performance
 

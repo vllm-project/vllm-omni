@@ -280,8 +280,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             exc,
                         )
                 else:
-                    self._compile_transformer("transformer")
-                    self._compile_transformer("transformer_2")
+                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+                    if not transformer_attrs:
+                        transformer_attrs = ("transformer", "transformer_2")
+                    for attr_name in transformer_attrs:
+                        self._compile_transformer(attr_name)
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",

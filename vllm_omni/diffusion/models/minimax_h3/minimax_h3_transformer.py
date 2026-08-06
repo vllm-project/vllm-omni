@@ -26,7 +26,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -134,6 +134,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_pos_for_infer_output_info",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        "video_token_layout",
     }
 )
 
@@ -310,6 +311,8 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        role: str = "self",
+        role_category: str | None = None,
         skip_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -348,7 +351,12 @@ class MiniMaxH3Attention(nn.Module):
             head_size=self.head_dim,
             softmax_scale=self.softmax_scale,
             causal=False,
+            # Packed rows reach the impl as [B, S, N, D].
+            qkv_layout="BSND",
+            role=role,
+            role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
+            prefix=prefix,
         )
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -374,6 +382,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -407,6 +416,7 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
             },
+            video_layout=video_layout,
         )
         return self.attention(
             q.unsqueeze(0),
@@ -424,6 +434,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         packed_total: int | None = None,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -463,6 +474,7 @@ class MiniMaxH3Attention(nn.Module):
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
+            video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -573,6 +585,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
             skip_sequence_parallel=True,
         )
         self.mlp = MiniMaxH3MLP(
@@ -642,6 +656,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
+        # The prefix also carries the block index that block-sparse attention
+        # backends match against their skip_layers selector.
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -672,6 +688,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         max_seqlen: int,
         packed_total: int,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -699,6 +716,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             packed_total=packed_total,
             sp_seq_lens=sp_seq_lens,
+            video_layout=video_layout,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -831,6 +849,10 @@ class MiniMaxH3DiTModel(nn.Module):
         },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
+    # The checkpoint already stores qkv and the MLP gate/up as single tensors
+    # (see the reordering in load_weights), so there are no unfused names for
+    # quantization or LoRA to map onto. Address the fused layers directly, e.g.
+    # ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
@@ -1097,6 +1119,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+        video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1145,6 +1168,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                video_layout=video_layout,
             )
         hidden = self.sp_gather(hidden)
 

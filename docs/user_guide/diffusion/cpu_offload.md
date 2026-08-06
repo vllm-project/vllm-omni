@@ -184,10 +184,15 @@ class Flux2Transformer2DModel(nn.Module):
 ### How It Works
 
 Distributed layerwise offloading extends single-GPU layerwise offloading to
-multi-device deployments.  Each DP rank stores only **1/dp_size** of the model
-weights in host memory; full layer weights are reconstructed at runtime via
-**AllGather** on a dedicated communication stream, overlapped with computation
-via a fixed double-buffer scheme.
+multi-device deployments. In the default mode, each rank stores only
+**1/dp_size** of the model weights in host memory; full layer weights are
+reconstructed at runtime via **AllGather** on a dedicated communication stream,
+overlapped with computation via a fixed double-buffer scheme. The
+`--dlo-no-use-allgather` mode instead streams standard-loader rank-local
+weights independently and does not shard weights across ranks.
+
+For the implementation design and compatibility matrix, see
+[Distributed Layerwise Offload](../../design/feature/distributed_layerwise_offload.md).
 
 **Key features:**
 - **Weight sharding + AllGather**: each rank stores 1/dp_size of weights,
@@ -219,7 +224,7 @@ vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --data-parallel-size 4
 
-# Without AllGather (each rank loads full weights, no sharding)
+# Without DLO AllGather (each rank streams standard-loader rank-local weights)
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --data-parallel-size 4 \
@@ -247,9 +252,9 @@ m = Omni(
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
-| `--data-parallel-size N` | Number of DP ranks for weight sharding | `1` |
+| `--data-parallel-size N` | Number of DP ranks; DLO weight-sharding group when AllGather is enabled | `1` |
 | `--dlo-use-allgather` | Shard + AllGather (saves CPU, requires concurrent requests) | `true` |
-| `--dlo-no-use-allgather` | Full weights per rank (no sharding, no AllGather) | `false` |
+| `--dlo-no-use-allgather` | Use standard-loader rank-local weights; no DLO sharding or AllGather | `false` |
 
 ### How model weights are loaded (mmap path)
 
@@ -303,9 +308,15 @@ request while AllGather synchronizes only weight shards (request-independent).
 
 ### Limitations
 - Online quantization (FP8) is incompatible with mmap loading — falls back to
-  regular `load_weights()` automatically
-- Tensor Parallel is not supported (DLO uses DP-based sharding)
-- HSDP + AllGather is rejected (would double-shard weights)
+  regular loading only when the model is outside the DLO+AllGather mmap path;
+  online quantization with DLO+AllGather is rejected. Use
+  `--dlo-no-use-allgather` or disable online quantization.
+- Tensor Parallel > 1 is rejected in the DLO+AllGather mmap path because TP-aware
+  weight-loader callbacks are bypassed. The no-AllGather path retains the
+  standard TP loader and is experimental.
+- HSDP + AllGather is rejected because it would double-shard parameters. HSDP
+  with no-AllGather is accepted at configuration level, but has limited
+  end-to-end validation.
 - `num_inference_steps=None` is not allowed in DP multi-concurrency mode
 
 **Module Discovery**
@@ -338,7 +349,7 @@ OffloadBackend (base class)
 ├── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
 │                          (single-GPU, full weights on host)
 └── DistributedLayerwiseOffloadBackend → uses DistributedLayerwiseOffloadHook
-                                         (multi-GPU, 1/dp_size sharded weights + AllGather)
+                                         (multi-GPU, sharded AllGather or rank-local mode)
 ```
 
 Factory function `get_offload_backend()` selects the appropriate backend based on
@@ -369,4 +380,10 @@ reasoner/generator components inside the model forward pass.
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
 - Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attrs` pointing to transformer blocks
-- Distributed Layerwise Offloading works with any model that supports Layerwise Offloading — no additional model changes required.  See [Cosmos3 DistOffload recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md) for usage examples.
+- Distributed Layerwise Offloading reuses the layerwise block topology, but the
+  model and parallelism combination still needs validation. AllGather mode
+  additionally requires a compatible checkpoint/mmap layout; no-AllGather mode
+  retains the standard loader's rank-local tensors. See the
+  [DLO design](../../design/feature/distributed_layerwise_offload.md) and
+  [Cosmos3 DistOffload recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md)
+  for usage examples.

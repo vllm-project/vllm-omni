@@ -366,8 +366,8 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components plus any a pipeline opts into via
-        # ``_lora_components`` (opt-in; other pipelines unchanged).
+        # Default denoising components, declared DiT components, and any a
+        # pipeline opts into via ``_lora_components``.
         #
         # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
         # Without scanning this component, adapters can load/activate while
@@ -379,8 +379,10 @@ class DiffusionLoRAManager:
             "bagel",
             "unet",
         )
+        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
         extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
-        for component_name in (*default_components, *extra_components):
+        component_names = dict.fromkeys((*default_components, *declared_components, *extra_components))
+        for component_name in component_names:
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
