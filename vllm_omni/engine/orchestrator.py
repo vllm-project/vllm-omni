@@ -56,6 +56,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
@@ -197,6 +198,110 @@ def build_engine_core_request_from_tokens(
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
     )
+
+
+def _pd_scalar(value: Any) -> Any:
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return value.item()
+    return value
+
+
+def _extract_qwen3_tts_pd_decode_state(
+    multimodal_output: Any,
+    *,
+    resume_token_id: int,
+) -> dict[str, Any] | None:
+    """Extract Qwen3-TTS non-KV state for a decode continuation."""
+    if not isinstance(multimodal_output, dict):
+        return None
+    payload = unflatten_payload(multimodal_output)
+    hidden_states = payload.get("hidden_states")
+    meta = payload.get("meta")
+    if not isinstance(hidden_states, dict) or not isinstance(meta, dict):
+        return None
+
+    last = hidden_states.get("last")
+    trailing_text = hidden_states.get("trailing_text")
+    if not isinstance(last, torch.Tensor) or not isinstance(trailing_text, torch.Tensor):
+        return None
+
+    state: dict[str, Any] = {
+        "hidden_states": {"last": last, "trailing_text": trailing_text},
+        "meta": {
+            "talker_text_offset": int(_pd_scalar(meta.get("talker_text_offset", 0)) or 0),
+            "codec_streaming": bool(_pd_scalar(meta.get("codec_streaming", False))),
+        },
+    }
+    codes = payload.get("codes")
+    if isinstance(codes, dict) and isinstance(codes.get("ref"), torch.Tensor):
+        state["codes"] = {"ref": codes["ref"]}
+    if meta.get("ref_code_len") is not None:
+        state["meta"]["ref_code_len"] = int(_pd_scalar(meta["ref_code_len"]))
+
+    pd_sampler = payload.get("pd_sampler")
+    main_generator_state = pd_sampler.get("main_generator_state") if isinstance(pd_sampler, dict) else None
+    main_sampler_seed = _pd_scalar(pd_sampler.get("seed")) if isinstance(pd_sampler, dict) else None
+    if not isinstance(main_generator_state, torch.Tensor) or main_generator_state.dtype != torch.uint8:
+        raise RuntimeError("Qwen3-TTS PD prefill state is missing main sampler RNG state")
+    try:
+        main_sampler_seed = int(main_sampler_seed)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Qwen3-TTS PD prefill state has invalid main sampler seed") from exc
+    state["pd_sampler"] = {
+        "main_generator_state": main_generator_state,
+        "seed": main_sampler_seed,
+    }
+    # This is intentionally outside additional_information: it is a vLLM
+    # sequence token, not model-intermediate state. The D request must compute
+    # it as its first uncomputed token after restoring P's prompt KV.
+    state["_pd_resume_token_id"] = int(resume_token_id)
+    return state
+
+
+def _with_qwen3_tts_pd_decode_state(prompt: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Merge P-worker state and its sampled codec token into a D request."""
+    resume_token_id = state.get("_pd_resume_token_id")
+    if not isinstance(resume_token_id, int):
+        raise RuntimeError("Qwen3-TTS PD decode state is missing the prefill resume token")
+
+    merged_prompt = dict(prompt)
+    prompt_token_ids = merged_prompt.get("prompt_token_ids")
+    if not isinstance(prompt_token_ids, (list, tuple)):
+        raise TypeError("Qwen3-TTS PD decode requires prompt_token_ids")
+    # Keep D's sequence length equal to P's transferred KV prefix. Mooncake
+    # requires matching block counts and the first local decode position is
+    # filled with `resume_token_id` by GPUModelRunner after the prefix loads.
+    merged_prompt["prompt_token_ids"] = list(prompt_token_ids)
+
+    additional_information = merged_prompt.get("additional_information")
+    if additional_information is None:
+        additional_information = {}
+    elif not isinstance(additional_information, dict):
+        raise TypeError("Qwen3-TTS PD decode requires dictionary additional_information")
+    else:
+        additional_information = dict(additional_information)
+
+    for category, values in state.items():
+        if not isinstance(values, dict):
+            continue
+        existing = additional_information.get(category)
+        if existing is None:
+            target: dict[str, Any] = {}
+        elif isinstance(existing, dict):
+            target = dict(existing)
+        else:
+            raise TypeError(f"Qwen3-TTS PD decode additional_information.{category} must be a dictionary")
+        target.update(values)
+        additional_information[category] = target
+    # D receives P's KV only through the original prompt. Its runner injects
+    # this sampled codec token into the first local decode position after the
+    # remote prefix has loaded.
+    meta = additional_information.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        raise TypeError("Qwen3-TTS PD decode additional_information.meta must be a dictionary")
+    meta["pd_resume_token_id"] = resume_token_id
+    merged_prompt["additional_information"] = additional_information
+    return merged_prompt
 
 
 @dataclass
@@ -418,6 +523,7 @@ class Orchestrator:
         self.rpc_async_queue = rpc_async_queue
 
         self.async_chunk = bool(async_chunk)
+        self._pd_trace_enabled = os.getenv("VLLM_OMNI_PD_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
         self.log_stats = log_stats
@@ -1801,6 +1907,8 @@ class Orchestrator:
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
+                # [PD] Free the decode-replica inflight slot for this request.
+                self._release_pd_decode_for_request(request_id)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None:
                     cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
@@ -1814,6 +1922,65 @@ class Orchestrator:
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
         return abort_outputs
+
+    def _is_pd_prefill_stage(self, stage_id: int) -> bool:
+        return stage_id in self._pd_prefill_ids
+
+    def _is_pd_decode_stage(self, stage_id: int) -> bool:
+        return stage_id in self._pd_decode_ids
+
+    def _pd_decode_already_submitted(self, req_state: OrchestratorRequestState) -> bool:
+        return any(d_id in req_state.stage_submit_ts for d_id in self._pd_decode_ids)
+
+    def _peek_pd_decode_for_request(self, req_id: str) -> int | None:
+        return self._pd_request_to_decode.get(req_id)
+
+    def _release_pd_decode_for_request(self, req_id: str) -> int | None:
+        stage_id = self._pd_request_to_decode.pop(req_id, None)
+        if stage_id is None:
+            return None
+        cur = self._pd_decode_inflight.get(stage_id, 0)
+        self._pd_decode_inflight[stage_id] = max(0, cur - 1)
+        if self._pd_trace_enabled:
+            logger.info(
+                "[PD_TRACE] decode_release req=%s stage=%d inflight=%s",
+                req_id,
+                stage_id,
+                self._pd_decode_inflight,
+            )
+        return stage_id
+
+    def _pick_pd_decode_stage(self, req_id: str, bound_prefill_id: int | None) -> int:
+        if not self._pd_decode_ids:
+            raise RuntimeError("[Orchestrator][PD] No decode stage is configured")
+        existing = self._peek_pd_decode_for_request(req_id)
+        if existing is not None:
+            return existing
+
+        candidates = list(self._pd_decode_ids)
+        if bound_prefill_id is not None:
+            filtered = [d_id for d_id in candidates if bound_prefill_id in self._pd_decode_to_prefill.get(d_id, [])]
+            if filtered:
+                candidates = filtered
+            else:
+                logger.warning(
+                    "[Orchestrator][PD] No decode stage references bound prefill stage-%s; using all decode stages %s",
+                    bound_prefill_id,
+                    candidates,
+                )
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        elif self._pd_decode_pick_strategy == "least_inflight":
+            chosen = min(candidates, key=lambda d_id: (self._pd_decode_inflight.get(d_id, 0), d_id))
+        else:
+            idx = self._pd_decode_round_robin_idx % len(candidates)
+            chosen = candidates[idx]
+            self._pd_decode_round_robin_idx = (self._pd_decode_round_robin_idx + 1) % max(1, len(self._pd_decode_ids))
+
+        self._pd_request_to_decode[req_id] = chosen
+        self._pd_decode_inflight[chosen] = self._pd_decode_inflight.get(chosen, 0) + 1
+        return chosen
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -2320,11 +2487,22 @@ class Orchestrator:
 
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
-            if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
+            if not isinstance(kv_params, dict):
                 continue
 
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
+            is_pd_prefill = self._is_pd_prefill_stage(stage_id)
+            pd_submit_ready = is_pd_prefill and bool(kv_params.get("pd_submit_ready"))
+            kv_extraction_ack = bool(kv_params.get("kv_ready"))
+            if not pd_submit_ready and not kv_extraction_ack:
+                continue
+            # The extraction ACK arrives only after D has pulled KV. It is a
+            # producer-release event, not the signal to submit D; waiting for
+            # it here would form a P/D pull deadlock.
+            if is_pd_prefill and not pd_submit_ready:
+                logger.info("[PD_TRACE] qwen3_tts_kv_extraction_ack req=%s", req_id)
+                continue
             if req_state is None:
                 continue
             if self._cfg_tracker.is_companion(req_id):
@@ -2340,18 +2518,71 @@ class Orchestrator:
             if (stage_id + 1) in req_state.stage_submit_ts:
                 continue
 
+            # [PD] Qwen3-TTS prefill hands off non-KV state (hidden_states / codes /
+            # sampler RNG) plus the single sampled codec token that decode resumes
+            # from. Upstream has no equivalent -- its PD targets the Qwen3-Omni
+            # thinker, which needs only KV.
+            if self._is_pd_prefill_stage(stage_id):
+                # Keep producer metadata (notably remote_request_id) if an
+                # earlier output recorded it, then add this submit-ready event.
+                previous_kv_params = self._pd_kv_params.get(req_id, {})
+                previous_kv_params = (
+                    dict(previous_kv_params)
+                    if isinstance(previous_kv_params, dict)
+                    else dict(previous_kv_params)
+                )
+                self._pd_kv_params[req_id] = {**previous_kv_params, **kv_params}
+                resume_token_ids = list(getattr(raw_output, "new_token_ids", None) or [])
+                if len(resume_token_ids) != 1:
+                    raise RuntimeError(
+                        "[Orchestrator][PD] Qwen3-TTS prefill must hand off exactly one sampled codec token "
+                        f"for req={req_id}; got {resume_token_ids}"
+                    )
+                pd_decode_state = _extract_qwen3_tts_pd_decode_state(
+                    getattr(raw_output, "multimodal_output", None),
+                    resume_token_id=int(resume_token_ids[0]),
+                )
+                if pd_decode_state is None:
+                    raw_pd_state = getattr(raw_output, "multimodal_output", None)
+                    raw_pd_state_keys = sorted(raw_pd_state) if isinstance(raw_pd_state, dict) else []
+                    raise RuntimeError(
+                        f"[Orchestrator][PD] Missing Qwen3-TTS decode state for req={req_id}; "
+                        f"raw_state_keys={raw_pd_state_keys}"
+                    )
+                req_state.pd_prefill_multimodal_output = pd_decode_state
+                if self._pd_trace_enabled:
+                    prefill_submitted_at = req_state.stage_submit_ts.get(stage_id, req_state.request_timestamp)
+                    logger.info(
+                        "[PD_TRACE] prefill_submit_ready req=%s stage=%d residence_ms=%.3f remote_request_id=%s "
+                        "resume_token_id=%d state_keys=%s",
+                        req_id,
+                        stage_id,
+                        (_time.time() - prefill_submitted_at) * 1000.0,
+                        bool(self._pd_kv_params[req_id].get("remote_request_id")),
+                        int(pd_decode_state["_pd_resume_token_id"]),
+                        sorted(pd_decode_state),
+                    )
+
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, raw_output, stage_id)
             else:
                 await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
-    def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
+    def _build_pd_decode_params(
+        self,
+        req_id: str,
+        sp: Any,
+        prefill_stage_id: int | None = None,
+        main_sampler_seed: int | None = None,
+    ) -> Any:
         """Build decode-side sampling params with KV transfer params for PD routing.
 
         Clones the sampling params and injects kv_transfer_params that tell the
         decode engine where to pull the KV cache from (prefill engine's bootstrap addr).
         """
         sp = sp.clone()
+        if main_sampler_seed is not None:
+            sp.seed = int(main_sampler_seed)
         if sp.extra_args is None:
             sp.extra_args = {}
 
@@ -2372,8 +2603,15 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
-        decode_kv_params.update(kv_prefill_params)
+        # Overlay transport metadata from prefill. Lifecycle events are
+        # orchestrator-local and must not leak into the consumer connector.
+        decode_kv_params.update(
+            {
+                key: value
+                for key, value in kv_prefill_params.items()
+                if key not in {"pd_submit_ready", "kv_ready"}
+            }
+        )
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True
@@ -2640,46 +2878,66 @@ class Orchestrator:
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
-        if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
-            params = self._build_pd_decode_params(req_id, params)
+        # [PD] Multi-replica: pd_prefill_forward is computed from the id lists
+        # rather than upstream's single self._pd_pair equality check.
+        if pd_prefill_forward:
+            pd_decode_state = req_state.pd_prefill_multimodal_output
+            if not isinstance(pd_decode_state, dict):
+                raise RuntimeError(f"[Orchestrator][PD] Missing Qwen3-TTS state before decode submit for req={req_id}")
+            pd_sampler = pd_decode_state.get("pd_sampler")
+            sampler_seed = pd_sampler.get("seed") if isinstance(pd_sampler, dict) else None
+            if not isinstance(sampler_seed, int):
+                raise RuntimeError(f"[Orchestrator][PD] Missing Qwen3-TTS main sampler seed for req={req_id}")
+            params = self._build_pd_decode_params(
+                req_id,
+                params,
+                prefill_stage_id=src_stage_id,
+                main_sampler_seed=sampler_seed,
+            )
 
             # Use the original user prompt for the decode stage (not processed embeddings)
             original_prompt = req_state.prompt
             raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
 
-            decode_inputs: list[dict[str, Any]] = []
-            for decode_input in raw_decode_inputs:
-                if isinstance(decode_input, dict):
-                    decode_inputs.append(decode_input)
-                    continue
+            if len(raw_decode_inputs) != 1:
+                raise ValueError(
+                    "[Orchestrator][PD] Qwen3-TTS PD requires exactly one decode input per request; "
+                    f"got {len(raw_decode_inputs)} for req={req_id}"
+                )
+            decode_input = raw_decode_inputs[0]
+            if isinstance(decode_input, dict):
+                decode_prompt = _with_qwen3_tts_pd_decode_state(decode_input, pd_decode_state)
+            else:
                 prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
                 if prompt_token_ids is None:
                     raise TypeError(
                         "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
                         f"got {type(decode_input).__name__} for req={req_id}"
                     )
-                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
+                decode_prompt = _with_qwen3_tts_pd_decode_state(
+                    {"prompt_token_ids": list(prompt_token_ids)},
+                    pd_decode_state,
+                )
 
-            for decode_input in decode_inputs:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=decode_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=req_state.mm_features,
-                    resumable=next_stage_resumable,
-                )
-                request.external_req_id = request.request_id
-                if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                self._record_duplex_stage_submission(
-                    next_logical,
-                    req_id,
-                    replica_id,
-                    req_state,
-                )
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=decode_prompt,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=req_state.mm_features,
+                resumable=next_stage_resumable,
+            )
+            request.external_req_id = request.request_id
+            if already_submitted:
+                replica_id = await next_pool.submit_update(req_id, req_state, request)
+            else:
+                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            self._record_duplex_stage_submission(
+                next_logical,
+                req_id,
+                replica_id,
+                req_state,
+            )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
@@ -2691,6 +2949,18 @@ class Orchestrator:
                 request_id=req_id,
                 tx_ms=_tx_ms,
             )
+            if self._pd_trace_enabled:
+                logger.info(
+                    "[PD_TRACE] prefill_to_decode_submitted req=%s stage=%d->%d submit_ms=%.3f decode_inflight=%s",
+                    req_id,
+                    src_stage_id,
+                    next_logical,
+                    _tx_ms,
+                    self._pd_decode_inflight,
+                )
+            # NOTE: the inline async-chunk prewarm loop that used to live here was
+            # refactored upstream in 0.26 into _prewarm_async_chunk_stages(), which
+            # is driven from the request-admission path instead.
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
