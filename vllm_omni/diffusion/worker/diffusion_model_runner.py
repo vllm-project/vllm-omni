@@ -32,7 +32,12 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsPromptUpdate, supports_prompt_update, supports_step_execution
+from vllm_omni.diffusion.models.interface import (
+    SupportsPromptUpdate,
+    adopt_request_scoped_cache_dit,
+    supports_prompt_update,
+    supports_step_execution,
+)
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -304,7 +309,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.cache_backend = None
                 self.od_config.cache_backend = None
             else:
+                # Install configured cache capability once at startup. A model
+                # may explicitly adopt the enabled Cache-DiT backend and then
+                # own all later request-boundary enable/disable transitions.
                 self.cache_backend.enable(self.pipeline)
+                if str(self.od_config.cache_backend).lower() == "cache_dit" and adopt_request_scoped_cache_dit(
+                    self.pipeline,
+                    self.cache_backend,
+                ):
+                    logger.info(
+                        "Pipeline %s owns request-scoped Cache-DiT transitions.",
+                        type(self.pipeline).__name__,
+                    )
+                    self.cache_backend = None
 
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op

@@ -409,6 +409,34 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
+    def test_batches_omitted_and_explicit_lossless_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        omitted = scheduler.add_request(
+            _make_step_request(
+                "omitted",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "explicit",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    quality="lossless",
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [omitted]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
     def test_batches_different_request_local_seed_together(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))

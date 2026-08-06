@@ -57,7 +57,7 @@ class StepBatchSamplingParamsKey:
 
     # Request-scoped execution policy. A batch must use one quality mode
     # because model acceleration hooks are shared by the whole worker batch.
-    quality: str = "lossless"
+    quality: str | None = None
 
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
@@ -113,8 +113,9 @@ class RequestBatchSamplingParamsKey:
     use_en_prompt: bool = False
 
     # Request-scoped execution policy. Keep accelerated and reference-path
-    # requests in separate worker batches.
-    quality: str = "lossless"
+    # requests in separate worker batches. ``None`` delegates the default to
+    # the model and must remain distinct from explicit ``lossless``.
+    quality: str | None = None
 
     # LoRA identity.
     lora_int_id: int | None = None

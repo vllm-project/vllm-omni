@@ -131,6 +131,7 @@ class TestStreamingVideoOutputWebSocket:
         from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
         assert MiniMaxH3Pipeline._resolve_request_quality(sampling_params) == "high"
+        assert sampling_params.quality == "high"
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""

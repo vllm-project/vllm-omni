@@ -30,6 +30,69 @@ def test_offline_quality_reaches_h3_pipeline_boundary(quality: str):
     assert MiniMaxH3Pipeline._resolve_request_quality(batch.sampling_params) == quality
 
 
+def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va"})
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    cache_spec = object()
+    quality_plan = SimpleNamespace(cache_dit=cache_spec)
+    pipeline._quality_policy = Mock()
+    pipeline._quality_policy.resolve.return_value = quality_plan
+    events = []
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: events.append(("prepare", spec)))
+    pipeline.encode_prompt = Mock(
+        return_value=(
+            torch.ones(1, 2),
+            torch.ones(1, dtype=torch.long),
+        )
+    )
+
+    def diffuse(**kwargs):
+        events.append(("diffuse", kwargs))
+        return torch.zeros(1), torch.zeros(1)
+
+    pipeline.diffuse = diffuse
+    pipeline.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    sampling = OmniDiffusionSamplingParams(
+        quality="high",
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=50,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+    )
+    batch = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="quality boundary",
+                sampling_params=sampling,
+                request_id="quality-boundary",
+            )
+        ]
+    )
+
+    output = pipeline.forward(batch)
+
+    assert events[0] == ("prepare", cache_spec)
+    assert events[1][0] == "diffuse"
+    pipeline._quality_policy.resolve.assert_called_once_with(
+        quality="high",
+        num_inference_steps=50,
+    )
+    assert output.output == pipeline.decode.return_value
+
+
 def test_pipeline_import_registry_and_component_discovery():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.registry import (

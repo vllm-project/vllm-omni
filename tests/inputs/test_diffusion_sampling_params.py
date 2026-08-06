@@ -25,15 +25,16 @@ def test_from_params_returns_existing_omni_params() -> None:
     assert converted is params
 
 
-@pytest.mark.parametrize("quality", ["lossless", "high"])
+@pytest.mark.parametrize("quality", ["lossless", "high", "fast"])
 def test_quality_accepts_supported_request_levels(quality: str) -> None:
     params = OmniDiffusionSamplingParams(quality=quality)
 
     assert params.quality == quality
 
 
-def test_quality_defaults_to_lossless() -> None:
-    assert OmniDiffusionSamplingParams().quality == "lossless"
+def test_quality_defaults_to_model_owned_policy() -> None:
+    params = OmniDiffusionSamplingParams()
+    assert params.quality is None
 
 
 def test_quality_rejects_unsupported_request_level() -> None:

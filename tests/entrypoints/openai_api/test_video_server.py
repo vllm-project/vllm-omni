@@ -1445,7 +1445,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
-    assert req.quality == "lossless"
+    assert req.quality is None
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
@@ -2047,6 +2047,7 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_inference_steps == 4
     assert captured.guidance_scale == 7.5
+    assert captured.quality is None
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5

@@ -11,7 +11,7 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
-DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high", "fast")
 
 
 class OmniTextPrompt(TextPrompt):
@@ -210,11 +210,9 @@ class OmniDiffusionSamplingParams:
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
 
-    # Request-scoped quality policy. Models may opt into an accelerated
-    # implementation for "high"; "lossless" keeps the reference path.
-    # This field is intentionally model-agnostic so online and offline
-    # diffusion requests share the same runtime contract.
-    quality: str = "lossless"
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -346,7 +344,7 @@ class OmniDiffusionSamplingParams:
     output: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        if self.quality not in DIFFUSION_QUALITY_LEVELS:
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 
     @property

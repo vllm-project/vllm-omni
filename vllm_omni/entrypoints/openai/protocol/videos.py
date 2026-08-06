@@ -165,17 +165,21 @@ class VideoGenerationRequest(BaseModel):
     )
 
     # vllm-omni extensions for diffusion control
-    quality: str = Field(
-        default="lossless",
+    quality: str | None = Field(
+        default=None,
         description=(
-            "Request-level generation quality. 'lossless' uses the reference "
-            "path; 'high' opts into model-validated acceleration."
+            "Request-level generation quality. When omitted, the model chooses "
+            "its default policy; 'lossless' uses the reference path and 'high' "
+            "uses model-specific approximate acceleration intended to preserve "
+            "high output quality."
         ),
     )
 
     @field_validator("quality")
     @classmethod
-    def validate_quality(cls, value: str) -> str:
+    def validate_quality(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if value not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {value!r}")
         return value

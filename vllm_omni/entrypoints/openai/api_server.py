@@ -2811,7 +2811,7 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
         status=VideoGenerationStatus.QUEUED,
         size=req.size,
         prompt=req.prompt,
-        quality=req.quality,
+        quality=req.quality or "default",
     )
     resp.seconds = str(req.seconds or resp.seconds)
     return resp

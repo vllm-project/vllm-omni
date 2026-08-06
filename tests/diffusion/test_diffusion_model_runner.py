@@ -162,6 +162,17 @@ def _fake_platform_for_peak_memory():
     )
 
 
+def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
+    events = []
+    plain_pipeline = object()
+    request_scoped_pipeline = SimpleNamespace(adopt_cache_dit_backend=lambda backend: events.append(backend))
+    backend = object()
+
+    assert not model_runner_module.adopt_request_scoped_cache_dit(plain_pipeline, backend)
+    assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
+    assert events == [backend]
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

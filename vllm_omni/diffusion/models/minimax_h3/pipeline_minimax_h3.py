@@ -22,6 +22,10 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.cache.cachedit.backend import CacheDiTBackend
+from vllm_omni.diffusion.cache.cachedit.runtime import (
+    RequestScopedCacheDiTRuntime,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_dit_group,
@@ -74,6 +78,7 @@ from .presentation import (
     minimax_h3_ref2va_video_presentation,
     minimax_h3_text_only_ids,
 )
+from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .reference_video import (
     load_audio_file,
     load_video_audio,
@@ -542,9 +547,17 @@ class MiniMaxH3Pipeline(
     @staticmethod
     def _resolve_request_quality(
         sampling: OmniDiffusionSamplingParams,
-    ) -> str:
+    ) -> str | None:
         """Return the common request quality at the H3 pipeline boundary."""
         return sampling.quality
+
+    def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
+        """Adopt runner-installed generic Cache-DiT for request transitions."""
+
+        self._cache_dit_runtime.adopt(
+            backend,
+            installation_key=MINIMAX_H3_GENERIC_CACHE_KEY,
+        )
 
     def __init__(
         self,
@@ -683,6 +696,9 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        self._quality_policy = MiniMaxH3QualityPolicy(od_config)
+        self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
@@ -1742,6 +1758,11 @@ class MiniMaxH3Pipeline(
         num_steps = int(sampling.num_inference_steps or 50)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        quality_plan = self._quality_policy.resolve(
+            quality=quality,
+            num_inference_steps=num_steps,
+        )
+        self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         videos = []
         audios = []

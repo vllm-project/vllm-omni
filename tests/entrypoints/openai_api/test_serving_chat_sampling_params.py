@@ -327,6 +327,7 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(serving_chat, 
     assert sampling_params_list[0].extra_args == {"target_h": 512, "target_w": 768}
     diffusion_params = sampling_params_list[1]
     assert diffusion_params.num_inference_steps == 7
+    assert diffusion_params.quality is None
     assert (diffusion_params.height, diffusion_params.width) == (512, 768)
     assert diffusion_params.extra_args == {"solver": "euler"}
     assert captured["prompt"]["negative_prompt"] == "avoid blur"
