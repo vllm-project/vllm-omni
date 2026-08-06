@@ -28,6 +28,7 @@ from tests.e2e.accuracy.helpers import (
     model_output_dir,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
@@ -94,6 +95,7 @@ def _default_ar_dit_devices() -> tuple[str, str]:
 
 AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
+HUNYUAN_IMAGE_REF_PATH = get_asset_path("hunyuan/hunyuan_image_ref.png")
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
 
@@ -141,7 +143,6 @@ _DEPLOY_CONFIG = {
     "connectors": {
         "shared_memory_connector": {
             "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [
@@ -298,7 +299,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -331,7 +332,10 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if ro and getattr(ro, "outputs", None):
             cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not cot_text:
-            ar_text = getattr(out, "custom_output", {}).get("ar_generated_text")
+            multimodal_output = getattr(out, "multimodal_output", {}) or {}
+            metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+            text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+            ar_text = text_metadata.get("ar_generated_text") if isinstance(text_metadata, dict) else None
             if isinstance(ar_text, list):
                 cot_text = "\n".join(text for text in ar_text if text)
             else:
@@ -355,16 +359,17 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     return image, cot_text, elapsed
 
 
-def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_online(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
     server_args = [
-        "--stage-configs-path",
-        stage_configs_path,
+        "--deploy-config",
+        deploy_config_path,
         "--stage-init-timeout",
         "300",
         "--init-timeout",
         "900",
+        "--trust-remote-code",
     ]
     try:
         with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
@@ -411,7 +416,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
     torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
     reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
 )
-def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
+def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     """Online API test: same pipeline, same seed as offline → PSNR >= 10 dB."""
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
@@ -428,7 +433,7 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path, accuracy_
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
     cot_results = scorer.text_similarity(online_cot, COT_REF)
-    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
 
@@ -488,7 +493,12 @@ def _run_dit_model(
         os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
 
     try:
-        with OmniRunner(model, deploy_config=deploy_config_path, mode="text-to-image") as runner:
+        with OmniRunner(
+            model,
+            deploy_config=deploy_config_path,
+            mode="text-to-image",
+            trust_remote_code=True,
+        ) as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
             params = OmniDiffusionSamplingParams(
                 height=QUANT_HEIGHT,
@@ -521,7 +531,7 @@ def _run_dit_model(
     torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
     reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
 )
-def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
+def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
     from tabulate import tabulate  # lazy import
@@ -537,7 +547,7 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
     cot_results = scorer.text_similarity(omni_cot, COT_REF)
-    image_ref = Image.open(str(accuracy_assets_root / "hunyuan_image_ref.png")).convert("RGB")
+    image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
     ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
 

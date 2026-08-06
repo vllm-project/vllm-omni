@@ -30,7 +30,10 @@ from vllm.v1.engine.utils import (
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.engine.stage_init_utils import (
+    maybe_apply_audex_cfg_patches,
+    set_death_signal,
+)
 
 logger = init_logger(__name__)
 
@@ -50,6 +53,13 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
+        """Preserve omni payloads when vLLM builds its scheduler request."""
+        scheduler_request, current_wave = super().preprocess_add_request(request)
+        scheduler_request.additional_information = request.additional_information
+        scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
+        return scheduler_request, current_wave
 
     @staticmethod
     def run_stage_core(
@@ -123,6 +133,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # Audex CFG scheduler patches must land before EngineCore builds
+            # its Scheduler; gated on the stage's logits_processors config.
+            maybe_apply_audex_cfg_patches(kwargs.get("vllm_config"))
 
             engine_core = StageEngineCoreProc(
                 *args,

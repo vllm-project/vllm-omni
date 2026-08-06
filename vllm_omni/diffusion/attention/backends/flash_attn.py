@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -82,6 +83,28 @@ class FlashAttentionImpl(AttentionImpl):
     def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
         return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
 
+    @staticmethod
+    def _flash_varlen_wrapper(q, k, v, *, attn_func, causal, softmax_scale, **kwargs):
+        """Call a varlen-only FlashAttention backend for a dense segment."""
+        del kwargs
+        batch_size, q_len = q.shape[:2]
+        k_len = k.shape[1]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, k_len, dtype=torch.int32, device=q.device)
+        out = attn_func(
+            q=q.flatten(0, 1),
+            k=k.flatten(0, 1),
+            v=v.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=k_len,
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )
+        out = FlashAttentionImpl._unwrap_flash_output(out)
+        return out.reshape(batch_size, q_len, *out.shape[1:])
+
     def _forward_varlen_masked(
         self,
         query: torch.Tensor,
@@ -117,6 +140,46 @@ class FlashAttentionImpl(AttentionImpl):
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
+
+    def _forward_varlen_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Run FlashAttention directly on an already packed sequence.
+
+        Some diffusion transformers already maintain exact packed-document
+        boundaries. Reusing those boundaries avoids rebuilding boolean masks
+        and gathering/scattering Q/K/V in every attention layer.
+        """
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
+        if flash_attn_varlen_func is None:
+            raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
+        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError("Packed variable-length attention currently requires batch size 1")
+
+        out = flash_attn_varlen_func(
+            q=query.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        out = self._unwrap_flash_output(out)
+        return out.reshape_as(query)
 
     def _forward_varlen_dense(
         self,
@@ -171,6 +234,7 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
             flash_attn_func,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -182,14 +246,23 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        extra = attn_metadata.extra if attn_metadata is not None else {}
 
         # Try piecewise attention
         if full_attn_spans is not None:
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
-            attn_func = partial(
-                FlashAttentionImpl._flash_wrapper,
-                attn_func=flash_attn_func,
-            )
+            if flash_attn_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_wrapper,
+                    attn_func=flash_attn_func,
+                )
+            elif flash_attn_varlen_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_varlen_wrapper,
+                    attn_func=flash_attn_varlen_func,
+                )
+            else:
+                raise ImportError("Piecewise FlashAttention requires a dense or varlen FlashAttention function")
 
             return piecewise_attn(
                 query,
@@ -198,6 +271,23 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
+            )
+
+        packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+        present_packed_keys = [key for key in packed_keys if key in extra]
+        if present_packed_keys:
+            if len(present_packed_keys) != len(packed_keys):
+                missing = sorted(set(packed_keys) - set(present_packed_keys))
+                raise ValueError(f"Incomplete packed FlashAttention metadata; missing {missing}")
+            return self._forward_varlen_packed(
+                query,
+                key,
+                value,
+                cu_seqlens_q=extra["cu_seqlens_q"],
+                cu_seqlens_k=extra["cu_seqlens_k"],
+                max_seqlen_q=extra["max_seqlen_q"],
+                max_seqlen_k=extra["max_seqlen_k"],
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

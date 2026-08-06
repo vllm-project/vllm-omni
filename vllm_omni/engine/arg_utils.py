@@ -9,7 +9,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
@@ -23,6 +23,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
+    # PersonaPlex ships an empty config.json, so create_model_config() must patch
+    # model_type=personaplex from the arch name or the staged pipeline can't load
+    # the HF config without manual overrides.
+    "PersonaPlexTalkerForConditionalGeneration": "personaplex",
+    "PersonaPlexCode2Wav": "personaplex",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -47,6 +52,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
+        )
+        from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+            PersonaPlexConfig,
         )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
@@ -74,6 +82,7 @@ def _register_omni_hf_configs() -> None:
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
+        ("personaplex", PersonaPlexConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
@@ -159,10 +168,14 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    # Engine admission is the single source of truth for per-stage pools of
+    # model-owned streaming state (codec, decoder, and similar resources).
+    duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -341,7 +354,9 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
+            duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
@@ -393,7 +408,7 @@ class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
 # Fields in ``SHARED_FIELDS`` (e.g. ``model``, ``log_stats``) flow to BOTH
 # orchestrator and engine by design.
 #
-# Invariants enforced by ``tests/test_arg_utils.py``:
+# Invariants enforced by ``tests/engine/test_arg_utils_shared_fields.py``:
 #
 #   1. ``OrchestratorArgs`` ∩ ``OmniEngineArgs`` ⊆ ``SHARED_FIELDS``
 #   2. Every CLI flag is classifiable into one of the three buckets
@@ -423,7 +438,6 @@ class OrchestratorArgs:
     init_timeout: int = 600
 
     # === Cross-stage Communication ===
-    shm_threshold_bytes: int = 65536
     batch_timeout: int = 10
 
     # === Cluster / Backend ===
@@ -434,6 +448,9 @@ class OrchestratorArgs:
     stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
+    # derived sizing onto merged stages, then drops it before per-stage engine args.
+    strategy_config: str | None = None
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
@@ -457,12 +474,15 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
@@ -473,6 +493,9 @@ class OrchestratorArgs:
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -481,6 +504,7 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
+    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

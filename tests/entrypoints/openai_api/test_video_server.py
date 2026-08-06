@@ -12,11 +12,12 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
@@ -44,34 +45,41 @@ class MockVideoResult:
         videos,
         audios=None,
         sample_rate=None,
-        custom_output=None,
+        multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
     ):
-        self.multimodal_output = {"video": videos}
+        self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
-        self._custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
-
-    @property
-    def custom_output(self):
-        return self._custom_output
 
 
 class FakeAsyncOmni:
     def __init__(self):
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
+        self.model_class_name = "WanPipeline"
         self.captured_prompt = None
+        self.captured_reference_video_bytes = None
         self.captured_sampling_params_list = None
+
+    def get_diffusion_od_config(self):
+        return SimpleNamespace(model_class_name=self.model_class_name)
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        reference_videos = prompt.get("multi_modal_data", {}).get("video")
+        if (
+            isinstance(reference_videos, list)
+            and reference_videos
+            and all(isinstance(item, str) for item in reference_videos)
+        ):
+            self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
@@ -483,7 +491,7 @@ def test_v2v_video_generation_form(test_client, mocker: MockerFixture):
     assert input_video[0].size == (32, 24)
 
 
-def test_v2v_video_generation_with_video_reference_form(test_client, mocker: MockerFixture):
+def test_r9_typed_video_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
@@ -502,8 +510,113 @@ def test_v2v_video_generation_with_video_reference_form(test_client, mocker: Moc
 
     engine = test_client.app.state.openai_serving_video._engine_client
     input_video = engine.captured_prompt["multi_modal_data"]["video"]
-    assert len(input_video) == 2
-    assert input_video[0].size == (32, 24)
+    assert len(input_video) == 1
+    assert all(isinstance(item, str) for item in input_video)
+    assert engine.captured_reference_video_bytes is not None
+    assert len(engine.captured_reference_video_bytes) == 1
+    assert b"ftyp" in engine.captured_reference_video_bytes[0][:32]
+
+
+def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "Use both references.",
+            "image_reference": json.dumps(
+                [
+                    {"image_url": _make_test_image_data_url((40, 24))},
+                    {"image_url": _make_test_image_data_url((40, 24))},
+                ]
+            ),
+            "video_reference": json.dumps(
+                {"video_url": _make_test_video_data_url((32, 24), 2)},
+            ),
+            "audio_reference": json.dumps(
+                [{"audio_url": "data:audio/mp3;base64,ZmFrZQ=="}],
+            ),
+            "extra_params": json.dumps({"task": "ref2va", "frame_indices": [0, -1], "start_time_seconds": 1.5}),
+            "num_outputs_per_prompt": "2",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert len(multi_modal_data["image"]) == 2
+    assert len(multi_modal_data["video"]) == 1
+    assert all(isinstance(item, str) for item in multi_modal_data["video"])
+    assert engine.captured_reference_video_bytes is not None
+    assert len(engine.captured_reference_video_bytes) == 1
+    assert b"ftyp" in engine.captured_reference_video_bytes[0][:32]
+    assert isinstance(multi_modal_data["audio"], str)
+    assert engine.captured_sampling_params_list[0].num_outputs_per_prompt == 2
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_multi_video_generation_preserves_uploaded_files_until_generation(
+    endpoint,
+    test_client,
+    mocker: MockerFixture,
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Composite the subject from the first video into the second.",
+            "extra_params": json.dumps({"task": "ref2va", "duration": 15.0}),
+        },
+        files=[
+            ("input_references", ("subject.png", _make_test_image_bytes((40, 24)), "image/png")),
+            ("input_references", ("subject.mp4", b"subject-video", "video/mp4")),
+            ("input_references", ("background.mov", b"background-video", "video/quicktime")),
+            ("input_references", ("voice.wav", b"reference-audio", "audio/wav")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint.endswith("/sync"):
+        assert response.content == b"fake-video"
+    else:
+        video_id = response.json()["id"]
+        _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_videos = engine.captured_prompt["multi_modal_data"]["video"]
+    assert engine.captured_reference_video_bytes == [b"subject-video", b"background-video"]
+    assert len(input_videos) == 2
+    assert all(not Path(path).exists() for path in input_videos)
+    assert isinstance(engine.captured_prompt["multi_modal_data"]["image"], Image.Image)
+    assert isinstance(engine.captured_prompt["multi_modal_data"]["audio"], str)
+    assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
+    assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
+
+
+def test_decode_video_bytes_can_keep_first_frames():
+    from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
+
+    frames = _decode_video_bytes(
+        _make_test_video_bytes((32, 24), num_frames=6),
+        source="input_reference",
+        max_frames=2,
+        keep="first",
+    )
+
+    assert len(frames) == 2
+    assert frames.fps == pytest.approx(8.0)
+    red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
+    assert red_means[0] < red_means[1]
+    assert red_means[1] < 100
 
 
 def test_decode_video_bytes_can_keep_last_frames():
@@ -835,7 +948,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
 
-        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+            multimodal_output={
+                "video": [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 
@@ -939,11 +1058,16 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -981,11 +1105,16 @@ def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -1019,12 +1148,41 @@ def test_action_extraction_accepts_unbatched_action():
 
     result = MockVideoResult(
         [object()],
-        custom_output={
-            "action": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
-            "raw_action_dim": 2,
-            "action_mode": "policy",
-            "domain_id": 7,
+        multimodal_output={
+            "video": [object()],
+            "actions": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
         },
+    )
+
+    actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
+
+    assert actions and actions[0] is not None
+    assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
+    assert actions[0].shape == [2, 2]
+
+
+def test_action_extraction_accepts_multimodal_actions_payload():
+    import numpy as np
+
+    result = MockVideoResult([object()])
+    result.multimodal_output.update(
+        {
+            "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
+        }
     )
 
     actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
@@ -1032,6 +1190,9 @@ def test_action_extraction_accepts_unbatched_action():
     assert actions[0] is not None
     assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
     assert actions[0].shape == [2, 2]
+    assert actions[0].raw_action_dim == 2
+    assert actions[0].action_mode == "policy"
+    assert actions[0].domain_id == 7
 
 
 def test_missing_handler_returns_503():
@@ -1093,17 +1254,67 @@ def test_rejects_input_reference_and_image_reference_together(test_client):
     assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
 
 
-def test_rejects_image_reference_and_video_reference_together(test_client):
+def test_r10_typed_image_and_video_reference_form(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
     response = test_client.post(
         "/v1/videos",
         data={
-            "prompt": "bad refs",
-            "image_reference": '{"image_url": "https://example.com/cat.png"}',
-            "video_reference": '{"video_url": "https://example.com/cat.mp4"}',
+            "prompt": "use both references",
+            "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
+            "video_reference": json.dumps({"video_url": _make_test_video_data_url((32, 24), 2)}),
         },
     )
+    assert response.status_code == 200
+    _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+
+
+def test_generic_video_model_rejects_mixed_image_and_video_references(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "use both references",
+            "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
+            "video_reference": json.dumps({"video_url": _make_test_video_data_url((32, 24), 2)}),
+        },
+    )
+
     assert response.status_code == 400
-    assert "only one of input_reference, image_reference, or video_reference" in response.json()["detail"].lower()
+    assert "does not support mixed image and video" in response.json()["detail"].lower()
+
+
+def test_h3_multipart_rejects_bmp_image_reference(test_client):
+    image = Image.new("RGB", (64, 64), color="blue")
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, format="BMP")
+
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject unsupported image container", "extra_params": '{"task":"ref2va"}'},
+        files=[("input_references", ("reference.bmp", image_buffer.getvalue(), "image/bmp"))],
+    )
+
+    assert response.status_code == 400
+    assert "must use jpg" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_h3_upload_limit_checks_declared_size_before_read():
+    class OversizedUpload:
+        size = api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES + 1
+
+        async def read(self, _size):
+            raise AssertionError("the oversized upload must be rejected before reading")
+
+    with pytest.raises(HTTPException, match="size limit"):
+        await api_server._read_upload_limited(
+            OversizedUpload(),
+            max_bytes=api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
+        )
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -1840,7 +2051,13 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     async def _generate(prompt, request_id, sampling_params_list):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
-        yield MockVideoResult([object()], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [object()],
+            multimodal_output={
+                "video": [object()],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 

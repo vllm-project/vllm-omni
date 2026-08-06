@@ -18,6 +18,8 @@ from tests.helpers.runtime import DiffusionResponse, OmniRunnerHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
+# NOTE: Most of the flux2klein tests have migrated to the common diffusion tests.
+# This model will also use the tiny model builder when run at the core model level.
 MODEL = "black-forest-labs/FLUX.2-klein-4B"
 
 _OMNI_RUNNER_PARAM = (MODEL, None)
@@ -64,41 +66,6 @@ def _send_inpaint_with_generator(
                 num_inference_steps=_NUM_INFERENCE_STEPS,
                 guidance_scale=0.0,
                 generator=generator,
-                num_outputs_per_prompt=1,
-            ),
-        }
-    )
-
-
-# Regression test for https://github.com/vllm-project/vllm-omni/issues/3097
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-def test_flux2_klein_can_accept_text_inputs(omni_runner_handler: OmniRunnerHandler):
-    omni_runner_handler.send_diffusion_request(
-        {
-            "model": MODEL,
-            "prompt": "a cup of coffee on the table",
-            "sampling_params": OmniDiffusionSamplingParams(num_inference_steps=2, seed=42),
-        }
-    )
-
-
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_flux2_klein_inpaint_basic(omni_runner_handler: OmniRunnerHandler):
-    input_image, mask_image = _create_test_inputs()
-    omni_runner_handler.send_diffusion_request(
-        {
-            "model": MODEL,
-            "prompt": "Fill in the masked area with a beautiful garden",
-            "multi_modal_data": {"image": input_image, "mask_image": mask_image},
-            "sampling_params": OmniDiffusionSamplingParams(
-                height=_HEIGHT,
-                width=_WIDTH,
-                num_inference_steps=_NUM_INFERENCE_STEPS,
-                guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                 num_outputs_per_prompt=1,
             ),
         }

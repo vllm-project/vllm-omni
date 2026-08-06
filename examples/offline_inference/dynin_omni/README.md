@@ -1,4 +1,4 @@
-# Dynin-Omni Offline End2End Example
+# Dynin-Omni: Offline inference
 
 This folder contains a unified offline inference entrypoint:
 

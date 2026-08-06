@@ -23,6 +23,7 @@ _IM_END_TOKEN_ID = 151645
 
 MIMO_AUDIO_PIPELINE = PipelineConfig(
     model_type="mimo_audio",
+    default_deploy_config_name="mimo_audio.yaml",
     # HF ``architectures: ["MiMoAudioModel"]`` is also the registry key in
     # ``model_executor/models/registry.py``; it resolves to the internal
     # class ``MiMoAudioForConditionalGeneration`` in ``mimo_audio.py``.
@@ -56,7 +57,6 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.llm2code2wav",
             sync_process_input_func=f"{_PROC}.llm2code2wav_token_only",
             sampling_constraints={"detokenize": False},
         ),

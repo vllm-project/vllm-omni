@@ -8,8 +8,8 @@
 
 - Vendor: Tencent Hunyuan
 - Model: `tencent/HunyuanImage-3.0-Instruct`
-- Task: Text-to-image generation
-- Mode: Online serving and performance benchmarking, DiT stage only
+- Task: Text-to-image generation; text-to-text and image-to-text understanding
+- Mode: Offline understanding, online serving, and performance benchmarking
 - Maintainer: Community
 
 ## When to use this recipe
@@ -31,8 +31,10 @@ FP8/NVFP4 configuration:
 ## References
 
 - Model: <https://huggingface.co/tencent/HunyuanImage-3.0-Instruct>
-- Offline example:
+- Existing model-specific offline example:
   [`examples/offline_inference/hunyuan_image3`](../../examples/offline_inference/hunyuan_image3)
+- Shared T2T/I2T example:
+  [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Related PRs:
   [#2495](https://github.com/vllm-project/vllm-omni/pull/2495) for DiT performance CI,
   [#3055](https://github.com/vllm-project/vllm-omni/pull/3055) for GEBench accuracy CI,
@@ -41,6 +43,31 @@ FP8/NVFP4 configuration:
 ## Hardware Support
 
 ## GPU
+
+### Shared T2T/I2T offline example
+
+For text-to-text, the shared x-to-text example automatically selects the
+AR-only Hunyuan deploy config and applies the checkpoint's prompt tokens and
+stop-token rules:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --prompt "Explain why the sky appears blue."
+```
+
+Add `--image` for image-to-text:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --image /path/to/input.jpg \
+  --prompt "Describe the content of this image."
+```
+
+The AR-only default uses four GPUs. Pass `--deploy-config` to override the
+layout. Image-output tasks remain documented by the existing model-specific
+example and the DiT sections below.
 
 ### 4x H100/H800 80GB
 
@@ -137,10 +164,11 @@ curl -s http://localhost:8091/v1/chat/completions \
 PR [#2495](https://github.com/vllm-project/vllm-omni/pull/2495) adds
 performance CI configs for the same DiT-only settings. The CI step is
 currently opt-in (gated by `RUN_HUNYUAN_IMAGE3_PERF=1`) with `soft_fail`
-enabled, intended for initial data collection. Performance assertions are
-skipped (`skip-performance-assertion: true`); the baseline values in the
-JSON configs are reference-only and will be promoted to regression gates
-once enough nightly data has been collected.
+enabled, intended for initial data collection. Perf runners no longer
+compare metrics against JSON baselines at assert time; the `baseline`
+blocks in the configs are reference-only and are copied into result JSON
+for reporting. Regression gates can be reintroduced once enough nightly
+data has been collected.
 
 The user-facing equivalent is to launch one of the CLI commands above and
 generate 1024x1024 images with 50 denoising steps.

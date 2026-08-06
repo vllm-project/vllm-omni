@@ -16,14 +16,12 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
-      - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
-      - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
+      - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
@@ -38,7 +36,7 @@ nav:
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
-      - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
+      - MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
@@ -56,6 +54,7 @@ nav:
     - Diffusion Features:
       - Overview: user_guide/diffusion_features.md
       - Feature Compatibility: user_guide/feature_compatibility.md
+      - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
@@ -72,14 +71,14 @@ nav:
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
-      - Request-Level Batching: user_guide/diffusion/request_batching.md
-      - Step Execution: user_guide/diffusion/step_execution.md
+      - Execution Modes: user_guide/diffusion/execution_modes.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
       - ModelOpt: user_guide/quantization/modelopt.md
@@ -102,30 +101,49 @@ nav:
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
-    - design/architecture_overview.md
+    - Architecture Documents:
+      - Architecture Overview: design/architecture_overview.md
     - Feature Design:
-      - design/feature/disaggregated_inference.md
-      - design/feature/ray_based_execution.md
-      - design/feature/omni_connectors/
-      - design/feature/prefix_caching.md
-      - design/feature/cfg_parallel.md
-      - design/feature/expert_parallel.md
-      - design/feature/sequence_parallel.md
-      - design/feature/tensor_parallel.md
-      - design/feature/vae_parallel.md
-      - design/feature/hsdp.md
-      - design/feature/cache_dit.md
-      - design/feature/teacache.md
-      - design/feature/async_chunk.md
-      - design/feature/vae_parallel.md
-      - design/feature/diffusion_step_execution.md
-      - design/feature/diffusion_request_level_batching.md
-      - design/feature/diffusion_continuous_batching.md
+      - Runtime and Stage Execution:
+        - Disaggregated Inference: design/feature/disaggregated_inference.md
+        - Ray-based Execution: design/feature/ray_based_execution.md
+        - Async Chunk: design/feature/async_chunk.md
+        - Async Diffusion Output: design/feature/async_diffusion_output.md
+        - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
+        - Automatic Prefix Caching: design/feature/prefix_caching.md
+      - Communication:
+        - OmniConnector Implementations:
+          - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md
+          - Mooncake Transfer Engine Connector: design/feature/omni_connectors/mooncake_transfer_engine_connector.md
+          - Mori Transfer Engine Connector: design/feature/omni_connectors/mori_transfer_engine_connector.md
+          - Shared Memory Connector: design/feature/omni_connectors/shared_memory_connector.md
+          - Yuanrong Store Connector: design/feature/omni_connectors/yuanrong_connector.md
+          - Yuanrong Transfer Engine Connector: design/feature/omni_connectors/yuanrong_transfer_engine_connector.md
+      - Diffusion Acceleration:
+        - Parallelism:
+          - CFG-Parallel: design/feature/cfg_parallel.md
+          - Expert Parallel: design/feature/expert_parallel.md
+          - Hybrid Sharded Data Parallel (HSDP): design/feature/hsdp.md
+          - Pipeline Parallel: design/feature/pipeline_parallel.md
+          - Sequence Parallel: design/feature/sequence_parallel.md
+          - Tensor Parallel: design/feature/tensor_parallel.md
+          - VAE Patch Parallelism: design/feature/vae_parallel.md
+        - Attention Backends:
+          - Skip-Softmax: design/feature/skip_softmax.md
+        - Quantization: user_guide/quantization/overview.md
+        - Cache-DiT: design/feature/cache_dit.md
+        - TeaCache: design/feature/teacache.md
+        - Diffusion Continuous Batching: design/feature/diffusion_continuous_batching.md
+    - Infrastructure and Performance:
+      - Prometheus Metrics: design/metrics.md
+      - Speech Generation Performance Optimizations: design/qwen3_omni_tts_performance_optimization.md
     - Module Design:
-      - design/module/ar_module.md
-      - design/module/dit_module.md
-      - design/module/entrypoint_module.md
-      - design/module/async_omni_architecture.md
+      - Runtime Modules:
+        - AR Module: design/module/ar_module.md
+        - DIT Module: design/module/dit_module.md
+      - Orchestration:
+        - Entrypoint Module: design/module/entrypoint_module.md
+        - AsyncOmni Architecture: design/module/async_omni_architecture.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md

@@ -16,20 +16,11 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
-import enum
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
-
-# Python 3.10 compat: StrEnum was added in 3.11
-if not hasattr(enum, "StrEnum"):
-
-    class _StrEnum(str, enum.Enum):
-        """Minimal StrEnum backport for Python 3.10."""
-
-    enum.StrEnum = _StrEnum  # type: ignore[attr-defined]
-
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
@@ -90,28 +81,37 @@ def _make_audio_omni_output(
     request_id: str = "test-req",
     index: int = 0,
     num_prompt_tokens: int = 3,
+    stage_id: int | None = None,
+    replica_id: int | None = None,
+    audio_samples: int = 0,
 ) -> OmniRequestOutput:
     """Build an OmniRequestOutput for audio (no torch dependency)."""
+    completion = CompletionOutput(
+        index=index,
+        text="",
+        token_ids=[],
+        cumulative_logprob=0.0,
+        logprobs=None,
+        finish_reason="stop",
+        stop_reason=None,
+    )
+    if audio_samples > 0:
+        completion.multimodal_output = {
+            "audio": [MagicMock(numel=MagicMock(return_value=audio_samples))],
+            "sr": 24000,
+        }
     res = RequestOutput(
         request_id=request_id,
         prompt="test",
         prompt_token_ids=list(range(num_prompt_tokens)),
         prompt_logprobs=None,
-        outputs=[
-            CompletionOutput(
-                index=index,
-                text="",
-                token_ids=[],
-                cumulative_logprob=0.0,
-                logprobs=None,
-                finish_reason="stop",
-                stop_reason=None,
-            )
-        ],
+        outputs=[completion],
         finished=True,
     )
     return OmniRequestOutput(
         request_id=request_id,
+        stage_id=stage_id,
+        replica_id=replica_id,
         final_output_type="audio",
         request_output=res,
         finished=True,
@@ -144,7 +144,7 @@ def _build_serving_chat():
         engine_client=mock_engine,
         models=models,
         response_role="assistant",
-        openai_serving_render=mock_render,
+        online_renderer=mock_render,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
@@ -331,6 +331,74 @@ async def test_single_modality_audio_only_one_stop():
     assert finish_reasons[-1] == "stop"
 
 
+@pytest.mark.parametrize(
+    ("output_replica_id", "pool_replica_id", "expected_replica_id", "pool_lookup"),
+    [
+        (7, None, 7, False),
+        (None, 5, 5, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_streaming_audio_metrics_resolve_replica_id(
+    monkeypatch,
+    output_replica_id,
+    pool_replica_id,
+    expected_replica_id,
+    pool_lookup,
+):
+    import vllm_omni.entrypoints.openai.serving_chat as serving_chat_mod
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["audio"])
+    req_state = ClientRequestState(
+        request_id="internal-req",
+        external_request_id="test-req",
+    )
+    req_state.request_arrival_ts = time.time() - 1.0
+    serving_chat.engine_client.request_states = {"internal-req": req_state}
+    serving_chat.engine_client.mod_metrics = object()
+    serving_chat.engine_client.engine = MagicMock()
+    serving_chat.engine_client.engine.stage_pools = [MagicMock(), MagicMock(), MagicMock()]
+    serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.return_value = pool_replica_id
+
+    first_packet_calls = []
+    finalize_calls = []
+
+    def fake_observe_audio_first_packet(*args, **kwargs):
+        first_packet_calls.append(kwargs)
+
+    def fake_observe_audio_streaming_finalize(*args, **kwargs):
+        finalize_calls.append(kwargs)
+
+    monkeypatch.setattr(serving_chat_mod, "observe_audio_first_packet", fake_observe_audio_first_packet)
+    monkeypatch.setattr(serving_chat_mod, "observe_audio_streaming_finalize", fake_observe_audio_streaming_finalize)
+
+    async def result_generator():
+        yield _make_audio_omni_output(stage_id=2, replica_id=output_replica_id, audio_samples=2400)
+
+    await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    if pool_lookup:
+        serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.assert_called_once_with("internal-req")
+    else:
+        serving_chat.engine_client.engine.stage_pools[2].get_bound_replica_id.assert_not_called()
+    assert first_packet_calls[0]["stage_id"] == 2
+    assert first_packet_calls[0]["replica_id"] == expected_replica_id
+    assert finalize_calls[0]["stage_id"] == 2
+    assert finalize_calls[0]["replica_id"] == expected_replica_id
+
+
 # ---------------------------------------------------------------------------
 # Tests: fallback stop chunk when declared modality is not produced
 # ---------------------------------------------------------------------------
@@ -401,6 +469,90 @@ async def test_declared_modality_not_produced_text_finish_suppressed():
             if c.get("modality") == "text" and ch.get("delta", {}).get("content") == "!":
                 # Text finish should be suppressed because audio hasn't appeared
                 assert ch["finish_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: audio chunks that carry no waveform
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audio_chunk_without_waveform_keeps_stream_alive():
+    """An audio message with no PCM must not break the stream.
+
+    ``_create_audio_choice`` used to return an ErrorResponse here, which the
+    stream generator then iterated as a list of choices; the pydantic model
+    yields (field, value) tuples, so the loop raised
+    ``AttributeError: 'tuple' object has no attribute 'finish_reason'``.
+    """
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["text", "audio"])
+
+    empty_audio = _make_audio_omni_output()
+    empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
+
+    def create_audio_choice(omni_res, role, request, stream=False):
+        return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
+
+    serving_chat._create_audio_choice = create_audio_choice
+
+    async def result_generator():
+        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
+        yield _make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
+        yield empty_audio
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    assert not any("Error in chat completion stream generator" in line for line in raw_lines)
+    chunks = _parse_sse_chunks(raw_lines)
+    finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
+    assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
+    assert finish_reasons[-1] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_audio_choice_error_response_is_not_iterated_as_choices():
+    """Any ErrorResponse from the audio path is skipped, not iterated."""
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["text", "audio"])
+
+    serving_chat._create_audio_choice = MagicMock(
+        side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
+    )
+
+    async def result_generator():
+        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason="stop")
+        yield _make_audio_omni_output()
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    assert isinstance(serving_chat._create_error_response("boom"), ErrorResponse)
+    assert not any("AttributeError" in line for line in raw_lines)
+    chunks = _parse_sse_chunks(raw_lines)
+    finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
+    assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
 
 
 # ---------------------------------------------------------------------------

@@ -29,8 +29,13 @@ vLLM-Omni integrates cache-dit through `CacheDiTBackend`:
 | `cache_dit.refresh_context()` | Updates cache context when `num_inference_steps` changes |
 
 **Source files**:
-- `vllm_omni/diffusion/cache/cache_dit_backend.py` — `CacheDiTBackend`, enablers, `CUSTOM_DIT_ENABLERS`
-- `vllm_omni/diffusion/cache/` — cache backend implementations
+- `vllm_omni/diffusion/cache/cachedit/__init__.py` — public package API
+- `vllm_omni/diffusion/cache/cachedit/backend.py` — generic backend lifecycle and integration
+- `vllm_omni/diffusion/cache/cachedit/config.py` — Cache-DiT configuration types
+- `vllm_omni/diffusion/cache/cachedit/model_specific.py` — model-specific adapters, enablers, and registry
+
+Outside `vllm_omni/diffusion/cache`, import Cache-DiT symbols only from
+`vllm_omni.diffusion.cache.cachedit`.
 
 ## Standard Models: Automatic Support
 
@@ -175,7 +180,8 @@ Inspect your block's `forward()` return type and residual connection pattern to 
 
 ## Registering Custom Enablers
 
-Add your enabler to `CUSTOM_DIT_ENABLERS` in `vllm_omni/diffusion/cache/cache_dit_backend.py`:
+Add your enabler to `CUSTOM_DIT_ENABLERS` in
+`vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
 CUSTOM_DIT_ENABLERS = {
@@ -248,7 +254,7 @@ Models listed in `_NO_CACHE_ACCELERATION` in `vllm_omni/diffusion/registry.py` d
 
 | Model | Path | Notes |
 |-------|------|-------|
-| Standard DiT | `cache_dit_backend.py::enable_cache_for_dit` | Default enabler, automatic |
-| Wan2.2 | `cache_dit_backend.py::enable_cache_for_wan22` | Dual-transformer, auto-detects mode |
-| LongCat | `cache_dit_backend.py::enable_cache_for_longcat_image` | Multi-block-list |
-| BAGEL | `cache_dit_backend.py::enable_cache_for_bagel` | Complex omni model |
+| Standard DiT | `cachedit.backend::enable_cache_for_dit` | Default enabler, automatic |
+| Wan2.2 | `cachedit.model_specific::enable_cache_for_wan22` | Dual-transformer, auto-detects mode |
+| LongCat | `cachedit.config::CacheDiTAdapterConfig` | Declarative multi-block-list adapter |
+| BAGEL | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter |

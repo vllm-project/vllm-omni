@@ -21,7 +21,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -139,8 +139,13 @@ class InlineStageDiffusionClient(StageClientBase):
                         result.request_id = request_id
                     self._output_queue.put_nowait(result)
             else:
-                results = await self._engine.step(request)
-                result = results[0]
+                # Non-streaming callers share the streaming engine path but
+                # only publish the final output.
+                result = None
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                if result is None:
+                    raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:
                     result.request_id = request_id
                 self._output_queue.put_nowait(result)
@@ -173,6 +178,25 @@ class InlineStageDiffusionClient(StageClientBase):
             if task:
                 task.cancel()
             self._engine.abort(rid)
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+        timeout: float | None = None,
+    ) -> Any:
+        """Apply a midway interaction to an active streaming request."""
+        logger.debug(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] interaction: %s",
+            self.stage_id,
+            self.replica_id,
+            request_id,
+        )
+        return await self.collective_rpc_async(
+            "submit_interaction",
+            timeout=timeout,
+            args=(request_id, interaction),
+        )
 
     async def collective_rpc_async(
         self,

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -163,7 +164,7 @@ def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [10, 20, 11, 21, 12, 22]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_drops_count_matched_terminal_row() -> None:
@@ -204,7 +205,7 @@ def test_talker2code2wav_full_payload_drops_rows_aligned_to_non_codec_ids() -> N
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 0, 0]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
@@ -224,7 +225,48 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 7, 0, 8, 0, 9]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
+
+
+def test_talker2code2wav_async_chunk_flushes_cached_tail_on_stop_token() -> None:
+    request_id = "codec_tail"
+    stop_token_id = 999
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int, {request_id: 2}),
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "initial_codec_chunk_frames": 4,
+                    "codec_chunk_frames": 25,
+                    "codec_left_context_frames": 25,
+                }
+            }
+        ),
+    )
+    transfer_manager.code_prompt_token_ids[request_id] = [
+        torch.tensor([[frame, frame + 100]], dtype=torch.long) for frame in range(50)
+    ]
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        sampling_params=SimpleNamespace(
+            stop_token_ids=[stop_token_id],
+            stop_token_id=None,
+        ),
+    )
+
+    payload = q3.talker2code2wav_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.tensor([[stop_token_id, 0]], dtype=torch.long)}},
+        request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.meta.finished.item() is True
+    # 4 initial frames and one 25-frame chunk were already emitted. The final
+    # payload contains 25 frames of left context plus the remaining 21 frames.
+    assert payload.codes.audio.numel() == (25 + 21) * 2
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
@@ -247,9 +289,31 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["ids"]["all"] == [151644, 872, 3]
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
-    assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-1",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+    prompt = {
+        "additional_information": {
+            "speaker": ["ethan"],
+            "language": ["English"],
+        }
+    }
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt)
+
+    assert talker_prompt["additional_information"] == {
+        "speaker": ["ethan"],
+        "language": ["English"],
+    }
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:

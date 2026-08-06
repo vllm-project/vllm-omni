@@ -3,6 +3,8 @@
 import os
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +15,10 @@ from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_init_utils import (
+    get_stage_connector_spec,
+    load_omni_transfer_config_for_model,
+)
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
@@ -313,15 +319,71 @@ class TestResolveModelConfigPath:
         assert result is not None
         assert "glm_image.yaml" in result
 
+    def test_uses_registry_default_deploy_when_hf_model_type_differs(
+        self,
+        mocker: MockerFixture,
+        tmp_path,
+    ):
+        from vllm_omni.config.stage_config import _DEPLOY_DIR as _REAL_DEPLOY_DIR
+        from vllm_omni.entrypoints import utils as utils_mod
+
+        hf_config = SimpleNamespace(
+            model_type="minicpmo",
+            architectures=["MiniCPMO"],
+            version="4.5",
+        )
+        model = "local/minicpmo-registry-default-test"
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            return_value=hf_config,
+        )
+        mocker.patch(
+            "vllm_omni.config.config_factory.get_config",
+            return_value=hf_config,
+        )
+        # A bare deploy/<hf_model_type>.yaml must not win over the registered
+        # pipeline default when HF model_type is not an OMNI_PIPELINES key.
+        (tmp_path / "minicpmo.yaml").write_text("stages: []\n", encoding="utf-8")
+        (tmp_path / "minicpmo_4_5.yaml").write_bytes((_REAL_DEPLOY_DIR / "minicpmo_4_5.yaml").read_bytes())
+        mocker.patch.object(utils_mod, "_DEPLOY_DIR", tmp_path)
+
+        result = resolve_model_config_path(model)
+
+        assert result is not None
+        assert Path(result).as_posix().endswith("minicpmo_4_5.yaml")
+        assert Path(result).name == "minicpmo_4_5.yaml"
+        transfer_config = load_omni_transfer_config_for_model(model, result)
+        assert transfer_config is not None
+
+        sender = get_stage_connector_spec(
+            omni_transfer_config=transfer_config,
+            stage_id=1,
+            async_chunk=True,
+        )
+        receiver = get_stage_connector_spec(
+            omni_transfer_config=transfer_config,
+            stage_id=2,
+            async_chunk=True,
+        )
+        assert sender["extra"]["role"] == "sender"
+        assert receiver["extra"]["role"] == "receiver"
+        assert sender["extra"]["connector_get_sleep_s"] == 0.01
+        assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
+        assert sender["extra"]["connector_get_max_wait"] == 300
+
 
 class TestLoadAndResolveStageConfigs:
-    def test_load_and_resolve_with_kwargs(self):
+    def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
         """Ensure that dtype survives default stage creation."""
         kwargs = {"dtype": torch.float32}
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
+        mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
+
+        config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
             stage_configs_path=None,
             kwargs=kwargs,
+            trust_remote_code=False,
             default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
         )
         assert config_path is None
@@ -349,20 +411,23 @@ class TestLoadAndResolveStageConfigs:
         ]
         load_stage_configs = mocker.patch(
             "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-            return_value=returned_stage_configs,
+            return_value=(returned_stage_configs, None),
         )
 
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="dummy-model",
             stage_configs_path=str(deploy_path),
             kwargs={},
+            trust_remote_code=True,
         )
 
         load_stage_configs.assert_called_once_with(
             "dummy-model",
+            trust_remote_code=True,
             base_engine_args={},
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
+            strategy_config_path=None,
         )
         assert config_path == str(deploy_path)
         assert len(stage_configs) == 2
