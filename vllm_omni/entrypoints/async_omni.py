@@ -1217,6 +1217,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
+            self._release_pd_prefill_for_request(rid)
             state = self.request_states.get(rid)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
