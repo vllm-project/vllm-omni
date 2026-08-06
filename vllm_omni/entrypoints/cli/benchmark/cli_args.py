@@ -117,6 +117,78 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_videomme_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments specific to the Video-MME dataset."""
+    group = parser.add_argument_group("Video-MME Dataset Options")
+    group.add_argument(
+        "--videomme-parquet",
+        type=str,
+        default=None,
+        help="Path to local Video-MME parquet "
+        "(e.g. videomme/test-00000-of-00001.parquet). When set, Hub QA loading is skipped.",
+    )
+    group.add_argument(
+        "--videomme-video-dir",
+        type=str,
+        default=None,
+        help="Directory containing extracted Video-MME videos (videoID.mp4). "
+        "Typical layout after unzipping videos_chunked_*.zip: <root>/video/. "
+        "When using file:// URLs, start the server with --allowed-local-media-path "
+        "covering this directory.",
+    )
+    group.add_argument(
+        "--videomme-subtitle-dir",
+        type=str,
+        default=None,
+        help="Directory containing Video-MME .srt subtitles (videoID.srt). Used only with --videomme-use-subtitle.",
+    )
+    group.add_argument(
+        "--videomme-pack-mode",
+        type=str,
+        choices=["minicpm-frames", "minicpm-interleave", "video_url"],
+        default="minicpm-frames",
+        help="Multimodal packing. "
+        "'minicpm-frames' (default): OmniEvalKit MiniCPM videomme recipe — sampled frames "
+        "as image_url only (max_frames=96). "
+        "'minicpm-interleave': OmniEvalKit videomme_short recipe — 1fps frame/audio pairs "
+        "(max_frames=64). "
+        "'video_url': single video_url part (models with native video input).",
+    )
+    group.add_argument(
+        "--videomme-max-frames",
+        type=int,
+        default=None,
+        help="Override max sampled frames (OmniEvalKit defaults: 96 for minicpm-frames, 64 for minicpm-interleave).",
+    )
+    group.add_argument(
+        "--videomme-duration",
+        type=str,
+        choices=["all", "short", "medium", "long"],
+        default="all",
+        help="Filter by Video-MME duration bucket (default: all).",
+    )
+    group.add_argument(
+        "--videomme-use-subtitle",
+        action="store_true",
+        default=False,
+        help="Prepend subtitle text to the user prompt (Video-MME w/ subs setting).",
+    )
+    group.add_argument(
+        "--videomme-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local frames/audio as base64 data URLs so the server does not need "
+        "--allowed-local-media-path. Increases request size; use for small --num-prompts.",
+    )
+    group.add_argument(
+        "--videomme-save-eval-items",
+        action="store_true",
+        default=False,
+        help="Include per-request Video-MME accuracy rows in the saved JSON under "
+        "videomme_eval_items. Or set env VIDEOMME_SAVE_EVAL_ITEMS=1.",
+    )
+
+
 def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for Seed-TTS benchmarks."""
     group = parser.add_argument_group("Seed-TTS Dataset Options")
@@ -183,6 +255,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "videomme",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -249,6 +322,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_videomme_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
