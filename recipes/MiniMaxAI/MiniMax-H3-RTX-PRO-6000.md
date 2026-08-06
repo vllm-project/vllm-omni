@@ -13,7 +13,7 @@ Validated on:
 - Device order: CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 - Driver / CUDA: 580.105.08 / 13.0
 - vLLM-Omni : vllm/vllm-omni:minimax-h3
-
+- Workload: T2VA, 1344×768, duration=5.0, 50 steps, seed=1101
 
 ## Capacity requirements
 
