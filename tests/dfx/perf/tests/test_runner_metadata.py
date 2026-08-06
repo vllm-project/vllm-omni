@@ -123,35 +123,6 @@ def test_resolve_pytest_marks_rejects_legacy_object_format():
         )
 
 
-def test_extract_mark_resource_label():
-    from tests.dfx.conftest import extract_mark_resource_label
-
-    assert extract_mark_resource_label(None) == "na"
-    assert (
-        extract_mark_resource_label(
-            [
-                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
-                "full_model",
-            ]
-        )
-        == "H100"
-    )
-    assert (
-        extract_mark_resource_label(
-            [
-                {
-                    "hardware_marks": {
-                        "res": {"cuda": "H100", "rocm": "MI325"},
-                        "num_cards": 2,
-                    }
-                },
-                "diffusion",
-            ]
-        )
-        == "H100-MI325"
-    )
-
-
 def test_resource_label_for_filename():
     from tests.dfx.conftest import resource_label_for_filename
 
@@ -169,16 +140,14 @@ def test_hardware_json_value():
     assert hardware_json_value(None) == ""
 
 
-def test_extract_configs_resource_label(monkeypatch):
-    from tests.dfx.conftest import extract_configs_resource_label, get_runtime_resource_label
+def test_get_runtime_resource_label(monkeypatch):
+    from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
-    get_runtime_resource_label(refresh=True)
-    assert extract_configs_resource_label([]) == "H100"
-    get_runtime_resource_label(refresh=True)
+    assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",

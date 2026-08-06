@@ -11,8 +11,6 @@ from pathlib import Path
 import pytest
 from vllm.platforms import current_platform
 
-# Re-exported from tests.helpers.env (GPU wait + DeviceMemoryMonitor).
-
 # Marker description tag in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
 # Example: ``"H100: [hardware-resource] Tests that require H100 GPU"``.
 _HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"

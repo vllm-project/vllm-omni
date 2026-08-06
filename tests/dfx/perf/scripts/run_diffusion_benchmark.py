@@ -23,7 +23,6 @@ of all runs from cases in that file). Bulk load without ``--test-config-file`` u
 the same per-file aggregation; ``-m`` only selects which cases run.
 """
 
-import copy
 import json
 import os
 import socket
@@ -768,7 +767,7 @@ def run_benchmark(
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
     # Persist sweep-resolved baseline from params (already narrowed in _build_run_params).
-    baseline = copy.deepcopy(params.get("baseline") or {})
+    baseline = params.get("baseline") or {}
     metrics["baseline"] = baseline
 
     record: dict[str, Any] = {

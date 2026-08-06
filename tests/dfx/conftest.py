@@ -446,31 +446,6 @@ def _unique_benchmark_param_id_suffixes(params_list: list[dict[str, Any]]) -> li
     return unique
 
 
-def extract_mark_resource_label(mark_field: Any) -> str:
-    """Return a filename-safe hardware label from ``mark.hardware_marks.res`` values.
-
-    Example: ``{"cuda": "H100"}`` -> ``"H100"``; multiple platforms join with ``-``.
-
-    Prefer :func:`get_runtime_resource_label` for perf result filenames so labels
-    reflect the machine that actually ran the benchmark.
-    """
-    if isinstance(mark_field, list):
-        for item in mark_field:
-            if isinstance(item, dict) and "hardware_marks" in item:
-                return extract_mark_resource_label(item)
-        return "na"
-    if not isinstance(mark_field, dict):
-        return "na"
-    hw = mark_field.get("hardware_marks")
-    if not isinstance(hw, dict):
-        return "na"
-    res = hw.get("res")
-    if not isinstance(res, dict) or not res:
-        return "na"
-    labels = [_safe_filename_token(value) for value in res.values()]
-    return "-".join(labels) if labels else "na"
-
-
 # Device marketing-name tokens for ``get_runtime_resource_label`` only.
 # Longer / more specific tokens must appear before shorter substrings
 # (e.g. ``H200`` before ``H20``, ``910B4`` before ``910``).
@@ -560,12 +535,6 @@ def resource_label_for_filename(resource_label: str | None) -> str:
     if token in _FILENAME_OMIT_RESOURCE_LABELS:
         return ""
     return token
-
-
-def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
-    """Return runtime hardware label for perf result filenames."""
-    del configs
-    return get_runtime_resource_label()
 
 
 def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
