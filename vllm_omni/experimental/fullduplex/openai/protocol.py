@@ -63,7 +63,7 @@ class DuplexCapabilities:
     supports_model_native_turn_policy: bool = False
     supports_external_turn_signal: bool = True
     supports_client_commit: bool = True
-    supports_barge_in: bool = True
+    supports_server_vad: bool = True
     supports_input_append: bool = False
     supports_replace_latest_chunk: bool = True
     supports_reencode_context: bool = True
@@ -99,7 +99,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
-            supports_barge_in=False,
+            supports_server_vad=False,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -135,7 +135,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=False,
-            supports_barge_in=False,
+            supports_server_vad=False,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -171,7 +171,7 @@ class DuplexCapabilities:
             "supports_model_native_turn_policy": self.supports_model_native_turn_policy,
             "supports_external_turn_signal": self.supports_external_turn_signal,
             "supports_client_commit": self.supports_client_commit,
-            "supports_barge_in": self.supports_barge_in,
+            "supports_server_vad": self.supports_server_vad,
             "supports_input_append": self.supports_input_append,
             "supports_replace_latest_chunk": self.supports_replace_latest_chunk,
             "supports_reencode_context": self.supports_reencode_context,

@@ -739,6 +739,17 @@ class DuplexSessionRunnerMixin:
                         incarnation=session.incarnation,
                     )
                     if event_type == "response.cancel":
+                        if not self._session_auto_responds(session):
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "session_id": session.session_id,
+                                    "code": "server_vad_unsupported",
+                                    "error": "response.cancel requires turn_detection "
+                                    "type='server_vad'; current turn_detection is null",
+                                }
+                            )
+                            continue
                         requested_response_id = event.get("response_id")
                         has_active_response_work = native_response_in_progress()
                         if (
@@ -865,8 +876,8 @@ class DuplexSessionRunnerMixin:
                 if event_type == "turn.signal":
                     turn_event = event.get("event")
                     if isinstance(turn_event, str):
-                        if turn_event == "barge_in" and not session.capabilities.supports_barge_in:
-                            await emit_event(self._barge_in_unsupported_error(session))
+                        if turn_event == "barge_in" and not session.capabilities.supports_server_vad:
+                            await emit_event(self._server_vad_unsupported_error(session))
                             continue
                         if turn_event == "session.update":
                             payload = event.get("payload")
@@ -996,8 +1007,8 @@ class DuplexSessionRunnerMixin:
                             }
                         )
                         continue
-                    if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
-                        await emit_event(self._barge_in_unsupported_error(session))
+                    if not session.capabilities.supports_server_vad and self._event_requests_barge_in(event):
+                        await emit_event(self._server_vad_unsupported_error(session))
                         event = dict(event)
                         event.pop("force_barge_in", None)
                         for key in ("overlap_action", "overlap"):

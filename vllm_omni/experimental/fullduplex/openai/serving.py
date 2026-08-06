@@ -442,7 +442,7 @@ class OmniDuplexSessionHandler(
         """
         duration_ms = self._input_audio_duration_ms(event, payload)
         is_speech = self._input_looks_like_speech(event, payload, session=session)
-        if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
+        if not session.capabilities.supports_server_vad and self._event_requests_barge_in(event):
             return self._defer_unsupported_barge_in(session, duration_ms=duration_ms, is_speech=is_speech)
         explicit = event.get("overlap_action") or event.get("overlap")
         if isinstance(explicit, str):
@@ -541,7 +541,7 @@ class OmniDuplexSessionHandler(
                 "defer_runtime_append": True,
             }
 
-        if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and not session.capabilities.supports_barge_in:
+        if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and not session.capabilities.supports_server_vad:
             return self._defer_unsupported_barge_in(session, duration_ms=duration_ms, is_speech=True)
 
         session.accumulate_overlap_speech(duration_ms)
@@ -567,10 +567,10 @@ class OmniDuplexSessionHandler(
                 "defer_runtime_append": True,
             }
         if session.overlap_speech_ms >= session.config.overlap_barge_in_ms:
-            if not session.capabilities.supports_barge_in:
+            if not session.capabilities.supports_server_vad:
                 return {
                     "action": "listen",
-                    "reason": "barge_in_unsupported",
+                    "reason": "server_vad_unsupported",
                     "duration_ms": duration_ms,
                     "overlap_speech_ms": session.overlap_speech_ms,
                     "buffer_audio": True,
@@ -614,7 +614,7 @@ class OmniDuplexSessionHandler(
             session.accumulate_overlap_speech(duration_ms)
         return {
             "action": "listen",
-            "reason": "barge_in_unsupported",
+            "reason": "server_vad_unsupported",
             "duration_ms": duration_ms,
             "overlap_speech_ms": session.overlap_speech_ms,
             "buffer_audio": is_speech,
@@ -622,11 +622,11 @@ class OmniDuplexSessionHandler(
         }
 
     @staticmethod
-    def _barge_in_unsupported_error(session: DuplexSession) -> dict[str, object]:
+    def _server_vad_unsupported_error(session: DuplexSession) -> dict[str, object]:
         return {
             "type": "error",
             "session_id": session.session_id,
-            "code": "barge_in_unsupported",
+            "code": "server_vad_unsupported",
             "error": "Barge-in is not supported by this duplex model",
         }
 
@@ -1307,6 +1307,19 @@ class OmniDuplexSessionHandler(
             td_value = payload.get("turn_detection")
             if td_value is None and isinstance(audio_input, dict):
                 td_value = audio_input.get("turn_detection")
+            if (
+                isinstance(td_value, dict)
+                and td_value.get("type") == "server_vad"
+                and not session.capabilities.supports_server_vad
+            ):
+                return NativeRealtimeSessionProtocol._realtime_error_payload(
+                    "unsupported_turn_detection",
+                    "turn_detection.type='server_vad' is not supported "
+                    "by this model; set turn_detection to null and "
+                    "commit input explicitly via "
+                    "input_audio_buffer.commit + response.create",
+                    param="turn_detection",
+                )
             session.config.extra_body["realtime_turn_detection"] = td_value
             return OmniDuplexSessionHandler._resolve_turn_detection(session)
         return None
