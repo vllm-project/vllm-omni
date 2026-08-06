@@ -739,14 +739,15 @@ class DuplexSessionRunnerMixin:
                         incarnation=session.incarnation,
                     )
                     if event_type == "response.cancel":
-                        if not self._session_auto_responds(session):
+                        if self._session_auto_responds(session):
                             await emit_event(
                                 {
                                     "type": "error",
                                     "session_id": session.session_id,
-                                    "code": "server_vad_unsupported",
-                                    "error": "response.cancel requires turn_detection "
-                                    "type='server_vad'; current turn_detection is null",
+                                    "code": "client_cancel_not_allowed",
+                                    "error": "response.cancel is not allowed when "
+                                    "turn_detection type='server_vad' is active; "
+                                    "the server controls barge-in",
                                 }
                             )
                             continue
