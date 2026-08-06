@@ -1029,15 +1029,83 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def load_to_device(self) -> None:
         if not self.is_loaded:
             return
+        if getattr(self, "_omni_layerwise_enabled", False):
+            for name, child in self.vision.named_children():
+                if name != "blocks":
+                    child.to(self.device_target)
+            for name, child in self.text_model.named_children():
+                if name != "layers":
+                    child.to(self.device_target)
+            return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
             return
+        if getattr(self, "_omni_layerwise_enabled", False):
+            for hook in self._omni_layerwise_hooks:
+                hook.offload_layer()
+            for name, child in self.vision.named_children():
+                if name != "blocks":
+                    child.to("cpu")
+            for name, child in self.text_model.named_children():
+                if name != "layers":
+                    child.to("cpu")
+            torch.accelerator.empty_cache()
+            return
         self.vision.to("cpu")
         self.text_model.to("cpu")
         torch.accelerator.empty_cache()
+
+    def enable_omni_layerwise_offload(self, *, pin_memory: bool = True) -> None:
+        """Stream the TP-local Qwen vision/text blocks for low-HBM serving.
+
+        The encoder has its own TP process group, so these blocks must remain
+        rank-local.  Reusing the DiT AllGather group would concatenate
+        different TP shards and corrupt the encoder weights.
+        """
+        if not self.is_loaded or getattr(self, "_omni_layerwise_enabled", False):
+            return
+
+        from vllm_omni.diffusion.offloader.layerwise_backend import apply_block_hook
+        from vllm_omni.platforms import current_omni_platform
+
+        self._omni_layerwise_hooks = []
+        self._omni_layerwise_block_groups = []
+        copy_stream = current_omni_platform.Stream()
+        for blocks in (self.vision.blocks, self.text_model.layers):
+            if len(blocks) <= 1:
+                continue
+            last_hook = apply_block_hook(
+                blocks[-1],
+                blocks[0],
+                self.device_target,
+                copy_stream,
+                pin_memory,
+            )
+            hooks = [last_hook]
+            for index, block in enumerate(blocks[:-1]):
+                hooks.append(
+                    apply_block_hook(
+                        block,
+                        blocks[index + 1],
+                        self.device_target,
+                        copy_stream,
+                        pin_memory,
+                    )
+                )
+            for index, hook in enumerate(hooks):
+                hook._prev_hook = hooks[index - 1]
+            self._omni_layerwise_hooks.extend(hooks)
+            self._omni_layerwise_block_groups.append(blocks)
+
+        self._omni_layerwise_enabled = bool(self._omni_layerwise_hooks)
+        logger.info(
+            "MiniMax H3 encoder layerwise offload enabled on %d blocks across %d stacks",
+            sum(len(blocks) for blocks in self._omni_layerwise_block_groups),
+            len(self._omni_layerwise_block_groups),
+        )
 
     def _encode(
         self,

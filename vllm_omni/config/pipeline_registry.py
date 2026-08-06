@@ -86,6 +86,7 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
+from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -113,6 +114,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
+    "personaplex": PERSONAPLEX_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,

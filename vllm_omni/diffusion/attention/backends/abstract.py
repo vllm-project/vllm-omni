@@ -15,6 +15,10 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    # The backend can represent a contiguous valid K/V prefix by slicing the
+    # tensors instead of materializing a padding mask. Models may use this to
+    # avoid a slower masked-attention plan when tail padding is not semantic.
+    supports_prefix_kv_slicing: bool = False
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -83,6 +87,8 @@ class AttentionMetadata:
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
     #     the packed cu_seqlens tensors.
+    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
+    #     backend that advertises supports_prefix_kv_slicing.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
