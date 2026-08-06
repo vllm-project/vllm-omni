@@ -10,6 +10,7 @@ class DiffusionModelMetadata:
     # config/model plumbing can read it without importing concrete pipelines.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
     attention_mask_free: bool = False
 
 
@@ -38,7 +39,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=1,
+        max_multimodal_image_inputs=9,
+        supports_mixed_reference_inputs=True,
     ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),

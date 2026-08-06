@@ -1,7 +1,7 @@
 # MiniMax H3
 
-> Joint video and audio generation with text, first-frame, image/audio, or
-> multi-video conditions
+> Joint video and audio generation with text, first/last keyframes, and
+> mixed image/video/audio references
 
 ## Summary
 
@@ -16,8 +16,8 @@ checkpoint has two independently served partitions:
 
 - `FL2VA`: text-to-video+audio (`t2va`) and first-frame-to-video+audio
   (`fl2va`)
-- `Ref2VA`: image+audio or one-or-more-video reference-to-video+audio
-  (`ref2va`)
+- `Ref2VA`: up to 9 images, 3 videos, and 3 audio references in supported
+  image/video/audio combinations (`ref2va`; audio-only is rejected)
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
@@ -33,8 +33,10 @@ export MODEL_ROOT=/path/to/MiniMax-H3
 hf download MiniMaxAI/MiniMax-H3 --local-dir "${MODEL_ROOT}"
 ```
 
-Install vLLM-Omni from the checkout containing MiniMax H3 support. On
-Blackwell, install the optional FlashAttention-4 dependency:
+Install vLLM-Omni from the checkout containing MiniMax H3 support. The
+two-GPU RTX 5090/4090 profiles use cuDNN attention and do not need
+FlashAttention-4. Install the optional dependency only for the four-GPU
+B300/GB200 `FLASH_ATTN` profile:
 
 ```bash
 uv venv
@@ -49,6 +51,26 @@ reference-video preparation and MP4 output.
 
 One server loads one checkpoint partition. Set `MODEL` to `FL2VA` for T2VA
 and FL2VA requests, or to `Ref2VA` for either Ref2VA request.
+
+### Memory and storage requirements
+
+Treat GPU HBM, host RAM, and checkpoint storage as separate requirements. Each
+H3 checkpoint partition (`FL2VA` or `Ref2VA`) contains about **134 GiB** of
+BF16 safetensors (about **135 GiB** on disk). Keeping both partitions locally
+therefore needs roughly **270 GiB** of model storage, although the examples
+serve only one partition at a time.
+
+CPU offload and distributed layerwise offload reduce GPU residency; they do
+not make the model weights disappear. With `--dlo-no-use-allgather`, each
+worker retains its standard-loader rank-local weights in host memory, including
+pinned CPU buffers used for H2D streaming. Use at least **200 GiB available
+system RAM** before starting the two-GPU recipe; a **384 GiB host is
+recommended** to leave room for the OS, CUDA/PyTorch allocations, request
+inputs, and filesystem cache. Do not run the FL2VA and Ref2VA servers at the
+same time on a host sized for this minimum.
+
+The consumer-GPU profiles below are HBM budgets only. They still require the
+host-RAM budget above.
 
 ### Single GPU: accuracy and memory first
 
@@ -77,6 +99,98 @@ Use a GPU with enough memory for the active H3 component and enough system RAM
 for the offloaded components. CPU offload reduces GPU memory pressure but adds
 PCIe/NVLink transfer latency.
 
+### Two 24/32 GB GPUs: TP2 distributed layerwise offload
+
+For two PCIe consumer GPUs, combine TP2 with distributed layerwise offload
+(DLO). The standard loader first creates the rank-local TP shard. DLO keeps
+that shard in pinned host memory and streams the 30 tail DiT blocks through a
+shared two-buffer window without a DP AllGather. The first 20 DiT blocks are
+copied to the GPUs once per denoise stage, reused by every sampling step, and
+released before VAE decode so the decoder can reuse their HBM.
+
+```bash
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=8091
+
+CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 2 \
+  --tensor-parallel-size 2 \
+  --usp 1 \
+  --ring 1 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --dlo-resident-layers 20 \
+  --enforce-eager \
+  --diffusion-attention-backend CUDNN_ATTN
+```
+
+Use the profile that matches the per-GPU memory capacity:
+
+| Profile | GPUs | Starting shape | Resident DiT blocks | Attention | Execution | Status |
+|---|---:|---:|---:|---|---|---|
+| `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Target-hardware validated |
+| `rtx4090` | 2 x 24 GB | 1024x576 | 12 | cuDNN attention | eager | Capacity-proxy starting point |
+
+This topology uses all available parallel capacity: TP2 shards both the DiT
+and text encoder, `--dlo-no-use-allgather` streams each rank's local TP shard
+without reconstructing full blocks, and VAE patch parallelism splits tiled
+decode across both GPUs. cuDNN attention is selected explicitly for the RTX
+consumer path; the server stays eager to avoid an unqualified compile path.
+
+The resident count changes placement and transfer frequency only; it does not
+quantize or change the BF16/FP32 denoise math. Re-measure peak memory before
+increasing it on a different request shape.
+
+### RTX 5090 target-hardware validation
+
+At vLLM-Omni commit `ae6577ea`, one full 50-step T2VA request completed on
+2 x RTX 5090 without OOM:
+
+| Shape | Frames | Client E2E | Sampled peak/GPU | Output validation |
+|---:|---:|---:|---:|---|
+| 1344x768 | 124 at 24 FPS | 8 min 38 s | approximately 22.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+
+This is a single end-to-end validation run, not a warmed multi-run latency
+benchmark. The sampled `nvidia-smi` peak is also not a CUDA allocator
+high-water mark. The environment used vLLM 0.26.0, vLLM-Omni
+`0.26.1.dev14+gae6577ea`, and PyTorch 2.11.0+cu130. The
+[run record](https://github.com/lishunyang12/vllm-omni-rankings/blob/dcd06d7e83cb069842535918c0169ee9f3f29ba0/scripts/%E5%BE%AE%E4%BF%A1%E5%9B%BE%E7%89%87_20260805000034_86_237.png)
+captures the environment, output contract, elapsed time, and sampled peak.
+
+Before the target run, both profiles were exercised on two B300 ranks as an
+allocation and correctness proxy. At 1344x768, 124 frames, and 50 steps, the
+20-layer profile peaked at 27,726 MiB per rank. At 1024x576, the 12-layer
+profile peaked at 18,888 MiB per rank in a 5-step capacity run. The resident
+and fully streamed placements produced identical decoded video-frame and audio
+hashes for the same shape, step count, prompt, and seed. The B300 result does
+not establish RTX 4090 PCIe latency; treat the 4090 profile as a conservative
+starting point until it is measured on that GPU.
+
+To run T2VA, FL2VA, image+audio Ref2VA, and two-video Ref2VA in order, validate
+every MP4's H.264/AAC streams, and retain live server and GPU-memory logs:
+
+```bash
+RUN_ROOT=/path/to/run-root \
+MODEL_ROOT=/path/to/MiniMax-H3 \
+GPU_IDS=0,1 \
+PROFILE=rtx5090 \
+bash examples/offline_inference/minimax_h3/run_h3_2gpu_all_tasks.sh
+```
+
+The script selects 20 resident layers for `PROFILE=rtx5090` and 12 for
+`PROFILE=rtx4090`; `DLO_RESIDENT_LAYERS=N` overrides either default.
+
 ### Four GPUs: measured best-practice throughput
 
 The best validated four-GPU configuration on four NVIDIA B300 GPUs is:
@@ -85,7 +199,8 @@ The best validated four-GPU configuration on four NVIDIA B300 GPUs is:
 - Ulysses sequence parallelism degree 4;
 - native tiled VAE patch parallelism degree 4;
 - regional `torch.compile` for the repeated DiT blocks;
-- FlashAttention, with Ring and TP left at 1.
+- CuTe FlashAttention-4 through the `FLASH_ATTN` backend, with Ring and TP
+  left at 1.
 
 ```bash
 export MODEL="${MODEL_ROOT}/FL2VA"
@@ -108,6 +223,9 @@ vllm serve "${MODEL}" \
   --vae-use-tiling \
   --diffusion-attention-backend FLASH_ATTN
 ```
+
+On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
+`Using CuTe FlashAttention-4 on Blackwell` before recording measurements.
 
 Do not add `--enforce-eager` to this performance configuration. The first
 request includes regional compilation; warm the server once before measuring
@@ -225,6 +343,7 @@ curl -sS -X POST "${API_URL}" \
   -F 'prompt=In a snowy blue-purple forest, Ori carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes and softly snorts.' \
   -F 'width=1344' \
   -F 'height=768' \
+  -F 'aspect_ratio=16:9' \
   -F 'fps=24' \
   -F 'num_inference_steps=50' \
   -F 'flow_shift=12' \
@@ -253,11 +372,31 @@ curl -sS -X POST "${API_URL}" \
   -o fl2va.mp4
 ```
 
-### 3. Ref2VA: image and audio reference
+Use the same `FL2VA` partition for the official tail-keyframe forms. A single
+image with `frame_indices=[-1]` conditions the last frame; two ordered images
+with `frame_indices=[0,-1]` condition the first and last frames:
 
-Run this request against the `Ref2VA` partition. `audio_reference` accepts an
-HTTP(S) URL or a `data:` URL. In one terminal, expose the local reference
-assets to the serving host:
+```bash
+export LAST_FRAME=/path/to/fl2va_last_frame.png
+export FIRST_FRAME=/path/to/fl2va_first_frame.png
+
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=The subject moves naturally from the first image to the last image.' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=2102' \
+  -F 'extra_params={"task":"fl2va","duration":8.7,"frame_indices":[0,-1],"audio_flow_shift":3.0}' \
+  -F "input_references=@${FIRST_FRAME};type=image/png" \
+  -F "input_references=@${LAST_FRAME};type=image/png" \
+  -o fl2va_first_last.mp4
+```
+
+### 3. Ref2VA: image-only, image/audio, or mixed references
+
+Run these requests against the `Ref2VA` partition. Image-only Ref2VA omits
+`audio_reference`; adding one or more audio references is optional. The typed
+fields accept one object or an ordered JSON list. `audio_reference` accepts an
+HTTP(S) URL or a `data:` URL.
 
 ```bash
 python -m http.server 8092 \
@@ -265,7 +404,24 @@ python -m http.server 8092 \
   --directory /path/to/reference_assets
 ```
 
-Then submit the image and audio request from another terminal:
+Then submit an image-only request from another terminal:
+
+```bash
+export REF_IMAGE=/path/to/reference_assets/ref2va_image.png
+
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=A white cat sits on a beige couch and slowly looks toward the camera.' \
+  -F 'aspect_ratio=adaptive' \
+  -F 'short_edge=768' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=3100' \
+  -F 'extra_params={"task":"ref2va","duration":8.0,"audio_flow_shift":3.0}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -o ref2va_image_only.mp4
+```
+
+An image-plus-audio request is:
 
 ```bash
 export REF_IMAGE=/path/to/reference_assets/ref2va_image.png
@@ -288,7 +444,7 @@ curl -sS -X POST "${API_URL}" \
 The requested duration should cover the complete audio. If `duration` is
 shorter, the reference soundtrack is truncated to the generated clip.
 
-### 4. Ref2VA: two video references
+### 4. Ref2VA: video, separate audio, and mixed references
 
 Run this request against the `Ref2VA` partition. Repeat the
 `input_references` multipart field once per source video. H3 consumes the
@@ -313,10 +469,40 @@ curl -sS -X POST "${API_URL}" \
   -o ref2va_video_video.mp4
 ```
 
-The server stores uploaded multi-video references only for the lifetime of the
-request and deletes the temporary files after generation. Video Ref2VA uses
-the source-video soundtracks and does not accept a separate
-`audio_reference`.
+The server stores uploaded references only for the lifetime of the request and
+deletes temporary files after generation. A video may use its embedded
+soundtrack, a separate `audio_reference`, or both. To send a mixed multipart
+request, repeat `input_references` for each image, video, or audio file; the
+server classifies them by MIME type and preserves the per-type order.
+
+Reference videos must be MP4/MOV with H.264/H.265 video, optional AAC/MP3
+audio, 2–15 seconds each, and at most 15 seconds combined. They may still be
+longer than the generated clip. Use `start_time_seconds` to select a
+synchronized segment; for multiple typed video references, pass one value per
+video in `extra_params.start_time_seconds`.
+
+Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
+audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
+at most 15 seconds combined.
+
+## Official input matrix and limits
+
+| Task | Supported references | Limits |
+|------|----------------------|--------|
+| T2VA | text only | prompt must be non-empty |
+| FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
+| Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
+
+The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
+`16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
+image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
+`16:9`; `adaptive` and SGLang's `auto` spelling are accepted aliases for that
+default. `short_edge` controls the 768-pixel canvas and must be `768`.
+`num_outputs_per_prompt` accepts 1–10 and derives each output seed as
+`seed + output_index`. The asynchronous endpoint returns all
+outputs; the synchronous raw-MP4 endpoint returns the first output when more
+than one is requested.
 
 ## Key parameters
 
@@ -329,7 +515,15 @@ the source-video soundtracks and does not accept a separate
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
-| `width`, `height` | Multiples of 32 | Aspect ratio must be between 1:4 and 4:1 |
+| `aspect_ratio` | Task-specific | T2VA requires a named ratio; FL2VA follows the input image; Ref2VA defaults to `16:9` |
+| `short_edge` | `768` | H3 shape policy requires exactly 768 when `width`/`height` are omitted |
+| `num_outputs_per_prompt` | `1` | 1–10; async API returns every output |
+| `start_time_seconds` | `0` | Reference-video segment start; use a list in `extra_params` for multiple videos |
+| `width`, `height` | Multiples of 32 | Output aspect ratio must be between 1:4 and 4:1 |
+
+## ComfyUI Frontend
+
+Users can also use a ComfyUI frontend to interact with a hosted MiniMax-H3 service. The ComfyUI frontend can run in a separate environment or machine. Refer to [vLLM-Omni ComfyUI Integration](../../docs/features/comfyui.md) for details.
 
 ## Validated four-GPU evidence
 

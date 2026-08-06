@@ -258,6 +258,7 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
+    duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -478,6 +479,7 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -968,7 +970,12 @@ def _build_common_stage_config_kwargs(
     return (
         {
             "stage_pipeline_config": topology,
-            "model_config": _build_model_config(topology, stage_deploy, engine.model),
+            "model_config": _build_model_config(
+                topology,
+                stage_deploy,
+                engine.model,
+                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
+            ),
             "load_config": _build_load_config(engine.load),
             "cache_config": _build_cache_config(deploy, engine.cache),
             "scheduler_config": _build_scheduler_config(deploy, engine.scheduler),
@@ -1121,6 +1128,8 @@ def _build_model_config(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
+    *,
+    duplex_max_sessions: int,
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
@@ -1132,6 +1141,7 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
+        duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )
 

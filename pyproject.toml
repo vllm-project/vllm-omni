@@ -70,8 +70,7 @@ dev = [
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
     "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
-    "step-audio2==1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
+    "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
 demo = [
@@ -109,6 +108,7 @@ docs = [
     "mkdocstrings-python",
     "mkdocs-gen-files",
     "mkdocs-awesome-nav",
+    "mkdocs-redirects",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
