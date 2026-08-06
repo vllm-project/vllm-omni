@@ -193,7 +193,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
-            with torch.random.fork_rng(devices=devices):
+            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
@@ -237,7 +237,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
-            with torch.random.fork_rng(devices=devices):
+            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
