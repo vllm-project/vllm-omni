@@ -265,15 +265,22 @@ class DuplexSessionRunnerMixin:
             if session is None:
                 return False
             if session.active_response_id is not None:
+                print(f"[DUPLEX] native_in_progress: active_response_id={session.active_response_id}", flush=True)
                 return True
             if (
                 session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
                 and session.playback.sent_ms > session.playback.committed_ms
             ):
+                print(
+                    f"[DUPLEX] native_in_progress: playback_commit_policy=ack_only sent_ms={session.playback.sent_ms} committed_ms={session.playback.committed_ms}",
+                    flush=True,
+                )
                 return True
             if actor.active_response_task is not None and not actor.active_response_task.done():
+                print("[DUPLEX] native_in_progress: active_response_task not done", flush=True)
                 return True
             if actor.has_response_bound_append_tasks():
+                print("[DUPLEX] native_in_progress: has_response_bound_append_tasks", flush=True)
                 return True
             return False
 

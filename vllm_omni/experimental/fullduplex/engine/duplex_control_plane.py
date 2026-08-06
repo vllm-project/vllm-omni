@@ -257,6 +257,12 @@ class DuplexControlPlane:
         effective_fence = fence or session.fence
         request_id = self.stage_request_id(effective_fence, stage_id=stage_id)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
+        sp = tuple(self.sampling_params_for_config(session.runtime_config))
+        for i, p in enumerate(sp):
+            print(
+                f"[DUPLEX] ensure_stage_request stage={i} eos_token_id={getattr(p, 'eos_token_id', '?')} stop_token_ids={getattr(p, 'stop_token_ids', '?')}",
+                flush=True,
+            )
         context = DuplexStageRequestContext(
             request_id=request_id,
             session_id=session.session_id,
@@ -266,7 +272,7 @@ class DuplexControlPlane:
                 session.session_config.get("modalities"),
             ),
             config_generation=session.config_generation,
-            sampling_params=tuple(self.sampling_params_for_config(session.runtime_config)),
+            sampling_params=sp,
             session_config=session.session_config,
             runtime_config=session.runtime_config,
         )
