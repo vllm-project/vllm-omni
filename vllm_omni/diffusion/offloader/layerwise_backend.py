@@ -146,7 +146,21 @@ class LayerwiseOffloadHook(ModelHook):
             current_offset = 0
             for name, original_tensor, local_tensor in weights_with_local:
                 numel = local_tensor.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(local_tensor.flatten())
+                # Non-contiguous tensors (e.g. FP8 padded weights stored as
+                # F.pad(...).t(), column-major) must be serialised in physical
+                # storage order. .flatten() on a column-major tensor re-orders
+                # data in C-logical order; .view(shape) on restore then assigns
+                # C-major strides — a different layout than the original, causing
+                # the Cutlass W8A8 kernel to read wrong data. Fix: if the tensor
+                # is 2-D and its transpose is contiguous (F-order), store .t()
+                # in the flat buffer and restore via .view(t_shape).t().
+                if local_tensor.dim() == 2 and local_tensor.t().is_contiguous():
+                    data_to_store = local_tensor.t()
+                    store_transposed = True
+                else:
+                    data_to_store = local_tensor
+                    store_transposed = False
+                cpu_tensor[current_offset : current_offset + numel].copy_(data_to_store.flatten())
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
@@ -154,7 +168,8 @@ class LayerwiseOffloadHook(ModelHook):
                         "name": name,
                         "offset": current_offset,
                         "numel": numel,
-                        "shape": local_tensor.shape,
+                        "shape": data_to_store.shape,
+                        "store_transposed": store_transposed,
                     }
                 )
 
@@ -208,10 +223,11 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                LayerwiseOffloadHook._set_tensor_storage(
-                    target_param_or_buf,
-                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
-                )
+                base = gpu_weight[
+                    metadata["offset"] : metadata["offset"] + metadata["numel"]
+                ].view(metadata["shape"])
+                restored = base.t() if metadata.get("store_transposed") else base
+                LayerwiseOffloadHook._set_tensor_storage(target_param_or_buf, restored)
 
         self._prefetch_done = evt
 
