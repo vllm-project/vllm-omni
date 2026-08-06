@@ -1516,6 +1516,120 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         return hidden_states_cpu[start:end]
 
+    def _run_post_sample_talker_mtp(
+        self,
+        *,
+        req_ids: list[str],
+        valid_sampled_token_ids: list[list[int]],
+        sampled_token_ids: torch.Tensor,
+        invalid_req_indices: list[int],
+        sample_hidden_states: torch.Tensor,
+        multimodal_outputs: Any,
+    ) -> Any:
+        """Run an opt-in talker MTP with the token sampled in this step.
+
+        Some frame-synchronous talkers need the current temporal hidden state
+        and its newly sampled text token to produce the same frame's codec
+        codes. A resumable ``max_tokens=1`` segment has no later decode
+        preprocess in which to do that work, so those models expose
+        ``post_sample_talker_mtp`` instead.
+        """
+        model = getattr(self, "model", None)
+        hook = getattr(model, "post_sample_talker_mtp", None)
+        if not callable(hook):
+            return multimodal_outputs
+
+        selected_indices: list[int] = []
+        selected_req_ids: list[str] = []
+        selected_req_infos: list[dict[str, Any]] = []
+        duplex_indices: list[int] = []
+        invalid_indices = set(invalid_req_indices)
+        use_async_scheduling = bool(getattr(self, "use_async_scheduling", False))
+        for idx, req_id in enumerate(req_ids):
+            req_info = self.model_intermediate_buffer.get(req_id)
+            duplex = req_info.get("duplex") if isinstance(req_info, dict) else None
+            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+                continue
+            duplex_indices.append(idx)
+            if use_async_scheduling:
+                if idx in invalid_indices:
+                    continue
+            else:
+                token_ids = valid_sampled_token_ids[idx] if idx < len(valid_sampled_token_ids) else []
+                if not token_ids:
+                    continue
+                if len(token_ids) != 1:
+                    raise ValueError(
+                        "post_sample_talker_mtp requires exactly one sampled token "
+                        f"per request, got {len(token_ids)} for {req_id}"
+                    )
+            selected_indices.append(idx)
+            selected_req_ids.append(req_id)
+            selected_req_infos.append(req_info)
+
+        if not selected_indices:
+            return multimodal_outputs
+        if sampled_token_ids.ndim != 2 or sampled_token_ids.shape[0] < len(req_ids):
+            raise ValueError(
+                "post_sample_talker_mtp sampled-token rows do not match requests: "
+                f"shape={tuple(sampled_token_ids.shape)}, requests={len(req_ids)}"
+            )
+        if sampled_token_ids.shape[1] != 1:
+            raise ValueError(
+                "post_sample_talker_mtp does not support speculative token rows: "
+                f"shape={tuple(sampled_token_ids.shape)}"
+            )
+
+        empty_audio = torch.empty(0, dtype=torch.long, device=sample_hidden_states.device)
+        merged = dict(multimodal_outputs) if isinstance(multimodal_outputs, dict) else {}
+        existing_codes = merged.get("codes")
+        codes_payload = dict(existing_codes) if isinstance(existing_codes, dict) else {}
+        existing_audio = codes_payload.get("audio")
+        if isinstance(existing_audio, list) and len(existing_audio) == len(req_ids):
+            per_request_audio = list(existing_audio)
+        elif (
+            isinstance(existing_audio, torch.Tensor)
+            and existing_audio.ndim > 0
+            and existing_audio.shape[0] == len(req_ids)
+        ):
+            per_request_audio = [existing_audio[idx : idx + 1] for idx in range(len(req_ids))]
+        else:
+            per_request_audio = [empty_audio for _ in req_ids]
+        for idx in duplex_indices:
+            per_request_audio[idx] = empty_audio
+
+        indices = torch.tensor(
+            selected_indices,
+            dtype=torch.long,
+            device=sample_hidden_states.device,
+        )
+        input_ids = sampled_token_ids.index_select(0, indices).reshape(-1).to(torch.long)
+        codes = hook(
+            input_ids=input_ids,
+            hidden_states=sample_hidden_states.index_select(0, indices),
+            req_ids=selected_req_ids,
+            req_infos=selected_req_infos,
+        )
+        if not isinstance(codes, torch.Tensor) or codes.ndim != 2:
+            raise TypeError(f"post_sample_talker_mtp must return a rank-2 Tensor, got {type(codes).__name__}")
+        if codes.shape[0] != len(selected_req_ids):
+            raise ValueError(
+                f"post_sample_talker_mtp row count does not match requests: {codes.shape[0]} != {len(selected_req_ids)}"
+            )
+        for row, (idx, req_id) in enumerate(zip(selected_indices, selected_req_ids, strict=True)):
+            request_codes = codes[row : row + 1]
+            per_request_audio[idx] = request_codes
+            self._update_intermediate_buffer(
+                req_id,
+                {"codes": {"audio": request_codes}},
+            )
+
+        # Empty rows are intentional: they suppress replay of the previous
+        # frame while a chunked prefill has not sampled a token yet.
+        codes_payload["audio"] = per_request_audio
+        merged["codes"] = codes_payload
+        return merged
+
     def _build_multimodal_outputs(
         self,
         per_req_payloads: list[dict[str, object] | None] | None,
@@ -2035,6 +2149,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        multimodal_outputs = self._run_post_sample_talker_mtp(
+            req_ids=req_ids_output_copy,
+            valid_sampled_token_ids=valid_sampled_token_ids,
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            invalid_req_indices=invalid_req_indices,
+            sample_hidden_states=sample_hidden_states,
+            multimodal_outputs=multimodal_outputs,
+        )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled

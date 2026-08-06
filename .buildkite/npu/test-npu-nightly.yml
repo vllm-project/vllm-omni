@@ -95,6 +95,80 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+  - group: ":card_index_dividers: Diffusion I2I Model Test"
+    key: nightly-HunyuanImage3-x2i-test-group
+    depends_on: upload-nightly-pipeline
+    if: >-
+      build.env("NIGHTLY") == "1" ||
+      build.pull_request.labels includes "nightly-test" ||
+      build.pull_request.labels includes "diffusion-x2iat-test"
+    steps:
+      - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
+          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
+  - group: ":card_index_dividers: Diffusion Benchmark Perf Test"
+    key: nightly-diffusion-benchmark-group
+    depends_on: upload-nightly-pipeline
+    if: >-
+      build.env("NIGHTLY") == "1" ||
+      build.pull_request.labels includes "nightly-test" ||
+      build.pull_request.labels includes "diffusion-x2iat-test"
+    steps:
+      - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 SP=2"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=4"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
     depends_on: upload-nightly-pipeline
@@ -103,6 +177,14 @@ steps:
       build.pull_request.labels includes "nightly-test" ||
       build.pull_request.labels includes "diffusion-x2v-test"
     steps:
+      - label: ":full_moon: Diffusion X2V · Function Test"
+        mirror_hardwares: a2b3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k npu_i2v --run-level "full_model"
       - label: ":full_moon: Diffusion X2V · Perf Test"
         key: nightly-diffusion-x2v-performance
         timeout_in_minutes: 180

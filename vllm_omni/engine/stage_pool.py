@@ -1081,7 +1081,11 @@ class StagePool:
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
         outputs = await client.get_output_async()
-        if not outputs.outputs:
+        # Keep scheduler-only / finished-only batches. Omni schedulers mirror
+        # upstream by emitting SchedulerStats on throttled ticks even when no
+        # request output is produced, and dropping those batches loses KV/queue
+        # gauges for that interval.
+        if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
             return None
         return outputs
 
@@ -1097,7 +1101,6 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
-        iteration_stats = IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
