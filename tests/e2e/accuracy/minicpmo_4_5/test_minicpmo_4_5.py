@@ -9,6 +9,7 @@ text modalities with ``use_tts_template``, and server ``--interleave-mm-strings`
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,15 @@ _SEED_TTS_SERVER_ARGS = [
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
+# Evaluated at setup time, before the ``omni_server`` fixture boots a server. An
+# ``importorskip`` inside the test body would skip only after paying several minutes
+# of startup, and the resulting skip is easy to miss in a nightly log.
+_missing_daily_omni_deps = [name for name in ("datasets", "huggingface_hub") if importlib.util.find_spec(name) is None]
+requires_daily_omni_deps = pytest.mark.skipif(
+    bool(_missing_daily_omni_deps),
+    reason=f"Daily-Omni accuracy bench needs {', '.join(_missing_daily_omni_deps)}",
+)
+
 daily_test_params = [
     OmniServerParams(
         model=_MODEL,
@@ -106,12 +116,11 @@ def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
+@requires_daily_omni_deps
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", daily_test_params, indirect=True)
 def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
-    pytest.importorskip("datasets")
-    pytest.importorskip("huggingface_hub")
 
     argv = build_acc_benchmark_cli_argv(
         omni_server,
