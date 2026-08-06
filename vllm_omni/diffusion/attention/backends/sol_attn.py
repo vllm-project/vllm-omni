@@ -167,6 +167,22 @@ class SolAttnImpl(AttentionImpl):
         return False
 
     @staticmethod
+    def _clamp_sink_range(
+        used: int,
+        sink_start: int | None,
+        sink_tokens: int,
+    ) -> tuple[int, int]:
+        """Clamp the exact-KV sink range to ``[0, used]``.
+
+        The kernel requires ``sink_start + sink_tokens <= T``. Short sequences
+        (e.g. the text-refiner attention, which runs on the text rows only) can
+        be shorter than the configured sink, so clamp instead of failing.
+        """
+        start = 0 if sink_start is None else min(int(sink_start), used)
+        tokens = min(int(sink_tokens), used - start)
+        return start, tokens
+
+    @staticmethod
     def _used_length(attn_metadata: AttentionMetadata | None, seq_len: int) -> int:
         if attn_metadata is None:
             return seq_len
@@ -255,6 +271,11 @@ class SolAttnImpl(AttentionImpl):
         # kernel has no cu_seqlens support, so slice to the real length first;
         # the padding rows are masked by the model and their outputs discarded.
         used = self._used_length(attn_metadata, seq_len)
+        sink_start, sink_tokens = self._clamp_sink_range(
+            used,
+            self.config.sink_start,
+            self.config.sink_tokens,
+        )
         q = query[:, :used].contiguous()
         k = key[:, :used].contiguous()
         v = value[:, :used].contiguous()
@@ -270,8 +291,8 @@ class SolAttnImpl(AttentionImpl):
             tau=self.config.tau,
             thresh_type=self.config.thresh_type,
             kv_splits=_resolve_kv_splits(q, self.config.kv_splits),
-            sink_start=self.config.sink_start,
-            sink_tokens=self.config.sink_tokens,
+            sink_start=sink_start,
+            sink_tokens=sink_tokens,
         )
         if out.shape[1] < seq_len:
             padded = torch.zeros_like(query)

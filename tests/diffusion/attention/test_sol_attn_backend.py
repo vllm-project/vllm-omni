@@ -152,6 +152,15 @@ def test_sol_attn_spec_serialized_in_backend_kwargs():
     assert serialized["kv_splits"] == "auto"
 
 
+def test_sink_range_clamped_to_short_sequence():
+    # The text-refiner attention runs on short text rows; a configured sink
+    # larger than the sequence must be clamped instead of failing.
+    assert SolAttnImpl._clamp_sink_range(used=200, sink_start=0, sink_tokens=951) == (0, 200)
+    assert SolAttnImpl._clamp_sink_range(used=38000, sink_start=0, sink_tokens=951) == (0, 951)
+    assert SolAttnImpl._clamp_sink_range(used=500, sink_start=400, sink_tokens=951) == (400, 100)
+    assert SolAttnImpl._clamp_sink_range(used=500, sink_start=None, sink_tokens=951) == (0, 500)
+
+
 def test_used_length_respects_packed_padding():
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
