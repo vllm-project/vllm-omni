@@ -1428,12 +1428,12 @@ def _upgrade_open_issue_action_cells(html_fragment: str) -> str:
                 esc = html.escape(label)
                 opts.append(f'<option value="{esc}">{esc}</option>')
             followup_td = (
-                f'<td class="oi-followup-cell" data-oi-key="{key_attr}">'
+                f'<td class="oi-followup-cell" data-oi-key="{key_attr}" data-oi-state="empty">'
                 f'<select class="oi-followup-select" data-oi-key="{key_attr}" '
                 'aria-label="Follow-up action">' + "".join(opts) + "</select></td>"
             )
             note_td = (
-                f'<td class="oi-note-cell" data-oi-key="{key_attr}" data-oi-state="empty">'
+                f'<td class="oi-note-cell" data-oi-key="{key_attr}" data-oi-state="empty" data-oi-value="">'
                 '<button type="button" class="oi-note-btn oi-note-empty" '
                 'data-oi-note-action="edit" title="Click to add a remark">'
                 "Click to add a remark</button></td>"
@@ -1478,9 +1478,40 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
   }
   function memSet(k, v) { mem[k] = v || ""; lsSet(k, v); }
 
+  // --- Follow-up action (select) ---
+  // The selected value is stored in the <td>'s data-oi-value attribute so
+  // that browser "Save As" serialises it into the HTML file.  On init we
+  // prefer the data-attribute value (preserved by Save As) over localStorage
+  // so that a saved-as copy retains the user's choice.
+  function getFollowupValue(td) {
+    var attr = td ? td.getAttribute("data-oi-value") : null;
+    if (attr) return attr;
+    var ls = memGet(fKey(td.getAttribute("data-oi-key") || ""));
+    return ls || "";
+  }
+  function setFollowupValue(td, val) {
+    td.setAttribute("data-oi-value", val || "");
+    td.setAttribute("data-oi-state", val ? "set" : "empty");
+    memSet(fKey(td.getAttribute("data-oi-key") || ""), val);
+  }
+
+  // --- Remarks (note) ---
+  // The note text is stored in the <td>'s data-oi-value attribute so that
+  // browser "Save As" serialises it into the HTML file.
+  function getNoteValue(cell) {
+    var attr = cell ? cell.getAttribute("data-oi-value") : null;
+    if (attr) return attr;
+    var ls = memGet(nKey(cell.getAttribute("data-oi-key") || ""));
+    return ls || "";
+  }
+  function setNoteValue(cell, val) {
+    cell.setAttribute("data-oi-value", val || "");
+    cell.setAttribute("data-oi-state", val ? "set" : "empty");
+    memSet(nKey(cell.getAttribute("data-oi-key") || ""), val);
+  }
+
   function renderNote(cell) {
-    var key = cell.getAttribute("data-oi-key") || "";
-    var val = memGet(nKey(key));
+    var val = getNoteValue(cell);
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "oi-note-btn" + (val ? "" : " oi-note-empty");
@@ -1490,11 +1521,11 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
     cell.innerHTML = "";
     cell.appendChild(btn);
     cell.setAttribute("data-oi-state", val ? "set" : "empty");
+    if (val) { cell.setAttribute("data-oi-value", val); }
   }
 
   function editNote(cell) {
-    var key = cell.getAttribute("data-oi-key") || "";
-    var val = memGet(nKey(key));
+    var val = getNoteValue(cell);
     cell.innerHTML =
       '<div class="oi-note-editor">' +
       '<textarea class="oi-note-input" rows="3" ' +
@@ -1509,10 +1540,9 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
   }
 
   function commitNote(cell) {
-    var key = cell.getAttribute("data-oi-key") || "";
     var ta = cell.querySelector("textarea");
     var val = ta ? ta.value.trim() : "";
-    memSet(nKey(key), val);
+    setNoteValue(cell, val);
     renderNote(cell);
   }
 
@@ -1520,32 +1550,33 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
     var selects = document.querySelectorAll("select.oi-followup-select");
     for (var i = 0; i < selects.length; i++) {
       var sel = selects[i];
-      var saved = memGet(fKey(sel.getAttribute("data-oi-key") || ""));
-      if (saved) {
+      var td = sel.closest ? sel.closest("td") : null;
+      var val = getFollowupValue(td);
+      if (val) {
         var ok = false;
         for (var j = 0; j < sel.options.length; j++) {
-          if (sel.options[j].value === saved) { ok = true; break; }
+          if (sel.options[j].value === val) { ok = true; break; }
         }
-        if (ok) { sel.value = saved; }
+        if (ok) { sel.value = val; }
       }
-      var td = sel.closest ? sel.closest("td") : null;
-      if (td) { td.setAttribute("data-oi-state", sel.value ? "set" : "empty"); }
+      if (td) { setFollowupValue(td, sel.value); }
     }
     var notes = document.querySelectorAll("td.oi-note-cell");
     for (var k = 0; k < notes.length; k++) { renderNote(notes[k]); }
+    var summaries = document.querySelectorAll(".fa-summary-editable");
+    for (var s = 0; s < summaries.length; s++) { renderNote(summaries[s]); }
   }
 
   document.addEventListener("change", function (ev) {
     var sel = ev.target;
     if (!sel || !sel.classList || !sel.classList.contains("oi-followup-select")) return;
-    memSet(fKey(sel.getAttribute("data-oi-key") || ""), sel.value);
     var td = sel.closest ? sel.closest("td") : null;
-    if (td) { td.setAttribute("data-oi-state", sel.value ? "set" : "empty"); }
+    if (td) { setFollowupValue(td, sel.value); }
   });
 
   document.addEventListener("click", function (ev) {
     if (!ev.target || !ev.target.closest) return;
-    var cell = ev.target.closest("td.oi-note-cell");
+    var cell = ev.target.closest("td.oi-note-cell, .fa-summary-editable");
     if (!cell) return;
     if (ev.target.closest(".oi-note-save")) { ev.preventDefault(); commitNote(cell); return; }
     if (ev.target.closest(".oi-note-cancel")) { ev.preventDefault(); renderNote(cell); return; }
@@ -1555,7 +1586,7 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
   document.addEventListener("keydown", function (ev) {
     if (!ev.target || !ev.target.classList) return;
     if (!ev.target.classList.contains("oi-note-input")) return;
-    var cell = ev.target.closest ? ev.target.closest("td.oi-note-cell") : null;
+    var cell = ev.target.closest ? ev.target.closest("td.oi-note-cell, .fa-summary-editable") : null;
     if (!cell) return;
     if (ev.key === "Escape") { ev.preventDefault(); renderNote(cell); }
     else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); commitNote(cell); }

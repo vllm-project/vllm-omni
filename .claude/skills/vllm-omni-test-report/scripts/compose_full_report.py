@@ -368,6 +368,15 @@ def open_bug_assignees_all_assigned(
 # ---------------------------------------------------------------------------
 
 
+def _bug_di_detail_str(total_tenths: int, counts: dict[str, int], n_issues: int) -> str:
+    """Human-readable DI detail string shared by DI calculation helpers."""
+    parts = [f"{label}={counts[label]}" for label in BUG_DI_LABEL_ORDER if counts.get(label, 0)]
+    if counts.get("unclassified", 0):
+        parts.append(f"unclassified={counts['unclassified']}")
+    detail = ", ".join(parts) if parts else "no open bug"
+    return f"Auto Outstanding DI={_format_di_tenths(total_tenths)} ({n_issues} open bugs; {detail})"
+
+
 def legacy_open_bug_di_total(gh_token: str | None) -> tuple[int | None, str]:
     """
     Sum of priority-label-weighted DI for **all open** ``label:bug`` issues
@@ -384,11 +393,32 @@ def legacy_open_bug_di_total(gh_token: str | None) -> tuple[int | None, str]:
     except Exception as exc:
         return None, f"Unable to fetch open bugs ({exc})"
     total_tenths, counts = _bug_di_summary(issues)
-    parts = [f"{label}={counts[label]}" for label in BUG_DI_LABEL_ORDER if counts.get(label, 0)]
-    if counts.get("unclassified", 0):
-        parts.append(f"unclassified={counts['unclassified']}")
-    detail = ", ".join(parts) if parts else "no open bug"
-    return total_tenths, f"Auto Outstanding DI={_format_di_tenths(total_tenths)} ({len(issues)} open bugs; {detail})"
+    return total_tenths, _bug_di_detail_str(total_tenths, counts, len(issues))
+
+
+def release_open_bug_di_total(
+    gh_token: str | None,
+    stats_to: str,
+) -> tuple[int | None, str]:
+    """
+    Sum of priority-label-weighted DI for **open** ``label:bug`` issues whose
+    ``created_at`` UTC date is **on or before** ``stats_to`` (``YYYY-MM-DD``).
+
+    Issues created *after* the stats window end are excluded so that the DI
+    reflects only the bug backlog that existed during the release period.
+    The start date is intentionally unbounded — bugs from any earlier date
+    are included as long as they are still open.
+
+    Returns ``(total_tenths, detail_str)``. ``total_tenths`` is ``None`` when the
+    GitHub fetch fails.
+    """
+    try:
+        issues = _github_fetch_open_bug_issues(gh_token)
+    except Exception as exc:
+        return None, f"Unable to fetch open bugs ({exc})"
+    filtered = [i for i in issues if (d := _issue_created_date_utc(i)) is not None and d <= stats_to]
+    total_tenths, counts = _bug_di_summary(filtered)
+    return total_tenths, _bug_di_detail_str(total_tenths, counts, len(filtered))
 
 
 def open_critical_labeled_issue_count(gh_token: str | None) -> tuple[int | None, str]:
@@ -2386,11 +2416,23 @@ def render_failure_analysis_section(
     placeholders) so the *Failed* cells in the
     **Test Result → Overall test execution summary** table jump here.
     """
+    summary_section = (
+        "### Summary\n\n"
+        '<details class="report-subcard release-h-fold release-h4-fold">'
+        '<summary class="report-subcard-summary">'
+        '<span class="report-subcard-title">Summary</span></summary>'
+        '<div class="report-subcard-body">'
+        '<div class="fa-summary-editable" data-oi-key="failure-analysis-summary" '
+        'data-oi-value="" data-oi-state="empty">'
+        '<button type="button" class="oi-note-btn oi-note-empty" '
+        'data-oi-note-action="edit" title="Click to add a summary">'
+        "Click to add a summary</button></div></div></details>\n\n"
+    )
     intro = (
         "## Failure Analysis\n\n"
         "Per-machine failure detail. Click the *Failed* cell in the "
         "Test Result summary table to jump to the matching subsection below."
-        "\n\n"
+        "\n\n" + summary_section
     )
     return intro + _render_failure_summary_blocks(
         log_h200=log_h200,
@@ -3623,14 +3665,15 @@ def main() -> None:
     # ``## Issue tracking`` block, but that block is now folded into the
     # Open issues section and the per-job Failure Analysis, so the
     # standalone block would just duplicate information.
-    # "Remaining DI < 30" — self-calculated exactly like the development
-    # report's Metrics-overview **Outstanding DI** row: sum of priority-label
-    # weights across **all** open `label:bug` issues (no `created_at` stats
-    # window). Implementation: ``legacy_open_bug_di_total`` already lives
-    # in this file and is what the development variant uses; reuse it so the
-    # two reports stay in lockstep.
+    # "Remaining DI < 30" — self-calculated from open `label:bug` issues whose
+    # `created_at` is on or before ``stats_to``.  Issues created after the
+    # stats window end are excluded so the DI reflects only the bug backlog
+    # that existed during the release period.  The start date is unbounded —
+    # bugs from any earlier date are included as long as they are still open.
+    # (The Development variant uses ``legacy_open_bug_di_total`` which has no
+    # date filter at all; the two reports intentionally differ here.)
     open_issues_block = render_open_issues_section(stats_from, stats_to, gh_token, all_open=False)
-    di_total_tenths, di_detail = legacy_open_bug_di_total(gh_token)
+    di_total_tenths, di_detail = release_open_bug_di_total(gh_token, stats_to)
     # Threshold rule: cumulative Outstanding DI ≤ 30 ⇒ Pass, > 30 ⇒ Fail.
     # ``BUG_DI_THRESHOLD_TENTHS`` is the tenths representation of 30 (300),
     # so the comparison is ``total_tenths <= 300`` (= DI ≤ 30.0). On GitHub
@@ -3658,8 +3701,9 @@ def main() -> None:
   each latest **finished** build has no `failed`/`broken` job (Upload * Pipeline steps
   excluded); (2) self-calculated **Outstanding DI** = sum of priority-label weights
   (`critical=10` / `high priority=3` / `medium priority=1` / `low priority=0.1` /
-  `invalid=0`) across **all** open `label:bug` (no `created_at` window — same formula
-  as the Development report's Metrics overview); threshold < 30; (3) no open
+  `invalid=0`) across open `label:bug` whose `created_at` ≤ `{stats_to}`
+  (start date unbounded; issues created after the stats window are excluded);
+  threshold < 30; (3) no open
   `label:bug` + `label:critical`; (4) `All remaining bugs have assignees` is a
   manual user-selectable row; (5) `UT coverage meets this iteration requirement
   (Guide), Performance regression < 5% (Guide)` is a manual user-selectable

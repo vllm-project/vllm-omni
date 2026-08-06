@@ -880,7 +880,9 @@ def _github_issue_submit_script() -> str:
 
   function issueTitle(d) {{
     var n = d.node.replace(/\\s*\\(ERROR\\)\\s*$/i, "");
-    var t = "[Bug]: Nightly / CI failed - " + n;
+    var prefix = d.ctx && d.ctx.toLowerCase().indexOf("npu") !== -1 ? "[Bug][NPU]: " : "[Bug]: ";
+    var reason = d.reason ? " - " + d.reason : "";
+    var t = prefix + "Nightly / CI failed - " + n + reason;
     return t.length > 220 ? t.slice(0, 217) + "..." : t;
   }}
 
