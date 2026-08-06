@@ -600,24 +600,17 @@ def resolve_baseline_value(
     baseline_raw: Any,
     *,
     sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> Any:
-    """Pick the baseline threshold for one metric at this sweep step."""
+    """Pick the baseline threshold for one metric at this sweep step.
+
+    Accepts a sweep-aligned list/tuple (indexed by ``sweep_index``) or a scalar.
+    """
     if baseline_raw is None:
         return None
     if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
+        raise TypeError(
+            "per-metric baseline dict keyed by concurrency/request-rate is not supported; "
+            "use a sweep-aligned list or a scalar under each hardware bucket"
         )
     if isinstance(baseline_raw, (list, tuple)):
         if sweep_index is None:
@@ -632,8 +625,6 @@ def resolve_baseline_for_sweep(
     baseline_config: dict[str, Any] | None,
     *,
     sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> dict[str, Any]:
     """Resolve sweep-dependent baselines while keeping every hardware bucket.
 
@@ -645,7 +636,7 @@ def resolve_baseline_for_sweep(
 
         {"H100": {"throughput_qps": c}, "B200": {"throughput_qps": z}}
 
-    Per-metric values may be a sweep-aligned list (preferred) or a scalar.
+    Per-metric values may be a sweep-aligned list or a scalar.
     """
     if not baseline_config:
         return {}
@@ -661,8 +652,6 @@ def resolve_baseline_for_sweep(
             metric_name: resolve_baseline_value(
                 baseline_raw,
                 sweep_index=sweep_index,
-                max_concurrency=max_concurrency,
-                request_rate=request_rate,
             )
             for metric_name, baseline_raw in metrics.items()
         }
@@ -680,8 +669,6 @@ def run_benchmark(
     *,
     baseline_config: dict[str, Any] | None = None,
     sweep_index: int | None = None,
-    request_rate: Any | None = None,
-    max_concurrency: Any | None = None,
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
     resource_label: str | None = None,
@@ -759,12 +746,10 @@ def run_benchmark(
             result = json.load(f)
 
     if baseline_config:
-        # Keep every hardware bucket; resolve list/dict metrics to this sweep step.
+        # Keep every hardware bucket; resolve list metrics to this sweep step.
         result["baseline"] = resolve_baseline_for_sweep(
             baseline_config,
             sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
         )
     else:
         result["baseline"] = {}

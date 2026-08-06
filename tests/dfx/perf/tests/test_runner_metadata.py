@@ -366,13 +366,13 @@ def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
         },
     }
     # max_concurrency=[1,4,8,16,32] -> index 4 is concurrency 32
-    got = resolve_baseline_for_sweep(baseline, sweep_index=4, max_concurrency=32)
+    got = resolve_baseline_for_sweep(baseline, sweep_index=4)
     assert got == {
         "H100": {"mean_ttft_ms": 507.8, "mean_e2el_ms": 72630.0},
         "B200": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
     }
     # First sweep step keeps both hardware buckets too.
-    got0 = resolve_baseline_for_sweep(baseline, sweep_index=0, max_concurrency=1)
+    got0 = resolve_baseline_for_sweep(baseline, sweep_index=0)
     assert set(got0) == {"H100", "B200"}
     assert got0["H100"]["mean_ttft_ms"] == 96.4
     assert got0["B200"]["mean_ttft_ms"] == 90.0
@@ -396,7 +396,7 @@ def test_resolve_baseline_for_sweep_supports_list_and_scalar_under_hardware():
         "H100": {"throughput_qps": [0.4, 0.6, 0.8], "latency_mean": [1.0, 2.0, 3.0]},
         "B200": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
     }
-    assert resolve_baseline_for_sweep(listed, sweep_index=1, max_concurrency=8) == {
+    assert resolve_baseline_for_sweep(listed, sweep_index=1) == {
         "H100": {"throughput_qps": 0.6, "latency_mean": 2.0},
         "B200": {"throughput_qps": 0.7, "latency_mean": 1.8},
     }
@@ -415,8 +415,8 @@ def test_resolve_baseline_value_errors():
         resolve_baseline_value([1.0, 2.0], sweep_index=None)
     with pytest.raises(IndexError):
         resolve_baseline_value([1.0], sweep_index=1)
-    with pytest.raises(KeyError, match="max_concurrency"):
-        resolve_baseline_value({"1": 0.4}, sweep_index=None, max_concurrency=32)
+    with pytest.raises(TypeError, match="not supported"):
+        resolve_baseline_value({"1": 0.4}, sweep_index=0)
 
 
 def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):

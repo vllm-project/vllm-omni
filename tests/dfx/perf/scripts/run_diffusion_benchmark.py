@@ -877,13 +877,9 @@ def _build_run_params(
         run_params["max-concurrency"] = max_concurrency
     if "baseline" in params:
         # Keep all hardware buckets; pick the metric value for this sweep step only.
-        # request_rate="inf" is used for concurrency sweeps and is not a baseline key.
-        baseline_request_rate = None if request_rate in (None, "inf") else request_rate
         run_params["baseline"] = resolve_baseline_for_sweep(
             params.get("baseline"),
             sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=baseline_request_rate,
         )
     return run_params
 
