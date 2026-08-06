@@ -192,6 +192,7 @@ ignore = [
 # argument names) so they stay easy to diff against upstream releases.
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
+"vllm_omni/experimental/fullduplex/openai/realtime_protocol.py" = ["E501"]  # Auto-generated from OpenAPI spec
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"

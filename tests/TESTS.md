@@ -84,3 +84,22 @@
 - Turn 1 audio still garbled (separate issue).
 
 **Logs:** `tests/logs/2026-07-30_deploy-test_eos-emitted-fix.log`
+
+## 2026-08-05: MiniCPM-o E2E full suite pass (branch feat/duplex-qwen3-omni)
+
+**What:** Ran the full MiniCPM-o E2E test suite (`tests/e2e/online_serving/minicpmo/`) on AWS g7e.2xlarge. Fixed all test failures caused by removal of non-spec OpenAI Realtime WebSocket events (`response.speak`, `response.listen`, `session.closed`, `overlap.decision`, `playback.ack`).
+
+**Expected:** All 85 tests pass after removing references to non-spec events from test assertions and demo driver code.
+
+**Result:** 85/85 tests passed across multiple iterative runs.
+
+**Findings:**
+- Removed `response.speak` from event ordering checks in `minicpmo_realtime_duplex_scenarios.py`
+- Removed `resume`/`takeover` assertions from `test_minicpmo_4_5_duplex.py` (session resume removed)
+- Removed `expiry` assertions from `test_minicpmo_4_5_duplex_expansion.py` (expiry probe removed)
+- Fixed `REPO_ROOT` depth in `run_minicpmo_realtime_duplex_soft_interrupt.py` (`parents[3]` to `parents[4]`)
+- Rewrote `realtime_duplex_demo.py` post-commit model decision logic to use `response.done`/`response.created` instead of `response.listen`
+- Removed `listen_between_responses`, `final_listen_after_commit`, `listen_after_response_before_commit` assertions from `test_minicpmo_realtime_duplex_drivers.py`
+- Removed stale `validation_mode` parameter from `_send_clean_turn()` calls
+
+**Logs:** `tests/logs/2026-08-05_minicpmo_e2e_all_pass.log`
