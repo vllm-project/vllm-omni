@@ -7,6 +7,14 @@ eight GPUs raise the Ulysses degree to shard the attention sequence further.
 CPU offload and distributed layerwise offload are not required in any of
 these configurations.
 
+Validated on:
+- Host: <YLX Y762 >
+- GPUs: 8 × RTX PRO 6000 Blackwell (96 GiB)
+- Device order: CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+- Driver / CUDA: 580.105.08 / 13.0
+- vLLM-Omni : vllm/vllm-omni:minimax-h3
+
+
 ## Capacity requirements
 
 | Resource | Two GPUs | Four GPUs | Eight GPUs |
@@ -232,11 +240,7 @@ count, warmup count, and the device order used for the eight-GPU run.>
 
 | Measurement | Two GPUs | Four GPUs | Eight GPUs |
 | --- | ---: | ---: | ---: |
-| Maximum externally sampled peak | <TODO> | <TODO> | <TODO> |
-| T2VA worker-reported peak | <TODO> | <TODO> | <TODO> |
-| First-frame FL2VA worker-reported peak | <TODO> | <TODO> | <TODO> |
-| T2VA maximum GPU kernel-time deviation | <TODO> | <TODO> | <TODO> |
-| First-frame FL2VA maximum GPU kernel-time deviation | <TODO> | <TODO> | <TODO> |
+| Client E2E (50-step T2VA) | ~10 min | Not measured| ~4 min |
 
 <TODO: state the remaining headroom below the reported device capacity, and
 report the measured difference between the two eight-GPU device orders.>
@@ -261,4 +265,6 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
   -o t2va.mp4
 ```
-its only takes 4 min to finish it when 8*6000. 10 min to finish it when 2*6000
+Measured client E2E for the 50-step T2VA request above:
+~10 min on 2× RTX PRO 6000, ~4 min on 8× (after one warmup request).
+4-GPU latency was not measured on this host.
