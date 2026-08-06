@@ -1114,6 +1114,10 @@ class NativeRuntimeBridgeMixin:
             )
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
+            print(
+                f"[DUPLEX] end_of_turn block: response_id={response_id} data_plane_request_id={data_plane_request_id} active_response_id={session.active_response_id} auto_responds={self._session_auto_responds(session)}",
+                flush=True,
+            )
             if isinstance(data_plane_request_id, str) and not self._session_auto_responds(session):
                 self._serving_runtime_adapter.data_plane.close_stream(data_plane_request_id)
             if isinstance(data_plane_request_id, str):
@@ -1122,6 +1126,7 @@ class NativeRuntimeBridgeMixin:
                 if not self._session_auto_responds(session):
                     self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             should_commit = self._should_commit_response_to_history(session, response_id)
+            print(f"[DUPLEX] end_of_turn: calling end_response commit_text={should_commit}", flush=True)
             committed_message = session.end_response(
                 commit_text=should_commit,
                 preserve_request=self._session_auto_responds(session),
