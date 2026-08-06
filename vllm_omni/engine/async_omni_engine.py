@@ -315,8 +315,16 @@ class AsyncOmniEngine:
             from types import SimpleNamespace
 
             from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
+            model_class_name = resolve_model_class_name(self.model)
+            metadata = get_diffusion_model_metadata(model_class_name)
+            self._diffusion_od_config_view = SimpleNamespace(
+                model_class_name=model_class_name,
+                supports_multimodal_inputs=metadata.supports_multimodal_inputs,
+                max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
+                supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+            )
         return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
@@ -965,6 +973,7 @@ class AsyncOmniEngine:
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
+            text_encoder_tp_size = normalized_kwargs.get("text_encoder_tp_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -985,6 +994,7 @@ class AsyncOmniEngine:
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,
+                text_encoder_tp_size=text_encoder_tp_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -1022,6 +1032,7 @@ class AsyncOmniEngine:
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
+            "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

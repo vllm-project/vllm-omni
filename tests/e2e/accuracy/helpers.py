@@ -696,7 +696,7 @@ def _dreamzero_omni_server_from_params(params):
 
     server_args = list(params.server_args or [])
     if params.stage_config_path is not None:
-        server_args += ["--stage-configs-path", params.stage_config_path]
+        server_args += ["--deploy-config", params.stage_config_path]
     return OmniServer(
         params.model,
         server_args,

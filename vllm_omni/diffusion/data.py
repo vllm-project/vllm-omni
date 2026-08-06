@@ -192,6 +192,16 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    text_encoder_tp_size: int = 1
+    """Number of ranks used to tensor-parallel shard the diffusion text encoder.
+
+    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
+    which keeps the encoder fully resident on the DiT main rank (historical
+    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
+    ranks and run the encode with distributed collectives over the encoder
+    process group.
+    """
+
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
 
@@ -677,9 +687,13 @@ class OmniDiffusionConfig:
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
-    # concurrent requests in DP mode). If False: each rank loads full weights
-    # via H2D only (N× CPU memory, but no AllGather synchronization needed).
+    # concurrent requests in DP mode). If False: each rank streams the standard
+    # loader's rank-local tensors (including TP-local shards) via H2D only.
+    # This avoids AllGather synchronization, while host memory follows the
+    # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    # Leading main-DiT blocks kept resident by distributed layerwise offload.
+    dlo_resident_layers: int = 0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -774,6 +788,7 @@ class OmniDiffusionConfig:
     # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
 
     log_level: str = "info"
 
@@ -1108,6 +1123,7 @@ class OmniDiffusionConfig:
         metadata = get_diffusion_model_metadata(self.model_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:

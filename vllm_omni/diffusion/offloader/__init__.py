@@ -16,6 +16,7 @@ from .distributed_layerwise_backend import (
     remove_distributed_block_hook,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
+from .module_residency import PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan, supports_mmap_loading
 from .sequential_backend import (
     ModelLevelOffloadBackend,
@@ -41,6 +42,7 @@ __all__ = [
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
     "ModelLevelOffloadBackend",
+    "PinnedModuleStager",
     "apply_sequential_offload",
     "remove_sequential_offload",
     "apply_distributed_block_hook",

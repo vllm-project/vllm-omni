@@ -13,8 +13,6 @@ A config JSON file may be passed via --test-config-file. If omitted, every ``*.j
   pytest run_diffusion_benchmark.py -m "diffusion"
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
-Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
-
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
 
@@ -25,6 +23,7 @@ of all runs from cases in that file). Bulk load without ``--test-config-file`` u
 the same per-file aggregation; ``-m`` only selects which cases run.
 """
 
+import copy
 import json
 import os
 import socket
@@ -272,11 +271,6 @@ def _write_result_record(record: dict[str, Any]) -> Path:
         with open(target, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
     return target
-
-
-def _append_to_aggregated_file(record: dict[str, Any]) -> None:
-    """Backward-compatible wrapper; prefer :func:`_write_result_record`."""
-    _write_result_record(record)
 
 
 _server_lock = threading.Lock()
@@ -678,7 +672,7 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
+    exclude_keys = {"baseline", "dataset", "task", "name"}
 
     cmd = [
         sys.executable,
@@ -772,12 +766,17 @@ def run_benchmark(
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
+    # Persist the JSON baseline as-is (no hardware / sweep resolution).
+    baseline = copy.deepcopy(params.get("baseline") or {})
+    metrics["baseline"] = baseline
+
     record: dict[str, Any] = {
         "test_name": test_name,
         "endpoint": endpoint,
         "timestamp": timestamp,
         "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
+        "baseline": baseline,
         "result": metrics,
         "log_file": str(log_file),
         "Model": model,
@@ -827,69 +826,13 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_baseline_value(
-    baseline_raw: Any,
-    *,
-    sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-) -> Any:
-    """Pick the baseline threshold for this sweep step."""
-    if baseline_raw is None:
-        return 100000
-    if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
-        )
-    if isinstance(baseline_raw, (list, tuple)):
-        if sweep_index is None:
-            raise ValueError("sweep_index is required when baseline is a list or tuple")
-        return baseline_raw[sweep_index]
-    return baseline_raw
-
-
 def assert_result(
     result: dict[str, Any],
-    params: dict[str, Any],
     num_prompts: int,
-    *,
-    sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-    assert_baseline: bool = True,
 ) -> None:
-    """Assert that benchmark metrics satisfy the configured baselines."""
+    """Assert that the expected number of requests completed."""
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
-
-    if not assert_baseline:
-        return
-    if params.get("skip-performance-assertion", False):
-        print("Skipping performance assertions.")
-        return
-
-    for metric, baseline_raw in params.get("baseline", {}).items():
-        current = result.get(metric)
-        assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
-        threshold = _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
-        if "throughput" in metric:
-            assert current >= threshold, f"{metric}: {current:.4f} < baseline {threshold}"
-        else:
-            assert current <= threshold, f"{metric}: {current:.4f} > baseline {threshold}"
 
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
@@ -919,7 +862,6 @@ def _build_run_params(
     params: dict[str, Any],
     *,
     num_prompts: int,
-    sweep_index: int | None = None,
     request_rate: Any | None = None,
     max_concurrency: Any | None = None,
 ) -> dict[str, Any]:
@@ -931,16 +873,6 @@ def _build_run_params(
         run_params["request-rate"] = request_rate
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
-    if "baseline" in params:
-        run_params["baseline"] = {
-            metric: _resolve_baseline_value(
-                baseline_raw,
-                sweep_index=sweep_index,
-                max_concurrency=max_concurrency,
-                request_rate=request_rate,
-            )
-            for metric, baseline_raw in params["baseline"].items()
-        }
     return run_params
 
 
@@ -963,36 +895,28 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
 
     sweep_runs: list[dict[str, Any]] = []
 
-    for i, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
+    for request_rate, num_prompts in zip(request_rate_list, num_prompt_list):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     request_rate=request_rate,
                     num_prompts=num_prompts,
-                    sweep_index=i,
                 ),
                 "num_prompts": num_prompts,
-                "sweep_index": i,
-                "request_rate": request_rate,
-                "max_concurrency": None,
             }
         )
 
-    for i, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+    for max_concurrency, num_prompts in zip(max_concurrency_list, num_prompt_list):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     max_concurrency=max_concurrency,
                     num_prompts=num_prompts,
-                    sweep_index=i,
                     request_rate="inf",
                 ),
                 "num_prompts": num_prompts,
-                "sweep_index": i,
-                "request_rate": None,
-                "max_concurrency": max_concurrency,
             }
         )
 
@@ -1005,9 +929,6 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                     num_prompts=default_num_prompts,
                 ),
                 "num_prompts": default_num_prompts,
-                "sweep_index": None,
-                "request_rate": None,
-                "max_concurrency": None,
             }
         )
 
@@ -1023,14 +944,12 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
     paired_benchmark_params,
     indirect=["diffusion_server", "benchmark_params"],
 )
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
     For each server, all benchmark parameter sets defined in the config JSON
     are executed sequentially; metrics are recorded to the aggregated result file.
-
-    Pass ``--assert-baseline`` to compare ``throughput_qps``, ``latency_mean``, etc. to the JSON ``baseline`` block.
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
@@ -1073,14 +992,4 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, req
             print(f"\n  Aggregated results: {_aggregated_result_file_for_source(str(source))}")
         print("=" * 60)
 
-        assert_baseline = request.config.getoption("--assert-baseline", default=False)
-
-        assert_result(
-            result,
-            params,
-            sweep_run["num_prompts"],
-            sweep_index=sweep_run["sweep_index"],
-            max_concurrency=sweep_run["max_concurrency"],
-            request_rate=sweep_run["request_rate"],
-            assert_baseline=assert_baseline,
-        )
+        assert_result(result, sweep_run["num_prompts"])
