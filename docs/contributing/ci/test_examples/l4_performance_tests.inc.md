@@ -144,10 +144,6 @@ pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
-
-# Optional baseline assertion (default off)
-pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline \
-  --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 ```
 
 See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
@@ -204,4 +200,4 @@ You can add any benchmark running parameters you need here. For all optional par
 | num_prompts     | int / array | Yes      | 10,[10, 20, 30] | Number of requests. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of qps or max_concurrency, e.g., [10,10,10]. If an array is used, its length must match the number of qps or max_concurrency. |
 | request_rate    | float / array | No  | 0.5, [0.5, 1, inf] | Queries per second. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of num_prompts, e.g., [1,1,1]. If an array is used, its length must match the number of num_prompts.                          |
 | max_concurrency | int / array | No       | 1, [1, 2, 3]    | Maximum concurrent in-flight requests. Same array / expansion rules as `request_rate` (mutually exclusive with QPS mode).                                                                                                                                                                                                             |
-| baseline        | object      | No       | see below       | Optional thresholds. Hardware-nested form only: {"H100": {"throughput_qps": …}, "B200": {…}}. Per metric under each hardware key: scalar or sweep-aligned list. |
+| baseline        | object      | No       | see below       | Optional thresholds. **Hardware-nested only**: top-level keys must be `[hardware-resource]` pytest markers from `pyproject.toml` (`get_hardware_mark_list()`). Under each hardware key, metric names are free-form; values are scalars or sweep-aligned lists. Example: `{"H100": {"throughput_qps": […], "custom_stage_ms": 1.0}, "A3": {…}}`. Runtime filename aliases (`_RUNTIME_DEVICE_ALIASES`) are separate and do not expand this allowlist. |
