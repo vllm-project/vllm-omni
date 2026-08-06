@@ -64,4 +64,4 @@ curl -sS --max-time 1800 -X POST "http://yourinferenceurl/v1/videos/sync" \
   -F 'extra_params={"task":"t2va","duration":8,"audio_flow_shift":3.0}' \
   -o "out_t2va.mp4"
 ```
-its need ablout 25 mins to create finish.(4090*2)
+its need about 25 mins to create finish.(4090*2)
