@@ -1,0 +1,315 @@
+# Qwen3-TTS 2P2D PD deploy: 2 prefill (co-located on GPU0) + 2 decode (GPU2/3)
+# + 1 code2wav (GPU1).
+#   GPU0: P0 (kv_rank 0) + P1 (kv_rank 1)
+#   GPU1: code2wav
+#   GPU2: D0 (kv_rank 2)
+#   GPU3: D1 (kv_rank 3)
+pd_decode_pick_strategy: round_robin
+pd_prefill_pick_strategy: round_robin
+
+async_chunk: true
+
+stage_args:
+  # Stage 0: PREFILL (GPU 0, port 25201)
+  - stage_id: 0
+    stage_type: llm
+    is_prefill_only: true
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      env:
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25201
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_producer"
+        kv_rank: 0
+        kv_parallel_size: 4
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25201
+    final_output: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      detokenize: true
+      repetition_penalty: 1.0
+      stop_token_ids: []
+    subtalker_sampling_params:
+      do_sample: false
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
+
+  # Stage 1: PREFILL (GPU 0, port 25202) - co-located with stage 0
+  - stage_id: 1
+    stage_type: llm
+    is_prefill_only: true
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      env:
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25202
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_producer"
+        kv_rank: 1
+        kv_parallel_size: 4
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25202
+    final_output: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      detokenize: true
+      repetition_penalty: 1.0
+      stop_token_ids: []
+    subtalker_sampling_params:
+      do_sample: false
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
+
+  # Stage 2: DECODE (GPU 2, port 25203)
+  - stage_id: 2
+    stage_type: llm
+    is_decode_only: true
+    runtime:
+      devices: "2"
+      env:
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25203
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_consumer"
+        kv_rank: 2
+        kv_parallel_size: 4
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25203
+    engine_input_source: [0, 1]
+    final_output: false
+    output_connectors:
+      to_stage_4:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      detokenize: true
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  # Stage 3: DECODE (GPU 3, port 25204)
+  - stage_id: 3
+    stage_type: llm
+    is_decode_only: true
+    runtime:
+      devices: "3"
+      env:
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25204
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_consumer"
+        kv_rank: 3
+        kv_parallel_size: 4
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25204
+    engine_input_source: [0, 1]
+    final_output: false
+    output_connectors:
+      to_stage_4:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      detokenize: true
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  # Stage 4: Code2Wav (GPU 1)
+  - stage_id: 4
+    stage_type: llm
+    runtime:
+      devices: "1"
+    engine_args:
+      max_num_seqs: 128
+      model_stage: code2wav
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.5
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+      tensor_parallel_size: 1
+    engine_input_source: [2, 3]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_2:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      from_stage_3:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: false
+      repetition_penalty: 1.0
+
+edges:
+  - from: 0
+    to: 2
+  - from: 0
+    to: 3
+  - from: 1
+    to: 2
+  - from: 1
+    to: 3
+  - from: 2
+    to: 4
+  - from: 3
+    to: 4
+
