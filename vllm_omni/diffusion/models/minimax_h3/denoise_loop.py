@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from .adaln_schedule_cache import (
+    minimax_h3_adaln_schedule_cache_enabled,
+    minimax_h3_adaln_schedule_key,
+    minimax_h3_adaln_weight_offload_enabled,
+    minimax_h3_float32_bits,
+)
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -26,6 +33,15 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+
+
+@dataclass(frozen=True)
+class MiniMaxH3StepTimestepMetadata:
+    """Device-ready timestep routing for one denoise forward."""
+
+    unique_timesteps: torch.Tensor
+    inverse_indices: torch.Tensor
+    timestep_bits: tuple[int, ...]
 
 
 class MiniMaxH3DenoiseBranch:
@@ -45,6 +61,7 @@ class MiniMaxH3DenoiseBranch:
         device: torch.device,
     ) -> None:
         seq_len = int(packed["seq_len"])
+        self.device = device
         self.seq_len = seq_len
         self.img_pos = packed["img_pos"].view(-1).to(torch.long)
         self.audio_pos = packed["audio_pos"].view(-1).to(torch.long)
@@ -65,6 +82,12 @@ class MiniMaxH3DenoiseBranch:
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
+        timestep_category_ids = torch.zeros(seq_len, dtype=torch.long)
+        timestep_category_ids[self.img_pos[~self.update_mask]] = 1
+        timestep_category_ids[self.audio_pos[self.audio_update_mask]] = 2
+        timestep_category_ids[self.audio_pos[~self.audio_update_mask]] = 3
+        self.timestep_category_ids = timestep_category_ids
+        self.used_timestep_categories = torch.unique(timestep_category_ids, sorted=True)
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
@@ -87,43 +110,103 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        self._adaln_schedule_cache_active = False
+
+    def prepare_timestep_metadata(
+        self,
+        *,
+        sigmas_video: list[float],
+        sigmas_audio: list[float],
+        imgvid_cond_noise_aug_for_inference: float,
+        audio_cond_noise_aug_for_inference: float,
+    ) -> list[MiniMaxH3StepTimestepMetadata]:
+        """Precompute the full schedule's packed-row timestep routing on CPU."""
+        if len(sigmas_video) != len(sigmas_audio):
+            raise ValueError("video/audio sigma schedules must have equal length")
+        if len(sigmas_video) < 2:
+            raise ValueError("sigma schedules need at least 2 entries")
+
+        result: list[MiniMaxH3StepTimestepMetadata] = []
+        for step in range(len(sigmas_video) - 1):
+            t_video = 1.0 - float(sigmas_video[step])
+            t_audio = 1.0 - float(sigmas_audio[step])
+            category_timesteps = torch.tensor(
+                [
+                    t_video,
+                    max(t_video, float(imgvid_cond_noise_aug_for_inference)),
+                    t_audio,
+                    max(t_audio, float(audio_cond_noise_aug_for_inference)),
+                ],
+                dtype=torch.float32,
+            )
+            active_timesteps = category_timesteps.index_select(0, self.used_timestep_categories)
+            unique_timesteps, active_inverse = torch.unique(
+                active_timesteps,
+                sorted=True,
+                return_inverse=True,
+            )
+            category_inverse = torch.zeros(4, dtype=torch.long)
+            category_inverse.index_copy_(0, self.used_timestep_categories, active_inverse)
+            inverse_indices = category_inverse.index_select(0, self.timestep_category_ids)
+            result.append(
+                MiniMaxH3StepTimestepMetadata(
+                    unique_timesteps=unique_timesteps.to(self.device),
+                    inverse_indices=inverse_indices.to(self.device),
+                    timestep_bits=minimax_h3_float32_bits(unique_timesteps),
+                )
+            )
+        return result
+
+    def prepare_adaln_schedule_cache(
+        self,
+        model: Any,
+        timestep_metadata: list[MiniMaxH3StepTimestepMetadata],
+        *,
+        enabled: bool,
+    ) -> Any | None:
+        """Prepare exact model-local modulation tables for this schedule."""
+        self._adaln_schedule_cache_active = False
+        if not enabled:
+            clear = getattr(model, "clear_adaln_schedule_cache", None)
+            if clear is not None:
+                clear()
+            return None
+        prepare = getattr(model, "prepare_adaln_schedule_cache", None)
+        if prepare is None:
+            return None
+        with torch.inference_mode():
+            cache = prepare(
+                unique_timestep_plan=tuple(step.unique_timesteps for step in timestep_metadata),
+                schedule_key=minimax_h3_adaln_schedule_key(timestep_metadata),
+                offload_weights=minimax_h3_adaln_weight_offload_enabled(),
+            )
+        self._adaln_schedule_cache_active = cache is not None
+        return cache
 
     def forward_kwargs(
         self,
         *,
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
-        t_video: float,
-        t_audio: float,
-        imgvid_cond_timestep: float,
-        audio_ref_cond_timestep: float,
+        timestep_metadata: MiniMaxH3StepTimestepMetadata,
+        step_index: int | None = None,
     ) -> dict[str, Any]:
         x = self.x_base.clone()
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        # Packed-sequence timestep semantics: non-media rows (text and
-        # padding) inherit the current video timestep. Later steps must reuse
-        # the previous step's updated rows; re-initializing from zeros is only
-        # valid at step 0.
-        timesteps = torch.full(
-            (self.seq_len,),
-            float(t_video),
-            dtype=torch.float32,
-            device=x.device,
-        )
-        timesteps[self.img_pos_dev[self.update_mask_dev]] = t_video
-        timesteps[self.img_pos_dev[~self.update_mask_dev]] = imgvid_cond_timestep
-        timesteps[self.audio_pos_dev[self.audio_update_mask_dev]] = t_audio
-        timesteps[self.audio_pos_dev[~self.audio_update_mask_dev]] = audio_ref_cond_timestep
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
-        return {
+        dynamic_kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
-            "unique_timesteps": unique_timesteps,
-            "inverse_indices": inverse_indices,
+            "unique_timesteps": timestep_metadata.unique_timesteps,
+            "inverse_indices": timestep_metadata.inverse_indices,
         }
+        if self._adaln_schedule_cache_active:
+            if step_index is None:
+                raise ValueError("step_index is required while the AdaLN schedule cache is active")
+            dynamic_kwargs["adaln_step_index"] = step_index
+        return dynamic_kwargs
 
 
 def minimax_h3_denoise_loop(
@@ -153,6 +236,12 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    timestep_metadata = positive.prepare_timestep_metadata(
+        sigmas_video=sigmas_video,
+        sigmas_audio=sigmas_audio,
+        imgvid_cond_noise_aug_for_inference=imgvid_cond_noise_aug_for_inference,
+        audio_cond_noise_aug_for_inference=audio_cond_noise_aug_for_inference,
+    )
     n_cond = int((~positive.update_mask).sum())
     if keyframe_cond_rows is None:
         if n_cond != 0:
@@ -187,6 +276,16 @@ def minimax_h3_denoise_loop(
     if audio_anchor is not None:
         audio_rows[~audio_update] = audio_anchor
 
+    prepare_for_request_caches = getattr(model, "prepare_for_request_caches", None)
+    if prepare_for_request_caches is not None:
+        with torch.inference_mode():
+            prepare_for_request_caches()
+    positive.prepare_adaln_schedule_cache(
+        model,
+        timestep_metadata,
+        enabled=minimax_h3_adaln_schedule_cache_enabled(),
+    )
+
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
@@ -194,16 +293,12 @@ def minimax_h3_denoise_loop(
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
             s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
             t_v, t_a = 1.0 - s_v, 1.0 - s_a
-            imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
-            audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
 
             fk = positive.forward_kwargs(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
-                t_video=t_v,
-                t_audio=t_a,
-                imgvid_cond_timestep=imgvid_cond_t,
-                audio_ref_cond_timestep=audio_ref_cond_t,
+                timestep_metadata=timestep_metadata[step],
+                step_index=step,
             )
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
@@ -245,5 +340,6 @@ __all__ = [
     "MINIMAX_H3_IMGVID_COND_TIMESTEP",
     "MINIMAX_H3_VIDEO_ROW_WIDTH",
     "MiniMaxH3DenoiseBranch",
+    "MiniMaxH3StepTimestepMetadata",
     "minimax_h3_denoise_loop",
 ]

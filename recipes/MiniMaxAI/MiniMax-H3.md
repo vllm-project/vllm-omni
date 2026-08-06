@@ -233,6 +233,36 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 1. The H3 VAE supports its native `tile` mode, not
 `spatial_shard_height` or `spatial_shard_width`.
 
+### Optional exact-schedule AdaLN cache
+
+H3 can precompute every AdaLN projection for the request's known timestep
+schedule and reuse the exact rows in each denoise step:
+
+```bash
+export VLLM_OMNI_H3_ADALN_SCHEDULE_CACHE=1
+```
+
+The cache key uses the exact float32 timestep bit patterns. A request with the
+same schedule reuses the installed tables; a changed schedule rebuilds them.
+This is disabled by default because the tables consume persistent device
+memory proportional to the number of denoise steps and layers.
+
+After the tables are installed, the original projection weights can also move
+to CPU and release their device storage:
+
+```bash
+export VLLM_OMNI_H3_ADALN_SCHEDULE_CACHE=1
+export VLLM_OMNI_H3_ADALN_OFFLOAD_WEIGHTS=1
+```
+
+Weight offload requires the schedule cache. On a schedule change, the weights
+are restored, the replacement tables are built, and the weights are offloaded
+again. The optimization falls back to direct projection when the tables would
+occupy at least as much memory as the projection weights. DTensor/HSDP
+parameters remain under their distributed owner. With layerwise offload, H3's
+AdaLN projection parameters stay outside the per-block transfer set while the
+exact-schedule cache owns them.
+
 ### Text encoder tensor parallelism
 
 The Qwen3-VL text encoder (~51.5 GB in BF16 for the retained 50 layers) is by

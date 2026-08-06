@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from cache_dit import ForwardPattern
+from torch.distributed.tensor import DTensor
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -32,6 +33,14 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
+)
+from vllm_omni.platforms import current_omni_platform
+
+from .adaln_schedule_cache import (
+    MiniMaxH3AdalnScheduleCache,
+    MiniMaxH3AdalnScheduleKey,
+    minimax_h3_adaln_schedule_cache_enabled,
+    minimax_h3_build_adaln_table,
 )
 
 if TYPE_CHECKING:
@@ -132,6 +141,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_pos_for_infer_output_info",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        "adaln_step_index",
     }
 )
 
@@ -546,14 +556,118 @@ class MiniMaxH3AdalnProj(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
+        self.register_buffer("_precomputed_table", None, persistent=False)
+        self._precomputed_step: torch.Tensor | None = None
+        self._offloaded_projection_state: dict[str, tuple[torch.Tensor, torch.device, torch.Size]] | None = None
 
+    @property
+    def projection_weights_offloaded(self) -> bool:
+        return self._offloaded_projection_state is not None
+
+    @property
+    def projection_nbytes(self) -> int:
+        state = self._offloaded_projection_state
+        if state is not None:
+            return sum(tensor.numel() * tensor.element_size() for tensor, _, _ in state.values())
+        total = 0
+        for parameter in self.linear.parameters():
+            local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            total += local.numel() * local.element_size()
+        return total
+
+    def can_offload_projection(self) -> bool:
+        """Whether this projection can safely own ordinary parameter storage."""
+        if self.projection_weights_offloaded:
+            return True
+        parameters = tuple(self.linear.parameters())
+        return bool(parameters) and all(
+            not isinstance(parameter, DTensor) and not parameter.is_meta and parameter.numel() > 0
+            for parameter in parameters
+        )
+
+    def offload_projection(self) -> int:
+        """Move exact projection parameters to CPU and release device storage."""
+        if self.projection_weights_offloaded:
+            return 0
+        if self._precomputed_table is None:
+            raise RuntimeError("AdaLN projection weights require an installed precomputed table before offload")
+        if not self.can_offload_projection():
+            raise RuntimeError("AdaLN projection weight offload does not support DTensor, meta, or empty parameters")
+
+        state: dict[str, tuple[torch.Tensor, torch.device, torch.Size]] = {}
+        try:
+            for name, parameter in self.linear.named_parameters():
+                cpu_tensor = parameter.detach().to(device="cpu", copy=True)
+                state[name] = (cpu_tensor, parameter.device, parameter.shape)
+                parameter.data = torch.empty((0,), device=parameter.device, dtype=parameter.dtype)
+        except Exception:
+            for name, (cpu_tensor, device, shape) in state.items():
+                self.linear.get_parameter(name).data = cpu_tensor.to(device=device).view(shape)
+            raise
+        self._offloaded_projection_state = state
+        return sum(tensor.numel() * tensor.element_size() for tensor, _, _ in state.values())
+
+    def restore_projection(self) -> None:
+        """Restore a previously offloaded projection to its original devices."""
+        state = self._offloaded_projection_state
+        if state is None:
+            return
+        restored = {
+            name: cpu_tensor.to(device=device).view(shape) for name, (cpu_tensor, device, shape) in state.items()
+        }
+        for name, tensor in restored.items():
+            self.linear.get_parameter(name).data = tensor
+        self._offloaded_projection_state = None
+
+    def compute_flat(self, t_emb: torch.Tensor) -> torch.Tensor:
+        """Run the original projection and return `[M*modalities, ratio*H]`."""
+        x = nn.functional.silu(t_emb)
+        x, _ = self.linear(x.to(self.linear.weight.dtype))
+        m = x.shape[0]
+        return x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
+
+    def install_precomputed(
+        self,
+        table: torch.Tensor,
+        step_cursor: torch.Tensor,
+    ) -> None:
+        """Atomically select a non-persistent exact-schedule modulation table."""
+        expected_width = self.expand_ratio * self.hidden_size
+        if table.dim() != 3 or table.shape[-1] != expected_width:
+            raise ValueError(
+                f"precomputed AdaLN table must be [steps, rows, {expected_width}], got {list(table.shape)}"
+            )
+        if table.dtype != self.linear.weight.dtype:
+            raise ValueError(f"precomputed AdaLN table dtype mismatch: {table.dtype} != {self.linear.weight.dtype}")
+        if step_cursor.dtype != torch.long or step_cursor.dim() != 0:
+            raise ValueError("precomputed AdaLN step cursor must be a scalar torch.long tensor")
+        if table.device != step_cursor.device:
+            raise ValueError(f"precomputed AdaLN table/cursor device mismatch: {table.device} != {step_cursor.device}")
+        self._buffers["_precomputed_table"] = table
+        self._precomputed_step = step_cursor
+
+    def clear_precomputed(self) -> None:
+        """Restore direct projection without changing checkpoint parameters."""
+        self.restore_projection()
+        self._buffers["_precomputed_table"] = None
+        self._precomputed_step = None
+
+    @torch.compiler.disable
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
-        x = nn.functional.silu(t_emb)
-        x, _ = self.linear(x.to(_BF16_DTYPE))
-        m = x.shape[0]
-        x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
-        return tuple(x.chunk(self.expand_ratio, dim=-1))
+        table = self._precomputed_table
+        if table is None:
+            rows = self.compute_flat(t_emb)
+            return tuple(rows.chunk(self.expand_ratio, dim=-1))
+
+        step_cursor = self._precomputed_step
+        if step_cursor is None:
+            raise RuntimeError("precomputed AdaLN table is installed without a step cursor")
+        row_count = t_emb.shape[0] * self.modality_num
+        if row_count > table.shape[1]:
+            raise ValueError(f"precomputed AdaLN table row capacity is too small: {table.shape[1]} < {row_count}")
+        rows = table.index_select(0, step_cursor.reshape(1))[0].narrow(0, 0, row_count)
+        return tuple(rows.chunk(self.expand_ratio, dim=-1))
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -802,6 +916,13 @@ class MiniMaxH3DiTModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["blocks"]
 
     @staticmethod
+    def layerwise_offload_excluded_parameter_prefixes() -> tuple[str, ...]:
+        """Parameters owned by the exact-schedule cache instead of block hooks."""
+        if minimax_h3_adaln_schedule_cache_enabled():
+            return ("adaln_proj.linear.",)
+        return ()
+
+    @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
         del module
         parts = name.split(".")
@@ -941,6 +1062,8 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config,
             prefix="final_layer",
         )
+        self._adaln_projections = tuple(block.adaln_proj for block in self.blocks) + (self.final_layer.adaln_proj,)
+        self._adaln_schedule_cache: MiniMaxH3AdalnScheduleCache | None = None
         self._mark_missing_params_required()
 
     def _mark_missing_params_required(self) -> None:
@@ -954,6 +1077,126 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, buffer in self.named_buffers():
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
+
+    @torch.inference_mode()
+    def prepare_for_request_caches(self) -> None:
+        """Materialize a sequentially offloaded DiT before auxiliary cache work."""
+        registry = getattr(self, "_hook_registry", None)
+        if registry is None:
+            return
+        hook = registry.get_hook("sequential_offload")
+        if hook is not None:
+            hook.pre_forward(self)
+
+    @torch.inference_mode()
+    def prepare_adaln_schedule_cache(
+        self,
+        *,
+        unique_timestep_plan: tuple[torch.Tensor, ...],
+        schedule_key: MiniMaxH3AdalnScheduleKey,
+        offload_weights: bool = False,
+    ) -> MiniMaxH3AdalnScheduleCache | None:
+        """Build or reuse the single exact AdaLN schedule held by this model."""
+        if not unique_timestep_plan:
+            raise ValueError("AdaLN schedule must contain at least one denoise step")
+        normalized_key = tuple(tuple(int(value) for value in step) for step in schedule_key)
+        if len(normalized_key) != len(unique_timestep_plan):
+            raise ValueError(
+                f"AdaLN schedule key/plan length mismatch: {len(normalized_key)} != {len(unique_timestep_plan)}"
+            )
+        existing = self._adaln_schedule_cache
+        if existing is not None and existing.key == normalized_key:
+            return existing
+
+        for projection in self._adaln_projections:
+            projection.restore_projection()
+
+        t_embs = tuple(self.time_embedder(timestep.view(-1)) for timestep in unique_timestep_plan)
+        device = t_embs[0].device
+        if any(t_emb.device != device for t_emb in t_embs):
+            raise ValueError("AdaLN timestep embeddings must share one device")
+        step_cursor = torch.zeros((), dtype=torch.long, device=device)
+        tables = tuple(minimax_h3_build_adaln_table(projection, t_embs) for projection in self._adaln_projections)
+        table_bytes = sum(table.numel() * table.element_size() for table in tables)
+        projection_bytes = sum(projection.projection_nbytes for projection in self._adaln_projections)
+        offload_supported = offload_weights and all(
+            projection.can_offload_projection() for projection in self._adaln_projections
+        )
+        if offload_supported and table_bytes >= projection_bytes:
+            for projection in self._adaln_projections:
+                projection.clear_precomputed()
+            self._adaln_schedule_cache = None
+            logger.warning(
+                "MiniMax H3 AdaLN weight offload skipped because table bytes (%d) "
+                "would not save memory versus projection bytes (%d)",
+                table_bytes,
+                projection_bytes,
+            )
+            return None
+
+        # Build every table before changing the live projection path.
+        for projection, table in zip(self._adaln_projections, tables):
+            projection.install_precomputed(table, step_cursor)
+
+        offloaded_projection_bytes = 0
+        if offload_supported:
+            try:
+                offloaded_projection_bytes = sum(
+                    projection.offload_projection() for projection in self._adaln_projections
+                )
+            except Exception:
+                for projection in self._adaln_projections:
+                    projection.restore_projection()
+                logger.exception("MiniMax H3 AdaLN projection offload failed; retaining exact tables and weights")
+        elif offload_weights:
+            logger.warning("MiniMax H3 AdaLN projection offload is unsupported for the active parameter layout")
+
+        if offloaded_projection_bytes:
+            current_omni_platform.empty_cache()
+
+        cache = MiniMaxH3AdalnScheduleCache(
+            key=normalized_key,
+            t_embs=t_embs,
+            step_cursor=step_cursor,
+            steps=len(t_embs),
+            max_unique_timesteps=max(int(t_emb.shape[0]) for t_emb in t_embs),
+            table_bytes=table_bytes,
+            projection_bytes=projection_bytes,
+            offloaded_projection_bytes=offloaded_projection_bytes,
+            net_memory_saved_bytes=offloaded_projection_bytes - table_bytes,
+        )
+        self._adaln_schedule_cache = cache
+        if offloaded_projection_bytes:
+            gib = 1024**3
+            logger.info(
+                "MiniMax H3 AdaLN projection weights offloaded: %.3f GiB weights, "
+                "%.3f GiB tables, %.3f GiB net device-memory reduction",
+                offloaded_projection_bytes / gib,
+                table_bytes / gib,
+                cache.net_memory_saved_bytes / gib,
+            )
+        return cache
+
+    def clear_adaln_schedule_cache(self) -> None:
+        """Drop the model-local table and restore direct AdaLN projections."""
+        if self._adaln_schedule_cache is None:
+            return
+        for projection in self._adaln_projections:
+            projection.clear_precomputed()
+        self._adaln_schedule_cache = None
+
+    def _select_adaln_schedule_step(self, step_index: Any) -> torch.Tensor | None:
+        cache = self._adaln_schedule_cache
+        if cache is None:
+            if step_index is not None:
+                raise ValueError("adaln_step_index was supplied without a prepared AdaLN schedule")
+            return None
+        if isinstance(step_index, bool) or not isinstance(step_index, int):
+            raise ValueError("adaln_step_index must be an integer while the AdaLN schedule is active")
+        if step_index < 0 or step_index >= cache.steps:
+            raise ValueError(f"adaln_step_index {step_index} is outside [0, {cache.steps})")
+        cache.step_cursor.fill_(step_index)
+        return cache.t_embs[step_index]
 
     def load_weights(
         self,
@@ -1027,6 +1270,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_max_seqlen: int,
         seq_len: int,
         device: torch.device,
+        precomputed_t_emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build packed multimodal embeddings for the TP=1/SP=1 inference path.
 
@@ -1052,7 +1296,7 @@ class MiniMaxH3DiTModel(nn.Module):
         embeddings.index_add_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
         embeddings.index_add_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
 
-        t_emb = self.time_embedder(unique_timesteps)
+        t_emb = self.time_embedder(unique_timesteps) if precomputed_t_emb is None else precomputed_t_emb
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1071,6 +1315,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 f"{unexpected}; supported kwargs: "
                 f"{sorted(_FORWARD_SUPPORTED_KWARGS)}"
             )
+
+        precomputed_t_emb = self._select_adaln_schedule_step(kwargs.get("adaln_step_index"))
 
         x = _required_kwarg(kwargs, "x")
         audio_x = _required_kwarg(kwargs, "audio_x")
@@ -1124,6 +1370,7 @@ class MiniMaxH3DiTModel(nn.Module):
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
+            precomputed_t_emb=precomputed_t_emb,
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)

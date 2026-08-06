@@ -135,6 +135,14 @@ class _DummyBlock(nn.Module):
         self.weight = nn.Parameter(torch.randn(10, 10))
 
 
+class _OwnedProjectionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        self.adaln_proj = nn.Module()
+        self.adaln_proj.linear = nn.Linear(2, 3)
+
+
 class _SingleBlockModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["blocks"]
 
@@ -222,6 +230,49 @@ class TestGetBlocksFromDit:
         attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
         assert attr_names == ["blocks"]
         assert len(blocks) == 2
+
+
+def test_layerwise_hook_leaves_excluded_parameters_under_model_ownership(patched_offload_runtime):
+    current_block = _OwnedProjectionBlock()
+    next_block = _OwnedProjectionBlock()
+    current_adaln = {name: tensor.clone() for name, tensor in current_block.adaln_proj.linear.state_dict().items()}
+    next_adaln = {name: tensor.clone() for name, tensor in next_block.adaln_proj.linear.state_dict().items()}
+    hook = LayerwiseOffloadHook(
+        next_block=next_block,
+        device=torch.device("cpu"),
+        stream=DummyStream(),
+        pin_memory=False,
+        excluded_parameter_prefixes=("adaln_proj.linear.",),
+    )
+
+    hook.initialize_hook(current_block)
+
+    assert set(hook.block_parameters) == {"weight"}
+    assert set(hook.next_block_parameters) == {"weight"}
+    assert next_block.weight.numel() == 0
+    for name, tensor in next_block.adaln_proj.linear.state_dict().items():
+        torch.testing.assert_close(tensor, next_adaln[name], rtol=0, atol=0)
+
+    hook.offload_layer()
+    assert current_block.weight.numel() == 0
+    for name, tensor in current_block.adaln_proj.linear.state_dict().items():
+        torch.testing.assert_close(tensor, current_adaln[name], rtol=0, atol=0)
+
+
+def test_layerwise_backend_materializes_excluded_parameters_on_target_device():
+    block = _OwnedProjectionBlock()
+    expected_bytes = sum(
+        parameter.numel() * parameter.element_size() for parameter in block.adaln_proj.linear.parameters()
+    )
+
+    moved_bytes = LayerWiseOffloadBackend._move_excluded_parameters_to_device(
+        block,
+        torch.device("cpu"),
+        ("adaln_proj.linear.",),
+    )
+
+    assert moved_bytes == expected_bytes
+    assert all(parameter.device.type == "cpu" for parameter in block.adaln_proj.linear.parameters())
 
 
 class TestGetBlocksAttrNames:

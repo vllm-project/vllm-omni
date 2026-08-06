@@ -41,6 +41,7 @@ class LayerwiseOffloadHook(ModelHook):
         device: torch.device,
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
+        excluded_parameter_prefixes: tuple[str, ...] = (),
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -48,6 +49,7 @@ class LayerwiseOffloadHook(ModelHook):
         self.device = device
         self.copy_stream = stream or current_omni_platform.current_stream()
         self.pin_memory = pin_memory
+        self.excluded_parameter_prefixes = tuple(excluded_parameter_prefixes)
 
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: current_omni_platform.Event | None = None
@@ -90,10 +92,10 @@ class LayerwiseOffloadHook(ModelHook):
         # the input module is kept intact
         module = super().initialize_hook(module)
 
-        self.block_parameters: dict[str, nn.Parameter] = dict(module.named_parameters())
+        self.block_parameters = self._owned_parameters(module)
         self.block_buffers: dict[str, torch.Tensor] = dict(module.named_buffers())
 
-        self.next_block_parameters: dict[str, nn.Parameter] = dict(self.next_block.named_parameters())
+        self.next_block_parameters = self._owned_parameters(self.next_block)
         self.next_block_buffers: dict[str, torch.Tensor] = dict(self.next_block.named_buffers())
 
         # Pre-allocate gpu tensors in a flattened way
@@ -105,6 +107,13 @@ class LayerwiseOffloadHook(ModelHook):
         )
 
         return module
+
+    def _owned_parameters(self, module: nn.Module) -> dict[str, nn.Parameter]:
+        return {
+            name: parameter
+            for name, parameter in module.named_parameters()
+            if not name.startswith(self.excluded_parameter_prefixes)
+        }
 
     @staticmethod
     def _to_cpu(
@@ -255,9 +264,10 @@ def apply_block_hook(
     device: torch.device,
     stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
+    excluded_parameter_prefixes: tuple[str, ...] = (),
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
-    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory)
+    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory, excluded_parameter_prefixes)
     registry.register_hook(LayerwiseOffloadHook._HOOK_NAME, hook)
 
     return hook
@@ -283,6 +293,20 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         self.copy_stream = current_omni_platform.Stream()
         self._blocks: list[list[nn.Module]] = []
+
+    @staticmethod
+    def _move_excluded_parameters_to_device(
+        module: nn.Module,
+        device: torch.device,
+        excluded_parameter_prefixes: tuple[str, ...],
+    ) -> int:
+        moved_bytes = 0
+        for name, parameter in module.named_parameters():
+            if not name.startswith(excluded_parameter_prefixes):
+                continue
+            moved_bytes += parameter.numel() * parameter.element_size()
+            parameter.data = parameter.data.to(device, non_blocking=True)
+        return moved_bytes
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -341,6 +365,30 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
+            excluded_parameter_prefixes: tuple[str, ...] = ()
+            get_excluded_prefixes = getattr(dit_module, "layerwise_offload_excluded_parameter_prefixes", None)
+            if callable(get_excluded_prefixes):
+                excluded_parameter_prefixes = tuple(get_excluded_prefixes())
+                if excluded_parameter_prefixes:
+                    logger.info(
+                        "Leaving layer-wise parameters matching %s under %s ownership",
+                        excluded_parameter_prefixes,
+                        dit_module.__class__.__name__,
+                    )
+                    moved_bytes = sum(
+                        self._move_excluded_parameters_to_device(
+                            block,
+                            self.device,
+                            excluded_parameter_prefixes,
+                        )
+                        for block in blocks
+                    )
+                    logger.info(
+                        "Materialized %.3f GiB of model-owned layer-wise parameters on %s",
+                        moved_bytes / 1024**3,
+                        self.device,
+                    )
+
             # Move non-block modules to GPU (they stay resident)
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
@@ -368,6 +416,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                excluded_parameter_prefixes,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -381,6 +430,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                     self.device,
                     self.copy_stream,
                     self.config.pin_cpu_memory,
+                    excluded_parameter_prefixes,
                 )
                 block_hooks.append(hook)
 

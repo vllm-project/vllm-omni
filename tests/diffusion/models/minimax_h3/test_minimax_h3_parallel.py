@@ -25,7 +25,7 @@ def test_grouped_qkv_checkpoint_reorder():
     assert reordered[:, 0].tolist() == [0, 3, 1, 4, 2, 5]
 
 
-def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
+def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp(monkeypatch):
     from cache_dit import ForwardPattern
 
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
@@ -37,6 +37,11 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
     assert MiniMaxH3DiTModel._cache_dit_adapter_config.block_forward_patterns["blocks"] == ForwardPattern.Pattern_3
     assert not MiniMaxH3DiTModel._cache_dit_adapter_config.has_separate_cfg
     assert set(MiniMaxH3DiTModel._sp_plan) == {"sp_prepare", "sp_gather"}
+
+    monkeypatch.setenv("VLLM_OMNI_H3_ADALN_SCHEDULE_CACHE", "1")
+    assert MiniMaxH3DiTModel.layerwise_offload_excluded_parameter_prefixes() == ("adaln_proj.linear.",)
+    monkeypatch.delenv("VLLM_OMNI_H3_ADALN_SCHEDULE_CACHE")
+    assert MiniMaxH3DiTModel.layerwise_offload_excluded_parameter_prefixes() == ()
 
     model = object.__new__(MiniMaxH3DiTModel)
     nn.Module.__init__(model)
@@ -59,6 +64,14 @@ def test_packed_attention_is_a_regional_compile_boundary():
     )
 
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
+
+
+def test_adaln_projection_is_a_regional_compile_boundary():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3AdalnProj,
+    )
+
+    assert getattr(MiniMaxH3AdalnProj.forward, "_torchdynamo_disable", False)
 
 
 @pytest.mark.parametrize(
