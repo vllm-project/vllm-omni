@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Stub out the server-entry modules that are pulled in by
+# vllm_omni/entrypoints/openai/__init__.py before the real import.
+# Those modules transitively import vllm.entrypoints.chat_utils symbols
+# (e.g. get_history_tool_calls_cnt) that may not exist in all installed
+# vllm versions.  The static method under test only uses stdlib, so it
+# loads cleanly once the chain is broken.
+import sys
+from unittest.mock import MagicMock
+
+sys.modules.setdefault("vllm_omni.entrypoints.openai.serving_chat", MagicMock())
+sys.modules.setdefault("vllm_omni.entrypoints.openai.api_server", MagicMock())
+
 import hashlib
 import logging
 import pathlib

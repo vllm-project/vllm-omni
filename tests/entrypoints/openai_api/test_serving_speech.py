@@ -1102,8 +1102,9 @@ class TestTTSMethods:
         assert second[1] == 24000
         assert first[0] is second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
+        cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
-            ref_audio
+            cache_key
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
@@ -1718,7 +1719,7 @@ class TestTTSMethods:
         mocker.patch.object(
             speech_server,
             "_resolve_ref_audio",
-            new=mocker.AsyncMock(return_value=ref_audio_data),
+            new=mocker.AsyncMock(return_value=(*ref_audio_data, "fake_cache_key")),
         )
         mock_prompt = mocker.patch.object(
             speech_server,
@@ -1835,7 +1836,7 @@ class TestTTSMethods:
         mocker.patch.object(
             speech_server,
             "_resolve_ref_audio",
-            new=mocker.AsyncMock(return_value=ref_audio_data),
+            new=mocker.AsyncMock(return_value=(*ref_audio_data, "fake_cache_key")),
         )
         mock_prompt = mocker.patch.object(
             speech_server,
@@ -3859,7 +3860,7 @@ class TestTTSAsyncOffloading:
     ):
         """Base explicit true should reach the model prompt additional_information."""
         qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
-        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000))
+        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000, "fake_cache_key"))
         qwen3_tts_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
 

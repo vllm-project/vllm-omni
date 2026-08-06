@@ -334,11 +334,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers: set[str] = set()
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
-        # Stash the last cache key computed by _resolve_ref_audio so that the
-        # immediately following _get_resolved_ref_audio_artifact_key call can
-        # reuse it without re-stat-ing the file (avoids a TOCTOU race and
-        # halves syscalls on the hot path).
-        self._last_ref_audio_source_key: dict[str, str] = {}
         self._ref_audio_resolve_cache_bytes = 0
         self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
@@ -1069,7 +1064,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_sr = None
         voice_profile = None
         if request.ref_audio is not None:
-            ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
+            ref_audio, ref_sr, _ = await self._resolve_ref_audio(request.ref_audio)
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
@@ -1683,7 +1678,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
@@ -1702,7 +1697,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
@@ -1819,7 +1814,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt_token_ids = input_ids_to_python_list(inputs)
             return tokens_input(prompt_token_ids=prompt_token_ids)
 
-        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
         out = await asyncio.to_thread(
             build_voice_clone_prompt,
@@ -1888,8 +1883,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             encode_reference_audio,
         )
 
-        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-        artifact_key = self._get_resolved_ref_audio_artifact_key(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+        artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
         wav = np.asarray(wav_list, dtype=np.float32)
         ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
             artifact_key,
@@ -2051,7 +2046,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         raise OSError("path outside allowed_local_media_path; skipping stat")
                 st = os.stat(path)
                 cache_key_source = f"{ref_audio_str}:{st.st_mtime_ns}:{st.st_size}"
-            except OSError:
+            except (OSError, ValueError):
                 # Truncate the value to avoid dumping huge base64 blobs into
                 # the server log when a client omits the ``data:`` prefix.
                 display = ref_audio_str[:80]
@@ -2063,8 +2058,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
         return hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()
 
-    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
-        """Resolve ref_audio to (wav_samples, sample_rate).
+    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int, str]:
+        """Resolve ref_audio to (wav_samples, sample_rate, cache_key).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
@@ -2073,6 +2068,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Local file references incorporate mtime and size into the cache key
         so that modified files are automatically reloaded without a server
         restart. Remote URLs remain cached by their original string locator.
+
+        The returned *cache_key* should be passed to
+        ``_get_resolved_ref_audio_artifact_key`` when the caller needs the
+        artifact key, avoiding a redundant ``os.stat`` and the TOCTOU window.
         """
         # Pass the allowed-local-media-path so the stat is restricted to
         # paths the server operator has explicitly permitted.
@@ -2080,9 +2079,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not self._diffusion_mode:
             allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
         cache_key = self._get_ref_audio_cache_key(ref_audio_str, allowed_local_media_path=allowed_path)
-        # Stash so _get_resolved_ref_audio_artifact_key can reuse without
-        # re-stat-ing.
-        self._last_ref_audio_source_key[ref_audio_str] = cache_key
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
@@ -2093,7 +2089,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sr,
                 len(wav_list) / sr if sr > 0 else 0.0,
             )
-            return wav_list, sr
+            return wav_list, sr, cache_key
 
         # In diffusion mode, model_config may not be available
         if self._diffusion_mode:
@@ -2135,7 +2131,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             duration,
         )
         self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
-        return wav_list, sr
+        return wav_list, sr, cache_key
 
     @staticmethod
     def _make_ref_audio_artifact_cache_key(wav: np.ndarray, sr: int) -> str:
@@ -2146,16 +2142,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         h.update(wav_f32.tobytes(order="C"))
         return h.hexdigest()
 
-    def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        # Reuse the cache key stashed by the preceding _resolve_ref_audio call
-        # to avoid a second os.stat (TOCTOU race + wasted syscall).
-        source_key = self._last_ref_audio_source_key.pop(ref_audio_str, None)
-        if source_key is None:
-            source_key = self._get_ref_audio_cache_key(ref_audio_str)
-        cached = self._ref_audio_resolve_cache.get(source_key)
+    def _get_resolved_ref_audio_artifact_key(self, cache_key: str) -> str | None:
+        """Look up the artifact key for a previously resolved ref_audio.
+
+        *cache_key* must be the exact key returned by the preceding
+        ``_resolve_ref_audio`` call.  Passing the key explicitly avoids a
+        second ``os.stat`` syscall and eliminates the TOCTOU window that
+        would arise from recomputing the key independently.
+        """
+        cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is None:
             return None
-        self._ref_audio_resolve_cache.move_to_end(source_key)
+        self._ref_audio_resolve_cache.move_to_end(cache_key)
         return cached[3]
 
     def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:
@@ -2220,7 +2218,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _resolve_ref_audio_many(self, ref_audio_list: list[str]) -> list[tuple[list[float], int]]:
         resolved = []
         for ref_audio in ref_audio_list:
-            resolved.append(await self._resolve_ref_audio(ref_audio))
+            wav_list, sr, _ = await self._resolve_ref_audio(ref_audio)
+            resolved.append((wav_list, sr))
         return resolved
 
     # ---- Ming TTS helpers ----
@@ -2879,7 +2878,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         + mm_processor_kwargs with prompt_text.
         """
         # Resolve reference audio
-        wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+        wav_samples, sr, _ = await self._resolve_ref_audio(request.ref_audio)
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
 
         # Wrap the reference transcript in the CosyVoice3 instruction template
@@ -3141,7 +3140,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         # Voice cloning requires ref_audio + ref_text
         if request.ref_audio is not None and request.ref_text:
-            wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+            wav_samples, sr, _ = await self._resolve_ref_audio(request.ref_audio)
             audio_data = (np.asarray(wav_samples, dtype=np.float32), int(sr))
 
             mm_kwargs: dict[str, Any] = {
@@ -3273,8 +3272,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Uploaded voice: ref_audio was auto-set as [base64_data_url]
             ref_audio_source = tts_params["ref_audio"][0]
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
-            artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(ref_audio_source)
+            artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
             if artifact_key:
                 tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
             ref_code_length = self._estimate_ref_code_len([wav_list, sr])
@@ -3722,7 +3721,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id = f"speech-{random_uuid()}"
             prompt: dict[str, Any] = {"input": request.input}
             if request.ref_audio:
-                wav, sr = await self._resolve_ref_audio(request.ref_audio)
+                wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
                 prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text

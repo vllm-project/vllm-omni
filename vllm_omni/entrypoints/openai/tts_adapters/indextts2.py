@@ -225,7 +225,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
             ref_audio_source = server._get_uploaded_audio_data(voice_lower)
             using_uploaded_voice = ref_audio_source is not None
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, _ = await server._resolve_ref_audio(ref_audio_source)
             params["voice"] = [[wav_list, sr]]
         if using_uploaded_voice and voice_lower:
             params["voice_name"] = [voice_lower]
@@ -236,7 +236,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
             if key not in extras:
                 continue
             if key == "emo_audio":
-                wav_list, sr = await server._resolve_ref_audio(extras[key])
+                wav_list, sr, _ = await server._resolve_ref_audio(extras[key])
                 params[key] = [[wav_list, sr]]
             else:
                 params[key] = [extras[key]]

@@ -45,7 +45,7 @@ class FishSpeechAdapter(ARTTSAdapter):
         server = self.ctx.server
         ref_audio_data = None
         if request.ref_audio is not None:
-            wav_list, sr = await server._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, _ = await server._resolve_ref_audio(request.ref_audio)
             ref_audio_data = (wav_list, sr)
         prompt = await server._build_fish_speech_prompt_async(
             request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
