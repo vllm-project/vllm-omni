@@ -237,7 +237,7 @@ class DiffusionEngine:
         if getattr(self.od_config, "parallel_config", None) is not None:
             dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
         dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-        if dp_size > 1 and dist_offload:
+        if dp_size > 1 and dist_offload and getattr(self.od_config, "dlo_use_allgather", True):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
             # Set batch admission wait so concurrent requests accumulate

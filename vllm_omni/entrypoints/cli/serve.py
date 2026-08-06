@@ -213,9 +213,10 @@ class OmniServeCommand(CLISubcommand):
             "--task-type",
             type=str,
             default=None,
-            choices=["CustomVoice", "VoiceDesign", "Base"],
-            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
-            "If not specified, will be inferred from model path.",
+            help="Model-defined startup task type. The selected model validates "
+            "supported values; for example, TTS models accept CustomVoice, "
+            "VoiceDesign, or Base, while diffusion models may use it to select "
+            "task-specific weights. If omitted, the model default is used.",
         )
         # Forced aligner / word timestamps. --forced-aligner is the opt-in
         # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
@@ -646,15 +647,25 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             default=True,
             help="Use shard + AllGather for weight reconstruction (default: True). "
-            "When disabled (--dlo-no-use-allgather), each rank loads full weights "
-            "via H2D only — no sharding, no AllGather, no concurrent request "
-            "requirement, but N× CPU memory.",
+            "When disabled (--dlo-no-use-allgather), each rank streams the "
+            "standard loader's rank-local tensors via H2D only — no additional "
+            "DP sharding, no AllGather, and no concurrent-request requirement.",
         )
         omni_config_group.add_argument(
             "--dlo-no-use-allgather",
             dest="dlo_use_allgather",
             action="store_false",
-            help="Disable AllGather: each rank loads full weights independently.",
+            help=(
+                "Disable AllGather and stream standard-loader rank-local weights "
+                "independently (including existing TP shards)."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-resident-layers",
+            type=int,
+            default=0,
+            help="Keep this many leading main-DiT blocks resident on the device "
+            "while distributed layerwise offload streams the remaining blocks.",
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

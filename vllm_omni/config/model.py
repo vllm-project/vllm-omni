@@ -17,6 +17,8 @@ import vllm_omni.model_executor.models as me_models
 
 logger = init_logger(__name__)
 
+_QWEN3_TTS_TASK_TYPES = frozenset({"CustomVoice", "VoiceDesign", "Base"})
+
 
 class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
     """Config convertor for Omni multi-stage models.
@@ -101,8 +103,8 @@ class OmniModelConfig(ModelConfig):
              "audio", "latents"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
-         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-             If not specified, will be inferred from model path.
+         task_type: Model-defined startup task type. Each model validates its
+             supported values and applies the corresponding behavior.
 
 
     The correct way to initialize this class is via vLLM config, as most
@@ -122,6 +124,7 @@ class OmniModelConfig(ModelConfig):
     retains_state_across_chunks: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    duplex_max_sessions: int = 1
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None
@@ -207,6 +210,14 @@ class OmniModelConfig(ModelConfig):
             )
             return get_hf_text_config(self.hf_config)
 
+    def _validate_startup_task_type(self) -> None:
+        """Validate startup-only task selectors owned by an AR model."""
+        if self.model_arch != "Qwen3TTSTalkerForConditionalGenerationARVLLM" or self.task_type is None:
+            return
+        if self.task_type not in _QWEN3_TTS_TASK_TYPES:
+            supported = ", ".join(sorted(_QWEN3_TTS_TASK_TYPES))
+            raise ValueError(f"Qwen3-TTS --task-type must be one of {supported}; got {self.task_type!r}")
+
     def _patch_qwen3_tts(self):
         """Patches the value of `position_id_per_seconds` in Qwen3's
         TTS's talker_config into the this class's codec_frame_rate_hz.
@@ -274,6 +285,7 @@ class OmniModelConfig(ModelConfig):
             omni_cfg._patch_qwen3_tts()
 
         omni_cfg._maybe_override_text_config()
+        omni_cfg._validate_startup_task_type()
 
         if omni_cfg.hf_config is not None:
             omni_cfg.hf_config.architectures = omni_cfg.architectures

@@ -14,6 +14,9 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -87,6 +90,13 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        # Where the video segment sits in the packed sequence. Resolved to plain
+        # ints here so the attention layers never sync on it per step.
+        grid = packed["latent_grid"].tolist()
+        self.static_kwargs["video_token_layout"] = VideoTokenLayout(
+            prefix_len=int(packed["video_row_start"]),
+            latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+        )
 
     def forward_kwargs(
         self,
@@ -139,7 +149,8 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-    on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    on_step_end: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    on_step_start: Callable[[int, float, float], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
@@ -191,8 +202,14 @@ def minimax_h3_denoise_loop(
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
+            # Publish the step index so step-gated attention features (e.g. the
+            # dense warmup of RAINFUSION_ATTN) can see where we are.
+            set_forward_context_denoise_step_idx(step)
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
             s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
+            if on_step_start is not None:
+                # Attention gates use the scheduler-style descending timestep.
+                on_step_start(step, s_v, s_a)
             t_v, t_a = 1.0 - s_v, 1.0 - s_a
             imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
             audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
@@ -233,9 +250,10 @@ def minimax_h3_denoise_loop(
             audio_rows[audio_update] = new_audio
             if audio_anchor is not None:
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
-            if on_step is not None:
-                on_step(step, video_rows, audio_rows)
+            if on_step_end is not None:
+                on_step_end(step, video_rows, audio_rows)
 
+    set_forward_context_denoise_step_idx(None)
     return video_rows, audio_rows
 
 

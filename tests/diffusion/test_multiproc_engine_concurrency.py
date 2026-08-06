@@ -247,6 +247,56 @@ class TestRequestModeDispatch:
         results = {ro.request_id: ro.result.error for ro in out.runner_outputs}
         assert results == {request_id: f"result_for_{request_id}" for request_id in request_ids}
 
+    def test_dlo_dp_routes_multiple_requests_without_pipeline_batching(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.execute_request = Mock(return_value="dlo-dp")
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+
+        result = executor.execute_batch(scheduler_output)
+
+        assert result == "dlo-dp"
+        executor.execute_request.assert_called_once_with(scheduler_output)
+        executor.collective_rpc.assert_not_called()
+
+    def test_dlo_dp_multi_rank_reply_uses_synchronous_rpc_collection(self):
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+        )
+        executor._sync_result_buffer = res_q
+
+        def worker():
+            request = req_q.get(timeout=2)
+            assert "rpc_id" not in request
+            wave_id = request["wave_id"]
+            for dp_rank in range(2):
+                res_q.put(
+                    {
+                        "dp_rank": dp_rank,
+                        "output": _tagged_output(str(dp_rank)),
+                        "wave_id": wave_id,
+                    }
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        results = executor.collective_rpc(
+            "execute_model",
+            unique_reply_rank=None,
+            exec_all_ranks=True,
+        )
+        thread.join(timeout=2)
+
+        assert [result.error for result in results] == ["0", "1"]
+
 
 # ───────────────── concurrent collective RPC ─────────────────
 

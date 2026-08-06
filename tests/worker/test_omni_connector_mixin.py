@@ -105,6 +105,34 @@ class _FakeTPGroup:
 # ------------------------------------------------------------------ #
 
 
+@pytest.mark.parametrize(
+    ("role", "custom_func", "expected"),
+    [
+        ("sender", None, False),
+        ("sender", "package.build_payload", True),
+        ("receiver", None, True),
+    ],
+)
+def test_init_payload_connector_ownership(role, custom_func, expected):
+    model_config = _make_model_config(custom_func=custom_func)
+    model_config.stage_connector_config = {
+        "name": "MooncakeTransferEngineConnector",
+        "extra": {"role": role},
+    }
+
+    host = MixinHost()
+    connector = MockConnector()
+    with (
+        patch.object(host, "_create_connector", return_value=connector) as create,
+        patch.object(host, "_load_custom_func", return_value=(None, None)),
+    ):
+        host.init_omni_connectors(model_config)
+
+    assert (create.call_count == 1) is expected
+    assert (host._omni_connector is connector) is expected
+    host.shutdown_omni_connectors()
+
+
 class TestMixinAsyncChunkSendRecv(unittest.TestCase):
     """Test 2: Async chunk send/recv + bg threads."""
 

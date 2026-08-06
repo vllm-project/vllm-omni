@@ -126,6 +126,37 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
+def test_qwen3_tts_startup_task_type_is_validated():
+    vllm_config = EngineArgs().create_model_config()
+
+    config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+        task_type="Base",
+    )
+    assert config.task_type == "Base"
+
+    with pytest.raises(ValueError, match="Qwen3-TTS --task-type must be one of"):
+        OmniModelConfig.from_vllm_model_config(
+            vllm_config,
+            model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+            task_type="fl2va",
+        )
+
+
+def test_from_cli_args_picks_up_stage_configs_path():
+    """from_cli_args should pick up stage_configs_path from namespace."""
+    ns = argparse.Namespace(
+        model="facebook/opt-125m",
+        stage_configs_path="/some/path.yaml",
+        custom_pipeline_args=None,
+    )
+
+    args = OmniEngineArgs.from_cli_args(ns)
+    assert args.stage_configs_path == "/some/path.yaml"
+    assert args.custom_pipeline_args is None
+
+
 def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     """Ensure Code2Wav mirrors stage max_model_len into nested HF overrides.
 
