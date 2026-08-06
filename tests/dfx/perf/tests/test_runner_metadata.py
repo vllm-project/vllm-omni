@@ -17,7 +17,7 @@ def test_task_excluded_from_cli_args():
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
         "percentile-metrics": "audio_rtf,audio_ttfp",
-        "baseline": {"mean_audio_rtf": [0.5]},
+        "baseline": {"H100": {"mean_audio_rtf": [0.5]}},
     }
     exclude_keys = {
         "request_rate",
@@ -123,35 +123,6 @@ def test_resolve_pytest_marks_rejects_legacy_object_format():
         )
 
 
-def test_extract_mark_resource_label():
-    from tests.dfx.conftest import extract_mark_resource_label
-
-    assert extract_mark_resource_label(None) == "na"
-    assert (
-        extract_mark_resource_label(
-            [
-                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
-                "full_model",
-            ]
-        )
-        == "H100"
-    )
-    assert (
-        extract_mark_resource_label(
-            [
-                {
-                    "hardware_marks": {
-                        "res": {"cuda": "H100", "rocm": "MI325"},
-                        "num_cards": 2,
-                    }
-                },
-                "diffusion",
-            ]
-        )
-        == "H100-MI325"
-    )
-
-
 def test_resource_label_for_filename():
     from tests.dfx.conftest import resource_label_for_filename
 
@@ -169,16 +140,14 @@ def test_hardware_json_value():
     assert hardware_json_value(None) == ""
 
 
-def test_extract_configs_resource_label(monkeypatch):
-    from tests.dfx.conftest import extract_configs_resource_label, get_runtime_resource_label
+def test_get_runtime_resource_label(monkeypatch):
+    from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
-    get_runtime_resource_label(refresh=True)
-    assert extract_configs_resource_label([]) == "H100"
-    get_runtime_resource_label(refresh=True)
+    assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",
@@ -336,3 +305,183 @@ def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_pat
         ("start", tts_server),
         ("stop", tts_server),
     ]
+
+
+def test_is_hardware_nested_baseline():
+    from tests.dfx.conftest import (
+        _RUNTIME_DEVICE_ALIASES,
+        is_hardware_nested_baseline,
+    )
+    from tests.helpers.mark import get_hardware_mark_list
+
+    hardware_marks = get_hardware_mark_list()
+    assert hardware_marks
+    assert {"H100", "L4", "A3", "MI325", "B200"} <= hardware_marks
+    assert "cuda" not in hardware_marks
+    assert "full_model" not in hardware_marks
+
+    # Runtime aliases are a full static list (independent of baseline allowlist).
+    assert "H100" in _RUNTIME_DEVICE_ALIASES
+    assert "A100" in _RUNTIME_DEVICE_ALIASES
+
+    assert is_hardware_nested_baseline(
+        {
+            "H100": {"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]},
+            "A3": {"mean_ttft_ms": [0.9, 1.8], "mean_e2el_ms": [9.0, 18.0]},
+        }
+    )
+    # Custom metric names under a known hardware label are allowed.
+    assert is_hardware_nested_baseline({"H100": {"custom_stage_ms": 12.0, "foo_bar": [1.0, 2.0]}})
+    assert is_hardware_nested_baseline({"A3": {"request_throughput": 0.5}})
+    # Flat metric maps / concurrency-keyed maps are not hardware-nested.
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]})
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": {"1": 1.0, "32": 2.0}})
+    assert not is_hardware_nested_baseline({})
+    # Alias-only labels (not [hardware-resource] markers) are rejected for baselines.
+    assert not is_hardware_nested_baseline({"A100": {"throughput_qps": 1.0}})
+    # Unknown top-level hardware label is rejected.
+    assert not is_hardware_nested_baseline({"UnknownGPU": {"throughput_qps": 1.0}})
+    # Empty per-hardware metric map is rejected.
+    assert not is_hardware_nested_baseline({"H100": {}})
+
+
+def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    baseline = {
+        "H100": {
+            "mean_ttft_ms": [96.4, 140.8, 271.9, 362.3, 507.8],
+            "mean_e2el_ms": [18507.0, 28365.0, 31907.0, 48161.0, 72630.0],
+        },
+        "A3": {
+            "mean_ttft_ms": [90.0, 130.0, 250.0, 340.0, 480.0],
+            "mean_e2el_ms": [17000.0, 26000.0, 30000.0, 45000.0, 70000.0],
+        },
+    }
+    # max_concurrency=[1,4,8,16,32] -> index 4 is concurrency 32
+    got = resolve_baseline_for_sweep(baseline, sweep_index=4)
+    assert got == {
+        "H100": {"mean_ttft_ms": 507.8, "mean_e2el_ms": 72630.0},
+        "A3": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
+    }
+    # First sweep step keeps both hardware buckets too.
+    got0 = resolve_baseline_for_sweep(baseline, sweep_index=0)
+    assert set(got0) == {"H100", "A3"}
+    assert got0["H100"]["mean_ttft_ms"] == 96.4
+    assert got0["A3"]["mean_ttft_ms"] == 90.0
+
+
+def test_resolve_baseline_for_sweep_rejects_flat_baseline():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match=r"hardware-nested.*pyproject\.toml"):
+        resolve_baseline_for_sweep(
+            {"throughput_qps": [0.4, 0.6], "latency_mean": [1.0, 2.0]},
+            sweep_index=1,
+        )
+
+
+def test_resolve_baseline_for_sweep_rejects_unknown_hardware_label():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match=r"Unknown hardware label\(s\): \['A100'\].*pyproject\.toml"):
+        resolve_baseline_for_sweep(
+            {"A100": {"throughput_qps": 1.0}},
+            sweep_index=0,
+        )
+
+
+def test_resolve_baseline_for_sweep_supports_list_and_scalar_under_hardware():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    # Sweep-aligned lists under each hardware bucket (canonical form).
+    listed = {
+        "H100": {"throughput_qps": [0.4, 0.6, 0.8], "latency_mean": [1.0, 2.0, 3.0]},
+        "A3": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
+    }
+    assert resolve_baseline_for_sweep(listed, sweep_index=1) == {
+        "H100": {"throughput_qps": 0.6, "latency_mean": 2.0},
+        "A3": {"throughput_qps": 0.7, "latency_mean": 1.8},
+    }
+
+    # Scalars under hardware stay as-is (single-concurrency cases).
+    scalar = {"H100": {"throughput_qps": 0.5}}
+    assert resolve_baseline_for_sweep(scalar, sweep_index=0) == {"H100": {"throughput_qps": 0.5}}
+    # Custom metric names are preserved.
+    custom = {"H100": {"custom_stage_ms": [10.0, 20.0]}}
+    assert resolve_baseline_for_sweep(custom, sweep_index=1) == {"H100": {"custom_stage_ms": 20.0}}
+    assert resolve_baseline_for_sweep(None) == {}
+    assert resolve_baseline_for_sweep({}) == {}
+
+
+def test_resolve_baseline_value_errors():
+    from tests.dfx.conftest import resolve_baseline_value
+
+    with pytest.raises(ValueError, match="sweep_index"):
+        resolve_baseline_value([1.0, 2.0], sweep_index=None)
+    with pytest.raises(IndexError):
+        resolve_baseline_value([1.0], sweep_index=1)
+    with pytest.raises(TypeError, match="not supported"):
+        resolve_baseline_value({"1": 0.4}, sweep_index=0)
+
+
+def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):
+    """``_build_run_params`` / ``_iter_sweep_runs`` narrow list baselines per concurrency."""
+    import importlib
+    import sys
+
+    cfg = tmp_path / "mini_diffusion_perf.json"
+    cfg.write_text(
+        json.dumps(
+            [
+                {
+                    "test_name": "test_mini",
+                    "server_type": "vllm-omni",
+                    "mark": [
+                        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                        "diffusion",
+                        "full_model",
+                    ],
+                    "server_params": {"model": "m/mini"},
+                    "benchmark_params": [{"name": "p0", "num-prompts": 1, "max-concurrency": 1}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(cfg)])
+    sys.modules.pop("tests.dfx.perf.scripts.run_diffusion_benchmark", None)
+    from tests.dfx.perf.scripts import run_diffusion_benchmark as rdb
+
+    importlib.reload(rdb)
+
+    params = {
+        "name": "c_sweep",
+        "dataset": "random",
+        "task": "t2i",
+        "num-prompts": [8, 16, 32],
+        "max-concurrency": [1, 8, 32],
+        "baseline": {
+            "H100": {"throughput_qps": [0.1, 0.2, 0.3], "latency_mean": [10.0, 20.0, 30.0]},
+            "A3": {"throughput_qps": [0.11, 0.22, 0.33], "latency_mean": [9.0, 19.0, 29.0]},
+        },
+    }
+    run32 = rdb._build_run_params(
+        params,
+        num_prompts=32,
+        max_concurrency=32,
+        request_rate="inf",
+        sweep_index=2,
+    )
+    assert run32["max-concurrency"] == 32
+    assert run32["baseline"] == {
+        "H100": {"throughput_qps": 0.3, "latency_mean": 30.0},
+        "A3": {"throughput_qps": 0.33, "latency_mean": 29.0},
+    }
+
+    sweeps = rdb._iter_sweep_runs(params)
+    assert len(sweeps) == 3
+    assert sweeps[2]["params"]["max-concurrency"] == 32
+    assert sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"] == 0.3
+    assert "A3" in sweeps[2]["params"]["baseline"]
+    assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)

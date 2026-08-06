@@ -449,6 +449,7 @@ class _DiffusionConfigProjection:
     model: str | None = None
     model_class_name: str | None = None
     model_arch: str | None = None
+    task_type: str | None = None
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
@@ -479,6 +480,7 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -678,6 +680,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "stage_id",
         "model",
         "model_arch",
+        "task_type",
         "dtype",
         "trust_remote_code",
         "revision",

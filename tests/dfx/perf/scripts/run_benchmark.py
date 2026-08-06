@@ -237,7 +237,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         break
 
     # QPS / request-rate sweep
-    for qps, num_prompt in zip(qps_list, num_prompt_list):
+    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
             args=args,
@@ -246,6 +246,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
@@ -253,7 +254,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         assert_result(result, num_prompt)
 
     # concurrency test
-    for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
+    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
             args=args,
@@ -262,6 +263,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
