@@ -1106,6 +1106,27 @@ class TestTTSMethods:
             ref_audio
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
+    @pytest.mark.asyncio
+    async def test_diffusion_ref_audio_uses_injected_media_connector(
+        self, mocker: MockerFixture
+    ):
+        connector = mocker.MagicMock()
+        connector.fetch_audio_async = mocker.AsyncMock(
+            return_value=(np.zeros(24000, dtype=np.float32), 24000)
+        )
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+            media_connector=connector,
+        )
+
+        try:
+            await server._resolve_ref_audio("file:///tmp/reference.wav")
+        finally:
+            server.shutdown()
+
+        connector.fetch_audio_async.assert_awaited_once_with("file:///tmp/reference.wav")
+
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
         speech_server._tts_model_type = "qwen3_tts"

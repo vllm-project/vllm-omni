@@ -85,6 +85,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
+from vllm.multimodal.media import MediaConnector
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -793,8 +794,10 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
-            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
-            allowed_media_domains=getattr(args, "allowed_media_domains", None),
+            media_connector=MediaConnector(
+                allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+                allowed_media_domains=getattr(args, "allowed_media_domains", None),
+            ),
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
