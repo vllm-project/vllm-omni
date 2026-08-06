@@ -32,6 +32,7 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
@@ -56,7 +57,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        # See npu_ar_model_runner: the role check keeps connector-configured stages
+        # whose arch is not in the allowlist (e.g. MiniCPMO45Code2Wav) from silently
+        # skipping connector init and starving on the full-payload receive path.
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
@@ -332,6 +339,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
 
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
+            # [Omni] Mirrors gpu_generation_model_runner: models that declare
+            # ``requires_request_ids`` (e.g. MiniCPMO45Code2Wav) key their per-request
+            # streaming state on this. Without it they fall back to scraping ids out of
+            # ``runtime_additional_information``, which yields the literal string "None"
+            # when the producer payload carries no id -- every concurrent request then
+            # collapses onto the same state key and the stage aborts the batch.
+            if getattr(self.model, "requires_request_ids", False):
+                model_kwargs["request_ids"] = list(req_ids)
 
             # update global cos, sin
             update_cos_sin(positions)
