@@ -298,7 +298,9 @@ vllm-omni serve MiniMaxAI/MiniMax-H3 \
 For MiniMax-H3 the recommended starting point is the config above
 (`sink_tokens` covers the packed text/audio prefix; the first 10 of 20+
 denoise steps stay dense). Raise `tau` or cut `dense_steps` for more speed at
-the cost of fidelity — each step of `tau` costs several dB of PSNR on H3.
+the cost of fidelity — on 4× B300 the measured sweep drops from 35.3 dB PSNR
+(default) to 26.3 dB at the aggressive τ=2.0 / dense_steps=5 point (see the
+verification comment on the implementing PR).
 
 Programmatically the same block is a typed `SolAttnSpec` (values validated at
 construction):
