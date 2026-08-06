@@ -261,4 +261,4 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
   -o t2va.mp4
 ```
-its only takes 4 min to finish it when 8*6000.
+its only takes 4 min to finish it when 8*6000. 10 min to finish it when 2*6000
