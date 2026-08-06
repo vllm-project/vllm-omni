@@ -103,6 +103,7 @@ nav:
     - design/index.md
     - design/architecture_overview.md
     - Feature Design:
+      - design/feature/hardware_plugin_system.md
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
