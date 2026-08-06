@@ -25,6 +25,7 @@ of all runs from cases in that file). Bulk load without ``--test-config-file`` u
 the same per-file aggregation; ``-m`` only selects which cases run.
 """
 
+import copy
 import json
 import os
 import socket
@@ -46,8 +47,11 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     hardware_json_value,
     is_diffusion_perf_config,
+    resolve_baseline_for_sweep,
+    resolve_baseline_value,
     resolve_pytest_marks,
     resource_label_for_filename,
+    select_baseline_for_hardware,
 )
 from tests.helpers.runtime import get_open_port
 
@@ -761,12 +765,17 @@ def run_benchmark(
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
+    # Persist sweep-resolved baseline from params (already narrowed in _build_run_params).
+    baseline = copy.deepcopy(params.get("baseline") or {})
+    metrics["baseline"] = baseline
+
     record: dict[str, Any] = {
         "test_name": test_name,
         "endpoint": endpoint,
         "timestamp": timestamp,
         "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
+        "baseline": baseline,
         "result": metrics,
         "log_file": str(log_file),
         "Model": model,
@@ -816,36 +825,6 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_baseline_value(
-    baseline_raw: Any,
-    *,
-    sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-) -> Any:
-    """Pick the baseline threshold for this sweep step."""
-    if baseline_raw is None:
-        return 100000
-    if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
-        )
-    if isinstance(baseline_raw, (list, tuple)):
-        if sweep_index is None:
-            raise ValueError("sweep_index is required when baseline is a list or tuple")
-        return baseline_raw[sweep_index]
-    return baseline_raw
-
-
 def assert_result(
     result: dict[str, Any],
     params: dict[str, Any],
@@ -857,6 +836,7 @@ def assert_result(
     assert_baseline: bool = True,
 ) -> None:
     """Assert that benchmark metrics satisfy the configured baselines."""
+    del max_concurrency, request_rate  # sweep resolution uses list index only
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
@@ -866,15 +846,11 @@ def assert_result(
         print("Skipping performance assertions.")
         return
 
-    for metric, baseline_raw in params.get("baseline", {}).items():
+    baseline_data = select_baseline_for_hardware(params.get("baseline", {}))
+    for metric, baseline_raw in baseline_data.items():
         current = result.get(metric)
         assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
-        threshold = _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
+        threshold = resolve_baseline_value(baseline_raw, sweep_index=sweep_index)
         if "throughput" in metric:
             assert current >= threshold, f"{metric}: {current:.4f} < baseline {threshold}"
         else:
@@ -921,15 +897,10 @@ def _build_run_params(
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
     if "baseline" in params:
-        run_params["baseline"] = {
-            metric: _resolve_baseline_value(
-                baseline_raw,
-                sweep_index=sweep_index,
-                max_concurrency=max_concurrency,
-                request_rate=request_rate,
-            )
-            for metric, baseline_raw in params["baseline"].items()
-        }
+        run_params["baseline"] = resolve_baseline_for_sweep(
+            params.get("baseline"),
+            sweep_index=sweep_index,
+        )
     return run_params
 
 

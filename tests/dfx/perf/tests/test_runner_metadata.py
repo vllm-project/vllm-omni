@@ -299,7 +299,7 @@ def test_omni_baseline_accepts_values_at_threshold(metric, current, baseline):
 
     assert_result(
         {"completed": 1, metric: current},
-        {"baseline": {metric: baseline}},
+        {"baseline": {"H100": {metric: baseline}}, "baseline_hardware": "H100"},
         1,
         assert_baseline=True,
     )
@@ -318,7 +318,7 @@ def test_omni_baseline_rejects_regressions(metric, current, baseline, message):
     with pytest.raises(AssertionError, match=message):
         assert_result(
             {"completed": 1, metric: current},
-            {"baseline": {metric: baseline}},
+            {"baseline": {"H100": {metric: baseline}}, "baseline_hardware": "H100"},
             1,
             assert_baseline=True,
         )
@@ -351,3 +351,146 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
             1,
             assert_baseline=False,
         )
+
+
+def test_is_hardware_nested_baseline():
+    from tests.dfx.conftest import is_hardware_nested_baseline
+
+    assert is_hardware_nested_baseline(
+        {
+            "H100": {"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]},
+            "B200": {"mean_ttft_ms": [0.9, 1.8], "mean_e2el_ms": [9.0, 18.0]},
+        }
+    )
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]})
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": {"1": 1.0, "32": 2.0}})
+    assert not is_hardware_nested_baseline({})
+
+
+def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    baseline = {
+        "H100": {
+            "mean_ttft_ms": [96.4, 140.8, 271.9, 362.3, 507.8],
+            "mean_e2el_ms": [18507.0, 28365.0, 31907.0, 48161.0, 72630.0],
+        },
+        "B200": {
+            "mean_ttft_ms": [90.0, 130.0, 250.0, 340.0, 480.0],
+            "mean_e2el_ms": [17000.0, 26000.0, 30000.0, 45000.0, 70000.0],
+        },
+    }
+    # max_concurrency=[1,4,8,16,32] -> index 4 is concurrency 32
+    got = resolve_baseline_for_sweep(baseline, sweep_index=4)
+    assert got == {
+        "H100": {"mean_ttft_ms": 507.8, "mean_e2el_ms": 72630.0},
+        "B200": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
+    }
+    # First sweep step keeps both hardware buckets too.
+    got0 = resolve_baseline_for_sweep(baseline, sweep_index=0)
+    assert set(got0) == {"H100", "B200"}
+    assert got0["H100"]["mean_ttft_ms"] == 96.4
+    assert got0["B200"]["mean_ttft_ms"] == 90.0
+
+
+def test_resolve_baseline_for_sweep_rejects_flat_baseline():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match="hardware-nested"):
+        resolve_baseline_for_sweep(
+            {"throughput_qps": [0.4, 0.6], "latency_mean": [1.0, 2.0]},
+            sweep_index=1,
+        )
+
+
+def test_resolve_baseline_for_sweep_supports_list_and_scalar_under_hardware():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    # Sweep-aligned lists under each hardware bucket (canonical form).
+    listed = {
+        "H100": {"throughput_qps": [0.4, 0.6, 0.8], "latency_mean": [1.0, 2.0, 3.0]},
+        "B200": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
+    }
+    assert resolve_baseline_for_sweep(listed, sweep_index=1) == {
+        "H100": {"throughput_qps": 0.6, "latency_mean": 2.0},
+        "B200": {"throughput_qps": 0.7, "latency_mean": 1.8},
+    }
+
+    # Scalars under hardware stay as-is (single-concurrency cases).
+    scalar = {"H100": {"throughput_qps": 0.5}}
+    assert resolve_baseline_for_sweep(scalar, sweep_index=0) == {"H100": {"throughput_qps": 0.5}}
+    assert resolve_baseline_for_sweep(None) == {}
+    assert resolve_baseline_for_sweep({}) == {}
+
+
+def test_resolve_baseline_value_errors():
+    from tests.dfx.conftest import resolve_baseline_value
+
+    with pytest.raises(ValueError, match="sweep_index"):
+        resolve_baseline_value([1.0, 2.0], sweep_index=None)
+    with pytest.raises(IndexError):
+        resolve_baseline_value([1.0], sweep_index=1)
+    with pytest.raises(TypeError, match="not supported"):
+        resolve_baseline_value({"1": 0.4}, sweep_index=0)
+
+
+def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):
+    """``_build_run_params`` / ``_iter_sweep_runs`` narrow list baselines per concurrency."""
+    import importlib
+    import sys
+
+    cfg = tmp_path / "mini_diffusion_perf.json"
+    cfg.write_text(
+        json.dumps(
+            [
+                {
+                    "test_name": "test_mini",
+                    "server_type": "vllm-omni",
+                    "mark": [
+                        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                        "diffusion",
+                        "full_model",
+                    ],
+                    "server_params": {"model": "m/mini"},
+                    "benchmark_params": [{"name": "p0", "num-prompts": 1, "max-concurrency": 1}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(cfg)])
+    sys.modules.pop("tests.dfx.perf.scripts.run_diffusion_benchmark", None)
+    from tests.dfx.perf.scripts import run_diffusion_benchmark as rdb
+
+    importlib.reload(rdb)
+
+    params = {
+        "name": "c_sweep",
+        "dataset": "random",
+        "task": "t2i",
+        "num-prompts": [8, 16, 32],
+        "max-concurrency": [1, 8, 32],
+        "baseline": {
+            "H100": {"throughput_qps": [0.1, 0.2, 0.3], "latency_mean": [10.0, 20.0, 30.0]},
+            "B200": {"throughput_qps": [0.11, 0.22, 0.33], "latency_mean": [9.0, 19.0, 29.0]},
+        },
+    }
+    run32 = rdb._build_run_params(
+        params,
+        num_prompts=32,
+        max_concurrency=32,
+        request_rate="inf",
+        sweep_index=2,
+    )
+    assert run32["max-concurrency"] == 32
+    assert run32["baseline"] == {
+        "H100": {"throughput_qps": 0.3, "latency_mean": 30.0},
+        "B200": {"throughput_qps": 0.33, "latency_mean": 29.0},
+    }
+
+    sweeps = rdb._iter_sweep_runs(params)
+    assert len(sweeps) == 3
+    assert sweeps[2]["params"]["max-concurrency"] == 32
+    assert sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"] == 0.3
+    assert "B200" in sweeps[2]["params"]["baseline"]
+    assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)

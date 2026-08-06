@@ -637,28 +637,54 @@ def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
     return get_runtime_resource_label()
 
 
+_BASELINE_METRIC_HINTS = (
+    "throughput",
+    "latency",
+    "mean_",
+    "peak_",
+    "p50",
+    "p99",
+    "ttft",
+    "tpot",
+    "e2el",
+    "rtf",
+    "audio",
+    "memory",
+)
+
+
+def _looks_like_metric_map(value: dict[str, Any]) -> bool:
+    """True when ``value`` looks like ``{metric_name: threshold...}``."""
+    if not value:
+        return False
+    return any(any(hint in key.lower() for hint in _BASELINE_METRIC_HINTS) for key in value)
+
+
+def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
+    """True for ``{"H100": {"metric": ...}, "B200": {...}}`` baselines."""
+    if not baseline:
+        return False
+    values = list(baseline.values())
+    if not all(isinstance(value, dict) for value in values):
+        return False
+    return all(_looks_like_metric_map(value) for value in values)  # type: ignore[arg-type]
+
+
 def resolve_baseline_value(
     baseline_raw: Any,
     *,
     sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> Any:
-    """Pick the baseline threshold for this sweep step."""
+    """Pick the baseline threshold for one metric at this sweep step.
+
+    Accepts a sweep-aligned list/tuple (indexed by ``sweep_index``) or a scalar.
+    """
     if baseline_raw is None:
-        return 100000
+        return None
     if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
+        raise TypeError(
+            "per-metric baseline dict keyed by concurrency/request-rate is not supported; "
+            "use a sweep-aligned list or a scalar under each hardware bucket"
         )
     if isinstance(baseline_raw, (list, tuple)):
         if sweep_index is None:
@@ -669,23 +695,76 @@ def resolve_baseline_value(
     return baseline_raw
 
 
-def _baseline_thresholds_for_step(
-    baseline_data: dict[str, Any],
+def resolve_baseline_for_sweep(
+    baseline_config: dict[str, Any] | None,
     *,
     sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> dict[str, Any]:
-    """Resolve baseline config to one threshold per metric for this iteration."""
-    return {
-        metric_name: resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
+    """Resolve sweep-dependent baselines while keeping every hardware bucket.
+
+    Expects hardware-nested input only::
+
+        {"H100": {"throughput_qps": [a, b, c]}, "B200": {"throughput_qps": [x, y, z]}}
+
+    with ``sweep_index=2`` (e.g. concurrency 32) becomes::
+
+        {"H100": {"throughput_qps": c}, "B200": {"throughput_qps": z}}
+
+    Per-metric values may be a sweep-aligned list or a scalar.
+    """
+    if not baseline_config:
+        return {}
+    if not is_hardware_nested_baseline(baseline_config):
+        raise ValueError(
+            "baseline must be hardware-nested, e.g. "
+            '{"H100": {"throughput_qps": [...]}, "B200": {...}}; '
+            f"got top-level keys={list(baseline_config.keys())!r}"
         )
-        for metric_name, baseline_raw in baseline_data.items()
+
+    return {
+        hardware: {
+            metric_name: resolve_baseline_value(
+                baseline_raw,
+                sweep_index=sweep_index,
+            )
+            for metric_name, baseline_raw in metrics.items()
+        }
+        for hardware, metrics in baseline_config.items()
+        if isinstance(metrics, dict)
     }
+
+
+def select_baseline_for_hardware(
+    baseline_data: dict[str, Any] | None,
+    resource_label: str | None = None,
+) -> dict[str, Any]:
+    """Return the per-metric baseline map for the active hardware bucket.
+
+    Requires hardware-nested baselines, e.g. ``{"H100": {...}, "A3": {...}}``.
+    ``resource_label`` defaults to :func:`get_runtime_resource_label`.
+    """
+    if not baseline_data:
+        return {}
+    if not is_hardware_nested_baseline(baseline_data):
+        raise ValueError(
+            "baseline must be hardware-nested, e.g. "
+            '{"H100": {"throughput_qps": [...]}, "A3": {...}}; '
+            f"got top-level keys={list(baseline_data.keys())!r}"
+        )
+    label = resource_label if resource_label is not None else get_runtime_resource_label()
+    if label in baseline_data:
+        selected = baseline_data[label]
+    else:
+        selected = None
+        for key, value in baseline_data.items():
+            if str(key).upper() == str(label).upper():
+                selected = value
+                break
+    if selected is None:
+        raise KeyError(f"baseline has no entry for hardware {label!r}; keys={list(baseline_data.keys())!r}")
+    if not isinstance(selected, dict):
+        raise TypeError(f"baseline[{label!r}] must be a metric dict, got {type(selected).__name__}")
+    return selected
 
 
 def run_benchmark(
@@ -705,9 +784,11 @@ def run_benchmark(
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
-    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the resolved per-metric thresholds
-    (when ``baseline_config`` is provided). If the benchmark exits without writing a result file,
-    ``result_omni_template.json`` is used as a fallback.
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` stores the
+    sweep-resolved baseline (when ``baseline_config`` is provided). Hardware-nested
+    maps keep every hardware bucket, but each metric is reduced to the value for
+    this concurrency / request-rate step. If the benchmark exits without writing a
+    result file, ``result_omni_template.json`` is used as a fallback.
     """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
@@ -774,11 +855,10 @@ def run_benchmark(
             result = json.load(f)
 
     if baseline_config:
-        result["baseline"] = _baseline_thresholds_for_step(
+        # Keep every hardware bucket; resolve list metrics to this sweep step.
+        result["baseline"] = resolve_baseline_for_sweep(
             baseline_config,
             sweep_index=sweep_index,
-            request_rate=request_rate,
-            max_concurrency=max_concurrency,
         )
     else:
         result["baseline"] = {}

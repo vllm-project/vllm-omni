@@ -15,12 +15,13 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     resolve_baseline_value,
     run_benchmark,
+    select_baseline_for_hardware,
 )
 from tests.helpers.runtime import OmniServer
 
 # Compare metrics to each test JSON ``baseline`` block only when pytest is run with ``--assert-baseline``
-# (registered in ``tests/dfx/conftest.py``; default: off). ``run_benchmark`` and ``_resolve_baseline_value`` are
-# defined in the same module.
+# (registered in ``tests/dfx/conftest.py``; default: off). ``run_benchmark`` / ``resolve_baseline_value`` / ``select_baseline_for_hardware`` are
+# defined in ``tests/dfx/conftest.py``.
 #
 # Optional JSON field ``mark`` is applied as pytest marks via
 # ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
@@ -141,14 +142,13 @@ def assert_result(
         ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
     if not assert_baseline:
         return
-    baseline_data = params.get("baseline", {})
+    hardware = params.get("baseline_hardware")
+    baseline_data = select_baseline_for_hardware(params.get("baseline", {}), hardware)
     for metric_name, baseline_raw in baseline_data.items():
         current_value = result[metric_name]
         baseline_value = resolve_baseline_value(
             baseline_raw,
             sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
         )
         if "throughput" in metric_name:
             assert current_value >= baseline_value, (

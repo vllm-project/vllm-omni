@@ -53,31 +53,33 @@
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
-          "request_throughput": [
-            0.5383,
-            0.6042,
-            0.7547
-          ],
-          "mean_ttft_ms": [
-            333.2633,
-            533.8656,
-            547.3388
-          ],
-          "mean_e2el_ms": [
-            1857.2154,
-            6600.5101,
-            10450.6811
-          ],
-          "mean_audio_ttfp_ms": [
-            986.4666,
-            3411.0754,
-            3352.7515
-          ],
-          "mean_audio_rtf": [
-            0.4423,
-            1.5734,
-            2.3024
-          ]
+          "H100": {
+            "request_throughput": [
+              0.5383,
+              0.6042,
+              0.7547
+            ],
+            "mean_ttft_ms": [
+              333.2633,
+              533.8656,
+              547.3388
+            ],
+            "mean_e2el_ms": [
+              1857.2154,
+              6600.5101,
+              10450.6811
+            ],
+            "mean_audio_ttfp_ms": [
+              986.4666,
+              3411.0754,
+              3352.7515
+            ],
+            "mean_audio_rtf": [
+              0.4423,
+              1.5734,
+              2.3024
+            ]
+          }
         }
       }
     ]
