@@ -95,7 +95,7 @@ The cache is sized by `max_loras` (defaults to 1). Set `Omni(..., max_loras=N)` 
 ### Scale Semantics
 
 - `lora_scales[i]` multiplies adapter `i`'s contribution to the output delta.
-- `lora_scales[i] == 0.0` is a registered-but-inactive slot: the adapter remains in the cache but contributes nothing this forward pass. This is distinct from omitting the adapter from `lora_requests`, which releases the slot.
+- `lora_scales[i] == 0.0` skips the adapter for this activation: it is filtered out before the `max_loras` check, so it does not consume a slot and produces no delta. Subsequent requests that re-enable the adapter will reload it into the cache if it was evicted.
 - When `lora_requests` is set and `lora_scales` is omitted, every adapter defaults to scale `1.0`.
 
 ### Usage

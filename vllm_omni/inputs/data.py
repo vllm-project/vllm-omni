@@ -372,6 +372,11 @@ class OmniDiffusionSamplingParams:
         # lora_requests alone.
         if self.lora_requests and not self.lora_scales:
             self.lora_scales = [1.0] * len(self.lora_requests)
+        if len(self.lora_requests) != len(self.lora_scales):
+            raise ValueError(
+                f"lora_requests ({len(self.lora_requests)}) and lora_scales ({len(self.lora_scales)}) "
+                "must have the same length."
+            )
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)

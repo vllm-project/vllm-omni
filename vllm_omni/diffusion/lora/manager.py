@@ -239,11 +239,10 @@ class DiffusionLoRAManager:
                 f"lora_requests ({len(lora_requests)}) and lora_scales ({len(lora_scales)}) must have the same length"
             )
 
-        # scale=0.0 still occupies a slot; it is not equivalent to omitting the adapter.
-        if len(lora_requests) > self.max_loras:
-            raise ValueError(f"Requested {len(lora_requests)} adapters but max_loras={self.max_loras}")
-
-        # Filter out zero-scale adapters
+        # Filter out zero-scale adapters before enforcing max_loras so that
+        # [a, b] with scales [1.0, 0.0] only consumes one slot. A zero-scale
+        # adapter is treated as omitted from this activation; it is not kept
+        # registered-but-inactive.
         active_requests: list[LoRARequest] = []
         active_scales: list[float] = []
         for req, scale in zip(lora_requests, lora_scales):
@@ -252,6 +251,9 @@ class DiffusionLoRAManager:
                 continue
             active_requests.append(req)
             active_scales.append(scale)
+
+        if len(active_requests) > self.max_loras:
+            raise ValueError(f"Requested {len(active_requests)} adapters but max_loras={self.max_loras}")
 
         if not active_requests:
             logger.warning("All adapters have scale 0; deactivating all LoRA adapters")

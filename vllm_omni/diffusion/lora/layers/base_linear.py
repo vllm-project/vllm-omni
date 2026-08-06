@@ -154,7 +154,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 #   buffer = (x @ A.T)
                 #   y += buffer @ B.T
                 delta = (x_flat @ A.t()) @ B.t()
-                y_flat[:, offset : offset + slice_size] = y_flat[:, offset : offset + slice_size] + delta
+                y_flat[:, offset : offset + slice_size].add_(delta)
                 offset += slice_size
 
         return y_flat.view(original_shape)

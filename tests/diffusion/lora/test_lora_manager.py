@@ -725,6 +725,46 @@ def test_multi_adapter_skips_zero_scale(monkeypatch):
     assert layer._n_active_adapters == 1
 
 
+def test_zero_scale_does_not_consume_max_loras_slot():
+    """[a, b] with scales [1.0, 0.0] should fit in max_loras=1.
+
+    Zero-scale adapters are filtered out BEFORE the max_loras check, so they
+    do not consume a slot. This is the Copilot-review fix: previously the
+    max_loras check ran first and rejected this case even though only one
+    adapter is actually active.
+    """
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_loras=1,
+        max_cached_adapters=2,
+    )
+
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(4,))
+    manager._lora_modules = {"transformer.foo": layer}
+
+    rank = 2
+    lora = LoRALayerWeights(
+        module_name="foo",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 4)),
+        lora_b=torch.ones((4, rank)),
+    )
+    for aid in [1, 2]:
+        manager._registered_adapters[aid] = type(
+            "LM", (), {"id": aid, "loras": {"transformer.foo": lora}, "get_lora": lambda self, k: self.loras.get(k)}
+        )()
+
+    manager.set_active_adapters(
+        [_dummy_lora_request(1), _dummy_lora_request(2)],
+        [1.0, 0.0],
+    )
+
+    assert manager._active_adapter_ids == [1]
+
+
 def test_multi_adapter_are_active_at_scales():
     """Test the _are_active_at_scales comparison."""
     manager = DiffusionLoRAManager(
