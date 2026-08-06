@@ -83,6 +83,14 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # HiDream-I1-Full transformer coefficients (TeaCache4HiDream-I1 reference)
+    "HiDreamImageTransformer2DModel": [
+        -3.13605009e04,
+        -7.12425503e02,
+        4.91363285e01,
+        8.26515490e00,
+        1.08053901e-01,
+    ],
 }
 
 

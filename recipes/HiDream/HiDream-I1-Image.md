@@ -51,8 +51,8 @@ vllm serve ${MODEL_NAME_OR_PATH} \
    --port 8092 \
    --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
    --tensor-parallel-size 1 \
-   --vae_use_slicing \
-   --vae_use_tiling
+   --vae-use-slicing \
+   --vae-use-tiling
 ```
 
 
@@ -104,3 +104,24 @@ curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: applicatio
 #### Notes
 
 - Key flags: `--auxiliary-text-encoder` designates the path for the auxiliary text model meta-llama/Llama-3.1-8B-Instruct. For HiDream-I1-Full, unspecified use defaults meta-llama/Llama-3.1-8B-Instruct (downloaded from official Hugging Face), and custom paths are supported.
+
+#### TeaCache acceleration
+
+TeaCache is supported on the standard diffusion path (`pipeline.transformer`). Enable it for offline inference:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model HiDream-ai/HiDream-I1-Full \
+  --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
+  --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
+  --seed 42 \
+  --height 1024 --width 1024 \
+  --num-inference-steps 50 --guidance-scale 5.0 \
+  --tensor-parallel-size 1 \
+  --vae-use-slicing --vae-use-tiling \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh": 0.2}' \
+  --output hidream_teacache.png
+```
+
+For online serving, pass the cache settings through deploy YAML or equivalent server flags (`cache_backend: tea_cache`, `cache_config: {"rel_l1_thresh": 0.2}`). TeaCache and Cache-DiT are mutually exclusive.
