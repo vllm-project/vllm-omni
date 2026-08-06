@@ -3,6 +3,7 @@
 
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler, SchedulerInterface
 from vllm_omni.diffusion.sched.interface import (
+    AdmissionWaitDecision,
     CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -17,6 +18,7 @@ from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 Scheduler = RequestScheduler
 
 __all__ = [
+    "AdmissionWaitDecision",
     "DiffusionRequestStatus",
     "CachedRequestData",
     "DiffusionSchedulerOutput",

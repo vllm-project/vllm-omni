@@ -23,6 +23,7 @@ from vllm_omni.diffusion.diffusion_engine import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
+    AdmissionWaitDecision,
     CachedRequestData,
     NewRequestData,
 )
@@ -74,6 +75,34 @@ class MockScheduler:
 
     def num_running_requests(self) -> int:
         return 0
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> AdmissionWaitDecision:
+        del dp_concurrent
+        return AdmissionWaitDecision(
+            should_wait=True,
+            deadline=now + 0.5,
+            stable_window_s=0.05,
+            max_batch=self.max_num_running_reqs,
+        )
+
+    def should_end_admission_wait(
+        self,
+        decision: AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        waiting = self.num_waiting_requests()
+        return (
+            waiting >= decision.max_batch
+            or (waiting > 0 and now - stable_since >= decision.stable_window_s)
+            or (decision.deadline is not None and now >= decision.deadline)
+        )
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -543,7 +572,7 @@ class TestRequestBatchAdmission:
 
         start = time.monotonic()
         with engine._cv:
-            engine._wait_for_request_batch_admission_locked()
+            engine._wait_for_admission_if_needed_locked()
         waited_s = time.monotonic() - start
 
         # Stable-window exit (~50ms), not the full 1000ms deadline.
