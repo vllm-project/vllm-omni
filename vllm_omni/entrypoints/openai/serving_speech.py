@@ -314,6 +314,7 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _diffusion_mode: bool = False
+    _media_connector: MediaConnector
     _tts_executor: ThreadPoolExecutor | None = None
 
     def _init_speaker_storage(self) -> None:
@@ -459,6 +460,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.model_name = kwargs.pop("model_name", None)
         self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
         super().__init__(*args, **kwargs)
+        self._media_connector = MediaConnector(
+            allowed_local_media_path=self.model_config.allowed_local_media_path,
+            allowed_media_domains=self.model_config.allowed_media_domains,
+        )
         self._init_speaker_storage()
 
         # Find and cache the TTS stage (if any) during initialization
@@ -2017,17 +2022,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             return wav_list, sr
 
-        # In diffusion mode, model_config may not be available
-        if self._diffusion_mode:
-            connector = self._media_connector
-        else:
-            model_config = self.model_config
-            connector = MediaConnector(
-                allowed_local_media_path=model_config.allowed_local_media_path,
-                allowed_media_domains=model_config.allowed_media_domains,
-            )
         fetch_start_s = time.perf_counter()
-        wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+        wav_np, sr = await self._media_connector.fetch_audio_async(ref_audio_str)
         fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
