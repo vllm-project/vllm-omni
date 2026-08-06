@@ -445,9 +445,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
-        instance._media_connector = (
-            media_connector if media_connector is not None else MediaConnector()
-        )
+        instance._media_connector = media_connector if media_connector is not None else MediaConnector()
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
         instance._is_fish_speech = False

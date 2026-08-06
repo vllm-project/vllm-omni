@@ -1107,13 +1107,9 @@ class TestTTSMethods:
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
     @pytest.mark.asyncio
-    async def test_diffusion_ref_audio_uses_injected_media_connector(
-        self, mocker: MockerFixture
-    ):
+    async def test_diffusion_ref_audio_uses_injected_media_connector(self, mocker: MockerFixture):
         connector = mocker.MagicMock()
-        connector.fetch_audio_async = mocker.AsyncMock(
-            return_value=(np.zeros(24000, dtype=np.float32), 24000)
-        )
+        connector.fetch_audio_async = mocker.AsyncMock(return_value=(np.zeros(24000, dtype=np.float32), 24000))
         server = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=mocker.MagicMock(),
             model_name="test-model",
