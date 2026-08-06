@@ -252,8 +252,7 @@ while True:
   batch of compatible independent requests for one full pipeline forward when
   the pipeline supports request-level batching; the step-wise path can also
   admit or remove compatible requests between denoise steps. See
-  [Request-Level Batching](../feature/diffusion_request_level_batching.md) and
-  [Continuous Batching for Step-Wise Diffusion](../feature/diffusion_continuous_batching.md).
+  [Diffusion Continuous Batching](../feature/diffusion_continuous_batching.md).
 
 ---
 

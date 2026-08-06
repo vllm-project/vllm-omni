@@ -71,6 +71,12 @@ plugins:
   - search
   - autorefs
   - awesome-nav
+  - redirects:
+      redirect_maps:
+        user_guide/diffusion/request_batching.md: user_guide/diffusion/execution_modes.md
+        user_guide/diffusion/step_execution.md: user_guide/diffusion/execution_modes.md
+        design/feature/diffusion_request_level_batching.md: design/feature/diffusion_continuous_batching.md
+        design/feature/diffusion_step_execution.md: design/feature/diffusion_continuous_batching.md
   - glightbox
   - git-revision-date-localized:
       # exclude files

@@ -416,11 +416,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 )
             extra_args_signatures: set = set()
             for nr in new_reqs:
-                ea = getattr(nr.req, "extra_args", None)
-                if ea and isinstance(ea, dict):
-                    extra_args_signatures.add(json.dumps(ea, sort_keys=True))
-                else:
-                    extra_args_signatures.add(None)
+                ea = getattr(nr.req.sampling_params, "extra_args", None)
+                extra_args_signatures.add(json.dumps(ea, sort_keys=True, default=repr) if ea is not None else None)
             if len(extra_args_signatures) > 1:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to "
@@ -521,6 +518,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
 
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        dp_size = getattr(parallel_config, "data_parallel_size", 1)
+        if (
+            dp_size > 1
+            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            and getattr(self.od_config, "dlo_use_allgather", True)
+        ):
+            # DLO DP uses one independent request per DP replica.  It is not a
+            # fused pipeline request batch, so models such as MiniMax-H3 do not
+            # need to advertise supports_request_batch=True.
+            return self.execute_request(scheduler_output)
+
         result = self.collective_rpc(
             "execute_model_batch",
             args=(scheduler_output, self.od_config),
@@ -599,7 +608,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # so the D2H copy runs on a side stream in the worker background
         # thread while the default stream is free for the next forward.
         # pump routes the result back to a Future via rpc_id.
-        if not self.od_config.step_execution and method in ("execute_model", "execute_model_batch"):
+        multi_rank_reply = unique_reply_rank is None and exec_all_ranks
+        if (
+            not self.od_config.step_execution
+            and method in ("execute_model", "execute_model_batch")
+            and not multi_rank_reply
+        ):
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
             fut: concurrent.futures.Future = concurrent.futures.Future()

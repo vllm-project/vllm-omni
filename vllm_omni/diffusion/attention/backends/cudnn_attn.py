@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 
 class CuDNNAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -61,7 +62,26 @@ class CuDNNAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         attention_mask = None
         if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode="broadcast_k")
+            valid_kv_length = attn_metadata.extra.get("valid_kv_length")
+            if attn_metadata.attn_mask is None and isinstance(valid_kv_length, int):
+                if not 0 < valid_kv_length <= key.shape[1]:
+                    raise ValueError(
+                        "valid_kv_length must be within the K/V sequence, "
+                        f"got {valid_kv_length} for length {key.shape[1]}"
+                    )
+                # A contiguous valid prefix is mathematically equivalent to a
+                # broadcast key-padding mask. Slicing K/V keeps Q/output in the
+                # checkpoint's aligned layout while letting cuDNN select its
+                # much faster mask-free FMHA plan.
+                key = key[:, :valid_kv_length]
+                value = value[:, :valid_kv_length]
+            else:
+                attention_mask = _maybe_reshape_attn_mask(
+                    query,
+                    key,
+                    attn_metadata.attn_mask,
+                    mask_mode="broadcast_k",
+                )
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
