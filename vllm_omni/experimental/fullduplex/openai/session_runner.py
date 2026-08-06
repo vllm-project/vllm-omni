@@ -1435,6 +1435,10 @@ class DuplexSessionRunnerMixin:
                                 )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
+                        print(
+                            f"[DUPLEX] response.create: native_in_progress={native_response_in_progress()} append_tasks={len(actor.native_append_tasks)} dp_task={native.data_plane_task is not None} committed_payload={native.committed_audio_payload is not None} active_resp={session.active_response_id} active_req={session.active_request_id}",
+                            flush=True,
+                        )
                         if (
                             native_response_in_progress()
                             or actor.native_append_tasks
@@ -1445,6 +1449,10 @@ class DuplexSessionRunnerMixin:
                                 or actor.native_append_tasks
                                 or native.data_plane_task is not None
                             ):
+                                print(
+                                    "[DUPLEX] response.create: silently skipped (pending work, no active response)",
+                                    flush=True,
+                                )
                                 continue
                             await emit_event(
                                 {
@@ -1463,6 +1471,10 @@ class DuplexSessionRunnerMixin:
                             if operation_id is None:
                                 operation_id = uuid.uuid4().hex
                                 native.committed_audio_operation_id = operation_id
+                            print(
+                                f"[DUPLEX] response.create: dispatching start_native_append final=True precreate=True op={operation_id[:8]}",
+                                flush=True,
+                            )
                             await start_native_append(
                                 committed_payload,
                                 final=True,
@@ -1471,6 +1483,7 @@ class DuplexSessionRunnerMixin:
                                 retained_committed_payload=committed_payload,
                             )
                             continue
+                        print("[DUPLEX] response.create: ERROR no committed audio", flush=True)
                         await emit_event(
                             {
                                 "type": "error",

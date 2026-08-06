@@ -100,10 +100,16 @@ class NativeRuntimeBridgeMixin:
         mode: str = "append_tokens",
         expected_epoch: int | None = None,
     ) -> tuple[bool, bool]:
+        print(
+            f"[DUPLEX] _append_runtime_input: mode={mode} final={final} supports_input_append={session.capabilities.supports_input_append}",
+            flush=True,
+        )
         if not session.capabilities.supports_input_append:
+            print("[DUPLEX] _append_runtime_input: skipped (no input_append support)", flush=True)
             return True, False
         append_input = getattr(self._chat_service.engine_client, "append_duplex_input_async", None)
         if not callable(append_input):
+            print("[DUPLEX] _append_runtime_input: skipped (no append_duplex_input_async)", flush=True)
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
@@ -136,7 +142,12 @@ class NativeRuntimeBridgeMixin:
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
                 append_kwargs["collect_outputs"] = False
+            print("[DUPLEX] _append_runtime_input: calling append_duplex_input_async collect_outputs=False", flush=True)
             result = await append_input(session.session_id, **append_kwargs)
+            print(
+                f"[DUPLEX] _append_runtime_input: result keys={list(result.keys()) if isinstance(result, dict) else type(result).__name__}",
+                flush=True,
+            )
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
             await self._send_runtime_error(send_json, "runtime_append_failed", exc, session=session)
@@ -154,6 +165,10 @@ class NativeRuntimeBridgeMixin:
             return True, False
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         request_id, _ = self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
+        print(
+            f"[DUPLEX] _append_runtime_input: request_id={request_id} outputs_finished={self._data_plane_outputs_finished(result)}",
+            flush=True,
+        )
         if request_id is not None:
             self._serving_runtime_adapter.data_plane.begin_request(request_id)
         close_reason, emitted_response = await self._send_native_duplex_events(
@@ -166,6 +181,10 @@ class NativeRuntimeBridgeMixin:
         # drain task already exists. Treating only a newly-created drain as
         # activity clears active_request_id after later appends and prevents a
         # terminal TTS segment from scheduling the next model decision.
+        print(
+            f"[DUPLEX] _append_runtime_input: after send_native_duplex_events close_reason={close_reason} emitted={emitted_response}",
+            flush=True,
+        )
         emitted_response = emitted_response or request_id is not None
         if close_reason is None and await self._start_native_data_plane_stream_task(
             send_json,
@@ -247,7 +266,15 @@ class NativeRuntimeBridgeMixin:
         expected_epoch: int | None = None,
     ) -> bool:
         request_id, _ = self._data_plane_request_info(result)
+        print(
+            f"[DUPLEX] _start_native_data_plane_stream_task: request_id={request_id} outputs_finished={self._data_plane_outputs_finished(result)}",
+            flush=True,
+        )
         if request_id is None or self._data_plane_outputs_finished(result):
+            print(
+                "[DUPLEX] _start_native_data_plane_stream_task: early return (no request_id or outputs finished)",
+                flush=True,
+            )
             return False
         session.bind_request(request_id)
 
@@ -701,25 +728,33 @@ class NativeRuntimeBridgeMixin:
         engine_client = self._chat_service.engine_client
         final_output_stage_ids = set(engine_client._compute_final_output_stage_ids(session.config.modalities)) or None
 
+        print(f"[DUPLEX] _drain_native_data_plane_stream: starting drain for request_id={request_id}", flush=True)
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
             if self._serving_runtime_adapter.data_plane.is_terminal(request_id):
+                print("[DUPLEX] _drain: terminal request_id", flush=True)
                 return None
             if self._session_auto_responds(session):
                 active_request_id = session.active_request_id
                 if active_request_id is not None and active_request_id != request_id:
+                    print("[DUPLEX] _drain: request_id mismatch", flush=True)
                     return None
             if expected_epoch is not None and session.epoch != expected_epoch:
+                print("[DUPLEX] _drain: epoch mismatch", flush=True)
                 return None
             if session.state == DuplexSessionState.CLOSED:
+                print("[DUPLEX] _drain: session closed", flush=True)
                 return None
+            print("[DUPLEX] _drain: polling collect_outputs...", flush=True)
             outputs = await collect_outputs(
                 request_id,
                 final_output_stage_ids=final_output_stage_ids,
                 timeout=self._runtime_control_timeout_s(session),
             )
+            print(f"[DUPLEX] _drain: got {len(outputs) if outputs else 0} outputs", flush=True)
             if expected_epoch is not None and session.epoch != expected_epoch:
+                print("[DUPLEX] _drain: epoch mismatch after poll", flush=True)
                 return None
             if not outputs:
                 # An empty poll means no output arrived within one control
@@ -924,6 +959,10 @@ class NativeRuntimeBridgeMixin:
         end_of_turn = bool(native_result.get("end_of_turn", False))
         has_text = isinstance(text, str) and bool(text)
         has_audio = isinstance(audio, str) and bool(audio)
+        print(
+            f"[DUPLEX] _send_one_native_duplex_event: has_text={has_text} has_audio={has_audio} end_of_turn={end_of_turn} is_listen={native_result.get('is_listen')} keys={list(native_result.keys())[:10]}",
+            flush=True,
+        )
         if not has_text and not has_audio and not end_of_turn:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
