@@ -165,6 +165,10 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     source_partitions,
     expected_tasks,
 ):
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
     from vllm_omni.diffusion.models.minimax_h3 import (
         pipeline_minimax_h3 as pipeline_module,
     )
@@ -210,6 +214,14 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
 
     tokenizer_calls = []
     processor_calls = []
+    tokenizer_cls = Mock(spec=pipeline_module.Qwen2TokenizerFast)
+    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
+        tokenizer_calls.append((args, kwargs)) or object()
+    )
+    processor_cls = Mock(spec=pipeline_module.Qwen3VLProcessor)
+    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
+        processor_calls.append((args, kwargs)) or object()
+    )
     monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
     monkeypatch.setattr(
         pipeline_module,
@@ -229,12 +241,12 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     monkeypatch.setattr(
         pipeline_module,
         "Qwen2TokenizerFast",
-        SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer_calls.append((args, kwargs)) or object()),
+        tokenizer_cls,
     )
     monkeypatch.setattr(
         pipeline_module,
         "Qwen3VLProcessor",
-        SimpleNamespace(from_pretrained=lambda *args, **kwargs: processor_calls.append((args, kwargs)) or object()),
+        processor_cls,
     )
     monkeypatch.setattr(
         pipeline_module,
@@ -258,16 +270,15 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         fake_download,
     )
 
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         revision=None,
         task_type=task_type,
         quantization_config=None,
-        parallel_config=SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
         ),
-        enable_diffusion_pipeline_profiler=False,
     )
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 

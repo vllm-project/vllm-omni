@@ -20,11 +20,7 @@ def get_diffusion_model_index(
 ) -> dict | None:
     """Read the first standard Diffusers pipeline index available."""
     for filename in DIFFUSION_MODEL_INDEX_FILES:
-        try:
-            config = get_hf_file_to_dict(filename, model_name, revision=revision)
-        except Exception as exc:
-            logger.debug("Failed to read %s for %s: %s", filename, model_name, exc)
-            continue
+        config = get_hf_file_to_dict(filename, model_name, revision=revision)
         if isinstance(config, Mapping):
             return dict(config)
     return None
