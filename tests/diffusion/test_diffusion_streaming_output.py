@@ -341,7 +341,9 @@ class TestPipelineStreamingOutputToEntrypoint:
                 with client.websocket_connect("/v1/realtime/video") as ws:
                     ws.send_json({"type": "session.start", "prompt": "integration test"})
                     assert ws.receive_json()["type"] == "video.start"
+                    assert ws.receive_json()["type"] == "video.chunk_metadata"
                     assert ws.receive_bytes() == b"pipeline-fmp4-0"
+                    assert ws.receive_json()["type"] == "video.chunk_metadata"
                     assert ws.receive_bytes() == b"pipeline-fmp4-1"
                     done = ws.receive_json()
                     assert done["type"] == "session.done"
@@ -453,7 +455,6 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni.final_output_task = None
         omni.event_resolver = AsyncEventResolver()
         omni._enable_ar_profiler = False
-        omni._is_sleeping = False
         omni.prom_metrics = MagicMock()
         omni.mod_metrics = MagicMock()
         omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params

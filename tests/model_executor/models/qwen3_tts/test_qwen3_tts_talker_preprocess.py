@@ -17,6 +17,8 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
     Qwen3TTSTalkerForConditionalGeneration,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_minimal_talker(
     tts_pad_embed: torch.Tensor | None = None,

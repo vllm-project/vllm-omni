@@ -11,7 +11,7 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.flux2.pipeline_flux2 import UPSAMPLING_MAX_IMAGE_SIZE
 from diffusers.pipelines.flux2.system_messages import (
@@ -25,6 +25,7 @@ from transformers import AutoConfig, AutoProcessor, PixtralProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import DistributedAutoencoderKLFlux2
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -416,9 +417,9 @@ class Flux2Pipeline(
             system_message_t2i=SYSTEM_MESSAGE_UPSAMPLING_T2I,
             system_message_i2i=SYSTEM_MESSAGE_UPSAMPLING_I2I,
         )
-        self.vae = AutoencoderKLFlux2.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self._execution_device
-        )
+        self.vae = DistributedAutoencoderKLFlux2.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self._execution_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
         transformer_quant_config = _resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = Flux2Transformer2DModel(

@@ -1,0 +1,55 @@
+# Uploaded by upload_pipeline.py --upload (not the Buildkite hook).
+# ``if`` is injected by step ``key`` from skip-ci at upload time.
+steps:
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "bash .buildkite/cuda/scripts/build-ci-image.sh"
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L2 Test — PR ready label (diff-aware) or main+NIGHTLY=1 (--e2e, full E2E group)
+  - label: "Upload Ready Pipeline"
+    depends_on: image-build
+    key: upload-ready-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--e2e"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L3 Test — PR merge-test label (diff-aware) or main+NIGHTLY=1 (--e2e, full E2E group)
+  - label: "Upload Merge Pipeline"
+    depends_on: image-build
+    key: upload-merge-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--e2e"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
+  - label: "Upload Nightly Pipeline"
+    depends_on: image-build
+    key: upload-nightly-pipeline
+    commands:
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-nightly.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L5 Test — main+WEEKLY=1 (scheduled), or PR with weekly-test label
+  - label: "Upload Weekly Pipeline"
+    depends_on: image-build
+    key: upload-weekly-pipeline
+    commands:
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-weekly.yml
+    agents:
+      queue: "cpu_queue_premerge"

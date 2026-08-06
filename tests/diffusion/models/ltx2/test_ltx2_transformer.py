@@ -4,17 +4,20 @@
 import pytest
 from torch import nn
 
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel, _make_rms_norm
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-def test_ltx_rms_norm_no_affine_identity_weight_is_non_persistent_buffer():
+
+def test_ltx_rms_norm_no_affine_matches_official_torch_module():
     norm = _make_rms_norm(8, eps=1e-6, elementwise_affine=False)
 
     assert "weight" not in dict(norm.named_parameters())
-    assert "weight" in dict(norm.named_buffers())
+    assert norm.weight is None
+    assert "weight" not in dict(norm.named_buffers())
     assert "weight" not in norm.state_dict()
 
 
@@ -50,3 +53,16 @@ def test_ltx_transformer_exposes_hsdp_shard_conditions_for_blocks():
             matched.append(name)
 
     assert matched == ["transformer_blocks.0", "transformer_blocks.1"]
+
+
+@pytest.mark.parametrize("rope_type", ["interleaved", "split"])
+def test_ltx_sp_plan_shards_video_and_audio_timesteps_together(rope_type):
+    root_plan = LTX2VideoTransformer3DModel._build_sp_plan(rope_type)[""]
+
+    video_timestep = root_plan["timestep"]
+    audio_timestep = root_plan["audio_timestep"]
+
+    assert video_timestep.split_dim == audio_timestep.split_dim == 1
+    assert video_timestep.expected_dims == audio_timestep.expected_dims == 2
+    assert not video_timestep.split_output
+    assert not audio_timestep.split_output

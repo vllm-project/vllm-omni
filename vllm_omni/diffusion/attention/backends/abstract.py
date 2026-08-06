@@ -14,6 +14,7 @@ class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
+    supports_piecewise_spans: bool = False
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -51,6 +52,13 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
 
+@dataclass(frozen=True, slots=True)
+class QueryRange:
+    local_start: int
+    local_end: int
+    global_start: int
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -71,10 +79,15 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
+    #     variable-length query/key sequences for FlashAttention.
+    #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
+    #     the packed cu_seqlens tensors.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
+    query_ranges: tuple[QueryRange, ...] | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

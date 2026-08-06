@@ -9,9 +9,15 @@ import torch
 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
+    compute_ramp_emit,
     max_ic_for_chunk_size,
+    parse_chunk_ramp,
+    ramp_chunk_size,
+    ramp_cumulative,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+    _NUM_QUANTIZERS_DEFAULT,
+    _filter_audio_codes_qwen3_tts,
     talker2code2wav_async_chunk,
     talker2code2wav_full_payload,
     talker2code2wav_token_only,
@@ -35,21 +41,21 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
     )
 
 
-def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frames=0):
+def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frames=0, chunk_ramp=None):
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_left_context_frames": left_context,
+        "initial_codec_chunk_frames": initial_chunk_frames,
+    }
+    if chunk_ramp is not None:
+        extra["codec_chunk_ramp"] = chunk_ramp
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         scheduler_max_num_seqs=max_num_seqs,
         put_req_chunk=defaultdict(int),
+        ramp_chunk_count=defaultdict(int),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_left_context_frames": left_context,
-                    "initial_codec_chunk_frames": initial_chunk_frames,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -530,17 +536,23 @@ def test_full_payload_omits_left_context_size_without_ref():
         pytest.param({"codes.audio": torch.zeros((3, _Q), dtype=torch.long)}, id="all_codes_filtered"),
     ],
 )
-def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_output):
-    """Regression for #4463.
+def test_full_payload_emits_placeholder_frame_on_degenerate_take(pooling_output):
+    """Regression for #4463 and #5471 (the producer half of #5196).
 
-    A degenerate talker take used to return ``None`` from
-    ``talker2code2wav_full_payload``. The connector treats ``None`` as "drop the
+    A degenerate talker take must not return ``None`` from
+    ``talker2code2wav_full_payload``: the connector treats ``None`` as "drop the
     request", but Stage-1 was already scheduled to receive it, so its wait gate
-    polls to ``connector_get_max_wait`` (~300s) and the orchestrator aborts — one
-    stuck request stalls the whole two-stage pipeline. Each degenerate case
-    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped by
-    the filter) must instead return an empty-but-finished payload so the gate
-    releases and the request finishes immediately with zero-length audio.
+    polls to ``connector_get_max_wait`` (~300s) and one stuck request stalls the
+    whole two-stage pipeline (#4463). It must not return an *empty* finished
+    payload either: zero codec frames produce a zero-token Stage-1 request,
+    which full-payload scheduling placeholder-schedules once and never
+    collects; the base-scheduler fallback then schedules it at a negative span,
+    which killed the stage EngineCore before #5269 and leaves the request
+    parked in ``running`` forever after it (#5196, #5471). Each degenerate case
+    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped
+    by the filter) must instead return a finished payload with at least one
+    frame that survives the codec validity filter, so the request runs the
+    normal one-shot path and finishes cleanly.
     """
     request = SimpleNamespace(request_id="r", output_token_ids=[0, 1, 2])
 
@@ -548,4 +560,371 @@ def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_ou
 
     assert payload is not None
     assert payload["meta"]["finished"].item() is True
-    assert payload["codes"]["audio"].numel() == 0
+    audio = payload["codes"]["audio"]
+    # Same wire format as the normal path: flat, codebook-major, one frame.
+    assert audio.ndim == 1
+    assert audio.numel() == _NUM_QUANTIZERS_DEFAULT
+    # The placeholder must survive the same validity filter real takes go
+    # through; a frame the filter would drop re-creates the zero-token request.
+    frames = audio.reshape(-1, _NUM_QUANTIZERS_DEFAULT)
+    assert int(_filter_audio_codes_qwen3_tts(frames).shape[0]) >= 1
+
+
+_RAMP = [1, 4, 8, 16, 25]
+
+
+class TestRampHelpers:
+    def test_parse_ramp_none_when_absent(self):
+        assert parse_chunk_ramp({}) is None
+
+    def test_parse_ramp_valid(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": [1, 4, 8, 16, 25]}) == [1, 4, 8, 16, 25]
+
+    def test_parse_ramp_from_string(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": "1, 4, 8, 16, 25"}) == [1, 4, 8, 16, 25]
+
+    def test_parse_ramp_too_short(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": [25]}) is None
+
+    def test_parse_ramp_non_positive(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": [1, 0, 8]}) is None
+
+    def test_parse_ramp_bad_string(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": "a,b"}) is None
+
+    def test_parse_ramp_int_returns_none(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": 4}) is None
+
+    def test_parse_ramp_float_returns_none(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": 4.5}) is None
+
+    def test_parse_ramp_mixed_list_returns_none(self):
+        assert parse_chunk_ramp({"codec_chunk_ramp": [4, "x"]}) is None
+
+    def test_parse_ramp_warns_on_tail_mismatch(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8]}, steady=25)
+        assert result == [4, 4, 8]
+        assert any("reintroduces" in r.message for r in caplog.records)
+
+    def test_parse_ramp_no_warn_on_tail_match(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8, 16, 25]}, steady=25)
+        assert result == [4, 4, 8, 16, 25]
+        assert not any("reintroduces" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "index,ramp,steady,expected",
+        [
+            (0, _RAMP, 25, 1),
+            (1, _RAMP, 25, 4),
+            (2, _RAMP, 25, 8),
+            (3, _RAMP, 25, 16),
+            (4, _RAMP, 25, 25),
+            (5, _RAMP, 25, 25),
+            (100, _RAMP, 25, 25),
+        ],
+    )
+    def test_ramp_chunk_size(self, index, ramp, steady, expected):
+        assert ramp_chunk_size(index, ramp, steady) == expected
+
+    @pytest.mark.parametrize(
+        "index,ramp,steady,expected",
+        [
+            (0, _RAMP, 25, 1),
+            (1, _RAMP, 25, 5),
+            (2, _RAMP, 25, 13),
+            (3, _RAMP, 25, 29),
+            (4, _RAMP, 25, 54),
+            (5, _RAMP, 25, 79),
+            (6, _RAMP, 25, 104),
+            (100, _RAMP, 25, 54 + 96 * 25),
+        ],
+    )
+    def test_ramp_cumulative(self, index, ramp, steady, expected):
+        assert ramp_cumulative(index, ramp, steady) == expected
+
+    @pytest.mark.parametrize(
+        "length,chunk_index,finished,expected_emit,expected_ctx",
+        [
+            (0, 0, False, False, 0),
+            (1, 0, False, True, 1),
+            (3, 1, False, False, 0),
+            (5, 1, False, True, 4),
+            (12, 2, False, False, 0),
+            (13, 2, False, True, 8),
+            (28, 3, False, False, 0),
+            (29, 3, False, True, 16),
+            (53, 4, False, False, 0),
+            (54, 4, False, True, 25),
+            (78, 5, False, False, 0),
+            (79, 5, False, True, 25),
+            (1, 1, True, True, 0),
+            (3, 1, True, True, 2),
+            (5, 1, True, True, 4),
+        ],
+    )
+    def test_compute_ramp_emit(self, length, chunk_index, finished, expected_emit, expected_ctx):
+        emit, ctx = compute_ramp_emit(length, chunk_index, _RAMP, 25, finished)
+        assert emit == expected_emit
+        assert ctx == expected_ctx
+
+
+class TestChunkRampEmission:
+    RAMP = [1, 4, 8, 16, 25]
+
+    def _emit(self, tm, rid, n_frames, finished=False):
+        tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
+        return talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.zeros((0,))}},
+            request=_req(rid, finished=finished),
+            is_finished=finished,
+        )
+
+    def test_ramp_sequence_1_4_8_16_25(self):
+        tm = _tm(chunk_ramp=self.RAMP)
+        rid = "ramp-seq"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        assert len(p0.codes.audio) == _Q * 1
+        tm.ramp_chunk_count[rid] = 1
+
+        assert self._emit(tm, rid, 2) is None
+        assert self._emit(tm, rid, 3) is None
+        assert self._emit(tm, rid, 4) is None
+        p1 = self._emit(tm, rid, 5)
+        assert p1 is not None
+        assert len(p1.codes.audio) == _Q * 5
+        assert p1.meta.left_context_size == 1
+        tm.ramp_chunk_count[rid] = 2
+
+        for n in range(6, 13):
+            assert self._emit(tm, rid, n) is None
+        p2 = self._emit(tm, rid, 13)
+        assert p2 is not None
+        assert p2.meta.left_context_size == 5
+        tm.ramp_chunk_count[rid] = 3
+
+        for n in range(14, 29):
+            assert self._emit(tm, rid, n) is None
+        p3 = self._emit(tm, rid, 29)
+        assert p3 is not None
+        assert p3.meta.left_context_size == 13
+        tm.ramp_chunk_count[rid] = 4
+
+        for n in range(30, 54):
+            assert self._emit(tm, rid, n) is None
+        p4 = self._emit(tm, rid, 54)
+        assert p4 is not None
+        assert p4.meta.left_context_size == 25
+        tm.ramp_chunk_count[rid] = 5
+
+        for n in range(55, 79):
+            assert self._emit(tm, rid, n) is None
+        p5 = self._emit(tm, rid, 79)
+        assert p5 is not None
+        assert p5.meta.left_context_size == 25
+
+    def test_ramp_finished_flush_mid_chunk(self):
+        tm = _tm(chunk_ramp=self.RAMP)
+        rid = "ramp-flush"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        tm.ramp_chunk_count[rid] = 1
+
+        p_fin = self._emit(tm, rid, 3, finished=True)
+        assert p_fin is not None
+        assert p_fin.meta.finished.item() is True
+        assert len(p_fin.codes.audio) == _Q * (1 + 2)
+        assert p_fin.meta.left_context_size == 1
+
+    def test_ramp_finished_no_new_frames(self):
+        tm = _tm(chunk_ramp=self.RAMP)
+        rid = "ramp-no-new"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        tm.ramp_chunk_count[rid] = 1
+
+        p_fin = self._emit(tm, rid, 1, finished=True)
+        assert p_fin is not None
+        assert p_fin.meta.finished.item() is True
+        assert p_fin.codes.audio.numel() == 0
+
+    def test_ramp_finished_at_exact_threshold(self):
+        tm = _tm(chunk_ramp=self.RAMP)
+        rid = "ramp-exact"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        tm.ramp_chunk_count[rid] = 1
+
+        p1 = self._emit(tm, rid, 5, finished=True)
+        assert p1 is not None
+        assert p1.meta.finished.item() is True
+
+    def test_ramp_backward_compat_without_config(self):
+        tm = _tm(initial_chunk_frames=1)
+        rid = "no-ramp"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        assert len(p0.codes.audio) == _Q * 1
+        tm.put_req_chunk[rid] = 1
+
+        for n in range(2, 26):
+            assert self._emit(tm, rid, n) is None
+        p1 = self._emit(tm, rid, 26)
+        assert p1 is not None
+        assert p1.meta.left_context_size == 1
+
+    def test_ramp_with_ref_code_first_chunk(self):
+        tm = _tm(chunk_ramp=self.RAMP, left_context=25)
+        rid = "ramp-ref"
+        tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(1)]
+        ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+            request=_req(rid, finished=False),
+            is_finished=False,
+        )
+
+        assert payload is not None
+        assert payload.meta.ref_context_size == 2
+        assert payload.meta.ref_context_included is True
+        assert payload.meta.left_context_size == 2
+        assert len(payload.codes.audio) == _Q * (2 + 1)
+
+    def test_ramp_steady_state_after_ramp_exhausted(self):
+        tm = _tm(chunk_ramp=[1, 4], chunk_frames=25)
+        rid = "ramp-short"
+
+        p0 = self._emit(tm, rid, 1)
+        assert p0 is not None
+        tm.ramp_chunk_count[rid] = 1
+
+        p1 = self._emit(tm, rid, 5)
+        assert p1 is not None
+        tm.ramp_chunk_count[rid] = 2
+
+        for n in range(6, 30):
+            assert self._emit(tm, rid, n) is None
+        p2 = self._emit(tm, rid, 30)
+        assert p2 is not None
+        assert p2.meta.left_context_size == 5
+        tm.ramp_chunk_count[rid] = 3
+
+        for n in range(31, 55):
+            assert self._emit(tm, rid, n) is None
+        p3 = self._emit(tm, rid, 55)
+        assert p3 is not None
+        assert p3.meta.left_context_size == 25
+
+    def test_ramp_profile_4_4_8_16_25(self):
+        """Ramp [4,4,8,16,25]: chunk 0=4 frames (320ms audio covers chunk 1
+        gen time → no gap at chunk 0→1), gradual ramp to steady state."""
+        tm = _tm(chunk_ramp=[4, 4, 8, 16, 25])
+        rid = "ramp-4-4-8-16-25"
+
+        for n in range(1, 4):
+            assert self._emit(tm, rid, n) is None
+        p0 = self._emit(tm, rid, 4)
+        assert p0 is not None
+        assert p0.meta.left_context_size == 0
+        tm.ramp_chunk_count[rid] = 1
+
+        for n in range(5, 8):
+            assert self._emit(tm, rid, n) is None
+        p1 = self._emit(tm, rid, 8)
+        assert p1 is not None
+        assert p1.meta.left_context_size == 4
+        tm.ramp_chunk_count[rid] = 2
+
+        for n in range(9, 16):
+            assert self._emit(tm, rid, n) is None
+        p2 = self._emit(tm, rid, 16)
+        assert p2 is not None
+        assert p2.meta.left_context_size == 8
+        tm.ramp_chunk_count[rid] = 3
+
+        for n in range(17, 32):
+            assert self._emit(tm, rid, n) is None
+        p3 = self._emit(tm, rid, 32)
+        assert p3 is not None
+        assert p3.meta.left_context_size == 16
+        tm.ramp_chunk_count[rid] = 4
+
+        for n in range(33, 57):
+            assert self._emit(tm, rid, n) is None
+        p4 = self._emit(tm, rid, 57)
+        assert p4 is not None
+        assert p4.meta.left_context_size == 25
+        tm.ramp_chunk_count[rid] = 5
+
+        for n in range(58, 82):
+            assert self._emit(tm, rid, n) is None
+        p5 = self._emit(tm, rid, 82)
+        assert p5 is not None
+        assert p5.meta.left_context_size == 25
+
+    def test_ramp_resets_on_segment_boundary(self):
+        """After segment 1 emits chunks, a segment boundary clears
+        code_prompt_token_ids and ramp_chunk_count. Segment 2 must restart
+        from chunk index 0.
+
+        Regression for: put_req_chunk is request-global and not reset at
+        segment boundaries. ramp_chunk_count is popped alongside
+        code_prompt_token_ids on is_segment_finished, so the ramp index
+        resets by construction."""
+        tm = _tm(chunk_ramp=[4, 4, 8, 16, 25])
+        rid = "ramp-segment"
+
+        p0 = self._emit(tm, rid, 4)
+        assert p0 is not None
+        assert p0.meta.left_context_size == 0
+        tm.ramp_chunk_count[rid] = 1
+        tm.put_req_chunk[rid] = 1
+
+        p1 = self._emit(tm, rid, 8)
+        assert p1 is not None
+        tm.ramp_chunk_count[rid] = 2
+        tm.put_req_chunk[rid] = 2
+
+        tm.code_prompt_token_ids[rid] = []
+        tm.ramp_chunk_count.pop(rid, None)
+
+        p_seg2_0 = self._emit(tm, rid, 4)
+        assert p_seg2_0 is not None
+        assert p_seg2_0.meta.left_context_size == 0
+
+    def test_ramp_resets_on_segment_boundary_one_chunk_history(self):
+        """Segment 1 emitted exactly 1 chunk (put_req_chunk=1). Segment 2
+        must still restart from chunk index 0.
+
+        Regression for: the hybrid put_req_chunk/derived scheme collided
+        when put_chunk=1 because length >= ramp_cumulative(0) turned true
+        at length=4, causing chunk_index to jump to 1 and dropping the
+        first 4 frames of segment 2."""
+        tm = _tm(chunk_ramp=[4, 4, 8, 16, 25])
+        rid = "ramp-segment-1chunk"
+
+        p0 = self._emit(tm, rid, 4)
+        assert p0 is not None
+        tm.ramp_chunk_count[rid] = 1
+        tm.put_req_chunk[rid] = 1
+
+        tm.code_prompt_token_ids[rid] = []
+        tm.ramp_chunk_count.pop(rid, None)
+
+        p_seg2_0 = self._emit(tm, rid, 4)
+        assert p_seg2_0 is not None
+        assert p_seg2_0.meta.left_context_size == 0

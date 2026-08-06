@@ -114,7 +114,7 @@ def build_serving_chat() -> OmniOpenAIServingChat:
         engine_client=mock_engine,
         models=models,
         response_role="assistant",
-        openai_serving_render=MagicMock(),
+        online_renderer=MagicMock(),
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",

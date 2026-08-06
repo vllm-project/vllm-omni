@@ -17,6 +17,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -110,7 +113,6 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
         sender._omni_connector = connector
@@ -147,7 +149,6 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
         sender._omni_connector = connector
@@ -180,7 +181,6 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
             kv_transfer_manager=mock_kvm,
         )
@@ -202,7 +202,6 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
             kv_transfer_manager=mock_kvm,
         )
@@ -219,7 +218,6 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
             kv_transfer_manager=mock_kvm,
         )
@@ -257,7 +255,6 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
             kv_transfer_manager=mock_kvm,
         )
@@ -281,7 +278,6 @@ class TestOmniConnectorOutput(unittest.TestCase):
     def test_output_aggregation(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
         )
 
@@ -310,7 +306,6 @@ class TestMixinNoConnector(unittest.TestCase):
     def test_no_connector(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
         )
         self.assertIsNone(host._omni_connector)
@@ -336,7 +331,6 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
     def test_finished_load_reqs_flow_to_chunk_ready(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
         )
 
@@ -389,7 +383,6 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
         )
         host._omni_connector = MockConnector(stage_id=0)
@@ -424,7 +417,6 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
         )
         host._omni_connector = MockConnector(stage_id=0)
@@ -453,7 +445,6 @@ class TestKVSentReqIdsAccumulation(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(),
             kv_transfer_manager=mock_kvm,
         )
@@ -488,7 +479,6 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
     def _make_host(self, stage_id: int = 1) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
         )
         host._omni_connector = MockConnector(stage_id=stage_id)
@@ -587,7 +577,6 @@ class TestCleanupFinishedRequest(unittest.TestCase):
     def _make_host(self, stage_id: int = 1) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
         )
         host._omni_connector = MockConnector(stage_id=stage_id)
@@ -771,7 +760,6 @@ class TestSendChunkCachesMapping(unittest.TestCase):
         """send_chunk should cache the internal→external mapping."""
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
         host._omni_connector = MockConnector(stage_id=0)
@@ -802,7 +790,6 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
     def _make_host(self) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0),
         )
         host._omni_connector = MockConnector(stage_id=0)
@@ -901,7 +888,6 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
     def _make_host(self, rank: int) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
         host._omni_connector = MagicMock()
@@ -984,7 +970,6 @@ class TestKVTransferLifecycle(unittest.TestCase):
     def _make_host(self) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0),
         )
         return host
@@ -1039,7 +1024,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_send_side_request_payload_not_cleared_before_payload_is_consumable(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._request_ids_mapping["r1"] = "r1"
@@ -1063,7 +1047,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_payload_consumable_ignores_token_horizon_only_updates(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
@@ -1084,7 +1067,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_payload_consumable_accepts_decode_embeddings(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
@@ -1098,7 +1080,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_ar_metadata_only_followup_chunk_does_not_rewake_request(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._omni_connector = MagicMock()
@@ -1138,7 +1119,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_non_ar_recv_does_not_overwrite_unconsumed_staged_chunk(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
         host._omni_connector = MagicMock()
@@ -1164,7 +1144,6 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
     def test_non_ar_recv_waits_for_scheduler_handoff_before_fetching_next_chunk(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
         host._omni_connector = MagicMock()
@@ -1208,7 +1187,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 class TestRankAwareKVRouting(unittest.TestCase):
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
         host = MixinHost()
-        host.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=1))
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=1))
         host._from_tp = from_tp
         host._to_tp = to_tp
         host._local_rank = local_rank
@@ -1220,6 +1199,38 @@ class TestRankAwareKVRouting(unittest.TestCase):
             host.get_rank_aware_kv_keys("req", from_stage=0),
             ["req_0_0_2_1", "req_0_0_3_1"],
         )
+        host.shutdown_omni_connectors()
+
+    def test_single_rank_hooks_use_default_manager_key(self):
+        host = self._make_host(from_tp=1, to_tp=1, local_rank=0)
+        expected = ["omni_0_to_1_kv_cache_req"]
+
+        self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_rank_aware_kv_keys("req", from_stage=0, to_stage=1), expected)
+        host.shutdown_omni_connectors()
+
+    def test_init_uses_effective_manager_tp2_topology(self):
+        model_config = _make_model_config(stage_id=0)
+        model_config.omni_kv_config = {
+            "need_send_cache": True,
+            "omni_from_stage": "0",
+            "omni_to_stage": "1",
+            "rank_mapping": {"from_tp": 2, "to_tp": 2},
+        }
+        with patch(
+            "vllm_omni.distributed.omni_connectors.kv_transfer_manager.get_local_tp_rank",
+            return_value=1,
+        ):
+            manager = OmniKVTransferManager.from_model_config(model_config)
+
+        host = MixinHost()
+        host.init_omni_connectors(model_config=model_config, kv_transfer_manager=manager)
+
+        expected = ["req_0_0_1_1"]
+        self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_rank_aware_kv_keys("req", from_stage=0, to_stage=1), expected)
+        self.assertEqual(host.get_kv_rank_mapping()["from_tp"], 2)
+        self.assertEqual(host.get_kv_rank_mapping()["to_tp"], 2)
         host.shutdown_omni_connectors()
 
     def test_send_keys_route_from_rank_gt_to_rank(self):
@@ -1269,7 +1280,7 @@ class TestRankAwareKVRouting(unittest.TestCase):
 
 class TestAttachOmniConnectorOutput(unittest.TestCase):
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
-        from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
+        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
         host = MixinHost()
         host.get_omni_connector_output = lambda: OmniConnectorOutput(chunk_ready_req_ids={"req-1"})
@@ -1287,7 +1298,7 @@ class TestConnectorConfigValidation(unittest.TestCase):
         model_config.stage_connector_config = {"name": "   "}
 
         with self.assertRaisesRegex(RuntimeError, "missing connector name"):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
 
 class _FailingConnector:
@@ -1319,7 +1330,6 @@ class TestSendRetry(unittest.TestCase):
     def _make_sender(self, connector):
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
         sender._omni_connector = connector

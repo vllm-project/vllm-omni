@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -20,6 +21,8 @@
       "serve_args": {
         "deploy-config": "../vllm_omni/deploy/hunyuan_image3_dit.yaml",
         "tensor-parallel-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-use-tiling": true,
         "enable-diffusion-pipeline-profiler": true
       }
     },

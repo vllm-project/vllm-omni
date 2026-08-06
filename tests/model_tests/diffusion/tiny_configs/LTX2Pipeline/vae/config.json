@@ -1,0 +1,81 @@
+{
+  "_class_name": "AutoencoderKLLTX2Video",
+  "_diffusers_version": "0.37.0.dev0",
+  "block_out_channels": [
+    256,
+    512,
+    1024,
+    2048
+  ],
+  "decoder_block_out_channels": [
+    256,
+    512,
+    1024
+  ],
+  "decoder_causal": false,
+  "decoder_inject_noise": [
+    false,
+    false,
+    false,
+    false
+  ],
+  "decoder_layers_per_block": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "decoder_spatial_padding_mode": "reflect",
+  "decoder_spatio_temporal_scaling": [
+    true,
+    true,
+    true
+  ],
+  "down_block_types": [
+    "LTX2VideoDownBlock3D",
+    "LTX2VideoDownBlock3D",
+    "LTX2VideoDownBlock3D",
+    "LTX2VideoDownBlock3D"
+  ],
+  "downsample_type": [
+    "spatial",
+    "temporal",
+    "spatiotemporal",
+    "spatiotemporal"
+  ],
+  "encoder_causal": true,
+  "encoder_spatial_padding_mode": "zeros",
+  "in_channels": 3,
+  "latent_channels": 128,
+  "layers_per_block": [
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "out_channels": 3,
+  "patch_size": 4,
+  "patch_size_t": 1,
+  "resnet_norm_eps": 1e-06,
+  "scaling_factor": 1.0,
+  "spatial_compression_ratio": 32,
+  "spatio_temporal_scaling": [
+    true,
+    true,
+    true,
+    true
+  ],
+  "temporal_compression_ratio": 8,
+  "timestep_conditioning": false,
+  "upsample_factor": [
+    2,
+    2,
+    2
+  ],
+  "upsample_residual": [
+    true,
+    true,
+    true
+  ]
+}

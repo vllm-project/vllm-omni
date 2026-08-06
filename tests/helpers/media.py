@@ -529,6 +529,26 @@ def decode_b64_image(b64: str):
     return img
 
 
+def concat_audio(audio_val) -> np.ndarray:
+    """Flatten a multimodal audio payload to mono float32 samples.
+
+    Engines return ``multimodal_output["audio"]`` as a tensor, a list of
+    per-chunk tensors (streaming decoders), or an array-like; concatenate
+    in order and return a 1-D ``np.float32`` array (empty when a list has
+    no tensors).
+    """
+    import torch
+
+    if isinstance(audio_val, list):
+        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
+        if not tensors:
+            return np.zeros((0,), dtype=np.float32)
+        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
+    if isinstance(audio_val, torch.Tensor):
+        return audio_val.detach().cpu().float().reshape(-1).numpy()
+    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
+
+
 def preprocess_text(text):
     import opencc
 
@@ -632,7 +652,9 @@ def _serialize_whisper_model_download(model_size: str = "small"):
         f.close()
 
 
-def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "small") -> str:
+def _whisper_transcribe_in_current_process(
+    output_path: str, model_size: str = "small", language: str | None = None
+) -> str:
     import whisper
 
     device_index = None
@@ -664,6 +686,9 @@ def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "
             temperature=0.0,
             word_timestamps=True,
             condition_on_previous_text=False,
+            # None keeps whisper's auto-detection. Do not default this to a
+            # language: callers include non-English audio tests.
+            language=language,
         )["text"]
     finally:
         del model
@@ -674,15 +699,15 @@ def _whisper_transcribe_in_current_process(output_path: str, model_size: str = "
     return text or ""
 
 
-def convert_audio_file_to_text(output_path: str, model_size: str = "small") -> str:
+def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
     """Convert an audio file to text in an isolated subprocess."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size)
+        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language)
         return future.result()
 
 
-def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> str:
+def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", language: str | None = None) -> str:
     output_fd, output_path = tempfile.mkstemp(prefix="test_", suffix=".wav")
     os.close(output_fd)
     if os.environ.get("VLLM_OMNI_KEEP_REQUEST_MEDIA", "").lower() not in ("1", "true", "yes"):
@@ -690,11 +715,12 @@ def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small") -> 
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     print(f"audio data is saved: {output_path}")
-    return convert_audio_file_to_text(output_path, model_size)
+    return convert_audio_file_to_text(output_path, model_size, language)
 
 
 __all__ = [
     "_merge_base64_audio_to_segment",
+    "concat_audio",
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",

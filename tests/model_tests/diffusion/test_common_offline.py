@@ -8,10 +8,12 @@ from tests.model_tests.diffusion.config_types import (
 )
 from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
 from tests.model_tests.diffusion.task_runners import (
+    run_and_validate_determinism,
     run_and_validate_image_to_image_request,
-    run_and_validate_text_to_image_determinism,
-    run_and_validate_text_to_image_multi_output,
+    run_and_validate_image_to_video_request,
+    run_and_validate_multi_output,
     run_and_validate_text_to_image_request,
+    run_and_validate_text_to_video_request,
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
@@ -53,6 +55,10 @@ def test_pipeline_on_supported_tasks(
                     run_and_validate_text_to_image_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_image_to_image_request(omni)
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_text_to_video_request(omni)
+                elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
+                    run_and_validate_image_to_video_request(omni)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 
@@ -60,10 +66,12 @@ def test_pipeline_on_supported_tasks(
         # since checking it on every extra acceleration configuration is redundant
         # (see case_filtering).
         if check_determinism:
-            with subtests.test(msg="determinism"):
-                run_and_validate_text_to_image_determinism(omni)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"determinism[{task_type}]"):
+                    run_and_validate_determinism(omni, task_type)
         if check_multioutput:
-            with subtests.test(msg="multi_output"):
-                run_and_validate_text_to_image_multi_output(omni)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"multi_output[{task_type}]"):
+                    run_and_validate_multi_output(omni, task_type)
     finally:
         omni.close()

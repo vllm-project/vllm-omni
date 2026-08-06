@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 import huggingface_hub
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -63,7 +64,11 @@ def omni_snapshot_download(model_id: str) -> str:
 
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
-    if os.environ.get("VLLM_USE_MODELSCOPE", False):
+    # Read through ``vllm.envs`` so the flag keeps vLLM's semantics (only
+    # "true", case-insensitive, enables ModelScope). Reading the raw variable
+    # here made every non-empty value truthy, so ``VLLM_USE_MODELSCOPE=0``
+    # took the ModelScope path while the rest of the stack stayed on HF.
+    if envs.VLLM_USE_MODELSCOPE:
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
@@ -473,6 +478,7 @@ class OmniBase(PDDisaggregationMixin):
         req_start_ts: dict[str, float],
         wall_start_ts: float,
         final_stage_id_for_e2e: int,
+        stage_event_cursor: int = 0,
     ) -> OmniRequestOutput | None:
         req_id = result.request_id
         engine_outputs = result.engine_outputs
@@ -481,7 +487,7 @@ class OmniBase(PDDisaggregationMixin):
 
         # Merge AR stage timing from OrchestratorAggregator.stage_events
         if self._enable_ar_profiler:
-            ar_events = metrics.stage_events.get(str(req_id), [])
+            ar_events = metrics.stage_events.get(str(req_id), [])[stage_event_cursor:]
             for evt in ar_events:
                 if evt.stage_id != stage_id:
                     stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
@@ -494,7 +500,7 @@ class OmniBase(PDDisaggregationMixin):
                     stage_durations[key] = value
 
         # Merge per-stage gen times into stage_durations
-        for evt in metrics.stage_events.get(str(req_id), []):
+        for evt in metrics.stage_events.get(str(req_id), [])[stage_event_cursor:]:
             key = f"stage_{evt.stage_id}_gen_ms"
             if key not in stage_durations:
                 stage_durations[key] = evt.stage_gen_time_ms
@@ -546,7 +552,7 @@ class OmniBase(PDDisaggregationMixin):
                 # Token counters — aggregate across all stages for this request.
                 _prompt_tok = 0
                 _gen_tok = 0
-                for evt in metrics.stage_events.get(rid_key, []):
+                for evt in metrics.stage_events.get(rid_key, [])[stage_event_cursor:]:
                     if evt.stage_id == 0:
                         _prompt_tok += int(evt.num_tokens_in)
                     _gen_tok += int(evt.num_tokens_out)
@@ -581,7 +587,7 @@ class OmniBase(PDDisaggregationMixin):
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
-        for evt in metrics.stage_events.get(rid_key, []):
+        for evt in metrics.stage_events.get(rid_key, [])[stage_event_cursor:]:
             if evt.stage_id is None:
                 continue
             sid = int(evt.stage_id)
@@ -604,7 +610,9 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         return OmniRequestOutput(
             request_id=req_id or "",
+            finished=finished,
             stage_id=stage_id,
+            replica_id=result.replica_id,
             final_output_type=output_type,
             request_output=engine_outputs,
             images=images,
@@ -616,7 +624,6 @@ class OmniBase(PDDisaggregationMixin):
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
-            finished=finished,
         )
 
     def shutdown(self, timeout: float | None = None) -> None:
