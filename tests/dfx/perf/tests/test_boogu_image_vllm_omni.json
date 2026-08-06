@@ -25,8 +25,8 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "H100": {
-                        "throughput_qps": {"1": 0.0549, "2": 0.0547, "4": 0.0549},
-                        "latency_mean": {"1": 18.0, "2": 34.3, "4": 61.4},
+                        "throughput_qps": [0.0549, 0.0547, 0.0549],
+                        "latency_mean": [18.0, 34.3, 61.4],
                         "peak_memory_mb_max": 40500,
                         "peak_memory_mb_mean": 40500
                     }

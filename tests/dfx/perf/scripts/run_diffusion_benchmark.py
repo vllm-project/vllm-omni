@@ -45,6 +45,7 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     hardware_json_value,
     is_diffusion_perf_config,
+    resolve_baseline_for_sweep,
     resolve_pytest_marks,
     resource_label_for_filename,
 )
@@ -766,7 +767,7 @@ def run_benchmark(
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
-    # Persist the JSON baseline as-is (no hardware / sweep resolution).
+    # Persist sweep-resolved baseline from params (already narrowed in _build_run_params).
     baseline = copy.deepcopy(params.get("baseline") or {})
     metrics["baseline"] = baseline
 
@@ -862,6 +863,7 @@ def _build_run_params(
     params: dict[str, Any],
     *,
     num_prompts: int,
+    sweep_index: int | None = None,
     request_rate: Any | None = None,
     max_concurrency: Any | None = None,
 ) -> dict[str, Any]:
@@ -873,6 +875,16 @@ def _build_run_params(
         run_params["request-rate"] = request_rate
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
+    if "baseline" in params:
+        # Keep all hardware buckets; pick the metric value for this sweep step only.
+        # request_rate="inf" is used for concurrency sweeps and is not a baseline key.
+        baseline_request_rate = None if request_rate in (None, "inf") else request_rate
+        run_params["baseline"] = resolve_baseline_for_sweep(
+            params.get("baseline"),
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=baseline_request_rate,
+        )
     return run_params
 
 
@@ -895,19 +907,20 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
 
     sweep_runs: list[dict[str, Any]] = []
 
-    for request_rate, num_prompts in zip(request_rate_list, num_prompt_list):
+    for sweep_index, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     request_rate=request_rate,
                     num_prompts=num_prompts,
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
             }
         )
 
-    for max_concurrency, num_prompts in zip(max_concurrency_list, num_prompt_list):
+    for sweep_index, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
@@ -915,6 +928,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                     max_concurrency=max_concurrency,
                     num_prompts=num_prompts,
                     request_rate="inf",
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
             }
@@ -927,6 +941,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                 "params": _build_run_params(
                     params,
                     num_prompts=default_num_prompts,
+                    sweep_index=0,
                 ),
                 "num_prompts": default_num_prompts,
             }
