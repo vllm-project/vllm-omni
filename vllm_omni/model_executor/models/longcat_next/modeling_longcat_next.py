@@ -20,7 +20,7 @@ KV cache and fused MoE all apply. On top of that:
 """
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -798,6 +798,17 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         holder["module"] = module
         return module
 
+    @staticmethod
+    def _append_past_code(state: dict[str, Any], codes_row: torch.Tensor) -> None:
+        """Append a kept frame's codes to the row's GPU-resident repetition-
+        penalty history, avoiding the CPU round-trip + full-history re-stack
+        this used to do on every decode step (see past_codes/past_codes_t
+        usage below).
+        """
+        new_row = codes_row.detach().unsqueeze(0)
+        past = state.get("past_codes")
+        state["past_codes"] = new_row if past is None else torch.cat([past, new_row], dim=0)
+
     def _sample_audio_code(
         self,
         logits: torch.Tensor,
@@ -848,6 +859,63 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
         return logits.argmax(dim=-1)
 
+    def _sample_depth_codes(
+        self,
+        offset_vals: torch.Tensor,
+        num_levels: int,
+        rank: int,
+        tp_group: Any,
+        device: torch.device,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+        past_codes: torch.Tensor | None,
+        logits_fn: Callable[[int, torch.Tensor], torch.Tensor],
+        sentinel_fn: Callable[[int], int | None],
+    ) -> torch.Tensor:
+        """Shared rank-0+broadcast autoregressive depth-head sampling loop,
+        used by both plain (audio/visual) and CFG-visual sampling. Returns
+        the broadcast codes_row [num_levels].
+
+        ``logits_fn(level, cum_ids)`` produces this level's logits (a plain
+        head(...) call, or a cond/uncond CFG combination); ``sentinel_fn(level)``
+        returns the sentinel class index to mask for this level, or None.
+        """
+        codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
+        if rank == 0:
+            sampled_codes = []
+            base = offset_vals[0]
+            # Accumulator relative to the modality's own offset; filling one
+            # slot per iteration makes the depth loop autoregressive.
+            cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
+            for level in range(num_levels):
+                level_logits = logits_fn(level, cum_ids)
+                sentinel_idx = sentinel_fn(level)
+                if sentinel_idx is not None and sentinel_idx < level_logits.shape[-1]:
+                    level_logits = level_logits.clone()
+                    level_logits[sentinel_idx] = float("-inf")
+                code = self._sample_audio_code(
+                    level_logits,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    past_codes=None if past_codes is None else past_codes[:, level],
+                )
+                # Kept as a GPU tensor -- converting to a Python int here
+                # would force a device sync on every level of every row's
+                # decode step. The value is only ever consumed as a tensor
+                # (cum_ids, torch.stack below); callers that need a Python
+                # scalar sync once on the finished row, not per level.
+                sampled_codes.append(code)
+                cum_ids[0, level] = code + offset_vals[level] - base
+            codes_row = torch.stack(sampled_codes).to(dtype=torch.long)
+        tp_group.broadcast(codes_row, src=0)
+        return codes_row
+
     def _sample_depth_head(
         self,
         head: nn.Module,
@@ -867,9 +935,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         mask_sentinel: bool = False,
         mask_audio_sentinels: bool = False,
     ) -> torch.Tensor:
-        """Shared rank-0+broadcast depth-head sampling loop, used by both
-        audio_head and visual_head (same checkpoint class, hardcoded
-        cuda:0). Returns the broadcast codes_row [num_levels].
+        """Depth-head sampling for audio_head/visual_head (same checkpoint
+        class, hardcoded cuda:0), via the shared rank-0+broadcast loop.
 
         mask_sentinel zeroes the level-0 end-of-image class for the visual
         head so the grid bound in _advance_visual_gen is the sole
@@ -878,39 +945,33 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         only level-0's is the real chunk-end marker; a non-zero-level
         sentinel would OOB the VQ codebook gather at decode time.
         """
-        codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
-        if rank == 0:
-            sampled_codes = []
-            base = offset_vals[0]
-            hid = last_hidden.to(dtype=self.dtype)
-            # Accumulator relative to the modality's own offset; filling one
-            # slot per iteration makes the depth loop autoregressive.
-            cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
-            for level in range(num_levels):
-                logits = head(hid, cum_ids.to(hid.device), code_embed, level)
-                level_logits = logits[0]
-                sentinel_idx = None
-                if mask_sentinel and level == 0:
-                    sentinel_idx = self.visual_codebook_sizes[0]
-                elif mask_audio_sentinels and level >= 1:
-                    sentinel_idx = self.audio_codebook_sizes[level]
-                if sentinel_idx is not None and sentinel_idx < level_logits.shape[-1]:
-                    level_logits = level_logits.clone()
-                    level_logits[sentinel_idx] = float("-inf")
-                code = self._sample_audio_code(
-                    level_logits,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    past_codes=None if past_codes is None else past_codes[:, level],
-                )
-                sampled_codes.append(int(code))
-                cum_ids[0, level] = code + offset_vals[level] - base
-            codes_row = torch.tensor(sampled_codes, device=device, dtype=torch.long)
-        tp_group.broadcast(codes_row, src=0)
-        return codes_row
+        hid = last_hidden.to(dtype=self.dtype)
+
+        def logits_fn(level: int, cum_ids: torch.Tensor) -> torch.Tensor:
+            return head(hid, cum_ids.to(hid.device), code_embed, level)[0]
+
+        def sentinel_fn(level: int) -> int | None:
+            if mask_sentinel and level == 0:
+                return self.visual_codebook_sizes[0]
+            if mask_audio_sentinels and level >= 1:
+                return self.audio_codebook_sizes[level]
+            return None
+
+        return self._sample_depth_codes(
+            offset_vals,
+            num_levels,
+            rank,
+            tp_group,
+            device,
+            do_sample,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            past_codes,
+            logits_fn,
+            sentinel_fn,
+        )
 
     def _sample_cfg_visual_codes(
         self,
@@ -931,46 +992,41 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         cfg_scale: float = _DEFAULT_CFG_SCALE,
     ) -> torch.Tensor:
         """Sample visual codes with classifier-free guidance from a cond/uncond
-        pair. Mirrors _sample_depth_head's rank-0+broadcast structure, but at
-        every level combines cond/uncond logits as
-        ``cfg_scale * (cond - uncond) + uncond`` (cond from the parent's
-        hidden state, uncond from the twin's separate-KV-cache stream). Both
-        streams share one sampled code per level to stay locked in sequence.
+        pair, via the shared rank-0+broadcast loop. At every level combines
+        cond/uncond logits as ``cfg_scale * (cond - uncond) + uncond`` (cond
+        from the parent's hidden state, uncond from the twin's separate-KV-cache
+        stream). Both streams share one sampled code per level to stay locked
+        in sequence.
         """
-        codes_row = torch.zeros(num_levels, dtype=torch.long, device=device)
-        if rank == 0:
-            sampled_codes = []
-            base = offset_vals[0]
-            cond_hid = cond_hidden.to(dtype=self.dtype)
-            uncond_hid = uncond_hidden.to(dtype=self.dtype)
-            head = self.visual_head
-            cum_ids = torch.zeros(1, num_levels, dtype=torch.long, device=device)
-            for level in range(num_levels):
-                cond_logits = head(cond_hid, cum_ids.to(cond_hid.device), code_embed, level)[0]
-                uncond_logits = head(uncond_hid, cum_ids.to(uncond_hid.device), code_embed, level)[0]
-                combined = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
-                sentinel_idx = None
-                if level == 0:
-                    # Masked so the image can never self-terminate early --
-                    # the grid bound in _advance_visual_gen is the terminator.
-                    sentinel_idx = self.visual_codebook_sizes[0]
-                if sentinel_idx is not None and sentinel_idx < combined.shape[-1]:
-                    combined = combined.clone()
-                    combined[sentinel_idx] = float("-inf")
-                code = self._sample_audio_code(
-                    combined,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    past_codes=None if past_codes is None else past_codes[:, level],
-                )
-                sampled_codes.append(int(code))
-                cum_ids[0, level] = code + offset_vals[level] - base
-            codes_row = torch.tensor(sampled_codes, device=device, dtype=torch.long)
-        tp_group.broadcast(codes_row, src=0)
-        return codes_row
+        cond_hid = cond_hidden.to(dtype=self.dtype)
+        uncond_hid = uncond_hidden.to(dtype=self.dtype)
+        head = self.visual_head
+
+        def logits_fn(level: int, cum_ids: torch.Tensor) -> torch.Tensor:
+            cond_logits = head(cond_hid, cum_ids.to(cond_hid.device), code_embed, level)[0]
+            uncond_logits = head(uncond_hid, cum_ids.to(uncond_hid.device), code_embed, level)[0]
+            return cfg_scale * (cond_logits - uncond_logits) + uncond_logits
+
+        def sentinel_fn(level: int) -> int | None:
+            # Masked so the image can never self-terminate early -- the
+            # grid bound in _advance_visual_gen is the terminator.
+            return self.visual_codebook_sizes[0] if level == 0 else None
+
+        return self._sample_depth_codes(
+            offset_vals,
+            num_levels,
+            rank,
+            tp_group,
+            device,
+            do_sample,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            past_codes,
+            logits_fn,
+            sentinel_fn,
+        )
 
     def talker_mtp(
         self,
@@ -1082,8 +1138,9 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     all_codes[row] = -1
                     continue
 
-                past_codes = state.get("past_codes")
-                past_codes_t = torch.stack(past_codes).to(device) if past_codes else None
+                # GPU-resident history (see _append_past_code); no per-step
+                # CPU round-trip or full re-stack needed.
+                past_codes_t = state.get("past_codes")
                 codes_row = self._sample_depth_head(
                     self.audio_head,
                     audio_code_embed,
@@ -1126,7 +1183,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 if frame_kept:
                     # Repetition-penalty history: kept frames only.
-                    state.setdefault("past_codes", []).append(codes_row.detach().cpu())
+                    self._append_past_code(state, codes_row)
 
                 # Build the 3-stream next-step embedding.
                 # Stream 1: ext_id (audiotext_start/pad/audiogen_end).
@@ -1147,15 +1204,19 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 # code 0 doubles as the clamped-invalid value.
                 audio_emb = torch.zeros_like(ext_emb)
                 if frame_kept and deoff != 0:
+                    # Vectorized gather + mask instead of a per-level
+                    # Python loop with a `.item()` sync each iteration --
+                    # out-of-range levels are clamped for the gather then
+                    # zeroed, reproducing the old skip-if-out-of-range
+                    # behavior without forcing num_levels device syncs.
                     replicated_emb = self._ensure_replicated_audio_code_embedding(device)
                     offset_codes = codes_row + self.audio_offset_vals[:num_levels].to(device)
-                    row_embs = []
-                    for level in range(num_levels):
-                        idx = (offset_codes[level] - self.audio_offset_vals[0]).item()
-                        if 0 <= idx < replicated_emb.shape[0]:
-                            row_embs.append(replicated_emb[idx : idx + 1])
-                    if row_embs:
-                        audio_emb = torch.cat(row_embs, dim=0).sum(dim=0, keepdim=True)
+                    idxs = offset_codes - self.audio_offset_vals[0]
+                    valid = (idxs >= 0) & (idxs < replicated_emb.shape[0])
+                    if bool(valid.any()):
+                        clamped_idxs = idxs.clamp(0, replicated_emb.shape[0] - 1)
+                        gathered = replicated_emb[clamped_idxs] * valid.unsqueeze(-1).to(replicated_emb.dtype)
+                        audio_emb = gathered.sum(dim=0, keepdim=True)
 
                 # Sum the 3 streams
                 next_emb = ext_emb + text_emb + audio_emb
@@ -1249,8 +1310,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                         if t_row < last_talker_hidden.shape[0]
                         else last_talker_hidden[-1:]
                     )
-                    p_past = p_state.get("past_codes")
-                    p_past_t = torch.stack(p_past).to(device) if p_past else None
+                    p_past_t = p_state.get("past_codes")
                     cfg_scale = float(p_state.get("cfg_scale", _DEFAULT_CFG_SCALE))
                     codes_row = self._sample_cfg_visual_codes(
                         visual_code_embed,
@@ -1275,7 +1335,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     frame_kept = not is_row_boundary and not eoc_terminal
                     is_terminal = eoc_terminal
                     if frame_kept:
-                        p_state.setdefault("past_codes", []).append(codes_row.detach().cpu())
+                        self._append_past_code(p_state, codes_row)
 
                     # Both streams share the combined sample; mirror the
                     # twin's grid state onto the parent's so both terminate
@@ -1313,8 +1373,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     cfg_handled_rows.add(t_row)
                     continue
 
-                past_codes = state.get("past_codes")
-                past_codes_t = torch.stack(past_codes).to(device) if past_codes else None
+                past_codes_t = state.get("past_codes")
                 codes_row = self._sample_depth_head(
                     self.visual_head,
                     visual_code_embed,
@@ -1345,7 +1404,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
                 is_terminal = eoc_terminal
                 if frame_kept:
-                    state.setdefault("past_codes", []).append(codes_row.detach().cpu())
+                    self._append_past_code(state, codes_row)
 
                 # Unlike audio's 3-way sum, this is a masked replace: the
                 # visible token (IMAGE_PAD/IMAGE_NEWLINE) keeps its normal

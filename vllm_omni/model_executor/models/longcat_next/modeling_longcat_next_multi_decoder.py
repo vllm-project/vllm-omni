@@ -20,6 +20,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .longcat_next_utils import resolve_single_request_additional_info
 from .modeling_longcat_next_audio_decoder import LongcatNextAudioDecoder
 from .modeling_longcat_next_image_decoder import LongcatNextImageDecoder
 
@@ -78,20 +79,7 @@ class LongcatNextMultiDecoder(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        model_intermediate_buffer = (
-            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
-        )
-        if isinstance(model_intermediate_buffer, dict):
-            info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
-        else:
-            info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
-        if len(info_dicts) > 1:
-            logger.warning(
-                "LongcatNextMultiDecoder got %d requests in one batch; only the "
-                "first is decoded (max_num_seqs should be 1 for this stage).",
-                len(info_dicts),
-            )
-        additional_info = info_dicts[0] if info_dicts else {}
+        additional_info = resolve_single_request_additional_info(kwargs, "LongcatNextMultiDecoder")
 
         has_visual = bool(additional_info.get("visual_token_ids"))
         has_audio = bool(additional_info.get("audio_token_ids"))

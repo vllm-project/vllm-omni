@@ -28,6 +28,7 @@ from .longcat_next_utils import (
     load_remote_hf_config,
     load_weight_subtree,
     resolve_checkpoint_relative_path,
+    resolve_single_request_additional_info,
 )
 
 logger = init_logger(__name__)
@@ -104,20 +105,7 @@ class LongcatNextImageDecoder(nn.Module):
     ) -> OmniOutput:
         del input_ids, positions, intermediate_tensors, inputs_embeds
 
-        model_intermediate_buffer = (
-            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
-        )
-        if isinstance(model_intermediate_buffer, dict):
-            info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
-        else:
-            info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
-        if len(info_dicts) > 1:
-            logger.warning(
-                "LongcatNextImageDecoder got %d requests in one batch; only the "
-                "first is decoded (max_num_seqs should be 1 for this stage).",
-                len(info_dicts),
-            )
-        additional_info = info_dicts[0] if info_dicts else {}
+        additional_info = resolve_single_request_additional_info(kwargs, "LongcatNextImageDecoder")
         visual_codes = additional_info.get("visual_token_ids")
         if not visual_codes:
             logger.warning("No visual token IDs provided for image decoder")

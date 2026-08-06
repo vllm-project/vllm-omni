@@ -41,6 +41,31 @@ NUM_CODEBOOKS = 8
 _WEIGHT_PATH_PLACEHOLDER = "WEIGHT_PATH_TO_LONGCAT_NEXT"
 
 
+def resolve_single_request_additional_info(kwargs: dict[str, Any], decoder_name: str) -> dict[str, Any]:
+    """Unwrap a decoder-stage forward()'s model_intermediate_buffer/
+    runtime_additional_information kwarg down to the single request's info
+    dict.
+
+    Shared by the audio/image/multi decoder stages, all of which run with
+    max_num_seqs: 1 -- warns (rather than silently dropping) if more than
+    one request's info dict shows up in a batch.
+    """
+    model_intermediate_buffer = (
+        kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or {}
+    )
+    if isinstance(model_intermediate_buffer, dict):
+        info_dicts = [info for info in model_intermediate_buffer.values() if isinstance(info, dict)]
+    else:
+        info_dicts = [info for info in model_intermediate_buffer if isinstance(info, dict)]
+    if len(info_dicts) > 1:
+        logger.warning(
+            "%s got %d requests in one batch; only the first is decoded (max_num_seqs should be 1 for this stage).",
+            decoder_name,
+            len(info_dicts),
+        )
+    return info_dicts[0] if info_dicts else {}
+
+
 def resolve_checkpoint_relative_path(configured_path: str, model_path: str) -> str:
     """Resolve config.json's WEIGHT_PATH_TO_LONGCAT_NEXT placeholder against
     the local model directory, instead of requiring users to edit the
