@@ -252,3 +252,68 @@ See [SageAttention](attention_backends/sage.md#sageattention3-installation).
 ## HuggingFace Kernels Hub Backends
 
 See [Hugging Face Hub Backends](attention_backends/huggingface_hub.md).
+
+## SOL_ATTN Backend and On-the-Fly Block Sparsification
+
+`SOL_ATTN` runs NVlabs' Sol-Attn — a training-free, on-the-fly sparse attention
+kernel for video diffusion (https://nvlabs.github.io/Sana/Sol-Attn/). It routes
+attention blocks by threshold during an online-softmax pass instead of
+materializing a full proxy score map. For packed-sequence DiTs whose attention
+is sequence-bound (e.g. MiniMax-H3, ~50 layers over tens of thousands of packed
+tokens per denoise step), that block sparsification is a nearly free latency
+win at high fidelity.
+
+The kernel requires CUDA, BF16 activations, and `head_dim=128`. It has no
+`cu_seqlens` support, so the packed varlen layout is sliced to its real length
+first (the alignment-padding document is excluded and its output rows are
+masked by the model). Dense layers and early denoise steps run the exact
+packed-varlen `FLASH_ATTN` path, so the sparse kernel is measured against a
+bit-identical dense baseline.
+
+Install the upstream package (not bundled):
+
+```bash
+pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends
+```
+
+Enable it through the typed `sol_attn` block on the attention spec:
+
+| Key | Valid values | Meaning |
+|---|---|---|
+| `tau` | finite, `>= 0` | Routing threshold scale. Higher selects fewer exact KV blocks. Defaults to `1.0`. |
+| `thresh_type` | `diag`, `exact` | Threshold mode. `diag` is the fast approximate path. Defaults to `diag`. |
+| `sink_tokens` | `>= 0` | Exact-KV sink length for prefix tokens such as the text/audio rows of a packed layout. Defaults to `0`. |
+| `sink_start` | `>= 0` or `null` | Start index of the exact-KV sink range. Defaults to `0`. |
+| `dense_steps` | `>= 0` | Keep the first N denoise steps dense. Defaults to `10`. |
+| `dense_layers` | index selector, e.g. `"0,1"` or `"3-5"` | DiT blocks that always stay dense. Defaults to `"0,1"`. |
+| `kv_splits` | `auto` or `>= 1` | Number of KV splits used by the kernel. Defaults to `auto`. |
+
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --diffusion-attention-config '{"default": {"backend": "SOL_ATTN",
+      "sol_attn": {"tau": 1.0, "thresh_type": "diag", "sink_tokens": 951,
+                   "dense_steps": 10, "dense_layers": "0,1", "kv_splits": "auto"}}}'
+```
+
+For MiniMax-H3 the recommended starting point is the config above
+(`sink_tokens` covers the packed text/audio prefix; the first 10 of 20+
+denoise steps stay dense). Raise `tau` or cut `dense_steps` for more speed at
+the cost of fidelity — each step of `tau` costs several dB of PSNR on H3.
+
+Programmatically the same block is a typed `SolAttnSpec` (values validated at
+construction):
+
+```python
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, SolAttnSpec
+
+AttentionConfig(
+    default=AttentionSpec(
+        backend="SOL_ATTN",
+        sol_attn=SolAttnSpec(tau=1.0, sink_tokens=951, dense_steps=10),
+    ),
+)
+```
+
+`SOL_ATTN` is incompatible with ring sequence parallelism, since the kernel
+needs the whole key sequence to route blocks — use Ulysses SP
+(`ring_degree=1`, e.g. `--usp 4` on the four-GPU MiniMax-H3 profile).

@@ -304,6 +304,25 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "TRTLLM_ATTN was explicitly selected, but the installed FlashInfer build does not "
                         "provide trtllm_ragged_attention_deepseek. Install a compatible build."
                     )
+            if backend_upper == "SOL_ATTN":
+                if head_size != 128:
+                    raise ValueError(
+                        "SOL_ATTN diffusion attention backend requires head_dim=128 "
+                        f"(MiniMax-H3's attention head dim), got {head_size}. Select a "
+                        "different --diffusion-attention-backend."
+                    )
+                try:
+                    importlib.import_module("sol_attn")
+                except ImportError as e:
+                    raise ImportError(
+                        "Sol-Attn backend is not installed. Install it with "
+                        "`pip install git+https://github.com/NVlabs/Sana.git@sol-engine"
+                        "#subdirectory=techniques/sparse_backends`."
+                    ) from e
+                logger.info(
+                    "Using Sol-Attn diffusion attention backend (head_dim=%d, BF16 activations)",
+                    head_size,
+                )
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()

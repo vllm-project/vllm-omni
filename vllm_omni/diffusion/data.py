@@ -2374,6 +2374,49 @@ class BlockSparseSpec:
 
 
 @dataclass
+class SolAttnSpec:
+    """User-facing controls for the Sol-Attn sparse attention backend.
+
+    ``tau`` scales the routing threshold (higher selects fewer exact KV
+    blocks), ``thresh_type`` is ``diag`` (approximate diagonal routing) or
+    ``exact``, ``sink_tokens``/``sink_start`` pin an exact-KV prefix such as
+    the text/audio rows of a packed layout, ``dense_steps`` keeps the first N
+    denoise steps dense, ``dense_layers`` exempts individual DiT blocks, and
+    ``kv_splits`` sets the number of KV splits used by the kernel.
+    """
+
+    tau: float = 1.0
+    thresh_type: str = "diag"
+    sink_tokens: int = 0
+    sink_start: int | None = 0
+    dense_steps: int = 10
+    dense_layers: str | int = "0,1"
+    kv_splits: int | str = "auto"
+
+    _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
+
+    def __post_init__(self) -> None:
+        self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
+        if self.thresh_type not in self._VALID_THRESH_TYPES:
+            raise ValueError(
+                f"sol_attn.thresh_type={self.thresh_type!r} unsupported; use one of {sorted(self._VALID_THRESH_TYPES)}."
+            )
+        if self.sink_tokens < 0:
+            raise ValueError(f"sol_attn.sink_tokens must be >= 0; got {self.sink_tokens!r}.")
+        if self.sink_start is not None and self.sink_start < 0:
+            raise ValueError(f"sol_attn.sink_start must be >= 0 or None; got {self.sink_start!r}.")
+        if self.dense_steps < 0:
+            raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
+        if isinstance(self.kv_splits, int):
+            if self.kv_splits < 1:
+                raise ValueError(f"sol_attn.kv_splits must be >= 1; got {self.kv_splits!r}.")
+        elif isinstance(self.kv_splits, str) and self.kv_splits.lower() == "auto":
+            self.kv_splits = "auto"
+        else:
+            raise ValueError(f"sol_attn.kv_splits must be an int or 'auto'; got {self.kv_splits!r}.")
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2385,6 +2428,7 @@ class AttentionSpec:
     fastvideo_vsa_precision: str = "bf16"
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
+    sol_attn: SolAttnSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2394,6 +2438,7 @@ class AttentionSpec:
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sol_attn = self._coerce(self.sol_attn, SolAttnSpec, "sol_attn")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2432,6 +2477,11 @@ class AttentionSpec:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
+        if self.sol_attn is not None and self.backend.upper() != "SOL_ATTN":
+            raise ValueError(
+                f"sol_attn is only supported by the SOL_ATTN backend, but backend={self.backend!r}. "
+                "Remove sol_attn or set backend to SOL_ATTN."
             )
 
     @staticmethod
@@ -2489,7 +2539,17 @@ class AttentionSpec:
             kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
-
+        if self.sol_attn is not None:
+            s = self.sol_attn
+            kw["sol_attn"] = {
+                "tau": s.tau,
+                "thresh_type": s.thresh_type,
+                "sink_tokens": s.sink_tokens,
+                "sink_start": s.sink_start,
+                "dense_steps": s.dense_steps,
+                "dense_layers": s.dense_layers,
+                "kv_splits": s.kv_splits,
+            }
         return kw or None
 
 
