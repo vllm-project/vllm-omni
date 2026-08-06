@@ -421,8 +421,13 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
 
     runtime_cfg = stage_config.runtime
     engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
-    final_output: bool = stage_config.final_output
-    final_output_type: str | None = stage_config.final_output_type
+    # [PD] Legacy `stage_args:` YAMLs stay raw DictConfig -- they never pass through
+    # StageDeployConfig, so dataclass defaults are NOT applied and a direct attribute
+    # read raises on any omitted field. 0.24 read these with getattr defaults;
+    # restored here so legacy configs keep loading (the PD topology YAMLs are the
+    # only remaining stage_args users in-tree).
+    final_output: bool = _get_attr_or_item(stage_config, "final_output", False)
+    final_output_type: str | None = _get_attr_or_item(stage_config, "final_output_type", None)
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     # A pooling stage carries its task via default_pooling_params, set where the
@@ -484,7 +489,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         )
 
     engine_output_type = engine_args.get("engine_output_type")
-    is_comprehension = stage_config.is_comprehension
+    is_comprehension = _get_attr_or_item(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
 
     return StageMetadata(

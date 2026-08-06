@@ -44,6 +44,8 @@ stage_args:
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25201
     final_output: false
+    # vLLM-Omni 0.26 reads stage_config.final_output_type directly
+    final_output_type: null
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -94,6 +96,8 @@ stage_args:
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25202
     final_output: false
+    # vLLM-Omni 0.26 reads stage_config.final_output_type directly
+    final_output_type: null
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -144,6 +148,8 @@ stage_args:
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25203
     final_output: false
+    # vLLM-Omni 0.26 reads stage_config.final_output_type directly
+    final_output_type: null
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -198,6 +204,8 @@ stage_args:
     # [yurain] decode reads KV from all prefills (routed by orchestrator)
     engine_input_source: [0, 1, 2]
     final_output: false
+    # vLLM-Omni 0.26 reads stage_config.final_output_type directly
+    final_output_type: null
     output_connectors:
       to_stage_4:
         name: SharedMemoryConnector
