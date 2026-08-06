@@ -5,6 +5,9 @@ path. The same configuration entrypoint is used across diffusion-only models,
 multi-stage omni/TTS models, and multi-stage diffusion models, but each model
 type has a different quantization scope.
 
+For the internal architecture and backend extension points, see the
+[quantization design document](../../design/feature/quantization.md).
+
 ## Quantization Modes
 
 | Mode | Guide | Description | Methods |

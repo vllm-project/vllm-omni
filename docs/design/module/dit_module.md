@@ -252,8 +252,7 @@ while True:
   batch of compatible independent requests for one full pipeline forward when
   the pipeline supports request-level batching; the step-wise path can also
   admit or remove compatible requests between denoise steps. See
-  [Request-Level Batching](../feature/diffusion_request_level_batching.md) and
-  [Continuous Batching for Step-Wise Diffusion](../feature/diffusion_continuous_batching.md).
+  [Diffusion Continuous Batching](../feature/diffusion_continuous_batching.md).
 
 ---
 
@@ -540,7 +539,7 @@ def get_attn_backend_for_role(role, head_size, attention_config=None, role_categ
 
 4. **Platform default** — `current_omni_platform.get_diffusion_attn_backend_cls(...)` picks the best-available kernel for the hardware.
 
-A backend that needs configuration exposes it as a typed field on `AttentionSpec`; `AttentionSpec.backend_kwargs()` serializes it into the `backend_kwargs` the impl consumes. Today the only such field is `skip_softmax` (TRTLLM_ATTN), so e.g. `target_sparsity` can be set without changing model code.
+A backend that needs configuration exposes it as a typed field on `AttentionSpec`; `AttentionSpec.backend_kwargs()` serializes it into the `backend_kwargs` the impl consumes. Today those fields are `skip_softmax` (TRTLLM_ATTN) and `block_sparse` (any block-sparse backend, currently RAINFUSION_ATTN), so e.g. `target_sparsity` or `sparsity` can be set without changing model code.
 
 For the user-facing CLI surface, see [Diffusion Attention Backends](../../user_guide/diffusion/attention_backends.md). For the role declaration contract on the model side, see [Adding a Diffusion Model](../../contributing/model/adding_diffusion_model.md).
 

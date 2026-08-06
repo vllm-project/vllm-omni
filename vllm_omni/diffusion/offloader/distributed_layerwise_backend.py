@@ -219,6 +219,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             weights_with_local = []
             for name, t in name2weights.items():
                 local_t = t.to_local() if hasattr(t, "to_local") else t
+                mmap_transform = getattr(t, "mmap_weight_transform", None)
+                if callable(mmap_transform) and getattr(t, "mmap_weight_transform_pending", False):
+                    # Some checkpoints use a layout that is converted by the
+                    # regular weight loader (for example MiniMax-H3 grouped
+                    # QKV).  Apply that conversion one block at a time while
+                    # copying the rank-local CPU shard.  Keeping the raw
+                    # parameter as an mmap view avoids a private full-model
+                    # copy in every worker.
+                    local_t = mmap_transform(local_t)
                 weights_with_local.append((name, t, local_t))
 
             total_numel = sum(local.numel() for _, _, local in weights_with_local)
@@ -330,7 +339,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
                 for dtype, local_shard in gpu_shards.items():
-                    gw = gpu_weights[dtype]
+                    # Slice the shared (max-sized) output buffer down to this
+                    # block's actual AllGather output size. The buffers are
+                    # sized to the *largest* block across all groups, so for any
+                    # smaller block the full buffer would violate the
+                    # all_gather_into_tensor contract
+                    # (output.numel() == world_size * input.numel()).
+                    # Repoint offsets are relative to the block's flattened
+                    # buffer, so a prefix slice is safe.
+                    gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
                     torch.distributed.all_gather_into_tensor(
                         gw,
                         local_shard,
@@ -477,6 +494,111 @@ def remove_distributed_block_hook(module: nn.Module) -> None:
         logger.debug("Removed distributed offload hook from %s", module.__class__.__name__)
 
 
+class PinnedResidentLayerGroup:
+    """Keep selected layers in pinned host memory between requests.
+
+
+    TODO(offload): Extract this alongside PinnedModuleStager after the
+    distributed shard-and-pin operation becomes a shared storage primitive.
+    It currently remains here because it depends on DLO's local-shard layout.
+    Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
+    pinned CPU master copy and never copies generated device weights back to
+    host.  Entering the denoise stage performs one asynchronous H2D pass;
+    leaving it only restores zero-sized placeholders and releases the device
+    buffers.  This lets the following VAE stage reuse the same HBM.
+
+    The resident path is intentionally local-shard only.  With tensor
+    parallelism, the regular model loader has already produced each rank's TP
+    shard, so no DP AllGather is required or desirable here.
+    """
+
+    def __init__(
+        self,
+        blocks: list[nn.Module],
+        device: torch.device,
+        copy_stream: Any,
+        pin_memory: bool,
+    ) -> None:
+        self.device = device
+        self.copy_stream = copy_stream
+        self.loaded = False
+        self._states: list[dict[str, Any]] = []
+        self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+
+        for block in blocks:
+            params = dict(block.named_parameters())
+            bufs = dict(block.named_buffers())
+            targets: dict[str, torch.Tensor] = {**params, **bufs}
+            cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+                params,
+                bufs,
+                dp_size=1,
+                rank=0,
+                pin_memory=pin_memory,
+            )
+            self._states.append(
+                {
+                    "targets": targets,
+                    "cpu_shards": cpu_shards,
+                    "metadata": metadata,
+                }
+            )
+
+    def load(self) -> None:
+        if self.loaded:
+            return
+
+        # Allocate on the compute stream so the caching allocator can reuse
+        # blocks released by the encoder stage.  Allocating on the copy stream
+        # would create a separate stream-local pool and inflate peak HBM.
+        gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+        for state in self._states:
+            block_buffers: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, cpu_shard in state["cpu_shards"].items():
+                block_buffers[dtype] = torch.empty(
+                    cpu_shard.shape,
+                    dtype=dtype,
+                    device=self.device,
+                )
+            gpu_buffers.append(block_buffers)
+
+        self.copy_stream.wait_stream(current_omni_platform.current_stream())
+        ready = current_omni_platform.Event()
+        with current_omni_platform.stream(self.copy_stream):
+            for state, block_buffers in zip(self._states, gpu_buffers):
+                for dtype, cpu_shard in state["cpu_shards"].items():
+                    block_buffers[dtype].copy_(cpu_shard, non_blocking=True)
+            ready.record(self.copy_stream)
+
+        for state, block_buffers in zip(self._states, gpu_buffers):
+            targets = state["targets"]
+            for dtype, metas in state["metadata"].items():
+                gpu_buffer = block_buffers[dtype]
+                for meta in metas:
+                    set_tensor_storage(
+                        targets[meta["name"]],
+                        gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]].view(meta["shape"]),
+                    )
+
+        current_omni_platform.current_stream().wait_event(ready)
+        self._gpu_buffers = gpu_buffers
+        self.loaded = True
+
+    def offload(self) -> None:
+        if not self.loaded:
+            return
+
+        # Denoise kernels consume these buffers on the current compute stream.
+        # Synchronize once at the stage boundary; no D2H copy is necessary
+        # because the pinned CPU master weights were never overwritten.
+        current_omni_platform.synchronize()
+        for state in self._states:
+            for target in state["targets"].values():
+                set_tensor_storage(target, make_offload_placeholder(target))
+        self._gpu_buffers.clear()
+        self.loaded = False
+
+
 # ---------------------------------------------------------------------- #
 #  Backend                                                                #
 # ---------------------------------------------------------------------- #
@@ -494,6 +616,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     overlapped with computation.
     """
 
+    _MMAP_PARAM_ATTRS = ("weight_loader", "mmap_weight_transform")
+
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
 
@@ -504,6 +628,41 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
+        self._resident_blocks: list[nn.Module] = []
+        self._resident_layer_group: PinnedResidentLayerGroup | None = None
+
+    def load_resident_layers(self) -> None:
+        """Load the model-declared leading blocks for the denoise stage."""
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.load()
+
+    def offload_resident_layers(self) -> None:
+        """Release leading blocks before VAE decode to bound peak HBM."""
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.offload()
+
+    def _remember_mmap_param_attrs(self, pipeline: nn.Module) -> None:
+        """Save loader metadata before ``to_empty`` replaces Parameters."""
+        self._mmap_param_attrs = {
+            name: {attr: value for attr in self._MMAP_PARAM_ATTRS if (value := getattr(param, attr, None)) is not None}
+            for name, param in pipeline.named_parameters()
+        }
+
+    def _attach_mmap_param_attrs(
+        self,
+        name: str,
+        replacement: nn.Parameter,
+        source: nn.Parameter | None = None,
+    ) -> None:
+        attrs = getattr(self, "_mmap_param_attrs", {}).get(name, {})
+        for attr in self._MMAP_PARAM_ATTRS:
+            value = attrs.get(attr)
+            if value is None and source is not None:
+                value = getattr(source, attr, None)
+            if value is not None:
+                setattr(replacement, attr, value)
+                if attr == "mmap_weight_transform":
+                    replacement.mmap_weight_transform_pending = True
 
     def _load_weights_via_mmap(self, pipeline: nn.Module, modules) -> None:
         """Load DiT weights from safetensors via mmap views (no RSS).
@@ -605,6 +764,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 "callbacks are bypassed by the mmap path. Use DP or SP "
                 "instead of TP, or disable distributed layerwise offload."
             )
+
+        # ``Module.to_empty`` creates new Parameter objects and drops custom
+        # attributes installed by vLLM weight loaders.  Preserve them by full
+        # pipeline name so mmap replacements can reproduce checkpoint layout
+        # transforms such as MiniMax-H3 grouped QKV.
+        self._remember_mmap_param_attrs(pipeline)
 
         #
         # Important: when DiT modules are nested (e.g. transformer contains
@@ -730,7 +895,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     parent = parent[int(part)]
                 else:
                     parent = getattr(parent, part)
-            parent._parameters[parts[-1]] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+            replacement = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+            self._attach_mmap_param_attrs(name, replacement, param)
+            parent._parameters[parts[-1]] = replacement
             loaded += 1
             loaded_names.add(name)
 
@@ -785,7 +952,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                             parent = parent[int(part)]
                         else:
                             parent = getattr(parent, part)
-                    parent._parameters[bparts[-1]] = torch.nn.Parameter(tensor, requires_grad=bparam.requires_grad)
+                    replacement = torch.nn.Parameter(tensor, requires_grad=bparam.requires_grad)
+                    self._attach_mmap_param_attrs(full_param_name, replacement, bparam)
+                    parent._parameters[bparts[-1]] = replacement
                     block_loaded += 1
                     loaded_names.add(full_param_name)
 
@@ -896,7 +1065,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     parent = parent[int(part)]
                 else:
                     parent = getattr(parent, part)
-            parent._parameters[parts[-1]] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+            replacement = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+            self._attach_mmap_param_attrs(full_name, replacement, param)
+            parent._parameters[parts[-1]] = replacement
             loaded += 1
 
         if loaded > 0:
@@ -954,24 +1125,74 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             coord.ranks,
         )
 
-    def _register_on_demand_hook(self, module: nn.Module, label: str) -> None:
-        """Move *module* to GPU permanently.
+    def _register_on_demand_hook(self, module: nn.Module, label: str, *, stage_on_demand: bool = False) -> None:
+        """Prepare a pipeline-managed stage component or keep it resident.
 
-        Previously, on-demand hooks moved the module to GPU before forward
-        and back to CPU after forward (with synchronize + empty_cache).
-        However, _post_forward's global synchronize() and empty_cache()
-        disrupt the async prefetch pipeline (copy_stream / comm_stream)
-        used by distributed layerwise offload, causing garbled output.
-
-        Moving the module to GPU permanently avoids this issue at the
-        cost of slightly higher HBM usage (VAE/encoders are small).
+        Components that expose an explicit stage lifecycle are initially
+        offloaded and loaded by their pipeline only around encode/decode.
+        Other models retain the conservative resident behavior because a
+        generic post-forward hook can disrupt the DiT prefetch streams.
         """
+        offload_to_cpu = getattr(module, "offload_to_cpu", None)
+        if stage_on_demand and callable(offload_to_cpu):
+            offload_to_cpu()
+            logger.info("Prepared %s (%s) for pipeline-managed staged offload", label, module.__class__.__name__)
+            return
         module.to(self.device)
         logger.info("Moved %s (%s) to GPU (resident)", label, module.__class__.__name__)
 
+    def _try_layerwise_offload_encoder(self, module: nn.Module, name: str, plan: OffloadPlan | None) -> bool:
+        """Stream plan-declared encoder blocks on each rank without AllGather."""
+        if plan is None or name not in plan.encoder_block_attrs:
+            return False
+        if getattr(module, "_omni_layerwise_enabled", False):
+            return True
+
+        from operator import attrgetter
+
+        from vllm_omni.diffusion.offloader.layerwise_backend import apply_block_hook
+
+        hooks = []
+        block_groups = []
+        copy_stream = current_omni_platform.Stream()
+        for block_path in plan.encoder_block_attrs[name]:
+            try:
+                blocks = attrgetter(block_path)(module)
+            except AttributeError:
+                logger.warning("Encoder offload path %s.%s was not found", name, block_path)
+                continue
+            if not isinstance(blocks, nn.ModuleList) or len(blocks) <= 1:
+                logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
+                continue
+            group_hooks = [
+                apply_block_hook(blocks[-1], blocks[0], self.device, copy_stream, self.config.pin_cpu_memory)
+            ]
+            group_hooks.extend(
+                apply_block_hook(block, blocks[index + 1], self.device, copy_stream, self.config.pin_cpu_memory)
+                for index, block in enumerate(blocks[:-1])
+            )
+            for index, hook in enumerate(group_hooks):
+                hook._prev_hook = group_hooks[index - 1]
+            hooks.extend(group_hooks)
+            block_groups.append(blocks)
+
+        if not hooks:
+            return False
+        # The component lifecycle uses these generic attributes to keep only
+        # non-block encoder state resident during the encode phase.
+        module._omni_layerwise_hooks = hooks
+        module._omni_layerwise_block_groups = block_groups
+        module._omni_layerwise_enabled = True
+        logger.info(
+            "Enabled rank-local layerwise offload for encoder %s (%d blocks across %d stacks)",
+            name,
+            sum(len(blocks) for blocks in block_groups),
+            len(block_groups),
+        )
+        return True
+
     def _try_layerwise_offload_submodule(self, module: nn.Module, name: str, plan: OffloadPlan | None = None) -> bool:
         """Try to apply layerwise offload to a large submodule's blocks.
-
         Resolution order:
         1. OffloadPlan.offload_submodules (declarative, if plan is provided)
         2. Heuristic search for common block-list attributes
@@ -1081,6 +1302,78 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._blocks.append(blocks)
         return True
 
+    def _prepare_dit_non_block_modules(
+        self,
+        dit_module: nn.Module,
+        dit_name: str,
+        blocks_attr_names: list[str],
+        all_dit_modules: set[int],
+        plan: OffloadPlan | None,
+    ) -> None:
+        """Place or hook the DiT parts that are outside its repeated blocks.
+
+        This must run even when every repeated block is resident.  Otherwise
+        an all-resident stage skips placement for modules such as H3's token
+        refiner and enters the forward pass with CPU or meta tensors.
+        """
+        _ON_DEMAND_THRESHOLD = _ON_DEMAND_THRESHOLD_MB
+        for name, module in dit_module.named_children():
+            if name in blocks_attr_names:
+                logger.debug("Skipped blocks module %s", name)
+                continue
+
+            has_meta = any(getattr(param, "is_meta", False) for param in module.parameters())
+            if has_meta:
+                self._load_module_weights_from_mmap(module, dit_name, name)
+            module_mb = (
+                sum(
+                    param.nelement() * param.element_size() if not getattr(param, "is_meta", False) else 0
+                    for param in module.parameters()
+                )
+                / 1048576
+            )
+            explicitly_planned = plan is not None and name in plan.offload_submodules
+            if explicitly_planned or module_mb > _ON_DEMAND_THRESHOLD:
+                if id(module) in all_dit_modules:
+                    logger.info("Submodule '%s' is already a DiT module, skipping layerwise offload", name)
+                elif self._try_layerwise_offload_submodule(module, name, plan):
+                    pass
+                else:
+                    self._register_on_demand_hook(module, name)
+                continue
+
+            try:
+                module.to(self.device)
+            except (NotImplementedError, RuntimeError):
+                self._load_module_weights_from_mmap(module, dit_name, name)
+                # Non-persistent buffers such as RoPE frequencies do not
+                # exist in the checkpoint and must be reconstructed.
+                has_meta_buffer = any(getattr(buffer, "is_meta", False) for buffer in module.buffers(recurse=True))
+                if has_meta_buffer:
+                    saved_params = {
+                        param_name: param.data.clone()
+                        for param_name, param in module.named_parameters()
+                        if not getattr(param, "is_meta", False)
+                    }
+                    module.to_empty(device=self.device)
+                    for submodule in module.modules():
+                        if hasattr(submodule, "reset_parameters"):
+                            submodule.reset_parameters()
+                    for param_name, param in module.named_parameters():
+                        if param_name in saved_params:
+                            param.data.copy_(saved_params[param_name])
+                try:
+                    module.to(self.device)
+                except Exception:
+                    logger.warning("Module %s still has meta params after mmap load", name)
+
+        for param in dit_module._parameters.values():
+            if param is not None and not getattr(param, "is_meta", False):
+                param.data = param.data.to(self.device, non_blocking=True)
+        for buffer in dit_module._buffers.values():
+            if buffer is not None:
+                buffer.data = buffer.data.to(self.device, non_blocking=True)
+
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
@@ -1102,7 +1395,19 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # When present, replaces heuristic block discovery.
         plan = get_offload_plan(pipeline)
 
+        if self.config.dlo_resident_layers and (plan is None or not plan.resident_dit_paths):
+            logger.warning(
+                "dlo_resident_layers=%d was requested, but this model declares no "
+                "resident_dit_paths; all blocks will be streamed.",
+                self.config.dlo_resident_layers,
+            )
+
         # Load weights via mmap for DLO+AllGather.
+        # TODO(offload): Add a rank-local mmap path for dlo_no_use_allgather.
+        # It must apply declarative checkpoint-to-runtime adapters before the
+        # standard TP loader shards each block, and must cover staged encoders
+        # and VAEs as well as DiT blocks. The current AllGather mmap path is
+        # deliberately not reused because it changes the weight layout.
         # Gate condition MUST match diffusers_loader.py:
         #   supports_mmap_loading(pipeline) and not _has_online_quant
         # When the gate is False, the loader has already loaded weights via
@@ -1129,10 +1434,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
         # during the DiT forward pass.  They are only needed briefly for
         # text-encoding (before DiT) and VAE-decode (after DiT).
-        for enc in modules.encoders:
-            self._register_on_demand_hook(enc, "encoder")
-        for vae in modules.vaes:
-            self._register_on_demand_hook(vae, "vae")
+        for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+            self._try_layerwise_offload_encoder(enc, enc_name, plan)
+            self._register_on_demand_hook(
+                enc, "encoder", stage_on_demand=plan is not None and enc_name in plan.on_demand_component_paths
+            )
+        for vae, vae_name in zip(modules.vaes, modules.vae_names):
+            self._register_on_demand_hook(
+                vae,
+                "vae",
+                stage_on_demand=(plan is not None and vae_name in plan.on_demand_component_paths),
+            )
 
         # Move resident modules to GPU (small modules needed every forward)
         for name, module in zip(modules.resident_names, modules.resident_modules):
@@ -1163,92 +1475,40 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
+            resident_count = 0
+            if plan is not None and dit_name in plan.resident_dit_paths:
+                resident_count = min(self.config.dlo_resident_layers, len(blocks))
+            if resident_count:
+                resident_blocks = blocks[:resident_count]
+                self._resident_blocks.extend(resident_blocks)
+                blocks = blocks[resident_count:]
+                logger.info(
+                    "Keeping %d leading blocks resident on %s; streaming %d tail blocks",
+                    resident_count,
+                    dit_name,
+                    len(blocks),
+                )
+
+            self._prepare_dit_non_block_modules(
+                dit_module,
+                dit_name,
+                blocks_attr_names,
+                all_dit_modules,
+                plan,
+            )
+
             num_blocks = len(blocks)
+            if num_blocks == 0:
+                logger.info("All blocks for %s are resident; no streaming hooks required", dit_name)
+                continue
             if num_blocks <= 1:
                 logger.warning(
-                    "#Target layers (blocks) <= 1. Skipping offloading on %s (%s)",
+                    "#Streaming target layers (blocks) <= 1. Keeping the final block resident on %s (%s)",
                     dit_name,
                     dit_module.__class__.__name__,
                 )
-                dit_module.to(self.device)
+                self._resident_blocks.extend(blocks)
                 continue
-
-            # Move non-block modules to GPU (they stay resident).
-            # Large modules (> 1 GB) use on-demand hooks instead — they are
-            # only needed briefly (e.g. language_model for text encoding)
-            # and keeping them resident wastes HBM during the DiT loop.
-            _ON_DEMAND_THRESHOLD = _ON_DEMAND_THRESHOLD_MB  # alias for readability
-            for name, m in dit_module.named_children():
-                if name not in blocks_attr_names:
-                    _has_meta = any((p.is_meta if hasattr(p, "is_meta") else False) for p in m.parameters())
-                    if _has_meta:
-                        # Meta params: load from safetensors before moving to GPU
-                        self._load_module_weights_from_mmap(m, dit_name, name)
-                    _mb = (
-                        sum(
-                            (p.nelement() * p.element_size() if not (hasattr(p, "is_meta") and p.is_meta) else 0)
-                            for p in m.parameters()
-                        )
-                        / 1048576
-                    )
-                    if _mb > _ON_DEMAND_THRESHOLD:
-                        # Skip if this submodule is already a separate DiT
-                        # module (e.g. transformer.language_model when both
-                        # "transformer.language_model" and "transformer" are
-                        # in _dit_modules) — hooks already applied.
-                        if id(m) in all_dit_modules:
-                            logger.info("Submodule '%s' is already a DiT module, skipping layerwise offload", name)
-                        elif self._try_layerwise_offload_submodule(m, name, plan):
-                            pass  # layerwise hooks applied
-                        else:
-                            self._register_on_demand_hook(m, name)
-                    else:
-                        try:
-                            m.to(self.device)
-                        except (NotImplementedError, RuntimeError):
-                            # Meta params: load from safetensors via mmap, then move to GPU
-                            self._load_module_weights_from_mmap(m, dit_name, name)
-                            # Materialize any remaining meta buffers (e.g. RoPE
-                            # inv_freq, timestep freqs) on device and
-                            # recompute them from their original formulas.
-                            # These are non-persistent buffers not present in
-                            # the checkpoint — they must be reconstructed, not
-                            # left as torch.empty.
-                            # NOTE: Do NOT call reset_parameters() here — it
-                            # would re-initialize ALL parameters (including
-                            # mmap-loaded weights) with random values.
-                            _has_meta_buf = any(hasattr(b, "is_meta") and b.is_meta for b in m.buffers(recurse=True))
-                            if _has_meta_buf:
-                                # Save mmap-loaded param values before
-                                # reset_parameters (which re-initializes
-                                # ALL params with random values).
-                                saved_params = {
-                                    n: p.data.clone()
-                                    for n, p in m.named_parameters()
-                                    if not (hasattr(p, "is_meta") and p.is_meta)
-                                }
-                                m.to_empty(device=self.device)
-                                for submod in m.modules():
-                                    if hasattr(submod, "reset_parameters"):
-                                        submod.reset_parameters()
-                                # Restore mmap-loaded weights
-                                for n, p in m.named_parameters():
-                                    if n in saved_params:
-                                        p.data.copy_(saved_params[n])
-                            try:
-                                m.to(self.device)
-                            except Exception:
-                                logger.warning("Module %s still has meta params after mmap load", name)
-                else:
-                    logger.debug(f"Skipped blocks module {name}")
-
-            # Move top-level params/buffers to GPU
-            for param in dit_module._parameters.values():
-                if param is not None and not (hasattr(param, "is_meta") and param.is_meta):
-                    param.data = param.data.to(self.device, non_blocking=True)
-            for buffer in dit_module._buffers.values():
-                if buffer is not None:
-                    buffer.data = buffer.data.to(self.device, non_blocking=True)
 
             # Register hooks in a circular sliding window:
             # last block prefetches first block, block i prefetches block (i+1)
@@ -1306,7 +1566,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._all_hook_groups.append(block_hooks)
             self._blocks.append(blocks)
 
+        if self._resident_blocks:
+            self._resident_layer_group = PinnedResidentLayerGroup(
+                self._resident_blocks,
+                self.device,
+                self.copy_stream,
+                self.config.pin_cpu_memory,
+            )
+            pipeline._dlo_residency_controller = self
+
         if not self._all_hook_groups:
+            self.enabled = bool(self._resident_blocks)
             return
 
         # Unified allocation: 2 shared output buffers + 2 shared shard buffers
@@ -1416,8 +1686,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._on_demand_handles = []
         self._on_demand_shard_infos = []
 
+        self.offload_resident_layers()
         self._blocks.clear()
         self._all_hook_groups.clear()
+        self._resident_blocks.clear()
+        self._resident_layer_group = None
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
 

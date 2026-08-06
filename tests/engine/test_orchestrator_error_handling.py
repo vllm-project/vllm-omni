@@ -83,7 +83,11 @@ class FakeDeadLLMStageClient(FakeStageClient):
 
     async def get_output_async(self):
         if not self.add_request_calls:
-            return SimpleNamespace(outputs=[])
+            return SimpleNamespace(
+                outputs=[],
+                scheduler_stats=None,
+                finished_requests=None,
+            )
         raise EngineDeadError("Stage-0 engine core is dead")
 
 

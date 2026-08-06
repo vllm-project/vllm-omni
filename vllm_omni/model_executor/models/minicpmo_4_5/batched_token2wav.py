@@ -60,9 +60,12 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(self, token2wav: Any, trt_stepper: Any | None = None):
         super().__init__()
         self._token2wav = token2wav
+        # Optional TrtDiTStepper (step_audio2_dit_trt): replaces only the
+        # per-timestep DiT estimator call; encoder and HiFT stay on torch.
+        self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         hift_parameter = next(self.hift.parameters(), None)
@@ -200,6 +203,17 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._trt_stepper is not None:
+            out, new_cnn, new_att = self._trt_stepper.step(
+                x=x,
+                mu=mu,
+                t=time,
+                spks=speakers,
+                cond=cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+            return out.to(mu.dtype), new_cnn, new_att
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)

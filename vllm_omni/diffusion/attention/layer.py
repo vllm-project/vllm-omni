@@ -89,6 +89,15 @@ class Attention(nn.Module):
             role_category=role_category,
             allow_trtllm_default=allow_trtllm_default,
         )
+        parallel_config = getattr(config, "parallel_config", None)
+        allgather_degree = getattr(parallel_config, "allgather_degree", 1)
+        # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
+        # so validation does not depend on backend names.
+        if not skip_sequence_parallel and allgather_degree > 1 and attn_backend_cls.get_name() == "TRTLLM_ATTN":
+            raise ValueError(
+                "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
+                "Set --allgather-degree 1 or select another diffusion attention backend."
+            )
         if spec is not None:
             backend_kwargs = spec.backend_kwargs()
             self.backend_pref = spec.backend
@@ -107,6 +116,7 @@ class Attention(nn.Module):
             qkv_layout=qkv_layout,
             prefix=prefix,
             backend_kwargs=backend_kwargs,
+            role=role,
         )
         # Instantiate fallback backend for float32 support
         self.sdpa_fallback = SDPABackend.get_impl_cls()(

@@ -16,15 +16,15 @@
 /.claude/ @hsliuustc0106
 
 # Tests
-/tests/ @yenuo26
+/tests/ @yenuo26 @NickCao
 
 # CI
-/.buildkite/ @yenuo26 @congw729
+/.buildkite/ @yenuo26 @congw729 @NickCao
 
 # Engine and model_executor
 /vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307
 /vllm_omni/engine/ @tzhouam @yinpeiqi @fake0fan @Sy0307
-/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan @alex-jw-brooks
+/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan @alex-jw-brooks @NickCao
 /vllm_omni/model_executor/ @tzhouam @gcanlin
 /vllm_omni/worker/ @tzhouam @gcanlin
 
@@ -37,7 +37,7 @@
 
 # Omni and TTS support
 /vllm_omni/transformers_utils/ @tzhouam @yuanheng-zhao
-/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter @Sy0307 @gcanlin
+/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter @Sy0307 @gcanlin @NickCao
 
 # Benchmarks
 /benchmarks/accuracy/ @david6666666
