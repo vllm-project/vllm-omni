@@ -30,6 +30,42 @@ parallel, cache, quantized, or expert-kernel backends.
 - Related offline example: [`examples/offline_inference/text_to_video/text_to_video_lingbot.py`](../../examples/offline_inference/text_to_video/text_to_video_lingbot.py)
 - Related online video API docs: [`docs/serving/videos_api.md`](../../docs/serving/videos_api.md)
 
+## Prompt format
+
+LingBot-Video conditions its DiT on the structured caption used by its training
+data rather than on a free-form sentence. The upstream project keeps one caption
+per case in `assets/cases/t2v/<case>/prompt.json` and passes the `caption`
+sub-object to the pipeline as a compact JSON string:
+
+```python
+import json
+
+sample = json.loads(open("assets/cases/t2v/example_1/prompt.json").read())
+prompt = json.dumps(sample["caption"], ensure_ascii=False, separators=(",", ":"))
+```
+
+That caption object carries `comprehensive_description`
+(`scene_content_description` plus `camera_movement_description`), `camera_info`
+(`color`, `frame_size`, `shot_type_angle`, `lens_size`, `composition`,
+`lighting`, `lighting_type`), `world_knowledge`, and `prominent_elements`, where
+each element lists timestamped `actions`. Those timestamps describe the clip the
+caption was written for, so keep the request consistent with the sample's
+`duration`: `num_frames = duration * fps + 1`.
+
+`negative_prompt` follows the same convention. The pipeline default is itself a
+JSON string keyed by `universal_negative`, not prose, so pairing a free-form
+positive prompt with the default negative prompt asks classifier-free guidance
+to extrapolate between two different text distributions.
+
+The one-line prompts in the smoke commands below are deliberately trivial. At
+`192x320` / 9 frames / 2 steps the denoiser barely moves, so the caption format
+does not affect whether the run validates the plumbing. It does affect output
+quality once resolution, frame count, and step count approach the reference
+settings, on any vendor's hardware. Upstream issue
+<https://github.com/Robbyant/lingbot-video/issues/11> reports free-form prompts
+producing unusable video on NVIDIA GPUs. Start from an official caption whenever
+you evaluate quality rather than plumbing.
+
 ## Hardware Support
 
 This recipe documents the CUDA single-GPU dense and BF16 MoE checkpoint paths.
@@ -110,7 +146,8 @@ vllm serve robbyant/lingbot-video-moe-30b-a3b \
 
 These stage defaults match the LingBot reference pipeline. Request-level
 values continue to override them, so the smaller smoke request below remains
-unchanged.
+unchanged. Requests that do take these reference-scale defaults should also
+carry a structured caption, as described in [Prompt format](#prompt-format).
 
 When serving MoE, replace the request's `model` form value below with
 `robbyant/lingbot-video-moe-30b-a3b`.
@@ -150,13 +187,14 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o lingbot_t2v.mp4
 
 | Parameter | Suggested smoke value | Notes |
 |-----------|-----------------------|-------|
+| `prompt` | short sentence | A trivial sentence is enough for the smoke shape; quality runs need a structured caption, see [Prompt format](#prompt-format) |
 | `height` | `192` | Must be a multiple of 16 |
 | `width` | `320` | Must be a multiple of 16 |
 | `num_frames` | `9` | Must be `1` or `4n + 1`; this PR validates T2V with video outputs |
-| `num_inference_steps` | `2` | Use more steps for quality sweeps |
+| `num_inference_steps` | `2` | Use more steps for quality sweeps; those also need a structured caption, see [Prompt format](#prompt-format) |
 | `guidance_scale` | `3.0` | CFG is active when this is greater than `1.0` |
 | `flow_shift` | `3.0` | Scheduler flow-shift; aliases the pipeline's internal `shift` |
-| `negative_prompt` | model default | Optional text describing artifacts to avoid |
+| `negative_prompt` | model default | Structured JSON keyed by `universal_negative`; override it in that same shape, see [Prompt format](#prompt-format) |
 | `fps` | `24` | Output MP4 frame rate |
 
 ## Validation
