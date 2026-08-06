@@ -1090,7 +1090,7 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True, **kwargs: Any) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context with new num_inference_steps.
 
         This method updates the cache context when num_inference_steps changes
@@ -1101,8 +1101,6 @@ class CacheDiTBackend(CacheBackend):
             pipeline: The diffusion pipeline instance.
             num_inference_steps: New number of inference steps.
             verbose: Whether to log refresh operations.
-            **kwargs: Accepted and ignored for interface compatibility with other
-                cache backends (e.g., ``resume_from_step`` from inter-request cache).
         """
         if not self.enabled or self._refresh_func is None:
             logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")

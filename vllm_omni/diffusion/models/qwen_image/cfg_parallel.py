@@ -72,22 +72,20 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
-        step_latents_recorder = getattr(self, "_step_latents_recorder", None)
-
+        # Inter-request cache: seed latents from cache when resuming.
         if resume_from_step > 0 and resume_latents is not None:
             latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
             self.scheduler._step_index = resume_from_step
             self.scheduler.set_begin_index(resume_from_step)
-            logger.info(
-                "Resuming denoising from step %d/%d (timestep=%.1f)",
-                resume_from_step,
-                len(timesteps),
-                timesteps[resume_from_step].item() if resume_from_step < len(timesteps) else -1,
-            )
+        # Tell the step-recorder hook (if any) to skip the cached steps.
+        _recorder = getattr(self, "_step_latents_recorder", None)
+        if _recorder is not None:
+            _recorder.resume_from_step = resume_from_step
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
-                if i < resume_from_step:
+                # Step hooks: callbacks may skip this step (e.g. resume).
+                if not self.on_diffuse_step_begin(i, t):
                     pbar.update()
                     continue
                 if self.interrupt:
@@ -137,8 +135,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-                if step_latents_recorder is not None:
-                    step_latents_recorder.record(i, t.item(), latents)
+                self.on_diffuse_step_end(i, t, latents)
 
                 pbar.update()
 

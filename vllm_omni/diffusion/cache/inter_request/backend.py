@@ -158,6 +158,9 @@ class InterRequestCacheBackend(CacheBackend):
         self._pipeline = pipeline
         self.enabled = True
         self._recorder = StepLatentsRecorder()
+        # Register as a general-purpose denoising-step hook (see
+        # ProgressBarMixin). Kept also as an attribute for backwards compat.
+        pipeline.register_diffuse_step_hook(self._recorder)
         pipeline._step_latents_recorder = self._recorder
 
         if self._clip_model_path is not None:
@@ -382,15 +385,15 @@ class InterRequestCacheBackend(CacheBackend):
                 self._persistent_cache_dir,
             )
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True, **kwargs: Any) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         pass
 
-    def before_forward(self, is_dummy: bool = False) -> None:
+    def before_diffuse(self, is_dummy: bool = False) -> None:
         if self._recorder is not None and not is_dummy:
             self._recorder.clear()
             self._recorder.enable()
 
-    def after_forward(self, is_dummy: bool = False) -> None:
+    def after_diffuse(self, is_dummy: bool = False) -> None:
         """Reset the step-latents recorder after each forward pass."""
         if self._recorder is None or is_dummy:
             return
@@ -460,3 +463,117 @@ class InterRequestCacheBackend(CacheBackend):
 
     def clear(self) -> None:
         self._cache_store.clear()
+
+    # ------------------------------------------------------------------
+    # Cross-request polymorphic hooks (override CacheBackend no-ops).
+    # These encapsulate the runner logic so the runner can call every
+    # backend uniformly without isinstance() checks.
+    # ------------------------------------------------------------------
+    def short_circuit_requests(
+        self, reqs: list, target_device: Any
+    ) -> tuple[list, list]:
+        """Inspect requests before forward.
+
+        Returns (hit_outputs, remaining_reqs) where hit_outputs is a list of
+        (original_index, DiffusionOutput). Exact hits are short-circuited;
+        semantic hits set ``resume_from_step`` on the request for the pipeline.
+        """
+        if not self.enabled or self._pipeline is None:
+            return [], reqs
+
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        hit_outputs: list[tuple[int, Any]] = []
+        remaining_reqs: list = []
+        for idx, req in enumerate(reqs):
+            # Path A: resume from a cached step (set by a prior semantic hit).
+            resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+            if resume_from_step > 0:
+                step_latents_list = self.lookup_step_latents(req, target_device=target_device)
+                if step_latents_list is not None and len(step_latents_list) >= resume_from_step:
+                    resume_data = step_latents_list[resume_from_step - 1]
+                    req.sampling_params.resume_latents = resume_data.latent
+                    logger.info("Inter-request cache: resuming from step %d", resume_from_step)
+                else:
+                    req.sampling_params.resume_from_step = 0
+                remaining_reqs.append(req)
+                continue
+
+            # Path B: exact hit -> skip forward entirely.
+            cached_output = self.lookup(req, target_device=target_device)
+            if cached_output is not None:
+                logger.info("Inter-request cache HIT: skipping DiT computation entirely")
+                hit_outputs.append((idx, DiffusionOutput(output=cached_output)))
+                continue
+
+            # Path C: semantic hit -> set resume_from_step for partial skip.
+            if self.clip_enabled:
+                clip_result = self.semantic_lookup(req, target_device=target_device)
+                clip_latents, clip_step_latents, clip_sim, _, _ = clip_result
+                if clip_latents is not None and clip_step_latents is not None:
+                    total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
+                    clip_resume_step = self.compute_skip_steps(clip_sim, total_steps)
+                    if clip_resume_step > 0 and len(clip_step_latents) >= clip_resume_step:
+                        resume_data = clip_step_latents[clip_resume_step - 1]
+                        req.sampling_params.resume_latents = resume_data.latent
+                        req.sampling_params.resume_from_step = clip_resume_step
+                        logger.info(
+                            "CLIP semantic match: similarity=%.4f, resuming from step %d/%d",
+                            clip_sim, clip_resume_step, total_steps,
+                        )
+            remaining_reqs.append(req)
+        return hit_outputs, remaining_reqs
+
+    def post_forward_store(
+        self,
+        reqs: list,
+        outputs: list,
+        target_device: Any,
+        runner: Any,
+        is_dummy: bool = False,
+    ) -> list:
+        """Store computed outputs for future reuse; annotate outputs with cache hashes."""
+        if not self.enabled or self._pipeline is None:
+            return outputs
+        for req, output in zip(reqs, outputs):
+            if output.output is None or is_dummy:
+                continue
+            _resume = getattr(req.sampling_params, "resume_from_step", 0) or 0
+            if _resume > 0:
+                continue
+            step_latents_data = None
+            if self._recorder is not None and self._recorder.num_steps > 0:
+                step_latents_data = [
+                    StepLatentData(
+                        step_index=r.step_index,
+                        timestep=r.timestep,
+                        latent=r.latent,
+                    )
+                    for r in self._recorder.records
+                ]
+            cache_key_hash = self.store(req, output.output, step_latents=step_latents_data)
+            logger.info("STORE_DEBUG: hash=%s output_shape=%s", cache_key_hash,
+                        output.output.shape if hasattr(output.output, "shape") else "N/A")
+            if cache_key_hash is not None:
+                output.custom_output["cache_key_hash"] = cache_key_hash
+                if runner is not None and hasattr(runner, "_update_cache_image_embedding"):
+                    runner._update_cache_image_embedding(cache_key_hash, output.output)
+            logger.info("Inter-request cache: stored DiT output for future reuse")
+        return outputs
+
+    def merge_hit_outputs(
+        self, outputs: list, hit_outputs: list
+    ) -> list:
+        """Merge cache-hit outputs back into their original positions."""
+        if not hit_outputs:
+            return outputs
+        merged: list = []
+        computed_iter = iter(outputs)
+        hit_map = dict(hit_outputs)
+        total = max(max(hit_map.keys()) + 1, len(outputs) + len(hit_outputs))
+        for i in range(total):
+            if i in hit_map:
+                merged.append(hit_map[i])
+            else:
+                merged.append(next(computed_iter))
+        return merged

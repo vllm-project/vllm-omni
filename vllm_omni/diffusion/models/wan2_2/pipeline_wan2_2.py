@@ -460,20 +460,23 @@ class Wan22Pipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        # Inter-request cache: resume support
-        step_latents_recorder = getattr(self, "_step_latents_recorder", None)
+        # Inter-request cache: seed latents from cache when resuming.
         if resume_from_step > 0 and resume_latents is not None:
             latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
             self.scheduler._step_index = resume_from_step
             self.scheduler.set_begin_index(resume_from_step)
+        # Tell the step-recorder hook (if any) to skip the cached steps.
+        _recorder = getattr(self, "_step_latents_recorder", None)
+        if _recorder is not None:
+            _recorder.resume_from_step = resume_from_step
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
                 set_forward_context_denoise_step_idx(step_idx)
 
-                # Inter-request cache: skip already-computed steps
-                if step_idx < resume_from_step:
+                # Step hooks: callbacks may skip this step (e.g. resume).
+                if not self.on_diffuse_step_begin(step_idx, t):
                     pbar.update()
                     continue
 
@@ -551,8 +554,7 @@ class Wan22Pipeline(
                 )
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-                if step_latents_recorder is not None:
-                    step_latents_recorder.record(step_idx, t.item(), latents)
+                self.on_diffuse_step_end(step_idx, t, latents)
                 pbar.update()
 
         return latents

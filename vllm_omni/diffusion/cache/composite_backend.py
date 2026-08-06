@@ -43,7 +43,7 @@ class CompositeCacheBackend(InterRequestCacheBackend):
     Coordination logic:
     - enable(): enables cache_dit on transformer first, then inter_request recorder
     - refresh(): when resume_from_step > 0, tells cache_dit to use (total - resume) steps
-    - All other methods (lookup, store, before_forward, after_forward) inherit from
+    - All other methods (lookup, store, before_diffuse, after_diffuse) inherit from
       InterRequestCacheBackend unchanged - cache_dit operates automatically via
       transformer hooks.
     """
@@ -74,7 +74,6 @@ class CompositeCacheBackend(InterRequestCacheBackend):
         num_inference_steps: int,
         verbose: bool = True,
         resume_from_step: int = 0,
-        **kwargs: Any,
     ) -> None:
         """Refresh cache_dit context, adjusting for resume_from_step.
 

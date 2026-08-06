@@ -80,7 +80,6 @@ class CacheBackend(ABC):
         pipeline: Any,
         num_inference_steps: int,
         verbose: bool = True,
-        **kwargs: Any,
     ) -> None:
         """
         Refresh cache state for new generation.
@@ -94,10 +93,63 @@ class CacheBackend(ABC):
             num_inference_steps: Number of inference steps for the current generation.
                                 May be used for cache context updates.
             verbose: Whether to log refresh operations (default: True)
-            **kwargs: Additional keyword arguments (e.g., resume_from_step for
-                     composite backends that need to adjust effective step count).
         """
         raise NotImplementedError("Subclasses must implement refresh()")
+
+    # ------------------------------------------------------------------
+    # Cross-request (inter-request) hooks.
+    #
+    # These have default no-op implementations so that backends which do not
+    # implement cross-request caching (cache_dit, tea_cache, ...) are handled
+    # transparently by the runner without isinstance() checks.
+    # ------------------------------------------------------------------
+
+    def short_circuit_requests(
+        self, reqs: list, target_device: Any
+    ) -> tuple[list, list]:
+        """Inspect requests before forward; return (hit_outputs, remaining_reqs).
+
+        hit_outputs is a list of (original_index, DiffusionOutput) tuples for
+        requests served directly from cache. remaining_reqs are the requests
+        that still need to be computed. Default: pass everything through.
+        """
+        return [], reqs
+
+    def post_forward_store(
+        self,
+        reqs: list,
+        outputs: list,
+        target_device: Any,
+        runner: Any,
+        is_dummy: bool = False,
+    ) -> list:
+        """Store computed outputs for future reuse; return stored outputs.
+
+        Default no-op: returns the outputs unchanged.
+        """
+        return outputs
+
+    def merge_hit_outputs(
+        self, outputs: list, hit_outputs: list
+    ) -> list:
+        """Merge cache-hit outputs back into the computed outputs list.
+
+        hit_outputs is a list of (original_index, DiffusionOutput). Default:
+        return outputs unchanged (no hits to merge).
+        """
+        return outputs
+
+    def before_diffuse(self, is_dummy: bool = False) -> None:
+        """Prepare for a forward pass (e.g. reset a step recorder). No-op by default."""
+        pass
+
+    def after_diffuse(self, is_dummy: bool = False) -> None:
+        """Clean up after a forward pass. No-op by default."""
+        pass
+
+    def shutdown(self) -> None:
+        """Release resources (LMCache engines, executors, etc.). No-op by default."""
+        pass
 
     def is_enabled(self) -> bool:
         """
