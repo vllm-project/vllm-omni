@@ -135,6 +135,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
             sigmas=config.sigmas,
+            extra_args={"aspect_ratio": "16:9"},
         ),
     )
     main_process_peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
