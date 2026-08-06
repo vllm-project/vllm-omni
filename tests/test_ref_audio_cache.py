@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 
 # Stub out the server-entry modules that are pulled in by
 # vllm_omni/entrypoints/openai/__init__.py before the real import.
