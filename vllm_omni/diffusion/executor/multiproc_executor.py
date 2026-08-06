@@ -60,6 +60,10 @@ class _ExecutorShutdownCleaner:
                     logger.warning("Terminating diffusion worker %s after timeout", proc.name)
                     proc.terminate()
                     proc.join(5)
+                if proc.is_alive():  # The worker did not response proc.terminate()
+                    logger.warning("Terminating diffusion worker %s still alive", proc.name)
+                    proc.kill()
+                    proc.join(5)
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
