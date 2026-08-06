@@ -4255,15 +4255,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             torch.Tensor: mask
 
         """
-        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
-        for i in range(size):
-            if num_left_chunks < 0:
-                start = 0
-            else:
-                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
-            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
-            ret[i, start:ending] = True
-        return ret
+        indices = torch.arange(size, device=device)
+        chunk_index = indices // chunk_size
+        chunk_end = torch.clamp(
+            (chunk_index + 1) * chunk_size + num_lookhead,
+            max=size,
+        )
+
+        mask = indices.unsqueeze(0) < chunk_end.unsqueeze(1)
+        if num_left_chunks >= 0:
+            chunk_start = torch.clamp(
+                (chunk_index - num_left_chunks) * chunk_size,
+                min=0,
+            )
+            mask.logical_and_(indices.unsqueeze(0) >= chunk_start.unsqueeze(1))
+        return mask
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         input_lengths_after_cnn = (input_lengths - 1) // 2 + 1

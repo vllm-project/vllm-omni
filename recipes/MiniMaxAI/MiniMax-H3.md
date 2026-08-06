@@ -33,8 +33,10 @@ export MODEL_ROOT=/path/to/MiniMax-H3
 hf download MiniMaxAI/MiniMax-H3 --local-dir "${MODEL_ROOT}"
 ```
 
-Install vLLM-Omni from the checkout containing MiniMax H3 support. On
-Blackwell, install the optional FlashAttention-4 dependency:
+Install vLLM-Omni from the checkout containing MiniMax H3 support. The
+two-GPU RTX 5090/4090 profiles use cuDNN attention and do not need
+FlashAttention-4. Install the optional dependency only for the four-GPU
+B300/GB200 `FLASH_ATTN` profile:
 
 ```bash
 uv venv
@@ -49,6 +51,26 @@ reference-video preparation and MP4 output.
 
 One server loads one checkpoint partition. Set `MODEL` to `FL2VA` for T2VA
 and FL2VA requests, or to `Ref2VA` for either Ref2VA request.
+
+### Memory and storage requirements
+
+Treat GPU HBM, host RAM, and checkpoint storage as separate requirements. Each
+H3 checkpoint partition (`FL2VA` or `Ref2VA`) contains about **134 GiB** of
+BF16 safetensors (about **135 GiB** on disk). Keeping both partitions locally
+therefore needs roughly **270 GiB** of model storage, although the examples
+serve only one partition at a time.
+
+CPU offload and distributed layerwise offload reduce GPU residency; they do
+not make the model weights disappear. With `--dlo-no-use-allgather`, each
+worker retains its standard-loader rank-local weights in host memory, including
+pinned CPU buffers used for H2D streaming. Use at least **200 GiB available
+system RAM** before starting the two-GPU recipe; a **384 GiB host is
+recommended** to leave room for the OS, CUDA/PyTorch allocations, request
+inputs, and filesystem cache. Do not run the FL2VA and Ref2VA servers at the
+same time on a host sized for this minimum.
+
+The consumer-GPU profiles below are HBM budgets only. They still require the
+host-RAM budget above.
 
 ### Single GPU: accuracy and memory first
 
@@ -76,6 +98,98 @@ vllm serve "${MODEL}" \
 Use a GPU with enough memory for the active H3 component and enough system RAM
 for the offloaded components. CPU offload reduces GPU memory pressure but adds
 PCIe/NVLink transfer latency.
+
+### Two 24/32 GB GPUs: TP2 distributed layerwise offload
+
+For two PCIe consumer GPUs, combine TP2 with distributed layerwise offload
+(DLO). The standard loader first creates the rank-local TP shard. DLO keeps
+that shard in pinned host memory and streams the 30 tail DiT blocks through a
+shared two-buffer window without a DP AllGather. The first 20 DiT blocks are
+copied to the GPUs once per denoise stage, reused by every sampling step, and
+released before VAE decode so the decoder can reuse their HBM.
+
+```bash
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=8091
+
+CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 2 \
+  --tensor-parallel-size 2 \
+  --usp 1 \
+  --ring 1 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --dlo-resident-layers 20 \
+  --enforce-eager \
+  --diffusion-attention-backend CUDNN_ATTN
+```
+
+Use the profile that matches the per-GPU memory capacity:
+
+| Profile | GPUs | Starting shape | Resident DiT blocks | Attention | Execution | Status |
+|---|---:|---:|---:|---|---|---|
+| `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Target-hardware validated |
+| `rtx4090` | 2 x 24 GB | 1024x576 | 12 | cuDNN attention | eager | Capacity-proxy starting point |
+
+This topology uses all available parallel capacity: TP2 shards both the DiT
+and text encoder, `--dlo-no-use-allgather` streams each rank's local TP shard
+without reconstructing full blocks, and VAE patch parallelism splits tiled
+decode across both GPUs. cuDNN attention is selected explicitly for the RTX
+consumer path; the server stays eager to avoid an unqualified compile path.
+
+The resident count changes placement and transfer frequency only; it does not
+quantize or change the BF16/FP32 denoise math. Re-measure peak memory before
+increasing it on a different request shape.
+
+### RTX 5090 target-hardware validation
+
+At vLLM-Omni commit `ae6577ea`, one full 50-step T2VA request completed on
+2 x RTX 5090 without OOM:
+
+| Shape | Frames | Client E2E | Sampled peak/GPU | Output validation |
+|---:|---:|---:|---:|---|
+| 1344x768 | 124 at 24 FPS | 8 min 38 s | approximately 22.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+
+This is a single end-to-end validation run, not a warmed multi-run latency
+benchmark. The sampled `nvidia-smi` peak is also not a CUDA allocator
+high-water mark. The environment used vLLM 0.26.0, vLLM-Omni
+`0.26.1.dev14+gae6577ea`, and PyTorch 2.11.0+cu130. The
+[run record](https://github.com/lishunyang12/vllm-omni-rankings/blob/dcd06d7e83cb069842535918c0169ee9f3f29ba0/scripts/%E5%BE%AE%E4%BF%A1%E5%9B%BE%E7%89%87_20260805000034_86_237.png)
+captures the environment, output contract, elapsed time, and sampled peak.
+
+Before the target run, both profiles were exercised on two B300 ranks as an
+allocation and correctness proxy. At 1344x768, 124 frames, and 50 steps, the
+20-layer profile peaked at 27,726 MiB per rank. At 1024x576, the 12-layer
+profile peaked at 18,888 MiB per rank in a 5-step capacity run. The resident
+and fully streamed placements produced identical decoded video-frame and audio
+hashes for the same shape, step count, prompt, and seed. The B300 result does
+not establish RTX 4090 PCIe latency; treat the 4090 profile as a conservative
+starting point until it is measured on that GPU.
+
+To run T2VA, FL2VA, image+audio Ref2VA, and two-video Ref2VA in order, validate
+every MP4's H.264/AAC streams, and retain live server and GPU-memory logs:
+
+```bash
+RUN_ROOT=/path/to/run-root \
+MODEL_ROOT=/path/to/MiniMax-H3 \
+GPU_IDS=0,1 \
+PROFILE=rtx5090 \
+bash examples/offline_inference/minimax_h3/run_h3_2gpu_all_tasks.sh
+```
+
+The script selects 20 resident layers for `PROFILE=rtx5090` and 12 for
+`PROFILE=rtx4090`; `DLO_RESIDENT_LAYERS=N` overrides either default.
 
 ### Four GPUs: measured best-practice throughput
 

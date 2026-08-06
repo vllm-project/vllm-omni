@@ -376,18 +376,30 @@ class MiniMaxH3Attention(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
-        The scalar packed-layout metadata and the CuTe FlashAttention-4 DSL
-        are intentionally opaque to Dynamo. Keeping this boundary narrow lets
-        regional compile fuse projections, norms, RoPE, and the surrounding
-        DiT block without repeatedly graph-breaking inside the FA4 compiler.
+        The scalar packed-layout metadata and backend-specific attention
+        kernels are intentionally opaque to Dynamo. Keeping this boundary
+        narrow lets regional compile fuse projections, norms, RoPE, and the
+        surrounding DiT block without repeated graph breaks.
         """
-        used = int(cu_seqlens[1].item())
-        packed_total = int(cu_seqlens[-1].item())
+        # max_seqlen is already the first (real) packed document length. Do
+        # not read the CUDA cu_seqlens scalars here: this function runs once
+        # per layer and .item() would serialize every attention launch.
+        if not 0 < max_seqlen <= packed_total:
+            raise ValueError(
+                f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
+            )
+        used = min(max_seqlen, packed_total)
         attn_mask = None
-        if used < packed_total:
+        # Ring attention can dispatch to a different implementation from the
+        # configured backend, so this no-mask fast path is local-only.
+        prefix_slice = (
+            not getattr(self.attention, "use_ring", False) and self.attention.attn_backend.supports_prefix_kv_slicing
+        )
+        if used < packed_total and not prefix_slice:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -396,6 +408,7 @@ class MiniMaxH3Attention(nn.Module):
                 "cu_seqlens_k": cu_seqlens,
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
+                "valid_kv_length": used,
             },
         )
         return self.attention(
@@ -412,6 +425,7 @@ class MiniMaxH3Attention(nn.Module):
         rope_freqs: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int | None = None,
         sp_seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
@@ -448,6 +462,10 @@ class MiniMaxH3Attention(nn.Module):
             v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            # Before Ulysses, q contains only this rank's row shard. The
+            # backend receives the global sequence after all-to-all, so carry
+            # its Python length explicitly instead of inferring it from q.
+            packed_total=packed_total if packed_total is not None else q.shape[0],
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -655,6 +673,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         rope_freqs: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int,
         sp_seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
@@ -681,6 +700,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             rope_freqs=rope_freqs,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            packed_total=packed_total,
             sp_seq_lens=sp_seq_lens,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
@@ -1127,6 +1147,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 rope_freqs=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                packed_total=seq_len,
             )
         hidden = self.sp_gather(hidden)
 
