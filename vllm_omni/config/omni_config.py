@@ -480,6 +480,7 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

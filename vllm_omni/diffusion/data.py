@@ -690,9 +690,13 @@ class OmniDiffusionConfig:
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
-    # concurrent requests in DP mode). If False: each rank loads full weights
-    # via H2D only (N× CPU memory, but no AllGather synchronization needed).
+    # concurrent requests in DP mode). If False: each rank streams the standard
+    # loader's rank-local tensors (including TP-local shards) via H2D only.
+    # This avoids AllGather synchronization, while host memory follows the
+    # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    # Leading main-DiT blocks kept resident by distributed layerwise offload.
+    dlo_resident_layers: int = 0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

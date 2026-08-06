@@ -344,6 +344,13 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
     assert loaded == {"transformer.a", "transformer.b", "transformers_ref.a"}
 
 
+def test_dlo_offload_plan_includes_token_refiner():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    assert MiniMaxH3Pipeline._offload_plan.offload_submodules == {"token_refiner": "blocks"}
+    assert MiniMaxH3Pipeline._offload_plan.resident_dit_paths == frozenset({"transformer"})
+
+
 def test_joint_postprocess_is_multiprocessing_picklable():
     from vllm_omni.diffusion.models.minimax_h3 import (
         get_minimax_h3_post_process_func,
@@ -398,6 +405,87 @@ def test_shifted_sigma_schedule_matches_reference_values():
     assert sigmas == pytest.approx(
         [1.0, 0.9729729891, 0.9230769277, 0.8000000119, 0.0],
         abs=1e-7,
+    )
+
+
+def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        supports_prefix_kv_slicing = True
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    # Model-side Ulysses shards rows before Attention gathers them again.
+    # The Python packed_total must therefore remain global even though q is
+    # local here.
+    q = torch.randn(4, 2, 4)
+    cu_seqlens = torch.tensor([0, 5, 8], dtype=torch.int32)
+
+    output = attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    assert output.shape == q.shape
+    assert attention.attention.metadata.attn_mask is None
+    assert attention.attention.metadata.extra["valid_kv_length"] == 5
+
+
+def test_packed_attention_keeps_padding_mask_for_other_backends():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        supports_prefix_kv_slicing = False
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    assert torch.equal(
+        attention.attention.metadata.attn_mask,
+        torch.tensor([[True, True, True, True, True, False, False, False]]),
     )
 
 
@@ -607,6 +695,142 @@ def test_layerwise_offload_releases_text_encoder():
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
 
 
+def test_distributed_layerwise_offload_releases_text_encoder():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+
+
+def test_distributed_layerwise_offload_stages_vae_component():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+    )
+    component = Mock()
+
+    with pipeline._component_on_device(component):
+        component.load_to_device.assert_called_once_with()
+        component.offload_to_cpu.assert_not_called()
+
+    component.offload_to_cpu.assert_called_once_with()
+
+
+def test_distributed_layerwise_resident_blocks_are_stage_scoped():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    controller = Mock()
+    pipeline._dlo_residency_controller = controller
+
+    with pipeline._resident_dit_layers_on_device():
+        controller.load_resident_layers.assert_called_once_with()
+        controller.offload_resident_layers.assert_not_called()
+
+    controller.offload_resident_layers.assert_called_once_with()
+
+
+def test_distributed_layerwise_resident_blocks_release_on_failure():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    controller = Mock()
+    pipeline._dlo_residency_controller = controller
+
+    with pytest.raises(RuntimeError, match="denoise failed"):
+        with pipeline._resident_dit_layers_on_device():
+            raise RuntimeError("denoise failed")
+
+    controller.load_resident_layers.assert_called_once_with()
+    controller.offload_resident_layers.assert_called_once_with()
+
+
+def test_distributed_layerwise_resident_blocks_can_be_skipped():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    controller = Mock()
+    pipeline._dlo_residency_controller = controller
+
+    with pipeline._resident_dit_layers_on_device(enabled=False):
+        pass
+
+    controller.load_resident_layers.assert_not_called()
+    controller.offload_resident_layers.assert_not_called()
+
+
+def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLEncoder,
+    )
+
+    class Stack(torch.nn.Module):
+        def __init__(self, count):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
+
+    class TextStack(torch.nn.Module):
+        def __init__(self, count):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
+
+    hooks = []
+
+    def fake_apply(block, next_block, device, stream, pin_memory):
+        hook = SimpleNamespace(
+            block=block,
+            next_block=next_block,
+            device=device,
+            stream=stream,
+            pin_memory=pin_memory,
+            _prev_hook=None,
+            offload_layer=Mock(),
+        )
+        hooks.append(hook)
+        return hook
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.offloader.layerwise_backend.apply_block_hook",
+        fake_apply,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform.Stream",
+        Mock(return_value="copy-stream"),
+    )
+    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.device_target = torch.device("cpu")
+    encoder.vision = Stack(2)
+    encoder.text_model = TextStack(3)
+
+    encoder.enable_omni_layerwise_offload(pin_memory=False)
+
+    assert len(hooks) == 5
+    assert all(hook._prev_hook is not None for hook in hooks)
+    assert all(hook.device == torch.device("cpu") for hook in hooks)
+
+
 def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -636,6 +860,82 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     )
 
     assert next(video_vae.parameters()).dtype == torch.float32
+
+
+def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(1, 1)
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+        },
+    )
+    monkeypatch.setattr(
+        vae_module,
+        "_load_remote_component",
+        lambda _path, _config: FakeRemote(),
+    )
+
+    video_vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("meta"),
+        load_device=torch.device("cpu"),
+    )
+
+    assert next(video_vae.parameters()).device.type == "cpu"
+    assert video_vae._device_target.type == "meta"
+
+
+def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(1, 1)
+
+    stager = Mock()
+    stager_cls = Mock(return_value=stager)
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+        },
+    )
+    monkeypatch.setattr(
+        vae_module,
+        "_load_remote_component",
+        lambda _path, _config: FakeRemote(),
+    )
+    monkeypatch.setattr(vae_module, "PinnedModuleStager", stager_cls)
+
+    video_vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cuda"),
+        load_device=torch.device("cpu"),
+    )
+    video_vae.load_to_device()
+    video_vae.offload_to_cpu()
+
+    stager_cls.assert_called_once_with(
+        video_vae.remote,
+        torch.device("cuda"),
+        pin_memory=True,
+    )
+    stager.load.assert_called_once_with()
+    stager.offload.assert_called_once_with()
 
 
 def test_video_vae_encode_uses_configured_parallel_tiling():
