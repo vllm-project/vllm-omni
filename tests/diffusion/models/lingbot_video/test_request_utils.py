@@ -270,13 +270,7 @@ def test_normalize_lingbot_request_prefers_explicit_frames_over_duration():
         height=192,
         num_frames=9,
         fps=24,
-        extra_args={
-            "duration": 5,
-            "_vllm_request_context": {
-                "seconds": None,
-                "num_frames_explicit": True,
-            },
-        },
+        extra_args={"duration": 5},
     )
     assert online.num_frames == 9
 

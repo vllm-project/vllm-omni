@@ -3345,6 +3345,13 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    stage_configs = (
+        handler.stage_configs
+        or app_stage_configs
+        or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+    )
+    _check_max_outputs_per_prompt(stage_configs, request.num_outputs_per_prompt)
+
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
@@ -3361,11 +3368,6 @@ async def _parse_video_form(
 
     decode_spec = ReferenceVideoDecodeSpec()
     if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
-        stage_configs = (
-            handler.stage_configs
-            or app_stage_configs
-            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
-        )
         decode_spec = _reference_video_decode_spec(request, stage_configs)
     reference_image = None
     reference_video = None

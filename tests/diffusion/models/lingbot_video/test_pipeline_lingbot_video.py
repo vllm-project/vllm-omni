@@ -165,7 +165,6 @@ def test_postprocess_preserves_image_contract_for_serving():
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
     from vllm_omni.diffusion.output_formatter import (
-        DiffusionStepTimings,
         format_diffusion_outputs,
         normalize_diffusion_postprocess_output,
     )
@@ -192,7 +191,6 @@ def test_postprocess_preserves_image_contract_for_serving():
         diffusion_output=DiffusionOutput(output=raw_output),
         output_data=raw_output,
         postprocess_output=normalized,
-        timings=DiffusionStepTimings(0.0, 0.0, 0.0, 0.0),
     )
 
     assert len(result.images) == 1
@@ -545,6 +543,24 @@ def test_forward_marks_invalid_request_contract_as_client_error():
     )
 
     with pytest.raises(OmniClientError, match="does not accept") as exc_info:
+        pipeline.forward(request)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_forward_marks_unsupported_output_count_as_client_error():
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _make_pipeline()
+    request = _make_request_batch(
+        {"prompt": "motion", "modalities": ["video"]},
+        height=192,
+        width=320,
+        num_frames=9,
+        num_outputs_per_prompt=2,
+    )
+
+    with pytest.raises(OmniClientError, match="one output per prompt") as exc_info:
         pipeline.forward(request)
 
     assert exc_info.value.status_code == 400

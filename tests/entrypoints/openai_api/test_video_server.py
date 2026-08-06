@@ -263,6 +263,15 @@ def _cosmos3_stage_configs():
     ]
 
 
+def _lingbot_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(model_class_name="LingBotVideoPipeline"),
+        )
+    ]
+
+
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
     deadline = time.time() + timeout_s
     last_payload = None
@@ -470,41 +479,57 @@ def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, 
 
 
 @pytest.mark.parametrize(
-    ("generation_request", "expected"),
+    ("generation_request", "expected_num_frames", "expected_duration"),
     [
         (
-            VideoGenerationRequest(
-                prompt="top-level frames",
-                seconds="5",
-                num_frames=9,
-                extra_params={"_vllm_request_context": {"user_value": True}},
-            ),
-            {"seconds": "5", "num_frames_explicit": True},
+            VideoGenerationRequest(prompt="top-level frames", seconds="5", num_frames=9),
+            9,
+            5.0,
         ),
         (
-            VideoGenerationRequest(
-                prompt="nested frames",
-                video_params=VideoParams(num_frames=9),
-            ),
-            {"seconds": None, "num_frames_explicit": True},
+            VideoGenerationRequest(prompt="nested frames", video_params=VideoParams(num_frames=9)),
+            9,
+            None,
         ),
         (
-            VideoGenerationRequest(prompt="duration only", seconds="5"),
-            {"seconds": "5", "num_frames_explicit": False},
+            VideoGenerationRequest(prompt="seconds only", seconds="5"),
+            120,
+            5.0,
         ),
     ],
 )
-def test_video_generation_preserves_frame_count_provenance(generation_request, expected):
+def test_video_generation_bridges_request_fields(generation_request, expected_num_frames, expected_duration):
     engine = FakeAsyncOmni()
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
         model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     )
 
-    asyncio.run(handler._run_and_extract(generation_request, "frame-count-provenance"))
+    asyncio.run(handler._run_and_extract(generation_request, "field-bridge"))
 
-    context = engine.captured_sampling_params_list[0].extra_args["_vllm_request_context"]
-    assert context == expected
+    sampling = engine.captured_sampling_params_list[0]
+    # Top-level ``seconds`` bridges into extra_args["duration"]; num_frames is
+    # passed through (or derived as seconds x fps when omitted). No private
+    # provenance channel is injected.
+    assert "_vllm_request_context" not in sampling.extra_args
+    assert sampling.num_frames == expected_num_frames
+    if expected_duration is None:
+        assert "duration" not in sampling.extra_args
+    else:
+        assert sampling.extra_args["duration"] == expected_duration
+
+
+def test_video_generation_rejects_model_output_count_limit(test_client, mocker: MockerFixture):
+    handler = test_client.app.state.openai_serving_video
+    mocker.patch.object(handler, "_stage_configs", _lingbot_stage_configs())
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "A fox running through snow.", "num_outputs_per_prompt": "2"},
+    )
+
+    assert response.status_code == 400
+    assert "supports at most 1 output per prompt" in response.json()["detail"]
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):

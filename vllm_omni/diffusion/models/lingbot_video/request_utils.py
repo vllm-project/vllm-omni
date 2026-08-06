@@ -346,15 +346,6 @@ def resolve_lingbot_output_dimensions(
     return OutputDimensions(width=resolved_width, height=resolved_height)
 
 
-def _request_context(extra_args: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    context = extra_args.get("_vllm_request_context")
-    if context is None:
-        return None
-    if not isinstance(context, Mapping):
-        raise TypeError("LingBot internal `_vllm_request_context` must be a mapping.")
-    return context
-
-
 def normalize_lingbot_request(
     request: Any,
     *,
@@ -374,7 +365,6 @@ def normalize_lingbot_request(
     prompt_fields = _runtime_prompt_fields(prompt_obj)
     sampling = request.sampling_params
     extra_args = dict(sampling.extra_args or {})
-    request_context = _request_context(extra_args)
 
     mode = resolve_lingbot_mode(prompt_obj)
     prompt = caption_from_lingbot_prompt(_prompt_value(prompt_obj))
@@ -403,27 +393,16 @@ def normalize_lingbot_request(
     )
     fps = _positive_int(fps_raw, "fps")
 
-    request_seconds = _pick(request_context, "seconds") if request_context is not None else None
     extra_seconds = _pick(extra_args, "seconds")
     prompt_seconds = _pick(prompt_fields, "seconds")
     duration_value = _pick(extra_args, "duration")
     prompt_duration = _pick(prompt_fields, "duration")
-    if any(value is not None for value in (request_seconds, extra_seconds, prompt_seconds)) and any(
+    if any(value is not None for value in (extra_seconds, prompt_seconds)) and any(
         value is not None for value in (duration_value, prompt_duration)
     ):
         raise ValueError("LingBot `seconds` and `duration` cannot be provided together.")
     duration = next(
-        (
-            value
-            for value in (
-                request_seconds,
-                extra_seconds,
-                prompt_seconds,
-                duration_value,
-                prompt_duration,
-            )
-            if value is not None
-        ),
+        (value for value in (extra_seconds, prompt_seconds, duration_value, prompt_duration) if value is not None),
         None,
     )
 
@@ -431,15 +410,11 @@ def normalize_lingbot_request(
         _pick(extra_args, "num_frames"),
         _pick(prompt_fields, "num_frames"),
     )
-    if request_context is not None and request_context.get("num_frames_explicit"):
+    explicit_num_frames = model_num_frames
+    if explicit_num_frames is None and sampling.num_frames not in (None, 1):
+        # ``sampling.num_frames`` defaults to 1 (the image-model sentinel).
+        # Treat any other value as an explicit request; ``1`` means "omitted".
         explicit_num_frames = sampling.num_frames
-    else:
-        explicit_num_frames = model_num_frames
-        if request_context is None and explicit_num_frames is None and sampling.num_frames not in (None, 1):
-            # Offline requests do not carry Pydantic field provenance. Treat a
-            # non-default sampling value as explicit; callers that need an
-            # explicit one-frame video can put num_frames in the prompt.
-            explicit_num_frames = sampling.num_frames
 
     if mode is LingBotGenerationMode.T2I:
         if duration is not None:

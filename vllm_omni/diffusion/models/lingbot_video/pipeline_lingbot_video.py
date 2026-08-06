@@ -612,6 +612,8 @@ class LingBotVideoPipeline(
         do_cfg = guidance_scale > 1.0
         image_condition = None
         prompt_images = None
+        # Public image/mode combinations are validated by resolve_lingbot_mode.
+        # Keep these checks as defensive invariants for direct internal calls.
         if mode is LingBotGenerationMode.TI2V:
             if input_image is None:
                 raise ValueError("LingBot TI2V generation requires one input image.")
@@ -829,16 +831,16 @@ class LingBotVideoPipeline(
         request = req.requests[0]
         sampling = request.sampling_params
         extra_args = dict(sampling.extra_args or {})
-        if sampling.num_outputs_per_prompt != 1:
-            raise ValueError(
-                f"LingBotVideoPipeline only supports one output per prompt, got {sampling.num_outputs_per_prompt}."
-            )
 
         default_shift = getattr(self.od_config, "flow_shift", None) or 3.0
         default_output_type = getattr(self.od_config, "output_type", None) or "pt"
         if default_output_type not in {"pt", "np", "latent"}:
             default_output_type = "pt"
         try:
+            if sampling.num_outputs_per_prompt != 1:
+                raise ValueError(
+                    f"LingBotVideoPipeline only supports one output per prompt, got {sampling.num_outputs_per_prompt}."
+                )
             request_config = normalize_lingbot_request(
                 request,
                 default_negative_prompt=self.default_negative_prompt,

@@ -138,6 +138,9 @@ def encode_clean_image_latent(
         enabled=vae_device.type == "cuda",
     ):
         encoded = vae.encode(normalized)
+        # Match the official LingBot TI2V path exactly: sample the posterior
+        # with the request generator before initial noise latents are created.
+        # Using mode() would change both the clean prefix and the RNG stream.
         clean_latent = encoded.latent_dist.sample(generator)
 
     mean = torch.tensor(
