@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -40,6 +40,10 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Pre-padding global sequence length per SequenceParallelInput shard_group,
+    # for models that auto-pad several independent sequences in one boundary.
+    # The singleton fields above remain for single-sequence models.
+    sp_shard_metadata: dict[str, int] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -49,6 +53,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # One entry per active SP split boundary: whether it auto-pads, which makes
+    # every rank's shard the same length and lets attention collectives skip a
+    # runtime length all-gather. Pushed on split, popped on gather.
+    _sp_equal_pad_stack: list[bool] = field(default_factory=list)
 
     @property
     def sp_active(self) -> bool:
@@ -71,6 +79,15 @@ class ForwardContext:
         sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
         return sp_size is not None and sp_size > 1
 
+    @property
+    def sp_rank_local_seq_lens_equal(self) -> bool:
+        """Whether every active SP boundary guarantees equal local shard sizes.
+
+        Only framework-managed auto_pad boundaries provide this contract; a
+        region that also shards manually keeps the dynamic length exchange.
+        """
+        return bool(self._sp_equal_pad_stack) and all(self._sp_equal_pad_stack)
+
     def __post_init__(self):
         pass
 
@@ -88,6 +105,13 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def get_sp_shard_original_seq_len(shard_group: str) -> int | None:
+    """Pre-padding global length of `shard_group`, or None if it was not split."""
+    if not is_forward_context_available():
+        return None
+    return get_forward_context().sp_shard_metadata.get(shard_group)
 
 
 def build_local_sp_padding_mask(
