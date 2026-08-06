@@ -339,17 +339,41 @@ def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_pat
 
 
 def test_is_hardware_nested_baseline():
-    from tests.dfx.conftest import is_hardware_nested_baseline
+    from tests.dfx.conftest import (
+        _RUNTIME_DEVICE_ALIASES,
+        is_hardware_nested_baseline,
+    )
+    from tests.helpers.mark import get_hardware_mark_list
+
+    hardware_marks = get_hardware_mark_list()
+    assert hardware_marks
+    assert {"H100", "L4", "A3", "MI325", "B200"} <= hardware_marks
+    assert "cuda" not in hardware_marks
+    assert "full_model" not in hardware_marks
+
+    # Runtime aliases are a full static list (independent of baseline allowlist).
+    assert "H100" in _RUNTIME_DEVICE_ALIASES
+    assert "A100" in _RUNTIME_DEVICE_ALIASES
 
     assert is_hardware_nested_baseline(
         {
             "H100": {"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]},
-            "B200": {"mean_ttft_ms": [0.9, 1.8], "mean_e2el_ms": [9.0, 18.0]},
+            "A3": {"mean_ttft_ms": [0.9, 1.8], "mean_e2el_ms": [9.0, 18.0]},
         }
     )
+    # Custom metric names under a known hardware label are allowed.
+    assert is_hardware_nested_baseline({"H100": {"custom_stage_ms": 12.0, "foo_bar": [1.0, 2.0]}})
+    assert is_hardware_nested_baseline({"A3": {"request_throughput": 0.5}})
+    # Flat metric maps / concurrency-keyed maps are not hardware-nested.
     assert not is_hardware_nested_baseline({"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]})
     assert not is_hardware_nested_baseline({"mean_ttft_ms": {"1": 1.0, "32": 2.0}})
     assert not is_hardware_nested_baseline({})
+    # Alias-only labels (not [hardware-resource] markers) are rejected for baselines.
+    assert not is_hardware_nested_baseline({"A100": {"throughput_qps": 1.0}})
+    # Unknown top-level hardware label is rejected.
+    assert not is_hardware_nested_baseline({"UnknownGPU": {"throughput_qps": 1.0}})
+    # Empty per-hardware metric map is rejected.
+    assert not is_hardware_nested_baseline({"H100": {}})
 
 
 def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
@@ -360,7 +384,7 @@ def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
             "mean_ttft_ms": [96.4, 140.8, 271.9, 362.3, 507.8],
             "mean_e2el_ms": [18507.0, 28365.0, 31907.0, 48161.0, 72630.0],
         },
-        "B200": {
+        "A3": {
             "mean_ttft_ms": [90.0, 130.0, 250.0, 340.0, 480.0],
             "mean_e2el_ms": [17000.0, 26000.0, 30000.0, 45000.0, 70000.0],
         },
@@ -369,22 +393,32 @@ def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
     got = resolve_baseline_for_sweep(baseline, sweep_index=4)
     assert got == {
         "H100": {"mean_ttft_ms": 507.8, "mean_e2el_ms": 72630.0},
-        "B200": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
+        "A3": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
     }
     # First sweep step keeps both hardware buckets too.
     got0 = resolve_baseline_for_sweep(baseline, sweep_index=0)
-    assert set(got0) == {"H100", "B200"}
+    assert set(got0) == {"H100", "A3"}
     assert got0["H100"]["mean_ttft_ms"] == 96.4
-    assert got0["B200"]["mean_ttft_ms"] == 90.0
+    assert got0["A3"]["mean_ttft_ms"] == 90.0
 
 
 def test_resolve_baseline_for_sweep_rejects_flat_baseline():
     from tests.dfx.conftest import resolve_baseline_for_sweep
 
-    with pytest.raises(ValueError, match="hardware-nested"):
+    with pytest.raises(ValueError, match=r"hardware-nested.*pyproject\.toml"):
         resolve_baseline_for_sweep(
             {"throughput_qps": [0.4, 0.6], "latency_mean": [1.0, 2.0]},
             sweep_index=1,
+        )
+
+
+def test_resolve_baseline_for_sweep_rejects_unknown_hardware_label():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match=r"Unknown hardware label\(s\): \['A100'\].*pyproject\.toml"):
+        resolve_baseline_for_sweep(
+            {"A100": {"throughput_qps": 1.0}},
+            sweep_index=0,
         )
 
 
@@ -394,16 +428,19 @@ def test_resolve_baseline_for_sweep_supports_list_and_scalar_under_hardware():
     # Sweep-aligned lists under each hardware bucket (canonical form).
     listed = {
         "H100": {"throughput_qps": [0.4, 0.6, 0.8], "latency_mean": [1.0, 2.0, 3.0]},
-        "B200": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
+        "A3": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
     }
     assert resolve_baseline_for_sweep(listed, sweep_index=1) == {
         "H100": {"throughput_qps": 0.6, "latency_mean": 2.0},
-        "B200": {"throughput_qps": 0.7, "latency_mean": 1.8},
+        "A3": {"throughput_qps": 0.7, "latency_mean": 1.8},
     }
 
     # Scalars under hardware stay as-is (single-concurrency cases).
     scalar = {"H100": {"throughput_qps": 0.5}}
     assert resolve_baseline_for_sweep(scalar, sweep_index=0) == {"H100": {"throughput_qps": 0.5}}
+    # Custom metric names are preserved.
+    custom = {"H100": {"custom_stage_ms": [10.0, 20.0]}}
+    assert resolve_baseline_for_sweep(custom, sweep_index=1) == {"H100": {"custom_stage_ms": 20.0}}
     assert resolve_baseline_for_sweep(None) == {}
     assert resolve_baseline_for_sweep({}) == {}
 
@@ -457,7 +494,7 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
         "max-concurrency": [1, 8, 32],
         "baseline": {
             "H100": {"throughput_qps": [0.1, 0.2, 0.3], "latency_mean": [10.0, 20.0, 30.0]},
-            "B200": {"throughput_qps": [0.11, 0.22, 0.33], "latency_mean": [9.0, 19.0, 29.0]},
+            "A3": {"throughput_qps": [0.11, 0.22, 0.33], "latency_mean": [9.0, 19.0, 29.0]},
         },
     }
     run32 = rdb._build_run_params(
@@ -470,12 +507,12 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
     assert run32["max-concurrency"] == 32
     assert run32["baseline"] == {
         "H100": {"throughput_qps": 0.3, "latency_mean": 30.0},
-        "B200": {"throughput_qps": 0.33, "latency_mean": 29.0},
+        "A3": {"throughput_qps": 0.33, "latency_mean": 29.0},
     }
 
     sweeps = rdb._iter_sweep_runs(params)
     assert len(sweeps) == 3
     assert sweeps[2]["params"]["max-concurrency"] == 32
     assert sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"] == 0.3
-    assert "B200" in sweeps[2]["params"]["baseline"]
+    assert "A3" in sweeps[2]["params"]["baseline"]
     assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)

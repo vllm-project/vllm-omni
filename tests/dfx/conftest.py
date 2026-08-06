@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
@@ -471,11 +471,16 @@ def extract_mark_resource_label(mark_field: Any) -> str:
     return "-".join(labels) if labels else "na"
 
 
-_KNOWN_RUNTIME_RESOURCE_TOKENS: tuple[str, ...] = (
+# Device marketing-name tokens for ``get_runtime_resource_label`` only.
+# Longer / more specific tokens must appear before shorter substrings
+# (e.g. ``H200`` before ``H20``, ``910B4`` before ``910``).
+_RUNTIME_DEVICE_ALIASES: tuple[str, ...] = (
     "H100",
     "H800",
     "H200",
     "H20",
+    "B200",
+    "GB200",
     "L40S",
     "L40",
     "L4",
@@ -504,7 +509,7 @@ def _normalize_runtime_device_label(raw: str) -> str:
     if not raw or not str(raw).strip():
         return "na"
     upper = str(raw).upper()
-    for token in _KNOWN_RUNTIME_RESOURCE_TOKENS:
+    for token in _RUNTIME_DEVICE_ALIASES:
         if token.upper() in upper:
             return _safe_filename_token(token)
     compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
@@ -563,37 +568,24 @@ def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
     return get_runtime_resource_label()
 
 
-_BASELINE_METRIC_HINTS = (
-    "throughput",
-    "latency",
-    "mean_",
-    "peak_",
-    "p50",
-    "p99",
-    "ttft",
-    "tpot",
-    "e2el",
-    "rtf",
-    "audio",
-    "memory",
-)
-
-
-def _looks_like_metric_map(value: dict[str, Any]) -> bool:
-    """True when ``value`` looks like ``{metric_name: threshold...}``."""
-    if not value:
-        return False
-    return any(any(hint in key.lower() for hint in _BASELINE_METRIC_HINTS) for key in value)
-
-
 def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
-    """True for ``{"H100": {"metric": ...}, "B200": {...}}`` baselines."""
+    """True for ``{"H100": {"metric": ...}, "A3": {...}}`` baselines.
+
+    Detection is structural + hardware-label allowlist (not metric-name hints):
+
+    - every top-level value is a non-empty dict (per-hardware metric map);
+    - every top-level key is in :func:`tests.helpers.mark.get_hardware_mark_list`
+      (``[hardware-resource]`` markers from ``pyproject.toml``).
+
+    Metric names under each hardware bucket are unconstrained.
+    Runtime device aliases (:data:`_RUNTIME_DEVICE_ALIASES`) are unrelated.
+    """
     if not baseline:
         return False
-    values = list(baseline.values())
-    if not all(isinstance(value, dict) for value in values):
+    if not all(isinstance(value, dict) and bool(value) for value in baseline.values()):
         return False
-    return all(_looks_like_metric_map(value) for value in values)  # type: ignore[arg-type]
+    allowed = {label.upper() for label in get_hardware_mark_list()}
+    return all((token := str(key).strip()) and token.upper() in allowed for key in baseline.keys())
 
 
 def resolve_baseline_value(
@@ -630,21 +622,41 @@ def resolve_baseline_for_sweep(
 
     Expects hardware-nested input only::
 
-        {"H100": {"throughput_qps": [a, b, c]}, "B200": {"throughput_qps": [x, y, z]}}
+        {"H100": {"throughput_qps": [a, b, c]}, "A3": {"throughput_qps": [x, y, z]}}
 
     with ``sweep_index=2`` (e.g. concurrency 32) becomes::
 
-        {"H100": {"throughput_qps": c}, "B200": {"throughput_qps": z}}
+        {"H100": {"throughput_qps": c}, "A3": {"throughput_qps": z}}
 
     Per-metric values may be a sweep-aligned list or a scalar.
     """
     if not baseline_config:
         return {}
     if not is_hardware_nested_baseline(baseline_config):
+        allowed = sorted(get_hardware_mark_list())
+        unknown = [
+            str(key).strip()
+            for key in baseline_config.keys()
+            if str(key).strip().upper() not in {label.upper() for label in allowed}
+        ]
+        nested_shape = all(isinstance(value, dict) and bool(value) for value in baseline_config.values())
+        if nested_shape and unknown:
+            raise ValueError(
+                "baseline top-level keys must be [hardware-resource] pytest markers from "
+                "pyproject.toml (tool.pytest.ini_options.markers). "
+                f"Unknown hardware label(s): {unknown!r}. "
+                f"Known markers: {allowed!r}. "
+                "Add a marker such as '\"A100: [hardware-resource] Tests that require A100 GPU\"' "
+                "to pyproject.toml, then retry."
+            )
         raise ValueError(
-            "baseline must be hardware-nested, e.g. "
-            '{"H100": {"throughput_qps": [...]}, "B200": {...}}; '
-            f"got top-level keys={list(baseline_config.keys())!r}"
+            "baseline must be hardware-nested with [hardware-resource] marker names as "
+            "top-level keys, e.g. "
+            '{"H100": {"throughput_qps": [...]}, "A3": {"custom_metric": 1.0}}. '
+            f"got top-level keys={list(baseline_config.keys())!r}; "
+            f"known markers={allowed!r}. "
+            "If you need a new hardware bucket, add it to pyproject.toml markers with "
+            "the [hardware-resource] tag."
         )
 
     return {
