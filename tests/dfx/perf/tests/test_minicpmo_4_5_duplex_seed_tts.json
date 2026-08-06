@@ -44,19 +44,19 @@
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "request_throughput": [
-            0.2415
+            0.1594
           ],
           "mean_ttft_ms": [
-            122.6731
+            274.164
           ],
           "mean_e2el_ms": [
-            4073.804
+            6250.7696
           ],
           "mean_audio_ttfp_ms": [
-            523.4768
+            994.422
           ],
           "mean_audio_rtf": [
-            0.28295
+            0.46163
           ]
         }
       }
