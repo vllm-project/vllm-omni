@@ -114,12 +114,6 @@ def _resolve_component_quant_config(quant_config, component: str):
     return quant_config
 
 
-def _resolve_component_quant_config(quant_config, component: str):
-    if hasattr(quant_config, "resolve"):
-        return quant_config.resolve(component)
-    return quant_config
-
-
 def _minimax_h3_post_process(output, output_type: str = "np"):
     """Convert the joint video/audio output without capturing worker state.
 
