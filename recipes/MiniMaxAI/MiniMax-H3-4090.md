@@ -30,7 +30,6 @@ lower the resident count and re-measure before trusting it.
 > behavior with `--task-type fl2va` or `--task-type ref2va`.
 
 ## Two RTX 4090s: 1024x576, 5 seconds
-## Two RTX 4090s: 1024x576, 5 seconds
 
 Use TP2 and 12 resident DiT layers. This is the `rtx4090` profile from the main
 recipe. A 1024x576 capacity run of this profile peaked at 18,888 MiB per rank on
@@ -55,13 +54,11 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/MiniMax-H3/FL2VA \
 
 *request curl must add -F 'aspect_ratio=16:9'
 ```bash
-curl -sS --max-time 1800 -X POST "http://yourinferenceurl/v1/videos/sync" \
-  -F 'model=minimax-h3-4090' \
+curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
   -F 'prompt=傍晚小厨房的真人实拍的手 与手绘发光2d动画 融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。' \
   -F 'aspect_ratio=16:9' \
-  -F 'width=1280' -F 'height=720' -F 'fps=24' \
+  -F 'width=1024' -F 'height=576' -F 'fps=24' \
   -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":8,"audio_flow_shift":3.0}' \
-  -o "out_t2va.mp4"
+  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
+  -o out.mp4
 ```
-its need about 25 mins to create finish.(4090*2)
