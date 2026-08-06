@@ -931,6 +931,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        export_pd_decode_state = callable(getattr(self.model, "export_pd_decode_state", None))
+        if finished_reqs and export_pd_decode_state:
+            frozen_states = getattr(self, "_pd_kv_transfer_states", None)
+            if frozen_states is None:
+                frozen_states = {}
+                self._pd_kv_transfer_states = frozen_states
+            for req_id in finished_reqs:
+                # Freeze the state at exactly the same scheduling boundary as
+                # the KV snapshot. Do not overwrite it while waiting for the
+                # asynchronous extraction acknowledgement.
+                frozen_states.setdefault(
+                    req_id,
+                    self.model.export_pd_decode_state(self.model_intermediate_buffer.get(req_id, {})),
+                )
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             finished_reqs = self._merge_model_kv_transfer_metadata(finished_reqs)
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
@@ -1002,9 +1016,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     self.kv_extracted_req_ids = None
 
                     output = make_empty_encoder_model_runner_output(scheduler_output)
-                    if kv_ids:
-                        output = copy(output)
-                        output.kv_extracted_req_ids = kv_ids
+                    output = self._attach_pd_states_to_kv_ack_output(output, kv_ids)
                     return self.attach_omni_connector_output(output)
 
             # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
@@ -1026,9 +1038,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 else:
                     output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
-                if kv_ids:
-                    output = copy(output)
-                    output.kv_extracted_req_ids = kv_ids
+                output = self._attach_pd_states_to_kv_ack_output(output, kv_ids)
 
                 return self.attach_omni_connector_output(output)
 
@@ -1797,6 +1807,113 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._omni_payload_copy_stream = stream
         return stream
 
+    def _collect_pd_prefill_decode_states(self, req_ids: list[str]) -> list[dict[str, Any] | None] | None:
+        """Consume non-KV states frozen at the matching KV snapshot boundary."""
+        kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        if getattr(kv_transfer_config, "kv_role", None) != "kv_producer":
+            return None
+        frozen_states = getattr(self, "_pd_kv_transfer_states", None)
+        if not isinstance(frozen_states, dict):
+            raise RuntimeError(f"Qwen3-TTS PD KV acknowledgement has no frozen state map for reqs={req_ids}")
+        missing = [req_id for req_id in req_ids if req_id not in frozen_states]
+        if missing:
+            raise RuntimeError(
+                "Qwen3-TTS PD KV acknowledgement is missing frozen runtime state "
+                f"for reqs={missing}; available={list(frozen_states)}"
+            )
+        return [frozen_states.pop(req_id) for req_id in req_ids]
+
+    def _export_pd_prefill_decode_states(self, req_ids: list[str]) -> list[dict[str, Any] | None] | None:
+        """Snapshot Qwen3-TTS state with the model output that starts D pull."""
+        kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        if getattr(kv_transfer_config, "kv_role", None) != "kv_producer":
+            return None
+        export_state = getattr(self.model, "export_pd_decode_state", None)
+        if not callable(export_state):
+            return None
+
+        states: list[dict[str, Any]] = []
+        for req_id in req_ids:
+            state = export_state(self.model_intermediate_buffer.get(req_id, {}))
+            req_state = self.requests.get(req_id)
+            generator = getattr(req_state, "generator", None)
+            sampling_params = getattr(req_state, "sampling_params", None)
+            seed = getattr(sampling_params, "seed", None)
+            if not isinstance(generator, torch.Generator) or seed is None:
+                raise RuntimeError(
+                    "Qwen3-TTS PD prefill requires a request-local main sampler generator "
+                    f"for req={req_id}"
+                )
+            # The P sampler has just consumed y0. Preserve its exact post-y0
+            # state; replaying a token sample on D is not equivalent because
+            # vLLM's sampler can consume a variable amount of RNG.
+            state["pd_sampler"] = {
+                "main_generator_state": generator.get_state().detach().to("cpu").clone(),
+                "seed": int(seed),
+            }
+            states.append(state)
+        return states
+
+    def _attach_pd_states_to_kv_ack_output(
+        self,
+        output: Any,
+        kv_ids: list[str] | None,
+        states: list[dict[str, Any] | None] | None = None,
+    ) -> Any:
+        """Attach frozen PD state to the output that carries a KV acknowledgement."""
+        if not kv_ids:
+            return output
+        if isinstance(output, OmniModelRunnerOutput):
+            output = copy(output)
+        else:
+            # kv_connector_no_forward() returns the upstream base output type.
+            # Promote it before crossing the worker/engine boundary; dynamically
+            # adding multimodal_outputs to the base type is not wire-stable.
+            output = OmniModelRunnerOutput.with_kv_conn_output_only(
+                getattr(output, "kv_connector_output", None)
+            )
+        output.kv_extracted_req_ids = kv_ids
+        if states is None:
+            states = self._collect_pd_prefill_decode_states(kv_ids)
+        if states is None:
+            return output
+        if len(states) != len(kv_ids):
+            raise RuntimeError(f"Qwen3-TTS PD state/ack mismatch: states={len(states)} ack_ids={len(kv_ids)}")
+
+        req_ids = list(getattr(output, "req_ids", None) or [])
+        req_id_to_index = dict(getattr(output, "req_id_to_index", None) or {})
+        mm_outputs = list(getattr(output, "multimodal_outputs", None) or [])
+        if len(mm_outputs) < len(req_ids):
+            mm_outputs.extend([None] * (len(req_ids) - len(mm_outputs)))
+
+        for req_id, state in zip(kv_ids, states, strict=True):
+            if state is None:
+                raise RuntimeError(f"Qwen3-TTS PD KV acknowledgement has empty runtime state for req={req_id}")
+            state_payload = _ensure_tensor_values(flatten_payload(state))
+            index = req_id_to_index.get(req_id)
+            if index is None:
+                index = len(req_ids)
+                req_ids.append(req_id)
+                req_id_to_index[req_id] = index
+                mm_outputs.append(state_payload)
+            else:
+                while len(mm_outputs) <= index:
+                    mm_outputs.append(None)
+                merged_payload = dict(mm_outputs[index] or {})
+                merged_payload.update(state_payload)
+                mm_outputs[index] = merged_payload
+
+        output.req_ids = req_ids
+        output.req_id_to_index = req_id_to_index
+        output.multimodal_outputs = mm_outputs
+        logger.info(
+            "[PD_TRACE] qwen3_tts_kv_ack_state_attached reqs=%s state_keys=%s output_type=%s",
+            kv_ids,
+            [sorted(_ensure_tensor_values(flatten_payload(state))) for state in states],
+            type(output).__name__,
+        )
+        return output
+
     def _build_omni_model_runner_output_from_snapshot(
         self,
         *,
@@ -1816,6 +1933,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         kv_extracted_req_ids: list[str] | None,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
+        pd_decode_states: list[dict[str, Any] | None] | None = None,
         postprocess_already_applied: bool = False,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
@@ -1936,8 +2054,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
+        if pd_decode_states is not None:
+            if len(pd_decode_states) != len(req_ids_output_copy):
+                raise RuntimeError(
+                    "Qwen3-TTS PD state/output cardinality mismatch: "
+                    f"states={len(pd_decode_states)} requests={len(req_ids_output_copy)}"
+                )
+            if not pooler_output:
+                pooler_output = [{} for _ in req_ids_output_copy]
+            for index, state in enumerate(pd_decode_states):
+                if state:
+                    pooler_output[index].update(_ensure_tensor_values(flatten_payload(state)))
         if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
+            # PD state has a non-client root name, so normal partitioning would
+            # retain it only for connector transport. Mirror this tiny payload
+            # onto the EngineCore multimodal channel consumed by the scheduler.
+            if pd_decode_states is not None:
+                if pooler_client is None:
+                    pooler_client = [None for _ in req_ids_output_copy]
+                for index, state in enumerate(pd_decode_states):
+                    if not state:
+                        continue
+                    client_payload = dict(pooler_client[index] or {})
+                    client_payload.update(_ensure_tensor_values(flatten_payload(state)))
+                    pooler_client[index] = client_payload
         else:
             # Connector-less stages expose the same payload through the
             # orchestrator bridge; non-async stages preserve legacy behavior.
@@ -1994,6 +2135,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
+        pd_kv_ack_states = None
 
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
@@ -2003,9 +2145,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
+            output = OmniModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return self.attach_omni_connector_output(
-                OmniModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+                self._attach_pd_states_to_kv_ack_output(output, kv_extracted_req_ids)
             )
+
+        if kv_extracted_req_ids:
+            pd_kv_ack_states = self._collect_pd_prefill_decode_states(list(kv_extracted_req_ids))
 
         # Unpack ephemeral state.
         (
@@ -2171,8 +2317,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         )
 
         use_async_omni_output = self._should_use_async_omni_output()
+        kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        has_pd_state_export = (
+            getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+            and callable(getattr(self.model, "export_pd_decode_state", None))
+        )
         omni_postprocess_already_applied = False
-        if use_async_omni_output:
+        if use_async_omni_output or has_pd_state_export:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
                 hidden_states=hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -2181,6 +2332,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 req_ids_output_copy=req_ids_output_copy,
                 query_start_loc_cpu=query_start_loc_cpu,
             )
+        if has_pd_state_export and not omni_postprocess_already_applied:
+            raise RuntimeError("Qwen3-TTS PD submit state export requires eager postprocess")
+        # This snapshot rides the producer output that makes the decode worker
+        # start its pull. ACK-side state remains a separate release signal.
+        pd_decode_states = (
+            self._export_pd_prefill_decode_states(req_ids_output_copy)
+            if has_pd_state_export
+            else None
+        )
         output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
             use_async_omni_output=use_async_omni_output,
             hidden_states=hidden_states,
@@ -2193,7 +2353,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
             with record_function_or_nullcontext("omni_output_builder:total"):
-                return self._build_omni_model_runner_output_from_snapshot(
+                output = self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
@@ -2210,8 +2370,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     kv_extracted_req_ids=kv_extracted_req_ids,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
+                    pd_decode_states=pd_decode_states,
                     postprocess_already_applied=omni_postprocess_already_applied,
                 )
+            return self._attach_pd_states_to_kv_ack_output(
+                output,
+                kv_extracted_req_ids,
+                pd_kv_ack_states,
+            )
 
         if not use_async_omni_output:
             output = output_builder()

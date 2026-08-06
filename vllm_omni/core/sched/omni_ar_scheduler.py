@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -105,6 +106,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
+        # Native connector PD: submit decode before its extraction acknowledgement.
+        self._pd_prefill_submit_ready_requests: set[str] = set()
+        self._kv_ready_multimodal_output_by_req: dict[str, dict[str, Any]] = {}
 
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
@@ -115,6 +119,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._maybe_cap_running_reqs_for_pd_decode()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -185,8 +190,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
 
+    def _uses_native_pd_kv_transfer(self) -> bool:
+        """Whether the upstream KV connector owns this P/D handoff."""
+        config = getattr(self.vllm_config, "kv_transfer_config", None)
+        return getattr(config, "kv_role", None) == "kv_producer"
+
     def _get_kv_transfer_criteria(self) -> dict | None:
-        return self._get_omni_kv_config_value("kv_transfer_criteria")
+        criteria = self._get_omni_kv_config_value("kv_transfer_criteria")
+        if criteria:
+            return criteria
+        if self._uses_native_pd_kv_transfer():
+            return {"type": "prefill_finished", "stop_after_transfer": True}
+        return None
 
     def _get_omni_kv_config_value(self, key: str, default: Any = None) -> Any:
         config = getattr(self, "_omni_kv_config", None)
@@ -257,6 +272,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if criteria_type == "prefill_finished":
             if confirmed_computed >= request.num_prompt_tokens:
+                if self._uses_native_pd_kv_transfer():
+                    self.transfer_triggered_requests.add(request.request_id)
+                    self._pd_prefill_submit_ready_requests.add(request.request_id)
+                    return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(
                     request.request_id,
                     confirmed_computed,
@@ -270,6 +289,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 idx = new_token_ids.index(target_token_id)
                 tokens_to_exclude = len(new_token_ids) - (idx + 1)
                 snapshot_len = confirmed_computed - tokens_to_exclude
+                if self._uses_native_pd_kv_transfer():
+                    self.transfer_triggered_requests.add(request.request_id)
+                    self._pd_prefill_submit_ready_requests.add(request.request_id)
+                    return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(
                     request.request_id,
                     snapshot_len,
@@ -302,6 +325,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
         self._process_pending_omni_inputs(model_mode="ar")
+        self._maybe_break_pd_decode_wedge()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -329,6 +353,186 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _is_pd_decode_consumer_stage(self) -> bool:
+        """True on the decode (kv_consumer) side of a PD split."""
+        cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+        return getattr(cfg, "kv_role", None) in ("kv_consumer", "kv_both")
+
+    def _kv_safe_max_running_reqs(self) -> int | None:
+        """Max concurrent max-length sequences this stage's KV pool can hold.
+
+        Reuses upstream's group-aware concurrency helper -- the same one that
+        logs "Maximum concurrency for N tokens per request" at startup -- so the
+        derived cap matches the number already visible in the engine log and
+        hybrid / multi-group / num_gpu_blocks_override layouts are handled for
+        free. Falls back to flat blocks-per-request math (which is block-size
+        invariant) when that helper or the KV cache config is unavailable.
+
+        Returns None when capacity cannot be determined, meaning "do not cap".
+        """
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+
+        try:
+            from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
+
+            if kv_cache_config is not None and getattr(kv_cache_config, "kv_cache_groups", None):
+                cap = int(get_max_concurrency_for_kv_cache_config(self.vllm_config, kv_cache_config))
+                if cap >= 1:
+                    return cap
+        except Exception:
+            logger.debug(
+                "[Omni][PD] group-aware KV concurrency helper unavailable; falling back to block math.",
+                exc_info=True,
+            )
+
+        max_model_len = int(getattr(self, "max_model_len", 0) or 0)
+        block_size = int(getattr(self, "block_size", 0) or 0)
+        num_blocks = int(getattr(kv_cache_config, "num_blocks", 0) or 0)
+        if not num_blocks:
+            num_blocks = int(getattr(self.cache_config, "num_gpu_blocks", 0) or 0)
+        if max_model_len <= 0 or block_size <= 0 or num_blocks <= 0:
+            return None
+        blocks_per_req = -(-max_model_len // block_size)  # ceil
+        return (num_blocks // blocks_per_req) or None
+
+    def _maybe_cap_running_reqs_for_pd_decode(self) -> None:
+        """Clamp the decode-stage admission gate to KV-safe concurrency.
+
+        ``max_num_seqs`` is really a batch-*shape* knob: the worker uses it to
+        size the persistent batch and pick CUDA-graph capture sizes. The
+        scheduler separately uses ``max_num_running_reqs`` purely as an
+        admission gate. When ``max_num_seqs`` exceeds what the KV pool can hold
+        at ``max_model_len``, the scheduler over-admits and the RUNNING loop is
+        forced to call ``_preempt_request`` to claw blocks back.
+
+        On a PD *consumer* stage a preempted request is unrecoverable: its
+        remote prefill KV was already released on the producer, and the
+        Qwen3-TTS talker rebuilds each step's input embedding from all 16
+        codebooks of the previous frame while ``Request`` only carries
+        codebook 0 -- a resumed request re-prefills against a zeroed
+        ``codes.audio`` placeholder and would emit garbage. Such requests pile
+        up as PREEMPTED, upstream only admits WAITING work while
+        ``not preempted_reqs``, and the replica wedges at ``running=0``.
+
+        So cap admission at KV capacity here. Lowering only
+        ``max_num_running_reqs`` is safe: upstream reads it just in the
+        admission gate and in ``assert len(self.running) <=
+        max_num_running_reqs``, which a lower value only makes easier to
+        satisfy. Worker-side batch sizing reads ``max_num_seqs``, untouched.
+
+        Inert at normal load -- it only binds under a pathological pileup.
+        Override with ``VLLM_OMNI_PD_DECODE_MAX_RUNNING`` (<=0 disables).
+        """
+        if not self._is_pd_decode_consumer_stage():
+            return
+
+        configured = getattr(self, "max_num_running_reqs", 0)
+        if not configured:
+            return
+
+        try:
+            raw = (os.getenv("VLLM_OMNI_PD_DECODE_MAX_RUNNING", "") or "").strip()
+            if raw:
+                override = int(raw)
+                if override <= 0:
+                    logger.info(
+                        "[Omni][PD] Decode admission cap disabled via "
+                        "VLLM_OMNI_PD_DECODE_MAX_RUNNING=%s (max_num_running_reqs=%d).",
+                        raw,
+                        configured,
+                    )
+                    return
+                cap = override
+            else:
+                kv_safe = self._kv_safe_max_running_reqs()
+                if kv_safe is None:
+                    return
+                cap = kv_safe
+            cap = max(1, min(cap, configured))
+        except Exception:
+            init_logger(__name__).exception(
+                "[Omni][PD] Failed to compute decode admission cap; leaving max_num_running_reqs=%d unchanged.",
+                configured,
+            )
+            return
+
+        if cap >= configured:
+            return
+
+        self.max_num_running_reqs = cap
+        logger.info(
+            "[Omni][PD] Decode (kv_consumer) admission cap: max_num_running_reqs %d -> %d "
+            "(max_model_len=%d; max_num_seqs stays %s for worker batch/CUDA-graph sizing). "
+            "A preempted PD-consumer request can never be re-admitted (remote prefill KV "
+            "released; multi-codebook talker state absent from Request token ids), so "
+            "admitting beyond KV capacity risks wedging the replica at running=0. "
+            "Override with VLLM_OMNI_PD_DECODE_MAX_RUNNING (<=0 disables).",
+            configured,
+            cap,
+            getattr(self, "max_model_len", -1),
+            getattr(self.scheduler_config, "max_num_seqs", "?"),
+        )
+
+    def _maybe_break_pd_decode_wedge(self) -> None:
+        """Recover a permanently wedged PD decode replica.
+
+        Root cause (observed under sustained load + over-generation runaways):
+        the decode stage preempts running requests under transient KV pressure.
+        A preempted PD-*consumer* request cannot be re-admitted -- its remote
+        prefill KV was already released on the producer, and a request that
+        generated near ``max_model_len`` tokens would need to recompute more
+        than ``max_num_batched_tokens`` in one step (the talker prefill is not
+        chunkable here), so ``schedule()`` can never re-admit it. Such requests
+        pile up as PREEMPTED, ``running`` drains to 0, and the whole replica
+        makes zero progress forever (GPU 0%), stalling every request behind it.
+        Single-node has no remote-KV dependency, so its preempted requests
+        recompute locally and this never happens.
+
+        We detect the wedge (nothing running, but waiting-queue requests that
+        cannot be scheduled) sustained across a grace window of scheduler
+        steps, and abort the stuck requests so the client gets a terminal
+        response and the replica resumes serving new requests. This converts a
+        total replica hang into graceful per-request failure under extreme
+        pressure.
+        """
+        if not self._is_pd_decode_consumer_stage():
+            return
+        try:
+            running = len(self.running)
+            stuck = [
+                r
+                for r in self.waiting
+                if r.status in (RequestStatus.PREEMPTED, RequestStatus.WAITING)
+            ]
+            # Wedge signature: nothing running yet requests stranded in waiting.
+            if running == 0 and stuck:
+                self._pd_wedge_ticks = getattr(self, "_pd_wedge_ticks", 0) + 1
+            else:
+                self._pd_wedge_ticks = 0
+                return
+            # Grace window: the engine core sleeps ~1ms per idle step, so this
+            # is a few seconds of *continuous* zero-progress-with-backlog, which
+            # normal operation never sustains. Tunable via env.
+            threshold = int(os.getenv("VLLM_OMNI_PD_DECODE_WEDGE_TICKS", "3000") or "3000")
+            if self._pd_wedge_ticks < threshold:
+                return
+            stuck_ids = [r.request_id for r in stuck]
+            logger.error(
+                "[Omni][PD] Decode replica wedged: running=0 with %d stranded "
+                "waiting requests for %d scheduler steps (preempted PD-consumer "
+                "requests cannot recompute -- remote prefill KV released). "
+                "Aborting %d stuck request(s) to recover the replica: %s",
+                len(stuck_ids),
+                self._pd_wedge_ticks,
+                len(stuck_ids),
+                stuck_ids[:8],
+            )
+            self.finish_requests(stuck_ids, RequestStatus.FINISHED_ABORTED)
+            self._pd_wedge_ticks = 0
+        except Exception:
+            init_logger(__name__).exception("[Omni][PD] wedge-recovery check failed")
+
 
     def update_from_output(
         self,
@@ -370,6 +574,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
+        # Retain Qwen3-TTS runtime state until a possibly later KV ack.
+        kv_extracted_ids = list(getattr(model_runner_output, "kv_extracted_req_ids", None) or [])
+        if mm_outputs is not None and self.kv_transfer_criteria:
+            for req_id in set(num_scheduled_tokens) | set(kv_extracted_ids):
+                req_index = model_runner_output.req_id_to_index.get(req_id)
+                if req_index is None or req_index >= len(mm_outputs):
+                    continue
+                mm_output = mm_outputs[req_index]
+                if isinstance(mm_output, dict) and mm_output:
+                    self._kv_ready_multimodal_output_by_req[req_id] = mm_output
+
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
@@ -383,17 +598,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Pre-process KV extraction acks so that the per-request loop below
         # can see up-to-date active_kv_transfers state and emit kv_ready
         # signals while requests are still alive (before any deferred stop).
-        kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
         if kv_extracted_ids:
             for req_id in kv_extracted_ids:
                 try:
                     self.active_kv_transfers.discard(req_id)
                     req = self.requests.get(req_id)
                     if req is not None and not req.is_finished():
+                        pd_state = self._kv_ready_multimodal_output_by_req.pop(req_id, None)
                         outputs[req.client_index].append(
                             OmniEngineCoreOutput(
                                 request_id=req_id,
                                 new_token_ids=[],
+                                multimodal_output=pd_state,
                                 kv_transfer_params={"kv_ready": True},
                             )
                         )
@@ -543,7 +759,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
-            if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+            # Transfer can coincide with a terminal token and must still run.
+            if self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -641,6 +858,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if req_id in self._pd_prefill_submit_ready_requests:
+                submit_params = {
+                    "pd_submit_ready": True,
+                    "transfer_id": f"xfer-{req_id}",
+                    "remote_request_id": req_id,
+                }
+                kv_transfer_params = {**(kv_transfer_params or {}), **submit_params}
+                self._pd_prefill_submit_ready_requests.discard(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 OmniSchedulerMixin._append_request_output(
                     self,
@@ -859,12 +1084,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_active = request_id in self.active_kv_transfers
 
                 if already_triggered:
-                    if is_active:
+                    if is_active or request_id in self.requests_needing_kv_transfer:
                         # It triggered but hasn't finished yet. We MUST wait.
                         logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                         self.waiting_for_transfer_free.add(request_id)
                         self._kv_wait_start_ts[request_id] = time.monotonic()
-                        kv_xfer_params = None
+                        # Preserve native connector bootstrap metadata for decode.
                         return kv_xfer_params, ec_xfer_params
                     elif request_id in self.waiting_for_transfer_free:
                         # Blocks held until KV extraction completes in a future step.
@@ -921,6 +1146,61 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter is not None:
                 self.chunk_transfer_adapter.cleanup_receiver(request_id)
 
+    def _update_from_kv_xfer_finished(self, kv_connector_output) -> None:
+        """Guarded variant of the upstream KV-transfer finish handler.
+
+        Upstream ``Scheduler._update_from_kv_xfer_finished`` asserts that every
+        ``finished_recving`` / ``finished_sending`` request id is still present
+        in ``self.requests``. That invariant does not hold in the Omni PD flow:
+        a decode (consumer) request can be aborted (client disconnect) or a
+        producer request can be reaped by Mooncake's own
+        ``VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`` ("timed out ... without being
+        sent") *before* the connector delivers the matching finished
+        notification. When that late notification arrives the base assert fires
+        inside ``update_from_output`` and kills the whole StageEngineCoreProc
+        (EngineDeadError -> orchestrator dies -> server exits) — i.e. one
+        stranded transfer escalates into a full-server outage.
+
+        Here we skip ids that are no longer tracked (their blocks were already
+        freed on the abort/cleanup path) and only free blocks for requests we
+        still own, so a stranded transfer stays a per-request no-op instead of a
+        fatal error. Behaviour for live requests is identical to upstream.
+        """
+        if self.connector is not None:
+            self.connector.update_connector_output(kv_connector_output)
+
+        for req_id in kv_connector_output.finished_recving or ():
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "[Omni][PD] finished_recving for untracked req %s "
+                    "(aborted/reaped before KV recv completed); skipping.",
+                    req_id,
+                )
+                continue
+            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                self.finished_recving_kv_req_ids.add(req_id)
+            elif RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
+            else:
+                logger.warning(
+                    "[Omni][PD] finished_recving for req %s in unexpected "
+                    "status %s; skipping free.",
+                    req_id,
+                    req.status,
+                )
+
+        for req_id in kv_connector_output.finished_sending or ():
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "[Omni][PD] finished_sending for untracked req %s "
+                    "(aborted/reaped before KV send completed); skipping.",
+                    req_id,
+                )
+                continue
+            self._free_blocks(req)
+
     def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""
         # Avoid duplicate marking (if already pending in queue)
@@ -966,15 +1246,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:
         """Determine if a request should trigger KV cache transfer."""
+        request = self.requests.get(req_id)
+        if self._uses_native_pd_kv_transfer():
+            return request is not None and not self._request_omits_kv_transfer_to_next_stage(request)
         if not self._get_omni_kv_config_value("need_send_cache", False):
             return False
-        request = self.requests.get(req_id)
-        if request is not None and self._request_omits_kv_transfer_to_next_stage(request):
-            return False
-        return True
+        return request is None or not self._request_omits_kv_transfer_to_next_stage(request)
 
     def _cleanup_kv_tracking(self, request_ids: Iterable[str]) -> None:
         for req_id in request_ids:
+            self._kv_ready_multimodal_output_by_req.pop(req_id, None)
+            self._pd_prefill_submit_ready_requests.discard(req_id)
             if req_id in self.waiting_for_transfer_free:
                 continue
             self.transfer_triggered_requests.discard(req_id)

@@ -213,6 +213,7 @@ class Omni(OmniBase):
         self.engine.abort(request_ids)
         for req_id in request_ids:
             self._record_request_failure_once(req_id, reason="client_abort")
+            self._release_pd_prefill_for_request(req_id)
             self.request_states.pop(req_id, None)
         if self.log_stats:
             logger.info("[Omni] Aborted request(s) %s", ",".join(request_ids))

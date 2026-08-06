@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import copy
 import json
+import os
 import queue
 import shutil
 import threading
@@ -970,44 +971,116 @@ class AsyncOmniEngine:
 
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
-        Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
+        Returns topology plus per-prefill bootstrap metadata, or None.
         """
-        pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
-        if pd_pair is None:
+        topology = PDDisaggregationMixin.detect_pd_separation_topology(self.stage_configs)
+        if topology is None:
             return None
-        prefill_idx, decode_idx = pd_pair
+        prefill_ids = list(topology["prefill_ids"])
+        decode_ids = list(topology.get("decode_ids") or [topology["decode_id"]])
+        pd_pair = (prefill_ids[0], decode_ids[0]) if len(prefill_ids) == 1 and len(decode_ids) == 1 else None
 
-        # Extract bootstrap address from prefill stage engine_args
-        bootstrap_addr: str | None = None
-        try:
-            prefill_cfg = self.stage_configs[prefill_idx]
-            ea = getattr(prefill_cfg, "engine_args", None)
-            kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
-            if kv_cfg is not None:
-                port = vllm_envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
-                kv_ip = getattr(kv_cfg, "kv_ip", None) or "127.0.0.1"
-                bootstrap_addr = f"http://{kv_ip}:{port}"
-        except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Could not extract PD bootstrap address: %s", exc)
+        # Extract producer bootstrap addresses from prefill stage configs.
+        # Do not read vllm_envs.VLLM_MOONCAKE_BOOTSTRAP_PORT here: this code runs
+        # in the APIServer process, while MooncakeConnector reads the per-stage
+        # runtime.env inside worker subprocesses. Reading the parent env would
+        # usually return vLLM's default 8998 and make decode connect to the wrong
+        # bootstrap server.
+        bootstrap_addr_by_prefill: dict[int, str] = {}
+        for prefill_idx in prefill_ids:
+            try:
+                prefill_cfg = self.stage_configs[prefill_idx]
+                ea = getattr(prefill_cfg, "engine_args", None)
+                kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
+                if kv_cfg is None and hasattr(ea, "get"):
+                    kv_cfg = ea.get("kv_transfer_config")
+                if kv_cfg is not None:
+                    kv_cfg_dict = (
+                        OmegaConf.to_container(kv_cfg, resolve=True) if not isinstance(kv_cfg, dict) else kv_cfg
+                    )
+                    extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
+                    if not isinstance(extra_cfg, dict):
+                        extra_cfg = OmegaConf.to_container(extra_cfg, resolve=True)
+                    runtime_cfg = getattr(prefill_cfg, "runtime", None)
+                    if runtime_cfg is None and hasattr(prefill_cfg, "get"):
+                        runtime_cfg = prefill_cfg.get("runtime")
+                    env_cfg = None
+                    if runtime_cfg is not None:
+                        env_cfg = (
+                            runtime_cfg.get("env") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "env", None)
+                        )
+                    env_port = None
+                    if env_cfg is not None:
+                        env_port = (
+                            env_cfg.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+                            if hasattr(env_cfg, "get")
+                            else getattr(env_cfg, "VLLM_MOONCAKE_BOOTSTRAP_PORT", None)
+                        )
+                    extra_port = extra_cfg.get("mooncake_bootstrap_port")
+                    port = (
+                        int(env_port) if env_port is not None else int(extra_port) if extra_port is not None else 25201
+                    )
+                    kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
+                    bootstrap_addr_by_prefill[prefill_idx] = f"http://{kv_ip}:{port}"
+            except Exception as exc:
+                logger.warning(
+                    "[AsyncOmniEngine] Could not extract PD bootstrap address for stage-%d: %s", prefill_idx, exc
+                )
+
+        bootstrap_addr = bootstrap_addr_by_prefill.get(prefill_ids[0]) if prefill_ids else None
 
         logger.info(
-            "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
-            prefill_idx,
-            decode_idx,
-            bootstrap_addr,
+            "[AsyncOmniEngine] PD disaggregation detected: prefill_ids=%s, decode_ids=%s, bootstrap_by_prefill=%s",
+            prefill_ids,
+            decode_ids,
+            bootstrap_addr_by_prefill,
         )
-        prefill_engine_id: str | None = None
-        try:
-            prefill_client = self.stage_clients[prefill_idx]
-            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
-            prefill_engine_id = getattr(kv_cfg, "engine_id", None)
-        except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+        prefill_engine_id_by_prefill: dict[int, str] = {}
+        for prefill_idx in prefill_ids:
+            try:
+                prefill_client = self.stage_clients[prefill_idx]
+                kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
+                prefill_engine_id = getattr(kv_cfg, "engine_id", None)
+                if prefill_engine_id is not None:
+                    prefill_engine_id_by_prefill[prefill_idx] = prefill_engine_id
+            except Exception as exc:
+                logger.warning(
+                    "[AsyncOmniEngine] Could not extract prefill engine_id for stage-%d: %s", prefill_idx, exc
+                )
+
+        decode_pick_strategy = "round_robin"
+        # Env var wins over YAML (docs table: env > YAML > default).
+        env_decode_strategy = os.getenv("VLLM_OMNI_PD_DECODE_PICK_STRATEGY") or None
+        if env_decode_strategy:
+            env_decode_strategy = env_decode_strategy.strip().lower()
+            if env_decode_strategy in ("round_robin", "least_inflight"):
+                decode_pick_strategy = env_decode_strategy
+            else:
+                logger.warning(
+                    "[AsyncOmniEngine] Ignoring unknown VLLM_OMNI_PD_DECODE_PICK_STRATEGY=%r; "
+                    "allowed: round_robin, least_inflight",
+                    env_decode_strategy,
+                )
+        if decode_pick_strategy == "round_robin":
+            try:
+                if self.config_path:
+                    raw_cfg = OmegaConf.load(self.config_path)
+                    configured_strategy = raw_cfg.get("pd_decode_pick_strategy") if hasattr(raw_cfg, "get") else None
+                    if configured_strategy:
+                        decode_pick_strategy = str(configured_strategy).strip().lower()
+            except Exception as exc:
+                logger.debug("[AsyncOmniEngine] Could not read pd_decode_pick_strategy: %s", exc)
 
         return {
-            "pd_pair": (prefill_idx, decode_idx),
+            "pd_pair": pd_pair,
+            "prefill_ids": prefill_ids,
+            "decode_ids": decode_ids,
+            "decode_to_prefill": topology.get("decode_to_prefill") or {},
             "bootstrap_addr": bootstrap_addr,
-            "prefill_engine_id": prefill_engine_id,
+            "bootstrap_addr_by_prefill": bootstrap_addr_by_prefill,
+            "prefill_engine_id": prefill_engine_id_by_prefill.get(prefill_ids[0]) if prefill_ids else None,
+            "prefill_engine_id_by_prefill": prefill_engine_id_by_prefill,
+            "decode_pick_strategy": decode_pick_strategy,
         }
 
     @staticmethod

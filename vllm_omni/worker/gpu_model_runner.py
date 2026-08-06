@@ -1,5 +1,9 @@
 import contextlib
+import copy
 import inspect
+import os
+import time
+import zlib
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -80,11 +84,92 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
-        # The Omni tensor prefix cache will be allocated
-        # when we initialize the metadata builders if enabled
+        # [yurain] Omni tensor prefix cache (allocated when metadata builder initialized if enabled)
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._mtp_ar_timing_enabled = os.getenv("VLLM_OMNI_MTP_AR_TIMING", "0").lower() not in (
+            "0",
+            "",
+            "false",
+            "off",
+        )
+        self._mtp_ar_timing_interval = max(1, int(os.getenv("VLLM_OMNI_MTP_AR_TIMING_INTERVAL", "50")))
+        # [yurain] Opt-in: batch all rows assigned to the same replica into ONE
+        # forward() call per replica. Requires VLLM_OMNI_MTP_NUM_REPLICAS >= 2.
+        # Each replica receives bsz = ceil(total_bsz / num_replicas) and the
+        # replicas run concurrently on separate CUDA streams.
+        # Rows with an explicit per-request seed fall back to scalar dispatch
+        # for their group (the group still runs on its own stream).
+        # Default OFF -- the sub-batch path needs VLLM_OMNI_MTP_BATCH_PER_REPLICA=1.
+        self._mtp_batch_per_replica: bool = os.getenv("VLLM_OMNI_MTP_BATCH_PER_REPLICA", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._mtp_ar_timing_stats = {
+            "mtp_ms": 0.0,
+            "mtp_calls": 0,
+            "mtp_rows": 0,
+            "ar_decode_ms": 0.0,
+            "ar_decode_calls": 0,
+            "ar_decode_tokens": 0,
+            "ar_prefill_ms": 0.0,
+            "ar_prefill_calls": 0,
+            "ar_prefill_tokens": 0,
+        }
+        self._mtp_timing_depth = 0
+
+    def _timing_sync_device(self) -> None:
+        if self._mtp_ar_timing_enabled and torch.cuda.is_available():
+            torch.accelerator.synchronize(self.device)
+
+    def _is_decode_forward_for_timing(self) -> bool:
+        scheduled = self._omni_num_scheduled_tokens_np
+        return scheduled is not None and len(scheduled) > 0 and int(scheduled.max()) == 1
+
+    def _record_mtp_ar_timing(self, kind: str, elapsed_ms: float, *, rows: int = 0, tokens: int = 0) -> None:
+        if not self._mtp_ar_timing_enabled:
+            return
+        stats = self._mtp_ar_timing_stats
+        if kind == "mtp":
+            stats["mtp_ms"] += elapsed_ms
+            stats["mtp_calls"] += 1
+            stats["mtp_rows"] += rows
+        elif kind == "ar_decode":
+            stats["ar_decode_ms"] += elapsed_ms
+            stats["ar_decode_calls"] += 1
+            stats["ar_decode_tokens"] += tokens
+        else:
+            stats["ar_prefill_ms"] += elapsed_ms
+            stats["ar_prefill_calls"] += 1
+            stats["ar_prefill_tokens"] += tokens
+
+        total_calls = int(stats["mtp_calls"] + stats["ar_decode_calls"] + stats["ar_prefill_calls"])
+        if total_calls % self._mtp_ar_timing_interval != 0:
+            return
+
+        mtp_avg = stats["mtp_ms"] / max(1, stats["mtp_calls"])
+        ar_decode_avg = stats["ar_decode_ms"] / max(1, stats["ar_decode_calls"])
+        ar_prefill_avg = stats["ar_prefill_ms"] / max(1, stats["ar_prefill_calls"])
+        ratio = mtp_avg / ar_decode_avg if ar_decode_avg > 0 else 0.0
+        logger.info(
+            "[MTP-AR-TIMING] mtp_avg_ms=%.3f mtp_calls=%d mtp_rows=%d "
+            "ar_decode_avg_ms=%.3f ar_decode_calls=%d ar_decode_tokens=%d "
+            "ar_prefill_avg_ms=%.3f ar_prefill_calls=%d ar_prefill_tokens=%d "
+            "mtp/ar_decode=%.2f",
+            mtp_avg,
+            int(stats["mtp_calls"]),
+            int(stats["mtp_rows"]),
+            ar_decode_avg,
+            int(stats["ar_decode_calls"]),
+            int(stats["ar_decode_tokens"]),
+            ar_prefill_avg,
+            int(stats["ar_prefill_calls"]),
+            int(stats["ar_prefill_tokens"]),
+            ratio,
+        )
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -165,8 +250,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 device=sm.device,
                             )
 
-        # Initialize the wrapper for both multimodal output tensors
-        # and for hidden states to be passed between stages
+        # [yurain] init wrapper for multimodal output / hidden states between stages
         if self.cache_config.enable_prefix_caching:
             self.omni_prefix_cache = OmniTensorPrefixCache(
                 num_blocks=kv_cache_config.num_blocks,
@@ -223,6 +307,118 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self._init_talker_mtp_replicas()
+
+    def _init_talker_mtp_replicas(self) -> None:
+        self.talker_mtp_code_predictors = []
+        self.talker_mtp_streams = []
+        try:
+            num_replicas = int(os.getenv("VLLM_OMNI_MTP_NUM_REPLICAS", "1") or "1")
+        except ValueError:
+            num_replicas = 1
+        num_replicas = max(1, num_replicas)
+        if num_replicas == 1:
+            return
+        kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        if getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
+            return
+        if not torch.cuda.is_available():
+            logger.warning("VLLM_OMNI_MTP_NUM_REPLICAS=%d ignored: CUDA is unavailable", num_replicas)
+            return
+        graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
+        if isinstance(self.talker_mtp, graph_wrapper_cls):
+            logger.warning(
+                "VLLM_OMNI_MTP_NUM_REPLICAS=%d ignored: graph-wrapped talker_mtp is not replica-safe", num_replicas
+            )
+            return
+        base_code_predictor = getattr(self.model, "code_predictor", None)
+        if base_code_predictor is None:
+            logger.warning("VLLM_OMNI_MTP_NUM_REPLICAS=%d ignored: model has no code_predictor", num_replicas)
+            return
+
+        def _prepare_replica(replica):
+            # [yurain] Keep CUDA graphs enabled but give each replica its own
+            # private graph memory pool (torch.cuda.graph_pool_handle()) instead
+            # of vLLM's shared global pool. Graphs sharing one pool are not
+            # safe to replay concurrently on different streams (may clobber
+            # each other's memory); a private pool per replica makes
+            # concurrent capture/replay across streams safe while still
+            # getting graph-replay speed.
+            if hasattr(replica, "_graph_pool"):
+                replica._graph_pool = torch.cuda.graph_pool_handle()
+            replica._proj_buf = None
+            replica._compiled_model_fwd = None
+            replica._bucket_sizes = []
+            replica._bucket_pos_ids = {}
+            replica._lm_heads_list = None
+            replica._codec_embeds_list = None
+            replica._device_graphs = {}
+            if hasattr(replica, "_full_ar_graphs"):
+                replica._full_ar_graphs = {}
+                replica._all_codes_bufs = {}
+                replica._layer0_code_bufs = {}
+                replica._noise_buf = None
+                replica._cap_inv_temperature = None
+                replica._cap_top_k = None
+                replica._full_graph_disabled_runtime = False
+            if hasattr(replica, "_full_ar_kv_graphs"):
+                replica._full_ar_kv_graphs = {}
+                replica._kv_caches = {}
+                replica._kv_pos_prefill = {}
+                replica._kv_pos_decode = {}
+                replica._kv_disabled_runtime = False
+            setup_compile = getattr(replica, "_setup_compile", None)
+            if callable(setup_compile):
+                setup_compile()
+
+        replicas = []
+        try:
+            with torch.cuda.device(self.device), torch.inference_mode():
+                for _ in range(num_replicas):
+                    replica = copy.deepcopy(base_code_predictor).to(device=self.device)
+                    replica.eval()
+                    _prepare_replica(replica)
+                    replicas.append(replica)
+                torch.accelerator.synchronize(self.device)
+        except Exception:
+            logger.exception("VLLM_OMNI_MTP_NUM_REPLICAS=%d disabled: failed to initialize replicas", num_replicas)
+            self.talker_mtp_code_predictors = []
+            self.talker_mtp_streams = []
+            return
+        self.talker_mtp_code_predictors = replicas
+        self.talker_mtp_streams = [torch.cuda.Stream(device=self.device) for _ in replicas]
+        graphs_active = bool(getattr(replicas[0], "_device_graphs", None)) if replicas else False
+        logger.info(
+            "[MTP-REPLICA] enabled num_replicas=%d cuda_graphs=%s (private_pool_per_replica) prewarmed=1",
+            len(replicas),
+            "enabled" if graphs_active else "disabled",
+        )
+
+    @staticmethod
+    def _mtp_replica_idx_for_req(req_id: str, num_replicas: int) -> int:
+        """Stable request-id -> MTP replica mapping.
+
+        Each replica (see :meth:`_init_talker_mtp_replicas`) is an
+        independently-deepcopied ``code_predictor`` with its own runtime
+        state (captured-CUDA-graph sampling-constant lock-in, noise/layer0
+        buffers, etc.). ``talker_mtp``'s residual-codebook output is written
+        straight back into ``inputs_embeds`` and feeds the *next* decode
+        step of the main talker AR loop, so a request must always be served
+        by the same replica across steps -- otherwise it gets "relayed"
+        between two replicas with independent state, which can silently
+        perturb its generation trajectory (observed as a request that
+        never samples ``stop_token_ids`` and runs all the way to
+        ``max_tokens``, under concurrent load).
+        ``row % num_replicas`` (the previous scheme) keys off this request's
+        *transient position* within the current decode batch, which changes
+        across steps whenever the batch composition changes (a request
+        finishing / a new one being admitted). Hashing the request id keeps
+        the assignment fixed for the lifetime of the request regardless of
+        where it lands in the batch. ``zlib.crc32`` is used instead of the
+        builtin ``hash()`` because the latter is salted per-process
+        (``PYTHONHASHSEED``) and is not guaranteed stable across workers.
+        """
+        return zlib.crc32(req_id.encode("utf-8")) % num_replicas
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -614,9 +810,32 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.error(f"Error updating model intermediate buffer: {e}")
             # Decode additional_information payloads (dictionary)
             try:
-                if getattr(new_req_data, "additional_information", None) is not None:
-                    info_dict = deserialize_additional_information(new_req_data.additional_information)
+                _ai_raw = getattr(new_req_data, "additional_information", None)
+                if _ai_raw is not None:
+                    logger.warning_once(
+                        "additional_information on request data is deprecated, use model_intermediate_buffer"
+                    )
+                    info_dict = deserialize_additional_information(_ai_raw)
                     if info_dict:
+                        pd_sampler = info_dict.get("pd_sampler")
+                        generator_state = (
+                            pd_sampler.get("main_generator_state") if isinstance(pd_sampler, dict) else None
+                        )
+                        if generator_state is not None:
+                            if not isinstance(generator_state, torch.Tensor) or generator_state.dtype != torch.uint8:
+                                raise RuntimeError(
+                                    f"Qwen3-TTS PD sampler state is invalid for req={req_id}"
+                                )
+                            if req_state.generator is None:
+                                raise RuntimeError(
+                                    f"Qwen3-TTS PD sampler generator is missing for req={req_id}"
+                                )
+                            req_state.generator.set_state(generator_state.detach().to("cpu").contiguous())
+                            logger.info(
+                                "[PD_TRACE] qwen3_tts_main_sampler_restored req=%s state_bytes=%d",
+                                req_id,
+                                generator_state.numel(),
+                            )
                         self.model_intermediate_buffer[req_id] = info_dict
                         setattr(
                             self.requests[req_id],
@@ -750,8 +969,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                    req_state.output_token_ids = req_data.all_token_ids[req_id][-num_output_tokens:]
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -1772,6 +1990,46 @@ class OmniGPUModelRunner(GPUModelRunner):
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())
                 num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                resume_meta = req_infos.get("meta")
+                if not isinstance(resume_meta, dict):
+                    additional_information = req_infos.get("additional_information")
+                    resume_meta = (
+                        additional_information.get("meta") if isinstance(additional_information, dict) else None
+                    )
+                resume_token_id = (
+                    resume_meta.get("pd_resume_token_id") if isinstance(resume_meta, dict) else None
+                )
+                resume_consumed = (
+                    bool(resume_meta.get("pd_resume_token_consumed", False))
+                    if isinstance(resume_meta, dict)
+                    else False
+                )
+                if isinstance(resume_token_id, torch.Tensor):
+                    resume_token_id = resume_token_id.item() if resume_token_id.numel() == 1 else None
+                try:
+                    resume_token_id = int(resume_token_id) if resume_token_id is not None else None
+                except (TypeError, ValueError):
+                    resume_token_id = None
+                is_pd_resume_token = (
+                    resume_token_id is not None
+                    and not resume_consumed
+                    and span_len == 1
+                    and num_computed_tokens == prompt_len
+                )
+                if is_pd_resume_token:
+                    # Keep the remote request at P's exact prompt length so
+                    # Mooncake pulls matching blocks. Once that prefix is
+                    # local, substitute P's sampled layer-0 token into D's
+                    # first decode position; this forward writes its local KV
+                    # and runs MTP exactly as a continuous decode would.
+                    input_ids[s] = resume_token_id
+                    resume_meta["pd_resume_token_consumed"] = True
+                    logger.info(
+                        "[PD_TRACE] qwen3_tts_decode_resume req=%s token_id=%d prompt_len=%d",
+                        req_id,
+                        resume_token_id,
+                        prompt_len,
+                    )
                 is_prefill = num_computed_tokens < prompt_len
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
@@ -1851,6 +2109,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         decode_batch_size = len(decode_req_ids)
         if decode_batch_size == 0:
             return
+
         _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
             num_tokens=decode_batch_size,
             num_reqs=decode_batch_size,
@@ -1880,7 +2139,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
             seed = None
             if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
+                seed = extra_args.get("tts_local_seed", extra_args.get("qwen3_tts_request_seed"))
             return int(seed) if seed is not None else None
 
         def _row_generator(req_id: str) -> torch.Generator | None:
@@ -1894,7 +2153,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             generator = cache.get(req_id)
             if generator is None or generator.device != req_input_ids.device:
                 generator = torch.Generator(device=req_input_ids.device)
-                generator.manual_seed(seed)
+                generator.manual_seed(int(seed))
                 cache[req_id] = generator
             return generator
 
@@ -1905,32 +2164,153 @@ class OmniGPUModelRunner(GPUModelRunner):
             for stale_id in [rid for rid in cache if rid not in self.requests]:
                 del cache[stale_id]
 
-        if (
-            decode_batch_size > 1
-            and any(generator is not None for generator in row_generators)
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
-        ):
-            # A torch.Generator is a single stream. Using one generator for a
-            # multi-row batch would make explicitly-seeded requests depend on
-            # other rows in the same scheduler step, so keep that path scalar.
+        if decode_batch_size > 1:
             saved_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size].clone()
             saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
             saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
             saved_text = self.text_step.gpu[:decode_batch_size].clone()
-            try:
-                for row, req_id in enumerate(decode_req_ids):
-                    self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
-                    self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
-                    self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
-                    self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
-                    row_offsets = None if start_offsets is None else [start_offsets[row]]
-                    self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
-            finally:
-                self.talker_mtp_input_ids.gpu[:decode_batch_size].copy_(saved_input_ids)
-                self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
-                self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
-                self.text_step.gpu[:decode_batch_size].copy_(saved_text)
-            return
+            replicas = getattr(self, "talker_mtp_code_predictors", None) or []
+            streams = getattr(self, "talker_mtp_streams", None) or []
+            if len(replicas) > 1 and len(streams) == len(replicas) and torch.cuda.is_available():
+                timing_enabled = self._mtp_ar_timing_enabled
+                if timing_enabled:
+                    self._timing_sync_device()
+                    mtp_t0 = time.perf_counter()
+                outputs: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * decode_batch_size
+                current_stream = torch.cuda.current_stream(device=self.device)
+                used_streams = []
+                talker_kwargs_base = {
+                    "do_sample": subtalker_params.get("do_sample"),
+                    "temperature": subtalker_params.get("temperature"),
+                    "top_k": subtalker_params.get("top_k"),
+                    "top_p": subtalker_params.get("top_p"),
+                }
+                if self._mtp_batch_per_replica:
+                    # Sub-batch dispatch: group rows by replica, each replica
+                    # gets a contiguous sub-batch and runs one forward() call.
+                    # Rows with explicit seed fall back to scalar within the group.
+                    # NOTE: replica assignment is keyed by req_id (not batch
+                    # position) -- see _mtp_replica_idx_for_req for why.
+                    rows_by_replica: dict[int, list[int]] = {}
+                    for row, req_id in enumerate(decode_req_ids):
+                        replica_idx = self._mtp_replica_idx_for_req(req_id, len(replicas))
+                        rows_by_replica.setdefault(replica_idx, []).append(row)
+                    for replica_idx, rows in rows_by_replica.items():
+                        stream = streams[replica_idx]
+                        if stream not in used_streams:
+                            stream.wait_stream(current_stream)
+                            used_streams.append(stream)
+                        group_req_ids = [decode_req_ids[r] for r in rows]
+                        group_has_seed = any(row_generators[r] is not None for r in rows)
+                        with torch.cuda.stream(stream):
+                            if group_has_seed:
+                                # Scalar fallback for this replica's rows only.
+                                for row, req_id in zip(rows, group_req_ids, strict=True):
+                                    talker_kwargs = dict(talker_kwargs_base)
+                                    if row_generators[row] is not None:
+                                        talker_kwargs["generator"] = row_generators[row]
+                                    if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+                                        talker_kwargs["req_ids"] = [req_id]
+                                        talker_kwargs["req_infos"] = [
+                                            self.model_intermediate_buffer.setdefault(req_id, {})
+                                        ]
+                                    outputs[row] = self.talker_mtp(
+                                        saved_input_ids[row : row + 1],
+                                        saved_embeds[row : row + 1],
+                                        saved_hidden[row : row + 1],
+                                        saved_text[row : row + 1],
+                                        code_predictor_override=replicas[replica_idx],
+                                        **talker_kwargs,
+                                    )
+                            else:
+                                row_idx = torch.tensor(rows, device=saved_input_ids.device, dtype=torch.long)
+                                talker_kwargs = dict(talker_kwargs_base)
+                                if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+                                    talker_kwargs["req_ids"] = group_req_ids
+                                    talker_kwargs["req_infos"] = [
+                                        self.model_intermediate_buffer.setdefault(r, {}) for r in group_req_ids
+                                    ]
+                                batch_embeds, batch_codes = self.talker_mtp(
+                                    saved_input_ids.index_select(0, row_idx),
+                                    saved_embeds.index_select(0, row_idx),
+                                    saved_hidden.index_select(0, row_idx),
+                                    saved_text.index_select(0, row_idx),
+                                    code_predictor_override=replicas[replica_idx],
+                                    **talker_kwargs,
+                                )
+                                for local_idx, row in enumerate(rows):
+                                    outputs[row] = (
+                                        batch_embeds[local_idx : local_idx + 1],
+                                        batch_codes[local_idx : local_idx + 1] if batch_codes is not None else None,
+                                    )
+                else:
+                    # Scalar dispatch: one call per row, each on its replica's stream.
+                    # NOTE: replica assignment is keyed by req_id (not batch
+                    # position) -- see _mtp_replica_idx_for_req for why.
+                    for row, req_id in enumerate(decode_req_ids):
+                        replica_idx = self._mtp_replica_idx_for_req(req_id, len(replicas))
+                        stream = streams[replica_idx]
+                        if stream not in used_streams:
+                            stream.wait_stream(current_stream)
+                            used_streams.append(stream)
+                        talker_kwargs = dict(talker_kwargs_base)
+                        if row_generators[row] is not None:
+                            talker_kwargs["generator"] = row_generators[row]
+                        if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+                            talker_kwargs["req_ids"] = [req_id]
+                            talker_kwargs["req_infos"] = [self.model_intermediate_buffer.setdefault(req_id, {})]
+                        with torch.cuda.stream(stream):
+                            outputs[row] = self.talker_mtp(
+                                saved_input_ids[row : row + 1],
+                                saved_embeds[row : row + 1],
+                                saved_hidden[row : row + 1],
+                                saved_text[row : row + 1],
+                                code_predictor_override=replicas[replica_idx],
+                                **talker_kwargs,
+                            )
+                for stream in used_streams:
+                    current_stream.wait_stream(stream)
+                if timing_enabled:
+                    self._timing_sync_device()
+                    self._record_mtp_ar_timing("mtp", (time.perf_counter() - mtp_t0) * 1000.0, rows=decode_batch_size)
+                out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
+                if not isinstance(out_key, tuple) or len(out_key) != 2:
+                    raise TypeError(
+                        f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}"
+                    )
+                if start_offsets is None:
+                    id_to_index = self.input_batch.req_id_to_index
+                    start_offsets = [int(self.query_start_loc.cpu[id_to_index[req_id]]) for req_id in decode_req_ids]
+                for row, (req_id, start_offset) in enumerate(zip(decode_req_ids, start_offsets, strict=True)):
+                    output = outputs[row]
+                    assert output is not None
+                    req_embeds_row, code_predictor_codes_row = output
+                    inputs_embeds[start_offset : start_offset + 1] = req_embeds_row[:1]
+                    if code_predictor_codes_row is not None:
+                        update_dict = {out_key[0]: {out_key[1]: code_predictor_codes_row[:1]}}
+                        self._merge_additional_information_update(req_id, update_dict)
+                return
+
+            if any(generator is not None for generator in row_generators) and not getattr(
+                self.model, "talker_mtp_accepts_per_row_generators", False
+            ):
+                # A torch.Generator is a single stream. Using one generator for a
+                # multi-row batch would make explicitly-seeded requests depend on
+                # other rows in the same scheduler step, so keep that path scalar.
+                try:
+                    for row, req_id in enumerate(decode_req_ids):
+                        self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
+                        self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
+                        self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
+                        self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
+                        row_offsets = None if start_offsets is None else [start_offsets[row]]
+                        self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
+                finally:
+                    self.talker_mtp_input_ids.gpu[:decode_batch_size].copy_(saved_input_ids)
+                    self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
+                    self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
+                    self.text_step.gpu[:decode_batch_size].copy_(saved_text)
+                return
 
         talker_kwargs = {
             "do_sample": subtalker_params.get("do_sample"),
@@ -1948,6 +2328,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             talker_kwargs["req_infos"] = [
                 self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
             ]
+        timing_enabled = self._mtp_ar_timing_enabled
+        if timing_enabled:
+            self._timing_sync_device()
+            mtp_t0 = time.perf_counter()
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -1958,6 +2342,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 text_step,
                 **talker_kwargs,
             )
+        if timing_enabled:
+            self._timing_sync_device()
+            self._record_mtp_ar_timing("mtp", (time.perf_counter() - mtp_t0) * 1000.0, rows=decode_batch_size)
         # update the inputs_embeds and code_predictor_codes
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:
@@ -1990,6 +2377,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
             )
 
+        timing_enabled = self._mtp_ar_timing_enabled
+        if timing_enabled:
+            self._timing_sync_device()
+            ar_t0 = time.perf_counter()
         model_output = super()._model_forward(
             input_ids=input_ids,
             positions=positions,
@@ -1998,6 +2389,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        if timing_enabled:
+            self._timing_sync_device()
+            if input_ids is not None:
+                num_tokens = int(input_ids.shape[0])
+            elif inputs_embeds is not None:
+                num_tokens = int(inputs_embeds.shape[0])
+            else:
+                num_tokens = 0
+            kind = "ar_decode" if self._is_decode_forward_for_timing() else "ar_prefill"
+            self._record_mtp_ar_timing(kind, (time.perf_counter() - ar_t0) * 1000.0, tokens=num_tokens)
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
