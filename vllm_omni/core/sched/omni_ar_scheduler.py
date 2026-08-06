@@ -858,14 +858,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if req_id in self._pd_prefill_submit_ready_requests:
+            pd_submit_ready = getattr(self, "_pd_prefill_submit_ready_requests", set())
+            if req_id in pd_submit_ready:
                 submit_params = {
                     "pd_submit_ready": True,
                     "transfer_id": f"xfer-{req_id}",
                     "remote_request_id": req_id,
                 }
                 kv_transfer_params = {**(kv_transfer_params or {}), **submit_params}
-                self._pd_prefill_submit_ready_requests.discard(req_id)
+                pd_submit_ready.discard(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 OmniSchedulerMixin._append_request_output(
                     self,
@@ -1254,9 +1255,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return request is None or not self._request_omits_kv_transfer_to_next_stage(request)
 
     def _cleanup_kv_tracking(self, request_ids: Iterable[str]) -> None:
+        pd_state_cache = getattr(self, "_kv_ready_multimodal_output_by_req", None)
+        pd_submit_ready = getattr(self, "_pd_prefill_submit_ready_requests", None)
         for req_id in request_ids:
-            self._kv_ready_multimodal_output_by_req.pop(req_id, None)
-            self._pd_prefill_submit_ready_requests.discard(req_id)
+            if pd_state_cache is not None:
+                pd_state_cache.pop(req_id, None)
+            if pd_submit_ready is not None:
+                pd_submit_ready.discard(req_id)
             if req_id in self.waiting_for_transfer_free:
                 continue
             self.transfer_triggered_requests.discard(req_id)
