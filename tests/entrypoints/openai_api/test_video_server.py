@@ -1989,10 +1989,6 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.seed == 42
     assert captured.quality == "high"
 
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-    assert MiniMaxH3Pipeline._resolve_request_quality(captured) == "high"
-
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
     """Frame interpolation parameters should be forwarded on the sync path."""

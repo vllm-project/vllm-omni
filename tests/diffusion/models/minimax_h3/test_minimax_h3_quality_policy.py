@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -62,7 +63,6 @@ def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
     plan = _resolve_quality(policy, num_inference_steps=17)
     spec = plan.cache_dit
 
-    assert plan.level == "high"
     assert spec is not None
     assert spec.installation_key == "minimax_h3.high"
     assert spec.num_inference_steps == 17
@@ -84,8 +84,12 @@ def test_high_quality_requires_cache_dit_startup_capability():
         _quality_od_config(cache_backend="none"),
     )
 
-    with pytest.raises(ValueError, match="requires the server to start"):
+    with pytest.raises(OmniClientError, match="requires the server to start") as exc_info:
         _resolve_quality(policy)
+
+    output = DiffusionOutput.from_exception(exc_info.value)
+    assert output.error_status_code == 400
+    assert output.error_type == "BadRequestError"
 
 
 @pytest.mark.parametrize(
@@ -94,8 +98,10 @@ def test_high_quality_requires_cache_dit_startup_capability():
         ("cache_dit", None, "minimax_h3.generic"),
         ("cache_dit", "lossless", None),
         ("cache_dit", "high", "minimax_h3.high"),
+        ("cache_dit", "fast", None),
         ("none", None, None),
         ("none", "lossless", None),
+        ("none", "fast", None),
     ],
 )
 def test_model_policy_owns_request_cache_target(cache_backend, quality, expected_key):
@@ -111,7 +117,6 @@ def test_model_policy_owns_request_cache_target(cache_backend, quality, expected
         quality=quality,
     )
 
-    assert plan.level == quality
     if expected_key is None:
         assert plan.cache_dit is None
     else:
@@ -131,9 +136,11 @@ def test_h3_adopts_runner_installed_cache_dit_backend():
             pipeline,
             "adopted",
             (adopted, installation_key),
-        )
+        ),
+        is_enabled=True,
     )
 
     pipeline.adopt_cache_dit_backend(backend)
 
     assert pipeline.adopted == (backend, "minimax_h3.generic")
+    assert pipeline.is_cache_dit_enabled()

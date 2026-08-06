@@ -13,23 +13,6 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-@pytest.mark.parametrize("quality", ["lossless", "high"])
-def test_offline_quality_reaches_h3_pipeline_boundary(quality: str):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    request = OmniDiffusionRequest(
-        prompt="test H3 quality",
-        sampling_params=OmniDiffusionSamplingParams(quality=quality),
-        request_id=f"quality-{quality}",
-    )
-    batch = DiffusionRequestBatch([request])
-
-    assert MiniMaxH3Pipeline._resolve_request_quality(batch.sampling_params) == quality
-
-
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest

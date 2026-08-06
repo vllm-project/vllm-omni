@@ -142,6 +142,10 @@ class SupportsRequestScopedCacheDiT(Protocol):
         """Assume ownership of an enabled Cache-DiT backend."""
         ...
 
+    def is_cache_dit_enabled(self) -> bool:
+        """Return whether this pipeline currently has Cache-DiT installed."""
+        ...
+
 
 def adopt_request_scoped_cache_dit(pipeline: object, backend: CacheDiTBackend) -> bool:
     """Transfer an enabled Cache-DiT backend to an opted-in pipeline."""
@@ -150,3 +154,9 @@ def adopt_request_scoped_cache_dit(pipeline: object, backend: CacheDiTBackend) -
         return False
     pipeline.adopt_cache_dit_backend(backend)
     return True
+
+
+def is_request_scoped_cache_dit_enabled(pipeline: object) -> bool:
+    """Read Cache-DiT state from a pipeline that owns its lifecycle."""
+
+    return isinstance(pipeline, SupportsRequestScopedCacheDiT) and pipeline.is_cache_dit_enabled()

@@ -168,10 +168,9 @@ class VideoGenerationRequest(BaseModel):
     quality: str | None = Field(
         default=None,
         description=(
-            "Request-level generation quality. When omitted, the model chooses "
-            "its default policy; 'lossless' uses the reference path and 'high' "
-            "uses model-specific approximate acceleration intended to preserve "
-            "high output quality."
+            "Request-level generation quality intent. Supported values are "
+            "'lossless', 'high', and 'fast'; exact behavior is model-specific. "
+            "When omitted, the model chooses its default policy."
         ),
     )
 

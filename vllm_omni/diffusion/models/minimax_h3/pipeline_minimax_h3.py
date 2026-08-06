@@ -49,7 +49,6 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -544,13 +543,6 @@ class MiniMaxH3Pipeline(
     ]
     dummy_run_num_frames: ClassVar[int] = 0
 
-    @staticmethod
-    def _resolve_request_quality(
-        sampling: OmniDiffusionSamplingParams,
-    ) -> str | None:
-        """Return the common request quality at the H3 pipeline boundary."""
-        return sampling.quality
-
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
 
@@ -558,6 +550,11 @@ class MiniMaxH3Pipeline(
             backend,
             installation_key=MINIMAX_H3_GENERIC_CACHE_KEY,
         )
+
+    def is_cache_dit_enabled(self) -> bool:
+        """Return the request-scoped Cache-DiT installation state."""
+
+        return self._cache_dit_runtime.is_enabled
 
     def __init__(
         self,
@@ -1575,7 +1572,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
 
         sampling = request.sampling_params
-        quality = self._resolve_request_quality(sampling)
+        quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)

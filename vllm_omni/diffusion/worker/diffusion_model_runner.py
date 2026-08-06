@@ -35,6 +35,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
     adopt_request_scoped_cache_dit,
+    is_request_scoped_cache_dit_enabled,
     supports_prompt_update,
     supports_step_execution,
 )
@@ -540,11 +541,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and prompt_embed_cache is not None:
                 logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
 
+            runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
             if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and od_config.cache_backend == "cache_dit"
+                od_config.cache_backend == "cache_dit"
                 and od_config.enable_cache_dit_summary
+                and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
 

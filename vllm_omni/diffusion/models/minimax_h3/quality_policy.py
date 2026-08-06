@@ -12,6 +12,7 @@ from vllm_omni.diffusion.cache.cachedit.runtime import (
     CacheDiTRequestSpec,
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_GENERIC_CACHE_KEY = "minimax_h3.generic"
 MINIMAX_H3_HIGH_CACHE_KEY = "minimax_h3.high"
@@ -33,7 +34,6 @@ def _high_quality_cache_config() -> DiffusionCacheConfig:
 class MiniMaxH3QualityPlan:
     """Resolved execution choices for one MiniMax H3 request."""
 
-    level: str | None
     cache_dit: CacheDiTRequestSpec | None
 
 
@@ -44,6 +44,8 @@ class MiniMaxH3QualityPolicy:
     server-configured profile, ``lossless`` selects no cache, and ``high``
     selects H3's high-quality profile. Without startup Cache-DiT capability,
     omitted and ``lossless`` requests select no cache while ``high`` fails.
+    Other registered quality intents select no cache until H3 defines a
+    model-specific policy for them.
     The pipeline owns applying the resulting target at the request boundary.
     """
 
@@ -59,11 +61,10 @@ class MiniMaxH3QualityPolicy:
     ) -> MiniMaxH3QualityPlan:
         if quality == "high":
             if self._configured_backend != "cache_dit":
-                raise ValueError(
+                raise OmniClientError(
                     'MiniMax-H3 quality="high" requires the server to start with cache_backend="cache_dit"'
                 )
             return MiniMaxH3QualityPlan(
-                level=quality,
                 cache_dit=CacheDiTRequestSpec(
                     installation_key=MINIMAX_H3_HIGH_CACHE_KEY,
                     cache_config=_high_quality_cache_config(),
@@ -82,7 +83,6 @@ class MiniMaxH3QualityPolicy:
             else None
         )
         return MiniMaxH3QualityPlan(
-            level=quality,
             cache_dit=cache_dit,
         )
 

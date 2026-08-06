@@ -79,5 +79,4 @@ def test_startup_cache_follows_omit_lossless_high_omit_state_machine(monkeypatch
     assert events[5][-1] == 40
     assert events[6][-1] == 30
     assert events[10][-1] == 20
-    assert runtime.installation_key == "generic"
     assert runtime.is_enabled

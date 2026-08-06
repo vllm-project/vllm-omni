@@ -35,10 +35,6 @@ class RequestScopedCacheDiTRuntime:
         self._installation_key: str | None = None
 
     @property
-    def installation_key(self) -> str | None:
-        return self._installation_key
-
-    @property
     def is_enabled(self) -> bool:
         return self._backend is not None and self._backend.is_enabled()
 

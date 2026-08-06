@@ -128,9 +128,6 @@ class TestStreamingVideoOutputWebSocket:
 
         _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
 
-        from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-        assert MiniMaxH3Pipeline._resolve_request_quality(sampling_params) == "high"
         assert sampling_params.quality == "high"
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
