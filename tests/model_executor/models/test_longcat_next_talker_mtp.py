@@ -60,8 +60,10 @@ class _StubModel(nn.Module):
     """
 
     _sample_audio_code = M._sample_audio_code
+    _sample_depth_codes = M._sample_depth_codes
     _sample_depth_head = M._sample_depth_head
     _sample_cfg_visual_codes = M._sample_cfg_visual_codes
+    _append_past_code = M._append_past_code
     _ensure_replicated_audio_code_embedding = M._ensure_replicated_audio_code_embedding
     _ensure_audio_code_embed_module = M._ensure_audio_code_embed_module
     _ensure_replicated_visual_code_embedding = M._ensure_replicated_visual_code_embedding
