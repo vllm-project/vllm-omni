@@ -86,6 +86,7 @@ class MiniMaxH3QualityPolicy:
             cache_dit=cache_dit,
         )
 
+
 __all__ = [
     "MINIMAX_H3_GENERIC_CACHE_KEY",
     "MINIMAX_H3_HIGH_CACHE_KEY",
