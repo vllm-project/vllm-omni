@@ -52,6 +52,7 @@ def pytorch_attn_forward(
     alibi_slopes=None,
     return_softmax=False,
     op_type="efficient",
+    attn_mask: torch.Tensor | None = None,
 ):
     assert op_type in ["flash", "efficient"], f"Invalid op_type: {op_type}"
     """
@@ -83,7 +84,38 @@ def pytorch_attn_forward(
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    if op_type == "flash":
+    if attn_mask is not None:
+        mask = attn_mask.to(device=q.device, dtype=torch.bool)
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+        elif mask.ndim != 4:
+            raise ValueError(f"Unsupported attention mask rank for ring SDPA: {mask.ndim}")
+
+        scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
+        scores.mul_(softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5)
+
+        if causal:
+            q_len, k_len = q.shape[-2], k.shape[-2]
+            causal_mask = torch.ones((q_len, k_len), dtype=torch.bool, device=q.device).tril()
+            mask = mask & causal_mask.view(1, 1, q_len, k_len)
+
+        mask = torch.broadcast_to(mask, scores.shape)
+        valid_rows = mask.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        scores = torch.where(valid_rows, scores, torch.zeros_like(scores))
+
+        probs = torch.softmax(scores, dim=-1)
+        probs = torch.where(valid_rows, probs, torch.zeros_like(probs))
+        out = torch.matmul(probs, v.to(torch.float32))
+        lse = torch.logsumexp(scores, dim=-1)
+        lse = torch.where(
+            valid_rows.squeeze(-1),
+            lse,
+            torch.full_like(lse, torch.finfo(lse.dtype).min),
+        )
+    elif op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
             q,
             k,

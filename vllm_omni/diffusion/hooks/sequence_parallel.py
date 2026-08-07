@@ -384,7 +384,6 @@ class SequenceParallelSplitHook(ModelHook):
         """
         from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
         from vllm_omni.diffusion.distributed.parallel_state import (
-            get_ring_parallel_world_size,
             get_sequence_parallel_rank,
             get_sequence_parallel_world_size,
         )
@@ -418,14 +417,6 @@ class SequenceParallelSplitHook(ModelHook):
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
                 f"Please switch to SDPA or Ascend attention backend."
-            )
-
-        # Ring attention does not support attention_mask
-        if get_ring_parallel_world_size() > 1:
-            raise ValueError(
-                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use Ring attention which does not support attention_mask. "
-                f"Please switch to Ulysses SP only."
             )
 
         # Calculate padding

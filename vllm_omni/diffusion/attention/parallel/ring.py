@@ -141,6 +141,7 @@ class RingParallelAttention:
                 joint_tensor_key=joint_key,
                 joint_tensor_value=joint_value,
                 joint_strategy=joint_strategy,
+                attn_mask=attn_metadata.attn_mask if attn_metadata is not None else None,
             )
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func

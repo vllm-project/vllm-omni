@@ -33,6 +33,7 @@ def ring_pytorch_attn_func(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
+    attn_mask=None,
 ):
     return RingAttentionFunc.apply(
         group,
@@ -45,6 +46,7 @@ def ring_pytorch_attn_func(
         joint_tensor_key,
         joint_tensor_value,
         joint_strategy,
+        attn_mask,
     )
 
 
@@ -64,6 +66,7 @@ class RingAttentionFunc(torch.autograd.Function):
         joint_tensor_key=None,
         joint_tensor_value=None,
         joint_strategy="front",
+        attn_mask=None,
     ):
         # Validate causal + joint_strategy combination
         # When causal=True and joint_strategy="rear", the causal mask would incorrectly
@@ -87,6 +90,41 @@ class RingAttentionFunc(torch.autograd.Function):
 
         out, lse = None, None
         next_k, next_v = None, None
+        original_k_len = k.shape[1]
+        joint_key_len = 0 if joint_tensor_key is None else joint_tensor_key.shape[1]
+        joint_query_len = max(0, q.shape[1] - original_k_len)
+
+        def _slice_attn_mask_for_step(step: int, step_k_len: int) -> torch.Tensor | None:
+            if attn_mask is None:
+                return None
+            if joint_strategy != "front":
+                raise ValueError("Ring attention mask slicing currently supports joint_strategy='front' only.")
+
+            owner_rank = (comm.rank - step) % comm.world_size
+            image_query_start = joint_query_len + comm.rank * original_k_len
+            image_key_start = joint_key_len + owner_rank * original_k_len
+
+            query_mask = attn_mask
+            if joint_query_len:
+                joint_query_mask = query_mask[..., :joint_query_len, :]
+                image_query_mask = query_mask[
+                    ...,
+                    image_query_start : image_query_start + original_k_len,
+                    :,
+                ]
+                query_mask = torch.cat([joint_query_mask, image_query_mask], dim=-2)
+            else:
+                query_mask = query_mask[
+                    ...,
+                    image_query_start : image_query_start + original_k_len,
+                    :,
+                ]
+
+            step_mask = query_mask[..., image_key_start : image_key_start + step_k_len]
+            if step == 0 and joint_key_len:
+                joint_mask = query_mask[..., :joint_key_len]
+                step_mask = torch.cat([joint_mask, step_mask], dim=-1)
+            return None if torch.all(step_mask) else step_mask
 
         if sm_scale is None:
             sm_scale = q.shape[-1] ** -0.5
@@ -108,6 +146,7 @@ class RingAttentionFunc(torch.autograd.Function):
                         step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                         step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
+                step_attn_mask = _slice_attn_mask_for_step(step, k.shape[1])
                 block_out, block_lse = pytorch_attn_forward(
                     q,
                     step_k,
@@ -115,6 +154,7 @@ class RingAttentionFunc(torch.autograd.Function):
                     softmax_scale=sm_scale,
                     causal=is_causal and step == 0,
                     op_type=op_type,
+                    attn_mask=step_attn_mask,
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
