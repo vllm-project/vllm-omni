@@ -10,6 +10,7 @@ from dataclasses import fields
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -47,6 +48,7 @@ class BaseScheduler(ABC):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
+        self._diffusion_kv_enabled = False
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -63,6 +65,10 @@ class BaseScheduler(ABC):
             self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
+        self._diffusion_kv_enabled = (
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -251,11 +257,42 @@ class BaseScheduler(ABC):
         """Remove subclass-owned per-request state before popping request state."""
 
     def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> SchedulerRequestState:
+        kv_requests = request.diffusion_kv_requests or ()
+        if self._diffusion_kv_enabled:
+            self._reject_legacy_dense_kv(request)
+            if not kv_requests:
+                raise ValueError("paged_scheduler request preprocessing did not produce DiffusionKVRequest state")
+        elif kv_requests:
+            raise ValueError("dense_legacy request unexpectedly contains Scheduler Diffusion KV requests")
+
+        # DiffusionKVRequest objects are mutable Scheduler/native-KVCacheManager
+        # state and must never ride the normal request payload to a Worker.
+        request.diffusion_kv_requests = None
         return SchedulerRequestState(
             request_id=request_id,
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
+            diffusion_kv_requests=kv_requests,
         )
+
+    @staticmethod
+    def _reject_legacy_dense_kv(request: OmniDiffusionRequest) -> None:
+        """Keep dense injected KV out of the Scheduler-owned paged path."""
+
+        populated_fields: list[str] = []
+        for owner_name, owner in (
+            ("request", request),
+            ("sampling_params", request.sampling_params),
+        ):
+            for field_name, value in vars(owner).items():
+                if value is not None and (field_name == "past_key_values" or field_name.endswith("_past_key_values")):
+                    populated_fields.append(f"{owner_name}.{field_name}")
+        if populated_fields:
+            fields_text = ", ".join(sorted(populated_fields))
+            raise ValueError(
+                "paged_scheduler Diffusion KV does not accept legacy dense KV payloads; "
+                f"clear these fields before admission: {fields_text}"
+            )
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:

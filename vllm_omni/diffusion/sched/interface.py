@@ -6,9 +6,12 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -129,6 +132,7 @@ class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
