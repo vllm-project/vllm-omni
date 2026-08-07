@@ -571,3 +571,34 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# [PD] Patch MooncakeConnector globally for PD disaggregation.
+#
+# This MUST live here, not only in PDDisaggregationMixin._init_pd_state():
+# _init_pd_state runs in the APIServer process, while the KV connector is
+# constructed inside each stage worker subprocess. Those subprocesses import
+# vllm_omni (and therefore this module) but never touch the mixin, so without
+# this call the decode-side connector stays unpatched, never issues its KV
+# pull, and every decode request sits in WAITING_FOR_REMOTE_KVS until the
+# 480 s mooncake timeout.
+def _patch_mooncake_connector_for_pd():
+    try:
+        from vllm_omni.distributed.kv_transfer.mooncake_pd_patch import (
+            apply_mooncake_connector_patch,
+        )
+
+        apply_mooncake_connector_patch()
+    except ImportError:
+        pass
+    except Exception:
+        # Patch failure is non-fatal for non-PD deployments; PD deployments
+        # will surface it later as "Missing remote_request_id".
+        _PATCH_LOGGER.warning(
+            "Failed to apply MooncakeConnector PD patch at vllm_omni import; "
+            "PD KV transfer will fail with 'Missing remote_request_id' if used.",
+            exc_info=True,
+        )
+
+
+_patch_mooncake_connector_for_pd()
