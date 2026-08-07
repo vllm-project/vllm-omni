@@ -181,10 +181,8 @@ def test_high_quality_requires_cache_dit_startup_capability():
         ("cache_dit", None, "minimax_h3.generic"),
         ("cache_dit", "lossless", None),
         ("cache_dit", "high", "minimax_h3.high"),
-        ("cache_dit", "fast", None),
         ("none", None, None),
         ("none", "lossless", None),
-        ("none", "fast", None),
     ],
 )
 def test_model_policy_owns_request_cache_target(cache_backend, quality, expected_key):

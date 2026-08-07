@@ -11,7 +11,7 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
-DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high", "fast")
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
 class OmniTextPrompt(TextPrompt):

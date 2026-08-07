@@ -131,8 +131,6 @@ class MiniMaxH3QualityPolicy:
     server-configured profile, ``lossless`` selects no cache, and ``high``
     selects H3's high-quality profile. Without startup Cache-DiT capability,
     omitted and ``lossless`` requests select no cache while ``high`` fails.
-    Other registered quality intents select no cache until H3 defines a
-    model-specific policy for them.
     H3-specific Cache-DiT refresh hints are read from request ``extra_args``;
     they do not change the global diffusion request contract.
     The pipeline owns applying the resulting target at the request boundary.

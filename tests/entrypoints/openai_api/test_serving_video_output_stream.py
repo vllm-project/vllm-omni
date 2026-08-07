@@ -130,6 +130,29 @@ class TestStreamingVideoOutputWebSocket:
 
         assert sampling_params.quality == "high"
 
+    def test_omitted_quality_preserves_engine_default(self, mocker: MockerFixture) -> None:
+        async def mock_generate(*_args, **_kwargs):
+            if False:
+                yield None
+
+        _app, handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[],
+            mock_generate=mock_generate,
+        )
+        engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(quality="high")]
+        request_data = handler._coerce_request_data(
+            {
+                "type": "session.start",
+                "prompt": "H3 streaming default quality",
+            }
+        )
+        request = VideoGenerationRequest(**request_data)
+
+        _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+
+        assert sampling_params.quality == "high"
+
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""
 
