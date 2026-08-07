@@ -130,9 +130,6 @@ class Qwen3OmniNativeDuplexServingAdapter:
             "top_k": 20,
             "repetition_penalty": 1.05,
         }
-        stop_token_ids = cls._thinker_stop_token_ids(model_config)
-        if stop_token_ids:
-            stage0_params["stop_token_ids"] = stop_token_ids
         stage1_params: dict[str, object] = {
             "temperature": 0.9,
             "top_k": 50,

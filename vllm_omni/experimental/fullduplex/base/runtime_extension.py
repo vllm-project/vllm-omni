@@ -65,10 +65,6 @@ class BaseDuplexRuntimeExtension(ABC):
                 if not hasattr(params, name):
                     continue
                 setattr(params, name, value)
-                if name == "stop_token_ids":
-                    all_stop_token_ids = getattr(params, "_all_stop_token_ids", None)
-                    if isinstance(all_stop_token_ids, set):
-                        all_stop_token_ids.update(int(token_id) for token_id in value)
             configured.append(params)
         return tuple(configured)
 
