@@ -626,6 +626,12 @@ single `MiniMaxH3DiTModel` forward per step.
 
 TeaCache and Cache-DiT are mutually exclusive; pick one cache backend per server.
 
+The examples use `rel_l1_thresh=0.17`, which provided the best conservative
+speed/quality balance in the validated 107-frame T2VA workload. Lower values
+may produce few or no cache hits, while higher values can improve performance
+at the cost of output quality. Validate the threshold on representative
+prompts and generation settings before changing it.
+
 ### Offline (Python API)
 
 ```python
@@ -648,7 +654,13 @@ outputs = omni.generate(
         fps=24,
         num_inference_steps=50,
         seed=42,
-        extra_args={"task": "t2va", "flow_shift": 12.0, "audio_flow_shift": 3.0},
+        extra_args={
+            "task": "t2va",
+            "duration": 4.0,
+            "aspect_ratio": "16:9",
+            "flow_shift": 12.0,
+            "audio_flow_shift": 3.0,
+        },
     ),
 )
 ```
