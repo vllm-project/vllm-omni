@@ -172,7 +172,7 @@ OmniDiffusionSamplingParams(
 | no Cache-DiT | omitted or `lossless` | Run the reference path |
 | no Cache-DiT | `high` | Reject the request |
 
-See the [MiniMax H3 recipe](../../../../recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
+See the [MiniMax H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
 for a complete request and measured trade-off.
 
 ---
