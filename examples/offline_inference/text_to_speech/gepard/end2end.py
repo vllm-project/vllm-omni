@@ -6,6 +6,13 @@ Single-stage native-AR pipeline: a Qwen3.5 backbone samples one 32-code FSQ
 frame per step; the NeMo NanoCodec decodes the frames to a 22.05 kHz mono
 waveform. PR1 is zero-shot (default learned voice) — no reference audio.
 
+Generation length and seed are stage settings, not flags here: one output
+token is one audio frame, so ``max_tokens`` in the deploy YAML is the frame
+budget, and ``seed`` there makes the in-model 32-head sampling reproducible.
+Pass a copy of the YAML via ``--deploy-config`` to change either — a
+SamplingParams object handed to ``generate()`` would replace the stage
+defaults wholesale rather than merge, dropping the pipeline's stop token.
+
 Usage:
   python end2end.py --text "Hello, this is Gepard speaking."
 """
@@ -18,6 +25,7 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
+import vllm_omni
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -26,9 +34,12 @@ from vllm_omni import Omni  # noqa: E402
 
 MODEL = "nineninesix/gepard-1.0"
 SAMPLE_RATE = 22050
+# Absolute: the loader hands the path straight to OmegaConf, which resolves a
+# bare name against the current working directory, not the package.
+DEFAULT_DEPLOY_CONFIG = str(Path(vllm_omni.__file__).resolve().parent / "deploy" / "gepard.yaml")
 
 
-def build_request(text: str, max_new_frames: int = 1000, seed: int | None = None) -> dict:
+def build_request(text: str) -> dict:
     """Build an Omni request payload for Gepard (zero-shot, no ref audio).
 
     ``preprocess`` only consumes the [speaker slots, SOT, text, EOT, SOS]
@@ -44,17 +55,12 @@ def build_request(text: str, max_new_frames: int = 1000, seed: int | None = None
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     prompt_token_ids = build_gepard_prompt_ids(
         tokenizer(text, add_special_tokens=False)["input_ids"],
-        start_of_text=cfg.start_of_text,
-        end_of_text=cfg.end_of_text,
-        start_of_speech=cfg.start_of_speech,
-        speaker_token_base=cfg.speaker_token_base,
-        num_speaker_prefix=cfg.num_speaker_prefix,
+        config=cfg,
     )
-
-    additional: dict = {"text": [text], "max_new_frames": [max_new_frames]}
-    if seed is not None:
-        additional["seed"] = [seed]
-    return {"prompt_token_ids": prompt_token_ids, "additional_information": additional}
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "additional_information": {"text": [text]},
+    }
 
 
 def save_audio(waveform: torch.Tensor, path: str, sample_rate: int = SAMPLE_RATE) -> None:
@@ -81,7 +87,7 @@ def main(args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Synthesizing: {args.text!r}")
-    inputs = build_request(text=args.text, max_new_frames=args.max_new_frames, seed=args.seed)
+    inputs = build_request(text=args.text)
 
     for i, stage_outputs in enumerate(omni.generate(inputs)):
         # OmniRequestOutput.request_output is a single RequestOutput, not a list.
@@ -113,8 +119,6 @@ def main(args) -> None:
 def parse_args():
     parser = TrackingArgumentParser(description="Gepard-1.0 offline TTS inference (zero-shot)")
     parser.add_argument("--text", default="Hello, this is Gepard speaking.", help="Text to synthesize.")
-    parser.add_argument("--max-new-frames", type=int, default=1000, help="Max AR frames (21.5 fps).")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument(
         "--output-dir",
         default=os.path.join(
@@ -125,11 +129,12 @@ def parse_args():
     )
     parser.add_argument(
         "--deploy-config",
-        default="gepard.yaml",
+        default=DEFAULT_DEPLOY_CONFIG,
         help=(
-            "Deploy YAML: a bare name resolves against vllm_omni/deploy/. This must stay set — "
-            "the checkpoint self-identifies as qwen3_5_text, so without the YAML's `pipeline: gepard` "
-            "pin the architectures fallback routes Qwen3_5ForCausalLM to the diffusion registry."
+            "Path to the deploy YAML (default: the packaged vllm_omni/deploy/gepard.yaml). This must "
+            "stay set — the checkpoint self-identifies as qwen3_5_text, so without the YAML's "
+            "`pipeline: gepard` pin the architectures fallback routes Qwen3_5ForCausalLM to the "
+            "diffusion registry. Copy it to change max_tokens (the frame budget) or seed."
         ),
     )
     # The upstream defaults are too tight for a cold start (backbone + codec

@@ -8,7 +8,7 @@ heads, binary stop head and voice-clone ref_compressor are Gepard additions.
 
 Parses the model's ``gepard_config.json`` sidecar, which nests the LM
 parameters under ``backbone_config`` and carries audio-head cardinalities,
-special tokens and codec settings.
+special tokens, codec settings and the short-text repetition layout.
 
 The backbone uses standard 1D RoPE. The sidecar's ``backbone_config`` carries
 vestigial mrope keys from a template, so they are stripped when building the
@@ -54,6 +54,8 @@ class GepardConfig(PretrainedConfig):
         audio_embed_dim: int = 32,
         # -- Special tokens (gepard_config.json ``special_tokens``) --
         special_tokens: dict | None = None,
+        # -- Short-text repetition (gepard_config.json ``text_repetition``) --
+        text_repetition: dict | None = None,
         # -- NeMo NanoCodec (gepard_config.json ``codec``) --
         codec: dict | None = None,
         # -- Voice cloning (parsed + carried; PR1 uses null_prefix only) --
@@ -66,8 +68,6 @@ class GepardConfig(PretrainedConfig):
         #    31 side-channel heads use the same temperature in-model) --
         temperature: float = 0.3,
         top_p: float = 0.95,
-        # -- Generation bound: max audio frames per request --
-        max_frames: int = 1000,
         **kwargs,
     ):
         # WARNING: every attribute below is assigned before super().__init__()
@@ -97,6 +97,18 @@ class GepardConfig(PretrainedConfig):
         self.tokeniser_length = st.get("tokeniser_length", 248077)
         self.speaker_token_base = self.tokeniser_length
 
+        # ---- Short-text repetition (prompt layout) -----------------------
+        # A short text is repeated so its text region carries enough token
+        # mass; ``prompt.py`` reads these. They must match the training
+        # layout, so they come from the checkpoint rather than a literal.
+        # ``mixed_keep_prob`` / ``seed`` in the same block are training-only
+        # (the inference repeat count is deterministic) and not parsed.
+        tr = text_repetition or {}
+        self.text_repetition_enabled = tr.get("enabled", True)
+        self.text_repetition_target_tokens = tr.get("target_text_tokens", 16)
+        self.text_repetition_apply_below = tr.get("apply_below", 13)
+        self.text_repetition_max_repeats = tr.get("max_repeats", 8)
+
         # ---- Codec (NeMo NanoCodec, runs OUTSIDE vLLM) -------------------
         cc = codec or {}
         self.codec_id = cc.get("codec_id", "nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps")
@@ -116,7 +128,6 @@ class GepardConfig(PretrainedConfig):
         # ---- Sampling / generation --------------------------------------
         self.temperature = temperature
         self.top_p = top_p
-        self.max_frames = max_frames
 
         # ---- Voice cloning (carried for the follow-up cloning PR) --------
         vc = voice_cloning or {}

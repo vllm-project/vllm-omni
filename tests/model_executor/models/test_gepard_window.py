@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU coverage for Gepard's prompt layout and streaming-decode window.
+"""CPU coverage for Gepard's prompt layout, streaming-decode window and config.
 
 The e2e test needs a GPU, NeMo and the checkpoint, so it only runs nightly.
 These pin the parts that are pure logic and break silently: which frames each
-decode covers, which samples survive the lookback trim, and the prompt layout.
+decode covers, which samples survive the lookback trim, the prompt layout, and
+that the packaged deploy config sits where the example looks for it.
 
 The codec is replaced by a shift-invariant stand-in whose output depends only
 on the codes, which makes "chunked emissions concatenate to one whole-history
@@ -13,10 +14,14 @@ decode" an exact assertion — the contract lookback exists to provide.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn as nn
 
+import vllm_omni
+from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
 from vllm_omni.model_executor.models.gepard.gepard_talker import (
     CHUNK_FRAMES,
@@ -36,6 +41,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 SAMPLES_PER_FRAME = 1024
 NUM_HEADS = 32
 SAMPLE_RATE = 22050
+# Text-token count at or above which the layout is left unrepeated, read from
+# the checkpoint defaults so the boundary cases follow the config.
+APPLY_BELOW = GepardConfig().text_repetition_apply_below
 
 
 class _ShiftInvariantCodec:
@@ -176,23 +184,26 @@ def test_codec_runs_once_per_chunk_not_once_per_frame() -> None:
     assert sum(fake.windows) < num_frames * 2  # far below one decode per frame
 
 
-def test_tail_is_flushed_when_a_request_ends_without_stop() -> None:
-    """max_tokens / abort finish the request with no STOP frame; the frames
-    committed since the last chunk must still reach the queue."""
+def test_final_emit_drains_a_partial_chunk() -> None:
+    """A request can end mid-chunk (max_tokens, STOP); the frames committed
+    since the last cadence boundary must still reach the queue.
+
+    Arithmetic only: this drives ``_emit_audio`` directly, so it says nothing
+    about *whether* the engine reaches it on the request's last step. That
+    wiring lives in ``test_gepard_wiring.py`` — a bug there leaves this green.
+    """
     codec, _fake = _make_codec()
     talker = _make_talker(codec)
     state = _GepardState(request_id="req-0")
     num_frames = FIRST_CHUNK_FRAMES + CHUNK_FRAMES + 5
-    talker._active_states["req-0"] = state
 
     _generate(talker, state, num_frames, stop_at_end=False)
     assert state.emitted_frames < num_frames, "a partial chunk should still be pending"
 
-    talker._deferred_cleanup_ids.add("req-0")  # on_requests_finished's effect
-    talker._flush_deferred_cleanup()
+    talker._emit_audio(state, is_final=True)
 
     torch.testing.assert_close(_drain(talker), _expected_samples(num_frames))
-    assert "req-0" not in talker._active_states
+    assert state.emitted_frames == num_frames
 
 
 def test_emitting_with_nothing_pending_is_a_no_op() -> None:
@@ -247,19 +258,106 @@ def test_end_of_speech_tail_is_a_no_op_by_default() -> None:
     assert out is audio
 
 
+def _repeat_count(ids: list[int], cfg: GepardConfig) -> int:
+    """How many ``[SOT ... EOT]`` copies the layout carries."""
+    return ids.count(cfg.start_of_text)
+
+
 def test_gepard_prompt_layout() -> None:
     """The prompt carries the speaker slots and exactly one SOS, at the end."""
     cfg = GepardConfig()
-    ids = build_gepard_prompt_ids(
-        [1, 2, 3],
-        start_of_text=cfg.start_of_text,
-        end_of_text=cfg.end_of_text,
-        start_of_speech=cfg.start_of_speech,
-        speaker_token_base=cfg.speaker_token_base,
-        num_speaker_prefix=cfg.num_speaker_prefix,
-    )
+    ids = build_gepard_prompt_ids([1, 2, 3], config=cfg)
 
     slots = [cfg.speaker_token_base + i for i in range(cfg.num_speaker_prefix)]
     assert ids[: cfg.num_speaker_prefix] == slots
     assert ids.count(cfg.start_of_speech) == 1, "only the canonical copy may carry SOS"
     assert ids[-1] == cfg.start_of_speech, "the first frame is sampled from the SOS position"
+
+
+def test_short_text_repeats_to_reach_the_target_token_mass() -> None:
+    """A short text is repeated until its region holds ~target_text_tokens."""
+    cfg = GepardConfig()
+    text = [1, 2, 3, 4]  # target 16 / 4 -> 4 copies
+    ids = build_gepard_prompt_ids(text, config=cfg)
+
+    assert _repeat_count(ids, cfg) == 4
+    assert ids.count(cfg.start_of_speech) == 1, "only the last copy opens the speech region"
+    assert ids[-1] == cfg.start_of_speech
+
+
+@pytest.mark.parametrize(
+    ("num_text_tokens", "repeated"),
+    [
+        (APPLY_BELOW - 1, True),
+        (APPLY_BELOW, False),
+        (APPLY_BELOW + 1, False),
+    ],
+)
+def test_apply_below_is_the_repetition_boundary(num_text_tokens: int, repeated: bool) -> None:
+    """Both sides of the threshold: at apply_below the text is left alone.
+
+    The layout has to match training here or WER collapses, and the boundary
+    is where an off-by-one would be invisible in a single happy-path clip.
+    """
+    cfg = GepardConfig()
+    ids = build_gepard_prompt_ids(list(range(1, num_text_tokens + 1)), config=cfg)
+
+    assert (_repeat_count(ids, cfg) > 1) is repeated
+
+
+def test_max_repeats_caps_a_one_token_text() -> None:
+    """target/1 would ask for 16 copies; the cap keeps the prefill bounded."""
+    cfg = GepardConfig()
+    ids = build_gepard_prompt_ids([1], config=cfg)
+
+    assert _repeat_count(ids, cfg) == cfg.text_repetition_max_repeats
+
+
+def test_repetition_thresholds_are_read_from_the_config() -> None:
+    """The numbers come from the checkpoint sidecar, not from literals.
+
+    A checkpoint whose text_repetition block differs must change the layout;
+    duplicating the values in the builder would silently ignore it.
+    """
+    cfg = GepardConfig(text_repetition={"enabled": True, "target_text_tokens": 9, "apply_below": 8, "max_repeats": 2})
+    assert _repeat_count(build_gepard_prompt_ids([1, 2, 3], config=cfg), cfg) == 2  # ceil(9/3)=3, capped at 2
+    assert _repeat_count(build_gepard_prompt_ids(list(range(8)), config=cfg), cfg) == 1  # at apply_below
+
+
+def test_repetition_can_be_disabled() -> None:
+    cfg = GepardConfig(text_repetition={"enabled": False})
+    ids = build_gepard_prompt_ids([1], config=cfg)
+
+    assert _repeat_count(ids, cfg) == 1
+    assert ids[-1] == cfg.start_of_speech
+
+
+def test_empty_text_is_rejected() -> None:
+    """An empty text would still assemble a valid layout and be voiced.
+
+    ``[slots, SOT, EOT, SOS]`` parses, prefills and generates: the failure is
+    audible, not raised, which is the worst shape for a caller to debug.
+    """
+    with pytest.raises(ValueError, match="at least one text token"):
+        build_gepard_prompt_ids([], config=GepardConfig())
+
+
+def test_packaged_deploy_config_is_where_the_example_looks_for_it() -> None:
+    """The example resolves its default off ``vllm_omni.__file__``; tests reach
+    the same YAML through ``tests.helpers.stage_config``, so nothing covered the
+    packaged location until this.
+
+    ``pipeline: gepard`` is the load-bearing key: the checkpoint self-identifies
+    as qwen3_5_text, so without the pin the architectures fallback routes it to
+    the diffusion registry.
+
+    This asserts the location, not the example's constant — importing the
+    example would pull ``Omni`` and NeMo into a CPU test. Running the quick
+    start verbatim stays a release check.
+    """
+    path = Path(vllm_omni.__file__).resolve().parent / "deploy" / "gepard.yaml"
+    assert path.is_file(), f"packaged deploy config missing at {path}"
+
+    deploy = load_deploy_config(path)
+    assert deploy.pipeline == "gepard"
+    assert deploy.stages, "deploy config declares no stages"

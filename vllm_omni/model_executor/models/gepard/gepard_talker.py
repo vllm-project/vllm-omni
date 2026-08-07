@@ -51,15 +51,23 @@ class _ReqInfo:
     is_prefill: bool
     prompt_len: int
     num_computed_tokens: int
+    # Engine-side output-token cap; None when the runner does not thread it.
+    max_tokens: int | None
+    # SamplingParams.seed; None when the caller did not ask for reproducibility.
+    seed: int | None
 
     @classmethod
     def from_hook_kwargs(cls, kwargs: dict[str, Any], *, span: int) -> _ReqInfo:
         # span fallback: direct calls (unit tests) don't thread scheduler state.
+        max_tokens = kwargs.get("_omni_max_tokens")
+        seed = kwargs.get("_omni_seed")
         return cls(
             request_id=str(kwargs.get("request_id", "default")),
             is_prefill=bool(kwargs.get("_omni_is_prefill", span > 1)),
             prompt_len=int(kwargs.get("_omni_prompt_len") or 0),
             num_computed_tokens=int(kwargs.get("_omni_num_computed_tokens") or 0),
+            max_tokens=None if max_tokens is None else int(max_tokens),
+            seed=None if seed is None else int(seed),
         )
 
 
@@ -84,6 +92,9 @@ class _GepardState:
     emitted_frames: int = 0
     # Speaker prefix (PR1: always null_prefix; cloning PR overrides).
     speaker_prefix: torch.Tensor | None = None
+    # RNG for this request's in-model sampling; set only when it carries a
+    # seed. None means the sampling draws from the global RNG.
+    generator: torch.Generator | None = None
     frame_count: int = 0
     past_first_step: bool = False
     is_stopping: bool = False
@@ -109,7 +120,7 @@ class GepardTalkerForConditionalGeneration(nn.Module):
         self.config = cfg
         self._device = current_omni_platform.get_torch_device()
         # Deterministic argmax sampling, for reproducible comparisons.
-        self._greedy = os.environ.get("TTS_GREEDY", "0") == "1"
+        self._greedy = os.environ.get("VLLM_GEPARD_GREEDY", "0") == "1"
         # -------------------- audio-head layout --------------------
         self.vocab_sizes: list[int] = list(cfg.audio_head_levels)  # [8,7,6,6]*8
         self.num_heads: int = cfg.num_audio_heads  # 32
@@ -148,12 +159,15 @@ class GepardTalkerForConditionalGeneration(nn.Module):
         # Cheap and NeMo-free to construct; load() does the heavy import.
         self._codec = NanoCodec(codec_id=cfg.codec_id, sample_rate=cfg.codec_sample_rate)
 
+        self._max_model_len: int = int(vllm_config.model_config.max_model_len or 0)
+
         self._active_states: dict[str, _GepardState] = {}
         # These queues must stay index-aligned across preprocess -> forward ->
         # compute_logits: preprocess appends in input_batch.req_ids order.
         # samples_frame is False for a partial prefill chunk, whose sampled
-        # token vLLM discards.
-        self._pending_requests: list[tuple[str, int, bool]] = []
+        # token vLLM discards; is_last_token marks the step on which the engine
+        # will finish the request for running out of budget.
+        self._pending_requests: list[tuple[str, int, bool, bool]] = []
         # (req_id, head0, do_stop); head0 < 0 marks a discarded placeholder row.
         self._results_queue: list[tuple[str, int, bool]] = []
         self._audio_queue: list[tuple[str, torch.Tensor | None]] = []
@@ -228,15 +242,54 @@ class GepardTalkerForConditionalGeneration(nn.Module):
         self._deferred_cleanup_ids.update(str(r) for r in finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
+        """Free finished requests' state. Cleanup only — never emits audio.
+
+        Emitting from here cannot work, in two independent ways: this runs at
+        the end of the NEXT forward, which for the last in-flight request never
+        happens; and by then the id has left ``req_ids_output_copy``, so
+        ``_resolve_sparse_mm_routing`` drops any payload queued under it. The
+        tail is emitted in ``forward`` instead, on the request's final step,
+        while it is still in the output batch.
+
+        Whatever is still pending here is therefore genuinely unshippable — an
+        abort, or a finish this model could not predict. Say so rather than
+        dropping it quietly.
+        """
         for req_id in self._deferred_cleanup_ids:
-            # A request can finish without our STOP ever firing (max_tokens,
-            # abort). Drain whatever frames it accumulated before dropping the
-            # state, else the tail of the clip is silently lost.
-            state = self._active_states.get(req_id)
-            if state is not None:
-                self._emit_audio(state, is_final=True)
-            self._active_states.pop(req_id, None)
+            state = self._active_states.pop(req_id, None)
+            if state is not None and state.frame_count > state.emitted_frames:
+                logger.warning(
+                    "Gepard request %s ended with %d undelivered frame(s): it finished "
+                    "without the stop head firing and without reaching its token budget "
+                    "(aborted or preempted). Its audio is truncated.",
+                    req_id,
+                    state.frame_count - state.emitted_frames,
+                )
         self._deferred_cleanup_ids.clear()
+
+    def _is_last_output_token(self, info: _ReqInfo, *, span: int, samples_frame: bool) -> bool:
+        """Whether the token sampled this step is the request's budget-final one.
+
+        vLLM finishes a request at the end of the step that produces its
+        ``max_tokens``-th output token (or that fills ``max_model_len``). That
+        step is the last one on which the request appears in the runner's
+        output batch, so it is also the last chance to ship its audio.
+
+        Counted off the engine's own cursor rather than a local tally, so a
+        re-prefill after preemption cannot desync it.
+        """
+        if not samples_frame:
+            # A partial prefill chunk's sampled token is discarded, so it does
+            # not count against the budget.
+            return False
+        budget = info.max_tokens
+        if self._max_model_len:
+            len_cap = self._max_model_len - info.prompt_len
+            budget = len_cap if budget is None else min(budget, len_cap)
+        if budget is None or budget <= 0:
+            return False
+        produced = info.num_computed_tokens + span - info.prompt_len + 1
+        return produced >= budget
 
     # -------------------- streaming codec decode --------------------
 
@@ -269,25 +322,49 @@ class GepardTalkerForConditionalGeneration(nn.Module):
 
     # -------------------- 32-head sampling + stop --------------------
 
-    def _sample_frame(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(N, hidden) -> head0 (N,), heads_1_31 (N, 31), do_stop (N,)."""
+    @staticmethod
+    def _gumbel_noise(ref: torch.Tensor, generators: list[torch.Generator | None] | None) -> torch.Tensor:
+        """Gumbel noise shaped like ``ref``; row i uses ``generators[i]`` if set.
+
+        A seeded row draws its own noise of a fixed shape, so what a request
+        samples does not depend on which other requests shared its batch. With
+        no seeded row anywhere this is one batched draw from the global RNG,
+        which is the unseeded path.
+        """
+        if not generators or all(g is None for g in generators):
+            u = torch.rand_like(ref)
+        else:
+            u = torch.stack(
+                [
+                    torch.rand(ref.shape[1:], generator=g, device=ref.device, dtype=ref.dtype)
+                    if g is not None
+                    else torch.rand(ref.shape[1:], device=ref.device, dtype=ref.dtype)
+                    for g in generators
+                ]
+            )
+        return -torch.log(-torch.log(u.clamp_min_(1e-20)))
+
+    def _sample_frame(
+        self,
+        hidden: torch.Tensor,
+        generators: list[torch.Generator | None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(N, hidden) -> head0 (N,), heads_1_31 (N, 31), do_stop (N,).
+
+        ``generators`` is row-aligned with ``hidden`` (both follow
+        ``_pending_requests``). The 32 heads are sampled here rather than by
+        vLLM's sampler, so a request's seed only reaches the audio through it.
+        """
         fused = self.fused_codebook_head(hidden)  # (N, 216)
 
         gathered = fused[:, self._cb_gather_idx].float() + self._cb_mask  # (N,31,8)
-        if self._greedy:
-            heads = gathered.argmax(dim=-1)
-        else:
-            u = torch.rand_like(gathered).clamp_min_(1e-20)
-            gumbel = -torch.log(-torch.log(u))
-            heads = (gathered / self.temperature + gumbel).argmax(dim=-1)  # (N,31)
-
         h0_logits = fused[:, : self.head0_vocab].float()  # (N,8)
         if self._greedy:
-            head0 = h0_logits.argmax(dim=-1)
+            heads = gathered.argmax(dim=-1)  # (N,31)
+            head0 = h0_logits.argmax(dim=-1)  # (N,)
         else:
-            u0 = torch.rand_like(h0_logits).clamp_min_(1e-20)
-            g0 = -torch.log(-torch.log(u0))
-            head0 = (h0_logits / self.temperature + g0).argmax(dim=-1)  # (N,)
+            heads = (gathered / self.temperature + self._gumbel_noise(gathered, generators)).argmax(dim=-1)
+            head0 = (h0_logits / self.temperature + self._gumbel_noise(h0_logits, generators)).argmax(dim=-1)
 
         p_stop = torch.sigmoid(self.stop_head(hidden)).squeeze(-1)  # (N,)
         do_stop = p_stop > self.stop_threshold
@@ -336,6 +413,14 @@ class GepardTalkerForConditionalGeneration(nn.Module):
             state.frame_count = 0
             state.past_first_step = False
             state.is_stopping = False
+            # The 32 heads are sampled in-model, so SamplingParams.seed — which
+            # only reaches vLLM's sampler — never touches the audio unless it is
+            # threaded into a generator here. Re-seeded on every prefill so a
+            # preempted request replays its own stream.
+            state.generator = None
+            if info.seed is not None:
+                state.generator = torch.Generator(device=dev)
+                state.generator.manual_seed(info.seed)
 
             embeds = self.model.embed_input_ids(input_ids)
             prefix = state.speaker_prefix if state.speaker_prefix is not None else self.null_prefix
@@ -354,7 +439,8 @@ class GepardTalkerForConditionalGeneration(nn.Module):
                 hidden = self.config.get_text_config().hidden_size
                 embeds = torch.zeros(1, hidden, device=dev, dtype=self.null_prefix.dtype)
 
-        self._pending_requests.append((req_id, span, samples_frame))
+        is_last_token = self._is_last_output_token(info, span=span, samples_frame=samples_frame)
+        self._pending_requests.append((req_id, span, samples_frame, is_last_token))
         return input_ids, embeds, {}
 
     # -------------------- forward --------------------
@@ -381,16 +467,18 @@ class GepardTalkerForConditionalGeneration(nn.Module):
             # One sampling row per request: the LAST scheduled position of its
             # span (prefill: the SOS position -> first frame; decode: its one
             # token). Same row set compute_logits sees at logits_indices.
-            ends, offset = [], 0
-            for _, span, _ in self._pending_requests:
+            ends, generators, offset = [], [], 0
+            for req_id, span, _samples_frame, _is_last in self._pending_requests:
                 offset += span
                 ends.append(offset - 1)
+                state = self._active_states.get(req_id)
+                generators.append(state.generator if state is not None else None)
             rows = hidden[torch.tensor(ends, device=hidden.device)]
-            head0, heads_1_31, want_stop = self._sample_frame(rows)
+            head0, heads_1_31, want_stop = self._sample_frame(rows, generators)
             frame_embeds = self._audio_frame_embed(head0, heads_1_31)
             head0_l = head0.tolist()
             stop_l = want_stop.tolist()
-            for i, (req_id, _span, samples_frame) in enumerate(self._pending_requests):
+            for i, (req_id, _span, samples_frame, is_last_token) in enumerate(self._pending_requests):
                 if not samples_frame:
                     # Partial prefill chunk: vLLM discards this row's token.
                     self._results_queue.append((req_id, -1, False))
@@ -411,8 +499,12 @@ class GepardTalkerForConditionalGeneration(nn.Module):
                     state.past_first_step = True
                 self._results_queue.append((req_id, int(head0_l[i]), do_stop))
                 # The STOP frame itself is not committed, so on do_stop this
-                # flushes exactly the frames that were.
-                self._emit_audio(state, is_final=do_stop)
+                # flushes exactly the frames that were. is_last_token covers the
+                # other way a request ends — the engine's token budget, which
+                # the stop head never sees. Both have to flush HERE: this is the
+                # last step on which the request is still in the output batch,
+                # and a payload queued after it is dropped by routing.
+                self._emit_audio(state, is_final=do_stop or is_last_token)
             self._pending_requests.clear()
         self._flush_deferred_cleanup()
         return hidden
