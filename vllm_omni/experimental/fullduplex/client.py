@@ -341,7 +341,6 @@ class RealtimeDuplexClient:
             "output_audio_format": output_audio_format,
             "turn_detection": {"type": "server_vad"},
             "overlap_policy": "listen_only",
-            "playback_commit_policy": "ack_only",
             "extra_body": {
                 "force_listen_count": 0,
             },

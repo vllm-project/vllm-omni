@@ -267,15 +267,6 @@ class DuplexSessionRunnerMixin:
             if session.active_response_id is not None:
                 print(f"[DUPLEX] native_in_progress: active_response_id={session.active_response_id}", flush=True)
                 return True
-            if (
-                session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
-                and session.playback.sent_ms > session.playback.committed_ms
-            ):
-                print(
-                    f"[DUPLEX] native_in_progress: playback_commit_policy=ack_only sent_ms={session.playback.sent_ms} committed_ms={session.playback.committed_ms}",
-                    flush=True,
-                )
-                return True
             if actor.active_response_task is not None and not actor.active_response_task.done():
                 print("[DUPLEX] native_in_progress: active_response_task not done", flush=True)
                 return True
@@ -642,7 +633,7 @@ class DuplexSessionRunnerMixin:
                 self._realtime_protocols[session.session_id] = realtime_protocol
             native.silence_continuation_scheduler = schedule_native_silence_continuation
             if realtime_protocol is not None:
-                session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+                session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
             open_result = await self._open_runtime_session(session, emit_event)
             if open_result is False:
                 return
@@ -1442,8 +1433,17 @@ class DuplexSessionRunnerMixin:
                                 )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
+                        nip = native_response_in_progress()
+                        at = len(actor.native_append_tasks)
+                        dp = native.data_plane_task is not None
+                        cp = native.committed_audio_payload is not None
+                        ar = session.active_response_id
+                        aq = session.active_request_id
                         print(
-                            f"[DUPLEX] response.create: native_in_progress={native_response_in_progress()} append_tasks={len(actor.native_append_tasks)} dp_task={native.data_plane_task is not None} committed_payload={native.committed_audio_payload is not None} active_resp={session.active_response_id} active_req={session.active_request_id}",
+                            f"[DUPLEX] response.create: native_in_progress={nip}"
+                            f" append_tasks={at} dp_task={dp}"
+                            f" committed_payload={cp}"
+                            f" active_resp={ar} active_req={aq}",
                             flush=True,
                         )
                         if (
@@ -1479,7 +1479,9 @@ class DuplexSessionRunnerMixin:
                                 operation_id = uuid.uuid4().hex
                                 native.committed_audio_operation_id = operation_id
                             print(
-                                f"[DUPLEX] response.create: dispatching start_native_append final=True precreate=True op={operation_id[:8]}",
+                                f"[DUPLEX] response.create: dispatching"
+                                f" start_native_append final=True"
+                                f" precreate=True op={operation_id[:8]}",
                                 flush=True,
                             )
                             await start_native_append(

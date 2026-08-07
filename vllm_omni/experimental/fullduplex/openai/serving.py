@@ -770,10 +770,7 @@ class OmniDuplexSessionHandler(
 
     @staticmethod
     def _assistant_playback_active(session: DuplexSession) -> bool:
-        return (
-            session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
-            and session.playback.sent_ms > session.playback.committed_ms
-        )
+        return False
 
     @staticmethod
     def _input_looks_like_speech(
@@ -1489,7 +1486,7 @@ class OmniDuplexSessionHandler(
         committed_ms = session.playback.committed_ms
         committed_message = session.end_response(
             commit_text=self._should_commit_response_to_history(session, old_response_id),
-            playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            playback_commit_policy=DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value,
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
