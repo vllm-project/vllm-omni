@@ -35,7 +35,7 @@ def test_stage_cli_builds_headless_replica_cmd(tmp_path: Path) -> None:
     assert "--headless" in cmd
     assert cmd[cmd.index("--stage-id") + 1] == "1"
     assert cmd[cmd.index("--replica-id") + 1] == "2"
-    assert cmd[cmd.index("--stage-configs-path") + 1] == server.stage_config_path
+    assert cmd[cmd.index("--deploy-config") + 1] == server.stage_config_path
 
 
 def test_stage_cli_splits_devices_per_replica(tmp_path: Path) -> None:

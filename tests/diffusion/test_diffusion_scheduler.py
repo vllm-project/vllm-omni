@@ -380,6 +380,63 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
+    def test_batches_different_quality_levels_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        high = scheduler.add_request(
+            _make_step_request(
+                "high",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    quality="high",
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "lossless",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    quality="lossless",
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [high]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+    def test_batches_omitted_and_explicit_lossless_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        omitted = scheduler.add_request(
+            _make_step_request(
+                "omitted",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "explicit",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    quality="lossless",
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [omitted]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
     def test_batches_different_request_local_seed_together(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
@@ -929,6 +986,35 @@ class TestStepScheduler:
         assert _new_ids(second) == [req_b]
         assert second.num_running_reqs == 1
         assert second.num_waiting_reqs == 1
+
+    def test_step_batch_rejects_different_quality_levels(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        high = scheduler.add_request(
+            _make_step_request(
+                "high",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    quality="high",
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "lossless",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    quality="lossless",
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [high]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
 
     def test_step_batch_co_schedules_requests_sharing_lora(self) -> None:
         """Multiple requests with the same LoRA (id + scale) co-batch."""
