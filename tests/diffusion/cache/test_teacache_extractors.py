@@ -485,14 +485,17 @@ class _MiniMaxH3FakeQKVLinear(_MiniMaxH3FakeLinear):
 
 
 class _MiniMaxH3FakeAttention(nn.Module):
+    class FakeBackend:
+        supports_prefix_kv_slicing = False
+
     def __init__(self, **kwargs):
         del kwargs
         super().__init__()
+        self.attn_backend = self.FakeBackend
+        self.use_ring = False
 
     def forward(self, q, k, v, metadata=None):
         del k, v, metadata
-        if q.dim() == 4:
-            return q.squeeze(0)
         return q
 
 
@@ -583,6 +586,9 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
         model = h3.MiniMaxH3DiTModel(_minimax_h3_small_od_config(), quant_config=None)
+        for submodule in model.modules():
+            if isinstance(submodule, h3.MiniMaxH3Attention):
+                submodule.rope._forward_method = submodule.rope.forward_native
         model.eval()
         return model
 
@@ -635,6 +641,31 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
 
         torch.testing.assert_close(actual_video, expected_video)
         torch.testing.assert_close(actual_audio, expected_audio)
+
+    def test_run_transformer_blocks_forwards_packed_layout(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """The extractor block call must mirror the native packed contract."""
+        from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+
+        video_layout = VideoTokenLayout(prefix_len=2, latent_grid=(1, 1, 2))
+        inputs = {**sample_inputs, "video_token_layout": video_layout}
+        block = minimax_h3_module.blocks[0]
+        original_forward = block.forward
+        received: list[tuple[int, VideoTokenLayout | None]] = []
+
+        def capture_forward(*args, **kwargs):
+            received.append((kwargs["packed_total"], kwargs["video_layout"]))
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(block, "forward", capture_forward)
+        context = extract_minimax_h3_context(minimax_h3_module, **inputs)
+        context.run_transformer_blocks()
+
+        assert received == [(sample_inputs["x"].shape[1], video_layout)]
 
     def test_teacache_reuses_h3_block_residual(self, minimax_h3_module, sample_inputs, monkeypatch):
         """A guaranteed cache hit must skip the H3 transformer block."""

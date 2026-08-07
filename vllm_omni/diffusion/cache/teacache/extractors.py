@@ -1307,6 +1307,7 @@ def extract_minimax_h3_context(
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+    video_layout = kwargs.get("video_token_layout")
 
     if x.dim() != 3 or x.shape[0] != 1:
         raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1361,6 +1362,8 @@ def extract_minimax_h3_context(
                 rope_freqs=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                packed_total=seq_len,
+                video_layout=video_layout,
             )
         hidden = module.sp_gather(hidden)
         return (hidden,)
