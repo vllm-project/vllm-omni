@@ -1,0 +1,290 @@
+[
+    {
+        "test_name": "test_minicpmo_4_5",
+        "server_params": {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "trust_remote_code": true,
+            "extra_cli_args": [
+                "--trust-remote-code"
+            ]
+        },
+        "benchmark_params": [
+            {
+                "task": "latency_text_tts",
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    4
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 400,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+            },
+            {
+                "task": "latency_audio_in_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(0, 60, 3)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+            },
+            {
+                "task": "latency_image_in_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1
+                },
+                "random_mm_bucket_config": {
+                    "(256, 256, 1)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+            },
+            {
+                "task": "latency_video_in_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "video": 1
+                },
+                "random_mm_bucket_config": {
+                    "(720, 1280, 2)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+            },
+            {
+                "task": "latency_text_no_tts",
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    4
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 400,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": [
+                        "text"
+                    ]
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el"
+            },
+            {
+                "task": "latency_audio_in_no_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(0, 60, 3)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text"
+                    ]
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el"
+            },
+            {
+                "task": "latency_image_in_no_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1
+                },
+                "random_mm_bucket_config": {
+                    "(256, 256, 1)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text"
+                    ]
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el"
+            },
+            {
+                "task": "latency_video_in_no_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "max_concurrency": [
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "video": 1
+                },
+                "random_mm_bucket_config": {
+                    "(720, 1280, 2)": 1.0
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text"
+                    ]
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el"
+            },
+            {
+                "task": "queueing_probe_mixed_mm_tts",
+                "dataset_name": "random-mm",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    10
+                ],
+                "request_rate": [
+                    0.1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(256, 256, 1)": 0.34,
+                    "(720, 1280, 2)": 0.33,
+                    "(0, 60, 3)": 0.33
+                },
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+            }
+        ]
+    }
+]
