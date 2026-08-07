@@ -263,15 +263,6 @@ def _cosmos3_stage_configs():
     ]
 
 
-def _lingbot_stage_configs():
-    return [
-        SimpleNamespace(
-            stage_type="diffusion",
-            engine_args=SimpleNamespace(model_class_name="LingBotVideoPipeline"),
-        )
-    ]
-
-
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
     deadline = time.time() + timeout_s
     last_payload = None
@@ -517,19 +508,6 @@ def test_video_generation_bridges_request_fields(generation_request, expected_nu
         assert "duration" not in sampling.extra_args
     else:
         assert sampling.extra_args["duration"] == expected_duration
-
-
-def test_video_generation_rejects_model_output_count_limit(test_client, mocker: MockerFixture):
-    handler = test_client.app.state.openai_serving_video
-    mocker.patch.object(handler, "_stage_configs", _lingbot_stage_configs())
-
-    response = test_client.post(
-        "/v1/videos",
-        data={"prompt": "A fox running through snow.", "num_outputs_per_prompt": "2"},
-    )
-
-    assert response.status_code == 400
-    assert "supports at most 1 output per prompt" in response.json()["detail"]
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):

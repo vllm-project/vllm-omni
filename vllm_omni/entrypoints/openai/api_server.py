@@ -1816,7 +1816,6 @@ async def generate_images(
         )
 
     try:
-        _check_max_outputs_per_prompt(stage_configs, request.n)
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
         if len(stage_configs) > 1:
@@ -2762,26 +2761,6 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     return model_classes
 
 
-def _check_max_outputs_per_prompt(
-    stage_configs: list[Any] | None,
-    requested_outputs: int,
-) -> None:
-    for model_cls in _diffusion_model_classes(stage_configs):
-        limit = getattr(model_cls, "max_outputs_per_prompt", None)
-        if limit is None:
-            continue
-        if isinstance(limit, bool) or not isinstance(limit, Integral) or int(limit) <= 0:
-            raise RuntimeError(f"{model_cls.__name__}.max_outputs_per_prompt must be a positive integer.")
-        if requested_outputs > int(limit):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=(
-                    f"{model_cls.__name__} supports at most {int(limit)} output per prompt, "
-                    f"but n={requested_outputs} was requested."
-                ),
-            )
-
-
 def _normalize_reference_video_decode_spec(spec: ReferenceVideoDecodeSpec) -> ReferenceVideoDecodeSpec:
     max_frames = spec.max_frames
     if max_frames is not None:
@@ -3287,13 +3266,6 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
-    stage_configs = (
-        handler.stage_configs
-        or app_stage_configs
-        or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
-    )
-    _check_max_outputs_per_prompt(stage_configs, request.num_outputs_per_prompt)
-
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
@@ -3310,6 +3282,11 @@ async def _parse_video_form(
 
     decode_spec = ReferenceVideoDecodeSpec()
     if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
+        stage_configs = (
+            handler.stage_configs
+            or app_stage_configs
+            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+        )
         decode_spec = _reference_video_decode_spec(request, stage_configs)
     reference_image = None
     reference_video = None

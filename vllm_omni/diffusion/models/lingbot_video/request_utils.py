@@ -13,8 +13,6 @@ from typing import Any
 from PIL import Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.interface import OutputDimensions
-
 logger = init_logger(__name__)
 
 LINGBOT_RUNTIME_PROMPT_FIELDS = frozenset(
@@ -303,8 +301,8 @@ def resolve_lingbot_output_dimensions(
     prompt_fields: Mapping[str, Any] | None = None,
     default_width: int = 480,
     default_height: int = 480,
-) -> OutputDimensions:
-    """Resolve the dimensions that LingBot will use for generation."""
+) -> tuple[int, int]:
+    """Resolve the ``(width, height)`` that LingBot will use for generation."""
     prompt_fields = prompt_fields or {}
     requested_width = _pick(prompt_fields, "width")
     requested_height = _pick(prompt_fields, "height")
@@ -326,7 +324,7 @@ def resolve_lingbot_output_dimensions(
         resolution=resolution,
         ratio=ratio,
     )
-    return OutputDimensions(width=resolved_width, height=resolved_height)
+    return resolved_width, resolved_height
 
 
 def normalize_lingbot_request(
@@ -412,14 +410,13 @@ def normalize_lingbot_request(
     else:
         num_frames = normalize_lingbot_num_frames(default_num_frames)
 
-    dimensions = resolve_lingbot_output_dimensions(
+    width, height = resolve_lingbot_output_dimensions(
         sampling_width=sampling.width,
         sampling_height=sampling.height,
         prompt_fields=prompt_fields,
         default_width=default_width,
         default_height=default_height,
     )
-    width, height = dimensions.width, dimensions.height
     num_inference_steps = sampling.num_inference_steps
     if num_inference_steps is None:
         num_inference_steps = _first_not_none(_pick(extra_args, "num_inference_steps"), default_num_inference_steps)

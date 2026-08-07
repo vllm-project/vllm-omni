@@ -181,28 +181,24 @@ def test_resolve_lingbot_size_validates_sources_and_alignment():
 
 
 def test_resolve_lingbot_output_dimensions_matches_request_priority():
-    dimensions = resolve_lingbot_output_dimensions(
+    assert resolve_lingbot_output_dimensions(
         sampling_width=480,
         sampling_height=480,
         prompt_fields={"resolution": "720p", "ratio": "16:9"},
-    )
-    assert (dimensions.width, dimensions.height) == (736, 1280)
+    ) == (736, 1280)
 
-    dimensions = resolve_lingbot_output_dimensions(
+    assert resolve_lingbot_output_dimensions(
         sampling_width=480,
         sampling_height=480,
         prompt_fields={"width": 320, "height": 192},
-    )
-    assert (dimensions.width, dimensions.height) == (320, 192)
+    ) == (320, 192)
 
-    dimensions = resolve_lingbot_output_dimensions(
+    assert resolve_lingbot_output_dimensions(
         sampling_width=320,
         sampling_height=192,
-    )
-    assert (dimensions.width, dimensions.height) == (320, 192)
+    ) == (320, 192)
 
-    dimensions = resolve_lingbot_output_dimensions()
-    assert (dimensions.width, dimensions.height) == (480, 480)
+    assert resolve_lingbot_output_dimensions() == (480, 480)
 
 
 def test_normalize_lingbot_request_uses_mode_defaults_and_preserves_empty_negative():

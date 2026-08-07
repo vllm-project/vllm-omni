@@ -23,7 +23,6 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
-    SupportsOutputCountLimit,
 )
 from vllm_omni.diffusion.models.lingbot_video.image_condition import (
     LingBotImageCondition,
@@ -307,7 +306,6 @@ class LingBotVideoPipeline(
     SupportImageInput,
     ProgressBarMixin,
     SupportsComponentDiscovery,
-    SupportsOutputCountLimit,
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 

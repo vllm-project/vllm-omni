@@ -988,25 +988,6 @@ def test_generate_images_max_size_rejected(async_omni_test_client):
     assert response.status_code == 400
 
 
-def test_lingbot_multiple_outputs_rejected_before_engine_dispatch(
-    lingbot_test_client,
-    mock_async_diffusion,
-):
-    response = lingbot_test_client.post(
-        "/v1/images/generations",
-        json={
-            "prompt": "a cat",
-            "n": 2,
-            "size": "320x192",
-        },
-    )
-
-    assert response.status_code == HTTPStatus.BAD_REQUEST.value
-    assert "supports at most 1 output per prompt" in response.json()["detail"]
-    assert "n=2" in response.json()["detail"]
-    assert mock_async_diffusion.generate_calls == 0
-
-
 def test_generate_multiple_images(test_client):
     """Test generating multiple images"""
     response = test_client.post(

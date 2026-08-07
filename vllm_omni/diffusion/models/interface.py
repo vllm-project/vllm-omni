@@ -34,19 +34,6 @@ class ReferenceVideoDecodeSpec:
     keep: Literal["first", "last"] = "first"
 
 
-@dataclass(frozen=True)
-class OutputDimensions:
-    width: int
-    height: int
-
-
-@runtime_checkable
-class SupportsOutputCountLimit(Protocol):
-    """Declare a per-prompt output-count limit for API validation."""
-
-    max_outputs_per_prompt: ClassVar[int]
-
-
 @runtime_checkable
 class SupportAudioInput(Protocol):
     support_audio_input: ClassVar[bool] = True
