@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
     import torch
 
-    from vllm_omni.diffusion.cache.cachedit.backend import CacheDiTBackend
+    from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState

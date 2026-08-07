@@ -10,9 +10,7 @@ from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Any
 
-from vllm_omni.diffusion.cache.cachedit.runtime import (
-    CacheDiTRequestSpec,
-)
+from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.errors import OmniClientError
 

@@ -22,8 +22,8 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
-from vllm_omni.diffusion.cache.cachedit.backend import CacheDiTBackend
-from vllm_omni.diffusion.cache.cachedit.runtime import (
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
