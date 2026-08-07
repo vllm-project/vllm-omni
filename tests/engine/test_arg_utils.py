@@ -128,6 +128,24 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
+def test_qwen3_tts_startup_task_type_is_validated():
+    vllm_config = EngineArgs().create_model_config()
+
+    config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+        task_type="Base",
+    )
+    assert config.task_type == "Base"
+
+    with pytest.raises(ValueError, match="Qwen3-TTS --task-type must be one of"):
+        OmniModelConfig.from_vllm_model_config(
+            vllm_config,
+            model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+            task_type="fl2va",
+        )
+
+
 def test_from_cli_args_picks_up_stage_configs_path():
     """from_cli_args should pick up stage_configs_path from namespace."""
     ns = argparse.Namespace(

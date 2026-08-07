@@ -53,6 +53,11 @@ def download_backend(monkeypatch: pytest.MonkeyPatch):
         "download_weights_from_hf_specific",
         lambda **_kwargs: picked.append("huggingface"),
     )
+    monkeypatch.setattr(
+        omni_base,
+        "file_or_path_exists",
+        lambda *_args, **_kwargs: False,
+    )
 
     def run() -> str:
         picked.clear()
@@ -82,3 +87,14 @@ def test_unset_defaults_to_huggingface(monkeypatch, download_backend):
     monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
 
     assert download_backend() == "huggingface"
+
+
+def test_modular_diffusers_defers_component_download(monkeypatch, download_backend):
+    monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
+    monkeypatch.setattr(
+        omni_base,
+        "file_or_path_exists",
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert download_backend() == "none"

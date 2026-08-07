@@ -12,19 +12,17 @@
 - Maintainer: Community
 
 This recipe adapts [MiniMax-H3.md](MiniMax-H3.md) for MUSA environments.
-MiniMax H3 has two independently served checkpoint partitions:
-
-- `FL2VA` serves text-to-video+audio (`t2va`) and
-  first-frame-to-video+audio (`fl2va`).
-- `Ref2VA` serves image/audio or video-reference generation (`ref2va`).
+The modular H3 pipeline can load both task-specific DiTs, but this MUSA recipe
+uses a **single task partition**: `FL2VA` for `t2va`/`fl2va`, or `Ref2VA` for
+`ref2va`. This avoids loading both DiTs.
 
 ## Prerequisites
 
 ### Checkpoint
 
-Only download the partition needed by the server. Downloading the whole model
-repository also retrieves duplicate shared components and the original
-top-level pipeline layout.
+Download the partition required by the selected startup task. The commands below
+run a single-task server; do not use the modular default (combined) mode on MUSA
+until its two-DiT memory and performance profile is validated.
 
 For T2VA and FL2VA:
 
@@ -66,14 +64,13 @@ soundfile. Formats that libsndfile cannot read are demuxed through ffmpeg.
 
 ## Start a server
 
-One server loads one checkpoint partition. Set `MODEL` to `FL2VA` for T2VA
-and FL2VA, or to `Ref2VA` for Ref2VA.
+Use the partition path and set `--task-type` explicitly: `fl2va` for T2VA/FL2VA
+or `ref2va` for Ref2VA.
 
-The validated Ref2VA configuration uses tensor parallelism across four MTT
-S5000 GPUs and offloads inactive model components to CPU:
+The validated Ref2VA configuration uses tensor parallelism across four MTT S5000 GPUs and offloads inactive model components to CPU:
 
 ```bash
-export MODEL="${MODEL_ROOT}/FL2VA"
+export MODEL="${MODEL_ROOT}/Ref2VA"
 export PORT=8091
 
 MUSA_VISIBLE_DEVICES=0,1,2,3 \
@@ -85,6 +82,7 @@ vllm serve "${MODEL}" \
   --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 4 \
+  --task-type ref2va \
   --tensor-parallel-size 4 \
   --vae-patch-parallel-size 4 \
   --enable-cpu-offload \
@@ -133,7 +131,8 @@ Keep `--vae-use-tiling` enabled for this serving profile.
 - Keep Ring Attention at degree 1. The current Ring path does not preserve
   MiniMax H3 packed padding boundaries.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
-- Each server process loads only one checkpoint partition.
+- This MUSA recipe uses an explicitly selected single task partition; combined
+  serving loads both DiTs.
 - H3 currently executes one generation request per diffusion batch.
 - FP8 quantization has not been enabled for MiniMax H3.
 - MP3, M4A, MP4, and reference-video audio fallback requires `ffmpeg` on

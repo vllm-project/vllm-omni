@@ -59,7 +59,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
+| **[CPU Offload](diffusion/cpu_offload.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
 | **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
 | **[VAE Parallelism](diffusion/parallelism/vae_parallelism.md)** | Distributes VAE decode work across GPUs | High-resolution generation with reduced VAE memory peak |
 
@@ -104,8 +104,8 @@ The following tables show which models support each feature:
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload_diffusion.md).
-> 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
+> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload.md).
+> 2. The **💾Quantization** column is collapsed for readability. See [Quantization](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
 
@@ -274,9 +274,9 @@ Measured on NVIDIA H800:
 
 **Memory Optimization:**
 
-- **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
+- **[CPU Offload Guide](diffusion/cpu_offload.md)** - Offload model components to CPU, reduce GPU memory usage
 - **[VAE Parallelism Guide](diffusion/parallelism/vae_parallelism.md)** - Distribute VAE decode work across GPUs for high-resolution images and videos
-- **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
+- **[Quantization](quantization/overview.md)** - Quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
 
 **Extensions:**
 

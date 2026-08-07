@@ -128,6 +128,29 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def validate_diffusion_attn_backend(cls, selected_backend: str) -> None:
+        """Reject an explicitly selected backend this platform cannot run.
+
+        Platforms call this from ``get_diffusion_attn_backend_cls`` so that a
+        backend restricted to other hardware, or one whose kernel package is
+        missing, fails during resolution rather than at the first forward.
+        """
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        backend_upper = selected_backend.upper()
+        backend_cls = DiffusionAttentionBackendEnum[backend_upper].get_class()
+
+        supported = backend_cls.supported_platforms
+        platform = cls._omni_enum.value
+        if supported is not None and platform not in supported:
+            raise ValueError(
+                f"The {backend_upper} diffusion attention backend runs on {', '.join(supported)} only, "
+                f"but the current platform is {platform}. Select a backend supported here, "
+                "such as FLASH_ATTN or TORCH_SDPA."
+            )
+        backend_cls.validate_available()
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
