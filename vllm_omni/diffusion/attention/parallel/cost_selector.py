@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class SPStrategy(StrEnum):
@@ -265,3 +265,42 @@ class SPCostSelector:
         if workload.has_attention_mask and not caps.ring_attention_mask:
             return "Ring does not support attention masks"
         return None
+
+
+def resolve_auto_sp_strategy(parallel_config: Any) -> StrategyDecision | None:
+    """Resolve an opt-in SP strategy before process-group initialization.
+
+    The selected backend determines which mutually exclusive process groups
+    are created, so selection happens once at worker startup rather than in an
+    attention hot path. The deployment workload and an offline calibration
+    file are explicit inputs; manual degree configuration remains the default.
+    """
+    mode = str(getattr(parallel_config, "sp_strategy", "manual"))
+    if mode == "manual":
+        return None
+    if mode != "auto":
+        raise ValueError(f"sp_strategy must be 'manual' or 'auto', got {mode!r}")
+
+    profile = getattr(parallel_config, "sp_selector_profile", None)
+    raw_workload = getattr(parallel_config, "sp_selector_workload", None)
+    if not profile or not isinstance(raw_workload, dict):
+        raise ValueError("sp_strategy='auto' requires sp_selector_profile and sp_selector_workload")
+
+    workload_args = dict(raw_workload)
+    workload_args.setdefault("sp_degree", int(getattr(parallel_config, "sequence_parallel_size", 1)))
+    workload_args.setdefault("ulysses_mode", str(getattr(parallel_config, "ulysses_mode", "strict")))
+    workload = SPWorkload(**workload_args)
+    selector = SPCostSelector(
+        EmpiricalCostModel.from_jsonl(profile),
+        capabilities=StrategyCapabilities(
+            ring=bool(getattr(parallel_config, "sp_selector_allow_ring", False)),
+        ),
+    )
+    decision = selector.select(workload)
+
+    degree = workload.sp_degree
+    parallel_config.ulysses_degree = degree if decision.strategy == SPStrategy.ULYSSES else 1
+    parallel_config.ring_degree = degree if decision.strategy == SPStrategy.RING else 1
+    parallel_config.allgather_degree = degree if decision.strategy == SPStrategy.ALLGATHER_KV else 1
+    parallel_config.sequence_parallel_size = degree
+    return decision

@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.attention.backends.ring.ring_kernels import pytorch_attn_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.distributed.comm import RingComm
-from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 
 logger = init_logger(__name__)
 
@@ -85,7 +84,6 @@ class RingAttentionFunc(torch.autograd.Function):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        q_heads = q.shape[2]
 
         out, lse = None, None
         next_k, next_v = None, None
@@ -109,15 +107,6 @@ class RingAttentionFunc(torch.autograd.Function):
                     else:
                         step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                         step_v = torch.cat([step_v, joint_tensor_value], dim=1)
-
-                kv_heads = step_k.shape[2]
-                if q_heads != kv_heads:
-                    if q_heads % kv_heads != 0:
-                        raise ValueError(
-                            f"Ring SDPA requires Q heads ({q_heads}) to be divisible by KV heads ({kv_heads})."
-                        )
-                    step_k = repeat_kv(step_k, q_heads // kv_heads)
-                    step_v = repeat_kv(step_v, q_heads // kv_heads)
 
                 block_out, block_lse = pytorch_attn_forward(
                     q,

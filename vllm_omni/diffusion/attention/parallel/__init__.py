@@ -20,6 +20,7 @@ from .cost_selector import (
     SPWorkload,
     StrategyCapabilities,
     StrategyDecision,
+    resolve_auto_sp_strategy,
 )
 from .factory import build_parallel_attention_strategy
 
@@ -35,4 +36,5 @@ __all__ = [
     "StrategyCapabilities",
     "StrategyDecision",
     "build_parallel_attention_strategy",
+    "resolve_auto_sp_strategy",
 ]

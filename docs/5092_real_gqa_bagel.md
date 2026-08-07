@@ -18,3 +18,34 @@ are calibration data for `strategy: auto`, not a claim that one strategy is
 universally optimal.
 
 The benchmark does not commit model weights or generated frames.
+
+## Startup-time selection
+
+Auto selection is opt-in and is resolved before distributed process groups are
+initialized. A diffusion stage can declare a representative deployment shape
+and an offline JSONL calibration profile:
+
+```yaml
+parallel_config:
+  sp_strategy: auto
+  sp_selector_profile: /path/to/sp_calibration.jsonl
+  sp_selector_workload:
+    seq_len: 4096
+    sp_degree: 4
+    num_heads: 32
+    num_kv_heads: 4
+    head_dim: 128
+    interconnect: nvlink
+```
+
+The calibration file contains one row per measured strategy and shape, using
+`strategy`, `interconnect`, `sp_degree`, `kv_ratio`, `seq_len`, and
+`latency_ms`. The earlier #5092 names (`sp`, `f`, `seq`, and `p50_ms`) are also
+accepted. The selector first rejects unsupported strategies, then chooses the
+lowest predicted latency and writes the corresponding degree before group
+initialization. Manual degree configuration remains the default.
+
+Ring is excluded from auto selection unless `sp_selector_allow_ring: true` is
+set, because the BAGEL result above shows that latency alone is not a sufficient
+quality gate. Enable it only after model-specific numerical and perceptual
+validation.

@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.diffusion.attention.parallel.cost_selector import resolve_auto_sp_strategy
 from vllm_omni.diffusion.data import (
     AsyncDiffusionOutput,
     AsyncOutputKind,
@@ -244,6 +245,16 @@ class DiffusionWorker:
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
+        decision = resolve_auto_sp_strategy(self.od_config.parallel_config)
+        if decision is not None:
+            logger.info(
+                "Auto-selected SP strategy %s before process-group initialization "
+                "(predicted %.4f ms; costs=%s; rejected=%s)",
+                decision.strategy,
+                decision.predicted_ms,
+                decision.costs_ms,
+                decision.rejected,
+            )
         world_size = self.od_config.num_gpus
         rank = self.rank
 

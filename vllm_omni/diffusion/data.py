@@ -180,6 +180,18 @@ class DiffusionParallelConfig:
     allgather_degree: int = 1
     """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
 
+    sp_strategy: str = "manual"
+    """SP strategy mode: manual degrees or startup-time auto selection."""
+
+    sp_selector_profile: str | None = None
+    """Offline JSONL latency calibration used by startup-time auto selection."""
+
+    sp_selector_workload: dict[str, Any] | None = None
+    """Deployment workload shape supplied to the startup-time selector."""
+
+    sp_selector_allow_ring: bool = False
+    """Allow auto selection of Ring after model-specific quality validation."""
+
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
 
@@ -259,6 +271,15 @@ class DiffusionParallelConfig:
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
+        assert self.sp_strategy in {"manual", "auto"}, (
+            f"sp_strategy must be 'manual' or 'auto', got {self.sp_strategy!r}"
+        )
+        if self.sp_strategy == "auto":
+            assert self.sp_selector_profile, "sp_strategy='auto' requires sp_selector_profile"
+            assert isinstance(self.sp_selector_workload, dict), "sp_strategy='auto' requires sp_selector_workload"
+            assert self.ulysses_degree == self.ring_degree == self.allgather_degree == 1, (
+                "sp_strategy='auto' cannot be combined with manual SP degrees"
+            )
         if self.allgather_degree > 1:
             assert self.ulysses_degree == 1 and self.ring_degree == 1, (
                 "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
@@ -266,7 +287,9 @@ class DiffusionParallelConfig:
                 f"allgather_degree={self.allgather_degree}."
             )
         expected_sp_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+            int(self.sp_selector_workload["sp_degree"])
+            if self.sp_strategy == "auto"
+            else (self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree)
         )
         assert self.sequence_parallel_size == expected_sp_size, (
             f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
@@ -283,9 +306,16 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = (
-                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-            )
+            if self.sp_strategy == "auto":
+                if not isinstance(self.sp_selector_workload, dict) or "sp_degree" not in self.sp_selector_workload:
+                    raise ValueError("sp_strategy='auto' requires sp_selector_workload.sp_degree")
+                self.sequence_parallel_size = int(self.sp_selector_workload["sp_degree"])
+                if self.sequence_parallel_size <= 1:
+                    raise ValueError("sp_selector_workload.sp_degree must be greater than one")
+            else:
+                self.sequence_parallel_size = (
+                    self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+                )
 
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.
