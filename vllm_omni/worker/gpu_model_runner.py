@@ -2038,6 +2038,19 @@ class OmniGPUModelRunner(GPUModelRunner):
                         num_computed_tokens,
                         prompt_len,
                     )
+                if _envs_pd_trace() and resume_consumed and num_computed_tokens in (prompt_len + 1, prompt_len + 2, prompt_len + 40, prompt_len + 200):
+                    _hs = req_infos.get("hidden_states") if isinstance(req_infos.get("hidden_states"), dict) else {}
+                    _mt = req_infos.get("meta") if isinstance(req_infos.get("meta"), dict) else {}
+                    _cd = req_infos.get("codes") if isinstance(req_infos.get("codes"), dict) else {}
+                    logger.info(
+                        "[PD_TRACE] frame_state req=%s computed=%d hs=%s tail_shape=%s last_shape=%s "
+                        "text_offset=%s codes=%s mtp_inputs=%s",
+                        req_id, num_computed_tokens, sorted(_hs),
+                        tuple(_hs["trailing_text"].shape) if hasattr(_hs.get("trailing_text"), "shape") else None,
+                        tuple(_hs["last"].shape) if hasattr(_hs.get("last"), "shape") else None,
+                        _mt.get("talker_text_offset"), sorted(_cd),
+                        "mtp_inputs" in req_infos,
+                    )
                 if is_pd_resume_token:
                     # Keep the remote request at P's exact prompt length so
                     # Mooncake pulls matching blocks. Once that prefix is

@@ -1161,14 +1161,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             additional_info = getattr(request, "additional_information", None) if request else None
             cached_reqs.additional_information[req_id] = additional_info
             if request and additional_info:
-                # [PD] Never consume the payload on a PD decode consumer. Its
-                # additional_information carries the one-shot prefill handoff
-                # (hidden_states / codes / pd_sampler / meta.pd_resume_token_id)
-                # and the request may still be scheduled as a NEW request in a
-                # later step; clearing it here loses the resume token and decode
-                # regenerates the utterance from scratch.
-                if self._is_pd_decode_consumer:
-                    continue
+                # [PD] The prefill handoff payload is ONE-SHOT: it must be
+                # delivered to the worker exactly once and then dropped. Leaving
+                # it on the request re-merges the frozen prefill snapshot into
+                # model_intermediate_buffer on every subsequent step, which resets
+                # hidden_states.trailing_text / meta.talker_text_offset each frame
+                # so the talker never advances its text and never samples
+                # codec-EOS (every request then runs to max_tokens).
                 request.additional_information = None
 
     def _process_chunk_queue(
