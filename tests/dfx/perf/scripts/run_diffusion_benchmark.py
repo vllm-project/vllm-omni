@@ -13,8 +13,6 @@ A config JSON file may be passed via --test-config-file. If omitted, every ``*.j
   pytest run_diffusion_benchmark.py -m "diffusion"
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
-Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
-
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
 
@@ -46,6 +44,7 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     hardware_json_value,
     is_diffusion_perf_config,
+    resolve_baseline_for_sweep,
     resolve_pytest_marks,
     resource_label_for_filename,
 )
@@ -274,11 +273,6 @@ def _write_result_record(record: dict[str, Any]) -> Path:
     return target
 
 
-def _append_to_aggregated_file(record: dict[str, Any]) -> None:
-    """Backward-compatible wrapper; prefer :func:`_write_result_record`."""
-    _write_result_record(record)
-
-
 _server_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -356,10 +350,49 @@ def _kill_process_tree(pid: int) -> None:
 
 
 def _resolve_offline_model(model: str) -> str:
-    """Under HF_HUB_OFFLINE, resolve a HF repo id to its local snapshot dir."""
+    """Resolve a model string to a local directory.
+
+    Local paths pass through unchanged. HF repo ids are resolved to their local
+    snapshot dir when ``HF_HUB_OFFLINE`` is set. ``repo_id/subfolder`` (e.g.
+    ``MiniMaxAI/MiniMax-H3/FL2VA``) is resolved to the matching partition
+    subfolder of the snapshot, downloading only that subfolder when online.
+    """
     import huggingface_hub
 
-    if not model or os.path.isdir(model) or not huggingface_hub.constants.HF_HUB_OFFLINE:
+    if not model or os.path.isdir(model):
+        return model
+
+    # MiniMax-H3 custom code uses relative imports across files, which breaks
+    # when the HF cache snapshot is symlinked (``get_class_from_dynamic_module``
+    # resolves ``realpath`` into the blobs dir). Mirror the accuracy test's env
+    # overrides so CI / local runs can point at a materialized partition. The
+    # repo-root key (used with ``--task-type fl2va|ref2va``) expects a
+    # materialized root containing the FL2VA/Ref2VA subfolders.
+    model_env_overrides = {
+        "MiniMaxAI/MiniMax-H3": "VLLM_TEST_MINIMAX_H3_MODEL",
+        "MiniMaxAI/MiniMax-H3/FL2VA": "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL",
+        "MiniMaxAI/MiniMax-H3/Ref2VA": "VLLM_TEST_MINIMAX_H3_REF2VA_MODEL",
+    }
+    env_name = model_env_overrides.get(model)
+    if env_name:
+        env_model = os.environ.get(env_name)
+        if env_model:
+            return env_model
+
+    parts = model.split("/")
+    if len(parts) >= 3:
+        repo_id = "/".join(parts[:2])
+        subfolder = "/".join(parts[2:])
+        from huggingface_hub import snapshot_download
+
+        snapshot_root = snapshot_download(
+            repo_id,
+            allow_patterns=[f"{subfolder}/**"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+        return str(Path(snapshot_root) / subfolder)
+
+    if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
     from huggingface_hub import snapshot_download
 
@@ -393,6 +426,11 @@ class DiffusionServer:
     def _start_server(self) -> None:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Give each run its own writable video-storage dir. The server default
+        # (/tmp/storage) may be missing or not writable on shared hosts / CI.
+        storage_path = Path(os.environ.get("VLLM_OMNI_STORAGE_PATH", str(BENCHMARK_RESULT_DIR / "storage")))
+        storage_path.mkdir(parents=True, exist_ok=True)
+        env["VLLM_OMNI_STORAGE_PATH"] = str(storage_path)
 
         cmd = [
             sys.executable,
@@ -678,7 +716,7 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
+    exclude_keys = {"baseline", "dataset", "task", "name"}
 
     cmd = [
         sys.executable,
@@ -772,12 +810,17 @@ def run_benchmark(
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
+    # Persist sweep-resolved baseline from params (already narrowed in _build_run_params).
+    baseline = params.get("baseline") or {}
+    metrics["baseline"] = baseline
+
     record: dict[str, Any] = {
         "test_name": test_name,
         "endpoint": endpoint,
         "timestamp": timestamp,
         "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
+        "baseline": baseline,
         "result": metrics,
         "log_file": str(log_file),
         "Model": model,
@@ -827,69 +870,13 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_baseline_value(
-    baseline_raw: Any,
-    *,
-    sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-) -> Any:
-    """Pick the baseline threshold for this sweep step."""
-    if baseline_raw is None:
-        return 100000
-    if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
-        )
-    if isinstance(baseline_raw, (list, tuple)):
-        if sweep_index is None:
-            raise ValueError("sweep_index is required when baseline is a list or tuple")
-        return baseline_raw[sweep_index]
-    return baseline_raw
-
-
 def assert_result(
     result: dict[str, Any],
-    params: dict[str, Any],
     num_prompts: int,
-    *,
-    sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-    assert_baseline: bool = True,
 ) -> None:
-    """Assert that benchmark metrics satisfy the configured baselines."""
+    """Assert that the expected number of requests completed."""
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
-
-    if not assert_baseline:
-        return
-    if params.get("skip-performance-assertion", False):
-        print("Skipping performance assertions.")
-        return
-
-    for metric, baseline_raw in params.get("baseline", {}).items():
-        current = result.get(metric)
-        assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
-        threshold = _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
-        if "throughput" in metric:
-            assert current >= threshold, f"{metric}: {current:.4f} < baseline {threshold}"
-        else:
-            assert current <= threshold, f"{metric}: {current:.4f} > baseline {threshold}"
 
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
@@ -932,15 +919,11 @@ def _build_run_params(
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
     if "baseline" in params:
-        run_params["baseline"] = {
-            metric: _resolve_baseline_value(
-                baseline_raw,
-                sweep_index=sweep_index,
-                max_concurrency=max_concurrency,
-                request_rate=request_rate,
-            )
-            for metric, baseline_raw in params["baseline"].items()
-        }
+        # Keep all hardware buckets; pick the metric value for this sweep step only.
+        run_params["baseline"] = resolve_baseline_for_sweep(
+            params.get("baseline"),
+            sweep_index=sweep_index,
+        )
     return run_params
 
 
@@ -963,36 +946,30 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
 
     sweep_runs: list[dict[str, Any]] = []
 
-    for i, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
+    for sweep_index, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     request_rate=request_rate,
                     num_prompts=num_prompts,
-                    sweep_index=i,
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
-                "sweep_index": i,
-                "request_rate": request_rate,
-                "max_concurrency": None,
             }
         )
 
-    for i, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+    for sweep_index, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     max_concurrency=max_concurrency,
                     num_prompts=num_prompts,
-                    sweep_index=i,
                     request_rate="inf",
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
-                "sweep_index": i,
-                "request_rate": None,
-                "max_concurrency": max_concurrency,
             }
         )
 
@@ -1003,11 +980,9 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                 "params": _build_run_params(
                     params,
                     num_prompts=default_num_prompts,
+                    sweep_index=0,
                 ),
                 "num_prompts": default_num_prompts,
-                "sweep_index": None,
-                "request_rate": None,
-                "max_concurrency": None,
             }
         )
 
@@ -1023,14 +998,12 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
     paired_benchmark_params,
     indirect=["diffusion_server", "benchmark_params"],
 )
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
     For each server, all benchmark parameter sets defined in the config JSON
     are executed sequentially; metrics are recorded to the aggregated result file.
-
-    Pass ``--assert-baseline`` to compare ``throughput_qps``, ``latency_mean``, etc. to the JSON ``baseline`` block.
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
@@ -1073,14 +1046,4 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, req
             print(f"\n  Aggregated results: {_aggregated_result_file_for_source(str(source))}")
         print("=" * 60)
 
-        assert_baseline = request.config.getoption("--assert-baseline", default=False)
-
-        assert_result(
-            result,
-            params,
-            sweep_run["num_prompts"],
-            sweep_index=sweep_run["sweep_index"],
-            max_concurrency=sweep_run["max_concurrency"],
-            request_rate=sweep_run["request_rate"],
-            assert_baseline=assert_baseline,
-        )
+        assert_result(result, sweep_run["num_prompts"])

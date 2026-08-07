@@ -387,8 +387,8 @@ that support request-level batching with `step_execution` disabled.
 
 Use this together with `max_num_seqs > 1` for bursty serving traffic. `0`
 disables admission waiting and preserves the lowest first-request latency.
-For diffusion request-level batching tuning, see
-[Request-Level Batching](../user_guide/diffusion/request_batching.md).
+For diffusion execution and batching tuning, see
+[Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 Default: `0.0`
 

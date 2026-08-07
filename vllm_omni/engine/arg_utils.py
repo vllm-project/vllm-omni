@@ -140,8 +140,9 @@ class OmniEngineArgs(EngineArgs):
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
-        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-            If not specified, will be inferred from model path.
+        task_type: Model-defined startup task type. Consumers validate the
+            supported values and decide whether it selects request behavior,
+            task-specific weights, or both.
         omni_master_address: TCP address that the OmniMasterServer (running
             inside AsyncOmniEngine) listens on for engine core registrations.
             Required when single-stage mode is active.
@@ -495,6 +496,7 @@ class OrchestratorArgs:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

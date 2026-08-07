@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -26,9 +27,13 @@ from tests.helpers.runtime import OmniServer
 pytestmark = [pytest.mark.benchmark, pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL_REPO_ID = "MiniMaxAI/MiniMax-H3"
-MODEL_REVISION = "73372e6cf53e414edd3ab03e357717fb0602e758"
+# The previously pinned revision was removed from the Hugging Face repository.
+MODEL_REVISION = "main"
 MODEL_ENV_VAR = "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL"
-REFERENCE_VIDEO_URL = f"https://huggingface.co/{MODEL_REPO_ID}/resolve/main/assets/t2va.mp4"
+# Keep the official asset link visible in the test report. Hugging Face's
+# ``blob`` URL is an HTML page, so resolve it to the raw asset for download.
+REFERENCE_VIDEO_URL = "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/assets/t2va.mp4"
+REFERENCE_VIDEO_SHA256 = "d66903241362e224085cc93f7a5e70fba6ab378d0ac6ff6af83acf2559849a42"
 
 # This is the official reproducible 768p T2VA prompt associated with
 # ``assets/t2va.mp4`` in the MiniMax H3 repository.
@@ -93,9 +98,15 @@ def _server_args() -> list[str]:
 
 def _download_reference_video(output_dir: Path) -> Path:
     reference_path = output_dir / "reference.mp4"
-    response = requests.get(REFERENCE_VIDEO_URL, timeout=120)
+    download_url = REFERENCE_VIDEO_URL.replace("/blob/", "/resolve/", 1)
+    response = requests.get(download_url, timeout=120)
     response.raise_for_status()
-    reference_path.write_bytes(response.content)
+    content = response.content
+    digest = hashlib.sha256(content).hexdigest()
+    assert digest == REFERENCE_VIDEO_SHA256, (
+        f"Official MiniMax H3 T2VA reference changed: got {digest}, expected {REFERENCE_VIDEO_SHA256}"
+    )
+    reference_path.write_bytes(content)
     return reference_path
 
 
@@ -159,6 +170,7 @@ def test_minimax_h3_t2va_matches_official_reference(
             {
                 "task": "t2va",
                 "duration": DURATION_SECONDS,
+                "aspect_ratio": "16:9",
                 "audio_flow_shift": AUDIO_FLOW_SHIFT,
             }
         ),

@@ -15,15 +15,10 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
-    resolve_baseline_value,
     run_benchmark,
 )
 from tests.helpers.runtime import OmniServer
 
-# Compare metrics to each test JSON ``baseline`` block only when pytest is run with ``--assert-baseline``
-# (registered in ``tests/dfx/conftest.py``; default: off). ``run_benchmark`` and ``_resolve_baseline_value`` are
-# defined in the same module.
-#
 # Optional JSON field ``mark`` is applied as pytest marks via
 # ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
 # {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "omni"]``).
@@ -162,36 +157,8 @@ def benchmark_params(request):
     }
 
 
-def assert_result(
-    result,
-    params,
-    num_prompt,
-    *,
-    assert_baseline: bool,
-    sweep_index: int | None = None,
-    max_concurrency: Any | None = None,
-    request_rate: Any | None = None,
-) -> None:
+def assert_result(result, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
-    if not assert_baseline:
-        return
-    baseline_data = params.get("baseline", {})
-    for metric_name, baseline_raw in baseline_data.items():
-        current_value = result[metric_name]
-        baseline_value = resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
-        if "throughput" in metric_name:
-            if current_value <= baseline_value:
-                print(
-                    f"ERROR: Throughput test results were below baseline: {metric_name}: {current_value} > {baseline_value}"
-                )
-        else:
-            if current_value >= baseline_value:
-                print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
 @pytest.mark.benchmark
@@ -200,7 +167,7 @@ def assert_result(
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params, request):
+def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     dataset_name = params.get("dataset_name", "")
@@ -212,7 +179,6 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
 
-    assert_baseline = request.config.getoption("--assert-baseline", default=False)
     resource_label = get_runtime_resource_label()
 
     def to_list(value, default=None):
@@ -271,7 +237,7 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
         break
 
     # QPS / request-rate sweep
-    for i, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
+    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
             args=args,
@@ -280,24 +246,15 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
-            sweep_index=i,
-            request_rate=qps,
-            max_concurrency=None,
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(
-            result,
-            params,
-            num_prompt,
-            assert_baseline=assert_baseline,
-            sweep_index=i,
-            request_rate=qps,
-        )
+        assert_result(result, num_prompt)
 
     # concurrency test
-    for i, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
             args=args,
@@ -306,18 +263,9 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
-            sweep_index=i,
-            request_rate=None,
-            max_concurrency=concurrency,
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(
-            result,
-            params,
-            num_prompt,
-            assert_baseline=assert_baseline,
-            sweep_index=i,
-            max_concurrency=concurrency,
-        )
+        assert_result(result, num_prompt)

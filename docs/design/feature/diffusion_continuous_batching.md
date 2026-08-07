@@ -1,165 +1,232 @@
-# Continuous Batching for Step-Wise Diffusion
+# Diffusion Continuous Batching
 
-!!! warning "Experimental Feature"
-    This feature is experimental. It currently applies only to native
-    diffusion pipelines running with `step_execution=True`.
-
-This document describes the batching extension built on top of
-[Diffusion Step Execution](diffusion_step_execution.md). The base
-step-execution contract is unchanged. The batching work is mainly in the
-scheduler and runner layers.
-
-## Why It Helps
-
-Step-wise execution breaks a long denoise loop into scheduler-visible units.
-That gives the runtime a place to admit other compatible requests between
-steps instead of waiting for an entire request to finish.
-
-This matters most in low-MFU or bursty serving scenarios:
-
-- one request's denoise step may not fully saturate the GPU
-- several compatible requests can share the same denoise forward pass
-- throughput and device utilization can improve without changing request-local
-  scheduler state
-
-This is **not** a guaranteed single-request latency win. The main benefit is
-usually higher utilization and better throughput when the workload contains
-multiple in-flight compatible requests.
+This document describes the unified diffusion execution architecture, including
+request execution, request-level batching, step execution, continuous batching,
+and output delivery. For user-facing configuration and CLI examples, see
+[Diffusion Execution Modes](../../user_guide/diffusion/execution_modes.md).
 
 ## Overview
 
-With continuous batching enabled:
+`DiffusionEngine` selects an execution mode from `step_execution` and uses
+`max_num_seqs` as that mode's scheduler capacity:
 
-- the scheduler may keep multiple compatible requests active at the same time
-- the runner packs request-local step state into one `InputBatch`
-- `denoise_step()` runs on that batch
-- `step_scheduler()` and `post_decode()` still run per request
+| Configuration | Engine mode | Scheduler | Execution |
+|---|---|---|---|
+| `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
+| `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
+| `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
+| `step_execution=True`, `max_num_seqs>1` | `STEP_BATCH` | `StepScheduler` | Compatible requests advanced together in step waves |
 
-The current implementation is conservative:
+Serial request execution is handled inside `REQUEST_BATCH`; it is not a
+separate engine mode. Similarly, continuous batching is the multi-request
+configuration of `STEP_BATCH`, not an independent execution mode.
 
-- only compatible requests are batched together
-- per-request progress and completion remain independent
+The engine performs the following initialization:
 
-Here, "continuous batching" means the step-wise path enabled by
-`step_execution=True`. Request-mode `DiffusionRequestBatch` is static
-request-level batching for one full pipeline `forward()` call; it does not
-admit or remove requests between denoise steps.
+1. Resolve model-specific pre- and post-processing hooks.
+2. Select `REQUEST_BATCH` or `STEP_BATCH`.
+3. Construct the configured `DiffusionExecutor`.
+4. Construct `RequestScheduler` or `StepScheduler`, unless a scheduler was
+   explicitly injected.
+5. Bind `execute_batch` or `execute_step`.
 
-## Enablement
+`DiffusionEngine.make_engine()` owns startup warmup after engine construction.
+This keeps construction, backend selection, and warmup failure cleanup in one
+lifecycle.
 
-Use `--step-execution` as the feature gate, then increase `--max-num-seqs`
-above `1` if you want batching:
+## Unified Output Stream
 
-```bash
-vllm serve Qwen/Qwen-Image --omni \
-  --port 8091 \
-  --step-execution \
-  --max-num-seqs 8
+All asynchronous diffusion requests use the same per-request output stream,
+regardless of whether the caller exposes streaming results to the user.
+
+```python
+async for output in engine.step_streaming(request):
+    ...
 ```
 
-`--max-num-seqs 1` keeps the step-wise path without enabling batching.
+When a request is admitted, the engine creates an
+`asyncio.Queue[DiffusionOutput]` keyed by its request ID. The busy loop sends
+both intermediate chunks and final results through that queue:
 
-For a reproducible replay flow using the bundled serving benchmark, see the
-Qwen-Image replay commands in
-[`benchmarks/diffusion/README.md`](gh-file:benchmarks/diffusion/README.md)
-and
-[`benchmarks/diffusion/performance_dashboard/qwen_image_serving_performance.md`](gh-file:benchmarks/diffusion/performance_dashboard/qwen_image_serving_performance.md).
+```text
+request
+  -> scheduler.add_request()
+  -> scheduler.schedule()
+  -> execute_batch() or execute_step()
+  -> scheduler.update_from_output()
+  -> per-request output queue
+  -> step_streaming()
+```
 
-## Scheduler
+Streaming callers forward every yielded output. Non-streaming callers consume
+the same generator to completion and return only its final output. This avoids
+maintaining separate future-based and queue-based result paths.
 
-The scheduler derives its batch capacity from `max_num_seqs` through
-`max_num_running_reqs`.
+`DiffusionEngine.step()` and
+`async_add_req_and_wait_for_response()` remain deprecated compatibility
+wrappers. New integrations should consume `step_streaming()` or
+`async_add_req_and_stream_response()`.
 
-Batch admission is gated by
-[`StepBatchSamplingParamsKey`](gh-file:vllm_omni/diffusion/sched/interface.py),
-which is built from shape-sensitive and CFG-sensitive sampling fields. This is
-the core correctness rule for batching: requests are only co-batched when they
-share the same denoise tensor contract.
+### Completion and Cancellation
 
-There are three important details:
+Output delivery and scheduler lifecycle are related but separate:
 
-- `num_inference_steps` is not part of the key, so requests with different
-  total step counts can still share a batch
-- requests also do not need to be at the same current denoise progress; active
-  requests can continue batching even when their current step indices diverge
-- admission is still FIFO, so an incompatible request at the head of the
-  waiting queue blocks later compatible requests
+- A terminal scheduler result always finalizes request state.
+- A disconnected or cancelled consumer removes only its delivery queue.
+- The scheduler may still finish and clean up the request after its queue has
+  been removed.
+- Engine shutdown sends an error output to all remaining streams.
 
-Today that compatibility rule is still shape-sensitive. `height`, `width`,
-`num_frames`, and CFG-related fields remain part of the key, so different
-resolutions or incompatible guidance settings do **not** co-batch yet. The
-key also covers LoRA identity (`lora_int_id`, `lora_scale`), so requests
-targeting different adapters or scales run in separate batches and the
-worker can activate exactly one adapter per step.
+This separation prevents cancelled consumers from leaving active request IDs in
+the scheduler.
 
-The scheduler batching unit is one logical `OmniDiffusionRequest`. In the
-step-wise path, runtime tensor batching is represented as `StepInputBatch`. For
-request-mode prompt semantics, see
-[Request-Level Batching](../../user_guide/diffusion/request_batching.md).
+## Request-Batch Execution
 
-## Runner
+Request-batch execution runs the complete diffusion pipeline for each scheduler
+wave. Each `OmniDiffusionRequest` remains an independent logical request with
+its own prompt, sampling parameters, seed, request ID, output, error, and abort
+state.
 
-The runner keeps persistent per-request execution state in
-[`StepRequestState`](gh-file:vllm_omni/diffusion/worker/utils.py),
-while the scheduler owns a separate lightweight
-[`SchedulerRequestState`](gh-file:vllm_omni/diffusion/sched/interface.py)
-for queueing and lifecycle tracking.
+With `max_num_seqs=1`, `execute_batch()` handles the serial request path. With a
+larger value, a pipeline can opt into fused execution by declaring:
 
-For each step, the runner builds an
-[`InputBatch`](gh-file:vllm_omni/diffusion/worker/input_batch.py) from the
-active request states:
+```python
+supports_request_batch = True
+```
 
-- prompt embeddings and masks are normalized and padded
-- dynamic tensors such as `latents` and `timesteps` are gathered each step
-- buffers are reused when batch composition stays the same
+Its `forward()` method must accept `DiffusionRequestBatch` and return one
+`DiffusionOutput` per request. The runner validates the result count and maps
+outputs back to their original request IDs with `BatchRunnerOutput`.
 
-The step-wise batched path is:
+Current in-tree request-batch implementations include the Flux, LTX-2, SD3, and
+Qwen-Image pipelines. Treat the pipeline capability flag in the source as
+authoritative because support continues to expand.
 
-1. Run `prepare_encode()` for newly admitted requests.
+### Request-Batch Data Flow
+
+- `DiffusionSchedulerOutput` carries scheduled request IDs and payloads.
+- `DiffusionRequestBatch` provides the pipeline-facing static batch.
+- `BatchRunnerOutput` carries per-request results back to the engine.
+
+Request-local setup, such as seed handling and output/error mapping, remains
+per request. Cache refresh, homogeneous LoRA activation, and
+`pipeline.forward(req_batch)` can be shared by the batch.
+
+### Compatibility and Admission
+
+`RequestBatchSamplingParamsKey` contains fields that affect the tensor contract,
+including shape, guidance, output count, and LoRA identity. Only compatible
+requests can share a fused forward call.
+
+Admission is FIFO and conservative. An incompatible request at the front of the
+waiting queue can prevent later compatible requests from joining the current
+wave.
+
+`request_batch_max_wait_ms` optionally delays the first schedule operation of a
+new wave so bursty arrivals can accumulate. It applies only when:
+
+- the pipeline supports request batching;
+- step execution is disabled;
+- no requests are currently running; and
+- the configured wait is greater than zero.
+
+The wait ends when the queue reaches capacity, stabilizes briefly, reaches its
+deadline, or the engine stops.
+
+## Step-Batch Execution
+
+Step execution exposes denoising progress to the scheduler. A supporting
+pipeline implements four stateful operations:
+
+| Operation | Responsibility |
+|---|---|
+| `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
+| `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
+| `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
+| `post_decode(state)` | Decode and postprocess a completed request or output boundary |
+
+Persistent request state lives in `StepRequestState`. Pipeline-specific fields
+that do not belong in the shared contract should be stored in `state.extra`.
+Queueing and lifecycle metadata remain in the scheduler's request state.
+
+Current native pipelines that explicitly enable step execution include
+Qwen-Image, HunyuanImage3, and Helios. Step execution alone does not imply
+continuous-batching support: Qwen-Image accepts batched step states.
+HunyuanImage3 accepts batched step states only when its resolved self-attention
+backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
+Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
+`diffusion_attention_config.default.backend=TORCH_SDPA` when
+`max_num_seqs>1`. See the
+[HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
+for its validated configuration. Helios supports only a single active step
+request and must use `max_num_seqs=1`.
+
+### Continuous Batching
+
+When `max_num_seqs>1`, `StepScheduler` can keep multiple compatible requests
+active. The runner gathers their state into `InputBatch`, performs one batched
+denoise forward, then applies scheduler updates per request:
+
+1. Receive transferred KV payloads, then run `prepare_encode()` for newly
+   admitted requests.
 2. Build or refresh `InputBatch`.
-3. Run one batched `denoise_step(input_batch)`.
-4. Slice the batched `noise_pred` back per request.
-5. Run per-request `step_scheduler()`.
-6. Run `post_decode()` only for requests that finished denoising.
-7. Scatter updated latents back into persistent request state with
-   [`scatter_latents()`](gh-file:vllm_omni/diffusion/worker/input_batch.py).
+3. Run one batched `denoise_step(input_batch, states=states)`.
+4. Slice noise predictions back to each request.
+5. Run each request's `step_scheduler()`.
+6. Run `post_decode()` at a chunk boundary or request completion.
+7. Scatter updated latents back into persistent request state.
 
-This keeps the shared work limited to the denoise forward pass while preserving
-request-local scheduler state and outputs.
+`StepBatchSamplingParamsKey` protects the batched tensor contract. Requests can
+have different total step counts and current step indices, but shape-sensitive,
+CFG-sensitive, and LoRA fields must be compatible. FIFO head-of-line blocking
+also applies here.
 
-## Engine
+Chunk-capable pipelines may emit intermediate results. Final-only step
+pipelines emit when the request finishes even if `streaming_output=True`.
 
-[`DiffusionEngine`](gh-file:vllm_omni/diffusion/diffusion_engine.py) provides
-the background loop and async add-request path needed for multiple requests to
-accumulate in the scheduler.
+## Model Author Guidelines
 
-When `step_execution=True`, the engine routes work through the step-wise
-executor path. The continuous batching behavior is defined by scheduler-side
-compatibility gating and runner-side `StepInputBatch` packing.
+When converting a request-level pipeline:
 
-## Current Limitations
+- Reuse the same helpers as `forward()` to avoid behavior drift.
+- Copy request-scoped scheduler state into `state.scheduler`.
+- Advance `state.step_index` only in `step_scheduler()`.
+- Keep model forward work in `denoise_step()`.
+- Keep latent mutation in `step_scheduler()`.
+- Keep final decoding equivalent to the tail of `forward()`.
+- Store masks, condition latents, and other request-local tensors in the
+  request state rather than on the shared pipeline.
 
-- Experimental feature; use `max_num_seqs=1` for the conservative single-request
-  step path.
-- Only native pipelines that already support `step_execution=True`.
-- Only homogeneous batches keyed by `StepBatchSamplingParamsKey` are supported.
-- `cache_backend`, KV transfer, and other request-mode extras are not wired
-  into the batched step-wise path yet.
-- Future work can relax the current same-shape restriction with richer
-  heterogeneous batching policies such as bucketing or padded execution for
-  different resolutions.
+Before setting `supports_step_execution = True`, validate output parity for the
+same seed and sampling parameters, scheduler isolation across concurrent
+requests, abort cleanup, progress reporting, and all supported CFG paths.
 
-## Related Files
+Before setting `supports_request_batch = True`, validate the batch input
+contract, one-output-per-request result shape, request identity and error
+mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
 
-- Scheduler base:
-  [`vllm_omni/diffusion/sched/base_scheduler.py`](gh-file:vllm_omni/diffusion/sched/base_scheduler.py)
-- Scheduler interface:
-  [`vllm_omni/diffusion/sched/interface.py`](gh-file:vllm_omni/diffusion/sched/interface.py)
-- Step scheduler:
-  [`vllm_omni/diffusion/sched/step_scheduler.py`](gh-file:vllm_omni/diffusion/sched/step_scheduler.py)
-- Runner:
-  [`vllm_omni/diffusion/worker/diffusion_model_runner.py`](gh-file:vllm_omni/diffusion/worker/diffusion_model_runner.py)
-- Input batch:
-  [`vllm_omni/diffusion/worker/input_batch.py`](gh-file:vllm_omni/diffusion/worker/input_batch.py)
-- Tests:
-  [`tests/diffusion/test_diffusion_scheduler.py`](gh-file:tests/diffusion/test_diffusion_scheduler.py)
+## Limitations
+
+- Request batching requires an explicit pipeline capability when
+  `max_num_seqs>1`.
+- Step execution requires the four-method stateful pipeline contract.
+- Both batching paths currently require homogeneous compatibility keys.
+- FIFO scheduling can reduce batching opportunities.
+- `request_batch_max_wait_ms` trades first-request latency for burst
+  coalescing.
+- All diffusion cache backends are currently unsupported in step mode.
+- KV transfer is supported for newly admitted step requests; some other
+  request-mode extras remain unsupported.
+- Step continuous batching remains experimental; use `max_num_seqs=1` for the
+  conservative step path.
+
+## Related Implementation
+
+- Engine: [`vllm_omni/diffusion/diffusion_engine.py`](gh-file:vllm_omni/diffusion/diffusion_engine.py)
+- Model contract: [`vllm_omni/diffusion/models/interface.py`](gh-file:vllm_omni/diffusion/models/interface.py)
+- Scheduler interface: [`vllm_omni/diffusion/sched/interface.py`](gh-file:vllm_omni/diffusion/sched/interface.py)
+- Request scheduler: [`vllm_omni/diffusion/sched/request_scheduler.py`](gh-file:vllm_omni/diffusion/sched/request_scheduler.py)
+- Step scheduler: [`vllm_omni/diffusion/sched/step_scheduler.py`](gh-file:vllm_omni/diffusion/sched/step_scheduler.py)
+- Runner: [`vllm_omni/diffusion/worker/diffusion_model_runner.py`](gh-file:vllm_omni/diffusion/worker/diffusion_model_runner.py)
+- Request batch: [`vllm_omni/diffusion/worker/request_batch.py`](gh-file:vllm_omni/diffusion/worker/request_batch.py)
+- Step input batch: [`vllm_omni/diffusion/worker/input_batch.py`](gh-file:vllm_omni/diffusion/worker/input_batch.py)
