@@ -125,20 +125,23 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
+    initial_chunk_frames = int(config.get("initial_codec_chunk_frames") or 0)
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    if chunk_frames <= 0 or initial_chunk_frames < 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
+            f"initial_codec_chunk_frames={initial_chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
-    return chunk_frames, left_context_frames
+    initial_chunk_frames = min(initial_chunk_frames or chunk_frames, chunk_frames)
+    return chunk_frames, initial_chunk_frames, left_context_frames
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -269,6 +272,7 @@ def tts2code2wav_async_chunk(
             "pending": [],
             "pending_text_utf8": [],
             "segment_text_recorded": False,
+            "segment_chunks_emitted": 0,
             "left_context": [],
             "codec_end": 0,
         }
@@ -289,16 +293,17 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, initial_chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    active_chunk_frames = initial_chunk_frames if state["segment_chunks_emitted"] == 0 else chunk_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < active_chunk_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else active_chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -319,12 +324,16 @@ def tts2code2wav_async_chunk(
         context = []
         output_codes = []
     state["codec_end"] = codec_end
+    if new_token_count:
+        state["segment_chunks_emitted"] += 1
     code_flat_numel = len(output_codes)
     if native_duplex and code_flat_numel > 0:
         segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
         pending_text_utf8.clear()
     if native_duplex and finished:
         state["segment_text_recorded"] = False
+        if not last_chunk:
+            state["segment_chunks_emitted"] = 0
     if flush_pending and not last_chunk and code_flat_numel == 0:
         # Keep the generic generation connector model-agnostic: a real token
         # makes this control-only TTS boundary schedulable, while the explicit
@@ -395,7 +404,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, _, left_context_frames = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 

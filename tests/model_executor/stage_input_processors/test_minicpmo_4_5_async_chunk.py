@@ -17,9 +17,12 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager():
+def _manager(*, initial_chunk_frames: int | None = None):
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 3}
+    if initial_chunk_frames is not None:
+        extra["initial_codec_chunk_frames"] = initial_chunk_frames
     return SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
+        connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
         put_req_chunk=defaultdict(int),
@@ -101,6 +104,46 @@ def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     assert steady is not None
     assert _codes(steady) == [22, 23, 24, *range(25, 50)]
     assert steady.meta.chunk_seq == 1
+
+
+def test_initial_chunk_then_steady_chunk() -> None:
+    manager = _manager(initial_chunk_frames=8)
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(7)), request, False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(7), request, False)
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 8
+    assert _codes(first) == [4218, 4218, 4218, *range(8)]
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(8, 32)), request, False) is None
+    steady = tts2code2wav_async_chunk(manager, _delta(32), request, False)
+
+    assert steady is not None
+    assert steady.meta.codec_chunk_frames == 25
+    assert _codes(steady) == [5, 6, 7, *range(8, 33)]
+
+
+def test_initial_chunk_resets_at_duplex_segment_boundary() -> None:
+    manager = _manager(initial_chunk_frames=8)
+    request = _request("req")
+
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(*range(8)), request, False)
+    boundary = tts2code2wav_async_chunk(manager, _duplex_delta(), request, True)
+    next_segment = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(8, 16), turn_id=8),
+        request,
+        False,
+    )
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 8
+    assert boundary is not None
+    assert boundary.meta.last_chunk is False
+    assert next_segment is not None
+    assert next_segment.meta.codec_chunk_frames == 8
 
 
 def test_exact_boundary_final_flushes_held_lookahead() -> None:

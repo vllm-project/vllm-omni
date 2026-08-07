@@ -12,6 +12,7 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
+      initial_codec_chunk_frames: 5
       codec_chunk_frames: 25
       codec_left_context_frames: 3
 
