@@ -84,14 +84,41 @@ intended workload rather than assuming these numbers transfer unchanged.
 owner. `reuse` needs one. Hint size scales with the latent shape, VACE block
 count, number of CFG branches, and number of transformer experts.
 
+This is additional live device memory and can cause CUDA OOM. A useful lower
+bound for retained cache storage is:
+
+```text
+history_sets x active_CFG_branches x sum(hint_bytes_per_model_owner)
+```
+
+where `history_sets` is 2 for `forecast50` and 1 for `reuse`. This is not a
+peak-memory upper bound. A refresh or forecast can also keep the current output
+and arithmetic temporaries live alongside the retained history. Consequently,
+the risk grows with resolution, frame count, sequential CFG branches, and
+multi-expert pipelines, and is highest when the cache-off workload already has
+little free VRAM. The B300 result above observed an extra 1,986 MiB, but that
+number must not be treated as a fixed reservation or a bound for other shapes.
+
 The backend releases retained hints in request-finally cleanup, including when
 the pipeline forward raises. This prevents tensors from remaining referenced
 between requests, but it does not remove the within-request peak shown above:
-forecasting still needs its history during denoising.
+forecasting still needs its history during denoising. PyTorch's CUDA caching
+allocator may also keep released blocks reserved for reuse; that is not a live
+hint reference or a cross-request leak, but process-level reserved memory may
+remain above the pre-request value.
+
+Operator-only or single-step profiling can miss this cost because the backend
+retains history across denoising-step calls. Measure a complete generation:
+reset CUDA peak statistics immediately before the request, synchronize after
+it, and report both peak allocated and peak reserved memory (or an equivalent
+process-level GPU-memory peak). Compare cache on and off in otherwise identical
+fresh processes. Do not infer OOM safety from a profile that covers only the
+reference block or one denoising step.
 
 If VRAM is the limiting resource, leave this backend disabled or compare the
 single-history `reuse` strategy against `forecast50`; `reuse` has a different
-quality profile and must be evaluated separately.
+quality profile and must be evaluated separately. `ref_hint_refresh_interval=1`
+bypasses hint storage, so it does not incur this retained-history cost.
 
 ## Operational Notes
 
