@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -127,13 +128,14 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "update_audio_mask",
         "token_tags",
         "skip_mask_out_condition",
+        "refined_text_embed",
         "prompt_embeds",
+        "refiner_packed_seq_params",
         "img_pos_info",
         "audio_pos_info",
         "text_pos_info",
         "img_pos_for_infer_output_info",
         "packed_seq_params",
-        "refiner_packed_seq_params",
         "video_token_layout",
     }
 )
@@ -1032,24 +1034,83 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError(f"{key}.{field} is required")
         return value
 
+    def compute_refined_text(
+        self,
+        *,
+        prompt_embeds: torch.Tensor,
+        refiner_packed_seq_params: Any,
+    ) -> torch.Tensor:
+        """Project and refine text hidden states into [text_len, H] bf16.
+
+        This output depends only on the request's text embeddings and refiner
+        packed-sequence layout; it carries no timestep dependency, so the
+        denoise loop computes it once and reuses it across every step. It lives
+        outside the regionally compiled DiT blocks, so caching it does not cross
+        a torch.compile / cudagraph capture boundary.
+
+        Because this runs outside :meth:`forward`, the model-level CPU-offload
+        hook (which onloads the DiT only around ``forward``) does not stage the
+        projection/refiner weights. They are onloaded here just for this call and
+        restored to their original devices afterward, so the offload residency
+        contract and peak-memory footprint are unchanged. When the weights are
+        already resident (layer-wise or no offload) the moves are no-ops.
+        """
+        device = prompt_embeds.device
+        refiner_cu = self._psp_field(refiner_packed_seq_params, "refiner_packed_seq_params", "cu_seqlens_q").to(
+            device=device, dtype=torch.int32
+        )
+        refiner_max = int(self._psp_field(refiner_packed_seq_params, "refiner_packed_seq_params", "max_seqlen_q"))
+        with self._modules_onloaded(self.condition_proj, self.token_refiner, device=device):
+            text_rows = prompt_embeds.to(device=device, dtype=_BF16_DTYPE)
+            text_embed, _ = self.condition_proj(text_rows)
+            return self.token_refiner(
+                text_embed,
+                cu_seqlens=refiner_cu,
+                max_seqlen=refiner_max,
+            )
+
+    @staticmethod
+    @contextmanager
+    def _modules_onloaded(*modules: nn.Module, device: torch.device):
+        """Temporarily move ``modules`` to ``device``, restoring origin devices.
+
+        Each module's parameters/buffers are moved to ``device`` on entry and
+        moved back to whatever device they started on upon exit. A module whose
+        weights already live on ``device`` is left untouched (no redundant copy).
+        """
+        original: list[tuple[nn.Module, torch.device]] = []
+        for module in modules:
+            src = next((p.device for p in module.parameters()), None)
+            if src is None or src == device:
+                continue
+            original.append((module, src))
+            module.to(device)
+        try:
+            yield
+        finally:
+            for module, src in original:
+                module.to(src)
+
     def _embed(
         self,
         *,
         x: torch.Tensor,
         audio_x: torch.Tensor,
-        text_embeddings_selected: torch.Tensor,
+        refined_text_embed: torch.Tensor,
         unique_timesteps: torch.Tensor,
         img_pos: torch.Tensor,
         audio_pos: torch.Tensor,
         text_pos: torch.Tensor,
-        refiner_cu_seqlens: torch.Tensor,
-        refiner_max_seqlen: int,
         seq_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build packed multimodal embeddings for the TP=1/SP=1 inference path.
 
         Returns (decoder_input [S, H] bf16, t_emb [M, t_dim] fp32).
+
+        ``refined_text_embed`` is the request-static token-refiner output built
+        once by :meth:`compute_refined_text`; the latent embedders below are the
+        only per-step work here.
         """
         # Latent embedders stay fp32 in and out; their outputs are cast to the
         # bf16 sequence dtype only during indexed scattering.
@@ -1058,16 +1119,10 @@ class MiniMaxH3DiTModel(nn.Module):
         audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
-        text_embed, _ = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(
-            text_embed,
-            cu_seqlens=refiner_cu_seqlens,
-            max_seqlen=refiner_max_seqlen,
-        )
+        text_embed = refined_text_embed.to(device=device, dtype=_BF16_DTYPE)
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
-        embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
+        embeddings.index_add_(0, text_pos, text_embed[: text_pos.shape[0]])
         embeddings.index_add_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
         embeddings.index_add_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
 
@@ -1100,7 +1155,19 @@ class MiniMaxH3DiTModel(nn.Module):
         token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
         skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
 
-        text_selected = _required_kwarg(kwargs, "prompt_embeds")
+        # Refined text is request-static. The denoise loop precomputes it once
+        # and passes it in via ``refined_text_embed`` (layerwise / no-offload,
+        # where the refiner weights are resident for the whole request). Under
+        # model (cpu) offload there is no loop-level point where the weights are
+        # resident, so the loop passes the raw text inputs instead and we refine
+        # here — inside forward, where the model-level hook has already onloaded
+        # the transformer, so ``compute_refined_text``'s guard is a no-op.
+        refined_text_embed = kwargs.get("refined_text_embed")
+        if refined_text_embed is None:
+            refined_text_embed = self.compute_refined_text(
+                prompt_embeds=_required_kwarg(kwargs, "prompt_embeds"),
+                refiner_packed_seq_params=_required_kwarg(kwargs, "refiner_packed_seq_params"),
+            )
 
         img_pos = self._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
         audio_pos = self._pos_ids(_required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info")
@@ -1116,9 +1183,6 @@ class MiniMaxH3DiTModel(nn.Module):
         psp = _required_kwarg(kwargs, "packed_seq_params")
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
-        refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
-        refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
-        refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
@@ -1135,13 +1199,11 @@ class MiniMaxH3DiTModel(nn.Module):
         decoder_input, t_emb = self._embed(
             x=x,
             audio_x=audio_x,
-            text_embeddings_selected=text_selected,
+            refined_text_embed=refined_text_embed,
             unique_timesteps=unique_timesteps.view(-1).to(device),
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device),
-            refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
         )

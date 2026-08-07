@@ -71,12 +71,24 @@ class MiniMaxH3DenoiseBranch:
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
+        # Request-static text hidden states + refiner layout. The refined text
+        # embedding is timestep-independent, so it is computed once and reused
+        # across steps. Depending on offload mode it is either precomputed by
+        # ``prepare_refined_text`` (stored under ``refined_text_embed``) or
+        # refined inside ``forward`` from these raw inputs (model cpu offload);
+        # both are always available so either path works.
+        self._prompt_embeds = text_embeddings.to(device)
+        self._refiner_packed_seq_params = {
+            "cu_seqlens_q": torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device),
+            "max_seqlen_q": text_len,
+        }
         self.static_kwargs: dict[str, Any] = {
             "img_position_ids": packed["img_position_ids"][None].to(device),
             "update_mask": self.update_mask_dev,
             "token_tags": token_tags.view(-1).to(torch.long).to(device),
             "skip_mask_out_condition": False,
-            "prompt_embeds": text_embeddings.to(device),
+            "prompt_embeds": self._prompt_embeds,
+            "refiner_packed_seq_params": self._refiner_packed_seq_params,
             "img_pos_info": {"position_ids": self.img_pos_dev},
             "audio_pos_info": {"position_ids": self.audio_pos_dev},
             "text_pos_info": {"position_ids": text_pos_dev},
@@ -84,10 +96,6 @@ class MiniMaxH3DenoiseBranch:
             "packed_seq_params": {
                 "cu_seqlens_q": cu.to(device),
                 "max_seqlen_q": int(cu[1]),
-            },
-            "refiner_packed_seq_params": {
-                "cu_seqlens_q": torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device),
-                "max_seqlen_q": text_len,
             },
         }
         # Where the video segment sits in the packed sequence. Resolved to plain
@@ -97,6 +105,22 @@ class MiniMaxH3DenoiseBranch:
             prefix_len=int(packed["video_row_start"]),
             latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
         )
+
+    def prepare_refined_text(self, model: Any) -> None:
+        """Precompute this branch's request-static refined text embedding.
+
+        Called once by the denoise loop for the layerwise / no-offload path so
+        the token-refiner runs once per request instead of once per step. Under
+        model cpu offload the loop skips this and lets ``forward`` refine from
+        the raw text inputs instead (see the loop for why); in that case
+        ``refined_text_embed`` is simply absent from ``static_kwargs`` and the
+        raw ``prompt_embeds`` / ``refiner_packed_seq_params`` carry the work.
+        """
+        refined = model.compute_refined_text(
+            prompt_embeds=self._prompt_embeds,
+            refiner_packed_seq_params=self._refiner_packed_seq_params,
+        )
+        self.static_kwargs["refined_text_embed"] = refined
 
     def forward_kwargs(
         self,
@@ -199,6 +223,27 @@ def minimax_h3_denoise_loop(
         audio_rows[~audio_update] = audio_anchor
 
     num_steps = len(sigmas_video) - 1
+    # Token-refiner output is request-static (no timestep dependency), so where
+    # possible we compute it once and reuse it across steps instead of once per
+    # forward. Whether that hoist is a win depends on where the refiner weights
+    # live during the loop:
+    #   * layerwise / no offload: refiner weights are resident on GPU for the
+    #     whole request, so hoisting the compute above the loop is a clean win --
+    #     the refiner runs once and ``compute_refined_text``'s onload guard is a
+    #     no-op. Every ``forward`` then consumes the cached ``refined_text_embed``.
+    #   * model (cpu) offload: the model-level hook onloads the transformer only
+    #     *inside* ``forward``. Hoisting here would run the refiner while its
+    #     weights are still on CPU, forcing an extra CPU->GPU->CPU round-trip --
+    #     a net regression for a refiner too small to pay it back. So we simply
+    #     don't hoist: ``forward`` refines internally each step from the raw text
+    #     inputs (weights already onloaded, no extra transfer), exactly matching
+    #     the pre-optimization path. This is deliberately a no-op branch, not an
+    #     oversight -- see PR discussion / tests for the measured parity.
+    is_model_offload = bool(getattr(getattr(model, "od_config", None), "enable_cpu_offload", False))
+    if not is_model_offload:
+        # Kept under inference_mode to match the per-step forward's context.
+        with torch.inference_mode():
+            positive.prepare_refined_text(model)
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
