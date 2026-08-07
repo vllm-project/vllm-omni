@@ -10,10 +10,13 @@ forward_hip, and apply_rotary_emb_mindiesd paths.
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 import torch
 
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_mindiesd
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -234,3 +237,33 @@ class TestRotaryEmbeddingNativeShapeRegression:
         output = rope.forward_native(x, cos, sin)
         assert output.shape == x.shape
         assert not torch.isnan(output).any()
+
+
+def test_mindie_full_dim_rope_keeps_h3_cos_sin_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """H3 passes complete rotary dims to MindIE instead of the CUDA half-dim layout."""
+    captured: dict[str, object] = {}
+
+    def rotary_position_embedding(x, cos, sin, **kwargs):
+        captured.update(x=x, cos=cos, sin=sin, kwargs=kwargs)
+        return x
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mindiesd",
+        types.SimpleNamespace(rotary_position_embedding=rotary_position_embedding),
+    )
+    x = torch.randn(11, 3, 96, dtype=torch.bfloat16)
+    cos = torch.randn(11, 96, dtype=torch.bfloat16)
+    sin = torch.randn(11, 96, dtype=torch.bfloat16)
+
+    actual = apply_rotary_emb_mindiesd(x, cos, sin, interleaved=False, half_head_dim=False)
+
+    assert actual is x
+    assert captured["x"] is x
+    assert captured["cos"] is cos
+    assert captured["sin"] is sin
+    assert captured["kwargs"] == {
+        "rotated_mode": "rotated_half",
+        "head_first": False,
+        "fused": True,
+    }

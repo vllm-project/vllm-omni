@@ -9,6 +9,7 @@ from typing import Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -72,6 +73,16 @@ def omni_snapshot_download(model_id: str) -> str:
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
+
+    # Modular Diffusers repositories describe independently loadable
+    # components. Let the selected pipeline download only its component
+    # sources instead of eagerly materializing the entire repository.
+    try:
+        if file_or_path_exists(model_id, "modular_model_index.json", revision=None):
+            return model_id
+    except (huggingface_hub.errors.GatedRepoError, huggingface_hub.errors.RepositoryNotFoundError):
+        # Preserve the more helpful errors raised by the full-download path.
+        pass
 
     try:
         download_weights_from_hf_specific(
