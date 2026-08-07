@@ -85,19 +85,37 @@ def _build_cache_context_refresh(
         # Cache-DiT has no predefined SCM mask for these small step counts.
         scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
         if projected_config.scm_steps_mask_policy is None or not scm_supported_steps:
+            if projected_config.force_refresh_step_hint is not None:
+                # Cache-DiT's ``once`` policy clears the hint after it fires.
+                # Reapply it at every request boundary so a repeated request
+                # with the same H3 policy receives the same behavior.
+                cache_dit.refresh_context(
+                    transformer,
+                    cache_config=DBCacheConfig().reset(
+                        num_inference_steps=num_inference_steps,
+                        force_refresh_step_hint=projected_config.force_refresh_step_hint,
+                        force_refresh_step_policy=projected_config.force_refresh_step_policy,
+                    ),
+                    verbose=verbose,
+                )
+                return
             cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
             return
 
+        refresh_config = DBCacheConfig().reset(
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=projected_config.scm_steps_mask_policy,
+                total_steps=num_inference_steps,
+            ),
+            steps_computation_policy=projected_config.scm_steps_policy,
+        )
+        if projected_config.force_refresh_step_hint is not None:
+            refresh_config.force_refresh_step_hint = projected_config.force_refresh_step_hint
+            refresh_config.force_refresh_step_policy = projected_config.force_refresh_step_policy
         cache_dit.refresh_context(
             transformer,
-            cache_config=DBCacheConfig().reset(
-                num_inference_steps=num_inference_steps,
-                steps_computation_mask=cache_dit.steps_mask(
-                    mask_policy=projected_config.scm_steps_mask_policy,
-                    total_steps=num_inference_steps,
-                ),
-                steps_computation_policy=projected_config.scm_steps_policy,
-            ),
+            cache_config=refresh_config,
             verbose=verbose,
         )
 

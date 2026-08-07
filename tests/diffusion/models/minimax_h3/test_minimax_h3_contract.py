@@ -72,6 +72,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline._quality_policy.resolve.assert_called_once_with(
         quality="high",
         num_inference_steps=50,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
     )
     assert output.output == pipeline.decode.return_value
 

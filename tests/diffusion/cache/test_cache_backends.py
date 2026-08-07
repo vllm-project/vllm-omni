@@ -254,6 +254,32 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_refresh_rearms_force_refresh_hint(self, mock_cache_dit, mock_block_adapter):
+        """A once hint must be restored for every repeated request."""
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "DiTPipeline"
+        pipeline.transformer = Mock()
+        pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+            block_forward_patterns={"layers": ForwardPattern.Pattern_0}
+        )
+
+        config = DiffusionCacheConfig(
+            force_refresh_step_hint=7,
+            force_refresh_step_policy="once",
+        )
+        backend = CacheDiTBackend(config)
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=20)
+        backend.refresh(pipeline, num_inference_steps=20)
+
+        assert mock_cache_dit.refresh_context.call_count == 2
+        for call in mock_cache_dit.refresh_context.call_args_list:
+            refresh_config = call.kwargs["cache_config"]
+            assert refresh_config.force_refresh_step_hint == 7
+            assert refresh_config.force_refresh_step_policy == "once"
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_enable_hunyuan_pipeline_uses_model_transformer(self, mock_cache_dit, mock_block_adapter):
         """Test HunyuanImage3 uses pipeline.transformer for cache enable/refresh.
 

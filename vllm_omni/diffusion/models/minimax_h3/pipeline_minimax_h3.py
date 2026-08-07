@@ -1758,6 +1758,7 @@ class MiniMaxH3Pipeline(
         quality_plan = self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
+            extra_args=extra,
         )
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)

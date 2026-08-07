@@ -578,6 +578,8 @@ than one is requested.
 
 | Parameter | Recommended value | Notes |
 |-----------|-------------------|-------|
+| `quality` | omitted or `lossless` | Request-level quality intent; `high` requires startup `--cache-backend cache_dit` and selects H3's conservative Cache-DiT profile |
+| `extra_params.force_refresh` | omitted | Optional positive 1-based denoising-step hint for a Cache-DiT context refresh; pair with `extra_params.force_refresh_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
