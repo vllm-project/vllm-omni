@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
-    AdmissionWaitDecision,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     RequestBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
 
 if TYPE_CHECKING:
@@ -33,17 +33,17 @@ class RequestScheduler(BaseScheduler):
         *,
         now: float,
         dp_concurrent: bool = False,
-    ) -> AdmissionWaitDecision:
+    ) -> _AdmissionWaitDecision:
         assert self.od_config is not None
         max_wait_ms = self.od_config.request_batch_max_wait_ms
         if max_wait_ms <= 0.0 or self.max_num_running_reqs <= 1:
-            return AdmissionWaitDecision(should_wait=False)
+            return _AdmissionWaitDecision(should_wait=False)
         if self.num_running_requests() > 0:
-            return AdmissionWaitDecision(should_wait=False)
+            return _AdmissionWaitDecision(should_wait=False)
 
         max_wait_s = max_wait_ms / 1000.0
         stable_window_s = min(0.3, max_wait_s / 2.0) if dp_concurrent else min(0.05, max_wait_s / 5.0)
-        return AdmissionWaitDecision(
+        return _AdmissionWaitDecision(
             should_wait=True,
             deadline=now + max_wait_s,
             stable_window_s=stable_window_s,
@@ -52,7 +52,7 @@ class RequestScheduler(BaseScheduler):
 
     def should_end_admission_wait(
         self,
-        decision: AdmissionWaitDecision,
+        decision: _AdmissionWaitDecision,
         *,
         now: float,
         stable_since: float,

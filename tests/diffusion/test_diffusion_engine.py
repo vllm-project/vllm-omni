@@ -23,9 +23,9 @@ from vllm_omni.diffusion.diffusion_engine import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
-    AdmissionWaitDecision,
     CachedRequestData,
     NewRequestData,
+    _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
@@ -81,9 +81,9 @@ class MockScheduler:
         *,
         now: float,
         dp_concurrent: bool = False,
-    ) -> AdmissionWaitDecision:
+    ) -> _AdmissionWaitDecision:
         del dp_concurrent
-        return AdmissionWaitDecision(
+        return _AdmissionWaitDecision(
             should_wait=True,
             deadline=now + 0.5,
             stable_window_s=0.05,
@@ -92,7 +92,7 @@ class MockScheduler:
 
     def should_end_admission_wait(
         self,
-        decision: AdmissionWaitDecision,
+        decision: _AdmissionWaitDecision,
         *,
         now: float,
         stable_since: float,
@@ -504,6 +504,11 @@ class TestRequestBatchAdmission:
     def test_config_rejects_negative_request_batch_max_wait_ms(self) -> None:
         with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
             OmniDiffusionConfig(model="test", request_batch_max_wait_ms=-1.0)
+
+    @pytest.mark.parametrize("bad_wait", [float("nan"), float("inf"), float("-inf")])
+    def test_config_rejects_nonfinite_request_batch_max_wait_ms(self, bad_wait: float) -> None:
+        with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
+            OmniDiffusionConfig(model="test", request_batch_max_wait_ms=bad_wait)
 
     def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
         config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)

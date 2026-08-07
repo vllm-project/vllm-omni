@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
-    AdmissionWaitDecision,
     CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -21,6 +20,7 @@ from vllm_omni.diffusion.sched.interface import (
     RequestBatchSamplingParamsKey,
     SchedulerRequestState,
     StepBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -158,14 +158,14 @@ class BaseScheduler(ABC):
         *,
         now: float,
         dp_concurrent: bool = False,
-    ) -> AdmissionWaitDecision:
+    ) -> _AdmissionWaitDecision:
         """Return the admission-delay policy for the next scheduling wave."""
         del now, dp_concurrent
-        return AdmissionWaitDecision(should_wait=False)
+        return _AdmissionWaitDecision(should_wait=False)
 
     def should_end_admission_wait(
         self,
-        decision: AdmissionWaitDecision,
+        decision: _AdmissionWaitDecision,
         *,
         now: float,
         stable_since: float,

@@ -29,8 +29,8 @@ class DiffusionRequestStatus(enum.IntEnum):
 
 
 @dataclass(frozen=True)
-class AdmissionWaitDecision:
-    """Scheduler policy for delaying the next admission wave. Typically used by request-level batching."""
+class _AdmissionWaitDecision:
+    """Internal scheduler policy for delaying the next admission wave."""
 
     should_wait: bool
     deadline: float | None = None
