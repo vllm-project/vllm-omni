@@ -1979,7 +1979,6 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
             "guidance_scale": "6.5",
             "seed": "42",
             "quality": "high",
-            "extra_params": json.dumps({"force_refresh": 7, "force_refresh_policy": "repeat"}),
         },
     )
     assert response.status_code == 200
@@ -1989,8 +1988,6 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
     assert captured.quality == "high"
-    assert captured.extra_args["force_refresh"] == 7
-    assert captured.extra_args["force_refresh_policy"] == "repeat"
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):

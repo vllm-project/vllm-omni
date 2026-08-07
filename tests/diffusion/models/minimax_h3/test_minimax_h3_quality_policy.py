@@ -76,14 +76,7 @@ def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
     assert spec.cache_config.scm_steps_mask_policy is None
 
 
-@pytest.mark.parametrize(
-    "extra_args",
-    [
-        {"force_refresh": 7},
-        {"force_refresh_step_hint": 7},
-    ],
-)
-def test_h3_force_refresh_is_model_owned_and_request_scoped(extra_args):
+def test_h3_force_refresh_is_model_owned_and_request_scoped():
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
 
     policy = MiniMaxH3QualityPolicy(_quality_od_config())
@@ -91,7 +84,7 @@ def test_h3_force_refresh_is_model_owned_and_request_scoped(extra_args):
         policy,
         quality="high",
         num_inference_steps=17,
-        extra_args=extra_args,
+        extra_args={"force_refresh_step_hint": 7},
     )
 
     assert plan.cache_dit is not None
@@ -108,7 +101,7 @@ def test_h3_force_refresh_policy_supports_repeat_and_does_not_mutate_generic_con
         MiniMaxH3QualityPolicy(config),
         quality=None,
         num_inference_steps=20,
-        extra_args={"force_refresh": 5, "force_refresh_policy": "repeat"},
+        extra_args={"force_refresh_step_hint": 5, "force_refresh_step_policy": "repeat"},
     )
 
     assert plan.cache_dit is not None
@@ -119,25 +112,49 @@ def test_h3_force_refresh_policy_supports_repeat_and_does_not_mutate_generic_con
     assert config.cache_config.force_refresh_step_hint is None
     assert config.cache_config.force_refresh_step_policy == "once"
 
+    restored = _resolve_quality(MiniMaxH3QualityPolicy(config), quality=None)
+    assert restored.cache_dit is not None
+    assert restored.cache_dit.installation_key == "minimax_h3.generic"
+    assert restored.cache_dit.cache_config is config.cache_config
+
 
 @pytest.mark.parametrize(
     ("extra_args", "message"),
     [
-        ({"force_refresh": True}, "positive integer"),
-        ({"force_refresh": 0}, "between 1"),
-        ({"force_refresh": 51}, "between 1"),
-        ({"force_refresh": 5, "force_refresh_policy": "always"}, "one of"),
-        ({"force_refresh_policy": "repeat"}, "requires a force_refresh"),
-        ({"force_refresh": 5, "force_refresh_step_hint": 6}, "must match"),
+        ({"force_refresh_step_hint": True}, "positive integer"),
+        ({"force_refresh_step_hint": 0}, "between 1"),
+        ({"force_refresh_step_hint": 51}, "between 1"),
+        ({"force_refresh_step_hint": 5, "force_refresh_step_policy": "always"}, "one of"),
+        ({"force_refresh_step_policy": "repeat"}, "requires force_refresh_step_hint"),
     ],
 )
-def test_h3_force_refresh_rejects_ambiguous_or_invalid_values(extra_args, message):
+def test_h3_force_refresh_rejects_invalid_values(extra_args, message):
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
 
     with pytest.raises(OmniClientError, match=message):
         _resolve_quality(
             MiniMaxH3QualityPolicy(_quality_od_config()),
             extra_args=extra_args,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cache_backend", "quality"),
+    [
+        ("cache_dit", "lossless"),
+        ("none", None),
+    ],
+)
+def test_h3_force_refresh_requires_active_cache_target(cache_backend, quality):
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend=cache_backend))
+
+    with pytest.raises(OmniClientError, match="require an active Cache-DiT"):
+        _resolve_quality(
+            policy,
+            quality=quality,
+            extra_args={"force_refresh_step_hint": 7},
         )
 
 

@@ -18,8 +18,6 @@ from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_GENERIC_CACHE_KEY = "minimax_h3.generic"
 MINIMAX_H3_HIGH_CACHE_KEY = "minimax_h3.high"
-MINIMAX_H3_FORCE_REFRESH_ARG = "force_refresh"
-MINIMAX_H3_FORCE_REFRESH_POLICY_ARG = "force_refresh_policy"
 MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG = "force_refresh_step_hint"
 MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG = "force_refresh_step_policy"
 MINIMAX_H3_FORCE_REFRESH_POLICIES = ("once", "repeat")
@@ -44,59 +42,49 @@ def _resolve_force_refresh(
 ) -> tuple[int, str] | None:
     """Resolve H3's request-scoped Cache-DiT refresh hint.
 
-    ``force_refresh`` is the short H3 request name.  The explicit
-    ``force_refresh_step_hint``/``force_refresh_step_policy`` spellings are
-    accepted as well so callers can use Cache-DiT's native terminology.
-    These are model-specific ``extra_args`` rather than global sampling
-    fields, keeping other diffusion models unchanged.
+    These are model-specific ``extra_args`` rather than global sampling fields,
+    keeping other diffusion models unchanged.
     """
 
     if not extra_args:
         return None
 
-    short_hint = extra_args.get(MINIMAX_H3_FORCE_REFRESH_ARG)
-    explicit_hint = extra_args.get(MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG)
-    if short_hint is not None and explicit_hint is not None and short_hint != explicit_hint:
-        raise OmniClientError(
-            "MiniMax H3 extra_args['force_refresh'] and "
-            "extra_args['force_refresh_step_hint'] must match when both are provided"
-        )
-    raw_hint = explicit_hint if explicit_hint is not None else short_hint
-
-    short_policy = extra_args.get(MINIMAX_H3_FORCE_REFRESH_POLICY_ARG)
-    explicit_policy = extra_args.get(MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG)
-    if short_policy is not None and explicit_policy is not None and short_policy != explicit_policy:
-        raise OmniClientError(
-            "MiniMax H3 extra_args['force_refresh_policy'] and "
-            "extra_args['force_refresh_step_policy'] must match when both are provided"
-        )
-    raw_policy = explicit_policy if explicit_policy is not None else short_policy
+    raw_hint = extra_args.get(MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG)
+    raw_policy = extra_args.get(MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG)
 
     if raw_hint is None:
         if raw_policy is not None:
-            raise OmniClientError(
-                "MiniMax H3 force_refresh_policy requires a force_refresh step hint"
-            )
+            raise OmniClientError("MiniMax H3 force_refresh_step_policy requires force_refresh_step_hint")
         return None
     if isinstance(raw_hint, bool) or not isinstance(raw_hint, Integral):
-        raise OmniClientError(
-            "MiniMax H3 force_refresh must be a positive integer denoising step hint"
-        )
+        raise OmniClientError("MiniMax H3 force_refresh_step_hint must be a positive integer")
 
     hint = int(raw_hint)
     if not 1 <= hint <= num_inference_steps:
         raise OmniClientError(
-            "MiniMax H3 force_refresh must be between 1 and "
+            "MiniMax H3 force_refresh_step_hint must be between 1 and "
             f"num_inference_steps ({num_inference_steps}), got {hint}"
         )
 
     policy = "once" if raw_policy is None else raw_policy
     if not isinstance(policy, str) or policy not in MINIMAX_H3_FORCE_REFRESH_POLICIES:
         raise OmniClientError(
-            "MiniMax H3 force_refresh_policy must be one of "
+            "MiniMax H3 force_refresh_step_policy must be one of "
             f"{list(MINIMAX_H3_FORCE_REFRESH_POLICIES)}, got {policy!r}"
         )
     return hint, policy
+
+
+def _has_force_refresh_args(extra_args: Mapping[str, Any] | None) -> bool:
+    if not extra_args:
+        return False
+    return any(
+        extra_args.get(name) is not None
+        for name in (
+            MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG,
+            MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG,
+        )
+    )
 
 
 def _with_force_refresh(
@@ -161,35 +149,31 @@ class MiniMaxH3QualityPolicy:
         num_inference_steps: int,
         extra_args: Mapping[str, Any] | None = None,
     ) -> MiniMaxH3QualityPlan:
-        force_refresh = _resolve_force_refresh(
-            extra_args,
-            num_inference_steps=num_inference_steps,
-        )
         if quality == "high":
             if self._configured_backend != "cache_dit":
                 raise OmniClientError(
                     'MiniMax-H3 quality="high" requires the server to start with cache_backend="cache_dit"'
                 )
-            return MiniMaxH3QualityPlan(
-                cache_dit=CacheDiTRequestSpec(
-                    installation_key=_cache_installation_key(MINIMAX_H3_HIGH_CACHE_KEY, force_refresh),
-                    cache_config=_with_force_refresh(_high_quality_cache_config(), force_refresh),
-                    num_inference_steps=num_inference_steps,
-                ),
-            )
+            base_key = MINIMAX_H3_HIGH_CACHE_KEY
+            base_config = _high_quality_cache_config()
+        elif self._configured_backend == "cache_dit" and quality is None:
+            base_key = MINIMAX_H3_GENERIC_CACHE_KEY
+            base_config = self._od_config.cache_config
+        else:
+            if _has_force_refresh_args(extra_args):
+                raise OmniClientError("MiniMax H3 force-refresh arguments require an active Cache-DiT request target")
+            return MiniMaxH3QualityPlan(cache_dit=None)
 
-        generic_requested = self._configured_backend == "cache_dit" and quality is None
-        cache_dit = (
-            CacheDiTRequestSpec(
-                installation_key=_cache_installation_key(MINIMAX_H3_GENERIC_CACHE_KEY, force_refresh),
-                cache_config=_with_force_refresh(self._od_config.cache_config, force_refresh),
-                num_inference_steps=num_inference_steps,
-            )
-            if generic_requested
-            else None
+        force_refresh = _resolve_force_refresh(
+            extra_args,
+            num_inference_steps=num_inference_steps,
         )
         return MiniMaxH3QualityPlan(
-            cache_dit=cache_dit,
+            cache_dit=CacheDiTRequestSpec(
+                installation_key=_cache_installation_key(base_key, force_refresh),
+                cache_config=_with_force_refresh(base_config, force_refresh),
+                num_inference_steps=num_inference_steps,
+            ),
         )
 
 

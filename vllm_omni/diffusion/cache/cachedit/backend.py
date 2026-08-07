@@ -88,7 +88,7 @@ def _build_cache_context_refresh(
             if projected_config.force_refresh_step_hint is not None:
                 # Cache-DiT's ``once`` policy clears the hint after it fires.
                 # Reapply it at every request boundary so a repeated request
-                # with the same H3 policy receives the same behavior.
+                # with the same configured policy receives the same behavior.
                 cache_dit.refresh_context(
                     transformer,
                     cache_config=DBCacheConfig().reset(
