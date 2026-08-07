@@ -24,6 +24,7 @@ from .format import (
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
     video_to_base64,
+    video_to_bytes,
 )
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
@@ -63,7 +64,11 @@ async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get",
 
 class VLLMOmniClient:
     def __init__(
-        self, base_url: str, timeout: float | None = None, poll_interval: float = 5.0, max_poll_duration: float = 60 * 5
+        self,
+        base_url: str,
+        timeout: float | None = None,
+        poll_interval: float = 5.0,
+        max_poll_duration: float = 60 * 30,
     ):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -261,12 +266,17 @@ class VLLMOmniClient:
         num_frames: int,
         fps: int,
         negative_prompt: str | None = None,
-        image: torch.Tensor | None = None,
+        frame: torch.Tensor | None = None,
+        references: dict | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
-        **extra_body,
+        **extra_params,
     ) -> VideoInput:
+        if frame is not None and references is not None:
+            raise ValueError("Provide only one of frame or references, not both.")
+
+        # === regular payload fields ===
         form = aiohttp.FormData()
         form.add_field("model", model)
         form.add_field("prompt", prompt)
@@ -279,22 +289,90 @@ class VLLMOmniClient:
         if sampling_params is not None:
             for k, v in sampling_params.items():
                 form.add_field(k, str(v))
-        if model_params is not None:
-            for k, v in model_params.items():
-                form.add_field(k, str(v))
         if lora is not None:
             form.add_field("lora", json.dumps(lora, ensure_ascii=False))
-        if extra_body:
-            form.add_field("extra_body", json.dumps(extra_body, ensure_ascii=False))
 
-        if image is not None:
+        # === multimodal inputs (first-last-frames, references, etc.) ===
+        input_reference_image: torch.Tensor | None = None
+        audio_reference: AudioInput | None = None
+        reference_videos: list[VideoInput] = []
+        video_task: str | None = None
+
+        if frame is not None:
+            input_reference_image = frame
+            video_task = "fl2va"
+        elif references is not None:
+            images = [references[k] for k in ("image_1", "image_2") if k in references and references[k] is not None]
+            audios = [references[k] for k in ("audio_1", "audio_2") if k in references and references[k] is not None]
+            videos = [references[k] for k in ("video_1", "video_2") if k in references and references[k] is not None]
+
+            if not images and not audios and not videos:
+                raise ValueError("references is empty; connect at least one image/audio/video.")
+
+            if videos:
+                if images or audios:
+                    raise ValueError(
+                        "Video references cannot be combined with image or audio references. "
+                        "Connect only video_1/video_2 for multi-video Ref2VA."
+                    )
+                reference_videos = videos
+                video_task = "ref2va"
+            elif len(images) == 1 and len(audios) == 1:
+                input_reference_image = images[0]
+                audio_reference = audios[0]
+                video_task = "ref2va"
+            else:
+                raise ValueError(
+                    "Invalid references combination. Supported modes: "
+                    "(1) one or more videos only, or (2) exactly one image and one audio."
+                )
+        else:
+            video_task = "t2va"
+
+        if input_reference_image is not None:
             image_filename = "image.png"  # Required for multipart form
             form.add_field(
                 "input_reference",
-                image_tensor_to_png_bytes(image, image_filename),
+                image_tensor_to_png_bytes(input_reference_image, image_filename),
                 filename=image_filename,
                 content_type="image/png",
             )
+
+        if audio_reference is not None:
+            form.add_field(
+                "audio_reference",
+                json.dumps({"audio_url": audio_to_base64(audio_reference)}, ensure_ascii=False),
+            )
+
+        for idx, video in enumerate(reference_videos, start=1):
+            video_filename = f"reference_{idx}.mp4"
+            form.add_field(
+                "input_references",
+                video_to_bytes(video, video_filename),
+                filename=video_filename,
+                content_type="video/mp4",
+            )
+
+        # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
+        if model_params is not None:
+            model_params = dict(model_params)
+            model_params.pop("type", None)
+
+        spec, _ = lookup_model_spec(model)
+        params_builder = spec.get("params_builder") if spec else None
+        if params_builder is not None:
+            form_fields = params_builder(
+                model_params or {},
+                extra_params={**extra_params, "task": video_task},
+            )
+            for k, v in form_fields.items():
+                form.add_field(k, v if isinstance(v, str) else str(v))
+        else:
+            if model_params is not None:
+                for k, v in model_params.items():
+                    form.add_field(k, str(v))
+            if extra_params:
+                form.add_field("extra_params", json.dumps(extra_params, ensure_ascii=False))
 
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             # Start the video generation job

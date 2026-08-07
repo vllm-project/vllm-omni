@@ -449,9 +449,8 @@ Key configuration fields:
 !!! note
     New in-tree models should define frozen topology in `models/<model>/pipeline.py`,
     register it in `vllm_omni/config/pipeline_registry.py`, and put deployment
-    knobs in `vllm_omni/deploy/<model>.yaml`. Legacy `stage_args` YAMLs are still
-    accepted for custom configs via `--stage-configs-path`, but should not be used
-    for new bundled defaults.
+    knobs in `vllm_omni/deploy/<model>.yaml`. Use `--deploy-config` to load a
+    custom deployment YAML.
 
 ### Batch mode
 

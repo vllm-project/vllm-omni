@@ -70,8 +70,7 @@ dev = [
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
     "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
-    "step-audio2==1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
+    "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
 demo = [
@@ -96,6 +95,12 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
+# the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
+fa4 = [
+    "flash-attn-4[cu13]==4.0.0b18",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -103,6 +108,7 @@ docs = [
     "mkdocstrings-python",
     "mkdocs-gen-files",
     "mkdocs-awesome-nav",
+    "mkdocs-redirects",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
@@ -244,13 +250,16 @@ markers = [
     "npu: Tests that run on NPU/Ascend (auto-added)",
     "musa: Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
-    "H100: Tests that require H100 GPU",
-    "L4: Tests that require L4 GPU",
-    "MI325: Tests that require MI325 GPU (AMD/ROCm)",
-    "B60: Tests that require Intel Arc Pro B60 XPU",
-    "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
-    "A2: Tests that require A2 NPU",
-    "A3: Tests that require A3 NPU",
+    # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
+    "H100: [hardware-resource] Tests that require H100 GPU",
+    "H200: [hardware-resource] Tests that require H200 GPU",
+    "L4: [hardware-resource] Tests that require L4 GPU",
+    "B200: [hardware-resource] Tests that require B200 GPU",
+    "MI325: [hardware-resource] Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: [hardware-resource] Tests that require Intel Arc Pro B60 XPU",
+    "S5000: [hardware-resource] Tests that require S5000 GPU (Moore Threads/MUSA)",
+    "A2: [hardware-resource] Tests that require A2 NPU",
+    "A3: [hardware-resource] Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
     "distributed_xpu: Tests that require multi cards on XPU platform",

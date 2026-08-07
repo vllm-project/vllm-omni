@@ -40,7 +40,7 @@ bash run_server_stage_cli.sh --stage 0
 bash run_server_stage_cli.sh --stage 1
 ```
 
-To use a custom deploy YAML (note: `--stage-configs-path` is deprecated in favor of `--deploy-config`):
+To use a custom deploy YAML:
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \

@@ -240,6 +240,28 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--task-type",
+            "fl2va",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.task_type == "fl2va"
+    assert stage_cfg["engine_args"]["task_type"] == "fl2va"
+
+
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     """Ensure diffusion serve CLI exposes the profiler switch."""
     parser = TrackingArgumentParser()
@@ -260,6 +282,36 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
+
+
+def test_serve_cli_forwards_distributed_offload_residency():
+    """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--dlo-resident-layers",
+            "20",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert args.enable_distributed_layerwise_offload is True
+    assert args.dlo_use_allgather is False
+    assert args.dlo_resident_layers == 20
+    assert engine_args["enable_distributed_layerwise_offload"] is True
+    assert engine_args["dlo_use_allgather"] is False
+    assert engine_args["dlo_resident_layers"] == 20
 
 
 def test_serve_cli_accepts_diffusion_compile_controls():
