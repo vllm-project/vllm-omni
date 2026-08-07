@@ -23,6 +23,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+    if getattr(args, "videomme_save_eval_items", False):
+        os.environ["VIDEOMME_SAVE_EVAL_ITEMS"] = "1"
     set_print_stage(getattr(args, "print_stage", False))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
