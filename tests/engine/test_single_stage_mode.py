@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,8 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -188,6 +191,34 @@ class TestOmniMasterServerAllocation:
         input_port = int(alloc.input_bind_address.split(":")[-1])
         output_port = int(alloc.output_bind_address.split(":")[-1])
         assert len({handshake_port, input_port, output_port}) == 3
+
+    def test_route_ports_remain_os_reserved_until_master_releases_them(self):
+        server = OmniMasterServer(master_address="127.0.0.1", master_port=15005, stage_ids=[0])
+        alloc = server.get_allocation(0)
+        ports = [
+            int(alloc.handshake_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.input_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.output_bind_address.rsplit(":", 1)[-1]),
+        ]
+
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.release_route_port_reservations(0, handshake=True, data=False)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", ports[0]))
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.stop()
+
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
 
     def test_get_zmq_addresses_returns_bind_addresses(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15002, stage_ids=[0])
@@ -397,6 +428,30 @@ class TestSingleStageModeDetection:
         assert engine.single_stage_mode is False
         assert engine._single_stage_id_filter is None
 
+    def test_stage_configs_path_loads_duplex_runtime_config(self, mocker: MockerFixture):
+        duplex_session = DuplexSessionRuntimeConfig(max_sessions=2)
+        get_pipeline_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
+            return_value=None,
+        )
+        load_deploy_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=duplex_session),
+        )
+
+        engine = self._make_engine_no_thread(
+            mocker,
+            stage_configs_path="/fake/duplex.yaml",
+        )
+
+        get_pipeline_config.assert_called_once_with(
+            model="fake-model",
+            trust_remote_code=False,
+            deploy_config_path="/fake/duplex.yaml",
+        )
+        load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
+        assert engine.duplex_session_config is duplex_session
+
     def test_single_stage_mode_without_stage_id_has_no_filter(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(
             mocker,
@@ -420,6 +475,89 @@ class TestSingleStageModeDetection:
     def test_omni_master_server_starts_as_none(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(mocker)
         assert not hasattr(engine, "_omni_master_server")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-restriction resolution vs. tri-state trust_remote_code (#5495)
+# ---------------------------------------------------------------------------
+
+
+class TestEndpointRestrictionsTrustRemoteCode:
+    """Regression tests for issue #5495.
+
+    ``AsyncOmniEngine.__init__`` takes ``trust_remote_code: bool | None`` where
+    ``None`` means "not specified" (the CLI default, since ``--trust-remote-code``
+    is ``store_true`` and its absence is mapped to ``None``). Endpoint-restriction
+    resolution eagerly loads the HF config via vLLM's ``get_config``, which does
+    ``trust_remote_code |= ...`` internally and raises ``TypeError`` on ``None``.
+    That used to be swallowed, leaving ``endpoint_restrictions`` empty so
+    ``/v1/completions`` was never shut down and the request crashed stage-1.
+
+    ``__init__`` must collapse the ``None`` "not specified" case to ``False`` at
+    the ``get_pipeline_config`` call site so the restriction is still computed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_config_factory_caches(self):
+        """Isolate the process-wide ``functools.cache`` on StageConfigFactory.
+
+        ``get_hf_config`` / ``try_infer_model_type`` cache per-model results for
+        the whole process. These tests patch ``get_config`` with a synthetic
+        Qwen3-Omni config for ``"fake-model"``; without clearing on teardown the
+        synthetic entry would leak to later tests in the same worker (after the
+        mock is restored), making the suite order-dependent. Clear both before
+        and after.
+        """
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+        yield
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
+    def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
+        mocker.patch.object(
+            AsyncOmniEngine,
+            "_resolve_stage_configs",
+            return_value=("/fake/path", [_make_stage_cfg(0)]),
+        )
+        mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
+        mocker.patch("threading.Thread")
+        mocker.patch("concurrent.futures.Future")
+        return AsyncOmniEngine(model="fake-model", **kwargs)
+
+    @staticmethod
+    def _install_qwen3_omni_config(mocker: MockerFixture) -> None:
+        """Patch get_config to a thinker+talker config, mirroring vLLM's
+        ``trust_remote_code |= ...`` (raises TypeError on None)."""
+        from transformers import Qwen3OmniMoeConfig
+
+        def fake_get_config(model, trust_remote_code, **_):
+            trust_remote_code |= False  # TypeError if None reaches here
+            return Qwen3OmniMoeConfig(enable_audio_output=True)
+
+        mocker.patch("vllm_omni.config.config_factory.get_config", side_effect=fake_get_config)
+
+    @pytest.mark.parametrize("trc_kwargs", [{}, {"trust_remote_code": False}, {"trust_remote_code": True}])
+    def test_completions_restriction_survives(self, mocker: MockerFixture, trc_kwargs: dict):
+        """COMPLETIONS restriction is computed regardless of how (or whether)
+        trust_remote_code is passed — including the unset case that resolves to
+        the engine's ``None`` default."""
+        from vllm_omni.config.endpoint_policy import OmniServingCapability
+
+        self._install_qwen3_omni_config(mocker)
+        engine = self._make_engine_no_thread(mocker, **trc_kwargs)
+        assert any(r.capability is OmniServingCapability.COMPLETIONS for r in engine.endpoint_restrictions), (
+            f"COMPLETIONS restriction dropped for {trc_kwargs or 'unset (None default)'}"
+        )
+
+    def test_unset_trust_remote_code_defaults_to_none(self, mocker: MockerFixture):
+        """Guard the tri-state premise: the engine keeps ``None`` (not ``False``)
+        when trust_remote_code is not passed, so the call-site coercion is what
+        prevents the crash."""
+        import inspect
+
+        default = inspect.signature(AsyncOmniEngine.__init__).parameters["trust_remote_code"].default
+        assert default is None
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +588,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -477,7 +615,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -550,7 +688,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="llm",
@@ -609,7 +747,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_stage_metadata",
+            "extract_legacy_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="diffusion",
@@ -724,6 +862,7 @@ class TestSingleStageReplicaInitialization:
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
             omni_master_port=26000,
+            log_stats=True,
         )
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
@@ -757,10 +896,17 @@ class TestSingleStageReplicaInitialization:
         sentinel_client = SimpleNamespace()
 
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
+        client_kwargs: dict[str, Any] = {}
+
+        def _capture_make_async_mp_client(**kwargs):
+            client_kwargs.update(kwargs)
+            events.append("attach")
+            return sentinel_client
+
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
-            side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
+            side_effect=_capture_make_async_mp_client,
         )
 
         result = runtime._initialize_remote_replica(plan, stage_init_timeout=60)
@@ -770,6 +916,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_connect.call_args.kwargs["vllm_config"].parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
+        assert client_kwargs["log_stats"] is True
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
@@ -943,7 +1090,7 @@ class TestSingleStageReplicaInitialization:
         plan = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
-        mocker.patch.object(runtime_mod, "extract_stage_metadata", return_value=remote_metadata)
+        mocker.patch.object(runtime_mod, "extract_legacy_stage_metadata", return_value=remote_metadata)
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_diffusion_proc", side_effect=_fake_connect)
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",

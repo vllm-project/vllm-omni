@@ -56,7 +56,7 @@ def _make_executor(num_gpus: int = 1):
 
     Returns ``(executor, request_queue, result_queue)``.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False)
+    od_cfg = SimpleNamespace(num_gpus=num_gpus, streaming_output=False, step_execution=True)
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_cfg
 
@@ -102,7 +102,10 @@ def _start_worker(req_q, res_q, count=2):
 
     def _run():
         for _ in range(count):
-            req = req_q.get(timeout=10)
+            try:
+                req = req_q.get(timeout=10)
+            except queue.Empty:
+                break
             method = req.get("method", "")
             args = req.get("args", ())
             if method == "execute_model_batch" and args and isinstance(args[0], DiffusionSchedulerOutput):
@@ -146,7 +149,7 @@ def _inject_interleave(executor):
         orig_enqueue(item)
         if threading.current_thread().name == "thread_a":
             a_enqueued.set()  # tell B: "A has enqueued"
-            b_complete.wait(5)  # block A until B finishes
+            b_complete.wait(1)  # block A until B finishes
 
     executor._broadcast_mq.enqueue = _controlled
     return a_enqueued, b_complete
@@ -173,8 +176,8 @@ class TestConcurrentRequestExecution:
             results["B"] = engine.add_req_and_wait_for_response(_mock_request("B"))
             b_complete.set()  # release A
 
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
+        ta = threading.Thread(target=_a, name="thread_a", daemon=True)
+        tb = threading.Thread(target=_b, name="thread_b", daemon=True)
         ta.start()
         tb.start()
         ta.join(10)
@@ -244,6 +247,56 @@ class TestRequestModeDispatch:
         results = {ro.request_id: ro.result.error for ro in out.runner_outputs}
         assert results == {request_id: f"result_for_{request_id}" for request_id in request_ids}
 
+    def test_dlo_dp_routes_multiple_requests_without_pipeline_batching(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.execute_request = Mock(return_value="dlo-dp")
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+
+        result = executor.execute_batch(scheduler_output)
+
+        assert result == "dlo-dp"
+        executor.execute_request.assert_called_once_with(scheduler_output)
+        executor.collective_rpc.assert_not_called()
+
+    def test_dlo_dp_multi_rank_reply_uses_synchronous_rpc_collection(self):
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+        )
+        executor._sync_result_buffer = res_q
+
+        def worker():
+            request = req_q.get(timeout=2)
+            assert "rpc_id" not in request
+            wave_id = request["wave_id"]
+            for dp_rank in range(2):
+                res_q.put(
+                    {
+                        "dp_rank": dp_rank,
+                        "output": _tagged_output(str(dp_rank)),
+                        "wave_id": wave_id,
+                    }
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        results = executor.collective_rpc(
+            "execute_model",
+            unique_reply_rank=None,
+            exec_all_ranks=True,
+        )
+        thread.join(timeout=2)
+
+        assert [result.error for result in results] == ["0", "1"]
+
 
 # ───────────────── concurrent collective RPC ─────────────────
 
@@ -274,8 +327,8 @@ class TestConcurrentCollectiveRpc:
             )
             b_complete.set()
 
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
+        ta = threading.Thread(target=_a, name="thread_a", daemon=True)
+        tb = threading.Thread(target=_b, name="thread_b", daemon=True)
         ta.start()
         tb.start()
         ta.join(10)
@@ -311,8 +364,8 @@ class TestConcurrentRequestExecutionAndCollectiveRpc:
             )
             b_complete.set()
 
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
+        ta = threading.Thread(target=_a, name="thread_a", daemon=True)
+        tb = threading.Thread(target=_b, name="thread_b", daemon=True)
         ta.start()
         tb.start()
         ta.join(10)
@@ -616,6 +669,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
 
     def test_collective_rpc_raises_when_is_failed(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(step_execution=True)
         executor._closed = False
         executor._broadcast_mq = MagicMock()
         executor._result_mq = MagicMock()
@@ -661,7 +715,7 @@ class TestMultiprocExecutorStepStreamingOutput:
 
     def test_execute_step_allows_streaming_output_mode(self):
         executor, req_q, res_q = _make_executor()
-        executor.od_config = SimpleNamespace(streaming_output=True)  # pyright: ignore[reportAttributeAccessIssue]
+        executor.od_config = SimpleNamespace(streaming_output=True, step_execution=True)  # pyright: ignore[reportAttributeAccessIssue]
         runner_outputs = [
             RunnerOutput(
                 request_id="sched-stream",
@@ -682,7 +736,10 @@ class TestMultiprocExecutorStepStreamingOutput:
 
         def _worker():
             for runner_output in runner_outputs:
-                req_q.get(timeout=10)
+                try:
+                    req_q.get(timeout=10)
+                except queue.Empty:
+                    break
                 res_q.put(runner_output)
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -939,6 +996,14 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
         executor._finalizer = lambda: None
+        # ------------------------------------------------------------------
+        # Attributes added by remove_bubble_v2 (async D2H); shutdown() iterates
+        # over them, so they need to exist even when constructed via __new__.
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
 
         proc = _make_short_lived_process()
         executor._processes = [proc]

@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""
