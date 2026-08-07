@@ -85,6 +85,8 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
             "tensor_parallel_size": None,
             "enable_expert_parallel": None,
             "enforce_eager": None,
+            "diffusion_compile_granularity": None,
+            "diffusion_compile_dynamic": None,
         }
     )[0]
 
@@ -94,6 +96,8 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
     assert parallel_config.tensor_parallel_size == 1
     assert parallel_config.enable_expert_parallel is False
     assert stage_cfg["engine_args"]["enforce_eager"] is False
+    assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "regional"
+    assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is True
 
 
 def test_default_stage_config_propagates_ulysses_mode():
@@ -236,6 +240,28 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--task-type",
+            "fl2va",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.task_type == "fl2va"
+    assert stage_cfg["engine_args"]["task_type"] == "fl2va"
+
+
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     """Ensure diffusion serve CLI exposes the profiler switch."""
     parser = TrackingArgumentParser()
@@ -256,6 +282,62 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
+
+
+def test_serve_cli_forwards_distributed_offload_residency():
+    """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--dlo-resident-layers",
+            "20",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert args.enable_distributed_layerwise_offload is True
+    assert args.dlo_use_allgather is False
+    assert args.dlo_resident_layers == 20
+    assert engine_args["enable_distributed_layerwise_offload"] is True
+    assert engine_args["dlo_use_allgather"] is False
+    assert engine_args["dlo_resident_layers"] == 20
+
+
+def test_serve_cli_accepts_diffusion_compile_controls():
+    """Ensure both compile controls reach the diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Lightricks/LTX-Video-0.9.8-13B-distilled",
+            "--omni",
+            "--diffusion-compile-granularity",
+            "full",
+            "--no-diffusion-compile-dynamic",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.diffusion_compile_granularity == "full"
+    assert args.diffusion_compile_dynamic is False
+    assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "full"
+    assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():
@@ -355,6 +437,7 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
             "stage_configs_path": "dummy.yaml",
             "additional_config": {"torchair_graph_config": {"enabled": True}},
         },
+        trust_remote_code=False,
     )
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
@@ -392,6 +475,7 @@ def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(
             "stage_configs_path": "dummy.yaml",
             "quantization_config": {"method": "bitsandbytes"},
         },
+        trust_remote_code=False,
     )
 
     assert stage_configs[0].engine_args.quantization_config == {"method": "bitsandbytes"}

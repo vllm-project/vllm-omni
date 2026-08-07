@@ -22,7 +22,6 @@ create_response=$(
     -F "num_frames=41" \
     -F "fps=24" \
     -F "num_inference_steps=20" \
-    -F "guidance_scale=3.0" \
     -F "seed=42"
 )
 

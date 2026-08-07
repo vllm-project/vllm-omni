@@ -33,6 +33,12 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.model_executor.models.audex.pipeline import (
+    AUDEX_S2S_PIPELINE,
+    AUDEX_THINKER_ONLY_PIPELINE,
+    AUDEX_TTA_PIPELINE,
+    AUDEX_TTS_PIPELINE,
+)
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -54,6 +60,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_DIT_PIPELINE,
     HUNYUAN_IMAGE3_PIPELINE,
 )
+from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_PIPELINE
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.longcat_next.pipeline import (
@@ -83,14 +90,24 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
+from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.soulx_singer.pipeline import (
+    SOULXSINGER_SVC_PIPELINE,
+    SOULXSINGER_SVS_PIPELINE,
+)
+from vllm_omni.model_executor.models.step_audio2.pipeline import (
+    STEP_AUDIO2_ASR_PIPELINE,
+    STEP_AUDIO2_PIPELINE,
+)
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
+from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
 
 logger = init_logger(__name__)
 
@@ -101,8 +118,11 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
+    "personaplex": PERSONAPLEX_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
+    "step_audio_2": STEP_AUDIO2_PIPELINE,
+    "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
@@ -114,8 +134,18 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
+    "hunyuan_video_15": HUNYUAN_VIDEO_15_PIPELINE,
+    "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
+    "audex_tts": AUDEX_TTS_PIPELINE,
+    "audex_tta": AUDEX_TTA_PIPELINE,
+    "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
+    "audex_s2s": AUDEX_S2S_PIPELINE,
+    # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
+    # ``model_type: nemotron_labs_audex``; bare ``vllm-omni serve <repo>``
+    # auto-detects through it and must land on the default (TTS) pipeline.
+    "nemotron_labs_audex": AUDEX_TTS_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming_tts": MING_TTS_PIPELINE,
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
@@ -140,6 +170,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "longcat_next_thinker_only": LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
     "longcat_next_thinker_multi_decoder": LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
+    "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
+    "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }
 
 
@@ -163,3 +195,15 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     if errors:
         logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
     OMNI_PIPELINES[model_type] = pipeline
+
+
+def resolve_pipeline_config(
+    model_type: str,
+    hf_config: PretrainedConfig | None = None,
+) -> PipelineConfig | None:
+    """Resolve a registry key to a concrete pipeline config."""
+    if model_type not in OMNI_PIPELINES:
+        logger.warning("Model type %s is not registered to OMNI_PIPELINES", model_type)
+        return None
+    pipeline = OMNI_PIPELINES[model_type]
+    return pipeline(hf_config) if callable(pipeline) else pipeline

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import io
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -14,9 +15,12 @@ from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 SEED = 42
@@ -28,10 +32,28 @@ PROMPT = "A brown and white dog is running on the grass."
 MEAN_THRESHOLD = 3e-2
 P99_THRESHOLD = 3e-1
 SSIM_THRESHOLD = 0.97
-PSNR_THRESHOLD = 30.0
+PSNR_THRESHOLD_CUDA = 30.0
+PSNR_THRESHOLD_NPU = 26.0
+
+
+def _psnr_threshold() -> float:
+    from vllm_omni.platforms import current_omni_platform
+
+    return PSNR_THRESHOLD_NPU if current_omni_platform.is_npu() else PSNR_THRESHOLD_CUDA
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-BASELINE_PATH = _REPO_ROOT / "tests" / "assets" / "hunyuan" / "hunyuan_baseline.png"
+
+
+def _baseline_path() -> Path:
+    from vllm_omni.platforms import current_omni_platform
+
+    suffix = "_npu" if current_omni_platform.is_npu() else ""
+    path = get_asset_path(f"hunyuan/hunyuan_baseline{suffix}.png")
+    assert path.exists(), f"Baseline image not found at {path}"
+    return path
+
+
 _OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).
@@ -48,15 +70,17 @@ _DEPLOY_CONFIG = {
             "trust_remote_code": True,
             "devices": "0,1,2,3",  # set dynamically by _write_deploy_config
             "vae_use_slicing": False,
+            "moe_backend": "flashinfer_cutlass",
             "vae_use_tiling": False,
             "parallel_config": {
                 "pipeline_parallel_size": 1,
                 "data_parallel_size": 1,
-                "tensor_parallel_size": 4,
+                "tensor_parallel_size": 1,
                 "enable_expert_parallel": True,
                 "sequence_parallel_size": 1,
                 "ulysses_degree": 1,
                 "ring_degree": 1,
+                "allgather_degree": 4,
                 "cfg_parallel_size": 1,
                 "vae_patch_parallel_size": 1,
                 "use_hsdp": False,
@@ -68,6 +92,23 @@ _DEPLOY_CONFIG = {
             },
         },
     ],
+    "platforms": {
+        "npu": {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "gpu_memory_utilization": 0.65,
+                    "devices": "0,1,2,3",
+                    "moe_backend": "auto",
+                    "max_num_batched_tokens": 32768,
+                    "parallel_config": {
+                        "tensor_parallel_size": 4,
+                        "enable_expert_parallel": True,
+                    },
+                },
+            ],
+        },
+    },
 }
 
 
@@ -82,9 +123,48 @@ def _devices() -> str:
 def _write_deploy_config(path: Path) -> None:
     config = copy.deepcopy(_DEPLOY_CONFIG)
     devices = _devices()
+    num_devices = len(devices.split(","))
     config["stages"][0]["devices"] = devices
-    config["stages"][0]["parallel_config"]["tensor_parallel_size"] = len(devices.split(","))
-    path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    parallel_config = config["stages"][0]["parallel_config"]
+    if parallel_config.get("allgather_degree", 1) > 1:
+        parallel_config["allgather_degree"] = num_devices
+    elif parallel_config.get("tensor_parallel_size", 1) > 1:
+        parallel_config["tensor_parallel_size"] = num_devices
+
+    sequence_parallel_size = (
+        parallel_config.get("allgather_degree", 1)
+        if parallel_config.get("allgather_degree", 1) > 1
+        else parallel_config.get("ulysses_degree", 1) * parallel_config.get("ring_degree", 1)
+    )
+    configured_world_size = (
+        parallel_config.get("pipeline_parallel_size", 1)
+        * parallel_config.get("data_parallel_size", 1)
+        * parallel_config.get("tensor_parallel_size", 1)
+        * sequence_parallel_size
+        * parallel_config.get("cfg_parallel_size", 1)
+    )
+    assert configured_world_size == num_devices, (
+        f"Configured parallel world size ({configured_world_size}) does not match "
+        f"the number of devices ({num_devices}): {parallel_config}"
+    )
+
+    parallel_config["sequence_parallel_size"] = sequence_parallel_size
+    config_text = yaml.dump(config, default_flow_style=False, sort_keys=False)
+    path.write_text(config_text)
+    logger.info(
+        "HunyuanImage3 pixel accuracy deploy config:\n"
+        "  path=%s\n"
+        "  CUDA_VISIBLE_DEVICES=%s\n"
+        "  devices=%s\n"
+        "  tensor_parallel_size=%s\n"
+        "  allgather_degree=%s\n%s",
+        path,
+        os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        devices,
+        parallel_config.get("tensor_parallel_size", 1),
+        parallel_config.get("allgather_degree", 1),
+        config_text,
+    )
 
 
 def _run_vllm_omni_hunyuan_image3_online(*, model: str, deploy_config: str, output_path: Path) -> Image.Image:
@@ -171,8 +251,8 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
 
 
 def _assert_against_baseline(image: Image.Image, label: str) -> None:
-    assert BASELINE_PATH.exists(), f"Baseline image not found at {BASELINE_PATH}"
-    baseline_image = Image.open(BASELINE_PATH).convert("RGB")
+    baseline_path = _baseline_path()
+    baseline_image = Image.open(baseline_path).convert("RGB")
 
     assert_images_pixel_close(
         model_name=f"{MODEL_NAME} ({label} vs baseline)",
@@ -186,11 +266,11 @@ def _assert_against_baseline(image: Image.Image, label: str) -> None:
         vllm_image=image,
         diffusers_image=baseline_image,
         ssim_threshold=SSIM_THRESHOLD,
-        psnr_threshold=PSNR_THRESHOLD,
+        psnr_threshold=_psnr_threshold(),
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=4)
 def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME)
@@ -204,7 +284,7 @@ def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> N
     _assert_against_baseline(image, "online")
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=4)
 def test_hunyuan_image3_pixel_accuracy_offline(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME)

@@ -94,8 +94,31 @@ def quack_scaled_fp8_mm(
         return None
     out = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=out_dtype)
     alpha = scale_a.reshape(1).float() * scale_b.reshape(1).float()
-    gemm.gemm_tuned(a, b, out, bias=bias, alpha=alpha)
+    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=True)
     return out
+
+
+_valid_scale_ptrs: set[tuple[int, int]] = set()
+
+
+def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
+    """True when both per-tensor scales are finite and positive.
+
+    vLLM initializes a per-tensor FP8 scale to ``finfo(float32).min`` and fills it at
+    weight-load time, so a call made before that (the dummy profiling forward) would
+    make ``alpha = scale_a * scale_b`` overflow to ``+inf`` and return an all-inf tile.
+    Cache only positive results: a buffer still holding the sentinel is re-checked and
+    picks up the fast path once the real scale is written.
+    """
+    key = (scale_a.data_ptr(), scale_b.data_ptr())
+    if key in _valid_scale_ptrs:
+        return True
+    ok = bool(
+        torch.isfinite(scale_a).all() and torch.isfinite(scale_b).all() and (scale_a > 0).all() and (scale_b > 0).all()
+    )
+    if ok:
+        _valid_scale_ptrs.add(key)
+    return ok
 
 
 def install_quack_fp8_patch() -> None:
@@ -115,6 +138,10 @@ def install_quack_fp8_patch() -> None:
         return
 
     def apply_scaled_mm(self, *, A, B, out_dtype, As, Bs, bias, output_shape):  # noqa: N803
+        # An unpopulated scale makes alpha overflow to +inf; hand those calls to
+        # FlashInfer, whose bmm_fp8 tolerates them.
+        if As.numel() != 1 or Bs.numel() != 1 or not _scales_valid(As, Bs):
+            return original(self, A=A, B=B, out_dtype=out_dtype, As=As, Bs=Bs, bias=bias, output_shape=output_shape)
         try:
             out = quack_scaled_fp8_mm(A, B, As, Bs, out_dtype, bias)
             if out is not None:

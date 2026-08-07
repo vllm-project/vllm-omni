@@ -95,6 +95,23 @@ class StepAudio2Token2WavCore(nn.Module):
         self.source_cache_len = STREAM_SOURCE_CACHE_LEN
         self.speech_window: torch.Tensor | None = None  # created lazily on device
 
+        # On Ascend the talker worker never routes through
+        # ``NPUOmniPlatform.set_device``, so gate on ``current_omni_platform``
+        # and apply the Token2Wav NPU patch here (idempotent) before
+        # ``_ensure_models_loaded`` runs. Covers every
+        # construction site (Step-Audio2 wrapper + MiniCPM-o facade): patched
+        # ``_ensure_models_loaded`` replaces HiFT's failing linear downsample,
+        # while patched ``forward`` expands CosyVoice DiT masks and forces
+        # MATH SDPA (avoids FA 161001).
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+                apply_step_audio2_token2wav_npu_patch,
+            )
+
+            apply_step_audio2_token2wav_npu_patch()
+
     def _ensure_models_loaded(self):
         """Lazy load models on first use"""
         if self._models_loaded:
@@ -161,6 +178,28 @@ class StepAudio2Token2WavCore(nn.Module):
         self._ensure_models_loaded()
         return self._hift
 
+    def _forward_spk_embedding(self, spk_feat: torch.Tensor) -> torch.Tensor:
+        """Run campplus on ``[T, 80]`` fbank features; returns ``[1, 192]`` on ``self.device``."""
+        spk_model = self.spk_model
+        if isinstance(spk_model, onnxruntime.InferenceSession):
+            return torch.tensor(
+                spk_model.run(None, {spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
+                device=self.device,
+            )
+        # CampplusTRT (or any callable taking [T, 80] and returning [1, 192]).
+        return spk_model(spk_feat).to(self.device)
+
+    def enable_trt_spk_embedding(self) -> None:
+        """Swap the onnxruntime campplus session for the shared TensorRT engine.
+
+        Reuses the CosyVoice3 CAM++ engine wrapper — MiniCPM-o / Step-Audio2
+        ship the same campplus.onnx architecture and I/O contract.
+        """
+        from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import get_campplus_trt
+
+        self._ensure_models_loaded()
+        self._spk_model = get_campplus_trt(f"{self.model_path}/campplus.onnx", device=self.device)
+
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
         # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
@@ -185,10 +224,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-        spk_emb = torch.tensor(
-            self.spk_model.run(None, {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
-            device=self.device,
-        )
+        spk_emb = self._forward_spk_embedding(spk_feat)
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.

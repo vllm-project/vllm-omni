@@ -1,0 +1,21 @@
+{
+  "_class_name": "LTX2TextConnectors",
+  "_diffusers_version": "0.37.0.dev0",
+  "audio_connector_attention_head_dim": 16,
+  "audio_connector_num_attention_heads": 2,
+  "audio_connector_num_layers": 1,
+  "audio_connector_num_learnable_registers": 4,
+  "caption_channels": 32,
+  "causal_temporal_positioning": false,
+  "connector_rope_base_seq_len": 32,
+  "rope_double_precision": true,
+  "rope_theta": 10000.0,
+  "rope_type": "split",
+  "text_proj_in_factor": 3,
+  "video_connector_attention_head_dim": 16,
+  "video_connector_num_attention_heads": 2,
+  "video_connector_num_layers": 1,
+  "video_connector_num_learnable_registers": 4,
+  "video_hidden_dim": 32,
+  "audio_hidden_dim": 32
+}

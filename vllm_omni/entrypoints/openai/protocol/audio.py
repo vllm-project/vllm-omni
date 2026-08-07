@@ -6,6 +6,10 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 
 _MAX_EMBEDDING_DIM = 8192
 
+SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
+SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
+DEFAULT_AUDIO_FORMAT: str = "wav"
+
 
 def _normalize_ref_audio_value(value):
     if value is None:
@@ -59,7 +63,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
     )
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -325,7 +329,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         description="Text prompt describing the audio to generate",
     )
     model: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -391,7 +395,7 @@ class SpeechBatchItem(BaseModel):
     input: str
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -411,7 +415,7 @@ class BatchSpeechRequest(BaseModel):
     items: list[SpeechBatchItem] = Field(..., min_length=1)
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -500,7 +504,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1)
     initial_codec_chunk_frames: int | None = Field(
