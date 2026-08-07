@@ -3075,9 +3075,21 @@ class Orchestrator:
                     _tx_ms,
                     self._pd_decode_inflight,
                 )
-            # NOTE: the inline async-chunk prewarm loop that used to live here was
-            # refactored upstream in 0.26 into _prewarm_async_chunk_stages(), which
-            # is driven from the request-admission path instead.
+            # [PD] stage2 (code2wav) is deliberately NOT prewarmed at admission:
+            # its engine_input_source is the decode replica, which is unknown until
+            # the pick strategy runs. Prewarm it here, now that next_logical is
+            # known. Without this the code2wav stage is never submitted, so decode
+            # generates codec tokens that nobody consumes and no audio is produced.
+            if self.async_chunk:
+                for downstream_stage_id in self._downstream_stage_ids.get(next_logical, []):
+                    if downstream_stage_id not in req_state.stage_submit_ts:
+                        await self._prewarm_async_chunk_stage(
+                            req_id,
+                            req_state.prompt,
+                            req_state,
+                            downstream_stage_id,
+                            source_stage_id=next_logical,
+                        )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -3201,6 +3213,112 @@ class Orchestrator:
             to_stage=next_logical,
             to_pool=next_pool,
             request_id=req_id,
+            tx_ms=_tx_ms,
+        )
+
+    @staticmethod
+    def _with_omni_source_stage(prompt: dict[str, Any], src_stage_id: int) -> dict[str, Any]:
+        enriched = dict(prompt)
+        additional_info = enriched.get("additional_information")
+        if isinstance(additional_info, dict):
+            additional_info = dict(additional_info)
+        else:
+            additional_info = {}
+        additional_info["omni_source_stage_id"] = [str(src_stage_id)]
+        enriched["additional_information"] = additional_info
+        return enriched
+
+    async def _prewarm_async_chunk_stage(
+        self,
+        request_id: str,
+        source_request: Any,
+        req_state: OrchestratorRequestState,
+        next_stage_id: int,
+        *,
+        source_stage_id: int,
+    ) -> None:
+        """Pre-submit one async-chunk receiver stage after its producer is known."""
+        prompt_token_ids = getattr(source_request, "prompt_token_ids", None)
+        if prompt_token_ids is None and isinstance(req_state.prompt, dict):
+            prompt_token_ids = req_state.prompt.get("prompt_token_ids")
+        if prompt_token_ids is None:
+            logger.warning(
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage%d prompt_token_ids missing",
+                request_id,
+                source_stage_id,
+            )
+            return
+
+        next_pool = self.stage_pools[next_stage_id]
+        params = req_state.sampling_params_list[next_stage_id]
+
+        _t_submit_start = _time.perf_counter()
+
+        if next_pool.stage_type == "diffusion":
+            await next_pool.submit_initial(
+                request_id,
+                req_state,
+                req_state.prompt,
+                submit_kwargs={
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [source_stage_id]),
+                        request_id=request_id,
+                    )
+                },
+            )
+        else:
+            import copy
+
+            from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+
+            try:
+                next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+            except Exception:
+                next_prompt_len = max(1, len(prompt_token_ids))
+
+            original_prompt = req_state.prompt
+            if isinstance(original_prompt, dict):
+                base_input = copy.deepcopy(original_prompt)
+            else:
+                base_input = {}
+
+            base_input["prompt_token_ids"] = [0] * next_prompt_len
+            base_input["multi_modal_data"] = None
+            base_input["mm_processor_kwargs"] = None
+            base_input = self._with_omni_source_stage(base_input, source_stage_id)
+            downstream_resumable = bool(getattr(source_request, "resumable", req_state.streaming.enabled))
+            request = build_engine_core_request_from_tokens(
+                request_id=request_id,
+                prompt=base_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                resumable=downstream_resumable,
+            )
+            request.external_req_id = request.request_id
+            await next_pool.submit_initial(
+                request_id,
+                req_state,
+                request,
+                prompt_text=None,
+            )
+
+        req_state.stage_submit_ts[next_stage_id] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        src_replica = self.stage_pools[source_stage_id].get_bound_replica_id(request_id)
+        logger.info(
+            "[Orchestrator] async_chunk prewarm req=%s stage-%d->stage-%d prompt_len=%d source_replica=%s",
+            request_id,
+            source_stage_id,
+            next_stage_id,
+            len(prompt_token_ids),
+            src_replica,
+        )
+        self._emit_tx_edge(
+            from_stage=source_stage_id,
+            from_replica=src_replica if src_replica is not None else 0,
+            to_stage=next_stage_id,
+            to_pool=next_pool,
+            request_id=request_id,
             tx_ms=_tx_ms,
         )
 
