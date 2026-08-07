@@ -257,12 +257,20 @@ class DuplexControlPlane:
         effective_fence = fence or session.fence
         request_id = self.stage_request_id(effective_fence, stage_id=stage_id)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
-        sp = tuple(self.sampling_params_for_config(session.runtime_config))
-        for i, p in enumerate(sp):
+        sp_list = list(self.sampling_params_for_config(session.runtime_config))
+        for i, p in enumerate(sp_list):
+            if hasattr(p, "update_from_generation_config"):
+                gen_config, eos_id = self._stage_port.get_generation_config(i)
+                if gen_config or eos_id is not None:
+                    if hasattr(p, "clone"):
+                        p = p.clone()
+                        sp_list[i] = p
+                    p.update_from_generation_config(gen_config, eos_id)
             print(
                 f"[DUPLEX] ensure_stage_request stage={i} eos_token_id={getattr(p, 'eos_token_id', '?')} stop_token_ids={getattr(p, 'stop_token_ids', '?')}",
                 flush=True,
             )
+        sp = tuple(sp_list)
         context = DuplexStageRequestContext(
             request_id=request_id,
             session_id=session.session_id,

@@ -253,6 +253,16 @@ class _OrchestratorDuplexStagePort:
         except Exception:
             return None
 
+    def get_generation_config(self, stage_id: int) -> tuple[dict[str, object], int | None]:
+        try:
+            model_config = self._stage_pools[stage_id].stage_vllm_config.model_config
+            generation_config = model_config.try_get_generation_config()
+        except Exception:
+            generation_config = {}
+        tokenizer = self.get_tokenizer(stage_id)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+        return generation_config, eos_token_id
+
     def compute_final_stage_id(self, modalities: list[str] | None) -> int:
         last = len(self._stage_pools) - 1
         if not modalities:
