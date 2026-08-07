@@ -45,6 +45,14 @@ _MODEL_COEFFICIENTS = {
         -6.30339273e01,
         7.61309272e-01,
     ],
+    # OmniGen2 transformer coefficients
+    "OmniGen2Transformer2DModel": [
+        -1.13169970e01,
+        1.28097796e01,
+        -2.35170830e00,
+        1.51188493e00,
+        4.86397212e-04,
+    ],
     # Z-Image transformer coefficients
     # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
     "ZImageTransformer2DModel": [

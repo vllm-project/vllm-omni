@@ -15,6 +15,7 @@ Currently implemented:
 - TestFlux2KleinExtractor: Flux2Klein model extractor
 - TestFlux2Extractor: Flux2 model extractor
 - TestFluxExtractor: Flux model extractor
+- TestOmniGen2Extractor: OmniGen2 model extractor
 """
 
 from abc import ABC, abstractmethod
@@ -28,10 +29,15 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_omnigen2_context,
 )
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+)
+from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
+    OmniGen2RotaryPosEmbed,
+    OmniGen2Transformer2DModel,
 )
 
 pytestmark = [pytest.mark.core_model]
@@ -44,6 +50,7 @@ def setup_tp_group():
         with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
             mock_tp_group = MagicMock()
             mock_tp_group.world_size = 1
+            mock_tp_group.rank_in_group = 0
             mock_get_tp_group.return_value = mock_tp_group
             yield
 
@@ -422,4 +429,125 @@ class TestFluxExtractor(BaseExtractorTest):
                 timestep=torch.tensor([500]),
                 img_ids=torch.randint(0, 64, (1, 16, 3)),
                 txt_ids=torch.randint(0, 64, (1, 8, 3)),
+            )
+
+
+class TestOmniGen2Extractor(BaseExtractorTest):
+    """Test extract_omnigen2_context function."""
+
+    def get_extractor(self):
+        return extract_omnigen2_context
+
+    @pytest.fixture
+    def omnigen2_module(self):
+        """Create a minimal OmniGen2Transformer2DModel for testing.
+
+        hidden_size // num_attention_heads must equal sum(axes_dim_rope),
+        so 48 // 2 == 8 + 8 + 8.
+
+        vLLM parallel layers allocate weights with torch.empty, which can
+        contain NaN/inf; re-initialize deterministically so forward outputs
+        are finite and reproducible.
+        """
+        model = OmniGen2Transformer2DModel(
+            patch_size=2,
+            in_channels=4,
+            hidden_size=48,
+            num_layers=2,
+            num_refiner_layers=1,
+            num_attention_heads=2,
+            num_kv_heads=1,
+            axes_dim_rope=(8, 8, 8),
+            axes_lens=(128, 128, 128),
+            text_feat_dim=32,
+        )
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.uniform_(-0.02, 0.02)
+        return model
+
+    def get_module(self, omnigen2_module):
+        return omnigen2_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        """Create sample T2I input tensors for OmniGen2 (no reference images)."""
+        batch_size = 1
+        txt_seq_len = 16
+        return {
+            "hidden_states": torch.randn(batch_size, 4, 16, 16),
+            "timestep": torch.tensor([0.5]),
+            "text_hidden_states": torch.randn(batch_size, txt_seq_len, 32),
+            "freqs_cis": OmniGen2RotaryPosEmbed.get_freqs_cis((8, 8, 8), (128, 128, 128), theta=10000),
+            "text_attention_mask": torch.ones(batch_size, txt_seq_len, dtype=torch.bool),
+            "ref_image_hidden_states": None,
+        }
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_modulated_input_shape(self, omnigen2_module, sample_inputs):
+        """modulated_input covers the joint (text + image) sequence at hidden_size."""
+        context = extract_omnigen2_context(omnigen2_module, **sample_inputs)
+
+        batch_size = sample_inputs["hidden_states"].shape[0]
+        txt_seq_len = sample_inputs["text_attention_mask"].shape[1]
+        img_seq_len = (16 // 2) * (16 // 2)
+        hidden_size = omnigen2_module.config.hidden_size
+        assert context.modulated_input.shape == (batch_size, txt_seq_len + img_seq_len, hidden_size)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_run_transformer_blocks_callable(self, omnigen2_module, sample_inputs):
+        """Test that run_transformer_blocks is callable."""
+        context = extract_omnigen2_context(omnigen2_module, **sample_inputs)
+        assert callable(context.run_transformer_blocks)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_postprocess_callable(self, omnigen2_module, sample_inputs):
+        """Test that postprocess is callable."""
+        context = extract_omnigen2_context(omnigen2_module, **sample_inputs)
+        assert callable(context.postprocess)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_run_transformer_blocks_passes_sp_boundaries(self, omnigen2_module, sample_inputs):
+        """run_transformer_blocks must pass through both SP boundaries so _sp_plan hooks fire."""
+        calls = []
+        handles = [
+            omnigen2_module.sp_input_boundary.register_forward_hook(lambda m, a, o: calls.append("input")),
+            omnigen2_module.sp_output_boundary.register_forward_hook(lambda m, a, o: calls.append("output")),
+        ]
+        try:
+            context = extract_omnigen2_context(omnigen2_module, **sample_inputs)
+            context.run_transformer_blocks()
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert calls == ["input", "output"]
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_hook_path_matches_native_forward(self, omnigen2_module, sample_inputs):
+        """Extractor preprocessing + run_transformer_blocks + postprocess must equal a plain forward."""
+        torch.manual_seed(0)
+        with torch.no_grad():
+            context = extract_omnigen2_context(omnigen2_module, **sample_inputs)
+            hooked = context.postprocess(context.run_transformer_blocks()[0])
+            native = omnigen2_module(**sample_inputs)
+        assert torch.allclose(hooked, native, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.cpu
+    def test_invalid_module_raises_error(self):
+        """Test that a module without main transformer layers raises ValueError."""
+        invalid_module = Mock()
+        invalid_module.layers = []
+
+        with pytest.raises(ValueError, match="Module must have main transformer layers"):
+            extract_omnigen2_context(
+                invalid_module,
+                hidden_states=torch.randn(1, 4, 16, 16),
+                timestep=torch.tensor([0.5]),
+                text_hidden_states=torch.randn(1, 16, 32),
+                freqs_cis=None,
+                text_attention_mask=torch.ones(1, 16, dtype=torch.bool),
             )

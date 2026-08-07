@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -842,7 +843,7 @@ class _OmniGen2SPOutputBoundary(nn.Module):
         return hidden_states
 
 
-class OmniGen2Transformer2DModel(nn.Module):
+class OmniGen2Transformer2DModel(CachedTransformer):
     """
     OmniGen2 Transformer 2D Model.
 
