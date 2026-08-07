@@ -116,6 +116,11 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return True
 
     @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """MUSA keeps Qwen3 talker MTP outside its dedicated FULL graph."""
+        return False
+
+    @classmethod
     def supports_float64(cls) -> bool:
         """MUSA does not support float64 yet."""
         return False

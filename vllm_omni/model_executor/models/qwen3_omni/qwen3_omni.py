@@ -100,6 +100,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     """
 
     realtime_max_tokens = 64
+    talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
