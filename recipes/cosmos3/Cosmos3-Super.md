@@ -115,6 +115,72 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   - I2V 1280×720, 189 frames, 35 steps → **~200 s**
   - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
   - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
+- **Measured (8x H200 SXM 141 GB, bf16, official 8-GPU config above):**
+  - T2V 1280×720, 189 frames, 35 steps, **guardrails off** → **~121 s**
+    (n=3, server-side `stage_gen_time_ms` 120.68 / 120.47 / 120.55 s, spread 0.2%)
+  - Same shape and seed with **`--tensor-parallel-size 8`** instead of the
+    config above → **~131 s** (n=3, 131.23 / 131.35 / 131.18 s, spread 0.13%).
+    At 50 steps: recommended config ~166 s (n=1 server-side; wall 168 / 169 /
+    168 s across n=3), TP-8 **~181 s** (n=3). So TP-8 is about **9% slower**
+    than the documented CFG-parallel x Ulysses x HSDP config on identical
+    hardware at both step counts.
+  - Every measured cell fits **`latency ~= 14.4 s + steps x per-step`** to
+    within 0.3%: per-step is 3.03-3.06 s for the recommended config and
+    3.33-3.36 s for TP-8, and the ~14.4 s non-denoise remainder is the same
+    in both (the server emits no per-stage breakdown, so its composition is
+    not measured here). The whole difference between the two strategies is
+    denoise-step rate.
+  - Three more 8-GPU strategies at the same shape, 35 steps, n=3 each:
+    hybrid `--ulysses-degree 2 --ring-degree 2` (with CFG 2 x HSDP 8) ~124 s;
+    `--ulysses-degree 8` without CFG parallelism ~126 s (widening sequence
+    parallelism does not pay for serializing the two CFG passes); and the
+    recommended config plus `--vae-patch-parallel-size 2` ~121 s (no
+    end-to-end gain at this shape). The documented config was the fastest of
+    the five measured.
+  - T2V 1280×720, 189 frames, 35 steps, **guardrails on** → **~139 s**
+    (n=2, 139.12 / 138.91 s) with the model repo's upsampled example prompt,
+    plus ~20 s one-time init at startup and 17 GB of extra weights on disk.
+    **Guardrail cost is content-dependent**: about +18 s (+15%) on that
+    example prompt, but only ~+2 s on randomized benchmark prompts at the
+    identical shape, so treat any guardrail overhead figure as
+    prompt-specific rather than a general tax.
+  - **Determinism is per server instance, not per seed.** Within one running
+    server, output is bitwise reproducible at a fixed seed in both guardrail
+    modes (three guardrails-off clips sha256-identical, likewise the two
+    guardrails-on clips; the two modes produce different bytes, so guardrails
+    alter the output rather than only gating it). Across a server restart the
+    same seed and config do **not** reproduce the clip: all 189 frames
+    differ, median PSNR 28.1 dB against the pre-restart clip, which is about
+    the same magnitude as one frame of motion (adjacent-frame PSNR 27.9 dB
+    within a single clip). Same-seed comparisons are only valid within one
+    server instance.
+  - **Memory (8-GPU):** 17.3 GiB per GPU at model load with HSDP shard 8;
+    ~43 GiB per GPU resident while serving.
+  - On the reference figures: the ~55 s claim is quoted at 50 steps without a
+    frame count; at 189 frames (the model card's own example default) 50
+    steps measured ~166 s here, and ~55 s would imply a per-step ~3.7x faster
+    than anything measured, so it most plausibly describes a much shorter
+    clip. The 111.94 s that `inference_benchmarks.md` reports for 8x H200
+    vLLM-Omni T2V 720p is a tensor-parallel figure per its own methodology
+    note and does not state steps; at the TP-8 per-step rate measured here it
+    corresponds to roughly 29-30 steps, which would explain the number
+    without either measurement being wrong.
+- **Enabling guardrails on this image needs `HF_HUB_DISABLE_XET=1`.** With guardrails on
+  and a token that has `nvidia/Cosmos-1.0-Guardrail` access, startup still fails with
+  `RuntimeError: Task error: Unable to parse string as hex hash value` from
+  `huggingface_hub` `xet_get`. That is
+  [huggingface/xet-core#895](https://github.com/huggingface/xet-core/issues/895), which
+  reproduces on exactly the pair this image pins: `hf-xet 1.5.1` and
+  `huggingface_hub 1.23.0`. The issue was closed 2026-07-28, after this image was pushed
+  on 2026-07-20. Setting `HF_HUB_DISABLE_XET=1` downloads the 146-file, 17 GB guardrail
+  repo in under two minutes and the server starts normally.
+- **Environment:** `vllm/vllm-omni:cosmos3` (`sha256:6d2630c7d637…`), vllm-omni
+  `0.25.0rc2.dev62+g9c1b7504b`, torch 2.11.0+cu130, driver 580.126.09, 8x H200 SXM
+  (143,771 MiB each) on NVLink full mesh. Startup to `Application startup complete`
+  depends on page-cache state: with the weights already in cache, TP-8 started in
+  ~90 s and the HSDP-sharded configs clustered at ~280-290 s; first start after a
+  node boot (cold cache, 124 GB off disk) took ~610 s. `--init-timeout 1800` was
+  never approached.
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
 - Same generation defaults, supported sizes, V2V reference-video controls
   (`condition_frame_indexes_vision`, `condition_video_keep`), and
