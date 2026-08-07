@@ -4,8 +4,6 @@
 """Unit tests for LayerwiseOffloadHook and LayerWiseOffloadBackend utilities."""
 
 import gc
-import os
-import socket
 from contextlib import contextmanager
 
 import pytest
@@ -15,6 +13,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
+from tests.helpers.dist import clear_dist_env, file_rendezvous, set_dist_env
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
@@ -39,26 +38,11 @@ def dummy_stream(_stream):
     yield None
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
-
-
 def _cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
 
-    for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-        os.environ.pop(key, None)
+    clear_dist_env()
 
     gc.collect()
     if current_omni_platform.is_available():
@@ -68,14 +52,13 @@ def _cleanup_distributed() -> None:
 
 @pytest.fixture(scope="module")
 def dist_group():
-    master_port = _find_free_port()
-    _set_dist_env(rank=0, world_size=1, master_port=master_port)
-
-    dist.init_process_group("gloo", rank=0, world_size=1)
-    try:
-        yield
-    finally:
-        _cleanup_distributed()
+    with file_rendezvous(prefix="layerwise_") as init_method:
+        set_dist_env(rank=0, world_size=1)
+        dist.init_process_group("gloo", rank=0, world_size=1, init_method=init_method)
+        try:
+            yield
+        finally:
+            _cleanup_distributed()
 
 
 @pytest.fixture

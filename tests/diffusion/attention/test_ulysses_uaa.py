@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import os
-import socket
 import tempfile
 
 import numpy as np
 import pytest
 import torch
 
+from tests.helpers.dist import file_rendezvous, set_dist_env
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
@@ -25,24 +25,10 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
-
-
 def _run_attention_case(
     local_rank: int,
     world_size: int,
-    master_port: int,
+    init_method: str,
     input_file: str,
     output_file: str,
     num_heads: int,
@@ -56,10 +42,10 @@ def _run_attention_case(
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
 
-    _set_dist_env(rank=local_rank, world_size=world_size, master_port=master_port)
+    set_dist_env(rank=local_rank, world_size=world_size)
     os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
-    init_distributed_environment(world_size=world_size, rank=local_rank)
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(
         data_parallel_size=1,
         cfg_parallel_size=1,
@@ -173,11 +159,6 @@ def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_head
     batch_size = 2
     head_size = 8
 
-    base_port = _find_free_port()
-    sp_port = _find_free_port()
-    while sp_port == base_port:
-        sp_port = _find_free_port()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
@@ -193,27 +174,29 @@ def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_head
         np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
 
         # Baseline (no SP)
-        torch.multiprocessing.spawn(
-            _run_attention_case,
-            args=(1, base_port, input_file, baseline_file, num_heads, head_size, 1, "strict"),
-            nprocs=1,
-        )
+        with file_rendezvous(prefix="ulysses_uaa_") as init_method:
+            torch.multiprocessing.spawn(
+                _run_attention_case,
+                args=(1, init_method, input_file, baseline_file, num_heads, head_size, 1, "strict"),
+                nprocs=1,
+            )
 
         # SP (Ulysses-P with UAA)
-        torch.multiprocessing.spawn(
-            _run_attention_case,
-            args=(
-                sp_world_size,
-                sp_port,
-                input_file,
-                sp_file,
-                num_heads,
-                head_size,
-                sp_world_size,
-                "advanced_uaa",
-            ),
-            nprocs=sp_world_size,
-        )
+        with file_rendezvous(prefix="ulysses_uaa_") as init_method:
+            torch.multiprocessing.spawn(
+                _run_attention_case,
+                args=(
+                    sp_world_size,
+                    init_method,
+                    input_file,
+                    sp_file,
+                    num_heads,
+                    head_size,
+                    sp_world_size,
+                    "advanced_uaa",
+                ),
+                nprocs=sp_world_size,
+            )
 
         baseline = np.load(baseline_file, allow_pickle=False)
         sp = np.load(sp_file, allow_pickle=False)
@@ -247,11 +230,6 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     # rank0/1 -> 3+2=5, rank2/3 -> 3+2=5
     split_sizes = [3, 2, 3, 2]
 
-    base_port = _find_free_port()
-    sp_port = _find_free_port()
-    while sp_port == base_port:
-        sp_port = _find_free_port()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
@@ -267,30 +245,44 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
         np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
 
         # Baseline (no SP)
-        torch.multiprocessing.spawn(
-            _run_attention_case,
-            args=(1, base_port, input_file, baseline_file, num_heads, head_size, 1, "strict", 1, None, "mem_efficient"),
-            nprocs=1,
-        )
+        with file_rendezvous(prefix="ulysses_uaa_") as init_method:
+            torch.multiprocessing.spawn(
+                _run_attention_case,
+                args=(
+                    1,
+                    init_method,
+                    input_file,
+                    baseline_file,
+                    num_heads,
+                    head_size,
+                    1,
+                    "strict",
+                    1,
+                    None,
+                    "mem_efficient",
+                ),
+                nprocs=1,
+            )
 
         # Hybrid SP: Ulysses (P=2) + Ring (P=2) with advanced_uaa
-        torch.multiprocessing.spawn(
-            _run_attention_case,
-            args=(
-                sp_world_size,
-                sp_port,
-                input_file,
-                sp_file,
-                num_heads,
-                head_size,
-                ulysses_degree,
-                "advanced_uaa",
-                ring_degree,
-                split_sizes,
-                "mem_efficient",
-            ),
-            nprocs=sp_world_size,
-        )
+        with file_rendezvous(prefix="ulysses_uaa_") as init_method:
+            torch.multiprocessing.spawn(
+                _run_attention_case,
+                args=(
+                    sp_world_size,
+                    init_method,
+                    input_file,
+                    sp_file,
+                    num_heads,
+                    head_size,
+                    ulysses_degree,
+                    "advanced_uaa",
+                    ring_degree,
+                    split_sizes,
+                    "mem_efficient",
+                ),
+                nprocs=sp_world_size,
+            )
 
         baseline = np.load(baseline_file, allow_pickle=False)
         sp = np.load(sp_file, allow_pickle=False)
