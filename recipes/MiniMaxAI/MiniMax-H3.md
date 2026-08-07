@@ -635,7 +635,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 omni = Omni(
     model=f"{MODEL_ROOT}/FL2VA",
     cache_backend="tea_cache",
-    cache_config={"rel_l1_thresh": 0.2},
+    cache_config={"rel_l1_thresh": 0.17},
     trust_remote_code=True,
     enable_cpu_offload=True,
 )
@@ -660,7 +660,7 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --omni \
   --trust-remote-code \
   --cache-backend tea_cache \
-  --cache-config '{"rel_l1_thresh":0.2}'
+  --cache-config '{"rel_l1_thresh":0.17}'
 ```
 
 ## Known limitations

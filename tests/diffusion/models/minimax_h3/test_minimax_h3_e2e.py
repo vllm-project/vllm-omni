@@ -153,7 +153,7 @@ def test_minimax_h3_t2va_teacache_single_gpu_smoke():
     engine = Omni(
         model=os.environ[MODEL_ENV],
         cache_backend="tea_cache",
-        cache_config={"rel_l1_thresh": 0.2},
+        cache_config={"rel_l1_thresh": 0.17},
         parallel_config=DiffusionParallelConfig(ulysses_degree=1),
         trust_remote_code=True,
         enable_cpu_offload=True,
