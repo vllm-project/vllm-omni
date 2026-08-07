@@ -1,7 +1,7 @@
 # MiniMax H3 on Ascend NPU
 
-> Joint video and audio generation with text, first-frame, image/audio, or
-> multi-video conditions — Ascend NPU deployment guide
+> Joint video and audio generation with text, first/last keyframes, and mixed
+> image/video/audio references — Ascend NPU deployment guide
 
 ## Summary
 
@@ -26,12 +26,12 @@ environments. Differences from the GPU path:
 
 ### Checkpoint
 
-Same as the GPU recipe — Hugging Face access approval is required:
+Same as the GPU recipe — Hugging Face access approval is required. Authenticate
+once; `vllm serve` downloads the required nested components automatically:
 
 ```bash
 hf auth login
-export MODEL_ROOT=/path/to/MiniMax-H3
-hf download MiniMaxAI/MiniMax-H3 --local-dir "${MODEL_ROOT}"
+export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
 ### Environment
@@ -50,7 +50,8 @@ uv pip install -e .
 ```
 
 Install the **mindie-sd** operator library to enable Ascend-optimized fused
-operators (`adalayernorm`, etc.):
+operators (`adalayernorm`, etc.) and the RainFusion `rf_v2` block-sparse
+attention kernel:
 
 ```bash
 git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD
@@ -72,24 +73,21 @@ pip install mindiesd-*.whl
 
 ## Start a server
 
-One server loads one checkpoint partition. Set `MODEL` to `FL2VA` for T2VA
-and FL2VA requests, or to `Ref2VA` for Ref2VA requests.
+Pass the repository ID directly. The pipeline loads the two nested DiTs while
+sharing the tokenizer, processor, text encoder, and VAEs from `FL2VA`.
 
-### Multi-NPU: 768P validated configuration
+### Multi-NPU: 768P combined-service configuration
 
-Validated on eight NPUs of an Atlas 800I A3 server with Ulysses sequence
-parallelism degree 8, text-encoder tensor parallelism degree 8, native tiled
-VAE patch parallelism degree 8, and layerwise offload:
+Use Ulysses sequence parallelism degree 8, text-encoder tensor parallelism
+degree 8, native tiled VAE patch parallelism degree 8, and layerwise offload:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PORT=9098
-export MODEL="${MODEL_ROOT}/FL2VA"
+export MODEL=MiniMaxAI/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 export PYTHONDONTWRITEBYTECODE=1
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
 
 vllm serve "${MODEL}" \
   --omni \
@@ -111,11 +109,30 @@ Do not add `--enforce-eager`. The first request includes regional
 compilation; warm the server once before measuring steady-state latency.
 H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
-To serve Ref2VA, stop the FL2VA server and restart with:
+The same endpoint accepts `task=t2va`, `task=fl2va`, and `task=ref2va`; no
+partition restart is required. Layerwise offload applies to both DiTs.
+
+### Optional optimizations
+
+Two independent optimizations may be enabled on top of the configuration
+above. Both are validated for T2VA only.
+
+**RainFusion block-sparse attention** — switch the attention backend, keeping
+every other flag unchanged:
 
 ```bash
-export MODEL="${MODEL_ROOT}/Ref2VA"
+  --diffusion-attention-backend RAINFUSION_ATTN
 ```
+
+**INT8 online quantization** — add one flag to the server command above:
+
+```bash
+  --quantization int8
+```
+
+Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
+over the whole sequence, so ring parallelism would split away the keys it
+needs. Scale with `--usp` instead.
 
 ## HTTP API examples
 
@@ -145,18 +162,26 @@ throughput guarantee.
 
 ## Known limitations
 
-- Each server process loads only one checkpoint partition.
+- Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
+  both task-specific DiTs, and loads one copy of every shared component.
 - H3 currently executes one generation request per diffusion batch.
 - The first regional-compile request is a warmup and should not be included
   in steady-state performance measurements.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional
-  standalone audio reference.
+- The official H3 input matrix and media limits are documented in the [GPU
+  recipe](MiniMax-H3.md#official-input-matrix-and-limits); this NPU path uses
+  the same HTTP request contract.
 - VAE patch parallelism requires size 1 or the full DiT group size and
   supports the H3 native `tile` mode only.
+- RainFusion block-sparse attention and INT8 quantization are validated for
+  T2VA only; use the BF16 dense configuration for FL2VA and Ref2VA.
+- Online quantization cannot be combined with distributed layerwise offload
+  while AllGather is enabled; pass `--dlo-no-use-allgather` in that case.
 
 ## Additional resources
 
 - [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
+- [Attention backends § RAINFUSION_ATTN](../../docs/user_guide/diffusion/attention_backends.md#rainfusion_attn-backend-and-block-sparse-video-attention)
+  — RainFusion knobs and tuning
+- [Int8 quantization](../../docs/user_guide/quantization/int8.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)

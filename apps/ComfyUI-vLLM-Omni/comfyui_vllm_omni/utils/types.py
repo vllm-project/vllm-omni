@@ -23,6 +23,14 @@ class WanModelSpecificParams(dict):
     pass
 
 
+class MiniMaxH3ModelSpecificParams(dict):
+    pass
+
+
+class VideoReferences(dict):
+    pass
+
+
 class ModelMode(Enum):
     IMAGE_GENERATION = auto()
     VIDEO_GENERATION = auto()
@@ -43,9 +51,11 @@ class ModelModeSpec(TypedDict):
 
 
 PayloadPreprocessor: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
+ParamsBuilder: TypeAlias = Callable[..., dict[str, Any]]
 
 
 class Spec(TypedDict):
     stages: list[Literal["diffusion", "autoregression"]]
     modes: list[ModelModeSpec]
     payload_preprocessor: NotRequired[PayloadPreprocessor]
+    params_builder: NotRequired[ParamsBuilder]

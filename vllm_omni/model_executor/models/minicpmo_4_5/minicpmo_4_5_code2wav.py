@@ -727,18 +727,16 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
+        # In-tree adapter over StepAudio2Token2WavCore on every platform. It
+        # matches the external `stepaudio2-minicpmo` Token2wav bit-for-bit on
+        # CUDA (same cosyvoice2 flow/DiT modules and weights) while dropping
+        # that package's hard-coded `.cuda()` calls, and auto-applies the
+        # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
+        # on NPU.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav as Token2wav,
+        )
         from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
@@ -765,4 +763,26 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+
+        trt_stepper = None
+        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        # TensorRT is CUDA-only; other platforms ignore the toggle.
+        if use_trt and current_omni_platform.is_cuda():
+            from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
+
+            dtype_name = str(
+                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
+            ).lower()
+            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            max_batch = int(extra.get("token2wav_trt_max_batch", 16))
+            device = next(token2wav.flow.parameters()).device
+            trt_stepper = build_dit_trt_stepper(
+                token2wav.flow.decoder.estimator,
+                device=device,
+                dtype=trt_dtype,
+                max_batch=max_batch,
+            )
+            logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
+            token2wav.enable_trt_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        self.backend = BatchedToken2Wav(token2wav, trt_stepper=trt_stepper)
