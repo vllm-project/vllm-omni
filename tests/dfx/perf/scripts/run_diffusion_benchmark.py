@@ -23,7 +23,6 @@ of all runs from cases in that file). Bulk load without ``--test-config-file`` u
 the same per-file aggregation; ``-m`` only selects which cases run.
 """
 
-import copy
 import json
 import os
 import socket
@@ -45,6 +44,7 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     hardware_json_value,
     is_diffusion_perf_config,
+    resolve_baseline_for_sweep,
     resolve_pytest_marks,
     resource_label_for_filename,
 )
@@ -350,10 +350,49 @@ def _kill_process_tree(pid: int) -> None:
 
 
 def _resolve_offline_model(model: str) -> str:
-    """Under HF_HUB_OFFLINE, resolve a HF repo id to its local snapshot dir."""
+    """Resolve a model string to a local directory.
+
+    Local paths pass through unchanged. HF repo ids are resolved to their local
+    snapshot dir when ``HF_HUB_OFFLINE`` is set. ``repo_id/subfolder`` (e.g.
+    ``MiniMaxAI/MiniMax-H3/FL2VA``) is resolved to the matching partition
+    subfolder of the snapshot, downloading only that subfolder when online.
+    """
     import huggingface_hub
 
-    if not model or os.path.isdir(model) or not huggingface_hub.constants.HF_HUB_OFFLINE:
+    if not model or os.path.isdir(model):
+        return model
+
+    # MiniMax-H3 custom code uses relative imports across files, which breaks
+    # when the HF cache snapshot is symlinked (``get_class_from_dynamic_module``
+    # resolves ``realpath`` into the blobs dir). Mirror the accuracy test's env
+    # overrides so CI / local runs can point at a materialized partition. The
+    # repo-root key (used with ``--task-type fl2va|ref2va``) expects a
+    # materialized root containing the FL2VA/Ref2VA subfolders.
+    model_env_overrides = {
+        "MiniMaxAI/MiniMax-H3": "VLLM_TEST_MINIMAX_H3_MODEL",
+        "MiniMaxAI/MiniMax-H3/FL2VA": "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL",
+        "MiniMaxAI/MiniMax-H3/Ref2VA": "VLLM_TEST_MINIMAX_H3_REF2VA_MODEL",
+    }
+    env_name = model_env_overrides.get(model)
+    if env_name:
+        env_model = os.environ.get(env_name)
+        if env_model:
+            return env_model
+
+    parts = model.split("/")
+    if len(parts) >= 3:
+        repo_id = "/".join(parts[:2])
+        subfolder = "/".join(parts[2:])
+        from huggingface_hub import snapshot_download
+
+        snapshot_root = snapshot_download(
+            repo_id,
+            allow_patterns=[f"{subfolder}/**"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+        return str(Path(snapshot_root) / subfolder)
+
+    if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
     from huggingface_hub import snapshot_download
 
@@ -387,6 +426,11 @@ class DiffusionServer:
     def _start_server(self) -> None:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Give each run its own writable video-storage dir. The server default
+        # (/tmp/storage) may be missing or not writable on shared hosts / CI.
+        storage_path = Path(os.environ.get("VLLM_OMNI_STORAGE_PATH", str(BENCHMARK_RESULT_DIR / "storage")))
+        storage_path.mkdir(parents=True, exist_ok=True)
+        env["VLLM_OMNI_STORAGE_PATH"] = str(storage_path)
 
         cmd = [
             sys.executable,
@@ -766,8 +810,8 @@ def run_benchmark(
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
 
-    # Persist the JSON baseline as-is (no hardware / sweep resolution).
-    baseline = copy.deepcopy(params.get("baseline") or {})
+    # Persist sweep-resolved baseline from params (already narrowed in _build_run_params).
+    baseline = params.get("baseline") or {}
     metrics["baseline"] = baseline
 
     record: dict[str, Any] = {
@@ -862,6 +906,7 @@ def _build_run_params(
     params: dict[str, Any],
     *,
     num_prompts: int,
+    sweep_index: int | None = None,
     request_rate: Any | None = None,
     max_concurrency: Any | None = None,
 ) -> dict[str, Any]:
@@ -873,6 +918,12 @@ def _build_run_params(
         run_params["request-rate"] = request_rate
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
+    if "baseline" in params:
+        # Keep all hardware buckets; pick the metric value for this sweep step only.
+        run_params["baseline"] = resolve_baseline_for_sweep(
+            params.get("baseline"),
+            sweep_index=sweep_index,
+        )
     return run_params
 
 
@@ -895,19 +946,20 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
 
     sweep_runs: list[dict[str, Any]] = []
 
-    for request_rate, num_prompts in zip(request_rate_list, num_prompt_list):
+    for sweep_index, (request_rate, num_prompts) in enumerate(zip(request_rate_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
                     params,
                     request_rate=request_rate,
                     num_prompts=num_prompts,
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
             }
         )
 
-    for max_concurrency, num_prompts in zip(max_concurrency_list, num_prompt_list):
+    for sweep_index, (max_concurrency, num_prompts) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         sweep_runs.append(
             {
                 "params": _build_run_params(
@@ -915,6 +967,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                     max_concurrency=max_concurrency,
                     num_prompts=num_prompts,
                     request_rate="inf",
+                    sweep_index=sweep_index,
                 ),
                 "num_prompts": num_prompts,
             }
@@ -927,6 +980,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
                 "params": _build_run_params(
                     params,
                     num_prompts=default_num_prompts,
+                    sweep_index=0,
                 ),
                 "num_prompts": default_num_prompts,
             }

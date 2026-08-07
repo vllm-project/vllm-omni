@@ -370,6 +370,9 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
+                # The stable adapter entry point still receives the same
+                # legacy stage object as replica planning. Its implementation
+                # switches only at the coordinated RFC #4021 cutover.
                 engine_args_dict = build_engine_args_dict(
                     stage_cfg,
                     self._model,

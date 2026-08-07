@@ -37,7 +37,7 @@
         "num-prompts": 10,
         "max-concurrency": 1,
         "baseline": {
-          "H100": {
+          "H200": {
             "throughput_qps": 0.213,
             "latency_mean": 4.6953,
             "latency_p99": 4.8601,
