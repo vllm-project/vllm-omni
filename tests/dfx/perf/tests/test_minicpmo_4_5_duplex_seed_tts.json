@@ -29,7 +29,7 @@
         "backend": "openai-realtime-tts",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          1
+          32
         ],
         "max_concurrency": [
           1
