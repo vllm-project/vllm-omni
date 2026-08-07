@@ -537,15 +537,40 @@ class Orchestrator:
             for replica_id in pool.available_replica_ids():
                 self._orch_monitor.register_replica(stage_id, replica_id)
 
+        # Maps src-stage -> downstream stages; PD fan-in/fan-out pipelines
+        # (e.g. 1P3D) are not numerically adjacent, so routing must consult this.
+        self._downstream_stage_ids: dict[int, list[int]] = self._build_downstream_stage_ids(stage_pools)
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
+        self._pd_prefill_ids: list[int] = []
+        self._pd_decode_ids: list[int] = []
+        self._pd_decode_to_prefill: dict[int, list[int]] = {}
         self._pd_bootstrap_addr: str | None = None
+        self._pd_bootstrap_addr_by_prefill: dict[int, str] = {}
         self._pd_prefill_engine_id: str | None = None
+        self._pd_prefill_engine_id_by_prefill: dict[int, str] = {}
+        self._pd_decode_pick_strategy: str = "round_robin"
+        self._pd_decode_round_robin_idx: int = 0
+        self._pd_decode_inflight: dict[int, int] = {}
+        self._pd_request_to_decode: dict[str, int] = {}
         self._pd_kv_params: dict[str, Any] = {}
         if pd_config is not None:
             self._pd_pair = pd_config.get("pd_pair")
+            self._pd_prefill_ids = list(
+                pd_config.get("prefill_ids") or ([] if self._pd_pair is None else [self._pd_pair[0]])
+            )
+            self._pd_decode_ids = list(
+                pd_config.get("decode_ids") or ([] if self._pd_pair is None else [self._pd_pair[1]])
+            )
+            self._pd_decode_to_prefill = {
+                int(k): list(v) for k, v in dict(pd_config.get("decode_to_prefill") or {}).items()
+            }
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
+            self._pd_bootstrap_addr_by_prefill = dict(pd_config.get("bootstrap_addr_by_prefill") or {})
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
+            self._pd_prefill_engine_id_by_prefill = dict(pd_config.get("prefill_engine_id_by_prefill") or {})
+            self._pd_decode_pick_strategy = str(pd_config.get("decode_pick_strategy") or "round_robin").lower()
+            self._pd_decode_inflight = {d_id: 0 for d_id in self._pd_decode_ids}
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._init_metrics_state(
             stage_pools,
@@ -593,6 +618,39 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+    @staticmethod
+    def _build_downstream_stage_ids(stage_pools: list[StagePool]) -> dict[int, list[int]]:
+        """Build src-stage -> downstream-stage mapping from stage metadata.
+
+        Legacy linear pipelines omit ``engine_input_source`` on some stages, so
+        callers still fall back to ``stage_id + 1`` when no explicit mapping is
+        present. Non-linear fan-in/fan-out pipelines (for example 1P3D where
+        stage-1/2/3 all feed stage-4) must use this mapping instead of numeric
+        adjacency.
+        """
+        downstream: dict[int, list[int]] = {}
+        for dst_id, pool in enumerate(stage_pools):
+            sources = list(getattr(pool.stage_client, "engine_input_source", None) or [])
+            for src_id in sources:
+                if not isinstance(src_id, int):
+                    try:
+                        src_id = int(src_id)
+                    except (TypeError, ValueError):
+                        continue
+                downstream.setdefault(src_id, []).append(dst_id)
+        return downstream
+
+    def _resolve_next_stage_id(self, src_stage_id: int) -> int:
+        candidates = self._downstream_stage_ids.get(src_stage_id) or []
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            non_pd_decode = [stage_id for stage_id in candidates if not self._is_pd_decode_stage(stage_id)]
+            if len(non_pd_decode) == 1:
+                return non_pd_decode[0]
+            raise RuntimeError(f"[Orchestrator] Ambiguous downstream stages for stage-{src_stage_id}: {candidates}")
+        return src_stage_id + 1
 
     def _init_metrics_state(
         self,
@@ -810,7 +868,13 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
+        # [PD] M-P-N-D: enter at the prefill stage the caller already picked
+        # rather than assuming the entry stage is always stage 0.
+        bound_p = getattr(msg, "bound_prefill_stage_id", None)
+        if bound_p is not None and 0 <= bound_p < len(self.stage_pools):
+            stage_id = bound_p
+        else:
+            stage_id = 0
         request_id = msg.request_id
         prompt = msg.prompt
         original_prompt = msg.original_prompt
@@ -872,7 +936,9 @@ class Orchestrator:
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        # [PD] The async-chunk prewarm must fire on the request's ENTRY stage,
+        # which for PD is a prefill stage rather than stage 0.
+        if self.async_chunk and (stage_id == 0 or self._is_pd_prefill_stage(stage_id)) and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
@@ -2482,7 +2548,15 @@ class Orchestrator:
         raw_outputs: EngineCoreOutputs,
     ) -> None:
         """Forward split requests once stage-0 KV is ready."""
-        if self.async_chunk:
+        # [PD] The PD prefill stage MUST be exempt from the async-chunk early
+        # return: PD yamls set async_chunk: true, so returning here drops every
+        # prefill->decode handoff and D silently regenerates from scratch.
+        if self._pd_trace_enabled:
+            logger.info(
+                "[PD_TRACE] kvready_enter stage=%d async_chunk=%s is_pd_prefill=%s n_out=%d",
+                stage_id, self.async_chunk, self._is_pd_prefill_stage(stage_id), len(raw_outputs.outputs),
+            )
+        if self.async_chunk and not self._is_pd_prefill_stage(stage_id):
             return
 
         for raw_output in raw_outputs.outputs:
@@ -2495,6 +2569,11 @@ class Orchestrator:
             is_pd_prefill = self._is_pd_prefill_stage(stage_id)
             pd_submit_ready = is_pd_prefill and bool(kv_params.get("pd_submit_ready"))
             kv_extraction_ack = bool(kv_params.get("kv_ready"))
+            if self._pd_trace_enabled:
+                logger.info(
+                    "[PD_TRACE] kvready_probe req=%s stage=%d is_pd_prefill=%s submit_ready=%s ack=%s keys=%s",
+                    req_id, stage_id, is_pd_prefill, pd_submit_ready, kv_extraction_ack, sorted(kv_params),
+                )
             if not pd_submit_ready and not kv_extraction_ack:
                 continue
             # The extraction ACK arrives only after D has pulled KV. It is a
@@ -2515,7 +2594,13 @@ class Orchestrator:
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
-            if (stage_id + 1) in req_state.stage_submit_ts:
+            # [PD] A prefill stage routes to a decode replica chosen by the pick
+            # strategy, which is not stage_id+1, so the dedupe check must ask
+            # whether ANY decode stage already has this request.
+            if self._is_pd_prefill_stage(stage_id):
+                if self._pd_decode_already_submitted(req_state):
+                    continue
+            elif (stage_id + 1) in req_state.stage_submit_ts:
                 continue
 
             # [PD] Qwen3-TTS prefill hands off non-KV state (hidden_states / codes /
@@ -2702,7 +2787,21 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        next_logical = src_stage_id + 1
+        # [PD] A prefill stage does not hand off to stage_id+1: it routes to a
+        # decode replica chosen by the pick strategy. Without this the decode
+        # branch below never runs, so D never receives P's resume token and
+        # regenerates the whole utterance from scratch.
+        pd_prefill_forward = self._is_pd_prefill_stage(src_stage_id) and self._pd_decode_ids
+        if pd_prefill_forward:
+            next_logical = self._pick_pd_decode_stage(req_id, src_stage_id)
+            if next_logical in req_state.final_output_stage_ids:
+                other_decode_finals = req_state.final_output_stage_ids.intersection(self._pd_decode_ids) - {
+                    next_logical
+                }
+                if other_decode_finals:
+                    req_state.final_output_stage_ids.difference_update(other_decode_finals)
+        else:
+            next_logical = self._resolve_next_stage_id(src_stage_id)
         next_pool = self.stage_pools[next_logical]
         if not next_pool.live_replica_ids():
             # The downstream stage lost all of its replicas before this in-flight
@@ -2713,7 +2812,11 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+        already_submitted = (
+            next_logical in req_state.stage_submit_ts
+            if pd_prefill_forward
+            else self._next_stage_already_submitted(src_stage_id, req_state)
+        )
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
 
@@ -2919,6 +3022,15 @@ class Orchestrator:
                     pd_decode_state,
                 )
 
+            if self._pd_trace_enabled:
+                _dp_ai = decode_prompt.get("additional_information")
+                logger.info(
+                    "[PD_TRACE] decode_build req=%s next=%d ai_keys=%s meta=%s n_tok=%d",
+                    req_id, next_logical,
+                    sorted(_dp_ai) if isinstance(_dp_ai, dict) else None,
+                    (_dp_ai.get("meta") if isinstance(_dp_ai, dict) else None),
+                    len(decode_prompt.get("prompt_token_ids") or []),
+                )
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=decode_prompt,
@@ -2928,6 +3040,11 @@ class Orchestrator:
                 resumable=next_stage_resumable,
             )
             request.external_req_id = request.request_id
+            if self._pd_trace_enabled:
+                logger.info(
+                    "[PD_TRACE] decode_submit req=%s next=%d already_submitted=%s submit_ts_keys=%s",
+                    req_id, next_logical, already_submitted, sorted(req_state.stage_submit_ts),
+                )
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
@@ -3132,6 +3249,25 @@ class Orchestrator:
             return False
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
+            # [PD] Never prewarm a PD decode replica (or a stage fed by one).
+            # Decode gets its input from the prefill handoff that carries P's KV
+            # plus the resume token; a placeholder prewarm here stamps
+            # stage_submit_ts, makes _pd_decode_already_submitted() true, and the
+            # real handoff is then silently dropped -- D regenerates the whole
+            # utterance from scratch (~65s of audio instead of ~4s).
+            if self._pd_trace_enabled:
+                logger.info("[PD_TRACE] prewarm_check stage=%d is_pd_decode=%s decode_ids=%s",
+                            next_stage_id, self._is_pd_decode_stage(next_stage_id), self._pd_decode_ids)
+            if self._is_pd_decode_stage(next_stage_id):
+                continue
+            # PD prefill siblings likewise receive KV via Mooncake, not chunks.
+            if self._is_pd_prefill_stage(next_stage_id):
+                continue
+            pd_input_sources = list(
+                getattr(self.stage_pools[next_stage_id].stage_client, "engine_input_source", None) or []
+            )
+            if any(self._is_pd_decode_stage(src_id) for src_id in pd_input_sources):
+                continue
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
             if not self._stage_receives_async_chunks(next_stage_id):

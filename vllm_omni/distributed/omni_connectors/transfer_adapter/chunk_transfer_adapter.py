@@ -1123,19 +1123,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Add additional info for cached requests and
         clean up ready chunks from scheduler output.
         """
-        if not self.receives_chunks:
-            return
         stage_id = self.connector.stage_id
+        import os as _os
+        if _os.getenv("VLLM_OMNI_PD_TRACE","0") not in ("","0","false","False"):
+            _cr = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            logger.info(
+                "[PD_TRACE] postproc stage=%s recv_chunks=%s has_reqs=%s cached_ids=%s",
+                stage_id, self.receives_chunks, requests is not None,
+                list(getattr(_cr, "req_ids", []) or []) if _cr else None,
+            )
 
         if stage_id == 0:
             return
 
+        # [PD] attach_cached_additional_information must run even on a stage that
+        # does not receive chunks. A PD decode stage takes its input from the
+        # Mooncake KV pull, not from the chunk connector, yet it still relies on
+        # this hop to carry additional_information (hidden_states / codes /
+        # pd_sampler / meta.pd_resume_token_id) onto scheduled_cached_reqs. The
+        # upstream 0.26 `if not self.receives_chunks: return` guard skipped it,
+        # so the resume token never reached the worker and decode silently
+        # regenerated the whole utterance instead of continuing from prefill.
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
+        if not self.receives_chunks:
+            return
         self._clear_chunk_ready(scheduler_output)
 
-    @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
+    def attach_cached_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if not cached_reqs:
             return
@@ -1146,6 +1161,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             additional_info = getattr(request, "additional_information", None) if request else None
             cached_reqs.additional_information[req_id] = additional_info
             if request and additional_info:
+                # [PD] Never consume the payload on a PD decode consumer. Its
+                # additional_information carries the one-shot prefill handoff
+                # (hidden_states / codes / pd_sampler / meta.pd_resume_token_id)
+                # and the request may still be scheduled as a NEW request in a
+                # later step; clearing it here loses the resume token and decode
+                # regenerates the utterance from scratch.
+                if self._is_pd_decode_consumer:
+                    continue
                 request.additional_information = None
 
     def _process_chunk_queue(
