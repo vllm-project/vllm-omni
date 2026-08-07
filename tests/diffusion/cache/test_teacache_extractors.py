@@ -685,7 +685,7 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         hook = TeaCacheHook(
             TeaCacheConfig(
                 transformer_type="MiniMaxH3DiTModel",
-                rel_l1_thresh=0.2,
+                rel_l1_thresh=0.3,
             )
         )
         hook.initialize_hook(minimax_h3_module)
