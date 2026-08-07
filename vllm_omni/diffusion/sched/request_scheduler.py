@@ -35,8 +35,8 @@ class RequestScheduler(BaseScheduler):
         dp_concurrent: bool = False,
     ) -> AdmissionWaitDecision:
         assert self.od_config is not None
-        max_wait_ms = float(self.od_config.request_batch_max_wait_ms)
-        if max_wait_ms <= 0:
+        max_wait_ms = self.od_config.request_batch_max_wait_ms
+        if max_wait_ms <= 0.0 or self.max_num_running_reqs <= 1:
             return AdmissionWaitDecision(should_wait=False)
         if self.num_running_requests() > 0:
             return AdmissionWaitDecision(should_wait=False)
