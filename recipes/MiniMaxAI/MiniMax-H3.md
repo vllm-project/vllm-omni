@@ -574,6 +574,42 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
 
+## Request-scoped quality
+
+Start the H3 server with Cache-DiT capability by adding this option to one of
+the launch commands above:
+
+```bash
+--cache-backend cache_dit
+```
+
+Then add one of these fields to any HTTP request above. Omitting `quality`
+keeps or restores the startup Cache-DiT profile.
+
+```bash
+-F 'quality=lossless'  # Native reference path for this request.
+-F 'quality=high'      # H3's conservative Cache-DiT profile.
+```
+
+Without startup Cache-DiT, omitted and `lossless` requests use the reference
+path, while `high` returns an error.
+
+The following result was measured on 4× NVIDIA H200 with SP4, text-encoder
+TP4, 1344×768, 124 frames, 24 FPS, and 50 inference steps. One full
+`lossless` warmup was excluded, followed by three fixed prompt/seed pairs in
+balanced switch order.
+
+| `quality` | Median inference latency | Speedup | SSIM vs `lossless` | PSNR vs `lossless` | Expected trade-off |
+|---|---:|---:|---:|---:|---|
+| `lossless` | 85.49 s | 1.00× | 1.0000 | exact | Native reference path |
+| `high` | 63.36 s | 1.35× | 0.9709 | 34.98 dB | Faster with measured same-seed deviation |
+
+> [!NOTE]
+> `high` selects a fixed Cache-DiT profile, but its cache hit rate and
+> resulting latency/quality trade-off may vary by hardware, topology, and
+> workload. The values above apply to this deployment and are not universal
+> guarantees. `lossless` remains the exact reference path.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
