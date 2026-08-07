@@ -140,7 +140,7 @@
         "num-prompts": 96,
         "skip-performance-assertion": true,
         "baseline": {
-          "H100": {
+          "H200": {
             "throughput_qps": 0.1874,
             "latency_p99": 101.852,
             "latency_mean": 79.0385,
