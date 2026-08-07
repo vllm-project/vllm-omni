@@ -103,7 +103,6 @@ class PersonaPlexEngine:
             return self
         import sentencepiece
         import torch
-        from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
 
         from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
@@ -121,6 +120,7 @@ class PersonaPlexEngine:
         from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
             PersonaPlexTemporalStreaming,
         )
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         cfg = self.config
         B = cfg.batch_size
@@ -128,11 +128,11 @@ class PersonaPlexEngine:
         self._codec = PersonaPlexMimiCodec(device=cfg.device)
         self._codec.streaming_init(B)
 
-        tok_path = hf_hub_download(cfg.hf_repo, "tokenizer_spm_32k_3.model")
+        tok_path = hf_api().hf_hub_download(cfg.hf_repo, "tokenizer_spm_32k_3.model")
         self._tokenizer = sentencepiece.SentencePieceProcessor(tok_path)
 
         logger.info("PersonaPlex native: loading temporal + depformer + embeddings")
-        sd = load_file(hf_hub_download(cfg.hf_repo, "model.safetensors"), device=cfg.device)
+        sd = load_file(hf_api().hf_hub_download(cfg.hf_repo, "model.safetensors"), device=cfg.device)
         dtype = torch.bfloat16
         self._temporal = PersonaPlexTemporalStreaming().to(cfg.device, dtype)
         self._temporal.load_weights(sd)
@@ -181,11 +181,11 @@ class PersonaPlexEngine:
         self._loaded_voice = voice
 
     def _resolve_voice_prompt(self, voice: str) -> str:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         if os.path.exists(voice):
             return voice
-        tgz = Path(hf_hub_download(self.config.hf_repo, "voices.tgz"))
+        tgz = Path(hf_api().hf_hub_download(self.config.hf_repo, "voices.tgz"))
         vdir = tgz.parent / "voices"
         if not vdir.exists():
             with tarfile.open(tgz, "r:gz") as tar:

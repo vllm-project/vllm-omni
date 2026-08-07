@@ -42,10 +42,10 @@ _QUALITY_CONFIG = QualityTestConfig(
 
 
 def _resolve_fl2va_model_ref() -> str:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     repo_root = Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=_MINIMAX_H3_REPO,
             revision=_MINIMAX_H3_REVISION,
             allow_patterns=["FL2VA/**"],
@@ -258,13 +258,13 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
     fl2va_root.mkdir()
     (fl2va_root / "model_index.json").write_text("{}", encoding="utf-8")
 
-    def fake_snapshot_download(*, repo_id, revision, allow_patterns):
+    def fake_snapshot_download(self, *, repo_id, revision, allow_patterns):
         assert repo_id == _MINIMAX_H3_REPO
         assert revision == _MINIMAX_H3_REVISION
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", fake_snapshot_download)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 

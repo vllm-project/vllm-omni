@@ -359,6 +359,8 @@ def _resolve_offline_model(model: str) -> str:
     """
     import huggingface_hub
 
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
     if not model or os.path.isdir(model):
         return model
 
@@ -383,9 +385,7 @@ def _resolve_offline_model(model: str) -> str:
     if len(parts) >= 3:
         repo_id = "/".join(parts[:2])
         subfolder = "/".join(parts[2:])
-        from huggingface_hub import snapshot_download
-
-        snapshot_root = snapshot_download(
+        snapshot_root = hf_api().snapshot_download(
             repo_id,
             allow_patterns=[f"{subfolder}/**"],
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
@@ -394,8 +394,6 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    from vllm_omni.transformers_utils.repo_utils import hf_api
-
     return hf_api().snapshot_download(model, local_files_only=True)
 
 
