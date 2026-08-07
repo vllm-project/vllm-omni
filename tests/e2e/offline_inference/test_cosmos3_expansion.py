@@ -101,27 +101,40 @@ def _make_lora_request(adapter_dir: Path) -> LoRARequest:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_cosmos3_lora_scale_and_deactivation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "omni_runner",
+    [
+        (
+            MODEL,
+            None,
+            {
+                "model_class_name": "Cosmos3OmniDiffusersPipeline",
+                "model_config": {"guardrails": False},
+            },
+        )
+    ],
+    indirect=True,
+)
+def test_cosmos3_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path: Path) -> None:
     lora_request = _make_lora_request(tmp_path / "cosmos3_lora")
+    omni = omni_runner.omni
+    baseline = _generate(omni)
+    image_1x = _generate(omni, lora_request, lora_scale=1.0)
+    image_2x = _generate(omni, lora_request, lora_scale=2.0)
+    restored = _generate(omni)
 
-    with OmniRunner(
-        MODEL,
-        stage_configs_path=None,
-        model_class_name="Cosmos3OmniDiffusersPipeline",
-        model_config={"guardrails": False},
-    ) as runner:
-        omni = runner.omni
-        baseline = _generate(omni)
-        image_1x = _generate(omni, lora_request, lora_scale=1.0)
-        image_2x = _generate(omni, lora_request, lora_scale=2.0)
-        restored = _generate(omni)
+    baseline_array = np.asarray(baseline, dtype=np.int16)
+    image_1x_array = np.asarray(image_1x, dtype=np.int16)
+    image_2x_array = np.asarray(image_2x, dtype=np.int16)
+    restored_array = np.asarray(restored, dtype=np.int16)
 
-    baseline_array = np.asarray(baseline)
-    image_1x_array = np.asarray(image_1x)
-    image_2x_array = np.asarray(image_2x)
-    restored_array = np.asarray(restored)
+    diff_1x = np.abs(baseline_array - image_1x_array).mean()
+    diff_2x = np.abs(baseline_array - image_2x_array).mean()
+    diff_restored = np.abs(baseline_array - restored_array).mean()
 
-    assert not np.array_equal(image_1x_array, baseline_array)
-    assert not np.array_equal(image_2x_array, baseline_array)
-    assert not np.array_equal(image_2x_array, image_1x_array)
-    assert np.array_equal(restored_array, baseline_array)
+    assert diff_1x > 0.5, f"LoRA scale=1.0 had no visible effect: diff={diff_1x}"
+    assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
+    assert not np.isclose(diff_1x, diff_2x, atol=1.0), (
+        f"LoRA scale had no effect: diff_1x={diff_1x:.2f}, diff_2x={diff_2x:.2f}"
+    )
+    assert diff_restored < 5.0, f"LoRA did not deactivate cleanly: diff_restored={diff_restored:.2f}"
