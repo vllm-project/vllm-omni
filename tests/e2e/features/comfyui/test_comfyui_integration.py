@@ -257,17 +257,21 @@ def _assert_sampling_param_values(
             f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
         )
     if expected_lora:
-        assert received.lora_request.lora_name == expected_lora["name"], (
-            f"Expected lora name={(expected_lora['name'])}, got {received.lora_request.lora_name}. The received sampling params: {received}"
+        assert len(received.lora_requests) == 1, (
+            f"Expected exactly one lora_request, got {received.lora_requests}. The received sampling params: {received}"
         )
-        assert received.lora_request.lora_int_id == expected_lora["int_id"], (
-            f"Expected lora int_id={expected_lora['int_id']}, got {received.lora_request.lora_int_id}. The received sampling params: {received}"
+        received_lora = received.lora_requests[0]
+        assert received_lora.lora_name == expected_lora["name"], (
+            f"Expected lora name={(expected_lora['name'])}, got {received_lora.lora_name}. The received sampling params: {received}"
         )
-        assert received.lora_request.lora_path == expected_lora["local_path"], (
-            f"Expected lora path={expected_lora['local_path']}, got {received.lora_request.lora_path}. The received sampling params: {received}"
+        assert received_lora.lora_int_id == expected_lora["int_id"], (
+            f"Expected lora int_id={expected_lora['int_id']}, got {received_lora.lora_int_id}. The received sampling params: {received}"
         )
-        assert received.lora_scale == expected_lora["scale"], (
-            f"Expected lora scale={expected_lora['scale']}, got {received.lora_scale}. The received sampling params: {received}"
+        assert received_lora.lora_path == expected_lora["local_path"], (
+            f"Expected lora path={expected_lora['local_path']}, got {received_lora.lora_path}. The received sampling params: {received}"
+        )
+        assert received.lora_scales == [expected_lora["scale"]], (
+            f"Expected lora scale={expected_lora['scale']}, got {received.lora_scales}. The received sampling params: {received}"
         )
 
 

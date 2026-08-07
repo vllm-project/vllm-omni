@@ -79,19 +79,19 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert sampling_params_list[1].guidance_scale == 7.5
     assert sampling_params_list[1].num_outputs_per_prompt == 2
     assert sampling_params_list[1].true_cfg_scale == 5.0
-    assert sampling_params_list[1].lora_request.name == "adapter-a"
-    assert sampling_params_list[1].lora_scale == 0.6
+    assert sampling_params_list[1].lora_requests[0].lora_name == "adapter-a"
+    assert sampling_params_list[1].lora_scales == [0.6]
     assert sampling_params_list[2].height == 768
     assert sampling_params_list[2].width == 1024
     assert sampling_params_list[2].seed == 0
     assert sampling_params_list[2].num_inference_steps == 28
-    assert sampling_params_list[2].lora_request.name == "adapter-a"
-    assert sampling_params_list[2].lora_scale == 0.6
-    assert gen_params.lora_request is None
+    assert sampling_params_list[2].lora_requests[0].lora_name == "adapter-a"
+    assert sampling_params_list[2].lora_scales == [0.6]
+    assert gen_params.lora_requests == []
     assert engine.default_sampling_params_list[1].height is None
-    assert engine.default_sampling_params_list[1].lora_request is None
+    assert engine.default_sampling_params_list[1].lora_requests == []
     assert engine.default_sampling_params_list[2].resolution == 640
-    assert engine.default_sampling_params_list[2].lora_request is None
+    assert engine.default_sampling_params_list[2].lora_requests == []
 
 
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):

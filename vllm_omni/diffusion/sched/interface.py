@@ -61,8 +61,9 @@ class StepBatchSamplingParamsKey:
 
     # LoRA identity. Requests with different adapters or scales must run in
     # separate batches so the worker can activate exactly one adapter per step.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # Tuples preserve adapter order; empty tuple means no LoRA.
+    lora_int_ids: tuple[int, ...] = ()
+    lora_scales: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, eq=True)
@@ -108,9 +109,9 @@ class RequestBatchSamplingParamsKey:
     layers: int = 4
     use_en_prompt: bool = False
 
-    # LoRA identity.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. Tuples preserve adapter order; empty tuple means no LoRA.
+    lora_int_ids: tuple[int, ...] = ()
+    lora_scales: tuple[float, ...] = ()
 
 
 @dataclass

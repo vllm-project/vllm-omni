@@ -213,10 +213,10 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
-        # Worker-side cache of (lora_request, lora_scale) per scheduled
+        # Worker-side cache of (lora_requests, lora_scales) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_lora_state: dict[str, tuple[list[LoRARequest] | None, list[float] | None]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -389,6 +389,7 @@ class DiffusionWorker:
             pipeline=self.model_runner.pipeline,
             device=self.device,
             dtype=self.od_config.dtype,
+            max_loras=self.od_config.max_loras,
             max_cached_adapters=self.od_config.max_cpu_loras,
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
@@ -447,9 +448,12 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.set_active_adapters(
+                    req.sampling_params.lora_requests,
+                    req.sampling_params.lora_scales,
+                )
             except Exception as exc:
-                if req.sampling_params.lora_request is not None:
+                if req.sampling_params.lora_requests:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
@@ -477,9 +481,9 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_active_adapters(sp.lora_requests, sp.lora_scales)
             except Exception as exc:
-                if sp.lora_request is not None:
+                if sp.lora_requests:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
@@ -503,11 +507,11 @@ class DiffusionWorker:
         return output
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
-        """Activate the LoRA adapter for the scheduled step batch.
+        """Activate the LoRA adapters for the scheduled step batch.
 
-        Newly scheduled requests register their (lora_request, lora_scale)
+        Newly scheduled requests register their (lora_requests, lora_scales)
         in ``_step_lora_state`` so cached requests can resolve to the same
-        adapter on later ticks. Finished requests are evicted. Batch
+        adapters on later ticks. Finished requests are evicted. Batch
         homogeneity is enforced by the scheduler via ``StepBatchSamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
@@ -517,25 +521,25 @@ class DiffusionWorker:
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
             self._step_lora_state[new_req.request_id] = (
-                sampling.lora_request,
-                sampling.lora_scale,
+                sampling.lora_requests,
+                sampling.lora_scales,
             )
 
         if self.lora_manager is None:
             return
 
-        lora_request: LoRARequest | None = None
-        lora_scale = 1.0
+        lora_requests: list[LoRARequest] | None = None
+        lora_scales: list[float] | None = None
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
-                lora_request, lora_scale = entry
+                lora_requests, lora_scales = entry
                 break
 
         try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            self.lora_manager.set_active_adapters(lora_requests, lora_scales)
         except Exception as exc:
-            if lora_request is not None:
+            if lora_requests:
                 raise
             logger.warning("LoRA activation skipped: %s", exc)
 

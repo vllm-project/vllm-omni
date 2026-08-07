@@ -16,25 +16,24 @@ class FakeLinearBase(LinearBase):
 
 
 class DummyBaseLayerWithLoRA(torch.nn.Module):
-    """Fake LoRA wrapper that records set/reset/create calls."""
+    """Fake LoRA wrapper that records set/reset/create calls per slot."""
 
     def __init__(self, base_layer: torch.nn.Module):
         super().__init__()
         self.base_layer = base_layer
 
         self.set_calls: list[
-            tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+            tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
-        self.reset_calls: int = 0
+        self.reset_calls: list[int] = []
         self.create_calls: int = 0
+        self._n_active_adapters: int = 0
 
     def set_lora(self, index: int, lora_a, lora_b):
-        assert index == 0
-        self.set_calls.append((lora_a, lora_b))
+        self.set_calls.append((index, lora_a, lora_b))
 
     def reset_lora(self, index: int):
-        assert index == 0
-        self.reset_calls += 1
+        self.reset_calls.append(index)
 
     def create_lora_weights(self, max_loras, lora_config, model_config):
         self.create_calls += 1

@@ -38,6 +38,7 @@ class DiffusionLoRAManager:
 
     Reuses vLLM's LoRA infrastructure, adapted for diffusion pipelines.
     Uses LRU cache management similar to LRUCacheLoRAModelManager.
+    Supports multi-LoRA composition: multiple adapters active simultaneously.
     """
 
     # Valid max allowed ranks for LoRA in vLLM
@@ -48,6 +49,7 @@ class DiffusionLoRAManager:
         pipeline: nn.Module,
         device: torch.device,
         dtype: torch.dtype,
+        max_loras: int = 1,
         max_cached_adapters: int = 1,
         lora_path: str | None = None,
         lora_scale: float = 1.0,
@@ -56,6 +58,8 @@ class DiffusionLoRAManager:
         Initialize the DiffusionLoRAManager.
 
         Args:
+            max_loras: Maximum number of LoRA adapters that can be composed
+                (active simultaneously) per request. Controls GPU buffer slot count.
             max_cached_adapters: Maximum number of LoRA adapters to keep in the
                 CPU-side cache (LRU). This mirrors vLLM's `max_cpu_loras` and is
                 exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
@@ -63,6 +67,7 @@ class DiffusionLoRAManager:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        self.max_loras = max_loras
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -79,8 +84,9 @@ class DiffusionLoRAManager:
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras
         self._registered_adapters: dict[int, LoRAModel] = {}  # adapter_id -> LoRAModel
-        self._active_adapter_id: int | None = None
-        self._adapter_scales: dict[int, float] = {}  # adapter_id -> external scale
+        # Currently active adapter ids (ordered) and their scales
+        self._active_adapter_ids: list[int] = []
+        self._active_adapter_scales: list[float] = []
 
         # LRU cache tracking (adapter_id -> last_used_time)
         self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
@@ -94,9 +100,11 @@ class DiffusionLoRAManager:
         self._max_lora_rank: int = 0
 
         logger.info(
-            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
+            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, "
+            "max_loras=%d, max_cached_adapters=%d, static_lora_path=%s",
             device,
             dtype,
+            max_loras,
             max_cached_adapters,
             lora_path,
         )
@@ -108,7 +116,7 @@ class DiffusionLoRAManager:
                 lora_int_id=stable_lora_int_id(lora_path),
                 lora_path=lora_path,
             )
-            self.set_active_adapter(init_request, lora_scale)
+            self.set_active_adapters([init_request], [lora_scale])
 
     def _compute_supported_lora_modules(self) -> set[str]:
         """Compute supported LoRA module suffixes for this pipeline.
@@ -210,65 +218,86 @@ class DiffusionLoRAManager:
             return None
         return sub_suffixes
 
-    def set_active_adapter(self, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> None:
-        """Set the active LoRA adapter for the pipeline.
+    def set_active_adapters(
+        self,
+        lora_requests: list[LoRARequest],
+        lora_scales: list[float],
+    ) -> None:
+        """Set the active LoRA adapters for the pipeline.
 
         Args:
-            lora_request: The LoRA request, or None to deactivate all adapters.
-            lora_scale: The external scale for the LoRA adapter.
+            lora_requests: List of LoRA requests. Empty list deactivates all.
+            lora_scales: Per-adapter scales, must match length of lora_requests.
+        """
+        if not lora_requests:
+            logger.debug("No lora_requests provided, deactivating all LoRA adapters")
+            self._deactivate_all_adapters()
+            return
+
+        if len(lora_requests) != len(lora_scales):
+            raise ValueError(
+                f"lora_requests ({len(lora_requests)}) and lora_scales ({len(lora_scales)}) must have the same length"
+            )
+
+        # Filter out zero-scale adapters before enforcing max_loras so that
+        # [a, b] with scales [1.0, 0.0] only consumes one slot. A zero-scale
+        # adapter is treated as omitted from this activation; it is not kept
+        # registered-but-inactive.
+        active_requests: list[LoRARequest] = []
+        active_scales: list[float] = []
+        for req, scale in zip(lora_requests, lora_scales):
+            if math.isclose(0.0, scale):
+                logger.debug("Skipping adapter %s with scale 0", req.lora_name)
+                continue
+            active_requests.append(req)
+            active_scales.append(scale)
+
+        if len(active_requests) > self.max_loras:
+            raise ValueError(f"Requested {len(active_requests)} adapters but max_loras={self.max_loras}")
+
+        if not active_requests:
+            logger.warning("All adapters have scale 0; deactivating all LoRA adapters")
+            self._deactivate_all_adapters()
+            return
+
+        # Ensure all adapters are registered (loaded into cache)
+        adapter_ids: list[int] = []
+        for req in active_requests:
+            adapter_id = req.lora_int_id
+            if adapter_id not in self._registered_adapters:
+                logger.info("Loading new adapter: id=%d, name=%s", adapter_id, req.lora_name)
+                self.add_adapter(req)
+            else:
+                self._touch_adapter_info(adapter_id)
+            adapter_ids.append(adapter_id)
+
+        self._activate_adapters(adapter_ids, active_scales)
+
+    def set_active_adapter(
+        self,
+        lora_request: LoRARequest | None,
+        lora_scale: float = 1.0,
+    ) -> None:
+        """Singular compatibility wrapper around set_active_adapters().
+
+        Equivalent to set_active_adapters([lora_request], [lora_scale]).
+        Passing lora_request=None deactivates all adapters. Like the plural
+        form, each call fully replaces the active adapter set (not append).
         """
         if lora_request is None:
-            if self._active_adapter_id is None:
-                logger.debug("No lora_request provided and adapters are already inactive")
-                return
-            logger.debug("No lora_request provided, deactivating all LoRA adapters")
-            self._deactivate_all_adapters()
-            return
-        elif math.isclose(0.0, lora_scale):
-            if self._active_adapter_id is None:
-                logger.debug("Received LoRA scale 0 with adapters already inactive")
-                return
-            logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
-            self._deactivate_all_adapters()
-            return
-
-        adapter_id = lora_request.lora_int_id
-        logger.debug(
-            "Setting active adapter: id=%d, name=%s, path=%s, scale=%.2f, cache_size=%d/%d",
-            adapter_id,
-            lora_request.lora_name,
-            lora_request.lora_path,
-            lora_scale,
-            len(self._registered_adapters),
-            self.max_cached_adapters,
-        )
-        if adapter_id not in self._registered_adapters:
-            logger.info("Loading new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
-            # Add the adapter + add to the cache
-            self.add_adapter(lora_request)
+            self.set_active_adapters([], [])
         else:
-            # Just touch the cache access order
-            self._touch_adapter_info(adapter_id)
-
-        self._activate_adapter(adapter_id, lora_scale)
+            self.set_active_adapters([lora_request], [lora_scale])
 
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
         self._adapter_access_order[adapter_id] = time.time()
         self._adapter_access_order.move_to_end(adapter_id)
 
-    def _update_adapter_scale(self, adapter_id: int, lora_scale: float):
-        """Update the adapter scale for a given adapter ID. To avoid potential
-        issues with using Floats as keys, for now, we round float values to
-        3 decimal points.
-        """
-        scale = DiffusionLoRAManager._get_rounded_scale(lora_scale)
-        self._adapter_scales[adapter_id] = scale
-
     @staticmethod
     def _get_rounded_scale(lora_scale: float):
-        """Normalizes a lora scale for use as a key in the _adapter_scales
-        dict; for now we just round scales to 3 decimal places.
+        """Normalizes a lora scale for use as comparison;
+        for now we just round scales to 3 decimal places.
         """
         return round(lora_scale, 3)
 
@@ -337,6 +366,16 @@ class DiffusionLoRAManager:
             return ["0", "1"]
         return []
 
+    def _make_lora_config(self) -> LoRAConfig:
+        """Build a LoRAConfig using current manager state."""
+        return LoRAConfig(
+            max_lora_rank=self._max_lora_rank,
+            max_loras=self.max_loras,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
         self._ensure_max_lora_rank(peft_helper.r)
 
@@ -357,14 +396,7 @@ class DiffusionLoRAManager:
                 return True
             return _match_target_modules(module_name, target_modules_list)
 
-        # dummy lora config
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._make_lora_config()
 
         # Default denoising components, declared DiT components, and any a
         # pipeline opts into via ``_lora_components``.
@@ -426,7 +458,7 @@ class DiffusionLoRAManager:
             for module_name, full_module_name, module, packed_modules_list in pending_replacements:
                 lora_layer = from_layer_diffusion(
                     layer=module,
-                    max_loras=1,
+                    max_loras=self.max_loras,
                     lora_config=lora_config,
                     packed_modules_list=packed_modules_list,
                     model_config=None,
@@ -442,7 +474,7 @@ class DiffusionLoRAManager:
 
         We allocate per-layer LoRA buffers once when we first replace layers.
         If a later adapter has a larger rank, we need to reinitialize those
-        buffers and re-apply the currently active adapter.
+        buffers and re-apply the currently active adapters.
         """
         if min_rank <= self._max_lora_rank:
             return
@@ -455,24 +487,19 @@ class DiffusionLoRAManager:
         if not self._lora_modules:
             return
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._make_lora_config()
 
         # Recreate per-layer buffers with the new maximum rank.
         for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+            lora_layer.create_lora_weights(max_loras=self.max_loras, lora_config=lora_config, model_config=None)
 
-        # Re-apply active adapter if needed (buffers were reset).
-        if self._active_adapter_id is not None:
-            active_id = self._active_adapter_id
-            active_scale = self._adapter_scales[active_id]
-            self._active_adapter_id = None
-            self._activate_adapter(active_id, active_scale)
+        # Re-apply active adapters if needed (buffers were reset).
+        if self._active_adapter_ids:
+            saved_ids = list(self._active_adapter_ids)
+            saved_scales = list(self._active_adapter_scales)
+            self._active_adapter_ids = []
+            self._active_adapter_scales = []
+            self._activate_adapters(saved_ids, saved_scales)
 
     @classmethod
     def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
@@ -510,137 +537,169 @@ class DiffusionLoRAManager:
         module_suffix = full_module_name.split(".")[-1]
         return lora_model.get_lora(module_suffix)
 
-    def _is_active_at_scale(self, adapter_id: int, scale: float) -> bool:
-        """True if the adapter_id is active and the current scale matches."""
-        rounded_scale = DiffusionLoRAManager._get_rounded_scale(scale)
-        is_active = self._active_adapter_id == adapter_id
-        matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
-        return is_active and matches_scale
+    def _are_active_at_scales(self, adapter_ids: list[int], scales: list[float]) -> bool:
+        """True if the given adapters are already active at the given scales."""
+        # TODO: order-sensitive — re-requesting the same adapter set in a
+        # different order forces full re-activation even though LoRA deltas
+        # compose via addition (commutative). Consider comparing as a
+        # (id, scale) multiset to skip redundant work.
+        if len(adapter_ids) != len(self._active_adapter_ids):
+            return False
+        for aid, scale, active_aid, active_scale in zip(
+            adapter_ids, scales, self._active_adapter_ids, self._active_adapter_scales
+        ):
+            if aid != active_aid:
+                return False
+            if self._get_rounded_scale(scale) != self._get_rounded_scale(active_scale):
+                return False
+        return True
 
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
-            return
+    def _set_lora_for_layer(
+        self,
+        lora_layer: BaseLayerWithLoRA,
+        full_module_name: str,
+        slot_index: int,
+        lora_model: LoRAModel,
+        scale: float,
+    ) -> None:
+        """Set LoRA weights for a single adapter slot on a single layer.
 
-        logger.info("Activating adapter: id=%d", adapter_id)
-        lora_model = self._registered_adapters[adapter_id]
+        Dispatches across four shapes: (1) adapter has no entry for this
+        module — fall through to per-slice suffix lookup for packed layers,
+        otherwise reset the slot; (2) adapter entry is ``PackedLoRALayerWeights``
+        with per-slice tensors already separated; (3) adapter entry is a single
+        fused tensor but the target layer is multi-slice, so split ``lora_b``
+        along ``output_slices``; (4) single-slice fused — apply directly.
+        """
+        lora_weights = self._get_lora_weights(lora_model, full_module_name)
 
-        # activate weights in each LoRA layer
-        for full_module_name, lora_layer in self._lora_modules.items():
-            lora_weights = self._get_lora_weights(lora_model, full_module_name)
-
-            if lora_weights is None:
-                n_slices = getattr(lora_layer, "n_slices", 1)
-                if n_slices > 1:
-                    prefix, _, packed_suffix = full_module_name.rpartition(".")
-                    sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
-                    if sub_suffixes is None:
-                        lora_layer.reset_lora(0)
-                        continue
-
-                    sub_loras: list[LoRALayerWeights | None] = []
-                    any_found = False
-                    for sub_suffix in sub_suffixes:
-                        sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
-                        sub_lora = self._get_lora_weights(lora_model, sub_full_name)
-                        if sub_lora is not None:
-                            any_found = True
-                            # Packed layers expect plain (non-packed) subloras.
-                            if isinstance(sub_lora, PackedLoRALayerWeights):
-                                sub_lora = None
-                        sub_loras.append(sub_lora if isinstance(sub_lora, LoRALayerWeights) else None)
-
-                    if not any_found:
-                        lora_layer.reset_lora(0)
-                        continue
-
-                    lora_a_list: list[torch.Tensor | None] = []
-                    lora_b_list: list[torch.Tensor | None] = []
-                    for sub_lora in sub_loras:
-                        if sub_lora is None:
-                            lora_a_list.append(None)
-                            lora_b_list.append(None)
-                            continue
-                        lora_a_list.append(sub_lora.lora_a)
-                        lora_b_list.append(sub_lora.lora_b * scale)
-
-                    lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
-                    logger.debug(
-                        "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
-                        full_module_name,
-                        sub_suffixes,
-                        scale,
-                    )
-                else:
-                    lora_layer.reset_lora(0)
-                continue
-
-            # Packed LoRA weights already provide per-slice tensors.
-            if isinstance(lora_weights, PackedLoRALayerWeights):
-                lora_a_list = lora_weights.lora_a
-                lora_b_list = [
-                    None if b is None else b * scale  # type: ignore[operator]
-                    for b in lora_weights.lora_b
-                ]
-                lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
-                logger.debug(
-                    "Activated packed LoRA for %s (scale=%.2f)",
-                    full_module_name,
-                    scale,
-                )
-                continue
-
-            # Fused (non-packed) weights: if the layer is multi-slice, split B.
+        # Case 1: no direct entry. Multi-slice layers may still match via the
+        # unpacked sub-suffixes (e.g. ``q_proj``/``k_proj``/``v_proj`` when
+        # target is a fused ``qkv_proj``); single-slice layers just miss.
+        if lora_weights is None:
             n_slices = getattr(lora_layer, "n_slices", 1)
             if n_slices > 1:
-                output_slices = getattr(lora_layer, "output_slices", None)
-                if output_slices is None:
-                    lora_layer.reset_lora(0)
-                    continue
+                prefix, _, packed_suffix = full_module_name.rpartition(".")
+                sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
+                if sub_suffixes is None:
+                    lora_layer.reset_lora(slot_index)
+                    return
 
-                total = sum(output_slices)
-                if lora_weights.lora_b.shape[0] != total:
-                    logger.warning(
-                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
-                        full_module_name,
-                        lora_weights.lora_b.shape[0],
-                        total,
-                    )
-                    lora_layer.reset_lora(0)
-                    continue
+                # Gather per-slice weights; each slice may independently miss.
+                sub_loras: list[LoRALayerWeights | None] = []
+                any_found = False
+                for sub_suffix in sub_suffixes:
+                    sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                    sub_lora = self._get_lora_weights(lora_model, sub_full_name)
+                    if sub_lora is not None:
+                        any_found = True
+                        # Packed layers expect plain (non-packed) subloras.
+                        if isinstance(sub_lora, PackedLoRALayerWeights):
+                            sub_lora = None
+                    sub_loras.append(sub_lora if isinstance(sub_lora, LoRALayerWeights) else None)
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
-                lora_a_list = [lora_weights.lora_a] * n_slices
-                lora_b_list = [b * scale for b in b_splits]
-                lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
-                logger.debug(
-                    "Activated fused LoRA for packed layer %s (scale=%.2f)",
+                if not any_found:
+                    lora_layer.reset_lora(slot_index)
+                    return
+
+                # Build per-slice A/B lists; None slots leave that slice at zero.
+                lora_a_list: list[torch.Tensor | None] = []
+                lora_b_list: list[torch.Tensor | None] = []
+                for sub_lora in sub_loras:
+                    if sub_lora is None:
+                        lora_a_list.append(None)
+                        lora_b_list.append(None)
+                        continue
+                    lora_a_list.append(sub_lora.lora_a)
+                    lora_b_list.append(sub_lora.lora_b * scale)
+
+                lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
+                return
+            else:
+                # Single-slice layer with no adapter entry: this slot is inactive.
+                lora_layer.reset_lora(slot_index)
+                return
+
+        # Case 2: packed LoRA weights already provide per-slice tensors.
+        if isinstance(lora_weights, PackedLoRALayerWeights):
+            lora_a_list = lora_weights.lora_a
+            lora_b_list = [
+                None if b is None else b * scale  # type: ignore[operator]
+                for b in lora_weights.lora_b
+            ]
+            lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
+            return
+
+        # Case 3: fused (non-packed) weights targeting a multi-slice layer.
+        # Split B along ``output_slices`` so each slice receives its portion;
+        # A is shared across slices (standard PEFT fused-QKV convention).
+        n_slices = getattr(lora_layer, "n_slices", 1)
+        if n_slices > 1:
+            output_slices = getattr(lora_layer, "output_slices", None)
+            if output_slices is None:
+                lora_layer.reset_lora(slot_index)
+                return
+
+            total = sum(output_slices)
+            if lora_weights.lora_b.shape[0] != total:
+                # Shape mismatch means we can't safely split; skip this layer
+                # rather than silently produce garbage outputs.
+                logger.warning(
+                    "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
                     full_module_name,
-                    scale,
+                    lora_weights.lora_b.shape[0],
+                    total,
                 )
-                continue
+                lora_layer.reset_lora(slot_index)
+                return
 
-            scaled_lora_b = lora_weights.lora_b * scale
-            lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
-            logger.debug(
-                "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
-                full_module_name,
-                lora_weights.lora_a.shape,
-                lora_weights.lora_b.shape,
-                scale,
-            )
+            b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
+            lora_a_list = [lora_weights.lora_a] * n_slices
+            lora_b_list = [b * scale for b in b_splits]
+            lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
+            return
 
-        self._active_adapter_id = adapter_id
-        self._update_adapter_scale(adapter_id, scale)
+        # Case 4: single-slice fused — apply A and scaled B directly.
+        scaled_lora_b = lora_weights.lora_b * scale
+        lora_layer.set_lora(index=slot_index, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+
+    def _activate_adapters(self, adapter_ids: list[int], scales: list[float]) -> None:
+        """Activate multiple adapters simultaneously, each in its own slot."""
+        if self._are_active_at_scales(adapter_ids, scales):
+            logger.debug("Adapters already active at requested scales, skipping")
+            return
+
+        logger.info("Activating %d adapter(s): ids=%s", len(adapter_ids), adapter_ids)
+
+        for full_module_name, lora_layer in self._lora_modules.items():
+            # Set each active adapter into its slot
+            for slot_index, (adapter_id, scale) in enumerate(zip(adapter_ids, scales)):
+                lora_model = self._registered_adapters[adapter_id]
+                self._set_lora_for_layer(lora_layer, full_module_name, slot_index, lora_model, scale)
+
+            # Reset unused slots
+            for slot_index in range(len(adapter_ids), self.max_loras):
+                lora_layer.reset_lora(slot_index)
+
+        # Tell each layer how many adapters are active
+        n_active = len(adapter_ids)
+        for lora_layer in self._lora_modules.values():
+            lora_layer._n_active_adapters = n_active  # type: ignore[attr-defined]
+
+        self._active_adapter_ids = list(adapter_ids)
+        self._active_adapter_scales = list(scales)
 
     def _deactivate_all_adapters(self) -> None:
-        if self._active_adapter_id is None:
+        if not self._active_adapter_ids:
             logger.debug("All adapters already inactive")
             return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
-            lora_layer.reset_lora(0)
-        self._active_adapter_id = None
+            for slot_index in range(self.max_loras):
+                lora_layer.reset_lora(slot_index)
+            lora_layer._n_active_adapters = 0  # type: ignore[attr-defined]
+        self._active_adapter_ids = []
+        self._active_adapter_scales = []
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:
@@ -703,11 +762,10 @@ class DiffusionLoRAManager:
             return False
 
         logger.info("Removing adapter: id=%d", adapter_id)
-        if self._active_adapter_id == adapter_id:
+        if adapter_id in self._active_adapter_ids:
             self._deactivate_all_adapters()
 
         del self._registered_adapters[adapter_id]
-        self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
         logger.debug(

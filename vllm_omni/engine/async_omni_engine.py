@@ -1058,6 +1058,7 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
+            "max_loras": kwargs.get("max_loras", 1),
             "quantization_config": kwargs.get("quantization_config", None),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
@@ -1244,6 +1245,10 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                max_loras = kwargs.get("max_loras")
+                if max_loras is not None:
+                    if not hasattr(cfg.engine_args, "max_loras") or cfg.engine_args.max_loras is None:
+                        cfg.engine_args.max_loras = max_loras
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None

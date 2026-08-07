@@ -724,10 +724,12 @@ class TestRunner:
 
 class _RecordingLoRAManager:
     def __init__(self) -> None:
-        self.calls: list[tuple[object | None, float]] = []
+        self.calls: list[tuple[list, list]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
-        self.calls.append((adapter, scale))
+    def set_active_adapters(self, adapters, scales) -> None:
+        adapters = list(adapters) if adapters is not None else []
+        scales = list(scales) if scales is not None else []
+        self.calls.append((adapters, scales))
 
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):
@@ -760,15 +762,15 @@ class TestWorker:
 
         DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
-        assert manager.calls == [(None, 1.0)]
+        assert manager.calls == [([], [])]
 
     def test_activates_lora_for_step_requests(self):
         from vllm_omni.lora.request import LoRARequest
 
         lora_request = LoRARequest(lora_name="adapter", lora_int_id=7, lora_path="/tmp/lora")
         request = _make_engine_request("req-1")
-        request.sampling_params.lora_request = lora_request
-        request.sampling_params.lora_scale = 0.75
+        request.sampling_params.lora_requests = [lora_request]
+        request.sampling_params.lora_scales = [0.75]
 
         manager = _RecordingLoRAManager()
         worker = _make_step_worker(lora_manager=manager)
@@ -776,15 +778,15 @@ class TestWorker:
 
         DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
-        assert manager.calls == [(lora_request, 0.75)]
+        assert manager.calls == [([lora_request], [0.75])]
 
     def test_recovers_lora_for_cached_step_requests(self):
         from vllm_omni.lora.request import LoRARequest
 
         lora_request = LoRARequest(lora_name="adapter", lora_int_id=11, lora_path="/tmp/lora")
         request = _make_engine_request("req-1")
-        request.sampling_params.lora_request = lora_request
-        request.sampling_params.lora_scale = 0.5
+        request.sampling_params.lora_requests = [lora_request]
+        request.sampling_params.lora_scales = [0.5]
 
         manager = _RecordingLoRAManager()
         worker = _make_step_worker(lora_manager=manager)
@@ -794,7 +796,7 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, first)
         DiffusionWorker.execute_stepwise(worker, second)
 
-        assert manager.calls == [(lora_request, 0.5), (lora_request, 0.5)]
+        assert manager.calls == [([lora_request], [0.5]), ([lora_request], [0.5])]
 
     def test_activates_single_lora_for_homogeneous_batch(self):
         """Multiple requests sharing the same LoRA → exactly one activation,
@@ -805,8 +807,8 @@ class TestWorker:
         reqs = []
         for rid in ("req-1", "req-2", "req-3"):
             r = _make_engine_request(rid)
-            r.sampling_params.lora_request = lora_request
-            r.sampling_params.lora_scale = 0.6
+            r.sampling_params.lora_requests = [lora_request]
+            r.sampling_params.lora_scales = [0.6]
             reqs.append(r)
 
         manager = _RecordingLoRAManager()
@@ -815,19 +817,21 @@ class TestWorker:
 
         DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
-        assert manager.calls == [(lora_request, 0.6)]
+        assert manager.calls == [([lora_request], [0.6])]
         assert set(worker._step_lora_state) == {"req-1", "req-2", "req-3"}
         for entry in worker._step_lora_state.values():
-            assert entry == (lora_request, 0.6)
+            assert entry == ([lora_request], [0.6])
 
     def test_evicts_step_lora_state_for_finished_requests(self):
         from vllm_omni.lora.request import LoRARequest
 
         lora_request = LoRARequest(lora_name="adapter", lora_int_id=3, lora_path="/tmp/lora")
         finishing = _make_engine_request("req-1")
-        finishing.sampling_params.lora_request = lora_request
+        finishing.sampling_params.lora_requests = [lora_request]
+        finishing.sampling_params.lora_scales = [1.0]
         next_request = _make_engine_request("req-2")
-        next_request.sampling_params.lora_request = lora_request
+        next_request.sampling_params.lora_requests = [lora_request]
+        next_request.sampling_params.lora_scales = [1.0]
 
         worker = _make_step_worker(lora_manager=_RecordingLoRAManager())
         first = _make_scheduler_output(finishing, request_id="req-1")
@@ -843,7 +847,7 @@ class TestWorker:
 
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
-        assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+        assert worker._step_lora_state == {"req-2": ([lora_request], [1.0])}
 
 
 @pytest.mark.cpu

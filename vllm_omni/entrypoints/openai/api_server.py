@@ -143,7 +143,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
     decode_audio_url,
@@ -1854,7 +1854,7 @@ async def generate_images(
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_requests(request.lora)
                 extra_body["lora"] = request.lora
             if request.bot_task is not None:
                 extra_body["bot_task"] = request.bot_task
@@ -1900,9 +1900,10 @@ async def generate_images(
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_reqs, lora_scales = _parse_lora_requests(request.lora)
+        if lora_reqs:
+            gen_params.lora_requests = lora_reqs
+            gen_params.lora_scales = lora_scales
 
         # Parse and add size if provided
         width, height = None, None
@@ -2135,9 +2136,10 @@ async def edit_images(
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_reqs, lora_scales = _parse_lora_requests(lora_dict)
+        if lora_reqs:
+            gen_params.lora_requests = lora_reqs
+            gen_params.lora_scales = lora_scales
         # 3.2 Validate resolution if provided
         if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
             raise HTTPException(
@@ -2271,7 +2273,7 @@ async def edit_images(
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)
-                _parse_lora_request(lora_dict)
+                _parse_lora_requests(lora_dict)
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task
@@ -2438,15 +2440,15 @@ def _get_lora_from_json_str(lora_body):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid LoRA JSON string")
 
-    if not isinstance(lora_dict, dict):
-        raise HTTPException(status_code=400, detail="LoRA must be a JSON object")
+    if not isinstance(lora_dict, (dict, list)):
+        raise HTTPException(status_code=400, detail="LoRA must be a JSON object or array of objects")
 
     return lora_dict
 
 
-def _parse_lora_request(lora_body: dict[str, Any]):
+def _parse_lora_requests(lora_body: dict[str, Any] | list[dict[str, Any]] | None):
     try:
-        return parse_lora_request(lora_body)
+        return parse_lora_requests(lora_body)
     except ValueError as e:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,

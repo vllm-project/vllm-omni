@@ -169,12 +169,14 @@ class TestGetStepBatchSamplingParamsKey:
 
         sp = OmniDiffusionSamplingParams(num_inference_steps=2)
         if lora_int_id is not None:
-            sp.lora_request = LoRARequest(
-                lora_name=f"adapter-{lora_int_id}",
-                lora_int_id=lora_int_id,
-                lora_path=f"/tmp/lora-{lora_int_id}",
-            )
-        sp.lora_scale = lora_scale
+            sp.lora_requests = [
+                LoRARequest(
+                    lora_name=f"adapter-{lora_int_id}",
+                    lora_int_id=lora_int_id,
+                    lora_path=f"/tmp/lora-{lora_int_id}",
+                )
+            ]
+            sp.lora_scales = [lora_scale]
         return OmniDiffusionRequest(
             prompt="prompt",
             sampling_params=sp,
@@ -941,8 +943,8 @@ class TestStepScheduler:
 
         def _with_lora(req_id: str) -> OmniDiffusionRequest:
             sp = OmniDiffusionSamplingParams(num_inference_steps=4)
-            sp.lora_request = lora
-            sp.lora_scale = 0.5
+            sp.lora_requests = [lora]
+            sp.lora_scales = [0.5]
             return _make_step_request(req_id, sampling_params=sp)
 
         req_a = scheduler.add_request(_with_lora("a"))
@@ -967,7 +969,8 @@ class TestStepScheduler:
 
         def _build(req_id: str, lora: LoRARequest) -> OmniDiffusionRequest:
             sp = OmniDiffusionSamplingParams(num_inference_steps=2)
-            sp.lora_request = lora
+            sp.lora_requests = [lora]
+            sp.lora_scales = [1.0]
             return _make_step_request(req_id, sampling_params=sp)
 
         req_a1 = scheduler.add_request(_build("a1", lora_a))
@@ -1003,8 +1006,8 @@ class TestStepScheduler:
 
         def _build(req_id: str, scale: float) -> OmniDiffusionRequest:
             sp = OmniDiffusionSamplingParams(num_inference_steps=2)
-            sp.lora_request = lora
-            sp.lora_scale = scale
+            sp.lora_requests = [lora]
+            sp.lora_scales = [scale]
             return _make_step_request(req_id, sampling_params=sp)
 
         req_full = scheduler.add_request(_build("full", 1.0))
@@ -1027,7 +1030,8 @@ class TestStepScheduler:
         lora = LoRARequest(lora_name="adapter", lora_int_id=3, lora_path="/tmp/lora")
 
         sp_with = OmniDiffusionSamplingParams(num_inference_steps=2)
-        sp_with.lora_request = lora
+        sp_with.lora_requests = [lora]
+        sp_with.lora_scales = [1.0]
         req_with = scheduler.add_request(_make_step_request("with", sampling_params=sp_with))
         req_without = scheduler.add_request(_make_step_request("without", num_inference_steps=2))
 

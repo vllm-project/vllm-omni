@@ -119,8 +119,9 @@ def test_krea2_vae_patch_parallel(omni_runner_handler: OmniRunnerHandler) -> Non
 
 def _generate(handler: OmniRunnerHandler, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> np.ndarray:
     sp = _sampling()
-    sp.lora_request = lora_request
-    sp.lora_scale = lora_scale
+    if lora_request is not None:
+        sp.lora_requests = [lora_request]
+        sp.lora_scales = [lora_scale]
     resp = handler.send_diffusion_request({"model": MODEL, "prompt": LORA_PROMPT, "sampling_params": sp})
     return np.asarray(resp.images[0].convert("RGB"), dtype=np.int16)
 
@@ -132,7 +133,7 @@ def test_krea2_lora(omni_runner_handler: OmniRunnerHandler) -> None:
 
     Uses ``LORA`` (a vLLM-Omni-compatible PEFT repackaging of ``krea/Krea-2-LoRA-darkbrush``,
     264 modules matched via the ReplicatedLinear projections) passed per-request through
-    ``OmniDiffusionSamplingParams.lora_request`` / ``lora_scale`` — the same fields the
+    ``OmniDiffusionSamplingParams.lora_requests`` / ``lora_scales`` — the same fields the
     diffusion LoRA manager reads to activate/deactivate the adapter.
     """
     lora_request = LoRARequest(lora_name="darkbrush", lora_int_id=stable_lora_int_id(LORA), lora_path=LORA)

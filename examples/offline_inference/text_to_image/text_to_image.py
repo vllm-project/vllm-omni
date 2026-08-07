@@ -4,7 +4,10 @@
 import argparse
 import functools
 import json
+import re
+import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
+        "--prompts",
+        nargs="+",
+        default=None,
+        help="Multiple prompts for batched generation. Overrides --prompt when set. "
+        "Each prompt is dispatched as part of a single omni.generate() batch call.",
+    )
+    parser.add_argument(
         "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
@@ -106,7 +116,16 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=str,
         default="qwen_image_output.png",
-        help="Path to save the generated image (PNG).",
+        help="Path to save the generated image (PNG). Used only in single-output mode "
+        "(one prompt, one LoRA combo, one image). Ignored when --output-dir is set.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for batch/XYZ output. Required when there are multiple prompts "
+        "or --axis is set. Files are saved as cell_x{x}_y{y}_z{z}.png; with --axis a "
+        "grid.png (or grid_z{k}.png per Z value) is also written.",
     )
     parser.add_argument(
         "--num-images-per-prompt",
@@ -248,13 +267,48 @@ def parse_args() -> argparse.Namespace:
         "--lora-path",
         type=str,
         default=None,
-        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
+        help="Path to LoRA adapter folder (PEFT format). Init-time static load: the adapter is "
+        "pre-loaded into the engine cache and applied to every request. Mutually exclusive with --lora-paths.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for LoRA weights (default: 1.0).",
+        help="Scale factor for --lora-path (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-paths",
+        nargs="+",
+        default=None,
+        help="Multiple LoRA adapter folders (PEFT format) for per-request composition. "
+        "Each request applies all listed adapters with the matching --lora-scales. "
+        "Mutually exclusive with --lora-path.",
+    )
+    parser.add_argument(
+        "--lora-scales",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Per-adapter scales for --lora-paths. Length must match --lora-paths; "
+        "defaults to 1.0 per adapter when omitted.",
+    )
+    parser.add_argument(
+        "--max-loras",
+        type=int,
+        default=None,
+        help="Maximum number of LoRA slots active simultaneously. Defaults to max(len(--lora-paths), 1).",
+    )
+    parser.add_argument(
+        "--axis",
+        action="append",
+        default=None,
+        metavar="SPEC",
+        help="XYZ axis. Repeat up to 3 times. Spec form: NAME=TYPE:v1|v2|v3 where "
+        "NAME ∈ {x,y,z} and TYPE ∈ {prompt, lora_scale[i], guidance_scale, "
+        "num_inference_steps, seed}. The Cartesian product of X×Y×Z defines cells: "
+        "X is columns, Y is rows, Z produces one grid per value (grid_z{k}.png). "
+        'Example: --axis "x=lora_scale[0]:0|1" --axis "y=lora_scale[1]:0|1" '
+        '--axis "z=prompt:a girl|a cat" yields a 2×2 grid per prompt.',
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -351,10 +405,230 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_prompts(args: argparse.Namespace) -> list[str]:
+    """Return the list of prompts to run. Prefers --prompts; falls back to --prompt."""
+    if args.prompts:
+        return list(args.prompts)
+    return [args.prompt]
+
+
+def _build_lora_request(path: str) -> LoRARequest:
+    return LoRARequest(
+        lora_name=Path(path).stem,
+        lora_int_id=stable_lora_int_id(path),
+        lora_path=path,
+    )
+
+
+def _resolve_lora(
+    args: argparse.Namespace,
+) -> tuple[list[LoRARequest], list[float], bool]:
+    """Return (lora_requests, lora_scales, is_per_request) for the default cell.
+
+    ``is_per_request`` is True when --lora-paths is given (per-request LoRA),
+    False when --lora-path (init-time) or no LoRA is used.
+    """
+    if args.lora_path and args.lora_paths:
+        raise ValueError("--lora-path and --lora-paths are mutually exclusive.")
+
+    if not args.lora_paths:
+        return [], [], False
+
+    lora_paths = list(args.lora_paths)
+    lora_scales = list(args.lora_scales) if args.lora_scales is not None else [1.0] * len(lora_paths)
+    if len(lora_paths) != len(lora_scales):
+        raise ValueError(
+            f"--lora-paths ({len(lora_paths)}) and --lora-scales ({len(lora_scales)}) must have the same length."
+        )
+    requests = [_build_lora_request(p) for p in lora_paths]
+    return requests, lora_scales, True
+
+
+_LORA_SCALE_TYPE_RE = re.compile(r"^lora_scale\[(\d+)\]$")
+_AXIS_TYPES = {"prompt", "guidance_scale", "num_inference_steps", "seed"}
+
+
+@dataclass
+class _Axis:
+    name: str  # 'x' | 'y' | 'z'
+    type: str
+    values: list[str]  # raw strings; converted per type when applied
+
+
+def _parse_axes(specs: list[str] | None) -> dict[str, _Axis]:
+    """Parse repeated --axis specs into a dict keyed by axis name."""
+    if not specs:
+        return {}
+    axes: dict[str, _Axis] = {}
+    for spec in specs:
+        name_part, sep, rest = spec.partition("=")
+        if not sep:
+            raise ValueError(f"--axis spec missing '=': {spec!r}")
+        type_part, sep, values_part = rest.partition(":")
+        if not sep:
+            raise ValueError(f"--axis spec missing ':' between type and values: {spec!r}")
+        name = name_part.strip().lower()
+        if name not in ("x", "y", "z"):
+            raise ValueError(f"--axis name must be x, y, or z; got {name!r}")
+        if name in axes:
+            raise ValueError(f"--axis {name} specified twice")
+        atype = type_part.strip()
+        if atype not in _AXIS_TYPES and not _LORA_SCALE_TYPE_RE.match(atype):
+            raise ValueError(
+                f"--axis type {atype!r} unknown. Supported: prompt, lora_scale[i], "
+                f"guidance_scale, num_inference_steps, seed."
+            )
+        values = [v.strip() for v in values_part.split("|") if v.strip()]
+        if not values:
+            raise ValueError(f"--axis {name} has no values: {spec!r}")
+        axes[name] = _Axis(name=name, type=atype, values=values)
+    return axes
+
+
+def _axis_label(axis: _Axis, value: str, lora_names: list[str]) -> str:
+    """Render a short cell-header label. Embeds a newline between name and value
+    so wide labels (e.g. ``lora_chardesign=1.00``) wrap cleanly in the grid
+    margin strips; the grid composer honors explicit newlines verbatim.
+    """
+    if axis.type == "prompt":
+        s = value if len(value) <= 40 else value[:37] + "..."
+        return s
+    m = _LORA_SCALE_TYPE_RE.match(axis.type)
+    if m:
+        idx = int(m.group(1))
+        name = lora_names[idx] if idx < len(lora_names) else f"lora[{idx}]"
+        return f"{name}\n{float(value):.2f}"
+    return f"{axis.type}\n{value}"
+
+
+def _apply_axis(
+    axis: _Axis,
+    raw_value: str,
+    cell: dict,
+    lora_count: int,
+) -> None:
+    """Mutate cell in place by applying a single axis value."""
+    t = axis.type
+    if t == "prompt":
+        cell["prompt"] = raw_value
+        return
+    m = _LORA_SCALE_TYPE_RE.match(t)
+    if m:
+        idx = int(m.group(1))
+        if idx >= lora_count:
+            raise ValueError(f"axis lora_scale[{idx}] but only {lora_count} LoRA(s) provided via --lora-paths")
+        cell["lora_scales"] = list(cell["lora_scales"])
+        cell["lora_scales"][idx] = float(raw_value)
+        return
+    if t == "guidance_scale":
+        cell["guidance_scale"] = float(raw_value)
+        return
+    if t == "num_inference_steps":
+        cell["num_inference_steps"] = int(raw_value)
+        return
+    if t == "seed":
+        cell["seed"] = int(raw_value)
+        return
+    raise ValueError(f"axis type {t!r} not implemented")
+
+
+def _compose_grid(
+    results: dict[tuple[int, int], list[Any]],
+    num_rows: int,
+    num_cols: int,
+    row_labels: list[str] | None = None,
+    col_labels: list[str] | None = None,
+    title: str | None = None,
+) -> Any:
+    """Stitch the first image of each (row, col) cell into a single grid PIL image.
+
+    Optional ``row_labels`` / ``col_labels`` reserve left/top strips with per-row
+    and per-column text. Optional ``title`` reserves a narrow banner on top.
+    """
+    from PIL import Image, ImageDraw
+
+    sample = next(iter(results.values()))[0]
+    cell_w, cell_h = sample.width, sample.height
+
+    col_strip = max(64, cell_h // 10) if col_labels else 0
+    row_strip = max(220, cell_w // 4) if row_labels else 0
+    title_strip = max(48, cell_h // 14) if title else 0
+
+    top = title_strip + col_strip
+    left = row_strip
+
+    grid = Image.new("RGB", (left + cell_w * num_cols, top + cell_h * num_rows), color="white")
+    draw = ImageDraw.Draw(grid)
+
+    font = _load_label_font(max(18, (col_strip or cell_h // 10) // 3))
+    font_row = _load_label_font(max(16, (col_strip or cell_h // 10) // 4))
+    font_title = _load_label_font(max(22, title_strip // 2)) if title else font
+
+    if title:
+        draw.text(
+            (grid.size[0] // 2, title_strip // 2),
+            title,
+            fill="black",
+            font=font_title,
+            anchor="mm",
+        )
+    if col_labels:
+        for c_idx, lbl in enumerate(col_labels):
+            x = left + c_idx * cell_w + cell_w // 2
+            y = title_strip + col_strip // 2
+            draw.text((x, y), lbl, fill="black", font=font, anchor="mm", align="center")
+    if row_labels:
+        for r_idx, lbl in enumerate(row_labels):
+            y = top + r_idx * cell_h + cell_h // 2
+            # Honor explicit newlines from axis labels; otherwise soft-wrap long text.
+            rendered = lbl if "\n" in lbl else ("\n".join(textwrap.wrap(lbl, width=18)) or lbl)
+            draw.text((row_strip // 2, y), rendered, fill="black", font=font_row, anchor="mm", align="center")
+
+    for (r, c), imgs in results.items():
+        grid.paste(imgs[0], (left + c * cell_w, top + r * cell_h))
+    return grid
+
+
+def _load_label_font(size: int):
+    """Return a readable TrueType font if available, otherwise PIL's default bitmap font."""
+    from PIL import ImageFont
+
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     use_nextstep = is_nextstep_model(args.model)
+
+    prompts = _resolve_prompts(args)
+    lora_requests, lora_scales, lora_is_per_request = _resolve_lora(args)
+    axes = _parse_axes(args.axis)
+
+    if axes and len(prompts) > 1:
+        raise ValueError(
+            "--axis cannot be combined with multi-prompt input; put prompts on the prompt axis instead, "
+            'e.g. --axis "z=prompt:a|b".'
+        )
+    requires_output_dir = len(prompts) > 1 or args.num_images_per_prompt > 1 or bool(axes)
+    if requires_output_dir and not args.output_dir:
+        raise ValueError(
+            "--output-dir is required when running multiple prompts, multiple images per prompt, "
+            "or --axis. Single --output is only valid for one image."
+        )
+    if args.max_loras is not None and args.lora_paths and args.max_loras < len(args.lora_paths):
+        raise ValueError(
+            f"--max-loras ({args.max_loras}) is smaller than len(--lora-paths) ({len(args.lora_paths)}). "
+            "Composition needs one slot per adapter — raise --max-loras or remove it to auto-size."
+        )
 
     cache_config = None
     cache_backend = args.cache_backend
@@ -392,7 +666,14 @@ def main():
     lora_args: dict[str, Any] = {}
     if args.lora_path:
         lora_args["lora_path"] = args.lora_path
-        print(f"Using LoRA from: {args.lora_path}")
+        print(f"Using init-time LoRA from: {args.lora_path}")
+
+    # max_loras sizes the adapter cache at init. Per-request combos may load
+    # several adapters simultaneously, so default to max(len(lora_paths), 1).
+    if args.max_loras is not None:
+        lora_args["max_loras"] = args.max_loras
+    elif args.lora_paths:
+        lora_args["max_loras"] = max(len(args.lora_paths), 1)
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
@@ -474,42 +755,17 @@ def main():
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
-        print(f"  LoRA: scale={args.lora_scale}")
+        print(f"  Init-time LoRA: scale={args.lora_scale}")
+    if lora_is_per_request:
+        print(f"  Per-request LoRA ({len(lora_requests)}):")
+        for idx, (req, scale) in enumerate(zip(lora_requests, lora_scales)):
+            print(f"    [{idx}] {req.lora_name} scale={scale}")
+    print(f"  Prompts: {len(prompts)}")
+    if axes:
+        print(f"  Axes: {', '.join(f'{a.name}={a.type}:{len(a.values)} values' for a in axes.values())}")
     if args.stage_configs_path:
         print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
-
-    # Build LoRA request when --lora-path is set
-    lora_request = None
-    if args.lora_path:
-        lora_request_id = stable_lora_int_id(args.lora_path)
-        lora_request = LoRARequest(
-            lora_name=Path(args.lora_path).stem,
-            lora_int_id=lora_request_id,
-            lora_path=args.lora_path,
-        )
-
-    generation_start = time.perf_counter()
-
-    prompt_dict = build_text_to_image_prompt(
-        model_class_name=model_class_name,
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-    )
-
-    diffusion_params = OmniDiffusionSamplingParams(
-        height=args.height,
-        width=args.width,
-        seed=args.seed,
-        generator=generator,
-        true_cfg_scale=args.cfg_scale,
-        guidance_scale=args.guidance_scale,
-        guidance_scale_2=args.guidance_scale_2,
-        num_inference_steps=args.num_inference_steps,
-        num_outputs_per_prompt=args.num_images_per_prompt,
-    )
 
     # Base layer: backward-compatible model-specific flags. New model params should
     # instead be declared in vllm_omni/model_extras and passed via --extra-body, so
@@ -529,52 +785,131 @@ def main():
     # still filtered against the model's declared extra_body_params downstream.
     if args.extra_body:
         user_extra.update(args.extra_body)
-    if declared_extra_body_params:
-        apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
+
+    init_non_diffusion = should_init_extra_args_for_non_diffusion_stages(model_class_name)
+
+    def _run_cell(prompt: str, cell: dict) -> list[Any]:
+        gen = torch.Generator(device=current_omni_platform.device_type).manual_seed(cell["seed"])
+        prompt_dict = build_text_to_image_prompt(
+            model_class_name=model_class_name,
+            prompt=prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+        )
+        diffusion_params = OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            seed=cell["seed"],
+            generator=gen,
+            true_cfg_scale=args.cfg_scale,
+            guidance_scale=cell["guidance_scale"],
+            guidance_scale_2=args.guidance_scale_2,
+            num_inference_steps=cell["num_inference_steps"],
+            num_outputs_per_prompt=args.num_images_per_prompt,
+            lora_requests=lora_requests if lora_is_per_request else [],
+            lora_scales=cell["lora_scales"] if lora_is_per_request else [],
+        )
+        if declared_extra_body_params:
+            apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
+        else:
+            diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
+
+        # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
+        # or wrap single diffusion params for single-stage models.
+        defaults = list(omni.default_sampling_params_list or [])
+        sampling_params_list = [clone_sampling_params(p) for p in defaults]
+        if not sampling_params_list:
+            sampling_params_list = [diffusion_params]
+
+        diffusion_replaced = False
+        for idx, params in enumerate(sampling_params_list):
+            if isinstance(params, OmniDiffusionSamplingParams):
+                sampling_params_list[idx] = diffusion_params
+                diffusion_replaced = True
+            elif init_non_diffusion and hasattr(params, "extra_args"):
+                if params.extra_args is None:
+                    params.extra_args = {}
+                params.extra_args.update(diffusion_params.extra_args or {})
+                if cell["seed"] is not None and hasattr(params, "seed"):
+                    params.seed = cell["seed"]
+
+                # MammothModa2's AR stage emits one visual token per grid cell,
+                # one EOL token per row, and one final look-ahead token whose hidden
+                # state is unavailable. Size the first stage from the prompt metadata
+                # instead of SamplingParams' default of 16 tokens.
+                prompt_info = prompt_dict.get("additional_information", {})
+                if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
+                    ar_width = int(prompt_info.get("ar_width", [0])[0])
+                    ar_height = int(prompt_info.get("ar_height", [0])[0])
+                    if ar_width > 0 and ar_height > 0:
+                        params.max_tokens = ar_height * (ar_width + 1) + 1
+
+        if not diffusion_replaced and len(sampling_params_list) == 1:
+            sampling_params_list = [diffusion_params]
+
+        outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+
+        images = None
+        for output in outputs:
+            images = getattr(output, "images", None)
+            if images:
+                break
+            req_out = getattr(output, "request_output", None)
+            images = getattr(req_out, "images", None) if req_out is not None else None
+            if images:
+                break
+
+        if not images:
+            images = extract_images_from_outputs(outputs)
+
+        if not images:
+            raise ValueError("No images found in request_output")
+        return images
+
+    defaults = {
+        "prompt": prompts[0],
+        "lora_scales": list(lora_scales),
+        "guidance_scale": args.guidance_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "seed": args.seed,
+    }
+
+    # (z_idx, y_idx, x_idx) -> images for one cell. Unused axes collapse to idx 0.
+    cell_images: dict[tuple[int, int, int], list[Any]] = {}
+
+    generation_start = time.perf_counter()
+
+    if axes:
+        x_axis, y_axis, z_axis = axes.get("x"), axes.get("y"), axes.get("z")
+        z_values = z_axis.values if z_axis else [None]
+        y_values = y_axis.values if y_axis else [None]
+        x_values = x_axis.values if x_axis else [None]
+
+        total = len(z_values) * len(y_values) * len(x_values)
+        counter = 0
+        for z_idx, z_val in enumerate(z_values):
+            for y_idx, y_val in enumerate(y_values):
+                for x_idx, x_val in enumerate(x_values):
+                    cell = dict(defaults)
+                    for ax, raw in ((x_axis, x_val), (y_axis, y_val), (z_axis, z_val)):
+                        if ax is not None:
+                            _apply_axis(ax, raw, cell, len(lora_requests))
+                    counter += 1
+                    label = " ".join(
+                        f"{ax.name}={raw}"
+                        for ax, raw in ((x_axis, x_val), (y_axis, y_val), (z_axis, z_val))
+                        if ax is not None
+                    )
+                    print(f"[cell {counter}/{total}] {label}")
+                    cell_images[(z_idx, y_idx, x_idx)] = _run_cell(cell["prompt"], cell)
     else:
-        diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
-
-    if lora_request:
-        diffusion_params.lora_request = lora_request
-        diffusion_params.lora_scale = args.lora_scale
-
-    # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
-    # or wrap single diffusion params for single-stage models.
-    init_non_diffusion = should_init_extra_args_for_non_diffusion_stages(
-        model_class_name,
-    )
-    defaults = list(omni.default_sampling_params_list or [])
-    sampling_params_list = [clone_sampling_params(p) for p in defaults]
-    if not sampling_params_list:
-        sampling_params_list = [diffusion_params]
-
-    diffusion_replaced = False
-    for idx, params in enumerate(sampling_params_list):
-        if isinstance(params, OmniDiffusionSamplingParams):
-            sampling_params_list[idx] = diffusion_params
-            diffusion_replaced = True
-        elif init_non_diffusion and hasattr(params, "extra_args"):
-            if params.extra_args is None:
-                params.extra_args = {}
-            params.extra_args.update(diffusion_params.extra_args or {})
-            if args.seed is not None and hasattr(params, "seed"):
-                params.seed = args.seed
-
-            # MammothModa2's AR stage emits one visual token per grid cell,
-            # one EOL token per row, and one final look-ahead token whose hidden
-            # state is unavailable. Size the first stage from the prompt metadata
-            # instead of SamplingParams' default of 16 tokens.
-            prompt_info = prompt_dict.get("additional_information", {})
-            if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
-                ar_width = int(prompt_info.get("ar_width", [0])[0])
-                ar_height = int(prompt_info.get("ar_height", [0])[0])
-                if ar_width > 0 and ar_height > 0:
-                    params.max_tokens = ar_height * (ar_width + 1) + 1
-
-    if not diffusion_replaced and len(sampling_params_list) == 1:
-        sampling_params_list = [diffusion_params]
-
-    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+        # No axes: generate one image per prompt; cell key (0, p_idx, 0).
+        cell = dict(defaults)
+        for p_idx, prompt in enumerate(prompts):
+            cell["prompt"] = prompt
+            print(f"[cell {p_idx + 1}/{len(prompts)}] prompt={prompt!r}")
+            cell_images[(0, p_idx, 0)] = _run_cell(prompt, cell)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -599,39 +934,55 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # omni.generate() returns list[OmniRequestOutput]
-    if not outputs or len(outputs) == 0:
-        raise ValueError("No output generated from omni.generate()")
-    logger.info(f"Outputs: {outputs}")
+    logger.info("Produced %d cells", len(cell_images))
 
-    images = None
-    for output in outputs:
-        images = getattr(output, "images", None)
-        if images:
-            break
-        req_out = getattr(output, "request_output", None)
-        images = getattr(req_out, "images", None) if req_out is not None else None
-        if images:
-            break
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for (z_idx, y_idx, x_idx), imgs in cell_images.items():
+            for n_idx, img in enumerate(imgs):
+                save_path = out_dir / f"cell_x{x_idx:02d}_y{y_idx:02d}_z{z_idx:02d}_n{n_idx:02d}.png"
+                img.save(save_path)
+                print(f"Saved {save_path}")
 
-    if not images:
-        images = extract_images_from_outputs(outputs)
+        if axes:
+            x_axis, y_axis, z_axis = axes.get("x"), axes.get("y"), axes.get("z")
+            lora_names = [req.lora_name for req in lora_requests]
+            col_labels = [_axis_label(x_axis, v, lora_names) for v in x_axis.values] if x_axis else None
+            row_labels = [_axis_label(y_axis, v, lora_names) for v in y_axis.values] if y_axis else None
+            num_cols = len(x_axis.values) if x_axis else 1
+            num_rows = len(y_axis.values) if y_axis else 1
 
-    if not images:
-        raise ValueError("No images found in request_output")
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = output_path.suffix or ".png"
-    stem = output_path.stem or "qwen_image_output"
-    if len(images) <= 1:
-        images[0].save(output_path)
-        print(f"Saved generated image to {output_path}")
+            z_values = z_axis.values if z_axis else [None]
+            for z_idx, z_val in enumerate(z_values):
+                slice_cells = {(y, x): imgs for (z, y, x), imgs in cell_images.items() if z == z_idx}
+                title = f"Z: {_axis_label(z_axis, z_val, lora_names)}" if z_axis else None
+                grid = _compose_grid(
+                    slice_cells,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                    row_labels=row_labels,
+                    col_labels=col_labels,
+                    title=title,
+                )
+                fname = f"grid_z{z_idx:02d}.png" if z_axis else "grid.png"
+                grid_path = out_dir / fname
+                grid.save(grid_path)
+                print(f"Saved grid to {grid_path}")
     else:
-        for idx, img in enumerate(images):
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-            img.save(save_path)
-            print(f"Saved generated image to {save_path}")
+        # Single-output mode: exactly one cell, one image.
+        only_images = next(iter(cell_images.values()))
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = output_path.suffix or ".png"
+        if len(only_images) == 1:
+            only_images[0].save(output_path)
+            print(f"Saved generated image to {output_path}")
+        else:
+            for n_idx, img in enumerate(only_images):
+                save_path = output_path.with_name(f"{output_path.stem}_{n_idx}{suffix}")
+                img.save(save_path)
+                print(f"Saved {save_path}")
 
 
 if __name__ == "__main__":

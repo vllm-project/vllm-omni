@@ -76,6 +76,7 @@ python text_to_image.py \
 | Argument | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
 | `--prompt` | str | `"a cup of coffee on the table"` | Text description for image generation |
+| `--prompts` | str+ | — | Multiple prompts for batched generation. Overrides `--prompt`. Requires `--output-dir`. |
 | `--seed` | int | `142` | Integer seed for deterministic sampling |
 | `--negative-prompt` | str | `None` | Negative prompt for classifier-free conditional guidance |
 | `--cfg-scale` | float | `4.0` | True CFG scale (model-specific guidance strength) |
@@ -84,7 +85,8 @@ python text_to_image.py \
 | `--num-inference-steps` | int | `50` | Diffusion sampling steps (more steps = higher quality, slower) |
 | `--height` | int | `1024` | Output image height in pixels |
 | `--width` | int | `1024` | Output image width in pixels |
-| `--output` | str | `"qwen_image_output.png"` | Path to save the generated image |
+| `--output` | str | `"qwen_image_output.png"` | Single-image output file path (one prompt, one LoRA combo, one image) |
+| `--output-dir` | str | — | Output directory for batch / multi-LoRA / XYZ runs. Files are named `cell_x{x}_y{y}_z{z}_n{n}.png`; `--axis` mode also writes `grid.png` (or `grid_z{k}.png` per Z value). |
 | `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
@@ -92,8 +94,12 @@ python text_to_image.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
 | `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
-| `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-path` | str | — | Path to a PEFT LoRA adapter folder for init-time static load |
+| `--lora-scale` | float | `1.0` | Scale factor for `--lora-path` |
+| `--lora-paths` | str+ | — | One or more PEFT LoRA adapter folders for per-request composition. Mutex with `--lora-path`. |
+| `--lora-scales` | float+ | `[1.0 ...]` | Per-adapter scales for `--lora-paths` (length must match) |
+| `--max-loras` | int | auto | LoRA cache slot count. Defaults to `max(len(--lora-paths), 1)` |
+| `--axis` | str (repeatable) | — | XYZ plot axis spec `NAME=TYPE:v1\|v2\|...` where NAME ∈ `{x,y,z}` and TYPE ∈ `{prompt, lora_scale[i], guidance_scale, num_inference_steps, seed}`. Cartesian product of axes defines cells; X=cols, Y=rows, Z produces one `grid_z{k}.png` per value. Repeat up to 3 times. |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 | `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
@@ -304,7 +310,9 @@ See more examples in the [cfg_parallel user guide](../../../docs/user_guide/para
 
 #### LoRA
 
-This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default `1.0`); omit it to use the base model only.
+This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters in two modes — see the [LoRA feature guide](../../../docs/user_guide/diffusion/lora.md) for a full description.
+
+**Init-time LoRA** — one adapter is pre-loaded when `Omni` starts and applied to every generation:
 
 ```bash
 python text_to_image.py \
@@ -314,6 +322,36 @@ python text_to_image.py \
   --lora-scale 1.0 \
   --output output.png
 ```
+
+**Per-request LoRA (incl. multi-LoRA composition)** — one or more adapters are attached to each request via `sampling_params.lora_requests`. Size the adapter cache with `--max-loras`:
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "A piece of cheesecake" \
+  --lora-paths /lora/style_a /lora/style_b \
+  --lora-scales 1.0 0.5 \
+  --max-loras 2 \
+  --output-dir outputs/composed/
+```
+
+**XYZ plot** — put any parameter on any axis and take the Cartesian product. Each `--axis` has the form `NAME=TYPE:v1|v2|...` where `NAME` is `x` / `y` / `z` and `TYPE` is one of `prompt`, `lora_scale[i]` (targets the i-th `--lora-paths` entry), `guidance_scale`, `num_inference_steps`, or `seed`. X/Y compose a 2D grid; Z writes one `grid_z{k}.png` per value.
+
+```bash
+# 2 × 2 scale sweep of two LoRAs, across 2 prompts (Z)
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --lora-paths /lora/style_a /lora/style_b \
+  --max-loras 2 \
+  --axis "x=lora_scale[0]:0|1" \
+  --axis "y=lora_scale[1]:0|1" \
+  --axis "z=prompt:a girl|a cat" \
+  --output-dir outputs/axis_test/
+```
+
+Grid cells are labeled with `{adapter}\n{scale}` for LoRA-scale axes and the prompt text for a prompt axis; the Z banner shows the current slice.
+
+`--lora-path` and `--lora-paths` are mutually exclusive. `--output-dir` is required whenever the script produces more than one image (multiple prompts, any `--axis`, or `--num-images-per-prompt > 1`).
 
 LoRA adapters must be in PEFT format. A typical adapter directory structure:
 

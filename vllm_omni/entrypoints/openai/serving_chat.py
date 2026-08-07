@@ -128,7 +128,7 @@ from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
     is_single_stage_diffusion,
-    parse_lora_request,
+    parse_lora_requests,
     resolve_diffusion_od_config,
     validate_requested_speaker,
 )
@@ -3100,15 +3100,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
-                    try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            default_stage_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                default_stage_params.lora_scale = lora_scale
-                    except Exception as e:  # pragma: no cover - safeguard
-                        logger.warning("Failed to parse LoRA request: %s", e)
+                if lora_body and isinstance(lora_body, (dict, list)):
+                    # Invalid shapes raise ValueError → outer handler returns 400.
+                    lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                    if lora_reqs:
+                        default_stage_params.lora_requests = lora_reqs
+                        default_stage_params.lora_scales = lora_scales
 
         return engine_prompt, sampling_params_list
 
@@ -3161,15 +3158,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             strength=extra_body.get("strength"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
-            try:
-                lora_req, lora_scale = parse_lora_request(lora_body)
-                if lora_req is not None:
-                    gen_params.lora_request = lora_req
-                    if lora_scale is not None:
-                        gen_params.lora_scale = lora_scale
-            except Exception as e:  # pragma: no cover - safeguard
-                logger.warning("Failed to parse LoRA request: %s", e)
+        if lora_body and isinstance(lora_body, (dict, list)):
+            # Invalid shapes raise ValueError → outer handler returns 400.
+            lora_reqs, lora_scales = parse_lora_requests(lora_body)
+            if lora_reqs:
+                gen_params.lora_requests = lora_reqs
+                gen_params.lora_scales = lora_scales
 
         gen_prompt: OmniTextPrompt = {
             "prompt": prompt,
@@ -3557,16 +3551,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if resolution is not None:
                 gen_params.resolution = resolution
 
-            # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
-                try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
-                except Exception as exc:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", exc)
+            # Parse per-request LoRA. parse_lora_requests raises ValueError on
+            # invalid shapes (e.g. a bare string); let it propagate so the
+            # outer handler returns a 400 instead of silently disabling LoRA.
+            if lora_body:
+                lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                if lora_reqs:
+                    gen_params.lora_requests = lora_reqs
+                    gen_params.lora_scales = lora_scales
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []

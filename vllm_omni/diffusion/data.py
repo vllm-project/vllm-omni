@@ -676,7 +676,8 @@ class OmniDiffusionConfig:
     # LoRA parameters
     lora_path: str | None = None
     lora_scale: float = 1.0
-    max_cpu_loras: int | None = None
+    max_loras: int = 1  # max adapters composed per request (GPU slot count)
+    max_cpu_loras: int | None = None  # max adapters cached on CPU (LRU)
 
     output_type: str = "pil"
 
@@ -1021,6 +1022,9 @@ class OmniDiffusionConfig:
                     f"got {type(self.quantization_config)!r}"
                 )
 
+        if self.max_loras < 1:
+            raise ValueError("max_loras must be >= 1 for diffusion LoRA")
+
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
@@ -1028,9 +1032,9 @@ class OmniDiffusionConfig:
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
         if self.max_cpu_loras is None:
-            self.max_cpu_loras = 1
-        elif self.max_cpu_loras < 1:
-            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+            self.max_cpu_loras = max(self.max_loras, 1)
+        elif self.max_cpu_loras < self.max_loras:
+            raise ValueError(f"max_cpu_loras ({self.max_cpu_loras}) must be >= max_loras ({self.max_loras})")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

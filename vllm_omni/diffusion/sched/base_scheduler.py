@@ -27,10 +27,11 @@ logger = init_logger(__name__)
 
 BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
 
-# LoRA identity is derived from `sampling.lora_request`, not a same-named field
+# LoRA identity is derived from `sampling.lora_requests`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
-    "lora_int_id"
+    "lora_int_ids",
+    "lora_scales",
 }
 
 
@@ -277,9 +278,11 @@ class BaseScheduler(ABC):
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
+        lora_requests = getattr(sampling, "lora_requests", None) or []
+        lora_scales = getattr(sampling, "lora_scales", None) or []
         return StepBatchSamplingParamsKey(
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_int_ids=tuple(req.lora_int_id for req in lora_requests),
+            lora_scales=tuple(lora_scales),
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 

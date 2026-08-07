@@ -310,9 +310,9 @@ class OmniDiffusionSamplingParams:
     save_output: bool = True
     return_frames: bool = False
 
-    # LoRA
-    lora_request: LoRARequest | None = None
-    lora_scale: float = 1.0
+    # LoRA — multiple adapters can be composed per request
+    lora_requests: list[LoRARequest] = field(default_factory=list)
+    lora_scales: list[float] = field(default_factory=list)
 
     # STA parameters
     STA_param: list | None = None
@@ -365,6 +365,18 @@ class OmniDiffusionSamplingParams:
             return None
 
         return float(fps)
+
+    def __post_init__(self):
+        # Default per-adapter LoRA scales to 1.0 when adapters are supplied
+        # without explicit scales, so callers can opt in by setting
+        # lora_requests alone.
+        if self.lora_requests and not self.lora_scales:
+            self.lora_scales = [1.0] * len(self.lora_requests)
+        if len(self.lora_requests) != len(self.lora_scales):
+            raise ValueError(
+                f"lora_requests ({len(self.lora_requests)}) and lora_scales ({len(self.lora_scales)}) "
+                "must have the same length."
+            )
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)

@@ -139,12 +139,13 @@ class StageDiffusionProc:
 
     def _reconstruct_sampling_params(self, sampling_params_dict: dict) -> OmniDiffusionSamplingParams:
         """Reconstruct OmniDiffusionSamplingParams from a dict, handling LoRA."""
-        lora_req = sampling_params_dict.get("lora_request")
-        if lora_req is not None:
+        lora_reqs = sampling_params_dict.get("lora_requests")
+        if lora_reqs:
             from vllm.lora.request import LoRARequest
 
-            if not isinstance(lora_req, LoRARequest):
-                sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
+            sampling_params_dict["lora_requests"] = [
+                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_reqs
+            ]
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)
 
