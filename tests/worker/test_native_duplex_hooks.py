@@ -2466,3 +2466,71 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform wiring: every AR model runner must reach the duplex hook.
+#
+# ``GPUARModelRunner`` and ``NPUARModelRunner`` are siblings -- neither inherits
+# the other's ``_sample`` -- so the NPU runner once carried a copy of the GPU
+# ``_sample`` with the ``prepare_duplex_sampling`` call dropped.  That left the
+# MiniCPM-o 4.5 thinker without a row -> session map on Ascend, so every mid-turn
+# ``<|listen|>`` was emitted verbatim and the model stopped speaking after turn 1.
+#
+# These checks parse the source instead of importing it: the NPU runner needs
+# ``vllm_ascend``, which is absent on the CPU test images that run this file.
+# ---------------------------------------------------------------------------
+
+_AR_RUNNERS = [
+    ("vllm_omni/worker/gpu_ar_model_runner.py", "GPUARModelRunner"),
+    ("vllm_omni/platforms/npu/worker/npu_ar_model_runner.py", "NPUARModelRunner"),
+]
+
+# method that must call it -> mixin method it must call
+_REQUIRED_DUPLEX_CALLS = {
+    "__init__": "_init_duplex_sampling_state",
+    "load_model": "_resolve_duplex_sampling_hook",
+    "_update_states": "_update_duplex_sampling_states",
+    "_sample": "_apply_duplex_sampling",
+}
+
+
+def _ar_runner_classdef(relative_path: str, class_name: str):
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / relative_path).read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise AssertionError(f"{class_name} not found in {relative_path}")
+
+
+@pytest.mark.parametrize(("relative_path", "class_name"), _AR_RUNNERS)
+def test_ar_runner_inherits_duplex_sampling_mixin(relative_path: str, class_name: str):
+    import ast
+
+    classdef = _ar_runner_classdef(relative_path, class_name)
+    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+    assert "DuplexSamplingRunnerMixin" in bases, (
+        f"{class_name} must inherit DuplexSamplingRunnerMixin so the duplex sampling "
+        f"hook is wired the same way on every platform"
+    )
+
+
+@pytest.mark.parametrize(("relative_path", "class_name"), _AR_RUNNERS)
+def test_ar_runner_calls_every_duplex_sampling_hook_site(relative_path: str, class_name: str):
+    import ast
+
+    classdef = _ar_runner_classdef(relative_path, class_name)
+    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
+
+    for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items():
+        method = methods.get(method_name)
+        assert method is not None, f"{class_name}.{method_name} is missing; it must call {required_call}"
+        called = {
+            node.func.attr
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert required_call in called, f"{class_name}.{method_name} must call self.{required_call}"
