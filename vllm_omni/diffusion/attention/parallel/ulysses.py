@@ -204,6 +204,25 @@ class UlyssesParallelAttention:
         attn_metadata: AttentionMetadata | None,
     ):
         mode = get_ulysses_mode(default="strict")
+        ulysses_world_size = self._sp_group.ulysses_world_size
+
+        # advanced_uaa pads non-divisible head counts before the Ulysses
+        # all-to-all. Padding K/V is not valid in hybrid Ulysses+Ring: the Ring
+        # GQA/MQA path would repeat the padded zero heads as real K/V heads.
+        # Reject this layout until K/V replication is performed before Ulysses.
+        if mode == "advanced_uaa" and self._sp_group.ring_world_size > 1:
+            for name, tensor in (("key", key), ("value", value)):
+                kv_head_cnt = int(tensor.shape[2])
+                if kv_head_cnt % ulysses_world_size != 0:
+                    raise ValueError(
+                        "ulysses_mode='advanced_uaa' with hybrid Ulysses+Ring "
+                        "does not support K/V head padding. "
+                        f"{name}_head_cnt={kv_head_cnt}, "
+                        f"ulysses_degree={ulysses_world_size}. "
+                        "Use ring_degree=1, choose a compatible ulysses_degree, "
+                        "or replicate K/V heads before Ulysses."
+                    )
+
         joint_tensor_query = joint_tensor_key = joint_tensor_value = None
         joint_strategy = "front"
         joint_len = 0
@@ -226,7 +245,6 @@ class UlyssesParallelAttention:
 
             # Slice joint_query for this Ulysses rank
             # joint_query is (B, S, H, D). We split H (dim 2).
-            ulysses_world_size = self._sp_group.ulysses_world_size
             ulysses_rank = self._sp_group.ulysses_rank
             joint_head_cnt = int(joint_tensor_query.shape[-2])
             joint_orig_head_cnt = joint_head_cnt

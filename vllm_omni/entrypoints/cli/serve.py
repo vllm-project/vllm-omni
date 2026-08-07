@@ -435,6 +435,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--fa-deterministic",
+            dest="fa_deterministic",
+            action="store_true",
+            default=False,
+            help=(
+                "Request FlashAttention deterministic=True on the local FLASH_ATTN dense path. "
+                "Slower than the library default deterministic=False; intended for accuracy CI. "
+                "Serving default remains non-deterministic."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,

@@ -613,6 +613,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    fa_deterministic: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
