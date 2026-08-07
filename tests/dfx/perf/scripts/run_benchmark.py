@@ -190,17 +190,17 @@ def assert_result(
     if is_hardware_nested_baseline(baseline_data):
         hardware = get_runtime_resource_label()
         if hardware not in baseline_data:
-            raise AssertionError(
-                f"No baseline for runtime hardware {hardware!r}; available={sorted(baseline_data)}"
-            )
+            raise AssertionError(f"No baseline for runtime hardware {hardware!r}; available={sorted(baseline_data)}")
         baseline_data = baseline_data[hardware]
     for metric_name, baseline_raw in baseline_data.items():
         current_value = result[metric_name]
+        # Mainline resolve_baseline_value only takes sweep_index (hardware nesting
+        # is handled above). max_concurrency/request_rate are kept on the signature
+        # for callers/tests but are unused after the #5402/#5845 baseline reshape.
+        del max_concurrency, request_rate
         baseline_value = resolve_baseline_value(
             baseline_raw,
             sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
         )
         if "throughput" in metric_name:
             assert current_value >= baseline_value, (
