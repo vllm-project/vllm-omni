@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
     IMG_END_TOKEN_ID,
     IMG_NEWLINE_TOKEN_ID,
@@ -8,6 +10,8 @@ from vllm_omni.model_executor.models.longcat_next.longcat_next_utils import (
     IMG_START_TOKEN_ID,
     infer_visual_grid,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_infer_visual_grid_from_newlines():
