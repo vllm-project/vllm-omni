@@ -81,6 +81,8 @@ def test_cachedit_public_api_is_explicit():
         "CacheDiTAdapterConfig",
         "CacheDiTBackend",
         "CacheDiTConfig",
+        "CacheDiTRequestSpec",
+        "RequestScopedCacheDiTRuntime",
         "SensenovaCachedAdapter",
         "cache_summary",
         "enable_cache_for_dit",

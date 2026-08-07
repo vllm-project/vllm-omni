@@ -64,4 +64,21 @@ def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModel
     # pipelines do not accidentally inherit limits meant for other models.
     if model_class_name is None:
         return DiffusionModelMetadata()
-    return _DIFFUSION_MODEL_METADATA.get(model_class_name, DiffusionModelMetadata())
+    metadata = _DIFFUSION_MODEL_METADATA.get(model_class_name)
+    if metadata is not None:
+        return metadata
+    # Some checkpoints report the HF architecture name diff from internal pipeline class name
+    # (e.g. HunyuanImage3ForCausalMM, WanVACEPipeline, OmniVoice ...).
+    from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+    entry = _DIFFUSION_MODELS.get(model_class_name)
+    if entry is not None:
+        # Unpack instead of indexing so a future change to the registry tuple
+        # shape fails loudly instead of silently reading the wrong element.
+        _, _, pipeline_cls_name = entry
+        # Note: the registry ``cls_name`` and the metadata keys are two separate
+        # key spaces. Aliases whose pipeline class has no metadata entry (e.g.
+        # Wan22VACEPipeline, OmniVoicePipeline) still fall back to the defaults;
+        # that is not a regression, it just means no capability override.
+        return _DIFFUSION_MODEL_METADATA.get(pipeline_cls_name, DiffusionModelMetadata())
+    return DiffusionModelMetadata()

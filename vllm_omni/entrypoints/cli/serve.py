@@ -435,6 +435,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--fa-deterministic",
+            dest="fa_deterministic",
+            action="store_true",
+            default=False,
+            help=(
+                "Request FlashAttention deterministic=True on the local FLASH_ATTN dense path. "
+                "Slower than the library default deterministic=False; intended for accuracy CI. "
+                "Serving default remains non-deterministic."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,
@@ -935,6 +946,9 @@ def run_headless(args: TrackingNamespace) -> None:
     # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
     # bracket each replica's spawn below with setup_stage_devices so they
     # don't all stack on cuda:0 (see ``per_replica_devices`` above).
+    # Headless startup still supplies the legacy OmegaConf stage shape through
+    # the stable adapter entry point. The implementation switches only when
+    # RFC #4021 threads structured stage configs through the launch plan.
     engine_args_dict = build_engine_args_dict(
         stage_cfg,
         model,
