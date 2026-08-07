@@ -2811,6 +2811,7 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
         status=VideoGenerationStatus.QUEUED,
         size=req.size,
         prompt=req.prompt,
+        quality=req.quality or "default",
     )
     resp.seconds = str(req.seconds or resp.seconds)
     return resp
@@ -3150,6 +3151,7 @@ async def _parse_video_form(
     short_edge: int | None = Form(default=None, ge=1),
     num_outputs_per_prompt: int = Form(default=1, ge=1, le=10),
     start_time_seconds: float | None = Form(default=None, ge=0.0),
+    quality: str | None = Form(default=None),
     num_inference_steps: int | None = Form(default=None),
     guidance_scale: float | None = Form(default=None),
     guidance_scale_2: float | None = Form(default=None),
@@ -3218,6 +3220,7 @@ async def _parse_video_form(
         "short_edge": short_edge,
         "num_outputs_per_prompt": num_outputs_per_prompt,
         "start_time_seconds": start_time_seconds,
+        "quality": quality,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": guidance_scale,
         "guidance_scale_2": guidance_scale_2,

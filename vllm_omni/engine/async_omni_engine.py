@@ -1043,6 +1043,7 @@ class AsyncOmniEngine:
             "diffusion_compile_dynamic": (
                 True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
             ),
+            "fa_deterministic": bool(kwargs.get("fa_deterministic", False)),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),

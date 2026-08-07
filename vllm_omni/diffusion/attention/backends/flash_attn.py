@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 logger = init_logger(__name__)
 
@@ -71,8 +72,19 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        cfg = get_current_diffusion_config_or_none()
+        self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+
+    def _warn_fa_deterministic_non_dense(self, path: str) -> None:
+        if not self.fa_deterministic:
+            return
+        logger.warning_once(
+            "fa_deterministic=True is ignored on the %s FlashAttention path; "
+            "only the dense flash_attn_func path passes deterministic=True.",
+            path,
+        )
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -250,6 +262,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Try piecewise attention
         if full_attn_spans is not None:
+            self._warn_fa_deterministic_non_dense("piecewise")
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
             if flash_attn_func is not None:
                 attn_func = partial(
@@ -280,6 +293,7 @@ class FlashAttentionImpl(AttentionImpl):
             if len(present_packed_keys) != len(packed_keys):
                 missing = sorted(set(packed_keys) - set(present_packed_keys))
                 raise ValueError(f"Incomplete packed FlashAttention metadata; missing {missing}")
+            self._warn_fa_deterministic_non_dense("packed-varlen")
             return self._forward_varlen_packed(
                 query,
                 key,
@@ -291,6 +305,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
+            self._warn_fa_deterministic_non_dense("masked-varlen")
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -299,15 +314,16 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if flash_attn_func is not None:
-            out = flash_attn_func(
-                query,
-                key,
-                value,
-                causal=self.causal,
-                softmax_scale=self.softmax_scale,
-            )
+            fa_kwargs = {
+                "causal": self.causal,
+                "softmax_scale": self.softmax_scale,
+            }
+            if self.fa_deterministic:
+                fa_kwargs["deterministic"] = True
+            out = flash_attn_func(query, key, value, **fa_kwargs)
             return self._unwrap_flash_output(out)
 
+        self._warn_fa_deterministic_non_dense("dense-varlen-fallback")
         return self._forward_varlen_dense(
             query,
             key,
