@@ -103,9 +103,7 @@ class TestAsr2Aligner:
     def _prompt_with_audio(rid="r0"):
         return {
             "request_id": rid,
-            "additional_information": {
-                proc.ALIGNER_AUDIO_KEY: (np.zeros(16000, dtype=np.float32), 16000)
-            },
+            "additional_information": {proc.ALIGNER_AUDIO_KEY: (np.zeros(16000, dtype=np.float32), 16000)},
         }
 
     def test_skips_when_transcript_is_empty(self):

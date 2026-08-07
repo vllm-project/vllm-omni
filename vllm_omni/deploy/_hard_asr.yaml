@@ -1,0 +1,57 @@
+# Qwen3-ASR single-stage deploy profile: audio in, transcript text out.
+#
+#   vllm-omni serve Qwen/Qwen3-ASR-1.7B --omni --trust-remote-code \
+#       --deploy-config vllm_omni/deploy/qwen3_asr.yaml
+#
+# WORD TIMESTAMPS. Add the aligner with:
+#
+#   --forced-aligner-config vllm_omni/deploy/qwen3_asr_forced_aligner.yaml
+#
+# which enables `response_format=verbose_json` +
+# `timestamp_granularities[]=word`. Use that profile rather than the packaged
+# TTS one: the aligner is hosted in the API server process on the first visible
+# CUDA device, and the TTS profile reserves 0.30 there, which on this stage's
+# 0.80 over-subscribes the card. Alternatively give the aligner its own card by
+# pinning this stage with `devices:`.
+#
+# SIZING. These are H100-80GB values and do not travel unchanged. Verified
+# failing on a MIG 1g.10gb slice, where 3.9 GiB of weights plus an encoder cache
+# profiled for 84 audio items leaves nothing for KV. On a smaller card lower, in
+# this order: max_num_batched_tokens, max_num_seqs, gpu_memory_utilization.
+#
+# Measured, 1xH100, 30s clips, no prefix/mm caching, 3 runs median:
+#   ASR only                                57.1 req/s  (1714 RTFx)
+#   with aligner, this stage 0.80 / 0.10    52.0 req/s  (1560 RTFx)   -9%
+#   with aligner, this stage 0.55 / 0.30    47.9 req/s  (1437 RTFx)  -16%
+#
+# Note ASR-only measures the same at 0.55 and 0.80 (57.2 vs 56.6): at this
+# concurrency it is not KV-cache-bound past ~35 GiB, and GPU utilisation sits
+# near 45% either way. The gain above comes from leaving the aligner less to
+# waste, not from the ASR stage using more.
+pipeline: qwen3_asr
+
+# Audio decode is GIL-bound (~40 clips/s per process for a 30s 48kHz stereo
+# mp3, flat past ~4 threads), so without this it serialises and caps the server
+# below what the GPU can consume. Measured on this profile at concurrency 384,
+# 3 runs median: 0 gives 19.9 req/s, 16 gives 52.6 req/s.
+#
+# A client sending 16 kHz mono reaches the same place by a different route
+# (~1.1 ms to decode against ~56 ms), and the two do not compound.
+audio_decode_procs: 16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 256
+    # 30s of audio is a large multimodal prefill; the 16384 default splits it
+    # across more chunked-prefill steps than necessary.
+    max_num_batched_tokens: 32768
+    mm_processor_cache_gb: 0
+    gpu_memory_utilization: 0.80
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_model_len: 8192
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
