@@ -53,7 +53,7 @@
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
-          "H100": {
+          "A3": {
             "request_throughput": [
               0.5383,
               0.6042,
