@@ -17,7 +17,7 @@ models = ["openbmb/MiniCPM-o-4_5"]
 _CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 
-test_params = [(model, None, {"deploy_config": _CI_DEPLOY, "trust_remote_code": True}) for model in models]
+test_params = [(model, _CI_DEPLOY, {"trust_remote_code": True}) for model in models]
 
 
 def get_question(prompt_type: str = "text") -> str:

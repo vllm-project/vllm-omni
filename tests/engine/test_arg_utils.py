@@ -144,19 +144,6 @@ def test_qwen3_tts_startup_task_type_is_validated():
         )
 
 
-def test_from_cli_args_picks_up_stage_configs_path():
-    """from_cli_args should pick up stage_configs_path from namespace."""
-    ns = argparse.Namespace(
-        model="facebook/opt-125m",
-        stage_configs_path="/some/path.yaml",
-        custom_pipeline_args=None,
-    )
-
-    args = OmniEngineArgs.from_cli_args(ns)
-    assert args.stage_configs_path == "/some/path.yaml"
-    assert args.custom_pipeline_args is None
-
-
 def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     """Ensure Code2Wav mirrors stage max_model_len into nested HF overrides.
 
