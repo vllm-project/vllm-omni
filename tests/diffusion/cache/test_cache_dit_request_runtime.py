@@ -80,3 +80,22 @@ def test_startup_cache_follows_omit_lossless_high_omit_state_machine(monkeypatch
     assert events[6][-1] == 30
     assert events[10][-1] == 20
     assert runtime.is_enabled
+
+
+def test_high_installs_without_startup_cache_and_lossless_uninstalls(monkeypatch):
+    events = []
+    monkeypatch.setattr(runtime_module, "CacheDiTBackend", _recording_backend(events))
+    pipeline = object()
+    runtime = RequestScopedCacheDiTRuntime(pipeline)
+
+    runtime.prepare(_spec("high", 40))
+    runtime.prepare(None)
+
+    assert [event[0] for event in events] == [
+        "create",
+        "enable",
+        "refresh",
+        "disable",
+    ]
+    assert events[2][-1] == 40
+    assert not runtime.is_enabled

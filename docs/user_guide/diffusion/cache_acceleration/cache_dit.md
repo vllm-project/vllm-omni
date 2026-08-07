@@ -143,8 +143,8 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 ## Request-Scoped Quality (MiniMax H3)
 
-MiniMax H3 can switch Cache-DiT at the request boundary. Start the server with
-`--cache-backend cache_dit`, then add a quality field to an online request:
+MiniMax H3 can switch Cache-DiT at the request boundary without enabling a
+cache backend at server startup. Add a quality field to an online request:
 
 ```bash
 # Native reference path for this request.
@@ -170,7 +170,10 @@ OmniDiffusionSamplingParams(
 | `--cache-backend cache_dit` | `lossless` | Remove Cache-DiT hooks and run the reference path |
 | `--cache-backend cache_dit` | `high` | Use or install H3's conservative Cache-DiT profile |
 | no Cache-DiT | omitted or `lossless` | Run the reference path |
-| no Cache-DiT | `high` | Reject the request |
+| no Cache-DiT | `high` | Install H3's conservative Cache-DiT profile |
+
+The startup option is only needed when omitted-quality requests should use the
+server-configured Cache-DiT profile by default.
 
 See the [MiniMax H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
 for a complete request and measured trade-off.

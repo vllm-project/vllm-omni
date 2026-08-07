@@ -576,23 +576,18 @@ than one is requested.
 
 ## Request-scoped quality
 
-Start the H3 server with Cache-DiT capability by adding this option to one of
-the launch commands above:
-
-```bash
---cache-backend cache_dit
-```
-
-Then add one of these fields to any HTTP request above. Omitting `quality`
-keeps or restores the startup Cache-DiT profile.
+Add one of these fields to any HTTP request above. No Cache-DiT startup option
+is required; H3 installs its conservative profile when a `high` request
+arrives and removes it for a `lossless` request.
 
 ```bash
 -F 'quality=lossless'  # Native reference path for this request.
 -F 'quality=high'      # H3's conservative Cache-DiT profile.
 ```
 
-Without startup Cache-DiT, omitted and `lossless` requests use the reference
-path, while `high` returns an error.
+Omitting `quality` preserves the startup default: it uses the reference path
+normally, or the server-configured profile when the server was started with
+`--cache-backend cache_dit`.
 
 The following result was measured on 4× NVIDIA H200 with SP4, text-encoder
 TP4, 1344×768, 124 frames, 24 FPS, and 50 inference steps. One full
@@ -614,7 +609,7 @@ balanced switch order.
 
 | Parameter | Recommended value | Notes |
 |-----------|-------------------|-------|
-| `quality` | omitted or `lossless` | Request-level quality intent; `high` requires startup `--cache-backend cache_dit` and selects H3's conservative Cache-DiT profile |
+| `quality` | omitted or `lossless` | Request-level quality intent; `high` dynamically installs H3's conservative Cache-DiT profile |
 | `extra_params.force_refresh_step_hint` | omitted | Optional positive 1-based denoising-step hint for an active Cache-DiT request; pair with `extra_params.force_refresh_step_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |

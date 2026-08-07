@@ -128,9 +128,10 @@ class MiniMaxH3QualityPolicy:
     """Resolve H3 request quality into a declarative Cache-DiT target.
 
     When the server starts with Cache-DiT, omitted quality selects the
-    server-configured profile, ``lossless`` selects no cache, and ``high``
-    selects H3's high-quality profile. Without startup Cache-DiT capability,
-    omitted and ``lossless`` requests select no cache while ``high`` fails.
+    server-configured profile. Otherwise, omitted quality selects no cache.
+    In either case, ``lossless`` selects no cache and ``high`` selects H3's
+    high-quality profile. The policy therefore owns whether a request installs
+    Cache-DiT; the startup backend only controls the omitted-quality default.
     H3-specific Cache-DiT refresh hints are read from request ``extra_args``;
     they do not change the global diffusion request contract.
     The pipeline owns applying the resulting target at the request boundary.
@@ -148,10 +149,6 @@ class MiniMaxH3QualityPolicy:
         extra_args: Mapping[str, Any] | None = None,
     ) -> MiniMaxH3QualityPlan:
         if quality == "high":
-            if self._configured_backend != "cache_dit":
-                raise OmniClientError(
-                    'MiniMax-H3 quality="high" requires the server to start with cache_backend="cache_dit"'
-                )
             base_key = MINIMAX_H3_HIGH_CACHE_KEY
             base_config = _high_quality_cache_config()
         elif self._configured_backend == "cache_dit" and quality is None:

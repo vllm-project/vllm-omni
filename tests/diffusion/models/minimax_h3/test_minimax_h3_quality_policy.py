@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -55,6 +55,7 @@ def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
 
     policy = MiniMaxH3QualityPolicy(
         _quality_od_config(
+            cache_backend="none",
             enable_layerwise_offload=True,
             enforce_eager=False,
             num_gpus=1,
@@ -158,23 +159,6 @@ def test_h3_force_refresh_requires_active_cache_target(cache_backend, quality):
         )
 
 
-def test_high_quality_requires_cache_dit_startup_capability():
-    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
-        MiniMaxH3QualityPolicy,
-    )
-
-    policy = MiniMaxH3QualityPolicy(
-        _quality_od_config(cache_backend="none"),
-    )
-
-    with pytest.raises(OmniClientError, match="requires the server to start") as exc_info:
-        _resolve_quality(policy)
-
-    output = DiffusionOutput.from_exception(exc_info.value)
-    assert output.error_status_code == 400
-    assert output.error_type == "BadRequestError"
-
-
 @pytest.mark.parametrize(
     ("cache_backend", "quality", "expected_key"),
     [
@@ -183,6 +167,7 @@ def test_high_quality_requires_cache_dit_startup_capability():
         ("cache_dit", "high", "minimax_h3.high"),
         ("none", None, None),
         ("none", "lossless", None),
+        ("none", "high", "minimax_h3.high"),
     ],
 )
 def test_model_policy_owns_request_cache_target(cache_backend, quality, expected_key):
