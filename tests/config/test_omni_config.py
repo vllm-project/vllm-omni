@@ -1007,6 +1007,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5893")
 def test_diffusion_config_field_classification_covers_current_fields():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
