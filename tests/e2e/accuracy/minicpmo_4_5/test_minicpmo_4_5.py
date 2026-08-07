@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
+"""MiniCPM-o 4.5 Daily-Omni + Seed-TTS + Video-MME accuracy regression coverage.
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
 ~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
 text modalities with ``use_tts_template``, and server ``--interleave-mm-strings``
 + 1fps / 128-frame media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+
+Video-MME settings follow OpenBMB OmniEvalKit MiniCPM ``videomme`` (w/o subs):
+``minicpm-frames``, ``max_frames=96``, ``temperature=0``, ``output_len=128``.
+Official MiniCPM-o 4.5 reports **70.4**; the gate is **0.68** (~2pp margin).
 """
 
 from __future__ import annotations
@@ -35,9 +39,15 @@ _RESULT_DIR = Path(
 )
 
 _MIN_DAILY_OMNI_ACCURACY = 0.78
+# MiniCPM-o 4.5 reports 70.4 on Video-MME (w/o subs); ~2pp margin like Daily-Omni.
+_MIN_VIDEOMME_ACCURACY = float(os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY", "0.68"))
 _MAX_SEED_TTS_MEAN_WER = 0.05
-# Match the validated Daily-Omni client body from daily_omni_bench.sh.
+# Match the validated Daily-Omni / Video-MME client body from the MiniCPM run scripts.
 _DAILY_EXTRA_BODY = {
+    "modalities": ["text"],
+    "chat_template_kwargs": {"enable_thinking": False},
+}
+_VIDEOMME_EXTRA_BODY = {
     "modalities": ["text"],
     "chat_template_kwargs": {"enable_thinking": False},
 }
@@ -58,6 +68,15 @@ _DAILY_OMNI_SERVER_ARGS = [
     "--media-io-kwargs",
     '{"video":{"fps":1,"num_frames":128}}',
 ]
+# Video-MME ``minicpm-frames`` sends sampled frames as image_url (no AV interleave).
+# Allow local ``file://`` frame-cache URLs so CI does not need megabyte-scale base64
+# payloads; the autouse fixture still appends ``--videomme-inline-local-video`` when
+# the allowlist is unavailable.
+_VIDEOMME_SERVER_ARGS = [
+    "--trust-remote-code",
+    "--allowed-local-media-path",
+    os.environ.get("VLLM_TEST_ALLOWED_LOCAL_MEDIA_PATH", "/"),
+]
 _SEED_TTS_SERVER_ARGS = [
     "--trust-remote-code",
 ]
@@ -69,6 +88,14 @@ daily_test_params = [
         model=_MODEL,
         stage_config_path=_DEPLOY_CONFIG,
         server_args=list(_DAILY_OMNI_SERVER_ARGS),
+    )
+]
+
+videomme_test_params = [
+    OmniServerParams(
+        model=_MODEL,
+        stage_config_path=_DEPLOY_CONFIG,
+        server_args=list(_VIDEOMME_SERVER_ARGS),
     )
 ]
 
@@ -88,18 +115,53 @@ def _require_vllm_cli() -> None:
         pytest.skip(str(exc))
 
 
-@pytest.fixture(autouse=True)
-def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inline cached Hub/local videos because the test server has no local-media allowlist."""
-    original = _acc_bench.daily_omni_bench_argv
+def _optional_local_videomme_dataset_path() -> str | None:
+    """Return an explicit local Video-MME root, or ``None`` to use the Hub default.
 
-    def _wrapped() -> list[str]:
-        argv = list(original())
+    Same rule as Daily-Omni / Seed-TTS: only an env-provided existing directory counts as
+    local. Hard-coded workspace paths are intentionally not probed so CI defaults to
+    ``lmms-lab/Video-MME`` via ``--videomme-repo``.
+    """
+    for key in ("VLLM_VIDEOMME_DATASET_PATH", "VIDEOMME_ROOT"):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if path.is_absolute() and path.is_dir():
+            return str(path.resolve())
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _inline_local_media_when_needed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inline Hub/local media when the server has no usable local-media allowlist.
+
+    Daily-Omni always inlines (matches the historical Qwen/MiniCPM accuracy fixture).
+    Video-MME prefers ``file://`` via ``--allowed-local-media-path`` (see
+    ``_VIDEOMME_SERVER_ARGS``); force inline only when ``VLLM_VIDEOMME_FORCE_INLINE=1``.
+    """
+    original_daily = _acc_bench.daily_omni_bench_argv
+    original_videomme = _acc_bench.videomme_bench_argv
+
+    def _wrap_daily() -> list[str]:
+        argv = list(original_daily())
         if "--daily-omni-inline-local-video" not in argv:
             argv.append("--daily-omni-inline-local-video")
         return argv
 
-    monkeypatch.setattr(_acc_bench, "daily_omni_bench_argv", _wrapped)
+    def _wrap_videomme() -> list[str]:
+        argv = list(original_videomme())
+        force_inline = os.environ.get("VLLM_VIDEOMME_FORCE_INLINE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if force_inline and "--videomme-inline-local-video" not in argv:
+            argv.append("--videomme-inline-local-video")
+        return argv
+
+    monkeypatch.setattr(_acc_bench, "daily_omni_bench_argv", _wrap_daily)
+    monkeypatch.setattr(_acc_bench, "videomme_bench_argv", _wrap_videomme)
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
@@ -114,6 +176,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
         omni_server,
         skip_seed=True,
         skip_daily=False,
+        skip_videomme=True,
     )
     argv.extend(
         [
@@ -139,6 +202,55 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", videomme_test_params, indirect=True)
+def test_minicpmo_4_5_videomme_accuracy_bench(omni_server) -> None:
+    """Gate MiniCPM-o 4.5 Video-MME (w/o subs) overall accuracy at the OmniEvalKit recipe."""
+    _require_vllm_cli()
+    pytest.importorskip("datasets")
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("av")
+
+    dataset_path = _optional_local_videomme_dataset_path()
+    num_prompts = int(os.environ.get("ACC_BENCH_VIDEOMME_NUM_PROMPTS", "2700"))
+    max_concurrency = int(os.environ.get("ACC_BENCH_VIDEOMME_MAX_CONCURRENCY", "4"))
+
+    argv = build_acc_benchmark_cli_argv(
+        omni_server,
+        skip_seed=True,
+        skip_daily=True,
+        skip_videomme=False,
+        num_prompts=num_prompts,
+        max_concurrency=max_concurrency,
+    )
+    argv.extend(
+        [
+            "--result-dir",
+            str(_RESULT_DIR),
+            "--min-videomme-accuracy",
+            str(_MIN_VIDEOMME_ACCURACY),
+            "--temperature",
+            "0",
+            "--output-len",
+            "128",
+            "--videomme-pack-mode",
+            "minicpm-frames",
+            "--videomme-max-frames",
+            "96",
+            "--videomme-duration",
+            os.environ.get("ACC_BENCH_VIDEOMME_DURATION", "all"),
+            "--videomme-extra-body-json",
+            json.dumps(_VIDEOMME_EXTRA_BODY, separators=(",", ":")),
+            "--trust-remote-code",
+        ]
+    )
+    # Absolute local root only; otherwise --videomme-repo (Hub) from build_acc_benchmark_cli_argv.
+    if dataset_path is not None:
+        argv.extend(["--videomme-dataset-path", dataset_path])
+
+    assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
+
+
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
 def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -148,6 +260,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
         omni_server,
         skip_seed=False,
         skip_daily=True,
+        skip_videomme=True,
         max_concurrency=4,
     )
     argv.extend(
@@ -176,6 +289,7 @@ def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
         omni_server,
         skip_seed=False,
         skip_daily=True,
+        skip_videomme=True,
         num_prompts=50,
         max_concurrency=1,
     )

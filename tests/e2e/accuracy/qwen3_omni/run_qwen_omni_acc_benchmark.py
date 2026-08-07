@@ -11,6 +11,9 @@ H100 / MI325) because they launch the live Omni server inside the test.
    run **fails** if accuracy is strictly below **0.69** (``--min-daily-omni-accuracy`` / ``ACC_BENCH_MIN_DAILY_OMNI_ACCURACY``).
 2. **Seed-TTS** — ``seed-tts-eval``-style metrics when ``--seed-tts-wer-eval`` is used
    (WER / SIM / UTMOS keys from :func:`compute_seed_tts_wer_metrics`).
+3. **Video-MME** — opt-in via ``--run-videomme`` (skipped by default so Daily-Omni / Seed-TTS callers
+   stay unchanged). MiniCPM-o 4.5 reports **70.4** on Video-MME (w/o subs); the default floor is
+   **0.68** (``--min-videomme-accuracy`` / ``ACC_BENCH_MIN_VIDEOMME_ACCURACY``).
 
 Prerequisites
 -------------
@@ -21,7 +24,8 @@ Prerequisites
   On L4 you may need a smaller checkpoint, quantization, or tighter engine flags; this script
   only drives the **client** benchmark.
 
-* ``vllm`` CLI from **vLLM-Omni** (so ``bench serve`` registers ``daily-omni`` / ``seed-tts``).
+* ``vllm`` CLI from **vLLM-Omni** (so ``bench serve`` registers ``daily-omni`` / ``seed-tts`` /
+  ``videomme``).
 
 * **Daily-Omni** — if local ``qa.json`` + ``Videos/`` are not both provided (CLI or matching env),
   the client passes ``--dataset-path`` with a Hub id (default ``liarliar/Daily-Omni``). The **child**
@@ -30,6 +34,13 @@ Prerequisites
   extracts ``Videos.tar`` from the Hub (``huggingface_hub``) on first multimodal request. Override
   the dataset repo with ``--daily-omni-repo`` or ``VLLM_DAILY_OMNI_REPO``; override the tar repo
   with ``VLLM_DAILY_OMNI_MEDIA_REPO`` if needed.
+
+* **Video-MME** — by default ``--dataset-path`` is the Hub id ``lmms-lab/Video-MME`` (override with
+  ``--videomme-repo`` / ``VLLM_VIDEOMME_REPO``). The child bench downloads parquet + video archives via
+  ``huggingface_hub.snapshot_download`` (needs ``huggingface_hub``, network or HF cache). Pass an
+  existing local root with ``--videomme-dataset-path`` / ``VLLM_VIDEOMME_DATASET_PATH`` /
+  ``VIDEOMME_ROOT`` to skip the Hub download. For CI servers without ``--allowed-local-media-path``,
+  pass ``--videomme-inline-local-video`` (or rely on the pytest fixture that appends it).
 
 * **Seed-TTS** optional extras for WER/SIM/UTMOS::
 
@@ -55,6 +66,18 @@ Skip one suite, tighten gates::
         --skip-daily-omni \\
         --max-seed-tts-mean-wer 0.35 \\
         --min-seed-tts-mean-sim 0.75
+
+MiniCPM-o Video-MME (w/o subs)::
+
+    python tests/e2e/accuracy/qwen3_omni/run_qwen_omni_acc_benchmark.py \\
+        --skip-daily-omni --skip-seed-tts --run-videomme \\
+        --videomme-pack-mode minicpm-frames \\
+        --videomme-max-frames 96 \\
+        --temperature 0 --output-len 128 \\
+        --min-videomme-accuracy 0.68
+
+    # Optional local mirror (absolute path) instead of Hub download:
+    #   --videomme-dataset-path /path/to/Video-MME
 """
 
 from __future__ import annotations
@@ -75,6 +98,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     load_benchmark_result,
     run_vllm_bench_subprocess,
     seed_tts_bench_argv,
+    videomme_bench_argv,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -99,6 +123,20 @@ def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) 
         errs.append("daily_omni_evaluated_ok is 0; no successful MCQ rows to score.")
     if min_accuracy is not None and float(acc) + 1e-12 < float(min_accuracy):
         errs.append(f"daily_omni_accuracy={acc:.6f} < --min-daily-omni-accuracy={min_accuracy}")
+    return errs
+
+
+def _validate_videomme(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+    errs: list[str] = []
+    acc = result.get("videomme_accuracy")
+    if acc is None:
+        errs.append("Missing videomme_accuracy (wrong dataset or no gold-evaluated rows).")
+        return errs
+    ev = int(result.get("videomme_evaluated_ok", 0) or 0)
+    if ev <= 0:
+        errs.append("videomme_evaluated_ok is 0; no successful MCQ rows to score.")
+    if min_accuracy is not None and float(acc) + 1e-12 < float(min_accuracy):
+        errs.append(f"videomme_accuracy={acc:.6f} < --min-videomme-accuracy={min_accuracy}")
     return errs
 
 
@@ -130,7 +168,7 @@ def _validate_seed_tts(
 
 
 def sync_dataset_env_from_ns(ns: argparse.Namespace) -> None:
-    """Mirror CLI path flags into env vars read by ``daily_omni_bench_argv`` / ``seed_tts_bench_argv``."""
+    """Mirror CLI path flags into env vars read by dataset ``*_bench_argv`` helpers."""
     repo = getattr(ns, "daily_omni_repo", None)
     if repo is not None and str(repo).strip():
         os.environ["VLLM_DAILY_OMNI_REPO"] = str(repo).strip()
@@ -138,6 +176,14 @@ def sync_dataset_env_from_ns(ns: argparse.Namespace) -> None:
         os.environ["VLLM_DAILY_OMNI_QA_JSON"] = str(Path(ns.daily_omni_qa_json).expanduser().resolve())
     if ns.daily_omni_video_dir is not None:
         os.environ["VLLM_DAILY_OMNI_VIDEO_DIR"] = str(Path(ns.daily_omni_video_dir).expanduser().resolve())
+    vm_repo = getattr(ns, "videomme_repo", None)
+    if vm_repo is not None and str(vm_repo).strip():
+        os.environ["VLLM_VIDEOMME_REPO"] = str(vm_repo).strip()
+    vm_path = getattr(ns, "videomme_dataset_path", None)
+    if vm_path is not None and str(vm_path).strip():
+        raw = str(vm_path).strip()
+        p = Path(raw).expanduser()
+        os.environ["VLLM_VIDEOMME_DATASET_PATH"] = str(p.resolve()) if p.exists() and p.is_dir() else raw
     if ns.seed_tts_dataset_path is not None:
         # ``--seed-tts-dataset-path`` accepts either a local directory or a
         # Hugging Face repo id. Only resolve to an absolute filesystem path
@@ -157,6 +203,9 @@ def _preserve_benchmark_dataset_env() -> Any:
         "VLLM_DAILY_OMNI_REPO",
         "VLLM_DAILY_OMNI_QA_JSON",
         "VLLM_DAILY_OMNI_VIDEO_DIR",
+        "VLLM_VIDEOMME_REPO",
+        "VLLM_VIDEOMME_DATASET_PATH",
+        "VIDEOMME_ROOT",
         "VLLM_SEED_TTS_DATASET_PATH",
         "SEED_TTS_ROOT",
     )
@@ -217,6 +266,46 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
         argv.extend(["--daily-omni-pack-mode", pack_mode])
     if ns.daily_omni_save_eval_items:
         argv.append("--daily-omni-save-eval-items")
+    print("\n$", vllm, *argv, "\n", flush=True)
+    run_vllm_bench_subprocess(vllm, argv)
+    out = Path(ns.result_dir) / result_filename
+    if not out.is_file():
+        raise FileNotFoundError(f"Expected result JSON at {out}")
+    return out
+
+
+def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
+    ns.result_dir.mkdir(parents=True, exist_ok=True)
+    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result_filename = f"omni_acc_videomme_{tag}.json"
+    extra = json.loads(ns.videomme_extra_body_json)
+    argv = (
+        _build_common_args(ns, result_filename=result_filename)
+        + videomme_bench_argv()
+        + [
+            "--disable-shuffle",
+            "--videomme-pack-mode",
+            ns.videomme_pack_mode,
+            "--videomme-duration",
+            ns.videomme_duration,
+            "--extra-body",
+            json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
+        ]
+    )
+    if ns.videomme_max_frames is not None:
+        argv.extend(["--videomme-max-frames", str(int(ns.videomme_max_frames))])
+    if ns.videomme_use_subtitle:
+        argv.append("--videomme-use-subtitle")
+    if ns.videomme_inline_local_video:
+        argv.append("--videomme-inline-local-video")
+    if ns.videomme_save_eval_items:
+        argv.append("--videomme-save-eval-items")
+    if ns.videomme_video_dir is not None:
+        argv.extend(["--videomme-video-dir", str(Path(ns.videomme_video_dir).expanduser().resolve())])
+    if ns.videomme_parquet is not None:
+        argv.extend(["--videomme-parquet", str(Path(ns.videomme_parquet).expanduser().resolve())])
+    if ns.videomme_subtitle_dir is not None:
+        argv.extend(["--videomme-subtitle-dir", str(Path(ns.videomme_subtitle_dir).expanduser().resolve())])
     print("\n$", vllm, *argv, "\n", flush=True)
     run_vllm_bench_subprocess(vllm, argv)
     out = Path(ns.result_dir) / result_filename
@@ -312,6 +401,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--skip-daily-omni", action="store_true")
     p.add_argument("--skip-seed-tts", action="store_true")
+    # Video-MME is opt-in: default skip=True so existing Daily-Omni / Seed-TTS callers stay unchanged.
+    p.set_defaults(skip_videomme=True)
+    p.add_argument(
+        "--skip-videomme",
+        action="store_true",
+        dest="skip_videomme",
+        help="Skip Video-MME (default).",
+    )
+    p.add_argument(
+        "--run-videomme",
+        action="store_false",
+        dest="skip_videomme",
+        help="Enable the Video-MME accuracy suite.",
+    )
 
     p.add_argument(
         "--daily-omni-repo",
@@ -356,6 +459,87 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=float((os.environ.get("ACC_BENCH_MIN_DAILY_OMNI_ACCURACY") or "0.69").strip() or "0.69"),
         help="Fail when daily_omni_accuracy is strictly below this threshold (0–1). "
         "Default baseline 0.69; override with env ACC_BENCH_MIN_DAILY_OMNI_ACCURACY or pass 0 to disable the floor.",
+    )
+
+    p.add_argument(
+        "--videomme-repo",
+        type=str,
+        default=None,
+        help="Hugging Face dataset id for Video-MME Hub mode (sets VLLM_VIDEOMME_REPO). "
+        "Default when no local path is set: lmms-lab/Video-MME. "
+        "Ignored when a local --videomme-dataset-path / VLLM_VIDEOMME_DATASET_PATH is used.",
+    )
+    p.add_argument(
+        "--videomme-dataset-path",
+        type=str,
+        default=None,
+        help="Optional local Video-MME root (parquet + videos). Existing directories skip the Hub "
+        "download; Hub ids are also accepted and passed through as --dataset-path. "
+        "Sets VLLM_VIDEOMME_DATASET_PATH.",
+    )
+    p.add_argument(
+        "--videomme-parquet",
+        type=Path,
+        default=None,
+        help="Optional explicit path to videomme/test-*.parquet.",
+    )
+    p.add_argument(
+        "--videomme-video-dir",
+        type=Path,
+        default=None,
+        help="Optional explicit directory of extracted Video-MME videos.",
+    )
+    p.add_argument(
+        "--videomme-subtitle-dir",
+        type=Path,
+        default=None,
+        help="Optional subtitle directory (used with --videomme-use-subtitle).",
+    )
+    p.add_argument(
+        "--videomme-pack-mode",
+        choices=("minicpm-frames", "minicpm-interleave", "video_url"),
+        default="minicpm-frames",
+        help="Video-MME multimodal pack recipe (OmniEvalKit MiniCPM default: minicpm-frames).",
+    )
+    p.add_argument(
+        "--videomme-max-frames",
+        type=int,
+        default=None,
+        help="Override max sampled frames (OmniEvalKit: 96 for minicpm-frames, 64 for interleave).",
+    )
+    p.add_argument(
+        "--videomme-duration",
+        choices=("all", "short", "medium", "long"),
+        default="all",
+        help="Filter Video-MME by duration bucket (default: all).",
+    )
+    p.add_argument(
+        "--videomme-use-subtitle",
+        action="store_true",
+        help="Prepend subtitle text to the user prompt (Video-MME w/ subs).",
+    )
+    p.add_argument(
+        "--videomme-inline-local-video",
+        action="store_true",
+        help="Embed frames/audio as base64 data URLs (no --allowed-local-media-path on the server).",
+    )
+    p.add_argument(
+        "--videomme-extra-body-json",
+        default='{"modalities":["text"],"chat_template_kwargs":{"enable_thinking":false}}',
+        help="JSON merged into each chat request for Video-MME.",
+    )
+    p.add_argument(
+        "--videomme-save-eval-items",
+        action="store_true",
+        help="Include per-request Video-MME accuracy rows in the saved JSON.",
+    )
+    p.add_argument(
+        "--min-videomme-accuracy",
+        type=float,
+        default=float((os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY") or "0.68").strip() or "0.68"),
+        help="Fail when videomme_accuracy is strictly below this threshold (0–1). "
+        "Default 0.68 (~2pp under MiniCPM-o 4.5 reported 70.4 w/o subs); "
+        "override with ACC_BENCH_MIN_VIDEOMME_ACCURACY or pass 0 to disable the floor.",
     )
 
     p.add_argument(
@@ -427,7 +611,7 @@ def parse_acc_benchmark_args(argv: list[str] | None = None) -> argparse.Namespac
 
 
 def run_acc_benchmark(ns: argparse.Namespace) -> int:
-    """Run Daily-Omni and/or Seed-TTS client benches against a running server; return 0 on success."""
+    """Run configured client benches against a running server; return 0 on success."""
     failed: list[str] = []
 
     with _preserve_benchmark_dataset_env():
@@ -448,6 +632,21 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 print(
                     f"[Daily-Omni] daily_omni_accuracy={data.get('daily_omni_accuracy')} "
                     f"evaluated_ok={data.get('daily_omni_evaluated_ok')}",
+                    flush=True,
+                )
+
+        if not ns.skip_videomme:
+            path = run_videomme(ns, vllm)
+            print(f"\n[Video-MME] result JSON: {path}", flush=True)
+            data = load_benchmark_result(path)
+            errs = _validate_videomme(data, min_accuracy=ns.min_videomme_accuracy)
+            if errs:
+                failed.extend([f"[Video-MME] {e}" for e in errs])
+            else:
+                print(
+                    f"[Video-MME] videomme_accuracy={data.get('videomme_accuracy')} "
+                    f"evaluated_ok={data.get('videomme_evaluated_ok')} "
+                    f"per_duration={data.get('videomme_per_duration_accuracy')}",
                     flush=True,
                 )
 

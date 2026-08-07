@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared helpers for Qwen3-Omni Daily-Omni / Seed-TTS ``vllm bench serve --omni`` accuracy runs.
+"""Shared helpers for Omni Daily-Omni / Seed-TTS / Video-MME ``vllm bench serve --omni`` accuracy runs.
 
 Local dataset paths are **optional**. When ``VLLM_DAILY_OMNI_QA_JSON`` + ``VLLM_DAILY_OMNI_VIDEO_DIR``
 point to existing files, those are used with inline video. Otherwise the benchmark falls back to
@@ -8,6 +8,10 @@ bench request that needs media downloads ``Videos.tar`` from the Hub when no vid
 
 Similarly for Seed-TTS: a local directory wins; otherwise ``--dataset-path`` uses the Hub id
 and ``huggingface_hub.snapshot_download`` inside ``resolve_seed_tts_root`` pulls files on demand.
+
+Video-MME follows the same pattern: an existing local directory via ``VLLM_VIDEOMME_DATASET_PATH`` /
+``VIDEOMME_ROOT`` (or ``--videomme-dataset-path`` / ``--dataset-path``) wins; otherwise the Hub id
+``lmms-lab/Video-MME`` is used and ``resolve_videomme_root`` downloads parquet + video archives.
 
 Use :func:`build_acc_benchmark_cli_argv` to assemble ``argv`` for a live Omni server (host/port/model
 and small bench defaults) before ``parse_args`` / ``run_acc_benchmark`` in the accuracy driver.
@@ -25,6 +29,7 @@ from typing import Any, Protocol
 
 DEFAULT_DAILY_OMNI_HF_REPO = "liarliar/Daily-Omni"
 DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
+DEFAULT_VIDEOMME_HF_REPO = "lmms-lab/Video-MME"
 
 
 class OmniBenchServerEndpoint(Protocol):
@@ -40,6 +45,7 @@ def build_acc_benchmark_cli_argv(
     *,
     skip_seed: bool,
     skip_daily: bool,
+    skip_videomme: bool = True,
     num_prompts: int | None = None,
     max_concurrency: int | None = None,
 ) -> list[str]:
@@ -49,6 +55,9 @@ def build_acc_benchmark_cli_argv(
     ``--num-prompts`` / ``--max-concurrency`` defaults (overridable via ``ACC_BENCH_NUM_PROMPTS`` /
     ``ACC_BENCH_MAX_CONCURRENCY``), and when Daily-Omni runs adds ``--daily-omni-repo`` so Hub QA
     matches :func:`daily_omni_bench_argv` once ``run_acc_benchmark`` mirrors ``--daily-omni-repo`` into env.
+
+    Video-MME is **opt-in** (``skip_videomme=True`` by default) so existing Daily-Omni / Seed-TTS
+    callers stay unchanged; pass ``skip_videomme=False`` (emits ``--run-videomme``) to enable it.
     """
     n_prompts = int(os.environ.get("ACC_BENCH_NUM_PROMPTS", "2000")) if num_prompts is None else int(num_prompts)
     n_conc = int(os.environ.get("ACC_BENCH_MAX_CONCURRENCY", "10")) if max_concurrency is None else int(max_concurrency)
@@ -71,6 +80,12 @@ def build_acc_benchmark_cli_argv(
         argv.append("--skip-seed-tts")
     if skip_daily:
         argv.append("--skip-daily-omni")
+    if skip_videomme:
+        argv.append("--skip-videomme")
+    else:
+        argv.append("--run-videomme")
+        repo = os.environ.get("VLLM_VIDEOMME_REPO", DEFAULT_VIDEOMME_HF_REPO).strip() or DEFAULT_VIDEOMME_HF_REPO
+        argv.extend(["--videomme-repo", repo])
     return argv
 
 
@@ -95,6 +110,43 @@ def daily_omni_bench_argv() -> list[str]:
     return [
         "--dataset-name",
         "daily-omni",
+        "--dataset-path",
+        repo,
+    ]
+
+
+def videomme_bench_argv() -> list[str]:
+    """CLI args for Video-MME (after ``vllm bench serve --omni``).
+
+    Same local-vs-Hub rule as :func:`seed_tts_bench_argv`:
+
+    * If ``VLLM_VIDEOMME_DATASET_PATH`` / ``VIDEOMME_ROOT`` names an existing directory,
+      use that local mirror as ``--dataset-path``.
+    * Otherwise pass the Hub id (``VLLM_VIDEOMME_REPO`` / ``lmms-lab/Video-MME``); the child
+      bench downloads via ``huggingface_hub.snapshot_download``.
+    """
+    root = os.environ.get("VLLM_VIDEOMME_DATASET_PATH", "").strip() or os.environ.get("VIDEOMME_ROOT", "").strip()
+    if root:
+        p = Path(root).expanduser()
+        # Preserve Hub ids verbatim. Only canonicalize when the value is a real directory.
+        if p.exists() and p.is_dir():
+            return [
+                "--dataset-name",
+                "videomme",
+                "--dataset-path",
+                str(p.resolve()),
+            ]
+        # Non-directory values (e.g. accidental Hub id in DATASET_PATH) fall through as path.
+        return [
+            "--dataset-name",
+            "videomme",
+            "--dataset-path",
+            root,
+        ]
+    repo = os.environ.get("VLLM_VIDEOMME_REPO", DEFAULT_VIDEOMME_HF_REPO).strip() or DEFAULT_VIDEOMME_HF_REPO
+    return [
+        "--dataset-name",
+        "videomme",
         "--dataset-path",
         repo,
     ]
@@ -207,6 +259,12 @@ def assert_daily_omni_scored(result: dict[str, Any]) -> None:
     acc = result.get("daily_omni_accuracy")
     assert acc is not None, "daily_omni_accuracy missing — wrong dataset or benchmark wiring"
     assert int(result.get("daily_omni_evaluated_ok", 0) or 0) > 0, "no successful MCQ rows (daily_omni_evaluated_ok==0)"
+
+
+def assert_videomme_scored(result: dict[str, Any]) -> None:
+    acc = result.get("videomme_accuracy")
+    assert acc is not None, "videomme_accuracy missing — wrong dataset or benchmark wiring"
+    assert int(result.get("videomme_evaluated_ok", 0) or 0) > 0, "no successful MCQ rows (videomme_evaluated_ok==0)"
 
 
 def assert_seed_tts_scored(result: dict[str, Any]) -> None:

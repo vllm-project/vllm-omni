@@ -56,6 +56,18 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.data_modules.videomme_dataset import (
+    VIDEOMME_DEFAULT_HF_REPO,
+    VideoMMEDataset,
+    VideoMMESampleRequest,
+    ensure_videomme_subtitles_extracted,
+    ensure_videomme_videos_extracted,
+    resolve_videomme_local_root,
+    resolve_videomme_root,
+    videomme_local_parquet,
+    videomme_local_subtitle_dir,
+    videomme_local_video_dir,
+)
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
     summarize_session_request_metrics,
@@ -151,6 +163,7 @@ def _pcm_s16le_to_seed_tts_wer_bytes(
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
+_DEFAULT_VIDEOMME_REPO = VIDEOMME_DEFAULT_HF_REPO
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -181,6 +194,17 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
 def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni."""
     if not isinstance(sample, DailyOmniSampleRequest):
+        return
+    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
+    if sample.omni_chat_messages is not None:
+        setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+    else:
+        setattr(rfi, "mm_position", sample.omni_chat_mm_position)
+
+
+def _attach_videomme_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Apply per-request OpenAI fields for Video-MME (same message path as Daily-Omni)."""
+    if not isinstance(sample, VideoMMESampleRequest):
         return
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
@@ -238,10 +262,26 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
+def _videomme_repo_from_args(args) -> str | None:
+    """Resolve HuggingFace repo id for Video-MME from CLI args."""
+    dp = getattr(args, "dataset_path", None)
+    hn = getattr(args, "hf_name", None)
+    supported = {p.lower() for p in VideoMMEDataset.SUPPORTED_DATASET_PATHS}
+    supported.add(_DEFAULT_VIDEOMME_REPO.lower())
+    if isinstance(dp, str) and dp.strip().lower() in supported:
+        return dp.strip()
+    if isinstance(hn, str) and hn.strip().lower() in supported:
+        return hn.strip()
+    return None
+
+
 def get_samples(args, tokenizer):
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
+    )
+    is_videomme = args.dataset_name == "videomme" or (
+        args.dataset_name == "hf" and _videomme_repo_from_args(args) is not None
     )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
@@ -258,7 +298,7 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_videomme or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -375,6 +415,113 @@ def get_samples(args, tokenizer):
             no_oversample=args.no_oversample,
         )
         return input_requests
+
+    if is_videomme:
+        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+            raise ValueError(
+                f"Video-MME dataset requires a multimodal backend that supports video. "
+                f"Got backend='{args.backend}'. Please use '--backend openai-chat-omni'"
+            )
+
+        video_dir = getattr(args, "videomme_video_dir", None)
+        subtitle_dir = getattr(args, "videomme_subtitle_dir", None)
+        parquet_path = getattr(args, "videomme_parquet", None)
+        if isinstance(parquet_path, str):
+            parquet_path = parquet_path.strip() or None
+        dataset_split = getattr(args, "hf_split", None) or "test"
+
+        # Local directory wins (absolute/relative existing path). Hub ids fall through to
+        # snapshot_download — same pattern as Seed-TTS / Daily-Omni.
+        local_root = resolve_videomme_local_root(getattr(args, "dataset_path", None)) or (
+            resolve_videomme_local_root(getattr(args, "hf_name", None))
+        )
+        repo_id = _videomme_repo_from_args(args)
+        if local_root is None and video_dir is None and parquet_path is None:
+            # Default Hub mode: download parquet + video zips on demand.
+            if args.dataset_name == "videomme":
+                hub_id = repo_id or _DEFAULT_VIDEOMME_REPO
+            elif repo_id is not None:
+                hub_id = repo_id
+            else:
+                raise ValueError(
+                    "Video-MME requires --videomme-parquet, a local --dataset-path mirror, or "
+                    f"--dataset-path / --hf-name {_DEFAULT_VIDEOMME_REPO}."
+                )
+            local_root = resolve_videomme_root(hub_id)
+            repo_id = hub_id
+            logger.info("Using Hugging Face Video-MME snapshot: root=%s repo=%s", local_root, hub_id)
+        elif local_root is not None:
+            logger.info("Using local Video-MME mirror: root=%s", local_root)
+
+        if local_root is not None:
+            if parquet_path is None:
+                local_pq = videomme_local_parquet(local_root)
+                if local_pq is not None:
+                    parquet_path = str(local_pq)
+            if video_dir is None:
+                try:
+                    video_dir = str(ensure_videomme_videos_extracted(local_root))
+                except FileNotFoundError:
+                    found = videomme_local_video_dir(local_root)
+                    video_dir = str(found) if found is not None else None
+            if subtitle_dir is None:
+                found_sub = ensure_videomme_subtitles_extracted(local_root) or videomme_local_subtitle_dir(local_root)
+                subtitle_dir = str(found_sub) if found_sub is not None else None
+
+        if parquet_path is None:
+            if args.dataset_name == "videomme":
+                repo_id = repo_id or (str(local_root) if local_root is not None else _DEFAULT_VIDEOMME_REPO)
+            elif repo_id is None and local_root is None:
+                raise ValueError(
+                    "Video-MME requires --videomme-parquet, a local --dataset-path mirror, or "
+                    f"--dataset-path / --hf-name {_DEFAULT_VIDEOMME_REPO}."
+                )
+
+        if video_dir is None:
+            raise ValueError(
+                "Video-MME requires --videomme-video-dir pointing at extracted videos "
+                "(directory of {videoID}.mp4), or a local/Hub dataset root containing video/ "
+                "or videos_chunked_*.zip."
+            )
+
+        logger.info(
+            "Loading Video-MME: parquet=%s, hf_repo=%s, video_dir=%s, pack_mode=%s",
+            parquet_path,
+            repo_id,
+            video_dir,
+            getattr(args, "videomme_pack_mode", "minicpm-frames"),
+        )
+        dataset = VideoMMEDataset(
+            parquet_path=parquet_path,
+            dataset_path=None if parquet_path is not None else (repo_id or str(local_root)),
+            dataset_split=dataset_split,
+            dataset_subset=getattr(args, "hf_subset", None),
+            random_seed=args.seed,
+            video_dir=video_dir,
+            subtitle_dir=subtitle_dir,
+            pack_mode=getattr(args, "videomme_pack_mode", "minicpm-frames"),
+            max_frames=getattr(args, "videomme_max_frames", None),
+            duration_filter=getattr(args, "videomme_duration", "all"),
+            use_subtitle=getattr(args, "videomme_use_subtitle", False),
+            inline_local_video=getattr(args, "videomme_inline_local_video", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            no_stream=getattr(args, "no_stream", False),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        if out_len is None:
+            out_len = VideoMMEDataset.DEFAULT_OUTPUT_LEN
+
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
 
     if is_seed_tts:
         if args.backend not in (
@@ -1645,6 +1792,7 @@ async def benchmark(
         chat_messages=test_chat_messages,
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
+    _attach_videomme_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
@@ -1710,6 +1858,7 @@ async def benchmark(
             chat_messages=test_chat_messages,
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
+        _attach_videomme_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
@@ -1795,6 +1944,7 @@ async def benchmark(
             chat_messages=request.chat_messages,
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
+        _attach_videomme_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
@@ -1891,6 +2041,21 @@ async def benchmark(
     if _daily_acc is not None:
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
+
+    from vllm_omni.benchmarks.data_modules.videomme_eval import (
+        compute_videomme_accuracy_metrics,
+        print_videomme_accuracy_summary,
+    )
+
+    _save_vm = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _vm_acc = compute_videomme_accuracy_metrics(input_requests, outputs, include_per_item=_save_vm)
+    if _vm_acc is not None:
+        result.update(_vm_acc)
+        print_videomme_accuracy_summary(_vm_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
