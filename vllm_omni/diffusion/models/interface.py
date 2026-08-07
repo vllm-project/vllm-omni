@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -39,20 +38,6 @@ class ReferenceVideoDecodeSpec:
 class OutputDimensions:
     width: int
     height: int
-
-
-@runtime_checkable
-class SupportsOutputDimensions(Protocol):
-    """Resolve the effective output dimensions before request dispatch."""
-
-    @classmethod
-    def resolve_output_dimensions(
-        cls,
-        *,
-        width: int | None = None,
-        height: int | None = None,
-        extra_args: Mapping[str, Any] | None = None,
-    ) -> OutputDimensions | None: ...
 
 
 @runtime_checkable

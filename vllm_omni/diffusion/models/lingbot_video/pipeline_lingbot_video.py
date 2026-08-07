@@ -21,11 +21,9 @@ from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import (
-    OutputDimensions,
     SupportImageInput,
     SupportsComponentDiscovery,
     SupportsOutputCountLimit,
-    SupportsOutputDimensions,
 )
 from vllm_omni.diffusion.models.lingbot_video.image_condition import (
     LingBotImageCondition,
@@ -36,7 +34,6 @@ from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import L
 from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     LingBotGenerationMode,
     normalize_lingbot_request,
-    resolve_lingbot_output_dimensions,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -310,7 +307,6 @@ class LingBotVideoPipeline(
     SupportImageInput,
     ProgressBarMixin,
     SupportsComponentDiscovery,
-    SupportsOutputDimensions,
     SupportsOutputCountLimit,
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
@@ -326,21 +322,6 @@ class LingBotVideoPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
-
-    @classmethod
-    def resolve_output_dimensions(
-        cls,
-        *,
-        width: int | None = None,
-        height: int | None = None,
-        extra_args: Mapping[str, Any] | None = None,
-    ) -> OutputDimensions:
-        del cls
-        return resolve_lingbot_output_dimensions(
-            sampling_width=width,
-            sampling_height=height,
-            extra_args=extra_args,
-        )
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()

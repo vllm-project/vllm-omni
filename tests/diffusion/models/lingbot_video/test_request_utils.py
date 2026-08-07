@@ -184,14 +184,20 @@ def test_resolve_lingbot_output_dimensions_matches_request_priority():
     dimensions = resolve_lingbot_output_dimensions(
         sampling_width=480,
         sampling_height=480,
-        extra_args={"resolution": "720p", "ratio": "16:9"},
+        prompt_fields={"resolution": "720p", "ratio": "16:9"},
     )
     assert (dimensions.width, dimensions.height) == (736, 1280)
 
     dimensions = resolve_lingbot_output_dimensions(
         sampling_width=480,
         sampling_height=480,
-        extra_args={"width": 320, "height": 192},
+        prompt_fields={"width": 320, "height": 192},
+    )
+    assert (dimensions.width, dimensions.height) == (320, 192)
+
+    dimensions = resolve_lingbot_output_dimensions(
+        sampling_width=320,
+        sampling_height=192,
     )
     assert (dimensions.width, dimensions.height) == (320, 192)
 
@@ -329,34 +335,20 @@ def test_normalize_lingbot_request_rejects_contract_conflicts():
 
 
 def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
+    # A prompt-provided size overrides the sampling width/height.
+    config = _normalize(
+        {"prompt": {"caption": "motion", "size": "320x192"}, "modalities": ["video"]},
+        width=480,
+        height=480,
+        num_frames=81,
+    )
+    assert (config.height, config.width) == (192, 320)
+
+    # Without a prompt size, the sampling dimensions are used.
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
         width=480,
         height=480,
         num_frames=81,
-        extra_args={"size": "320x192"},
     )
-    assert (config.height, config.width) == (192, 320)
-
-    config = _normalize(
-        {"prompt": "motion", "modalities": ["video"]},
-        width=480,
-        height=480,
-        num_frames=81,
-        extra_args={"resolution": "192p", "ratio": "9:16"},
-    )
-    assert (config.height, config.width) == (192, 320)
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        _normalize(
-            {"prompt": "motion", "modalities": ["video"]},
-            width=480,
-            height=480,
-            num_frames=81,
-            extra_args={
-                "width": 480,
-                "height": 480,
-                "resolution": "192p",
-                "ratio": "9:16",
-            },
-        )
+    assert (config.height, config.width) == (480, 480)

@@ -300,34 +300,17 @@ def resolve_lingbot_output_dimensions(
     *,
     sampling_width: Any = None,
     sampling_height: Any = None,
-    extra_args: Mapping[str, Any] | None = None,
     prompt_fields: Mapping[str, Any] | None = None,
     default_width: int = 480,
     default_height: int = 480,
 ) -> OutputDimensions:
     """Resolve the dimensions that LingBot will use for generation."""
-    extra_args = extra_args or {}
     prompt_fields = prompt_fields or {}
-    requested_width = _first_not_none(
-        _pick(extra_args, "width"),
-        _pick(prompt_fields, "width"),
-    )
-    requested_height = _first_not_none(
-        _pick(extra_args, "height"),
-        _pick(prompt_fields, "height"),
-    )
-    size = _first_not_none(
-        _pick(extra_args, "size"),
-        _pick(prompt_fields, "size"),
-    )
-    resolution = _first_not_none(
-        _pick(extra_args, "resolution"),
-        _pick(prompt_fields, "resolution"),
-    )
-    ratio = _first_not_none(
-        _pick(extra_args, "ratio"),
-        _pick(prompt_fields, "ratio"),
-    )
+    requested_width = _pick(prompt_fields, "width")
+    requested_height = _pick(prompt_fields, "height")
+    size = _pick(prompt_fields, "size")
+    resolution = _pick(prompt_fields, "resolution")
+    ratio = _pick(prompt_fields, "ratio")
     if requested_width is not None or requested_height is not None:
         width, height = requested_width, requested_height
     elif size is not None or resolution is not None or ratio is not None:
@@ -432,7 +415,6 @@ def normalize_lingbot_request(
     dimensions = resolve_lingbot_output_dimensions(
         sampling_width=sampling.width,
         sampling_height=sampling.height,
-        extra_args=extra_args,
         prompt_fields=prompt_fields,
         default_width=default_width,
         default_height=default_height,

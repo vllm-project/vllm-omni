@@ -93,7 +93,7 @@ from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
-from vllm_omni.diffusion.models.interface import OutputDimensions, ReferenceVideoDecodeSpec
+from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
@@ -1817,23 +1817,6 @@ async def generate_images(
 
     try:
         _check_max_outputs_per_prompt(stage_configs, request.n)
-        request_width, request_height = None, None
-        if request.size is not None:
-            request_width, request_height = parse_size(request.size)
-        effective_dimensions = _resolve_output_dimensions(
-            stage_configs,
-            width=request_width,
-            height=request_height,
-            extra_args=request.extra_params,
-        )
-        app_state_args = getattr(raw_request.app.state, "args", None)
-        if effective_dimensions is not None:
-            _check_max_generated_image_size(
-                app_state_args,
-                effective_dimensions.width,
-                effective_dimensions.height,
-            )
-
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
         if len(stage_configs) > 1:
@@ -1851,6 +1834,10 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
+                parse_size(request.size)
+                width, height = parse_size(request.size)
+                app_state_args = getattr(raw_request.app.state, "args", None)
+                _check_max_generated_image_size(app_state_args, width, height)
                 extra_body["size"] = request.size
             if request.negative_prompt is not None:
                 extra_body["negative_prompt"] = request.negative_prompt
@@ -1918,10 +1905,13 @@ async def generate_images(
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
 
-        # Parse and add the standard size if provided. Model-specific
-        # aliases were already resolved above for the global size guard.
-        width, height = request_width, request_height
-        size_str = f"{width}x{height}" if width is not None and height is not None else "model default"
+        # Parse and add size if provided
+        width, height = None, None
+        if request.size:
+            width, height = parse_size(request.size)
+            size_str = f"{width}x{height}"
+        else:
+            size_str = "model default"
 
         # Keep AR stage target grid in sync with requested output size.
         # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
@@ -1933,6 +1923,9 @@ async def generate_images(
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        _check_max_generated_image_size(app_state_args, width, height)
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -2767,57 +2760,6 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
         if model_cls is not None:
             model_classes.append(model_cls)
     return model_classes
-
-
-def _normalize_output_dimensions(dimensions: OutputDimensions) -> OutputDimensions:
-    width = dimensions.width
-    height = dimensions.height
-    if (
-        isinstance(width, bool)
-        or not isinstance(width, Integral)
-        or int(width) <= 0
-        or isinstance(height, bool)
-        or not isinstance(height, Integral)
-        or int(height) <= 0
-    ):
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Invalid output dimensions: width and height must be positive integers.",
-        )
-    return OutputDimensions(width=int(width), height=int(height))
-
-
-def _resolve_output_dimensions(
-    stage_configs: list[Any] | None,
-    *,
-    width: int | None,
-    height: int | None,
-    extra_args: dict[str, Any] | None = None,
-) -> OutputDimensions | None:
-    """Resolve model-specific aliases to the dimensions used by generation."""
-    for model_cls in _diffusion_model_classes(stage_configs):
-        resolver = getattr(model_cls, "resolve_output_dimensions", None)
-        if resolver is None:
-            continue
-        try:
-            dimensions = resolver(width=width, height=height, extra_args=extra_args)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
-        if dimensions is not None:
-            if not isinstance(dimensions, OutputDimensions):
-                raise RuntimeError(
-                    f"{model_cls.__name__}.resolve_output_dimensions must return OutputDimensions or None."
-                )
-            return _normalize_output_dimensions(dimensions)
-
-    if width is None and height is None:
-        return None
-    if width is None or height is None:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Output width and height must be provided together.",
-        )
-    return _normalize_output_dimensions(OutputDimensions(width=width, height=height))
 
 
 def _check_max_outputs_per_prompt(
