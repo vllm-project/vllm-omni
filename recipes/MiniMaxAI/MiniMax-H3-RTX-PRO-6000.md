@@ -241,7 +241,7 @@ count, warmup count, and the device order used for the eight-GPU run.>
 | Measurement | Two GPUs | Four GPUs | Eight GPUs |
 | --- | ---: | ---: | ---: |
 | Client E2E (50-step T2VA) | ~10 min | Not measured| ~4 min |
-| Client E2E (60-step ref2va) | ~12 min | Not measured| ~6 min |
+| Client E2E (60-step ref2va) | ~12 min | Not measured| ~5 min |
 
 <TODO: state the remaining headroom below the reported device capacity, and
 report the measured difference between the two eight-GPU device orders.>
