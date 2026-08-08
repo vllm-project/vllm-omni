@@ -394,6 +394,7 @@ class StageDeployConfig:
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
@@ -413,6 +414,9 @@ class StageDeployConfig:
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
+    enable_distributed_layerwise_offload: bool | None = None
+    dlo_use_allgather: bool | None = None
+    dlo_resident_layers: int | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

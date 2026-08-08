@@ -33,6 +33,7 @@ EXCLUDED_MODELS = [
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
     "MiniMaxH3Pipeline",
+    "MiniMaxH3ModularPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",

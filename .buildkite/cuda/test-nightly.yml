@@ -460,6 +460,21 @@ steps:
             exit $$EXIT2
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax-H3"
+        key: nightly-diffusion-x2v-performance-minimax-h3
+        timeout_in_minutes: 180
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+        mirror_hardwares: h100_4
+
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
     depends_on: upload-nightly-pipeline

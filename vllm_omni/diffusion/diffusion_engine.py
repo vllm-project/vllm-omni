@@ -116,6 +116,16 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    dp_size = getattr(parallel_config, "data_parallel_size", 1)
+    return (
+        dp_size > 1
+        and getattr(od_config, "enable_distributed_layerwise_offload", False)
+        and getattr(od_config, "dlo_use_allgather", True)
+    )
+
+
 def _move_tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.cpu() if value.device.type != "cpu" else value
@@ -202,7 +212,7 @@ class DiffusionEngine:
             return DiffusionExecutionMode.STEP_BATCH
 
         self.supports_request_batch = supports_request_batch(od_config)
-        if not self.supports_request_batch and _max_num_seqs(od_config) > 1:
+        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
             raise ValueError(
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
                 "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
@@ -233,17 +243,10 @@ class DiffusionEngine:
         # for distributed layerwise offload (which shards weights and
         # needs all ranks active simultaneously).  Ordinary DP with a
         # non-batch pipeline should not schedule multiple requests.
-        dp_size = 1
-        if getattr(self.od_config, "parallel_config", None) is not None:
-            dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
-        dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-        if dp_size > 1 and dist_offload:
+        dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
+        if _uses_dlo_dp_concurrency(self.od_config):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
-            # Set batch admission wait so concurrent requests accumulate
-            # before scheduling.  The scheduler reads this from od_config.
-            if getattr(self.od_config, "request_batch_max_wait_ms", 0) == 0:
-                self.od_config.request_batch_max_wait_ms = 500.0
             logger.info(
                 "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
                 dp_size,

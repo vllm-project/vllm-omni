@@ -868,6 +868,7 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
         OmniDiffusionSamplingParams(
             num_inference_steps=4,
             guidance_scale=7.5,
+            quality="high",
             generator_device="cpu",
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
@@ -890,6 +891,7 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_inference_steps == 4
     assert captured.guidance_scale == 7.5
+    assert captured.quality == "high"
     assert captured.generator_device == "cpu"
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
@@ -1445,6 +1447,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
+    assert req.quality is None
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
@@ -1464,6 +1467,8 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", frame_interpolation_scale=0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", sound_duration=0)
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", quality="medium")
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -1975,6 +1980,7 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
             "num_inference_steps": "30",
             "guidance_scale": "6.5",
             "seed": "42",
+            "quality": "high",
         },
     )
     assert response.status_code == 200
@@ -1983,6 +1989,7 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.num_inference_steps == 30
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
+    assert captured.quality == "high"
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
@@ -2018,6 +2025,7 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
         OmniDiffusionSamplingParams(
             num_inference_steps=4,
             guidance_scale=7.5,
+            quality="high",
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
             frame_interpolation_scale=0.5,
@@ -2038,6 +2046,7 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_inference_steps == 4
     assert captured.guidance_scale == 7.5
+    assert captured.quality == "high"
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
