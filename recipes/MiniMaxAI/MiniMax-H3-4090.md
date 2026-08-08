@@ -49,6 +49,16 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/MiniMax-H3/FL2VA \
   --dlo-resident-layers 12 --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
+## Target-hardware validation
+
+<TODO: describe the validated host: socket and NUMA layout, PCIe-only or not, CUDA version, driver version, PyTorch version, output shape, frame count, warmup count, and the device order used for the eight-GPU run.>
+
+| Measurement | Two GPUs | Four GPUs | Eight GPUs |
+| --- | ---: | ---: | ---: |
+| Client E2E (60-step T2VA) | ~8 min | Not measured| Not measured |
+| Client E2E (60-step ref2va) | ~15 min | Not measured| Not measured |
+
+
 
 ## request example
 
@@ -61,4 +71,21 @@ curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
   -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
   -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
   -o out.mp4
+```
+```bash
+curl -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  --fail-with-body \
+  -w '\nHTTP %{http_code}\n' \
+  --max-time 1200 \
+  -F "input_reference=@/root/hand.jpg;type=image/jpeg" \
+  -F "audio_reference=</root/audio_ref.json" \
+  -F "prompt=EOF 2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
+  -F "width=1344" \
+  -F "height=768" \
+  -F "fps=24" \
+  -F "num_inference_steps=60" \
+  -F "flow_shift=12" \
+  -F "seed=1101" \
+  -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
+  -o /root/out_ref2va.mp4
 ```
