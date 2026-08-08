@@ -279,5 +279,3 @@ curl -X POST "http://127.0.0.1:${PORT}/v1/videos/sync" \
   -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
   -o /root/out_ref2va.mp4
 ```
-
-
