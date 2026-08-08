@@ -46,6 +46,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.qwen_image.fused_qk_norm_rope import (
+    qwen_image_fused_qk_norm_rope,
+)
 
 logger = init_logger(__name__)
 
@@ -637,20 +640,36 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
-
         img_cos = vid_freqs.real.to(img_query.dtype)
         img_sin = vid_freqs.imag.to(img_query.dtype)
         txt_cos = txt_freqs.real.to(txt_query.dtype)
         txt_sin = txt_freqs.imag.to(txt_query.dtype)
 
-        img_query = self.rope(img_query, img_cos, img_sin)
-        img_key = self.rope(img_key, img_cos, img_sin)
-        txt_query = self.rope(txt_query, txt_cos, txt_sin)
-        txt_key = self.rope(txt_key, txt_cos, txt_sin)
+        if self.qk_norm:
+            img_query, img_key = qwen_image_fused_qk_norm_rope(
+                img_query,
+                img_key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                img_cos,
+                img_sin,
+                self.eps,
+            )
+        else:
+            img_query = self.norm_q(img_query)
+            img_key = self.norm_k(img_key)
+            img_query = self.rope(img_query, img_cos, img_sin)
+            img_key = self.rope(img_key, img_cos, img_sin)
+
+        txt_query, txt_key = qwen_image_fused_qk_norm_rope(
+            txt_query,
+            txt_key,
+            self.norm_added_q.weight,
+            self.norm_added_k.weight,
+            txt_cos,
+            txt_sin,
+            self.eps,
+        )
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
