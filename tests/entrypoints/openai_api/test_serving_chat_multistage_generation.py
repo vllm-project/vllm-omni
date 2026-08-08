@@ -134,6 +134,87 @@ def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(servi
     assert {"type": "text", "text": "What changed?"} in stripped_content
 
 
+def test_prepare_multistage_multimodal_inputs_preserves_shared_talker_audio(serving_chat):
+    reference_audio = ([0.0, 0.25, -0.25], 16000)
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="tts", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="code2wav", requires_multimodal_data=False),
+        ]
+    )
+    serving_chat.model_config = SimpleNamespace(
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+    )
+    request = SimpleNamespace(media_io_kwargs=None)
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Clone the reference voice."},
+                {"type": "audio", "audio": reference_audio},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "Read this sentence."}]},
+    ]
+
+    rendered_messages, downstream_data = asyncio.run(
+        serving_chat._prepare_multistage_multimodal_inputs(
+            messages,
+            request,
+        )
+    )
+
+    assert rendered_messages == messages
+    assert downstream_data == {"audio": [reference_audio]}
+
+
+def test_prepare_multistage_multimodal_inputs_reads_resolved_stage_runtime(serving_chat):
+    reference_audio = ([0.0, 0.25, -0.25], 16000)
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            {
+                "engine_args": {"model_stage": "llm"},
+                "runtime": {"requires_multimodal_data": True},
+            },
+            {
+                "engine_args": {"model_stage": "tts"},
+                "runtime": {"requires_multimodal_data": True},
+            },
+            {
+                "engine_args": {"model_stage": "code2wav"},
+                "runtime": {"requires_multimodal_data": False},
+            },
+        ]
+    )
+    serving_chat.model_config = SimpleNamespace(
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+    )
+    request = SimpleNamespace(media_io_kwargs=None)
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Clone the reference voice."},
+                {"type": "audio", "audio": reference_audio},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "Read this sentence."}]},
+    ]
+
+    rendered_messages, downstream_data = asyncio.run(
+        serving_chat._prepare_multistage_multimodal_inputs(
+            messages,
+            request,
+        )
+    )
+
+    assert rendered_messages == messages
+    assert downstream_data == {"audio": [reference_audio]}
+
+
 def test_needs_multistage_multimodal_split_noops_for_single_stage(serving_chat):
     serving_chat.engine_client = SimpleNamespace(
         stage_configs=[

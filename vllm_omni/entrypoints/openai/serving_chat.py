@@ -863,7 +863,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return additional_information
 
     def _needs_multistage_multimodal_split(self) -> bool:
-        return bool(self._deferred_multimodal_modalities())
+        return bool(self._downstream_multimodal_modalities())
+
+    def _downstream_multimodal_modalities(self) -> set[str]:
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        downstream_modalities: set[str] = set()
+        for stage in stage_configs[1:]:
+            downstream_modalities.update(self._stage_input_modalities(stage))
+        return downstream_modalities
 
     def _deferred_multimodal_modalities(self) -> set[str]:
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
@@ -874,32 +881,39 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if not first_stage_modalities:
             return set()
 
-        downstream_modalities: set[str] = set()
-        for stage in stage_configs[1:]:
-            downstream_modalities.update(self._stage_input_modalities(stage))
-        return downstream_modalities - first_stage_modalities
+        return self._downstream_multimodal_modalities() - first_stage_modalities
 
-    @staticmethod
-    def _stage_input_modalities(stage: Any) -> set[str]:
-        engine_args = getattr(stage, "engine_args", None)
+    @classmethod
+    def _stage_input_modalities(cls, stage: Any) -> set[str]:
+        engine_args = cls._stage_get(stage, "engine_args")
+        runtime = cls._stage_get(stage, "runtime")
         explicit = (
-            getattr(stage, "input_modalities", None)
-            or getattr(stage, "modalities", None)
-            or getattr(engine_args, "input_modalities", None)
-            or getattr(engine_args, "modalities", None)
+            cls._stage_get(stage, "input_modalities")
+            or cls._stage_get(stage, "modalities")
+            or cls._stage_get(engine_args, "input_modalities")
+            or cls._stage_get(engine_args, "modalities")
         )
         if explicit:
             return {str(modality) for modality in as_list(explicit)}
 
-        model_stage = str(getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", "")).lower()
+        model_stage = str(
+            cls._stage_get(engine_args, "model_stage") or cls._stage_get(stage, "model_stage", "")
+        ).lower()
+        requires_multimodal_data = bool(
+            cls._stage_get(
+                runtime,
+                "requires_multimodal_data",
+                cls._stage_get(stage, "requires_multimodal_data", False),
+            )
+        )
         if model_stage in {"asr", "stt"} or model_stage.endswith("_asr"):
             return {"audio"}
         if any(name in model_stage for name in ("vision", "vl", "aura")):
             return {"image", "video"}
         if any(name in model_stage for name in ("tts", "talker", "code2wav")):
-            return set()
+            return {"audio"} if requires_multimodal_data else set()
 
-        if getattr(stage, "requires_multimodal_data", False):
+        if requires_multimodal_data:
             return {"audio", "image", "video"}
         return set()
 
@@ -909,8 +923,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatLikeRequest | ResponsesRequest,
     ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
         """Hide modalities unsupported by stage 0 and stash them for downstream stages."""
+        downstream_modalities = self._downstream_multimodal_modalities()
         deferred_modalities = self._deferred_multimodal_modalities()
-        deferred_parts: dict[str, list[Any]] = {modality: [] for modality in deferred_modalities}
+        downstream_parts: dict[str, list[Any]] = {modality: [] for modality in downstream_modalities}
         stripped_messages: list[ChatCompletionMessageParam] = []
 
         for message in messages:
@@ -922,12 +937,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stripped_content: list[Any] = []
             changed = False
             for part in content:
-                modality, payload = self._deferred_multimodal_part(part, deferred_modalities)
+                modality, payload = self._deferred_multimodal_part(part, downstream_modalities)
                 if modality is not None:
                     if payload is not None:
-                        deferred_parts.setdefault(modality, []).append(payload)
-                    changed = True
-                    continue
+                        downstream_parts.setdefault(modality, []).append(payload)
+                    if modality in deferred_modalities:
+                        changed = True
+                        continue
                 stripped_content.append(part)
 
             if changed:
@@ -937,8 +953,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 stripped_messages.append(message)
 
-        deferred_parts = {modality: parts for modality, parts in deferred_parts.items() if parts}
-        if not deferred_parts:
+        downstream_parts = {modality: parts for modality, parts in downstream_parts.items() if parts}
+        if not downstream_parts:
             return messages, None
 
         media_connector = MediaConnector(
@@ -947,7 +963,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
         )
         multi_modal_data: dict[str, Any] = {}
-        for modality, parts in deferred_parts.items():
+        for modality, parts in downstream_parts.items():
             multi_modal_data[modality] = await self._materialize_deferred_multimodal_parts(
                 media_connector,
                 modality,

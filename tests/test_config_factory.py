@@ -1873,6 +1873,36 @@ class TestQwen3TTSPipeline:
         }
 
 
+class TestMiniCPMO45Pipeline:
+    def test_talker_preserves_request_multimodal_data(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        talker = pipeline.get_stage(1)
+        assert isinstance(talker, StagePipelineConfig)
+        assert talker.model_stage == "tts"
+        assert talker.custom_process_input_func is not None
+        assert talker.requires_multimodal_data is True
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_2gpu.yaml",
+            "minicpmo_4_5_3gpu.yaml",
+            "minicpmo_4_5_8x4090.yaml",
+        ],
+    )
+    def test_talker_skips_dummy_multimodal_profiling(self, filename):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
+
+
 class TestMingFlashOmniPipeline:
     def test_registered(self):
         p = resolve_pipeline_config("ming_flash_omni")

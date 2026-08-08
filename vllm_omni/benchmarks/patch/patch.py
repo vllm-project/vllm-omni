@@ -165,6 +165,22 @@ get_samples_old = datasets.get_samples
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
 _DEFAULT_VIDEOMME_REPO = VIDEOMME_DEFAULT_HF_REPO
 
+# MiniCPM-o's official audio-assistant prompt.  The model consumes the first
+# audio part in the system message when building its voice-cloning context.
+_MINICPM_AUDIO_ASSISTANT_PROMPT = {
+    "zh": {
+        "prefix": "模仿音频样本的音色并生成新的内容。",
+        "suffix": (
+            "你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。"
+            "请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。"
+        ),
+    },
+    "en": {
+        "prefix": "Use the voice in the audio prompt to synthesize new content.",
+        "suffix": "You are a helpful assistant with the above voice style.",
+    },
+}
+
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
     return os.environ.get("SEED_TTS_WER_EVAL", "").lower() in (
@@ -229,15 +245,29 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     setattr(rfi, "seed_tts_system_prompt", sys_prompt)
     setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
     setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
+    ex = sample.seed_tts_speech_extra
+    ref_audio = ex.get("ref_audio") if isinstance(ex, dict) else None
+    if isinstance(ref_audio, str) and ref_audio.strip():
+        locale = "zh" if (sample.seed_tts_locale or "").lower().startswith("zh") else "en"
+        prompt = _MINICPM_AUDIO_ASSISTANT_PROMPT[locale]
+        system_text = prompt["suffix"]
+        if sys_prompt:
+            system_text = f"{system_text}\n{sys_prompt}"
+        system_content = [
+            {"type": "text", "text": prompt["prefix"]},
+            {"type": "audio_url", "audio_url": {"url": ref_audio}},
+            {"type": "text", "text": system_text},
+        ]
+    else:
+        system_content = [{"type": "text", "text": sys_prompt}]
     setattr(
         rfi,
         "omni_chat_messages",
         [
-            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
         ],
     )
-    ex = sample.seed_tts_speech_extra
     if not ex:
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}

@@ -53,6 +53,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 4
     gpu_memory_utilization: 0.15
+    skip_mm_profiling: true
     enforce_eager: false
     max_num_batched_tokens: 8192
     # Talker context is 4096 (tts_config.max_position_embeddings).

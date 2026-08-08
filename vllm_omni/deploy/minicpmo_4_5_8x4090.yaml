@@ -57,6 +57,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 1
     gpu_memory_utilization: 0.9
+    skip_mm_profiling: true
     enforce_eager: true
     max_num_batched_tokens: 8192
     devices: "4"

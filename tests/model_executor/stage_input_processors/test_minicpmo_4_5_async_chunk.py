@@ -183,6 +183,26 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload.meta.turn_end is True
 
 
+def test_first_chunk_forwards_reference_voice_from_model_intermediate_buffer() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.model_intermediate_buffer = {
+        "codes": {"ref": [0.2, -0.2]},
+        "meta": {"ref_audio_sr": 24000},
+    }
+
+    payload = tts2code2wav_async_chunk(
+        manager,
+        _delta(*range(25)),
+        request,
+        False,
+    )
+
+    assert payload is not None
+    assert payload.codes.ref.tolist() == pytest.approx([0.2, -0.2])
+    assert payload.meta.ref_audio_sr == 24000
+
+
 def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     manager = _manager()
     request = _request("req")
@@ -222,6 +242,24 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     assert payload.meta.duplex_turn_id == 7
     assert payload.meta.segment_end is True
     assert payload.meta.turn_end is True
+
+
+def test_full_payload_forwards_reference_voice_from_model_intermediate_buffer() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.model_intermediate_buffer = {
+        "codes": {"ref": [0.2, -0.2]},
+        "meta": {"ref_audio_sr": 24000},
+    }
+
+    payload = tts2code2wav_full_payload(
+        transfer_manager=manager,
+        pooling_output={"codes.audio": torch.arange(7, dtype=torch.long)},
+        request=request,
+    )
+
+    assert payload.codes.ref.tolist() == pytest.approx([0.2, -0.2])
+    assert payload.meta.ref_audio_sr == 24000
 
 
 def test_sync_token_only_reserves_codec_and_silence_slots() -> None:

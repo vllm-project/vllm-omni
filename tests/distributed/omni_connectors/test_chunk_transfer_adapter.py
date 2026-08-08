@@ -462,6 +462,30 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert "req-non-ar" in adapter.finished_requests
 
 
+def test_load_poll_generation_preserves_non_audio_code_metadata(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-ref", RequestStatus.WAITING, external_req_id="ext-ref")
+    reference = torch.tensor([0.1, -0.1], dtype=torch.float32)
+    payload: OmniPayload = {
+        "codes": {
+            "audio": torch.tensor([7, 8], dtype=torch.long),
+            "ref": reference,
+        },
+        "meta": {
+            "ref_audio_sr": 24000,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [7, 8]
+    assert torch.equal(request.additional_information["codes"]["ref"], reference)
+    assert "audio" not in request.additional_information["codes"]
+    assert request.additional_information["meta"]["ref_audio_sr"] == 24000
+
+
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")

@@ -313,6 +313,38 @@ class TestPromptAndMultiModal:
         )
         assert out[0]["multi_modal_data"] == mm
 
+    def test_reference_audio_is_written_to_talker_handoff(self) -> None:
+        hidden = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+        out = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden)],
+            prompt={"multi_modal_data": {"audio": (waveform, 16000)}},
+            requires_multimodal_data=True,
+        )
+
+        handoff = out[0]["model_intermediate_buffer"]
+        assert handoff["codes"]["ref"] == waveform.tolist()
+        assert handoff["meta"]["ref_audio_sr"] == 16000
+
+    def test_deferred_reference_audio_is_written_to_talker_handoff(self) -> None:
+        hidden = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+        out = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden)],
+            prompt={
+                "additional_information": {
+                    "deferred_multi_modal_data": {"audio": (waveform, 16000)},
+                }
+            },
+            requires_multimodal_data=True,
+        )
+
+        handoff = out[0]["model_intermediate_buffer"]
+        assert handoff["codes"]["ref"] == waveform.tolist()
+        assert handoff["meta"]["ref_audio_sr"] == 16000
+
     def test_internal_streaming_context_is_accepted(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))
         out = llm2tts(
