@@ -1,8 +1,9 @@
 # Design Documents
 
 This section contains design documents and architecture specifications for
-vLLM-Omni. The sidebar groups documents by the system concern they describe,
-while the source paths remain stable so existing links continue to work.
+vLLM-Omni. The sidebar groups documents by the system concern they describe;
+retired module pages are preserved in the legacy archive instead of remaining
+in the active navigation.
 
 ## Architecture Documents
 
@@ -61,12 +62,29 @@ while the source paths remain stable so existing links continue to work.
 
 ## Module Design Documents
 
-### Runtime Modules
+- [Entrypoints and Serving Boundaries](module/entrypoints.md)
+- [vLLM-Omni Configuration](module/vllm_omni_config.md)
+- [Input, Output, and Modality Contracts](module/input_output_modality_contracts.md)
+- [Error Classification, Propagation, and Rendering](module/error_contracts.md)
+- [Engine Orchestration](module/engine_orchestration.md)
+- [Stage Runtime and Replica Lifecycle](module/stage_runtime.md)
+- [OmniConnector](module/omni_connector.md)
+- [Model Integration](module/model_integration.md)
+- [Autoregressive Runtime](module/ar_runtime.md)
+- Diffusion
+  - [Overview](module/diffusion/index.md)
+  - [Runtime](module/diffusion/diffusion_runtime.md)
+  - [Model Integration](module/diffusion/diffusion_model_integration.md)
+  - [Continuous Batching](module/diffusion/continuous_batching.md)
+  - [Parallelism](module/diffusion/parallelism.md)
+  - [Offloader](module/diffusion/offloader.md)
+- [Execution Platforms](module/execution_platforms.md)
+- [Cache Management](module/cache_management.md)
+- [Quantization](module/quantization.md)
+- [Observability](module/observability.md)
+- [Profiling](module/profiling.md)
+- [Benchmarking](module/benchmarking.md)
 
-- [AR Module](module/ar_module.md)
-- [DIT Module](module/dit_module.md)
-
-### Orchestration
-
-- [Entrypoint Module](module/entrypoint_module.md)
-- [AsyncOmni Architecture (Qwen3-Omni Example)](module/async_omni_architecture.md)
+The pre-#5137 pages are preserved in the
+[legacy module archive](module/archive/README.md) for historical reference and
+are not active design contracts.
