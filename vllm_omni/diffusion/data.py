@@ -662,8 +662,7 @@ class OmniDiffusionConfig:
     # the string form only).
     engine_backend: str | type = "default"
 
-    # Diffusion KV ownership. Keep this independent from ``omni_kv_config``,
-    # which configures cross-stage KV transport rather than local cache layout.
+    # Local Diffusion KV ownership and cache-layout mode.
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
 
     # Optional override for the diffusion model runner class (import path).

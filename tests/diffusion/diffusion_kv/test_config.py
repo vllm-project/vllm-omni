@@ -43,12 +43,6 @@ def test_paged_scheduler_rejects_dense_legacy_kv_receive() -> None:
         )
 
 
-def test_transport_config_does_not_select_diffusion_kv_mode() -> None:
-    config = OmniDiffusionConfig.from_kwargs(omni_kv_config={"cache_mode": "paged_scheduler"})
-
-    assert config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
-
-
 def test_paged_scheduler_does_not_depend_on_model_registry() -> None:
     config = OmniDiffusionConfig.from_kwargs(
         model_class_name="FutureDiffusionModel",

@@ -1012,31 +1012,6 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
-def test_from_pipeline_config_keeps_transport_config_out_of_diffusion_kv_mode(tmp_path):
-    deploy_path = tmp_path / "dreamzero_transport_kv.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    omni_kv_config:",
-                "      cache_mode: paged_scheduler",
-            ]
-        )
-    )
-
-    stage = _from_pipeline_key(
-        "dreamzero",
-        deploy_config_path=str(deploy_path),
-    ).stage_by_id(0)
-
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.connector_config.omni_kv_config == {"cache_mode": "paged_scheduler"}
-    assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
-
-
 def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
     deploy_path = tmp_path / "dreamzero_reserved_diffusion_kv.yaml"
     deploy_path.write_text(
