@@ -10,7 +10,7 @@ Cosmos3-Super is a 64B Mixture-of-Transformers world foundation model. It carrie
 
 Contents:
 
-* Service launch configuration across four parallelism strategies
+* Service launch configuration across five parallelism strategies
 * Benchmark entry and arguments
 * Dataset and workload settings
 * Single request latency, a latency decomposition model, and a concurrency envelope
