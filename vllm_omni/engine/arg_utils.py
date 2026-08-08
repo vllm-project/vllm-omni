@@ -488,6 +488,8 @@ class OrchestratorArgs:
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
+    enable_cuda_graph: bool = False
+    cuda_graph_config: dict[str, Any] | None = None
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

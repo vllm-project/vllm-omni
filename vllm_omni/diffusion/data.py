@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -719,6 +720,10 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    enable_cuda_graph: bool = False
+    cuda_graph_config: DiffusionCUDAGraphConfig | dict[str, Any] | None = field(
+        default_factory=DiffusionCUDAGraphConfig
+    )
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1001,6 +1006,12 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+        self.cuda_graph_config = DiffusionCUDAGraphConfig.from_value(
+            self.cuda_graph_config,
+            enabled=self.enable_cuda_graph,
+        )
+        self.enable_cuda_graph = bool(self.cuda_graph_config.enabled)
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction

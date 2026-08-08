@@ -573,6 +573,8 @@ class _DiffusionConfigProjection:
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
+    enable_cuda_graph: bool = False
+    cuda_graph_config: Any = field(default_factory=dict)
     VSA_sparsity: float = 0.0
     moba_config_path: str | None = None
     boundary_ratio: float | None = None
@@ -616,6 +618,7 @@ class _DiffusionConfigProjection:
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
         # pull in the full diffusion stack unless a diffusion stage is built.
+        from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig
         from vllm_omni.diffusion.data import (
             AttentionConfig,
             DiffusionCacheConfig,
@@ -658,6 +661,12 @@ class _DiffusionConfigProjection:
             self.cache_config = DiffusionCacheConfig.from_dict(dict(self.cache_config))
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             self.cache_config = DiffusionCacheConfig()
+
+        self.cuda_graph_config = DiffusionCUDAGraphConfig.from_value(
+            self.cuda_graph_config,
+            enabled=self.enable_cuda_graph,
+        )
+        self.enable_cuda_graph = bool(self.cuda_graph_config.enabled)
 
         self._propagate_quantization_from_tf_config(self.tf_model_config)
         if self.quantization_config is not None:

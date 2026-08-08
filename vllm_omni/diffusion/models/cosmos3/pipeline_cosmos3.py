@@ -47,6 +47,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -87,6 +88,7 @@ from .action import (
     resolve_domain_id,
     vision_condition_indexes,
 )
+from .cuda_graph import Cosmos3CUDAGraphManager
 from .transfer import (
     Cosmos3TransferConfig,
     has_transfer_hints,
@@ -977,6 +979,8 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
+        self._cuda_graph_manager: Cosmos3CUDAGraphManager | None = None
+        self._cuda_graph_cache_generation = 0
         self._robolab_transform = None
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
@@ -1014,6 +1018,61 @@ class Cosmos3OmniDiffusersPipeline(
 
     def disable_omni_model_cpu_offload(self) -> None:
         self.transformer.disable_model_cpu_offload()
+
+    def create_cuda_graph_manager(self, config: DiffusionCUDAGraphConfig) -> Cosmos3CUDAGraphManager:
+        return Cosmos3CUDAGraphManager(self.transformer.forward_cached_gen, config)
+
+    def bind_cuda_graph_manager(self, manager: Cosmos3CUDAGraphManager | None) -> None:
+        self._cuda_graph_manager = manager
+        if manager is None or not manager.enabled:
+            return
+        logger.info("Cosmos3 CUDA graphs enabled for cached GEN transformer forward.")
+
+    def _cuda_graph_capture_decision(self, transformer_kwargs: Mapping[str, Any]) -> tuple[bool, str | None]:
+        if getattr(self.transformer, "_model_cpu_offload_enabled", False):
+            return False, "model_cpu_offload"
+        cache_backend = getattr(self.od_config, "cache_backend", None)
+        if cache_backend not in (None, "", "none"):
+            return False, f"cache_backend_{cache_backend}"
+        if transformer_kwargs.get("action_latents") is not None and transformer_kwargs.get("action_domain_ids") is None:
+            return False, "action_domain_ids_not_static"
+        return True, None
+
+    def _transformer_forward_with_cuda_graph(
+        self,
+        graph_branch: str,
+        **transformer_kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        manager = getattr(self, "_cuda_graph_manager", None)
+        if manager is None:
+            return self.transformer(**transformer_kwargs)
+        if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
+            output = self.transformer(**transformer_kwargs)
+            if self.transformer.cached_kv is not None and self.transformer.cached_freqs_gen is not None:
+                self._cuda_graph_cache_generation += 1
+            return output
+
+        gen_kwargs = dict(transformer_kwargs)
+        gen_kwargs.pop("text_ids", None)
+        gen_kwargs.pop("text_mask", None)
+        gen_kwargs["cached_kv"] = self.transformer.cached_kv
+        gen_kwargs["cached_freqs_gen"] = self.transformer.cached_freqs_gen
+        can_capture, reason = self._cuda_graph_capture_decision(transformer_kwargs)
+        if not can_capture:
+            logger.debug("Cosmos3 CUDA graph skipped for branch=%s reason=%s", graph_branch, reason)
+            return self.transformer.forward_cached_gen(**gen_kwargs)
+
+        output = manager.run_cached_gen(
+            branch=graph_branch,
+            cache_generation=self._cuda_graph_cache_generation,
+            **gen_kwargs,
+        )
+        logger.debug(
+            "Cosmos3 CUDA graph branch=%s info=%s",
+            graph_branch,
+            manager.last_call_info,
+        )
+        return output
 
     # -- Weight loading --------------------------------------------------------
 
@@ -2650,7 +2709,8 @@ class Cosmos3OmniDiffusersPipeline(
                 cfg_active = _cfg_active_at(t)
 
                 self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                noise_cond = self.transformer(
+                noise_cond = self._transformer_forward_with_cuda_graph(
+                    "cond",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
@@ -2664,7 +2724,8 @@ class Cosmos3OmniDiffusersPipeline(
 
                 if cfg_active or keep_uncond_for_cache:
                     self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                    noise_uncond = self.transformer(
+                    noise_uncond = self._transformer_forward_with_cuda_graph(
+                        "uncond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=uncond_ids,
@@ -2688,7 +2749,8 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
-                noise_pred = self.transformer(
+                noise_pred = self._transformer_forward_with_cuda_graph(
+                    "single",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,

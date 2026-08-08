@@ -115,6 +115,80 @@ shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
+#### CUDA Graph
+
+CUDA Graph is optional for Cosmos3. Enable it when serving latency-sensitive
+workloads where repeated requests use the same resolution, frame count, and
+branch pattern, especially small text-to-image or short/low-resolution video
+requests. The shared diffusion CUDA Graph code only owns the CLI/config surface;
+Cosmos3 provides its own `Cosmos3CUDAGraphManager`, which captures
+`Cosmos3Transformer.forward_cached_gen()`.
+
+Current capture scope:
+
+1. Request setup, prompt/token processing, latent initialization, and scheduler
+   setup run eager.
+2. The first transformer call that builds `cached_kv` and `cached_freqs_gen`
+   runs eager.
+3. Once those caches exist, each stable `single`, `cond`, or `uncond` branch can
+   capture/replay the cached GEN path. The captured region includes GEN input
+   preparation, Ulysses GEN prepare/gather, GEN transformer layers, final norm,
+   projection, unpatchify, and action/sound projection work in
+   `forward_cached_gen()`.
+4. CFG combine, scheduler step, VAE encode/decode, audio decode, muxing, and
+   response postprocessing remain eager.
+
+Do not combine `--enable-cuda-graph` with `--cache-backend cache_dit` or
+`--cache-backend tea_cache` for Cosmos3. These cache backends make per-step
+cache-hit decisions in Python, while CUDA Graph replay is intended for stable
+compute paths. If you want CUDA Graph, leave `--cache-backend` unset or set it
+to `none`; if you want Cache-DiT or TeaCache acceleration, run without
+`--enable-cuda-graph`.
+
+Scope and recommended combinations:
+
+| Feature / path | Recommended? | CUDA Graph behavior |
+| --- | --- | --- |
+| Regular Cosmos3 denoising via `diffuse()` | Yes, for latency-sensitive workloads with stable resolution, frame count, and branch pattern | The first cache-building transformer call is eager; later cached GEN calls capture/replay when tensor shapes, strides, dtypes, devices, and branch keys are stable. |
+| `torch.compile` on non-cache paths | Yes | Supported with CUDA Graph. |
+| Ulysses / CFG branches | Yes, when shapes and branches are stable | Graph keys separate `cond`, `uncond`, and `single` branches. Ulysses GEN prepare/gather are inside the captured cached GEN path. |
+| Transfer/control denoising via `diffuse_transfer()` | No | Remains eager. |
+| Prompt encoding, scheduler steps, VAE encode/decode, sound tokenizer/audio decode | No | Remain eager. |
+| `cache_dit` / `tea_cache` | No; use as a separate cache-acceleration mode | Do not enable together with `--enable-cuda-graph`. |
+| CPU offload / layerwise offload | Benchmark first | Model CPU offload disables Cosmos3 CUDA Graph capture; benchmark any other offload mode before combining it with CUDA Graph. |
+| Sleep mode | Benchmark first | Validate wake-up behavior and memory impact for the target deployment before enabling with CUDA Graph. |
+| Custom pipelines | Only if the pipeline implements `create_cuda_graph_manager()` | Fall back to eager unless the pipeline provides a model-specific CUDA Graph manager. |
+
+Cosmos3 capture requires `cached_kv` and `cached_freqs_gen` to be ready,
+`--cache-backend` unset or `none`, model CPU offload disabled, and static action
+metadata when action latents are present. The graph cache is keyed by branch and
+input tensor metadata, so changing resolution, frame count, modality layout, or
+branch shape captures a separate graph.
+
+It is not recommended as the first optimization for long/high-resolution video
+generation, where transformer compute and VAE work dominate launch overhead. The
+benefit is expected to be smaller there, so benchmark your target shape before
+turning it on by default.
+
+Example:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --no-guardrails \
+  --diffusion-attention-backend TORCH_SDPA \
+  --enable-cuda-graph \
+  --cuda-graph-config '{"enabled":true,"warmup_steps":1,"max_graphs":8}'
+```
+
+In a single-B300 512x512 T2I benchmark with 20 steps, no CFG
+(`guidance_scale=1.0`), `TORCH_SDPA`, and `torch.compile` enabled, adding CUDA
+Graph improved `stage_0_gen_ms` from 220.61 ms to 203.16 ms (+7.9%) and mean
+latency from 293.75 ms to 277.80 ms (+5.4%). With the same prompt and seed, T2I
+and 33-frame T2V smoke outputs matched the `torch.compile` baseline exactly
+(SSIM 1.0).
+
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with

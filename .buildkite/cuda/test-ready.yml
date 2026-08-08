@@ -314,7 +314,9 @@ steps:
       - label: "Diffusion · Cosmos3 Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_cosmos3.py
+          - vllm_omni/diffusion/cuda_graph.py
           - vllm_omni/diffusion/models/cosmos3/
+          - vllm_omni/diffusion/worker/diffusion_model_runner.py
         commands:
           - |
             timeout 40m bash -c "

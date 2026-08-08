@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import zlib
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any
@@ -77,6 +77,75 @@ class RoboLabActionPostprocessInputs:
     action_space: str
     eef_pos: np.ndarray | None = None
     eef_quat: np.ndarray | None = None
+
+
+def _key_for_value(value: Any) -> Hashable:
+    if value is None:
+        return ("none",)
+    if isinstance(value, torch.Tensor):
+        device = value.device
+        return (
+            "tensor",
+            tuple(value.shape),
+            str(value.dtype),
+            (device.type, device.index),
+            str(value.layout),
+            tuple(value.stride()),
+        )
+    if isinstance(value, (bool, int, float, str, bytes)):
+        return (type(value).__name__, value)
+    if isinstance(value, tuple):
+        return ("tuple", len(value), tuple(_key_for_value(item) for item in value))
+    if isinstance(value, list):
+        return ("list", len(value), tuple(_key_for_value(item) for item in value))
+    raise TypeError(f"unsupported key value {type(value)!r}")
+
+
+def _clone_static(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_clone_static(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_static(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _clone_static(item) for key, item in value.items()}
+    return value
+
+
+def _copy_inputs(static_value: Any, dynamic_value: Any) -> None:
+    if isinstance(static_value, torch.Tensor):
+        static_value.copy_(dynamic_value)
+        return
+    if isinstance(static_value, tuple):
+        for static_item, dynamic_item in zip(static_value, dynamic_value, strict=True):
+            _copy_inputs(static_item, dynamic_item)
+        return
+    if isinstance(static_value, list):
+        for static_item, dynamic_item in zip(static_value, dynamic_value, strict=True):
+            _copy_inputs(static_item, dynamic_item)
+        return
+    if isinstance(static_value, dict):
+        for key in static_value:
+            _copy_inputs(static_value[key], dynamic_value[key])
+
+
+def _return_output(output: Any, *, clone: bool) -> Any:
+    if not clone:
+        return output
+    return _clone_output(output)
+
+
+def _clone_output(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_clone_output(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_output(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _clone_output(item) for key, item in value.items()}
+    return value
 
 
 def make_robolab_action_postprocess_inputs(inputs: RoboLabPolicyInputs) -> RoboLabActionPostprocessInputs:

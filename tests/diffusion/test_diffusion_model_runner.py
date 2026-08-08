@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -288,13 +289,18 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model)
+    target_logger = logging.getLogger(model_runner_module.__name__)
 
     def _regionally_compile(*args, **kwargs):
         raise RuntimeError("compile setup failed")
 
     monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
 
-    DiffusionModelRunner._compile_transformer(runner, "transformer")
+    target_logger.addHandler(caplog.handler)
+    try:
+        DiffusionModelRunner._compile_transformer(runner, "transformer")
+    finally:
+        target_logger.removeHandler(caplog.handler)
 
     assert runner.pipeline.transformer is model
     assert "failed before activation" in caplog.text
@@ -743,6 +749,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     runner.pipeline = None
     runner.cache_backend = None
     runner.offload_backend = None
+    runner.cuda_graph_manager = None
     runner.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -751,6 +758,8 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        enable_cuda_graph=False,
+        cuda_graph_config=None,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())

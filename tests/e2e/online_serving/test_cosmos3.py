@@ -39,6 +39,12 @@ SERVER_ARGS = [
     "Cosmos3OmniDiffusersPipeline",
     "--no-guardrails",
 ]
+CUDA_GRAPH_SERVER_ARGS = [
+    *SERVER_ARGS,
+    "--enable-cuda-graph",
+    "--cuda-graph-config",
+    '{"warmup_steps": 1, "max_graphs": 4}',
+]
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
@@ -53,11 +59,51 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
+def _get_cuda_graph_feature_cases(model: str):
+    """Return a CUDA graph-enabled Cosmos3 server row for focused L2 coverage."""
+    return [
+        pytest.param(
+            OmniServerParams(model=model, server_args=CUDA_GRAPH_SERVER_ARGS),
+            id="cuda_graph",
+            marks=SINGLE_CARD_MARKS,
+        ),
+    ]
+
+
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     """Default Cosmos3 T2I smoke through ``/v1/images/generations``."""
+    responses = openai_client.send_images_generations_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "size": "256x256",
+                "n": 1,
+                "response_format": "b64_json",
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+                "flow_shift": 3.0,
+                "seed": 42,
+            }
+        }
+    )
+    response = responses[0]
+    assert response.success, response.error_message
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["b64_json"]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_cuda_graph_feature_cases(MODEL), indirect=True)
+def test_text_to_image_cuda_graph_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    """Cosmos3 T2I smoke with diffusion CUDA graphs enabled."""
     responses = openai_client.send_images_generations_http_request(
         {
             "json": {

@@ -1029,6 +1029,8 @@ class AsyncOmniEngine:
             "cache_backend": cache_backend,
             "cache_config": cache_config,
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+            "enable_cuda_graph": kwargs.get("enable_cuda_graph", False),
+            "cuda_graph_config": kwargs.get("cuda_graph_config", None),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
@@ -1266,6 +1268,16 @@ class AsyncOmniEngine:
                     ):
                         cfg.engine_args.quantization_config = quantization_config
                 # Inject profiler flags for diffusion stages
+                enable_cuda_graph = kwargs.get("enable_cuda_graph")
+                if enable_cuda_graph:
+                    if not hasattr(cfg.engine_args, "enable_cuda_graph") or not getattr(
+                        cfg.engine_args, "enable_cuda_graph", False
+                    ):
+                        cfg.engine_args.enable_cuda_graph = enable_cuda_graph
+                cuda_graph_config = kwargs.get("cuda_graph_config")
+                if cuda_graph_config is not None:
+                    if not hasattr(cfg.engine_args, "cuda_graph_config") or cfg.engine_args.cuda_graph_config is None:
+                        cfg.engine_args.cuda_graph_config = cuda_graph_config
                 for profiler_key in (
                     "enable_diffusion_pipeline_profiler",
                     "enable_ar_profiler",

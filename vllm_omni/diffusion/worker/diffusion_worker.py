@@ -576,10 +576,10 @@ class DiffusionWorker:
 
         usage_before = allocator.get_current_usage()
 
+        if self.model_runner is not None:
+            self.model_runner.clear_cuda_graphs()
+
         if level == 2 and self.model_runner is not None:
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
-                logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
@@ -756,6 +756,7 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         if self.model_runner is not None:
+            self.model_runner.clear_cuda_graphs(unbind=True)
             mgr = getattr(self.model_runner, "kv_transfer_manager", None)
             if mgr is not None:
                 mgr.shutdown_prefetch()
@@ -773,6 +774,7 @@ class CustomPipelineWorkerExtension:
 
         # Clean up old pipeline
         if self.model_runner.pipeline is not None:
+            self.model_runner.clear_cuda_graphs(unbind=True)
             del self.model_runner.pipeline
             gc.collect()
             torch.accelerator.empty_cache()

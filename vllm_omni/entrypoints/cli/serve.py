@@ -593,6 +593,20 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
         omni_config_group.add_argument(
+            "--enable-cuda-graph",
+            action="store_true",
+            help="Enable diffusion CUDA graph replay for supported pipelines.",
+        )
+        omni_config_group.add_argument(
+            "--cuda-graph-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object configuring diffusion CUDA graph capture. "
+                'Example: \'{"enabled": true, "warmup_steps": 1, "max_graphs": 8}\'.'
+            ),
+        )
+        omni_config_group.add_argument(
             "--step-execution",
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
