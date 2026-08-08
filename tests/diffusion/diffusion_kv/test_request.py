@@ -44,6 +44,7 @@ def test_request_exposes_native_request_and_diffusion_semantics() -> None:
     assert request.block_hashes == []
     assert request.kv_contexts == ()
     assert request.skip_reading_prefix_cache is True
+    assert request.shared_prefix_boundary == 0
     assert request.status is RequestStatus.WAITING
 
 
@@ -118,7 +119,6 @@ def _manager(*, enable_caching: bool) -> KVCacheManager:
     return KVCacheManager(
         config,
         max_model_len=64,
-        max_num_batched_tokens=64,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         enable_caching=enable_caching,
@@ -130,7 +130,8 @@ def test_empty_hash_request_conforms_to_native_request_local_allocation() -> Non
     free_before = manager.block_pool.get_num_free_blocks()
     request = _request()
 
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    # vLLM 0.26 adds a shared-prefix-boundary return value.
+    computed_blocks, num_computed_tokens, *_ = manager.get_computed_blocks(request)
     assert num_computed_tokens == 0
     blocks = manager.allocate_slots(
         request,
@@ -155,7 +156,7 @@ def test_hashed_request_conforms_to_native_delayed_prefix_commit() -> None:
     target_hash = BlockHash(b"target".ljust(32, b"\0"))
     request = _request(block_hashes=[prefix_hash, target_hash])
 
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    computed_blocks, num_computed_tokens, *_ = manager.get_computed_blocks(request)
     assert num_computed_tokens == 0
     blocks = manager.allocate_slots(
         request,
@@ -173,7 +174,7 @@ def test_hashed_request_conforms_to_native_delayed_prefix_commit() -> None:
         request_id="req/diffusion-kv/cached",
         block_hashes=[prefix_hash, target_hash],
     )
-    cached_blocks, num_computed_tokens = manager.get_computed_blocks(cached_request)
+    cached_blocks, num_computed_tokens, *_ = manager.get_computed_blocks(cached_request)
 
     # Only the stable prefix was published. The dynamic target remains a miss.
     assert num_computed_tokens == cached_request.prefix_len

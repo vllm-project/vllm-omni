@@ -105,6 +105,9 @@ class DiffusionKVRequest:
         self.status = RequestStatus.WAITING
         self.num_preemptions = 0
         self.num_in_flight_tokens = 0
+        # vLLM 0.26 uses this optional boundary when publishing cached blocks;
+        # zero means that no sparse-retention boundary is active.
+        self.shared_prefix_boundary = 0
 
     @property
     def seq_len(self) -> int:

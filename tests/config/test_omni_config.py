@@ -967,6 +967,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
 
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
+        fa_deterministic=True,
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
         kv_cache_skip_layers=[2],
@@ -977,6 +978,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     )
 
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
+    assert cfg.fa_deterministic is True
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
@@ -997,6 +999,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "stages:",
                 "  - stage_id: 0",
                 "    diffusion_attention_backend: flash_attn",
+                "    fa_deterministic: true",
                 "    diffusion_kv_mode: paged_scheduler",
             ]
         )
@@ -1009,6 +1012,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
+    assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
