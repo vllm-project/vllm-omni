@@ -15,14 +15,73 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _attach_seed_tts_to_request_func_input,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def _seed_tts_request_input() -> RequestFuncInput:
+    return RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="Read this sentence.",
+        api_url="http://localhost:8091/v1/chat/completions",
+        prompt_len=4,
+        output_len=32,
+        extra_body={"modalities": ["text", "audio"]},
+    )
+
+
+def test_seed_tts_chat_messages_embed_reference_audio_without_changing_prompt() -> None:
+    request_input = _seed_tts_request_input()
+    sample = SeedTTSSampleRequest(
+        prompt="Read this sentence.",
+        prompt_len=4,
+        expected_output_len=32,
+        multi_modal_data=None,
+        request_id="seed-0",
+        seed_tts_locale="en",
+        seed_tts_system_prompt="Keep the wording exact.",
+        seed_tts_speech_extra={
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "Reference text.",
+            "task_type": "Base",
+        },
+    )
+
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+
+    content = request_input.omni_chat_messages[0]["content"]
+    assert [part["type"] for part in content] == ["text", "audio_url"]
+    assert content[0]["text"] == "Keep the wording exact."
+    assert content[1]["audio_url"]["url"] == "data:audio/wav;base64,AAAA"
+    assert request_input.extra_body["modalities"] == ["text", "audio"]
+    assert request_input.extra_body["ref_text"] == "Reference text."
+
+
+def test_seed_tts_chat_messages_without_reference_audio_stay_text_only() -> None:
+    request_input = _seed_tts_request_input()
+    sample = SeedTTSSampleRequest(
+        prompt="Read this sentence.",
+        prompt_len=4,
+        expected_output_len=32,
+        multi_modal_data=None,
+        request_id="seed-text-0",
+        seed_tts_locale="en",
+        seed_tts_speech_extra=None,
+    )
+
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+
+    content = request_input.omni_chat_messages[0]["content"]
+    assert content == [{"type": "text", "text": request_input.seed_tts_system_prompt}]
 
 
 class MockResponse:
@@ -46,6 +105,39 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_chat_payload_preserves_reference_fields(mocker: MockerFixture) -> None:
+    request_input = _seed_tts_request_input()
+    sample = SeedTTSSampleRequest(
+        prompt="Read this sentence.",
+        prompt_len=4,
+        expected_output_len=32,
+        multi_modal_data=None,
+        request_id="seed-payload-0",
+        seed_tts_locale="en",
+        seed_tts_speech_extra={
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "Reference text.",
+            "task_type": "Base",
+        },
+    )
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=MockResponse(200, [b"data: [DONE]\n\n"]))
+
+    await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    payload = mock_session.post.call_args.kwargs["json"]
+    assert payload["messages"] == request_input.omni_chat_messages
+    assert payload["messages"][0]["content"][1] == {
+        "type": "audio_url",
+        "audio_url": {"url": "data:audio/wav;base64,AAAA"},
+    }
+    assert payload["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert payload["ref_text"] == "Reference text."
+    assert payload["modalities"] == ["text", "audio"]
 
 
 @pytest.mark.asyncio

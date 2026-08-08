@@ -57,6 +57,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             model_stage="tts",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
+            requires_multimodal_data=True,
             hf_config_name="tts_config",
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.llm2tts",
