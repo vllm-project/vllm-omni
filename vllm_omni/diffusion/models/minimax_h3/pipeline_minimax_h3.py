@@ -749,7 +749,10 @@ class MiniMaxH3Pipeline(
             loaded_with_prefix.update(prefix + name for name in loaded)
         # The text encoder and both VAEs load eagerly in ``__init__`` rather
         # than through ``weights_sources``. Record them for the runner's strict
-        # missing-parameter check.
+        # missing-parameter check. For the text encoder that report is exact
+        # because its loader raises on any unloaded parameter or partially filled
+        # fused parameter; weaken that and gaps here become invisible. The two
+        # VAEs carry no equivalent guarantee.
         for component_name in ("text_encoder", "video_vae", "audio_vae"):
             component = getattr(self, component_name)
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
