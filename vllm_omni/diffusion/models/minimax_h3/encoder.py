@@ -911,10 +911,12 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         device: torch.device,
         load_model: bool,
         encoder_group: Any | None = None,
+        pin_cpu_memory: bool = True,
     ) -> None:
         super().__init__()
         self.device_target = device
         self.encoder_group = encoder_group
+        self._pin_cpu_memory = pin_cpu_memory
         self.image_token_id = 151655
         self.video_token_id = 151656
         self._tp_size = 1
@@ -1026,6 +1028,67 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 missing[:5],
             )
 
+    def _pin_offload_enabled(self) -> bool:
+        """Whether to use pinned-host buffers for full-model encoder offload.
+
+        Pinned (page-locked) host memory makes the 63 GB encoder GPU<->CPU
+        transfer an order of magnitude faster, but it holds that host memory
+        non-swappable. Controlled by the shared ``pin_cpu_memory`` offload
+        setting (default on); disable it on hosts without the spare
+        page-lockable RAM.
+        """
+        return bool(getattr(self, "_pin_cpu_memory", True))
+
+    def _pinned_cpu_mirror(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """Return a persistent pinned-CPU buffer mirroring ``tensor``'s storage.
+
+        Reused across requests keyed by tensor identity. Returns ``None`` if the
+        pinned allocation fails (e.g. insufficient page-lockable host RAM) so the
+        caller can fall back to a plain pageable copy instead of crashing.
+        """
+        cache = self.__dict__.setdefault("_pinned_mirror_cache", {})
+        key = id(tensor)
+        buf = cache.get(key)
+        if buf is None or buf.shape != tensor.shape or buf.dtype != tensor.dtype:
+            try:
+                buf = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+            except RuntimeError as exc:
+                logger.warning_once(
+                    "MiniMax H3 encoder pinned-offload buffer allocation failed (%s); "
+                    "falling back to pageable offload. Set pin_cpu_memory=False to silence.",
+                    exc,
+                )
+                return None
+            cache[key] = buf
+        return buf
+
+    def _move_module_pinned(self, module: nn.Module, *, to_device: bool) -> None:
+        """Move a module's params/buffers via persistent pinned host buffers.
+
+        ``to_device`` True copies pinned-CPU -> GPU; False copies GPU -> pinned
+        CPU and rebinds ``.data`` to the pinned buffer. Falls back to a plain
+        ``.to`` when the tensor is already on the wanted side, when pinned
+        offload is disabled, or when the pinned buffer cannot be allocated.
+        """
+        device = self.device_target
+        use_pinned = self._pin_offload_enabled()
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            if to_device:
+                if tensor.device.type == device.type:
+                    continue
+                gpu = torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
+                gpu.copy_(tensor, non_blocking=True)
+                tensor.data = gpu
+            else:
+                if tensor.device.type == "cpu":
+                    continue
+                pinned = self._pinned_cpu_mirror(tensor) if use_pinned else None
+                if pinned is None:
+                    tensor.data = tensor.data.to("cpu")
+                    continue
+                pinned.copy_(tensor, non_blocking=True)
+                tensor.data = pinned
+
     def load_to_device(self) -> None:
         if not self.is_loaded:
             return
@@ -1037,8 +1100,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 if name != "layers":
                     child.to(self.device_target)
             return
-        self.vision.to(self.device_target)
-        self.text_model.to(self.device_target)
+        self._move_module_pinned(self.vision, to_device=True)
+        self._move_module_pinned(self.text_model, to_device=True)
+        torch.accelerator.synchronize()
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
@@ -1054,8 +1118,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                     child.to("cpu")
             torch.accelerator.empty_cache()
             return
-        self.vision.to("cpu")
-        self.text_model.to("cpu")
+        self._move_module_pinned(self.vision, to_device=False)
+        self._move_module_pinned(self.text_model, to_device=False)
+        torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
     def enable_omni_layerwise_offload(self, *, pin_memory: bool = True) -> None:

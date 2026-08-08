@@ -676,6 +676,7 @@ class MiniMaxH3Pipeline(
             device=self.device,
             load_model=rank < text_encoder_tp_size,
             encoder_group=self.text_encoder_group,
+            pin_cpu_memory=getattr(od_config, "pin_cpu_memory", True),
         )
         stage_components = bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
