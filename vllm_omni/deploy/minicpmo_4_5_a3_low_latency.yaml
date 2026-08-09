@@ -1,0 +1,134 @@
+# MiniCPM-o 4.5 low-latency single-stream deploy for Ascend 910C (Atlas A3).
+#
+# Derived from minicpmo_4_5.yaml with four changes, tuned for the
+# single-concurrency streaming-speech use case:
+#   1. initial_codec_chunk_frames: 8   - ship the first audio packet after
+#      8 codec frames (0.32 s) instead of a full chunk (needs the
+#      configurable-first-chunk support in the async chunking processor)
+#   2. codec_chunk_frames: 25 -> 75  - amortize the per-chunk fixed cost of
+#      Code2Wav (measured ~199 ms fixed + ~2.3 ms/token on 910C)
+#   3. connector_get_sleep_s: 0.01 -> 0.002 - lower connector polling latency
+#   4. platforms.npu cudagraph_mode: PIECEWISE -> FULL_DECODE_ONLY for
+#      stages 0/1 - capture the whole decode step (incl. attention) instead
+#      of piecewise graphs; the Talker decode is dispatch-bound at
+#      ~11 ms/token under PIECEWISE
+#
+# Measured on 910C (image v0.25.0-a3, seed-tts en, 32 prompts, 3 warmups,
+# 3 rounds, concurrency 1) vs minicpmo_4_5.yaml on the same machine:
+#   Mean TTFT        316.33 ms -> 295.29 ms  (-6.7%)
+#   Mean AUDIO_TTFP  868.28 ms -> 813.18 ms  (-6.3%)
+#   Mean AUDIO_RTF   0.4633    -> 0.3800     (-18.0%)
+# Concurrency 4/8 RTF: 1.76 -> 1.30 / 2.86 -> 2.03.
+# Trade-off: concurrency-8 TTFP increases (larger steady-state chunks batch
+# longer under saturation); prefer the default yaml for high-concurrency
+# first-packet-sensitive serving.
+# Quality (seed-tts zh, 400 utterances, paraformer CER): 1.386% vs 1.414%
+# F16 reference - no regression.
+pipeline: minicpmo_4_5
+async_chunk: true
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.002
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 75
+      initial_codec_chunk_frames: 8
+      codec_left_context_frames: 3
+      # Token2Wav flow-matching sampling steps: 10 -> 3. Pure system-level
+      # vocoder speedup, no model-quality change. Same-session A/B on 910C:
+      # AUDIO_TTFP -30%, AUDIO_RTF -11%; full seed-tts-zh 2000-utt regression
+      # WER 1.385% / speaker-sim 0.8457 (vs 1.432% / 0.8474 at 10 steps).
+      # n_timesteps=2 fails to boot; 3 is the sweet spot.
+      token2wav_n_timesteps: 3
+
+stages:
+  - stage_id: 0
+    # Four-way concurrency matches the single-GPU memory shares below;
+    # larger batches make Code2Wav activations OOM on one H100.
+    max_num_seqs: 4
+    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
+    gpu_memory_utilization: 0.55
+    enforce_eager: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    max_model_len: 32768
+    devices: "0"
+    # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
+    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+    limit_mm_per_prompt:
+      # Daily-Omni: up to 64 interleaved image/audio pairs (1fps).
+      # Video-MME minicpm-frames: OmniEvalKit samples up to 96 frames as image_url.
+      image: 96
+      audio: 64
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      # 1.0 for MCQ accuracy; 1.1 can bias short A–D answers.
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: false
+    max_num_batched_tokens: 8192
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    # Codec sampling comes from the checkpoint's tts_config. These parameters
+    # govern only vLLM's binary continue/stop token.
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      min_tokens: 50
+      max_tokens: 2048
+      stop_token_ids: [1]
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.18
+    enforce_eager: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
