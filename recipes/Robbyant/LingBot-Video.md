@@ -32,9 +32,9 @@ parallel, cache, quantized, or expert-kernel backends.
 
 ## Hardware Support
 
-This recipe documents the CUDA single-GPU dense and BF16 MoE checkpoint paths.
-Multi-GPU parallelism, Cache-DiT, quantization, and CPU offload are not
-validated for LingBot-Video in this PR.
+This recipe documents the single-GPU dense and BF16 MoE checkpoint paths on
+NVIDIA CUDA and AMD ROCm. Multi-GPU parallelism, Cache-DiT, quantization, and
+CPU offload are not validated for LingBot-Video.
 
 ## GPU
 
@@ -145,6 +145,91 @@ done
 
 curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o lingbot_t2v.mp4
 ```
+
+## ROCm
+
+### 1 x AMD MI350X (gfx950)
+
+Both checkpoints run on the stock code path. The dense, MoE, and serving
+commands from the GPU section work unchanged apart from replacing
+`CUDA_VISIBLE_DEVICES` with `HIP_VISIBLE_DEVICES`; no ROCm-specific flag,
+environment variable, or fallback is required.
+
+#### Environment
+
+No published ROCm image contains LingBot-Video: the model landed in `v0.26.0`,
+and the newest `vllm/vllm-omni-rocm` release tag on Docker Hub predates it.
+Build a base image first, either with `docker build -f docker/Dockerfile.rocm`
+(pass `--build-arg ARG_PYTORCH_ROCM_ARCH=gfx950` for MI350X), or by installing
+`requirements/common.txt` on top of a recent `rocm/vllm-dev` image.
+
+The offline commands additionally run under the published
+`vllm/vllm-omni-rocm:v0.24.1` image with this repository on `PYTHONPATH`, since
+they do not import the API server. Online serving does not: the `v0.26.0` API
+server imports `vllm.entrypoints.scale_out`, which that image's vLLM predates.
+
+Validated with torch `2.11.0+gitd0c8b1f`, HIP `7.2.53211`, on
+`gfx950:sramecc+:xnack-`.
+
+#### Command
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a robotic arm picks up a red block" \
+  --output lingbot_t2v.mp4 \
+  --height 192 \
+  --width 320 \
+  --num-frames 9 \
+  --num-inference-steps 2 \
+  --guidance-scale 3.0 \
+  --flow-shift 3.0 \
+  --seed 42 \
+  --fps 24
+```
+
+Swap the model id for `robbyant/lingbot-video-moe-30b-a3b` to run the MoE
+checkpoint, and use the same `vllm serve` invocation as the GPU section for
+online serving.
+
+#### Verification
+
+Smoke results at the same `192x320`, 9-frame, 2-step shape as the L20X row
+above, measured on the second and later requests in one process:
+
+| Checkpoint | Generation time | Peak reserved GPU memory |
+|------------|-----------------|--------------------------|
+| Dense 1.3B | `0.186s`–`0.200s` | `13702 MiB` |
+| MoE 30B-A3B | `1.508s` | `68434 MiB` |
+
+Both produce a decodable `[9, 192, 320, 3]` uint8 MP4. The MoE peak matches the
+L20X measurement closely enough that the "at least about 70 GiB" guidance in
+the GPU section applies to ROCm as well.
+
+The online `/v1/videos` smoke also creates, polls, and downloads the generated
+MP4 successfully.
+
+Note that ROCm images ship neither `ffprobe` nor `ffmpeg`, so validate output
+shape with `imageio.v3.improps(path, plugin="pyav")` rather than `ffprobe`.
+MP4 export itself works because `imageio_ffmpeg` bundles its own binary.
+
+#### Notes
+
+- Reuse a long-lived container. The first request compiles the DiT blocks,
+  which costs about `17s`; the inductor cache lives on the container
+  filesystem, so `docker run --rm` re-pays that on every run. With the cache
+  warm the first request drops to `0.3s`–`0.4s` and engine init to about `32s`.
+- Attention resolves to the aiter FlashAttention backend rather than silently
+  falling back to SDPA; the gfx950 `fmha_v3_fwd/fwd_hd128_bf16` kernel is
+  loaded at runtime. `TORCH_SDPA` also works and is not measurably slower at
+  this shape.
+- The MoE path takes the same `torch._grouped_mm` grouped-GEMM route as CUDA.
+  The for-loop fallback in the sparse block is not used on ROCm.
+- Determinism matches the CUDA guidance: for a fixed attention backend and
+  seed, independent processes emit byte-identical MP4s. Switching backends
+  changes the output, which is expected for different BF16 attention kernels
+  and is why the parity harness below pins the math SDPA backend.
 
 ## Key Parameters
 
