@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -924,6 +925,25 @@ class StagePool:
 
     # ---- Stage-local admission ----
 
+    @staticmethod
+    def _prepare_diffusion_params(params: Any, *, request_id: str) -> OmniDiffusionSamplingParams:
+        """Normalize diffusion sampling params and enforce the seed contract.
+
+        Imported lazily so that pipelines without a diffusion stage do not pull
+        in the diffusion package just by importing this module.
+        """
+        from vllm_omni.diffusion.batch_invariance import (
+            diffusion_batch_invariant_enabled,
+            validate_batch_invariant_diffusion_seed,
+        )
+
+        enabled = diffusion_batch_invariant_enabled()
+        params = OmniDiffusionSamplingParams.from_params(params)
+        validate_batch_invariant_diffusion_seed(params, request_id=request_id)
+        # Give each dispatch its own params so a stage initializing the
+        # generator in place cannot leak that state into the next dispatch.
+        return copy.copy(params) if enabled else params
+
     async def submit_initial(
         self,
         request_id: str,
@@ -939,7 +959,7 @@ class StagePool:
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
-            params = OmniDiffusionSamplingParams.from_params(params)
+            params = self._prepare_diffusion_params(params, request_id=request_id)
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1003,7 +1023,7 @@ class StagePool:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
-            params = OmniDiffusionSamplingParams.from_params(params)
+            params = self._prepare_diffusion_params(params, request_id=request_id)
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)

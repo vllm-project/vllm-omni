@@ -72,6 +72,7 @@ nav:
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
       - Execution Modes: user_guide/diffusion/execution_modes.md
+      - Batch Invariance: features/batch_invariance.md
     - Quantization:
       - Quantization: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md

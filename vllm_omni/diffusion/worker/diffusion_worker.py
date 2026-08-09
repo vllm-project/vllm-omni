@@ -66,6 +66,35 @@ logger = init_logger(__name__)
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
 
 
+def _initialize_batch_invariance(device: torch.device) -> None:
+    """Initialize native vLLM BIC after CUDA selection and before distributed init."""
+    from vllm_omni.diffusion.batch_invariance import diffusion_batch_invariant_enabled
+
+    if not diffusion_batch_invariant_enabled():
+        return
+    if device.type != "cuda" or torch.version.hip is not None:
+        # ROCm/HIP and non-CUDA devices skip silently: no operator replacement, no
+        # notice. Upstream installs its GEMM overrides under is_device_capability_family
+        # checks that only a real CUDA device answers, so the coverage a HIP build would
+        # get is partial at best; not calling in keeps that out of the picture entirely.
+        # docs/features/batch_invariance.md records that the seed contract still applies.
+        return
+
+    # CUDA compute capability is deliberately not checked. Evidence covers 8.9 only,
+    # and upstream branches per capability family, so any other value is unverified
+    # rather than unsupported: the switch is honoured and determinism holds for the
+    # operators vLLM actually replaces. docs/features/batch_invariance.md carries the
+    # per-capability scope; VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=0 is the way out.
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+
+    # init_batch_invariance() re-reads envs.VLLM_BATCH_INVARIANT itself, so the
+    # diffusion-only switch has to align it or the op replacement silently no-ops.
+    # vllm.envs resolves this name lazily from os.environ, and its parser is
+    # bool(int(...)), so the value must stay int-parsable.
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    init_batch_invariance()
+
+
 @dataclass
 class _DiffusionVllmModelConfig:
     model: str
@@ -274,6 +303,7 @@ class DiffusionWorker:
         # Setup device
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
+        _initialize_batch_invariance(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.

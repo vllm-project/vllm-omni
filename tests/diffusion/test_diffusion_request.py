@@ -4,6 +4,7 @@
 import random
 
 import pytest
+import vllm.envs as envs
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -109,3 +110,33 @@ def test_explicit_nonzero_guidance_scale_is_honored(value):
 
     assert req.sampling_params.guidance_scale_provided is True
     assert req.sampling_params.guidance_scale == value
+
+
+def test_request_records_whether_seed_was_explicit_before_defaulting():
+    """The record has to be taken before the fallback assigns a seed of its own.
+
+    Once the fallback has run, sampling_params.seed alone cannot tell a caller-supplied
+    seed from a generated one, which is what the batch-invariance request contract needs.
+    """
+    implicit = _make_request()
+    explicit = OmniDiffusionRequest(
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(seed=0),
+        request_id="request-explicit",
+    )
+
+    assert implicit.seed_was_explicit is False
+    assert explicit.seed_was_explicit is True
+
+
+def test_dummy_warmup_request_still_uses_internal_seed_fallback_in_batch_invariant_mode(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "dummy run"},
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id=DUMMY_DIFFUSION_REQUEST_ID,
+    )
+
+    assert request.is_dummy_run()
+    assert isinstance(request.sampling_params.seed, int)
