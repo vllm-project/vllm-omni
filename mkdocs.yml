@@ -105,6 +105,7 @@ plugins:
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
+        - "re:vllm_omni\\.model_executor\\.models\\.chatterbox\\.s3gen_core.*"  # vendored S3Gen sources import optional deps (conformer, diffusers, omegaconf) not installed for docs
         - "vllm_omni.diffusion.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building

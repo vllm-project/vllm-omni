@@ -89,6 +89,18 @@ class StageEngineCoreProc(EngineCoreProc):
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
+        # Ensure omni HF config + tokenizer registrations are in place for this
+        # subprocess. Without this, models like Chatterbox that ship a raw
+        # tokenizer.json (no tokenizer_config.json) make
+        # StructuredOutputManager crash with KeyError when AutoTokenizer tries
+        # to look up TOKENIZER_MAPPING[type(config)].
+        try:
+            from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
+
+            register_omni_models_to_vllm()
+        except Exception as exc:  # pragma: no cover - best-effort
+            logger.warning("Skipping omni model registration in subprocess: %s", exc)
+
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves
         # ``--reasoning-parser``.  The main process already registered them

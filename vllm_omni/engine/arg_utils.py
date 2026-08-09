@@ -29,6 +29,9 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "PersonaPlexTalkerForConditionalGeneration": "personaplex",
     "PersonaPlexCode2Wav": "personaplex",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "ChatterboxTurboT3ForGeneration": "chatterbox_turbo",
+    "ChatterboxT3ForGeneration": "chatterbox",
+    "ChatterboxS3Gen": "chatterbox_turbo",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -42,6 +45,10 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.chatterbox.configuration_chatterbox import (
+            ChatterboxConfig,
+            ChatterboxTurboConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
         )
@@ -87,6 +94,8 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("chatterbox_turbo", ChatterboxTurboConfig),
+        ("chatterbox", ChatterboxConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -95,6 +104,23 @@ def _register_omni_hf_configs() -> None:
             pass
         if _CONFIG_REGISTRY is not None and model_type not in _CONFIG_REGISTRY:
             _CONFIG_REGISTRY[model_type] = config_cls
+
+    # Some of these configs (e.g. Chatterbox) correspond to models that ship
+    # a raw tokenizer.json without a tokenizer_config.json. Without a fallback
+    # class in TOKENIZER_MAPPING, vLLM's StructuredOutputManager crashes with
+    # KeyError when AutoTokenizer tries to infer the class from the config.
+    # Register a generic fast tokenizer for these so AutoTokenizer can load
+    # from the raw JSON file.
+    try:
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+        for config_cls in (ChatterboxConfig, ChatterboxTurboConfig):
+            try:
+                AutoTokenizer.register(config_cls, fast_tokenizer_class=PreTrainedTokenizerFast)
+            except ValueError:
+                pass  # already registered
+    except Exception as exc:
+        logger.warning("Skipping AutoTokenizer fallback registration: %s", exc)
 
 
 def register_omni_models_to_vllm():
@@ -300,7 +326,16 @@ class OmniEngineArgs(EngineArgs):
             # Workaround: create a patched config.json in a temp directory
             # and point hf_config_path to it so vLLM reads model_type from it.
             if not self.hf_config_path:
-                model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
+                # Prefer the model_type explicitly set in the stage YAML's
+                # hf_overrides (needed when one architecture is shared across
+                # variants with different model_types, e.g. ChatterboxS3Gen
+                # is used by both Turbo and Original and the arch-map only
+                # encodes one). Fall back to the arch-map otherwise.
+                model_type = None
+                if isinstance(self.hf_overrides, dict):
+                    model_type = self.hf_overrides.get("model_type")
+                if model_type is None:
+                    model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 

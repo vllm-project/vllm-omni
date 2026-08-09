@@ -1,0 +1,110 @@
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: t3
+      model_arch: ChatterboxTurboT3ForGeneration
+      # Defensive filter in case the Turbo repo ever adds multilingual shards
+      # (matching behavior in chatterbox.yaml for the Original variant).
+      ignore_patterns:
+        - "original/**/*"
+        - "t3_23lang.safetensors"
+        - "t3_mtl23ls_v2.safetensors"
+      hf_overrides:
+        architectures: [ChatterboxTurboT3ForGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      # async_scheduling stays off, matching every in-tree pipeline
+      # (step_audio_2, mimo_audio): on vllm v0.25 the async path only recovers
+      # token ids for preemption-resumed requests, so the OmniARScheduler's
+      # skip-and-re-add flow KeyErrors in _update_states. prefix_caching stays
+      # off: the example feeds placeholder prompt_token_ids ([0]*len), so
+      # caching would collide unrelated prompts of equal length.
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.5
+      distributed_executor_backend: "mp"
+      max_num_seqs: 64
+      max_num_batched_tokens: 2048
+      max_model_len: 8196
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.chatterbox.t3_to_s3gen_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 1000
+      top_p: 0.95
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.2
+      stop_token_ids: [6562]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: s3gen
+      model_arch: ChatterboxS3Gen
+      hf_overrides:
+        architectures: [ChatterboxS3Gen]
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      # S3Gen forward calls .item() for ctx_frames, which breaks CUDA graph
+      # capture (stream-capture-unsupported). Keep eager until S3Gen is
+      # refactored to avoid host-device syncs in forward.
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.3
+      distributed_executor_backend: "mp"
+      max_num_seqs: 64
+      max_num_batched_tokens: 8192
+      max_model_len: 8196
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # 25 tokens/sec → 1 second chunks with 1 second overlap.
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
