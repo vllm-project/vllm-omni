@@ -15,6 +15,7 @@ Contents:
 * Dataset and workload settings
 * Single request latency, a latency decomposition model, and a concurrency envelope
 * Reproducibility guidelines, including a determinism caveat that affects output comparison
+* B200 addendum: parallel-strategy pair, scaling ladder, concurrency spot-check, and batch-path results on 8x B200
 
 ---
 
@@ -287,3 +288,68 @@ The size of that effect is a band, not a number. Four same configuration crossin
 This matters for anyone comparing configurations by output, and it is easy to get wrong. Each configuration runs on its own server instance, so every cross configuration comparison carries a restart effect. In this study, tensor parallel against the recommended configuration measured 26.93, 28.75, and 27.49 dB across three crossings, entirely inside the same configuration band and not even its lowest member. There is no evidence that tensor parallelism alters output.
 
 Measured against a single control, the first of those figures had looked like a real 1.19 dB shortfall. **One control is worse than none, because it supplies a precision the measurement does not have.** Measure several same configuration crossings on your own hardware, report the band rather than a floor, and treat any cross configuration result inside that band as unresolved rather than as agreement or as difference.
+
+---
+
+# 9. B200 addendum
+
+### Environment (B200 lane)
+
+| Item | Value |
+| --- | --- |
+| Hardware | 8x NVIDIA B200 SXM (192 GB HBM3e per GPU), 160 vCPU, 1792 GB RAM |
+| Driver / host image | 580.126.09 / ubuntu24.04-cuda13.0.0.2.711 |
+| Cloud | Nebius us-central1, gpu-b200-sxm, preset 8gpu-160vcpu-1792gb, preemptible |
+| Image | `vllm/vllm-omni:cosmos3` @ sha256:6d2630c7d637b699557573f2c3fee8df5d4d0cd718977aa22549ed6a6ef30587 |
+| Model revision | `nvidia/Cosmos3-Super` @ e0262be9d8f7586bc24c069a2aed2b665bdff266 |
+| Harness | in-image `benchmarks/diffusion/diffusion_benchmark_serving.py`, client timeout patched 600 s -> 5400 s (same patch as the H200 lane) |
+
+### 1. Parallel-strategy pair, anchor shape (720p / 189 frames / 35 steps, seed 17, guardrails off, n=3; plus one 50-step cell per arm)
+
+| Arm | Wall (s), 35 steps | Wall (s), 50 steps |
+| --- | --- | --- |
+| Recommended: CFG2 x Ulysses4 x HSDP8 | 70 / 68 / 69 | 91 |
+| Tensor parallelism 8 | 78 / 77 / 77 | 104 |
+
+The recommended config is 10.7% faster at 35 steps and 12.5% faster at 50 steps. The ~9% recommended-over-TP advantage measured on 8x H200 (PR #5926 section 7.1) generalizes across GPU generations and slightly widens on B200.
+
+Steps-axis decomposition on the recommended arm, using the same derivation as section 7.2 of the H200 entry (step delta, guardrails off, example prompt):
+
+- Per-step rate: from the pair walls 69 s (35 steps, mean of 70/68/69) and 91 s (50 steps), (91 - 69)/15 = **1.467 s/step**. MP4 encode cancels inside a step delta.
+- Cross-generation scaling: the H200 entry's matched figures give (166.26 - 120.57)/15 = **3.046 s/step**, so the per-step rate scales **2.08x** from H200 to B200.
+- Fixed cost, with the basis difference stated: H200's stage-based fixed cost is 14.4 s. B200's wall-derived fixed cost is 17.7 s and includes MP4 encode and request overhead, which were not recorded separately on this host. Net of a few-second encode, the B200 fixed cost lands in the same ~14 s class, so the fixed cost reads as approximately GPU-independent.
+- Derivation warning: neither figure above uses the startup-stats field `denoise_step_latency_ms`. That field is stage_gen/steps by construction (3,448 ms on H200 guardrails off; 2,388.4 ms on B200 guardrails on at this prompt, matching 35 x 2,388.4 ≈ 83,595 ms stage-gen), so it amortizes the fixed cost, and on B200 also the guardrail cost, into every step. Section 7.6's guidance already bars that derivation.
+
+### 2. Scaling ladder spot-cells (720p / 189 frames / 35 steps, seed 17, guardrails off, wall, n=1)
+
+| GPUs | Measured (s) | NVIDIA published (s; tensor parallelism per their methodology) |
+| --- | --- | --- |
+| 1 | 377 | 390.28 |
+| 4 | 122 | 113.31 |
+| 8 | 77.3 (mean of 3, TP-8) | 62.11 |
+
+Within about 3-8% at 1 and 4 GPUs; 24% above the published 8-GPU number. Direction matches the H200 lane's finding that the card's published grid is not exactly reproducible on third-party hosts even with the vendor image; the gap is wider here than on H200 (8%). Comparing against the server-side stage-generation time (which, like NVIDIA's grid, excludes MP4 encode and request overhead): even subtracting ~3 s of encode, the 8-GPU delta stands at ~19%.
+
+### 3. Concurrency spot-check, production shape (720p / 189 frames / 35 steps, recommended config, guardrails on, `--dataset random`, patched client)
+
+| Concurrency | Clips/hr | stage-gen mean (s) | Peak memory max (MB) |
+| --- | --- | --- | --- |
+| 1 | 49.06 | 68.5 | 38,562 |
+| 2 | 54.99 | 110.7 | 38,562 |
+
++12.1% throughput at concurrency 2 with byte-identical peak memory (38,562 MB at both). Throughput saturates by concurrency 2 on B200 as well, consistent with the H200 entry's finding that added concurrency queues rather than batches. The B200's larger per-GPU memory changes nothing about the envelope at this shape.
+
+### 4. Blackwell-specific notes for the entry
+
+- The pinned `cosmos3` image serves the recommended config on B200 with no #5611-class failure; server logs resolve the layout to ulysses=4, ring=1, so ring degree > 1 remains unverified on B200 by this lane (see the datapoint comment on RFC #5631).
+- `vllm/vllm-omni:v0.26.0` fails to start with guardrails at the default ON (missing `cosmos-guardrail` package; the pinned image ships 0.3.1). With `--no-guardrails` it serves at 72 s (vs 69.0 s) and its output differs materially from the pinned image at the same seed (median PSNR 30.54 dB, below even the B200 restart comparisons that follow).
+- B200 same-config restart drift, measured from two restart comparisons (guardrails-on example prompt): median PSNR 32.17 and 32.13 dB. Two comparisons are an early estimate, but they already sit outside the H200 range (26.8-29.0 dB over four comparisons); use B200-measured drift for B200 parity claims.
+
+### 5. Batch-path addendum: `npa-cosmos3` on B200
+
+- `npa-cosmos3:1.2.2-cu130` (nebius-physical-ai @ 3fe8584, cosmos-framework 5e67049) on B200: Super t2v anchor shape, guardrails on, seed 17. Warm-cache invocations complete in 473 and 472 s wall (n=2); a first invocation including one-time guardrail-asset downloads took 740 s. Sampling 394 s (35 steps, ~11.25 s/step) on a single B200 card; the full 124 GB checkpoint fits one 192 GB card. Load-to-first-step ~80 s warm. All four runs byte-identical (sha256 3c96f88d9710d58b82399a2c8fe0df7964a07b179b902d179838f2578df5af77): the batch path is deterministic across process restarts on B200, in contrast to the serving path's per-server-instance determinism.
+- The serving container built from the pinned image (PR #268 branch @ dbc59ca) was also validated on B200: build gate pass, all three startup preflights refuse correctly (no token; unwritable cache; 4-of-8 GPUs), readiness 261 s, anchor clip content-verified (wall 87 s, stage-gen 83.7 s at 35 steps), per-rank memory 43.3-43.4 GiB during generation (49.7 GiB on rank 0, which also hosts the API server and guardrails; nvidia-smi readings 44,320-44,472 MiB and 50,880 MiB).
+
+### Artifacts
+
+Measurement logs, sweep JSONs, parity logs, sha256 manifests, and clips are retained and available on request; all numbers above are reproducible from them.
