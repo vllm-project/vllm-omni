@@ -37,6 +37,7 @@ th {
 | `Krea2Pipeline` | Krea 2 (Raw + Turbo) | `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | ✅︎ | | | |
 | `WanPipeline` | Wan2.1-T2V, Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-T2V-14B-Diffusers`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -97,3 +98,23 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+LingBot-World 2.0 v1 is limited to the 14B causal-fast checkpoint, one first-frame image plus a
+camera directory, 9–117 raw frames in `9 + 12k` increments, fixed four-step DMD sampling, and
+request-local history. Its DiT path and local RMSNorm are TP-aware, but real-checkpoint TP=1 and
+TP>1 CUDA runs are still pending. v1 does not support SP/USP, pipeline or CFG parallelism, HSDP,
+VAE parallelism, quantization, Cache-DiT/TeaCache, cross-request or streaming session state,
+runtime events, causal-pretrain, or the 1.3B checkpoint.
+Camera directories consume only `poses.npy` and `intrinsics.npy`; any `wasd_action.npy` or
+`ijkl_action.npy` files are ignored rather than converted to runtime action events.
+The repository includes an opt-in H100-class CUDA E2E matrix (also used on H200): a compiled
+default-resolution TP=1 one-block run, an eager TP=2 one-block sharding run, 21-frame determinism and camera-action sensitivity,
+and an 81-frame run that crosses the checkpoint's 18-latent-frame sliding window. The camera comparison
+expects primary and alternate action directories to be siblings under one trusted root. The table
+remains experimental until those real-checkpoint runs and a qualitative reference-video comparison
+are recorded; neither is claimed by the local CPU/stub suite. No AMD GPU, Ascend NPU, or Intel GPU
+support is claimed.
+
+The [LingBot-World checkpoint](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers)
+is separately licensed under CC BY-NC-SA and restricted to non-commercial use. The vLLM-Omni
+integration code is licensed under Apache-2.0.
