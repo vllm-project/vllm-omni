@@ -63,8 +63,8 @@ dev = [
     "zhconv==1.4.3",
     "scipy==1.18.0",
     "funasr==1.3.29",
-    "g2pM>=0.1.2.5", # SoulX-Singer SVS (also in soulx-svs extra); needed by weekly CI
-    "g2p-en>=2.1.0", # SoulX-Singer SVS English G2P (also in soulx-svs extra)
+    "g2pM==0.1.2.5", # SoulX-Singer SVS (also in soulx-svs extra); needed by weekly CI
+    "g2p-en==2.1.0", # SoulX-Singer SVS English G2P (also in soulx-svs extra)
     "lpips==0.1.4", # for quantization fp8
     "orjson==3.11.9", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
