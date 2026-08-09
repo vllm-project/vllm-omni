@@ -8,12 +8,12 @@ CPU offload and distributed layerwise offload are not required in any of
 these configurations.
 
 Validated on:
-- Host: <YLX Y762 >
+- Host: YLX Y762
 - GPUs: 8 × RTX PRO 6000 Blackwell (96 GiB)
-- Device order: CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+- Device order: default (`CUDA_VISIBLE_DEVICES` not set)
 - Driver / CUDA: 580.105.08 / 13.0
-- vLLM-Omni : vllm/vllm-omni:minimax-h3
-- Workload: T2VA, 1344×768, duration=5.0, 50 steps, seed=1101
+- Container image: `vllm/vllm-omni:minimax-h3`
+- Workload: T2VA, 1344×768, `duration=5.0`, 50 steps, `flow_shift=12`, `seed=1101`
 
 ## Capacity requirements
 
@@ -23,6 +23,7 @@ Validated on:
 | Checkpoint storage | 135 GiB per partition | 135 GiB per partition | 135 GiB per partition |
 | Available system RAM | 200 GiB minimum | 200 GiB minimum | 200 GiB minimum |
 | Recommended system RAM | 384 GiB | 384 GiB | 384 GiB |
+| Measured peak HBM per GPU | 77.49 GiB | 66.44 GiB | 61.07 GiB |
 
 `FL2VA` and `Ref2VA` are separate checkpoint partitions. Start one server at
 a time on a host sized for the minimum system-memory requirement, or pass
@@ -65,6 +66,10 @@ GPUs `(0,1)` and `(2,3)` are the two local pairs, the order is
 `CUDA_VISIBLE_DEVICES=0,2,1,3`. Do not copy these IDs blindly: reproduce the
 same relationship on the target host.
 
+Device-order pinning and NUMA binding are tuning knobs, not prerequisites.
+The measurements in this recipe were taken without either, so any gain from
+them is additional to the numbers reported below and is host-specific.
+
 ## Two-GPU serving configuration
 
 Two 96 GiB GPUs hold the BF16 model with TP2 alone. There is no Ulysses
@@ -76,12 +81,9 @@ or concurrency.
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
 export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
+export PORT=8000
 
-CUDA_VISIBLE_DEVICES=0,1 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
 VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --cpunodebind=0 --membind=0 \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
@@ -109,12 +111,9 @@ partition does not fit in 96 GiB.
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
 export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
+export PORT=8000
 
-CUDA_VISIBLE_DEVICES=0,2,1,3 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
 VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --cpunodebind=0 --membind=0 \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
@@ -138,18 +137,12 @@ lower per-GPU weight residency relative to the four-GPU profile; it lowers
 activation memory and per-step latency by sharding the attention sequence
 four ways.
 
-On a dual-socket host, eight GPUs span both NUMA nodes. Do not bind the
-server to a single node.
-
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
 export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
+export PORT=8000
 
-CUDA_VISIBLE_DEVICES=0,4,1,5,2,6,3,7 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
 VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --interleave=all \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
@@ -171,8 +164,8 @@ vllm serve "${MODEL}" \
 With TP2 and Ulysses4 the two Ulysses groups are ranks `(0,2,4,6)` and
 `(1,3,5,7)`, and the four tensor-parallel pairs are `(0,1)`, `(2,3)`,
 `(4,5)`, and `(6,7)`. On a dual-socket host these two collectives cannot
-both be socket-local. Choose the order that matches the measured
-bottleneck:
+both be socket-local. If you choose to pin the device order, the trade-off
+is:
 
 | Device order | Socket-local collective | Crosses sockets |
 | --- | --- | --- |
@@ -181,7 +174,8 @@ bottleneck:
 
 The first order assumes physical GPUs `0-3` are on NUMA node 0 and `4-7` on
 node 1. Reproduce that relationship on the target host rather than copying
-the IDs. Measure both orders once; the winner is host-specific.
+the IDs. The reported measurements use the default order and no NUMA
+binding; the two orders were not compared on this host.
 
 ### Headroom variant: TP4 with Ulysses2
 
@@ -207,11 +201,16 @@ to 400 GiB available system RAM and 270 GiB of model storage.
 Use `CUDA_VISIBLE_DEVICES=0,2,1,3`, `--cpunodebind=0 --membind=0`, and
 `--port 8091` for the FL2VA server. Use `CUDA_VISIBLE_DEVICES=4,6,5,7`,
 `--cpunodebind=1 --membind=1`, and `--port 8092` for the Ref2VA server.
+This layout is described for completeness and was not part of the measured
+runs.
 
 ## Shared serving notes
 
-Do not add `--enforce-eager` for a performance run. Warm the server once
-before measuring so regional compilation is outside the measured request.
+Do not add `--enforce-eager` for a performance run. Warm the server before
+measuring so regional compilation is outside the measured request. On this
+host the first request after startup ran 19% slower than the steady state
+(107.58 s versus 90.48 s on eight GPUs); two warmup requests were enough to
+converge.
 
 For Ref2VA on a single-server layout, stop the FL2VA server and restart the
 same command with `MODEL="${MODEL_ROOT}/Ref2VA"`.
@@ -234,22 +233,78 @@ layerwise offload.
 
 ## Target-hardware validation
 
-<TODO: describe the validated host: socket and NUMA layout, PCIe-only or
-not, CUDA version, driver version, PyTorch version, output shape, frame
-count, warmup count, and the device order used for the eight-GPU run.>
+T2VA, 1344×768, `duration=5.0`, `fps=24`, 50 steps, `flow_shift=12`,
+`seed=1101`, BF16, `CUDNN_ATTN`, tiled VAE, one request at a time. Servers
+were started with the commands above — default device order, no NUMA
+binding — plus `--enable-diffusion-pipeline-profiler`. Two warmup requests
+preceded each measured request.
 
 | Measurement | Two GPUs | Four GPUs | Eight GPUs |
 | --- | ---: | ---: | ---: |
-| Client E2E (50-step T2VA) | ~10 min | Not measured| ~4 min |
-| Client E2E (60-step ref2va) | ~12 min | Not measured| ~5 min |
+| Topology | TP2 × USP1 | TP2 × USP2 | TP2 × USP4 |
+| Text encode | 0.040 s | 0.044 s | 0.035 s |
+| Denoise, 50 steps | 278.55 s | 168.73 s | 87.90 s |
+| Per step | 5.571 s | 3.375 s | 1.758 s |
+| VAE decode | 5.396 s | 2.791 s | 1.798 s |
+| Client E2E | 284.76 s | 172.32 s | 90.48 s |
+| Peak HBM per GPU | 77.49 GiB | 66.44 GiB | 61.07 GiB |
+| Headroom below 96 GiB | 18.5 GiB | 29.6 GiB | 34.9 GiB |
 
-<TODO: state the remaining headroom below the reported device capacity, and
-report the measured difference between the two eight-GPU device orders.>
-Re-measure memory for longer reference inputs, concurrency greater than one,
-or a different output shape. The recorded run is a five-step profiling
-validation; it is not a production 50-step latency claim.
+Stage times are read from the `X-Stage-Durations` response header of
+`/v1/videos/sync`. Peak memory is the maximum of `nvidia-smi
+--query-gpu=memory.used` sampled at 1 Hz across every device for the
+duration of the measured request. Per step is denoise wall time divided by
+the 50 requested steps. Stage times sum to roughly 0.75 s less than
+end-to-end in all three configurations; queueing, result transfer, and MP4
+muxing sit outside the profiled stages.
+
+### Scaling behaviour
+
+Denoise speedup is not uniform across the sweep: 1.65× from two to four
+GPUs (83% efficiency) but 1.92× from four to eight (96%). Two GPUs run
+Ulysses1, so there is no sequence parallelism at all; going to four GPUs
+pays the one-time cost of introducing the all-to-all, while going from four
+to eight only widens an all-to-all that already exists. Expect the second
+doubling to pay off better than the first on this topology.
+
+VAE decode behaves in the opposite direction — 1.93× from two to four GPUs
+but only 1.55× from four to eight — as patch parallelism produces smaller
+tiles and tile-boundary overhead grows.
+
+Text encoding is 0.04 s in every configuration and is not worth optimising;
+denoise is 96-98% of end-to-end throughout.
+
+### Per-GPU memory model
+
+Peak memory falls by 11.05 GiB from two to four GPUs and by a further
+5.37 GiB from four to eight — halving each time the Ulysses degree doubles,
+because all three configurations shard the DiT with TP2 and hold identical
+weights per GPU. Fitting the first two points gives:
+
+```
+peak HBM per GPU ≈ 55.4 GiB + 22.1 GiB / ulysses_degree
+```
+
+That fit predicts 60.9 GiB at Ulysses4 against 61.07 GiB measured, a 0.25%
+error. The practical consequence is a floor near 55 GiB per GPU: adding
+GPUs past eight will not reduce the per-GPU requirement further. To serve
+on smaller cards, raise the tensor-parallel degree instead.
+
+Re-measure memory for longer reference inputs, concurrency greater than
+one, or a different output shape.
+
+### Not yet measured
+
+Ref2VA latency and memory have not been measured on this host. Ref2VA
+drives the Qwen3-VL presentation from tens of tokens for text-only prompts
+to several thousand with image or video references, so T2VA numbers do not
+transfer to it. The eight-GPU device-order comparison in the section above
+was also not run.
 
 ## T2VA request example
+
+`t2va` requires an explicit `aspect_ratio` even when `width` and `height`
+are supplied.
 
 ```bash
 export API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
@@ -266,14 +321,24 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
   -o t2va.mp4
 ```
-## ref2va request example
+
+To collect the stage breakdown and peak memory for a request, add
+`--enable-diffusion-pipeline-profiler` to the server command and `-D
+headers.txt` to the curl invocation, then read `X-Stage-Durations` and
+`X-Peak-Memory-MB` from the saved headers.
+
+## Ref2VA request example
+
+`ref2va` defaults to a 16:9 aspect ratio, so `aspect_ratio` is optional
+here.
+
 ```bash
 curl -X POST "http://127.0.0.1:${PORT}/v1/videos/sync" \
   --fail-with-body -w '\nHTTP %{http_code}\n' \
   --max-time 1200 \
   -F "input_reference=@/root/hand.jpg;type=image/jpeg" \
   -F "audio_reference=</root/audio_ref.json" \
-  -F "prompt=EOF 2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
+  -F "prompt=2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
   -F 'width=1344' -F 'height=768' -F 'fps=24' \
   -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
   -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
