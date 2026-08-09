@@ -616,7 +616,13 @@ def download_images(urls: list[str]) -> list[Image.Image]:
 _DREAMZERO_UPSTREAM_SERVER_SCRIPT = (
     Path(__file__).resolve().parent / "upstream_mock" / "upstream_socket_server_no_compile.py"
 )
-_DREAMZERO_DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
+# Hardcoded parity inputs (not env vars):
+# - source checkout of https://github.com/dreamzero0/dreamzero
+# - HF weights for the upstream reference server / vLLM side
+DREAMZERO_UPSTREAM_GIT = "https://github.com/dreamzero0/dreamzero.git"
+DREAMZERO_REPO = Path.home() / ".cache" / "vllm-omni" / "dreamzero_upstream"
+DREAMZERO_MODEL_ID = "GEAR-Dreams/DreamZero-DROID"
+_DREAMZERO_DEFAULT_MODEL = DREAMZERO_MODEL_ID
 _DREAMZERO_DEFAULT_READY_TIMEOUT_S = int(os.environ.get("OPENPI_SERVICE_READY_TIMEOUT_S", "900"))
 _DREAMZERO_DEFAULT_PROMPT = (
     "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
@@ -625,23 +631,42 @@ _DREAMZERO_DEFAULT_SESSION_ID = "openpi-e2e-parity-session"
 _DREAMZERO_OPENPI_VLLM_PATH = "/v1/realtime/robot/openpi"
 
 
-def require_dreamzero_parity_env() -> tuple[Path, Path]:
-    repo_env = os.environ.get("DREAMZERO_REPO")
-    if repo_env is None:
-        raise ValueError("DREAMZERO_REPO environment variable is required.")
-    repo = Path(repo_env).expanduser()
-    if not repo.is_dir():
-        raise FileNotFoundError(f"DREAMZERO_REPO does not exist: {repo}")
-    checkpoint_dir = repo / "checkpoints" / "dreamzero"
-    if not checkpoint_dir.is_dir():
-        raise FileNotFoundError(f"DreamZero checkpoint not found: {checkpoint_dir}")
+def _ensure_dreamzero_upstream_repo(repo: Path = DREAMZERO_REPO) -> Path:
+    marker = repo / "test_client_AR.py"
+    if marker.is_file():
+        return repo
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    if repo.exists():
+        raise FileNotFoundError(f"DreamZero upstream checkout at {repo} is incomplete (missing {marker.name}).")
+    subprocess.check_call(
+        ["git", "clone", "--depth", "1", DREAMZERO_UPSTREAM_GIT, str(repo)],
+    )
+    if not marker.is_file():
+        raise FileNotFoundError(f"Cloned DreamZero upstream is missing {marker}")
+    return repo
+
+
+def require_dreamzero_parity_env(
+    *,
+    repo: Path = DREAMZERO_REPO,
+    model_id: str = DREAMZERO_MODEL_ID,
+) -> tuple[Path, Path]:
+    """Resolve upstream DreamZero source + HF checkpoint paths for parity tests."""
+    from huggingface_hub import snapshot_download
+
+    repo = _ensure_dreamzero_upstream_repo(Path(repo).expanduser())
+    checkpoint_dir = Path(snapshot_download(model_id))
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
     return repo, checkpoint_dir
 
 
-def load_dreamzero_upstream_modules():
-    require_dreamzero_parity_env()
+def load_dreamzero_upstream_modules(
+    *,
+    repo: Path = DREAMZERO_REPO,
+    model_id: str = DREAMZERO_MODEL_ID,
+):
+    require_dreamzero_parity_env(repo=repo, model_id=model_id)
     import test_client_AR as dreamzero_upstream_client
     from eval_utils.policy_client import WebsocketClientPolicy
 
@@ -934,19 +959,18 @@ class DreamZeroUpstreamServer(_DreamZeroParityServer):
     def _build_env(self) -> dict[str, str]:
         from tests.helpers.env import pick_least_used_device_indices
 
+        # Only real process-env knobs for the torchrun child. DreamZero runtime
+        # toggles (ATTENTION_BACKEND / DIT cache / etc.) are hardcoded inside
+        # upstream_socket_server_no_compile.py; DREAMZERO_REPO is a Path constant there.
         dreamzero_repo, _ = require_dreamzero_parity_env()
         env = os.environ.copy()
-        env.setdefault("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{Path.cwd()}:{dreamzero_repo}:{env['PYTHONPATH']}".rstrip(":")
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(Path.cwd()), str(dreamzero_repo), existing_pythonpath) if part
+        )
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(index) for index in pick_least_used_device_indices(max(dreamzero_cfg_parallel_size(), 1))
         )
-        env.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-        env["ATTENTION_BACKEND"] = "torch"
-        env.setdefault("ENABLE_TENSORRT", "false")
-        env["ENABLE_DIT_CACHE"] = "false"
-        env["NUM_DIT_STEPS"] = "16"
-        env["DYNAMIC_CACHE_SCHEDULE"] = "false"
         return env
 
     def _create_client(self) -> Any:

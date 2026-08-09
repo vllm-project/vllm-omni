@@ -22,10 +22,10 @@ optional deps, this wrapper reproduces upstream `main()` but pins attention to
 PyTorch SDPA (`ATTENTION_BACKEND=torch`) for this subprocess only.
 
 Usage:
-    PYTHONPATH="${DREAMZERO_REPO}" \\
+    PYTHONPATH="<dreamzero_upstream>" \\
       .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \\
       tests/e2e/accuracy/upstream_mock/upstream_socket_server_no_compile.py --port 18081 \\
-      --model_path "${DREAMZERO_REPO}/checkpoints/dreamzero"
+      --model_path <hf_snapshot_or_local_checkpoint>
 """
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+# Same hardcoded checkout used by tests/e2e/accuracy/test_dreamzero.py
+DREAMZERO_REPO = Path.home() / ".cache" / "vllm-omni" / "dreamzero_upstream"
 
 
 def _identity_compile(*args, **kwargs):
@@ -51,11 +54,10 @@ def _identity_compile(*args, **kwargs):
 torch.compile = _identity_compile
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+os.environ.setdefault("ENABLE_TENSORRT", "false")
 
-DREAMZERO_REPO_ENV = os.environ.get("DREAMZERO_REPO")
-if not DREAMZERO_REPO_ENV:
-    raise RuntimeError("Set DREAMZERO_REPO to an upstream DreamZero checkout before launching this helper.")
-DREAMZERO_REPO = Path(DREAMZERO_REPO_ENV).expanduser()
+if not DREAMZERO_REPO.is_dir():
+    raise RuntimeError(f"DreamZero upstream checkout not found: {DREAMZERO_REPO}")
 if str(DREAMZERO_REPO) not in sys.path:
     sys.path.insert(0, str(DREAMZERO_REPO))
 

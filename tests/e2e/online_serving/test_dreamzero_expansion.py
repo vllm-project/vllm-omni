@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import abc
 import os
+import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -27,6 +31,47 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "GEAR-Dreams/DreamZero-DROID"
+
+
+def _ensure_openpi_client_for_case() -> None:
+    """PyPI openpi-client pins numpy<2; provide a local stand-in for this case only."""
+    try:
+        import openpi_client  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    from vllm_omni.entrypoints.openpi.connection import _pack, _unpack
+
+    class BasePolicy(abc.ABC):
+        @abc.abstractmethod
+        def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+            raise NotImplementedError
+
+        def reset(self) -> None:
+            return None
+
+    class _Packer:
+        def pack(self, obj: Any) -> bytes:
+            return _pack(obj)
+
+    openpi_client = types.ModuleType("openpi_client")
+    base_policy = types.ModuleType("openpi_client.base_policy")
+    base_policy.BasePolicy = BasePolicy
+    msgpack_numpy = types.ModuleType("openpi_client.msgpack_numpy")
+    msgpack_numpy.Packer = _Packer
+    msgpack_numpy.packb = _pack
+    msgpack_numpy.unpackb = _unpack
+    openpi_client.base_policy = base_policy
+    openpi_client.msgpack_numpy = msgpack_numpy
+    openpi_client.BasePolicy = BasePolicy
+    sys.modules["openpi_client"] = openpi_client
+    sys.modules["openpi_client.base_policy"] = base_policy
+    sys.modules["openpi_client.msgpack_numpy"] = msgpack_numpy
+
+
+_ensure_openpi_client_for_case()
 
 test_params = [
     OmniServerParams(
