@@ -109,6 +109,16 @@ _OMNI_MODELS = {
         "audex_omni",
         "NemotronHAudexForConditionalGeneration",
     ),
+    "FunAudioChatForConditionalGeneration": (
+        "funaudiochat",
+        "funaudiochat",
+        "FunAudioChatForConditionalGeneration",
+    ),
+    "FunAudioChatCosyVoice3Code2Wav": (
+        "funaudiochat",
+        "funaudiochat_code2wav",
+        "FunAudioChatCosyVoice3Code2Wav",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",

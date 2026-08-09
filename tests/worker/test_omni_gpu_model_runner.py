@@ -32,7 +32,20 @@ class DummyReqState:
 
 
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
-    """Dummy model whose class name must exactly match the production check."""
+    """Dummy model that opts in to multimodal feature forwarding."""
+
+    wants_mm_features_in_preprocess = True
+
+    def __init__(self):
+        super().__init__()
+
+    # No real forward needed for these tests.
+
+
+class FunAudioChatForConditionalGeneration(torch.nn.Module):
+    """Second dummy model that opts in to multimodal feature forwarding."""
+
+    wants_mm_features_in_preprocess = True
 
     def __init__(self):
         super().__init__()
@@ -186,6 +199,32 @@ def _make_runner_for_mimo(req_id="r_mimo"):
     runner.vllm_config = _DummyVllmConfig()
 
     # Attach a single request state with mm_features and additional_information_cpu.
+    req_state = DummyReqState()
+    req_state.mm_features = ["mm_feature_obj"]
+    req_state.additional_information_cpu = {"some_key": "some_value"}
+
+    runner.requests = {req_id: req_state}
+
+    return runner
+
+
+def _make_runner_for_funaudiochat(req_id="r_funaudio"):
+    """Create a minimal runner with a FunAudioChat-like model and request state.
+
+    Mirrors ``_make_runner_for_mimo`` but uses a dummy
+    ``FunAudioChatForConditionalGeneration`` to verify attribute-based opt-in.
+    """
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = FunAudioChatForConditionalGeneration()
+
+    class _DummyModelConfig:
+        async_chunk = False
+
+    class _DummyVllmConfig:
+        model_config = _DummyModelConfig()
+
+    runner.vllm_config = _DummyVllmConfig()
+
     req_state = DummyReqState()
     req_state.mm_features = ["mm_feature_obj"]
     req_state.additional_information_cpu = {"some_key": "some_value"}
@@ -637,14 +676,16 @@ def test_sync_local_stage_payloads_retains_payload_until_request_is_active():
     assert runner.requests["late"].additional_information_cpu == payload
 
 
-def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
+def test_maybe_attach_mm_features_req_infos_enriches_dict():
     runner = _make_runner_for_mimo()
     req_id = "r_mimo"
     req_state = runner.requests[req_id]
 
     # Existing req_infos should be copied and enriched, not mutated in place.
     original_req_infos = {"existing": 1}
-    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, original_req_infos, req_id)
+    enriched = OmniGPUModelRunner._maybe_attach_mm_features_req_infos(
+        runner, req_state, original_req_infos, req_id
+    )
 
     assert enriched is not original_req_infos
     assert enriched["existing"] == 1
@@ -654,13 +695,34 @@ def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
     assert enriched["req_id"] == req_id
 
 
-def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
+def test_maybe_attach_mm_features_req_infos_no_req_state_returns_input():
     runner = _make_runner_for_mimo()
     req_id = "missing"
     req_state = None
     req_infos = {"k": "v"}
 
-    result = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, req_infos, req_id)
+    result = OmniGPUModelRunner._maybe_attach_mm_features_req_infos(
+        runner, req_state, req_infos, req_id
+    )
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_maybe_attach_mm_features_req_infos_enriches_funaudiochat():
+    runner = _make_runner_for_funaudiochat()
+    req_id = "r_funaudio"
+    req_state = runner.requests[req_id]
+
+    # Existing req_infos should be copied and enriched, not mutated in place.
+    original_req_infos = {"existing": 1}
+    enriched = OmniGPUModelRunner._maybe_attach_mm_features_req_infos(
+        runner, req_state, original_req_infos, req_id
+    )
+
+    assert enriched is not original_req_infos
+    assert enriched["existing"] == 1
+    # mm_features should be filled from req_state when missing
+    assert enriched["mm_features"] == req_state.mm_features
+    # req_id should always be attached
+    assert enriched["req_id"] == req_id

@@ -101,7 +101,7 @@ from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, create_wav_header
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
     validate_layered_layers,
@@ -1397,6 +1397,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
         stop_reason_emitted: list[bool] = [False] * num_choices
+        # True until the first audio chunk is emitted, so we prepend the WAV
+        # header exactly once instead of per chunk (per-chunk headers decode
+        # as loud pops/blasts in the middle of the PCM stream).
+        first_audio_chunk = True
         num_prompt_tokens = 0
         num_cached_tokens = None
         if self.use_harmony:
@@ -2092,7 +2096,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
                     role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    choices_data = self._create_audio_choice(
+                        omni_res,
+                        role,
+                        request,
+                        stream=True,
+                        first_audio_chunk=first_audio_chunk,
+                    )
                     if isinstance(choices_data, ErrorResponse):
                         logger.error(
                             "Skipping audio chunk for request %s: %s",
@@ -2100,6 +2110,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices_data.error.message,
                         )
                         continue
+                    # Metadata-only audio messages use an empty delta and must
+                    # not consume the one-time WAV header. Keep the flag set
+                    # until a chunk containing encoded audio is emitted.
+                    if any(getattr(choice.delta, "content", None) for choice in choices_data):
+                        first_audio_chunk = False
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2700,7 +2715,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        stream: bool = False,
+        first_audio_chunk: bool = True,
     ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
@@ -2720,6 +2740,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
+        if audio_tensor is not None and audio_tensor.numel() == 0:
+            audio_tensor = None
         if audio_tensor is None:
             if not stream:
                 return self._create_error_response("Audio generation completed but no audio was produced.")
@@ -2762,16 +2784,42 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if isinstance(audio_format, ErrorResponse):
             return audio_format
 
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=sample_rate,
-            response_format=audio_format,
-            speed=1.0,
-            base64_encode=True,
-        )
+        # For streaming WAV, emit the header only on the first chunk and raw
+        # PCM on every subsequent chunk, so clients can concatenate the delta
+        # bytes into one valid WAV stream. Emitting a WAV header per chunk
+        # would inject 44 bytes of "RIFF..WAVE..data" into the middle of the
+        # PCM stream, which decoders play as a loud pop/blast at each
+        # chunk boundary.
+        if stream and audio_format == "wav":
+            pcm_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=sample_rate,
+                response_format="pcm",
+                speed=1.0,
+                base64_encode=False,
+            )
+            pcm_bytes = self.create_audio(pcm_obj).audio_data
 
-        audio_response: AudioResponse = self.create_audio(audio_obj)
-        audio_base64 = audio_response.audio_data
+            if first_audio_chunk:
+                wav_header = create_wav_header(
+                    sample_rate=sample_rate, num_channels=1, bits_per_sample=16
+                )
+                audio_bytes = wav_header + pcm_bytes
+            else:
+                audio_bytes = pcm_bytes
+
+            audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        else:
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=sample_rate,
+                response_format=audio_format,
+                speed=1.0,
+                base64_encode=True,
+            )
+
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            audio_base64 = audio_response.audio_data
 
         # Generate unique ID for the audio
         audio_id = f"audio-{uuid.uuid4().hex[:16]}"

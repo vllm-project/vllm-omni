@@ -21,6 +21,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
@@ -150,9 +151,11 @@ def _build_serving_chat():
         chat_template_content_format="auto",
     )
     instance._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
-            index=omni_res.request_output.outputs[0].index,
-            role=role,
+        side_effect=lambda omni_res, role, request, stream=False, first_audio_chunk=True: (
+            _mock_audio_choices(
+                index=omni_res.request_output.outputs[0].index,
+                role=role,
+            )
         )
     )
     return instance
@@ -489,10 +492,17 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     request = _make_request(modalities=["text", "audio"])
 
     empty_audio = _make_audio_omni_output()
-    empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
+    empty_audio.request_output.outputs[0].multimodal_output = {"audio": [torch.empty(0)]}
 
-    def create_audio_choice(omni_res, role, request, stream=False):
-        return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
+    def create_audio_choice(omni_res, role, request, stream=False, first_audio_chunk=True):
+        return OmniOpenAIServingChat._create_audio_choice(
+            serving_chat,
+            omni_res,
+            role,
+            request,
+            stream=stream,
+            first_audio_chunk=first_audio_chunk,
+        )
 
     serving_chat._create_audio_choice = create_audio_choice
 
@@ -521,6 +531,54 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
 
 
 @pytest.mark.asyncio
+async def test_metadata_only_audio_does_not_consume_first_wav_chunk():
+    """The WAV header flag remains set until encoded audio is emitted."""
+    serving_chat = _build_serving_chat()
+    request = _make_request(modalities=["audio"])
+    first_chunk_flags: list[bool] = []
+
+    def create_audio_choice(
+        omni_res,
+        role,
+        request,
+        stream=False,
+        first_audio_chunk=True,
+    ):
+        first_chunk_flags.append(first_audio_chunk)
+        content = "" if len(first_chunk_flags) == 1 else "UklGRg=="
+        return [
+            ChatCompletionResponseStreamChoice(
+                index=0,
+                delta=DeltaMessage(role=role, content=content),
+                logprobs=None,
+                finish_reason=omni_res.request_output.outputs[0].finish_reason,
+            )
+        ]
+
+    serving_chat._create_audio_choice = create_audio_choice
+
+    async def result_generator():
+        for finish_reason in (None, None, "stop"):
+            output = _make_audio_omni_output()
+            output.request_output.outputs[0].finish_reason = finish_reason
+            yield output
+
+    await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    assert first_chunk_flags == [True, True, False]
+
+
+@pytest.mark.asyncio
 async def test_audio_choice_error_response_is_not_iterated_as_choices():
     """Any ErrorResponse from the audio path is skipped, not iterated."""
     from vllm.entrypoints.openai.engine.protocol import ErrorResponse
@@ -529,7 +587,9 @@ async def test_audio_choice_error_response_is_not_iterated_as_choices():
     request = _make_request(modalities=["text", "audio"])
 
     serving_chat._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
+        side_effect=lambda omni_res, role, request, stream=False, first_audio_chunk=True: (
+            serving_chat._create_error_response("boom")
+        )
     )
 
     async def result_generator():

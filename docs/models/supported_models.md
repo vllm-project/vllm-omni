@@ -55,6 +55,7 @@ th {
 | `StableDiffusionXLPipeline` | Stable-Diffusion-XL | `stabilityai/stable-diffusion-xl-base-1.0` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` | ✅︎ | ✅︎ | | ✅︎ |
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ |
+| `FunAudioChatForConditionalGeneration` | Fun-Audio-Chat-8B | `FunAudioLLM/Fun-Audio-Chat-8B` | ✅︎ | | | |
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` | ✅︎ | ✅︎ | | |
@@ -97,3 +98,8 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+Fun-Audio-Chat requires the upstream Fun-Audio-Chat source package to be
+importable. Install it in the serving environment or set `FUN_AUDIO_CHAT_HOME`
+to its checkout. Stage 1 also needs speaker metadata from
+`FUN_AUDIO_CHAT_SPK_INFO` or `<FUN_AUDIO_CHAT_HOME>/utils/new_spk2info.pt`.

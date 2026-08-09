@@ -1503,18 +1503,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                     if decoded_info:
                         self._update_intermediate_buffer(req_id, decoded_info)
 
-    def _maybe_attach_mimo_audio_req_infos(
+    def _maybe_attach_mm_features_req_infos(
         self,
         req_state: CachedRequestState | None,
         req_infos: dict | None,
         req_id: str,
     ) -> dict | None:
-        """Attach MiMoAudio-specific fields into req_infos if applicable.
+        """Attach multimodal features for models that explicitly request them.
 
-        This helper is intentionally small and self-contained so that it can be
-        unit-tested to prevent regressions when updating MiMoAudio handling.
+        Models opt in with ``wants_mm_features_in_preprocess`` so adding a new
+        architecture does not require another runner-side class-name check.
         """
-        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+        if req_state is None or not getattr(
+            self.model, "wants_mm_features_in_preprocess", False
+        ):
             return req_infos
 
         # Always operate on a dict copy to avoid mutating shared instances.
@@ -1744,9 +1746,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # mimo-audio check
+                # Attach model-specific multimodal preprocessing inputs.
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                req_infos = self._maybe_attach_mm_features_req_infos(req_state, req_infos, req_id)
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])

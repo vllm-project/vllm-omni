@@ -501,6 +501,8 @@ class MiMoAudioForConditionalGeneration(
     SupportsMultiModal,
     CustomProcessMixin,
 ):
+    wants_mm_features_in_preprocess = True
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",

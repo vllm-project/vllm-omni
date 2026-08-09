@@ -1,0 +1,116 @@
+# Streaming variant of fun_audio_chat_cur8_cg.yaml.
+#
+# Identical to fun_audio_chat_cur8_cg.yaml except streaming is enabled:
+#   - top-level `async_chunk: true`
+#   - stage-0 `engine_args.custom_process_next_stage_input_func` points at the
+#     async-chunk producer `funaudiochat2code2wav_async_chunk`, which streams
+#     per-step CRQ codec increments to stage-1 via the chunk transfer adapter +
+#     default SHM connector. Audio is synthesized and emitted incrementally
+#     during decode instead of waiting for the full stage-0 finish.
+#
+# Streaming chunk granularity is tunable via the `connectors` section below
+# (codec_chunk_frames / initial_codec_chunk_frames /
+# codec_pre_lookahead_frames / codec_flow_segment_frames, in CRQ codec frames;
+# CosyVoice speech rate is 25 frames/s, so 25 frames == ~1s of audio).
+#
+# The original non-streaming behavior is recovered by using
+# fun_audio_chat_cur8_cg.yaml (or setting async_chunk: false).
+#
+# For local checkpoints, override `engine_args.model` in both stages below
+# instead of using the default HF repo IDs.
+async_chunk: true
+runtime:
+  connectors:
+    funaudio_stream:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        codec_chunk_frames: 50
+        initial_codec_chunk_frames: 10
+        codec_pre_lookahead_frames: 3
+        codec_flow_segment_frames: 200
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 8            # batch size 8
+    engine_args:
+      model: FunAudioLLM/Fun-Audio-Chat-8B
+      model_stage: s2s
+      model_arch: FunAudioChatForConditionalGeneration
+      # Streaming: stage-0 emits per-step CRQ codec increments as async chunks
+      # to stage-1 via the chunk transfer adapter + default SHM connector, so
+      # audio is synthesized and emitted incrementally during decode instead of
+      # waiting for the full stage-0 finish. Stage1 bounds Flow to an 8-second
+      # segment and carries only fixed-size HiFT continuity state.
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.funaudiochat.funaudiochat2code2wav_async_chunk
+      hf_overrides:
+        audio_config:
+          max_source_positions: 500
+      limit_mm_per_prompt:
+        audio: 1
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      trust_remote_code: true
+      enable_prefix_caching: false
+      gpu_memory_utilization: 0.85
+      engine_output_type: latent
+      max_model_len: 8192
+      max_num_batched_tokens: 8192
+      enforce_eager: false         # re-enable CUDA Graph
+      cudagraph_capture_sizes: [1, 2, 4, 8] # explicitly declare batch sizes to capture
+      distributed_executor_backend: "mp"
+      dtype: bfloat16
+    output_connectors:
+      to_stage_1: funaudio_stream
+    final_output: false
+    final_output_type: false
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.9
+      top_k: 0
+      repetition_penalty: 1.2
+      max_tokens: 2048
+      stop_token_ids: [151645, 151643]
+      detokenize: true
+      seed: 42
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "1"
+      max_batch_size: 8            # batch size 8
+    engine_args:
+      model: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+      model_stage: code2wav
+      model_arch: FunAudioChatCosyVoice3Code2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      trust_remote_code: true
+      enable_prefix_caching: false
+      gpu_memory_utilization: 0.3
+      engine_output_type: audio
+      max_model_len: 8192          # keep a safety cap to avoid OOM at inference time
+      max_num_batched_tokens: 32768
+      skip_tokenizer_init: true
+      enforce_eager: true          # disable CUDA Graph
+      # cudagraph_capture_sizes removed
+      distributed_executor_backend: "mp"
+      dtype: bfloat16
+    input_connectors:
+      from_stage_0: funaudio_stream
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.funaudiochat.funaudiochat2code2wav
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      detokenize: true
+      seed: 42

@@ -1,3 +1,4 @@
+import struct
 from io import BytesIO
 
 import numpy as np
@@ -13,6 +14,47 @@ except ImportError:
     soundfile = None
 
 logger = init_logger(__name__)
+
+
+def create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Create a WAV header with placeholder size values for streaming.
+
+    Uses 0xFFFFFFFF as placeholder for data size fields, which is accepted
+    by most audio clients and matches OpenAI's streaming WAV implementation.
+
+    Args:
+        sample_rate: Audio sample rate in Hz
+        num_channels: Number of audio channels (1 for mono, 2 for stereo)
+        bits_per_sample: Bits per sample (typically 16)
+
+    Returns:
+        44-byte WAV header as bytes
+    """
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    # Use 0xFFFFFFFF as placeholder for unknown size (streaming)
+    placeholder_size = 0xFFFFFFFF
+
+    # ref https://docs.fileformat.com/audio/wav/
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",  # ChunkID
+        placeholder_size,  # ChunkSize (placeholder)
+        b"WAVE",  # Format
+        b"fmt ",  # Subchunk1ID
+        16,  # Subchunk1Size (16 for PCM)
+        1,  # AudioFormat (1 for PCM)
+        num_channels,  # NumChannels
+        sample_rate,  # SampleRate
+        byte_rate,  # ByteRate
+        block_align,  # BlockAlign
+        bits_per_sample,  # BitsPerSample
+        b"data",  # Subchunk2ID
+        placeholder_size,  # Subchunk2Size (placeholder)
+    )
+
+    return header
 
 
 class AudioMixin:

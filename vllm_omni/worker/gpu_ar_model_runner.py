@@ -478,6 +478,41 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
+    def _postprocess_sampled_token_ids(
+        self,
+        sampled_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward sampled tokens to the model for in-place rewriting.
+
+        Models such as FunAudioChat expose ``postprocess_sampled_tokens`` to
+        force audio BOS/EOS tokens at speech-span boundaries. If the model does
+        not expose the hook, or the input is empty / not a single token per
+        request (spec-decode shapes), the tokens are returned unchanged.
+        """
+        postprocess = getattr(self.model, "postprocess_sampled_tokens", None)
+        if postprocess is None or not isinstance(sampled_token_ids, torch.Tensor):
+            return sampled_token_ids
+        if sampled_token_ids.numel() == 0:
+            return sampled_token_ids
+        req_ids = self.input_batch.req_ids
+        if not req_ids:
+            return sampled_token_ids
+        # req_id_to_index maps the sampled batch back to row offsets. Some
+        # batches may not populate it (e.g. PP dataloader prefill); the model
+        # hook tolerates missing mappings (it `continue`s per rid), so we
+        # forward an empty mapping rather than skipping the hook entirely —
+        # skipping would break models (e.g. FunAudioChat) whose
+        # force_audio_bos speech-span trigger depends on this rewrite running
+        # every decode step.
+        req_id_to_index = getattr(self.input_batch, "req_id_to_index", None) or {}
+        corrected = postprocess(
+            sampled_token_ids=sampled_token_ids,
+            req_ids=list(req_ids),
+            req_id_to_index=dict(req_id_to_index),
+            model_intermediate_buffer=self.model_intermediate_buffer,
+        )
+        return sampled_token_ids if corrected is None else corrected
+
     @staticmethod
     def _sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
         if not isinstance(multimodal_outputs, dict):
@@ -1953,6 +1988,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
 
             pooler_output = []
+            buffer_payload_keys = tuple(getattr(self.model, "pooler_output_buffer_keys", ()) or ())
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
                 for rid in req_ids_output_copy:
                     if rid not in downstream_req_id_set:
@@ -1977,6 +2013,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
                     )
+                    # Models that produce per-request intermediate tensors in
+                    # model_intermediate_buffer (e.g. FunAudioChat's stage-0
+                    # audio_token_ids) declare them via pooler_output_buffer_keys
+                    # so they are forwarded to the downstream stage's input
+                    # processor alongside the hidden/mm payload.
+                    if buffer_payload_keys:
+                        req_buffer = self.model_intermediate_buffer.get(rid, {})
+                        if isinstance(req_buffer, dict):
+                            for key in buffer_payload_keys:
+                                if key not in req_buffer:
+                                    continue
+                                value = req_buffer[key]
+                                if isinstance(value, torch.Tensor):
+                                    payload[key] = value.detach().to("cpu").contiguous()
+                                elif isinstance(value, list):
+                                    payload[key] = [
+                                        item.detach().to("cpu").contiguous()
+                                        if isinstance(item, torch.Tensor)
+                                        else item
+                                        for item in value
+                                    ]
+                                elif isinstance(value, tuple):
+                                    payload[key] = tuple(
+                                        item.detach().to("cpu").contiguous()
+                                        if isinstance(item, torch.Tensor)
+                                        else item
+                                        for item in value
+                                    )
+                                else:
+                                    payload[key] = value
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
@@ -2084,6 +2150,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # Let models (e.g. FunAudioChat) rewrite sampled tokens in place — e.g.
+        # to force an audio BOS at the start of a speech span, or audio EOS when
+        # a speech span finishes. Models that do not expose the hook, or whose
+        # sampled-tensor shape is not a single token per request (spec decode),
+        # are left untouched. Done before bookkeeping so the corrected tokens
+        # flow through the rest of the step.
+        sampler_output.sampled_token_ids = self._postprocess_sampled_token_ids(
+            sampler_output.sampled_token_ids
+        )
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
