@@ -347,6 +347,18 @@ class TestWorkerVllmConfigAdditionalConfig:
         assert result is mock_vllm_config
         assert mock_vllm_cls.call_args.kwargs["additional_config"] == od_config.additional_config
 
+    def test_create_diffusion_worker_vllm_config_sets_linear_backend(self, mocker: MockerFixture):
+        mock_vllm_config = mocker.Mock()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
+            return_value=mock_vllm_config,
+        )
+        od_config = mocker.Mock(additional_config={}, linear_backend="marlin")
+
+        result = _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)
+
+        assert result.kernel_config.linear_backend == "marlin"
+
     def test_create_diffusion_worker_vllm_config_falls_back_when_constructor_rejects_additional_config(
         self, mocker: MockerFixture
     ):

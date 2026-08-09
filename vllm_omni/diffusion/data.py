@@ -809,6 +809,8 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    # vLLM scaled-matmul kernel backend used by quantized diffusion linears.
+    linear_backend: str = "auto"
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.

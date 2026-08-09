@@ -966,6 +966,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
 
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
+        linear_backend="marlin",
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
         kv_cache_skip_layers=[2],
@@ -975,6 +976,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     )
 
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
+    assert cfg.linear_backend == "marlin"
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
@@ -1030,6 +1032,7 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "revision",
         "trust_remote_code",
         "distributed_executor_backend",
+        "linear_backend",
     } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 

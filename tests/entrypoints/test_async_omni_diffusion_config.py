@@ -33,6 +33,16 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_propagates_linear_backend():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "linear_backend": "marlin",
+        }
+    )[0]
+
+    assert stage_cfg["engine_args"]["linear_backend"] == "marlin"
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

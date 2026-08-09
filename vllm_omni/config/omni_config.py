@@ -603,6 +603,7 @@ class _DiffusionConfigProjection:
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
+    linear_backend: str = "auto"
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -774,6 +775,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "dist_timeout",
         "model_config",
         "quantization_config",
+        "linear_backend",
     }
 )
 _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
