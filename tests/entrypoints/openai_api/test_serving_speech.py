@@ -3445,16 +3445,17 @@ class TestCosyVoice3Serving:
     def test_cosyvoice3_model_type_detection(self, cosyvoice3_server):
         assert cosyvoice3_server._tts_model_type == "cosyvoice3"
         assert cosyvoice3_server._is_tts is True
-        assert cosyvoice3_server._is_cosyvoice3 is True
 
     def test_cosyvoice3_stage_registered(self):
-        from vllm_omni.entrypoints.openai.serving_speech import (
-            _COSYVOICE3_TTS_MODEL_STAGES,
-            _TTS_MODEL_STAGES,
+        from vllm_omni.entrypoints.openai.tts_adapters import (
+            all_tts_stage_keys,
+            detect_tts_model_type,
+            resolve_adapter,
         )
 
-        assert "cosyvoice3_talker" in _COSYVOICE3_TTS_MODEL_STAGES
-        assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
+        assert "cosyvoice3_talker" in resolve_adapter("cosyvoice3").stage_keys
+        assert "cosyvoice3_talker" in all_tts_stage_keys()
+        assert detect_tts_model_type("cosyvoice3_talker", None) == "cosyvoice3"
 
     def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")

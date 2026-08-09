@@ -178,6 +178,14 @@ class OmniModelConfig(ModelConfig):
                 return override
         return super().embedding_size
 
+    def get_inputs_embeds_size(self) -> int:
+        if self.hf_config_name is not None:
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            override = getattr(stage_config, "embedding_size", None)
+            if override is not None:
+                return override
+        return super().get_inputs_embeds_size()
+
     def get_model_arch_config(self):
         # For multi-stage omni models, use a stage-aware convertor so that
         # only the correct stage's quantization config is surfaced.

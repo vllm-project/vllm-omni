@@ -97,3 +97,10 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>H3</sup> MiniMax H3 AMD GPU support is validated on gfx942 (MI300X) and
+gfx950 (MI350) in BF16, using the AITER `FLASH_ATTN` diffusion attention backend.
+Other AMD SKUs (e.g. MI325X) are not listed until their
+own validation evidence is added. See the
+[MiniMax H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) for
+per-architecture serving commands.
