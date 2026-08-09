@@ -750,8 +750,73 @@ audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
 resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
 reduction.
 
+## TeaCache acceleration
+
+TeaCache reuses DiT block residuals across denoising steps when consecutive
+timestep embeddings are similar. MiniMax-H3 TeaCache is currently calibrated
+only for the FL2VA partition. In combined serving, FL2VA requests use TeaCache
+while Ref2VA requests run uncached; Ref2VA-only serving rejects TeaCache.
+
+TeaCache and Cache-DiT are mutually exclusive; pick one cache backend per server.
+
+The model-specific default and examples use `rel_l1_thresh=0.17`, which
+provided the best conservative speed/quality balance in the validated 107-frame
+T2VA workload. Lower values
+may produce few or no cache hits, while higher values can improve performance
+at the cost of output quality. Validate the threshold on representative
+prompts and generation settings before changing it.
+
+### Offline (Python API)
+
+Export the directory containing the `FL2VA` and `Ref2VA` subdirectories before
+running the Python example, for example `export MODEL_ROOT=/models/MiniMax-H3`.
+
+```python
+import os
+
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
+    cache_backend="tea_cache",
+    cache_config={"rel_l1_thresh": 0.17},
+    trust_remote_code=True,
+    enable_cpu_offload=True,
+)
+outputs = omni.generate(
+    "A quiet cinematic night scene with matching ambient sound.",
+    OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=29,
+        fps=24,
+        num_inference_steps=50,
+        seed=42,
+        extra_args={
+            "task": "t2va",
+            "duration": 4.0,
+            "aspect_ratio": "16:9",
+            "flow_shift": 12.0,
+            "audio_flow_shift": 3.0,
+        },
+    ),
+)
+```
+
+### Online serving
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.17}'
+```
+
 ## Known limitations
 
+- TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - H3 currently executes one generation request per diffusion batch.
@@ -770,6 +835,10 @@ reduction.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
 - Online FP8 is not compatible with layerwise offload.
+- TeaCache and Cache-DiT cannot be enabled on the same server.
+- Image+audio Ref2VA accepts exactly one image and one audio reference.
+- Video Ref2VA accepts one or more video files, but not an additional standalone
+  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
