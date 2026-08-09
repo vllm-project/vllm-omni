@@ -14,11 +14,17 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _runner_for_talker_graph_init(*, talker_mtp_graph_safe: bool | None) -> OmniGPUModelRunner:
+def _runner_for_talker_graph_init(
+    *,
+    talker_mtp_graph_safe: bool | None,
+    has_separate_talker: bool = True,
+    model_stage: str = "talker",
+) -> OmniGPUModelRunner:
     runner = object.__new__(OmniGPUModelRunner)
     runner.model = SimpleNamespace(
-        talker=object(),
+        talker=object() if has_separate_talker else None,
         talker_mtp=object(),
+        model_stage=model_stage,
     )
     if talker_mtp_graph_safe is not None:
         runner.model.talker_mtp_graph_safe = talker_mtp_graph_safe
@@ -36,6 +42,24 @@ def _runner_for_talker_graph_init(*, talker_mtp_graph_safe: bool | None) -> Omni
 
 def test_talker_mtp_skips_graph_when_model_declares_unsafe(monkeypatch):
     runner = _runner_for_talker_graph_init(talker_mtp_graph_safe=False)
+    talker_mtp = runner.model.talker_mtp
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: pytest.fail("graph wrapper must not be selected"),
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is talker_mtp
+
+
+@pytest.mark.parametrize("model_stage", ["thinker", "code2wav"])
+def test_non_talker_stage_does_not_use_talker_mtp_graph(monkeypatch, model_stage: str):
+    runner = _runner_for_talker_graph_init(
+        talker_mtp_graph_safe=None,
+        has_separate_talker=False,
+        model_stage=model_stage,
+    )
     talker_mtp = runner.model.talker_mtp
     monkeypatch.setattr(
         "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
