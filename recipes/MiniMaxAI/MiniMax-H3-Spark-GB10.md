@@ -29,9 +29,6 @@ math relative to the RTX and datacenter recipes:
   fit in 121 GiB. Online FP8 quantizes the DiT only (62 GiB to ~31 GiB); the
   Qwen3-VL text encoder (63 GiB) and both VAEs (~10.4 GiB) stay BF16.
 
-Weight quantization happens at load time and is slow on this platform, so
-`--init-timeout 3600` is needed to keep startup from being cut short.
-
 > **Modular H3:** after #5720 lands, preserve this recipe's one-partition
 > behavior with `--task-type fl2va` or `--task-type ref2va`.
 
