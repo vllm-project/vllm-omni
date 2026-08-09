@@ -236,6 +236,9 @@ def minimax_h3_packed_sequence(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "document_id": doc,
+        # Extent of the video segment within the packed sequence.
+        "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
+        "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
     }
 
 
@@ -554,6 +557,9 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "document_id": doc,
+        # Extent of the video segment within the packed sequence.
+        "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
+        "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
     }
 
 

@@ -213,9 +213,10 @@ class OmniServeCommand(CLISubcommand):
             "--task-type",
             type=str,
             default=None,
-            choices=["CustomVoice", "VoiceDesign", "Base"],
-            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
-            "If not specified, will be inferred from model path.",
+            help="Model-defined startup task type. The selected model validates "
+            "supported values; for example, TTS models accept CustomVoice, "
+            "VoiceDesign, or Base, while diffusion models may use it to select "
+            "task-specific weights. If omitted, the model default is used.",
         )
         # Forced aligner / word timestamps. --forced-aligner is the opt-in
         # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
@@ -434,6 +435,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--fa-deterministic",
+            dest="fa_deterministic",
+            action="store_true",
+            default=False,
+            help=(
+                "Request FlashAttention deterministic=True on the local FLASH_ATTN dense path. "
+                "Slower than the library default deterministic=False; intended for accuracy CI. "
+                "Serving default remains non-deterministic."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,
@@ -646,15 +658,25 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             default=True,
             help="Use shard + AllGather for weight reconstruction (default: True). "
-            "When disabled (--dlo-no-use-allgather), each rank loads full weights "
-            "via H2D only — no sharding, no AllGather, no concurrent request "
-            "requirement, but N× CPU memory.",
+            "When disabled (--dlo-no-use-allgather), each rank streams the "
+            "standard loader's rank-local tensors via H2D only — no additional "
+            "DP sharding, no AllGather, and no concurrent-request requirement.",
         )
         omni_config_group.add_argument(
             "--dlo-no-use-allgather",
             dest="dlo_use_allgather",
             action="store_false",
-            help="Disable AllGather: each rank loads full weights independently.",
+            help=(
+                "Disable AllGather and stream standard-loader rank-local weights "
+                "independently (including existing TP shards)."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-resident-layers",
+            type=int,
+            default=0,
+            help="Keep this many leading main-DiT blocks resident on the device "
+            "while distributed layerwise offload streams the remaining blocks.",
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
@@ -924,6 +946,9 @@ def run_headless(args: TrackingNamespace) -> None:
     # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
     # bracket each replica's spawn below with setup_stage_devices so they
     # don't all stack on cuda:0 (see ``per_replica_devices`` above).
+    # Headless startup still supplies the legacy OmegaConf stage shape through
+    # the stable adapter entry point. The implementation switches only when
+    # RFC #4021 threads structured stage configs through the launch plan.
     engine_args_dict = build_engine_args_dict(
         stage_cfg,
         model,

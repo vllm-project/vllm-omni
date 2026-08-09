@@ -24,17 +24,21 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {"lora_int_id"}
 
 
+def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    """Build the compatibility key shared by scheduling and DP dispatch."""
+    sampling = request.sampling_params
+    # LoRA identity is optional on sampling params (and on test stubs).
+    lora_request = getattr(sampling, "lora_request", None)
+    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    return RequestBatchSamplingParamsKey(**key_kwargs)
+
+
 class RequestScheduler(BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        """Build a request-batch compatibility key from sampling parameters."""
-        sampling = request.sampling_params
-        # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
-        key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-        return RequestBatchSamplingParamsKey(**key_kwargs)
+        return build_request_batch_sampling_params_key(request)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
