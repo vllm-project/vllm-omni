@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
@@ -65,6 +66,17 @@ def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) 
     return torch._weight_norm(weight_v, weight_g, dim=0)
 
 
+_SHARED_VLLM_SAMPLER: "Sampler | None" = None
+
+
+def _shared_vllm_sampler() -> "Sampler":
+    """The vLLM sampler is stateless; constructing it per decode step is pure overhead."""
+    global _SHARED_VLLM_SAMPLER
+    if _SHARED_VLLM_SAMPLER is None:
+        _SHARED_VLLM_SAMPLER = Sampler()
+    return _SHARED_VLLM_SAMPLER
+
+
 def _apply_repetition_penalty(
     logits: torch.Tensor,
     history: torch.Tensor,
@@ -87,9 +99,10 @@ def _apply_top_k_top_p(
     top_k: int | None,
     top_p: float | None,
     min_tokens_to_keep: int = 3,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """Apply the same candidate floors as the upstream Transformers warpers."""
-    filtered = logits.clone()
+    filtered = logits if inplace else logits.clone()
     vocab_size = filtered.shape[-1]
     # MiniCPM-o's gen_logits() appends TopPLogitsWarper before
     # TopKLogitsWarper. The order is observable for fixed-seed sampling.
@@ -392,11 +405,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
+        # ``logits`` is freshly materialized above (head_code -> float -> penalty),
+        # so the warpers may mask it in place.
         logits = _apply_top_k_top_p(
             logits,
             top_k=self._codec_top_k,
             top_p=self._codec_top_p,
             min_tokens_to_keep=3,
+            inplace=True,
         )
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
@@ -404,6 +420,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             num_samples=1,
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
+
+    def _step_constants(self, hidden: torch.Tensor):
+        """Constant per-step tensors, cached per (device, dtype).
+
+        These never change and downstream consumers only read them, so the
+        per-step H2D copies from ``new_tensor``/``torch.tensor`` are avoidable.
+        """
+        cache = getattr(self, "_step_constants_cache", None)
+        key = (hidden.device, hidden.dtype)
+        if cache is None or cache[0] != key:
+            neg_inf = float("-inf")
+            cache = (
+                key,
+                (
+                    hidden.new_tensor([0.0, neg_inf]),
+                    hidden.new_tensor([neg_inf, 0.0]),
+                    torch.tensor(False, dtype=torch.bool),
+                    torch.tensor(True, dtype=torch.bool),
+                    hidden.new_empty((0, 1), dtype=torch.long),
+                ),
+            )
+            self._step_constants_cache = cache
+        return cache[1]
 
     def make_omni_output(
         self,
@@ -434,7 +473,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         duplex_turn_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
-        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
@@ -480,16 +519,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(row_continue)
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                terminal_flags.append(flag_false)
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(row_continue)
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                terminal_flags.append(flag_false)
                 continue
             request_id = str(info.get("request_id", index))
             request_states = getattr(self, "_request_audio_states", None)
@@ -501,17 +540,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
+                stop_rows.append(row_stop)
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                terminal_flags.append(flag_false)
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(row_continue)
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                terminal_flags.append(flag_false)
                 continue
             codes = state.get("codes")
             if not isinstance(codes, torch.Tensor):
@@ -542,8 +581,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "accumulated": codes,
             }
             codec_deltas.append(delta)
-            terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            terminal_flags.append(flag_true if finished else flag_false)
+            stop_rows.append(row_stop if finished else row_continue)
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
@@ -635,7 +674,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return logits
 
     def sample(self, logits, sampling_metadata):
-        return Sampler()(logits, sampling_metadata)
+        # ``compute_logits`` emits one-hot stop rows ([0, -inf] / [-inf, 0]),
+        # so a full sampler pass is ~10 host-dispatched kernels for a
+        # deterministic pick; argmax is bit-identical on these rows. int32
+        # matches the standard sampler's output dtype -- the runner scatters
+        # these ids into int32 input buffers on the async path.
+        if (
+            isinstance(logits, torch.Tensor)
+            and logits.ndim == 2
+            and logits.shape[-1] == 2
+            and not getattr(sampling_metadata, "max_num_logprobs", None)
+        ):
+            return SamplerOutput(
+                sampled_token_ids=logits.argmax(dim=-1, keepdim=True).to(torch.int32),
+                logprobs_tensors=None,
+            )
+        return _shared_vllm_sampler()(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)
