@@ -619,6 +619,7 @@ def _make_od_config(
     return SimpleNamespace(
         enable_cpu_offload=False,
         enable_diffusion_pipeline_profiler=False,
+        enable_session_state_manager=False,
         model="/nonexistent/model/path",
         dtype=torch.float32,
         flow_shift=None,
