@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -104,6 +105,14 @@ def test_request_rejects_non_context_values() -> None:
 
 
 def _manager(*, enable_caching: bool) -> KVCacheManager:
+    # vLLM 0.26 lazily registers its built-in KV specs. Another test may have
+    # already registered an out-of-tree spec, making the registry non-empty
+    # before FullAttentionSpec is registered. Initialize the native mappings
+    # explicitly; vLLM 0.25 has no registration hook and needs no setup.
+    register_all = getattr(native_kv_managers, "register_all_kvcache_specs", None)
+    if register_all is not None:
+        register_all(None)
+
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=2,
