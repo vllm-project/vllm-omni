@@ -29,9 +29,36 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.get_logger(__name__)
+
+
+def _swiglu_intermediate_size(
+    hidden_dim: int,
+    multiple_of: int = 256,
+    ffn_dim_multiplier: float | None = None,
+) -> int:
+    hidden_dim = int(2 * hidden_dim / 3)
+    if ffn_dim_multiplier is not None:
+        hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+    return multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+
+def _hidream_topk_routing(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del hidden_states
+    scores = gating_output.softmax(dim=-1)
+    topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights, topk_ids
 
 
 class HiDreamImageFeedForwardSwiGLU(nn.Module):
@@ -43,11 +70,7 @@ class HiDreamImageFeedForwardSwiGLU(nn.Module):
         ffn_dim_multiplier: float | None = None,
     ):
         super().__init__()
-        hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
-        if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        hidden_dim = _swiglu_intermediate_size(hidden_dim, multiple_of, ffn_dim_multiplier)
 
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
@@ -420,12 +443,10 @@ class MOEFeedForwardSwiGLU(nn.Module):
         num_routed_experts: int,
         num_activated_experts: int,
         _force_inference_output: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.shared_experts = HiDreamImageFeedForwardSwiGLU(dim, hidden_dim // 2)
-        self.experts = nn.ModuleList(
-            [HiDreamImageFeedForwardSwiGLU(dim, hidden_dim) for i in range(num_routed_experts)]
-        )
         self._force_inference_output = _force_inference_output
         self.gate = MoEGate(
             embed_dim=dim,
@@ -434,22 +455,43 @@ class MOEFeedForwardSwiGLU(nn.Module):
             _force_inference_output=_force_inference_output,
         )
         self.num_activated_experts = num_activated_experts
+        self._use_fused_moe = current_omni_platform.is_cuda()
+        if self._use_fused_moe:
+            self.experts = FusedMoE(
+                num_experts=num_routed_experts,
+                top_k=num_activated_experts,
+                hidden_size=dim,
+                intermediate_size=_swiglu_intermediate_size(hidden_dim),
+                renormalize=False,
+                custom_routing_function=_hidream_topk_routing,
+                pcp_size=1,
+                prefix=f"{prefix}.experts" if prefix else "experts",
+            )
+        else:
+            self.experts = nn.ModuleList(
+                [HiDreamImageFeedForwardSwiGLU(dim, hidden_dim) for _ in range(num_routed_experts)]
+            )
 
     def forward(self, x):
         wtype = x.dtype
         identity = x
         orig_shape = x.shape
-        topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-        if self.training and not self._force_inference_output:
+        if self._use_fused_moe:
+            x = x.view(-1, x.shape[-1])
+            router_logits = F.linear(x, self.gate.weight, None)
+            y = self.experts(hidden_states=x, router_logits=router_logits).view(*orig_shape)
+        else:
+            topk_idx, topk_weight, aux_loss = self.gate(x)
+            x = x.view(-1, x.shape[-1])
+            flat_topk_idx = topk_idx.view(-1)
+        if not self._use_fused_moe and self.training and not self._force_inference_output:
             x = x.repeat_interleave(self.num_activated_experts, dim=0)
             y = torch.empty_like(x, dtype=wtype)
             for i, expert in enumerate(self.experts):
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(dtype=wtype)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape).to(dtype=wtype)
-        else:
+        elif not self._use_fused_moe:
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         y = y + self.shared_experts(identity)
         return y
@@ -499,6 +541,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
         _force_inference_output: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -522,6 +565,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
                 num_routed_experts=num_routed_experts,
                 num_activated_experts=num_activated_experts,
                 _force_inference_output=_force_inference_output,
+                prefix=f"{prefix}.ff_i" if prefix else "ff_i",
             )
         else:
             self.ff_i = HiDreamImageFeedForwardSwiGLU(dim=dim, hidden_dim=4 * dim)
@@ -566,6 +610,7 @@ class HiDreamImageTransformerBlock(nn.Module):
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
         _force_inference_output: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -590,6 +635,7 @@ class HiDreamImageTransformerBlock(nn.Module):
                 num_routed_experts=num_routed_experts,
                 num_activated_experts=num_activated_experts,
                 _force_inference_output=_force_inference_output,
+                prefix=f"{prefix}.ff_i" if prefix else "ff_i",
             )
         else:
             self.ff_i = HiDreamImageFeedForwardSwiGLU(dim=dim, hidden_dim=4 * dim)
@@ -702,6 +748,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
 
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.num_routed_experts = num_routed_experts
 
         self.t_embedder = HiDreamImageTimestepEmbed(self.inner_dim)
         self.p_embedder = HiDreamImagePooledEmbed(text_emb_dim, self.inner_dim)
@@ -722,9 +769,10 @@ class HiDreamImageTransformer2DModel(nn.Module):
                         num_routed_experts=num_routed_experts,
                         num_activated_experts=num_activated_experts,
                         _force_inference_output=force_inference_output,
+                        prefix=f"double_stream_blocks.{layer_idx}.block",
                     )
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
@@ -738,9 +786,10 @@ class HiDreamImageTransformer2DModel(nn.Module):
                         num_routed_experts=num_routed_experts,
                         num_activated_experts=num_activated_experts,
                         _force_inference_output=force_inference_output,
+                        prefix=f"single_stream_blocks.{layer_idx}.block",
                     )
                 )
-                for _ in range(num_single_layers)
+                for layer_idx in range(num_single_layers)
             ]
         )
 
@@ -1002,6 +1051,15 @@ class HiDreamImageTransformer2DModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        expert_params_mapping = []
+        if any(".experts.routed_experts.w13_weight" in name for name in params_dict):
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=self.num_routed_experts,
+            )
 
         # we need to load the buffers for beta and eps (XIELU)
         for name, buffer in self.named_buffers():
@@ -1012,6 +1070,26 @@ class HiDreamImageTransformer2DModel(nn.Module):
         for name, loaded_weight in weights:
             original_name = name
             lookup_name = name
+            expert_loaded = False
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                if weight_name not in original_name:
+                    continue
+                lookup_name = original_name.replace(weight_name, param_name)
+                param = params_dict[lookup_name]
+                expert_loaded = param.weight_loader(
+                    param,
+                    loaded_weight,
+                    lookup_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
+                if expert_loaded:
+                    break
+            if expert_loaded:
+                loaded_params.add(original_name)
+                loaded_params.add(lookup_name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in original_name:
                     continue

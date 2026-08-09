@@ -773,6 +773,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
     import vllm.config.vllm as vllm_config_module
+    import vllm.forward_context as vllm_forward_context
     import vllm.ir
     from vllm.config import CompilationConfig, DeviceConfig, VllmConfig
 
@@ -812,12 +813,15 @@ def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     monkeypatch.setattr(vllm.ir, "enable_torch_wrap", _enable_torch_wrap)
 
     assert not is_forward_context_available()
+    assert not vllm_forward_context.is_forward_context_available()
 
     with set_forward_context(vllm_config=vllm_config):
         assert is_forward_context_available()
         assert get_forward_context().vllm_config is vllm_config
+        assert vllm_forward_context.is_forward_context_available()
 
     assert not is_forward_context_available()
+    assert not vllm_forward_context.is_forward_context_available()
     assert calls == [
         ("set_current_vllm_config", vllm_config),
         ("ir_op_priority", None),

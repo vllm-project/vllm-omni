@@ -200,8 +200,10 @@ def set_forward_context(
         else:
             # Local import to avoid importing vllm.config.vllm at module import time.
             from vllm.config.vllm import set_current_vllm_config
+            from vllm.forward_context import set_forward_context as set_vllm_forward_context
 
             with (
+                set_vllm_forward_context(None, vllm_config),
                 set_current_vllm_config(vllm_config),
                 vllm_config.kernel_config.ir_op_priority.set_priority(),
                 vllm.ir.enable_torch_wrap(vllm_config.compilation_config.ir_enable_torch_wrap),
