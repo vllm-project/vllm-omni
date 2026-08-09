@@ -416,6 +416,14 @@ class FlashAttentionImpl(AttentionImpl):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata else None
+        layout = self.qkv_layout or "BNSD"
+
+        if attention_mask is not None and attention_mask.ndim == 2 and valid_kv_length is not None:
+            seq_dim = 1 if layout in ("BSND", "BSH") else 2
+            key = key.narrow(seq_dim, 0, valid_kv_length)
+            value = value.narrow(seq_dim, 0, valid_kv_length)
+            attention_mask = None
 
         # NPU aclnnFlashAttentionScore requires mask shape to be one of:
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
@@ -423,7 +431,6 @@ class FlashAttentionImpl(AttentionImpl):
         # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
         attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
 
-        layout = self.qkv_layout or "BNSD"
         return attention_forward(
             query,
             key,
