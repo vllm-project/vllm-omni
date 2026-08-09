@@ -551,7 +551,13 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     # Diffusers models: read _class_name from the pipeline index.
     model_index = get_diffusion_model_index(model)
     if model_index is not None:
-        return model_index.get("_class_name")
+        class_name = model_index.get("_class_name")
+        if class_name == "WanPipeline":
+            from vllm_omni.diffusion.utils.hf_utils import _looks_like_skyreels_v3_r2v
+
+            if _looks_like_skyreels_v3_r2v(model):
+                return "SkyReelsV3R2VPipeline"
+        return class_name
     if diffusion_load_format == "diffusers":
         return "DiffusersAdapterPipeline"
 
@@ -1167,6 +1173,11 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name == "WanPipeline":
+                        from vllm_omni.diffusion.utils.hf_utils import _looks_like_skyreels_v3_r2v
+
+                        if _looks_like_skyreels_v3_r2v(self.model):
+                            self.model_class_name = "SkyReelsV3R2VPipeline"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter

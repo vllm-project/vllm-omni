@@ -1,7 +1,7 @@
 # Image-To-Video
 
 This shared example generates videos from images with VACE, Wan2.2, LTX-2,
-HunyuanVideo-1.5, Cosmos3, and other compatible pipelines.
+HunyuanVideo-1.5, Cosmos3, SkyReels V3 R2V, and other compatible pipelines.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -25,6 +25,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
+| `Skywork/SkyReels-V3-R2V-14B` | 544 x 960 | 105 | 50 | text 7.5 / image 5.0 | Large 14B video model; use multiple GPUs or offload if needed |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
 
@@ -175,6 +176,27 @@ python image_to_video.py \
   --output i2v_wan_ti2v.mp4
 ```
 
+### SkyReels V3 R2V
+
+SkyReels V3 R2V accepts one to four reference images. Use repeated
+`--reference-image` flags; `--image` is also accepted as a single reference.
+
+```bash
+python image_to_video.py \
+  --model Skywork/SkyReels-V3-R2V-14B \
+  --reference-image person_a.jpg \
+  --reference-image person_b.jpg \
+  --prompt "Two reference characters walk through a rainy neon street, cinematic motion" \
+  --height 544 \
+  --width 960 \
+  --num-frames 105 \
+  --guidance-scale 7.5 \
+  --extra-body '{"guidance_scale_img": 5.0}' \
+  --num-inference-steps 50 \
+  --fps 24 \
+  --output skyreels_r2v.mp4
+```
+
 ### HunyuanVideo-1.5 I2V (480p)
 
 ```bash
@@ -246,12 +268,12 @@ python image_to_video.py \
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, LTX-2,
-  Cosmos3, or VACE).
+  SkyReels V3 R2V, Cosmos3, or VACE).
 - `--image`: Path to the first-frame or source image.
 - `--last-image`: Optional last-frame condition for models such as VACE.
 - `--mask-image`: Optional inpainting mask. White pixels are regenerated and black pixels are preserved.
 - `--reference-image`: Optional reference image; repeat it to provide multiple references.
-- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3.
+- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 and SkyReels V3 R2V image CFG.
 - `--prompt`: Text description of desired motion/animation.
 - `--height/--width`: Output resolution (auto-calculated from image if not set).
   Wan dimensions should be multiples of 16; LTX dimensions should be multiples

@@ -19,6 +19,8 @@ QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+# SkyReels V3 reference-to-video supports 1-4 reference images.
+SKYREELS_V3_R2V_MAX_INPUT_IMAGES = 4
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
@@ -54,6 +56,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
+    "SkyReelsV3R2VPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=SKYREELS_V3_R2V_MAX_INPUT_IMAGES,
+        attention_mask_free=True,
+    ),
     "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanS2VPipeline": DiffusionModelMetadata(attention_mask_free=True),
 }

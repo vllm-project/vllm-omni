@@ -183,6 +183,36 @@ def default_image_to_video_prompt(
     return default_image_to_image_prompt(prompt, negative_prompt, media_inputs["image"])
 
 
+def skyreels_v3_r2v_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: Mapping[str, Any],
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    del height, width, num_frames
+    unsupported = set(media_inputs) - {"image", "reference_images"}
+    if unsupported:
+        raise ValueError(f"SkyReels V3 R2V does not support media inputs: {sorted(unsupported)}.")
+
+    reference_images = media_inputs.get("reference_images")
+    if reference_images is None and isinstance(media_inputs.get("image"), Image.Image):
+        reference_images = [media_inputs["image"]]
+    if not isinstance(reference_images, list) or not reference_images:
+        raise ValueError("SkyReels V3 R2V requires at least one --reference-image or --image input.")
+    if not all(isinstance(image, Image.Image) for image in reference_images):
+        raise ValueError("SkyReels V3 R2V reference images must be PIL images.")
+
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "multi_modal_data": {"reference_images": reference_images},
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "AudioXPipeline": {
         "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
@@ -238,6 +268,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
+    },
+    "SkyReelsV3R2VPipeline": {
+        "extra_body_params": frozenset({"guidance_scale_img", "resolution"}),
+        "image_to_video_prompt_builder": skyreels_v3_r2v_image_to_video_prompt,
     },
     "MammothModa2DiTPipeline": {
         "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,

@@ -71,6 +71,14 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+def _looks_like_skyreels_v3_r2v(model_name: str) -> bool:
+    try:
+        tf_cfg = get_hf_file_to_dict("transformer/config.json", model_name) or {}
+        return tf_cfg.get("_class_name") == "SkyReelsC1WanI2v3DModel"
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.

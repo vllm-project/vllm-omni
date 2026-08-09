@@ -106,6 +106,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
     ),
+    "SkyReelsV3R2VPipeline": (
+        "skyreels_v3",
+        "pipeline_skyreels_v3_r2v",
+        "SkyReelsV3R2VPipeline",
+    ),
     "WanS2VPipeline": (
         "wan2_2",
         "pipeline_wan2_2_s2v",
@@ -521,6 +526,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "SkyReelsV3R2VPipeline": "get_skyreels_v3_r2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
@@ -579,6 +585,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "SkyReelsV3R2VPipeline": "get_skyreels_v3_r2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
