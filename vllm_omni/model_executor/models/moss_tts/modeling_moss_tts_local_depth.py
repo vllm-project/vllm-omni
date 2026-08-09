@@ -88,6 +88,79 @@ class _MossTTSLocalAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         return self.c_proj(attn_output)
 
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = hidden_states.shape[0]
+        qkv = self.c_attn(hidden_states)
+        query, key, value = qkv.split(self.embed_dim, dim=-1)
+        query = query.view(batch_size, self.n_head, self.head_dim)
+        key = key.view(batch_size, self.n_head, self.head_dim)
+        value = value.view(batch_size, self.n_head, self.head_dim)
+
+        position_ids = position_ids.to(dtype=torch.float32)
+        freqs = torch.einsum("s,d->sd", position_ids, self.inv_freq.to(device=hidden_states.device))
+        cos = freqs.cos().repeat_interleave(2, dim=-1).to(hidden_states.dtype)
+        sin = freqs.sin().repeat_interleave(2, dim=-1).to(hidden_states.dtype)
+        query = query * cos + self._rotate_half(query) * sin
+        key = key * cos + self._rotate_half(key) * sin
+        return query, key, value
+
+    def forward_token(
+        self,
+        hidden_states: torch.Tensor,
+        position: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager single-token path using the exact cached prefix length."""
+        batch_size = hidden_states.shape[0]
+        position_ids = torch.arange(
+            position,
+            position + 1,
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        query, key, value = self._project_qkv(hidden_states, position_ids)
+        key_cache[:batch_size, :, position].copy_(key)
+        value_cache[:batch_size, :, position].copy_(value)
+        attn_output = F.scaled_dot_product_attention(
+            query.unsqueeze(2),
+            key_cache[:batch_size, :, : position + 1],
+            value_cache[:batch_size, :, : position + 1],
+            is_causal=False,
+        )
+        attn_output = attn_output.squeeze(2).reshape(batch_size, self.embed_dim)
+        return self.c_proj(attn_output)
+
+    def forward_token_static(
+        self,
+        hidden_states: torch.Tensor,
+        position: torch.Tensor,
+        cache_positions: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fixed-shape token path that keeps ``position`` dynamic for compile."""
+        batch_size = hidden_states.shape[0]
+        query, key, value = self._project_qkv(hidden_states, position.reshape(1))
+
+        cache_index = position.reshape(1)
+        key_cache[:batch_size].index_copy_(2, cache_index, key.unsqueeze(2))
+        value_cache[:batch_size].index_copy_(2, cache_index, value.unsqueeze(2))
+        valid_prefix = cache_positions <= position
+        attn_output = F.scaled_dot_product_attention(
+            query.unsqueeze(2),
+            key_cache[:batch_size],
+            value_cache[:batch_size],
+            attn_mask=valid_prefix.view(1, 1, 1, -1),
+            is_causal=False,
+        )
+        attn_output = attn_output.squeeze(2).reshape(batch_size, self.embed_dim)
+        return self.c_proj(attn_output)
+
 
 class _MossTTSLocalMLP(nn.Module):
     def __init__(self, hidden_size: int, inner_size: int) -> None:
@@ -113,6 +186,40 @@ class _MossTTSLocalBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
         return hidden_states
 
+    def forward_token(
+        self,
+        hidden_states: torch.Tensor,
+        position: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn.forward_token(
+            self.ln_1(hidden_states),
+            position,
+            key_cache,
+            value_cache,
+        )
+        hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
+        return hidden_states
+
+    def forward_token_static(
+        self,
+        hidden_states: torch.Tensor,
+        position: torch.Tensor,
+        cache_positions: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn.forward_token_static(
+            self.ln_1(hidden_states),
+            position,
+            cache_positions,
+            key_cache,
+            value_cache,
+        )
+        hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
+        return hidden_states
+
 
 class MossTTSLocalDepthTransformer(nn.Module):
     """Per-frame depth transformer for MOSS-TTS-Local-Transformer-v1.5.
@@ -123,47 +230,151 @@ class MossTTSLocalDepthTransformer(nn.Module):
         and codebook-0's head (``audio_lm_heads[0]``) simultaneously.
       - codebooks 1..n_vq-1 are sampled sequentially: each sampled code is
         re-embedded (``audio_embeddings[c]``) and appended as the next
-        position, re-prefilling the block over the growing (<=n_vq) sequence
-        with a fresh causal mask each call -- mathematically identical to
-        incremental KV-cache decoding since attention is strictly causal and
-        only the last position is ever read, but avoids any cache plumbing
-        given the trivially short sequence length.
+        position. With ``use_static_local_kv_cache=True``, each step computes
+        only that position and reuses the K/V written earlier in the frame;
+        otherwise vLLM retains its growing-prefix compatibility path.
     """
 
-    def __init__(self, gpt2_config, hidden_size: int | None = None) -> None:
+    def __init__(
+        self,
+        gpt2_config,
+        hidden_size: int | None = None,
+        max_positions: int = 12,
+        use_static_local_kv_cache: bool = False,
+    ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size if hidden_size is not None else gpt2_config.n_embd)
-        n_head = int(gpt2_config.n_head)
+        self.n_head = int(gpt2_config.n_head)
+        self.head_dim = self.hidden_size // self.n_head
+        self.max_positions = int(max_positions)
+        self.use_static_local_kv_cache = bool(use_static_local_kv_cache)
         inner_size = int(gpt2_config.n_inner)
         eps = float(getattr(gpt2_config, "layer_norm_epsilon", 1e-5))
         rope_base = float(getattr(gpt2_config, "rope_base", 1_000_000.0))
-        self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, n_head, inner_size, rope_base, eps)])
+        self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, self.n_head, inner_size, rope_base, eps)])
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
         self._compiled_forward_prefix = None
+        self._compiled_forward_token = None
+        self.register_buffer(
+            "_cache_positions",
+            torch.arange(self.max_positions, dtype=torch.long),
+            persistent=False,
+        )
+        self._kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._kv_capacity = 0
+        self._kv_frozen = False
 
     def _forward_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
+        """Full-prefix reference path retained for parity tests."""
         hidden_states = seq_embeds
         for block in self.h:
             hidden_states = block(hidden_states)
         return self.ln_f(hidden_states)
 
+    def _ensure_kv_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if (
+            self._kv_capacity >= batch_size
+            and self._kv_cache
+            and self._kv_cache[0][0].device == device
+            and self._kv_cache[0][0].dtype == dtype
+        ):
+            return
+        if self._kv_frozen:
+            raise RuntimeError(
+                "MOSS-TTS local KV cache is frozen after CUDA graph setup "
+                f"(capacity={self._kv_capacity}, requested={batch_size}, "
+                f"device={device}, dtype={dtype})"
+            )
+        capacity = max(batch_size, self._kv_capacity, 1)
+        shape = (capacity, self.n_head, self.max_positions, self.head_dim)
+        self._kv_cache = [
+            (
+                torch.zeros(shape, device=device, dtype=dtype),
+                torch.zeros(shape, device=device, dtype=dtype),
+            )
+            for _ in self.h
+        ]
+        self._kv_capacity = capacity
+
+    def prepare_kv_cache(self, max_batch_size: int) -> None:
+        """Allocate the fixed-address workspace before CUDA graph capture."""
+        if not self.use_static_local_kv_cache:
+            return
+        self._ensure_kv_cache(
+            max_batch_size,
+            self.ln_f.weight.device,
+            self.ln_f.weight.dtype,
+        )
+        self._kv_frozen = True
+
+    def _forward_token(self, hidden_states: torch.Tensor, position: int) -> torch.Tensor:
+        x = hidden_states
+        for layer_idx, block in enumerate(self.h):
+            key_cache, value_cache = self._kv_cache[layer_idx]
+            x = block.forward_token(x, position, key_cache, value_cache)
+        return self.ln_f(x)
+
+    def _forward_token_static(
+        self,
+        hidden_states: torch.Tensor,
+        position: torch.Tensor,
+    ) -> torch.Tensor:
+        x = hidden_states
+        for layer_idx, block in enumerate(self.h):
+            key_cache, value_cache = self._kv_cache[layer_idx]
+            x = block.forward_token_static(
+                x,
+                position,
+                self._cache_positions,
+                key_cache,
+                value_cache,
+            )
+        return self.ln_f(x)
+
     def setup_compile(self) -> None:
-        if self._compiled_forward_prefix is not None:
+        if not self.use_static_local_kv_cache:
+            if self._compiled_forward_prefix is not None:
+                return
+            if not current_omni_platform.supports_torch_inductor():
+                self._compiled_forward_prefix = self._forward_prefix
+                logger.warning_once("MOSS-TTS local depth torch.compile disabled on this platform")
+                return
+            self._compiled_forward_prefix = torch.compile(
+                self._forward_prefix,
+                dynamic=False,
+                options={"epilogue_fusion": False},
+            )
+            logger.info("MOSS-TTS local depth prefix enabled with torch.compile")
+            return
+        if self._compiled_forward_token is not None:
             return
         if not current_omni_platform.supports_torch_inductor():
-            self._compiled_forward_prefix = self._forward_prefix
+            self._compiled_forward_token = self._forward_token_static
             logger.warning_once("MOSS-TTS local depth torch.compile disabled on this platform")
             return
-        self._compiled_forward_prefix = torch.compile(
-            self._forward_prefix,
+        self._compiled_forward_token = torch.compile(
+            self._forward_token_static,
             dynamic=False,
             options={"epilogue_fusion": False},
         )
-        logger.info("MOSS-TTS local depth prefix enabled with torch.compile")
+        logger.info("MOSS-TTS local depth incremental step enabled with torch.compile")
 
     def _run_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
         return forward_prefix(seq_embeds)
+
+    def _run_token(self, hidden_states: torch.Tensor, position: int) -> torch.Tensor:
+        if not 0 <= position < self.max_positions:
+            raise ValueError(f"local position {position} out of range [0, {self.max_positions})")
+        self._ensure_kv_cache(hidden_states.shape[0], hidden_states.device, hidden_states.dtype)
+        if self._compiled_forward_token is not None:
+            return self._compiled_forward_token(hidden_states, self._cache_positions[position])
+        return self._forward_token(hidden_states, position)
 
     @torch.no_grad()
     def generate_frame(
@@ -200,11 +411,15 @@ class MossTTSLocalDepthTransformer(nn.Module):
         batch_size = backbone_last_hidden.shape[0]
         dtype = self.ln_f.weight.dtype
 
-        embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
-        embeds[:, 0, :] = backbone_last_hidden.to(dtype)
-
-        hidden = self._run_prefix(embeds[:, :1, :])
-        local_hidden = hidden[:, 0, :]
+        if self.use_static_local_kv_cache:
+            if n_vq > self.max_positions:
+                raise ValueError(f"n_vq={n_vq} exceeds local KV capacity {self.max_positions}")
+            local_hidden = self._run_token(backbone_last_hidden.to(dtype), 0)
+            embeds = None
+        else:
+            embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
+            embeds[:, 0, :] = backbone_last_hidden.to(dtype)
+            local_hidden = self._run_prefix(embeds[:, :1, :])[:, 0, :]
 
         binary_logits = local_text_lm_head(local_hidden).float()
         # This is a binary continue/stop gate. The checkpoint expects sampling
@@ -253,9 +468,13 @@ class MossTTSLocalDepthTransformer(nn.Module):
             codes[:, channel_index] = channel_token
 
             if channel_index + 1 < n_vq:
-                embeds[:, channel_index + 1, :] = audio_embeddings[channel_index](channel_token).to(dtype)
-                hidden = self._run_prefix(embeds[:, : channel_index + 2, :])
-                local_hidden = hidden[:, channel_index + 1, :]
+                next_embed = audio_embeddings[channel_index](channel_token).to(dtype)
+                if self.use_static_local_kv_cache:
+                    local_hidden = self._run_token(next_embed, channel_index + 1)
+                else:
+                    assert embeds is not None
+                    embeds[:, channel_index + 1, :] = next_embed
+                    local_hidden = self._run_prefix(embeds[:, : channel_index + 2, :])[:, channel_index + 1, :]
 
         return should_continue, codes
 

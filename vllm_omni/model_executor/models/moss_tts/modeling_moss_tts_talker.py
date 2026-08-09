@@ -1314,7 +1314,21 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
+        self.use_static_local_kv_cache = bool(self.config.use_static_local_kv_cache)
+        self.local_transformer = MossTTSLocalDepthTransformer(
+            self.config.gpt2_config,
+            hidden_size=hidden_size,
+            max_positions=self.n_vq,
+            use_static_local_kv_cache=self.use_static_local_kv_cache,
+        )
+        self._local_kv_capacity = (
+            max(
+                int(vllm_config.scheduler_config.max_num_seqs),
+                int(vllm_config.compilation_config.max_cudagraph_capture_size or 0),
+            )
+            if self.use_static_local_kv_cache
+            else 0
+        )
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised
@@ -1733,6 +1747,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w = torch.stack(
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
+
+        if self.use_static_local_kv_cache:
+            self.local_transformer.prepare_kv_cache(self._local_kv_capacity)
 
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
