@@ -178,10 +178,9 @@ class TestAsyncOutputLoopLogic:
         t = threading.Thread(target=proc._async_output_loop, daemon=True)
         t.start()
 
-        # Give the loop time to process, then unblock and stop.
+        # Give the loop time to process, then send the shutdown sentinel.
         time.sleep(0.5)
-        proc._running = False
-        proc._async_output_queue.put((DiffusionOutput(), "sentinel", None))
+        proc._async_output_queue.put(None)
         t.join(timeout=2.0)
 
         mock_pack.assert_called()
@@ -191,3 +190,43 @@ class TestAsyncOutputLoopLogic:
             for c in proc.result_mq.enqueue.call_args_list
         )
         assert output_ready_enqueued, "Expected OUTPUT_READY with async_output_id='abc123' in enqueue calls"
+
+
+class TestWorkerProcShutdown:
+    def test_shutdown_stops_async_thread_and_releases_queues(self):
+        import threading
+
+        proc = _make_worker_proc(step_execution=False)
+        proc.worker = MagicMock()
+        proc.mq = MagicMock()
+        broadcast_mq = proc.mq
+        result_mq = proc.result_mq
+
+        thread = threading.Thread(target=proc._async_output_queue.get)
+        proc._async_output_thread = thread
+        thread.start()
+
+        proc.shutdown()
+
+        assert not thread.is_alive()
+        proc.worker.shutdown.assert_called_once_with()
+        broadcast_mq.shutdown.assert_called_once_with()
+        result_mq.shutdown.assert_called_once_with()
+        assert proc.mq is None
+        assert proc.result_mq is None
+
+    def test_shutdown_releases_queues_when_worker_shutdown_fails(self):
+        proc = _make_worker_proc(step_execution=True)
+        proc.worker = MagicMock()
+        proc.worker.shutdown.side_effect = RuntimeError("shutdown failed")
+        proc.mq = MagicMock()
+        broadcast_mq = proc.mq
+        result_mq = proc.result_mq
+
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            proc.shutdown()
+
+        broadcast_mq.shutdown.assert_called_once_with()
+        result_mq.shutdown.assert_called_once_with()
+        assert proc.mq is None
+        assert proc.result_mq is None
