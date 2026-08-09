@@ -654,25 +654,32 @@ reduction.
 ## TeaCache acceleration
 
 TeaCache reuses DiT block residuals across denoising steps when consecutive
-timestep embeddings are similar. H3 is CFG-distilled, so TeaCache hooks the
-single `MiniMaxH3DiTModel` forward per step.
+timestep embeddings are similar. MiniMax-H3 TeaCache is currently calibrated
+only for the FL2VA partition. In combined serving, FL2VA requests use TeaCache
+while Ref2VA requests run uncached; Ref2VA-only serving rejects TeaCache.
 
 TeaCache and Cache-DiT are mutually exclusive; pick one cache backend per server.
 
-The examples use `rel_l1_thresh=0.17`, which provided the best conservative
-speed/quality balance in the validated 107-frame T2VA workload. Lower values
+The model-specific default and examples use `rel_l1_thresh=0.17`, which
+provided the best conservative speed/quality balance in the validated 107-frame
+T2VA workload. Lower values
 may produce few or no cache hits, while higher values can improve performance
 at the cost of output quality. Validate the threshold on representative
 prompts and generation settings before changing it.
 
 ### Offline (Python API)
 
+Export the directory containing the `FL2VA` and `Ref2VA` subdirectories before
+running the Python example, for example `export MODEL_ROOT=/models/MiniMax-H3`.
+
 ```python
+import os
+
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 omni = Omni(
-    model=f"{MODEL_ROOT}/FL2VA",
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
     cache_backend="tea_cache",
     cache_config={"rel_l1_thresh": 0.17},
     trust_remote_code=True,
@@ -710,6 +717,7 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 
 ## Known limitations
 
+- TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - H3 currently executes one generation request per diffusion batch.

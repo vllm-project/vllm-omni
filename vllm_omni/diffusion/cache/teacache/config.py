@@ -93,6 +93,11 @@ _MODEL_COEFFICIENTS = {
     ],
 }
 
+_DEFAULT_REL_L1_THRESH = 0.2
+_MODEL_DEFAULT_REL_L1_THRESH = {
+    "MiniMaxH3DiTModel": 0.17,
+}
+
 
 @dataclass
 class TeaCacheConfig:
@@ -105,10 +110,8 @@ class TeaCacheConfig:
 
     Args:
         rel_l1_thresh: Threshold for accumulated relative L1 distance. When below threshold,
-            cached residual is reused. Values in [0.1, 0.3] work best:
-            - 0.2: ~1.5x speedup with minimal quality loss
-            - 0.4: ~1.8x speedup with slight quality loss
-            - 0.6: ~2.0x speedup with noticeable quality loss
+            cached residual is reused. If None, uses the model-specific default or 0.2
+            when no model-specific default is registered.
         coefficients: Polynomial coefficients for rescaling L1 distance. If None, uses
             model-specific defaults based on transformer_type.
         transformer_type: Transformer class name (e.g., "QwenImageTransformer2DModel").
@@ -116,14 +119,18 @@ class TeaCacheConfig:
             Defaults to "QwenImageTransformer2DModel".
     """
 
-    rel_l1_thresh: float = 0.2
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None
     transformer_type: str = "QwenImageTransformer2DModel"
 
     def __post_init__(self) -> None:
         """Validate and set default coefficients."""
-        if self.rel_l1_thresh <= 0:
-            raise ValueError(f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}")
+        threshold = self.rel_l1_thresh
+        if threshold is None:
+            threshold = _MODEL_DEFAULT_REL_L1_THRESH.get(self.transformer_type, _DEFAULT_REL_L1_THRESH)
+        if threshold <= 0:
+            raise ValueError(f"rel_l1_thresh must be positive, got {threshold}")
+        self.rel_l1_thresh = threshold
 
         if self.coefficients is None:
             # Use model-specific coefficients, explicitly check if the type exists or not

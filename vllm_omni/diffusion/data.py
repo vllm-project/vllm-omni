@@ -412,14 +412,14 @@ class DiffusionCacheConfig:
         >>> # Access via attribute
         >>> print(config.rel_l1_thresh)  # 0.3 (from dict)
         >>> print(config.Fn_compute_blocks)  # 8 (default)
-        >>> # Empty dict uses all defaults
+        >>> # Empty dict defers model-specific defaults to the TeaCache backend
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(default_config.rel_l1_thresh)  # None
     """
 
     # TeaCache parameters [tea_cache only]
-    # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
-    rel_l1_thresh: float = 0.2
+    # None defers to the model-specific TeaCache default (0.2 fallback).
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
 
     # MagCache parameters [mag_cache only]
