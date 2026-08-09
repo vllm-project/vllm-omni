@@ -85,9 +85,14 @@ def can_use_fish_kvcache_attn(
         return False
     if block_table.shape[0] != query.shape[0] or seq_lens.shape[0] != query.shape[0]:
         return False
-    if query.shape[-1] != 128 or key_cache.shape[-1] != 128:
+    if query.shape[-1] != 128 or key_cache.shape[-1] != 128 or value_cache.shape[-1] != 128:
+        return False
+    if key_cache.shape != value_cache.shape:
         return False
     if key_cache.shape[1] != 16:
+        return False
+    num_kv_heads = key_cache.shape[2]
+    if num_kv_heads <= 0 or query.shape[1] % num_kv_heads != 0:
         return False
     if query.dtype not in (torch.float16, torch.bfloat16):
         return False
@@ -95,17 +100,21 @@ def can_use_fish_kvcache_attn(
         return False
     if block_table.dtype != torch.int32 or seq_lens.dtype != torch.int32:
         return False
+    if not (query.device == key_cache.device == value_cache.device == block_table.device == seq_lens.device):
+        return False
     if max_seq_len <= 0:
         return False
     if max_seq_len > block_table.shape[1] * key_cache.shape[1]:
         return False
-    if not (
-        query.is_contiguous()
-        and key_cache.is_contiguous()
-        and value_cache.is_contiguous()
-        and block_table.is_contiguous()
-        and seq_lens.is_contiguous()
-    ):
+    if not (query.is_contiguous() and block_table.is_contiguous() and seq_lens.is_contiguous()):
+        return False
+    # vLLM packs K/V in the last dimension of a (block, head, token, 2*dim)
+    # allocation. transpose(1, 2) + split therefore returns strided views.
+    # The Triton kernel consumes all four strides directly; only the head
+    # dimension must remain dense for coalesced vector loads.
+    if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+        return False
+    if any(stride <= 0 for stride in (*key_cache.stride(), *value_cache.stride())):
         return False
     return True
 
