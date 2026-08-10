@@ -57,6 +57,11 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_execution_options,
     normalize_lingbot_request,
 )
+from vllm_omni.diffusion.models.lingbot_video.vae_tiling import (
+    LingBotVAETileGeometry,
+    configure_lingbot_vae_tiling,
+    normalize_lingbot_vae_tiling,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -579,6 +584,15 @@ class LingBotVideoPipeline(
             local_files_only=local_files_only,
             revision=revision,
         ).to(load_device)
+        self.vae_tiling_geometry = normalize_lingbot_vae_tiling(
+            model_config,
+            base_geometry=LingBotVAETileGeometry.from_vae(self.vae),
+        )
+        configure_lingbot_vae_tiling(
+            self.vae,
+            enabled=bool(getattr(od_config, "vae_use_tiling", False)),
+            geometry=self.vae_tiling_geometry,
+        )
         self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
             model,
             subfolder=scheduler_subfolder,
