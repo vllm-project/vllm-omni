@@ -135,12 +135,12 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     # Optional smaller threshold for the very first emitted chunk of a request:
     # lowers time-to-first-packet without touching steady-state chunk size
     # (same idea as fish_speech ``initial_codec_chunk_frames``).
-    first_chunk_frames = int(config.get("codec_first_chunk_frames", chunk_frames))
+    first_chunk_frames = int(config.get("initial_codec_chunk_frames", chunk_frames))
     if chunk_frames <= 0 or left_context_frames < 0 or first_chunk_frames <= 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
-            f"codec_first_chunk_frames={first_chunk_frames}, "
+            f"initial_codec_chunk_frames={first_chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames, min(first_chunk_frames, chunk_frames)
