@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.cachedit.backend import (
     CUSTOM_DIT_ENABLERS,
+    CacheDiTInstallation,
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
@@ -836,6 +837,66 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def enable_cache_for_lingbot_video(
+    pipeline: Any,
+    cache_config: Any,
+) -> CacheDiTInstallation:
+    """Enable Cache-DiT for LingBot Base and its optional Refiner.
+
+    Both native transformers use Pattern_3 and sequential CFG. Their scheduler
+    lengths may differ from the request values, so the pipeline owns refreshes
+    at each denoising-stage boundary after the scheduler is configured.
+    """
+    transformers = [pipeline.transformer]
+    blocks = [pipeline.transformer.blocks]
+    forward_patterns = [ForwardPattern.Pattern_3]
+
+    refiner_transformer = getattr(pipeline, "refiner_transformer", None)
+    if refiner_transformer is not None:
+        transformers.append(refiner_transformer)
+        blocks.append(refiner_transformer.blocks)
+        forward_patterns.append(ForwardPattern.Pattern_3)
+
+    block_adapter = BlockAdapter(
+        transformer=transformers[0] if len(transformers) == 1 else transformers,
+        blocks=blocks,
+        forward_pattern=forward_patterns,
+        has_separate_cfg=True,
+        check_forward_pattern=True,
+    )
+    refreshers: dict[str, RefreshCacheContextFunc] = {
+        "transformer": enable_cache_for_dit(
+            pipeline,
+            cache_config,
+            block_adapter,
+        )
+    }
+    if refiner_transformer is not None:
+        refreshers["refiner_transformer"] = _build_cache_context_refresh(
+            cache_config,
+            lambda active_pipeline: active_pipeline.refiner_transformer,
+        )
+    pipeline._cache_dit_stage_refreshers = refreshers
+
+    def refresh_at_stage_boundary(
+        pipeline: Any,
+        num_inference_steps: int,
+        verbose: bool = True,
+    ) -> None:
+        """Defer refresh until LingBot resolves each stage's real schedule."""
+
+        del pipeline, num_inference_steps, verbose
+
+    def cleanup() -> None:
+        pipeline._cache_dit_stage_refreshers.clear()
+
+    return CacheDiTInstallation(
+        refresh=refresh_at_stage_boundary,
+        targets=(block_adapter,),
+        cleanup=cleanup,
+    )
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -853,6 +914,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "LingBotVideoPipeline": enable_cache_for_lingbot_video,
         }
     )
 

@@ -39,13 +39,6 @@ from vllm_omni.diffusion.models.lingbot_video.image_condition import (
     prepare_ti2v_image_condition,
 )
 from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import LingBotVideoTransformer3DModel
-from vllm_omni.diffusion.models.lingbot_video.request_utils import (
-    LingBotExecutionOptions,
-    LingBotGenerationMode,
-    LingBotRefinerOptions,
-    normalize_lingbot_execution_options,
-    normalize_lingbot_request,
-)
 from vllm_omni.diffusion.models.lingbot_video.refiner_utils import (
     LingBotRefinerConfig,
     LingBotRefinerInputs,
@@ -56,6 +49,13 @@ from vllm_omni.diffusion.models.lingbot_video.refiner_utils import (
     normalize_lingbot_refiner_config,
     prepare_refiner_latent,
     resize_refiner_video,
+)
+from vllm_omni.diffusion.models.lingbot_video.request_utils import (
+    LingBotExecutionOptions,
+    LingBotGenerationMode,
+    LingBotRefinerOptions,
+    normalize_lingbot_execution_options,
+    normalize_lingbot_request,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -373,8 +373,7 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
             output_keys = [key for key in ("image", "video") if key in payload]
             if len(output_keys) != 1:
                 raise ValueError(
-                    "LingBot output payload must contain exactly one of 'image' or 'video', "
-                    f"got {sorted(payload)!r}."
+                    f"LingBot output payload must contain exactly one of 'image' or 'video', got {sorted(payload)!r}."
                 )
             output_key = output_keys[0]
             frames = payload[output_key]
@@ -433,10 +432,60 @@ class LingBotVideoPipeline(
         "_diffuse_refiner",
     ]
 
+    @staticmethod
+    def _validate_cache_dit_configuration(od_config: OmniDiffusionConfig) -> None:
+        cache_backend = str(getattr(od_config, "cache_backend", "none") or "none").lower()
+        if cache_backend != "cache_dit":
+            return
+
+        parallel_config = od_config.parallel_config
+        unsupported = []
+        checks = (
+            (
+                parallel_config.pipeline_parallel_size > 1,
+                "pipeline parallelism",
+            ),
+            (
+                parallel_config.tensor_parallel_size > 1,
+                "tensor parallelism",
+            ),
+            (
+                parallel_config.enable_expert_parallel,
+                "expert parallelism",
+            ),
+            (
+                (parallel_config.sequence_parallel_size or 1) > 1,
+                "sequence parallelism",
+            ),
+            (parallel_config.cfg_parallel_size > 1, "CFG parallelism"),
+            (
+                parallel_config.vae_patch_parallel_size > 1,
+                "VAE patch parallelism",
+            ),
+            (parallel_config.use_hsdp, "HSDP"),
+            (
+                od_config.enable_distributed_layerwise_offload,
+                "distributed layerwise offload",
+            ),
+        )
+        unsupported.extend(name for enabled, name in checks if enabled)
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT does not support the following combinations: "
+                + ", ".join(unsupported)
+                + ". Use an unsharded DiT stage; CPU offload and ordinary "
+                "layerwise offload remain supported."
+            )
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        self._validate_cache_dit_configuration(od_config)
         self.od_config = od_config
+        self._cache_dit_stage_refreshers: dict[
+            str,
+            Callable[[Any, int, bool], None],
+        ] = {}
         self._execution_device = get_local_device()
         self.device = self._execution_device
         self.vae_scale_factor_temporal = 4
@@ -483,9 +532,7 @@ class LingBotVideoPipeline(
         refiner_subfolder = self.refiner_config.transformer_subfolder
         refiner_local_files_only = bool(refiner_model and os.path.isdir(refiner_model))
         refiner_shares_source = bool(
-            self.refiner_config.enabled
-            and refiner_model == model
-            and refiner_revision == revision
+            self.refiner_config.enabled and refiner_model == model and refiner_revision == revision
         )
         if refiner_shares_source:
             component_subfolders.append(refiner_subfolder)
@@ -573,9 +620,7 @@ class LingBotVideoPipeline(
                     TransformerConfig.from_dict(refiner_transformer_config),
                     LingBotVideoTransformer3DModel,
                 )
-                self.refiner_transformer = LingBotVideoTransformer3DModel(
-                    **refiner_transformer_kwargs
-                )
+                self.refiner_transformer = LingBotVideoTransformer3DModel(**refiner_transformer_kwargs)
                 self.refiner_transformer.to(dtype=transformer_dtype)
                 self.refiner_scheduler = FlowUniPCMultistepScheduler.from_pretrained(
                     refiner_model,
@@ -607,6 +652,44 @@ class LingBotVideoPipeline(
             profiler_targets=list(self._PROFILER_TARGETS),
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False),
         )
+
+    def _refresh_cache_dit_stage(
+        self,
+        transformer_name: str,
+        num_inference_steps: int,
+    ) -> None:
+        refresh = getattr(self, "_cache_dit_stage_refreshers", {}).get(transformer_name)
+        if refresh is not None:
+            refresh(self, int(num_inference_steps), False)
+
+    def _validate_cache_dit_request(
+        self,
+        request_config: Any,
+        execution_options: LingBotExecutionOptions,
+        *,
+        is_dummy_run: bool = False,
+    ) -> None:
+        if is_dummy_run or not getattr(self, "_cache_dit_stage_refreshers", {}):
+            return
+
+        unsupported = []
+        if request_config.guidance_scale <= 1.0:
+            unsupported.append("Base guidance_scale <= 1")
+        if execution_options.batch_cfg:
+            unsupported.append("Base batch_cfg=true")
+
+        refiner_options = execution_options.refiner
+        if refiner_options.run:
+            if refiner_options.guidance_scale <= 1.0:
+                unsupported.append("Refiner guidance_scale <= 1")
+            if refiner_options.batch_cfg:
+                unsupported.append("Refiner batch_cfg=true")
+
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT currently requires sequential two-pass CFG "
+                "for every enabled denoising stage; unsupported request options: " + ", ".join(unsupported)
+            )
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
@@ -783,9 +866,7 @@ class LingBotVideoPipeline(
         generator: torch.Generator | None,
     ) -> torch.Tensor:
         if video.ndim != 5:
-            raise ValueError(
-                f"LingBot VAE encode expects [B,C,T,H,W], got {tuple(video.shape)}."
-            )
+            raise ValueError(f"LingBot VAE encode expects [B,C,T,H,W], got {tuple(video.shape)}.")
         vae_device = _module_device(self.vae)
         normalized = (video.to(device=vae_device, dtype=torch.float32) - 0.5) / 0.5
         with torch.autocast(
@@ -829,9 +910,7 @@ class LingBotVideoPipeline(
             raise RuntimeError(f"LingBot only supports decode batch size 1, got {frames.shape[0]}.")
         if mode is LingBotGenerationMode.T2I:
             if frames.shape[1] != 1:
-                raise RuntimeError(
-                    f"LingBot T2I decode expected exactly one frame, got shape {tuple(frames.shape)}."
-                )
+                raise RuntimeError(f"LingBot T2I decode expected exactly one frame, got shape {tuple(frames.shape)}.")
             return frames[0, 0]
         return frames[0]
 
@@ -955,9 +1034,7 @@ class LingBotVideoPipeline(
             image_condition=image_condition,
             cfg_parallel_group=cfg_parallel_group,
             cfg_parallel_rank=cfg_parallel_rank,
-            clean_prefix=(
-                image_condition.clean_latent if image_condition is not None else None
-            ),
+            clean_prefix=(image_condition.clean_latent if image_condition is not None else None),
         )
 
     @torch.no_grad()
@@ -998,6 +1075,11 @@ class LingBotVideoPipeline(
                 sigmas=sigmas,
                 shift=1.0,
             )
+
+        self._refresh_cache_dit_stage(
+            "transformer",
+            len(self.scheduler.timesteps),
+        )
 
         return self._run_denoise_stage(
             transformer=self.transformer,
@@ -1299,6 +1381,10 @@ class LingBotVideoPipeline(
             sigmas=sigmas,
             shift=1.0,
         )
+        self._refresh_cache_dit_stage(
+            "refiner_transformer",
+            len(self.refiner_scheduler.timesteps),
+        )
         settings = LingBotStageSettings(
             num_inference_steps=options.num_inference_steps,
             guidance_scale=options.guidance_scale,
@@ -1350,22 +1436,14 @@ class LingBotVideoPipeline(
         run_refiner = options.refiner.run
         if run_refiner and mode is LingBotGenerationMode.T2I:
             raise ValueError("LingBot Refiner is only supported for video modes.")
-        if run_refiner and (
-            self.refiner_transformer is None or self.refiner_scheduler is None
-        ):
+        if run_refiner and (self.refiner_transformer is None or self.refiner_scheduler is None):
             raise RuntimeError("LingBot Refiner was requested but is not initialized.")
 
         # Capture the initial seed before Base condition/latent generation consume
         # its generator. Refiner stochastic work must use an independent stream.
         if run_refiner and refiner_generator is None:
-            refiner_seed = (
-                generator.initial_seed()
-                if generator is not None
-                else int(torch.seed())
-            )
-            refiner_generator = torch.Generator(device=self.device).manual_seed(
-                refiner_seed
-            )
+            refiner_seed = generator.initial_seed() if generator is not None else int(torch.seed())
+            refiner_generator = torch.Generator(device=self.device).manual_seed(refiner_seed)
 
         settings = LingBotStageSettings(
             num_inference_steps=num_inference_steps,
@@ -1490,6 +1568,11 @@ class LingBotVideoPipeline(
                     LingBotRefinerConfig(),
                 ),
                 mode=request_config.mode,
+            )
+            self._validate_cache_dit_request(
+                request_config,
+                execution_options,
+                is_dummy_run=request.is_dummy_run(),
             )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc

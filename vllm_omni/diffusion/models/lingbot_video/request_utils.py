@@ -218,9 +218,7 @@ def normalize_lingbot_execution_options(
         else _non_negative_int_option(default_base_sigma_tail_steps, "base_sigma_tail_steps")
     )
     if legacy_threshold is not None:
-        logger.warning_once(
-            "LingBot `t_thresh` is deprecated; use `base_low_noise_threshold` for the Base schedule."
-        )
+        logger.warning_once("LingBot `t_thresh` is deprecated; use `base_low_noise_threshold` for the Base schedule.")
 
     run_explicit = "run_refiner" in extra_args
     run_refiner = (
@@ -230,8 +228,7 @@ def normalize_lingbot_execution_options(
     )
     if run_refiner and not refiner_config.enabled:
         raise ValueError(
-            "LingBot `run_refiner=true` requires startup configuration "
-            "`model_config.lingbot_refiner.enabled=true`."
+            "LingBot `run_refiner=true` requires startup configuration `model_config.lingbot_refiner.enabled=true`."
         )
     if mode is LingBotGenerationMode.T2I:
         if run_explicit and run_refiner:
@@ -242,8 +239,7 @@ def normalize_lingbot_execution_options(
     refiner_width = _positive_int_option(extra_args.get("refiner_width", 1920), "refiner_width")
     if refiner_height % 16 != 0 or refiner_width % 16 != 0:
         raise ValueError(
-            "LingBot Refiner height and width must be multiples of 16, "
-            f"got {refiner_height}x{refiner_width}."
+            f"LingBot Refiner height and width must be multiples of 16, got {refiner_height}x{refiner_width}."
         )
     refiner_steps = _positive_int_option(extra_args.get("refiner_steps", 8), "refiner_steps")
     refiner_guidance = _positive_float_option(
@@ -271,15 +267,10 @@ def normalize_lingbot_execution_options(
     )
     raw_max_frames = extra_args.get("refiner_max_video_frames")
     refiner_max_frames = (
-        None
-        if raw_max_frames is None
-        else _positive_int_option(raw_max_frames, "refiner_max_video_frames")
+        None if raw_max_frames is None else _positive_int_option(raw_max_frames, "refiner_max_video_frames")
     )
     if refiner_max_frames is not None and refiner_max_frames != 1 and (refiner_max_frames - 1) % 4 != 0:
-        raise ValueError(
-            "LingBot `refiner_max_video_frames` must be 1 or 4n+1, "
-            f"got {refiner_max_frames}."
-        )
+        raise ValueError(f"LingBot `refiner_max_video_frames` must be 1 or 4n+1, got {refiner_max_frames}.")
 
     return LingBotExecutionOptions(
         batch_cfg=_boolean_option(extra_args, "batch_cfg"),
@@ -563,7 +554,6 @@ def normalize_lingbot_request(
     prompt_fields = _runtime_prompt_fields(prompt_obj)
     sampling = request.sampling_params
     extra_args = dict(sampling.extra_args or {})
-
     mode = resolve_lingbot_mode(prompt_obj)
     prompt = caption_from_lingbot_prompt(_prompt_value(prompt_obj))
     images = _image_items(envelope)

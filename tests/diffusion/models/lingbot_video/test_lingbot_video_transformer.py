@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
+
 import pytest
 import torch
 
@@ -25,6 +27,74 @@ def _tiny_transformer(**overrides):
     }
     config.update(overrides)
     return LingBotVideoTransformer3DModel(**config)
+
+
+def test_transformer_declares_pattern_3_cache_dit_contract():
+    from cache_dit import ForwardPattern
+
+    from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+    from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import (
+        LingBotVideoBlock,
+        LingBotVideoTransformer3DModel,
+    )
+
+    adapter_config = LingBotVideoTransformer3DModel._cache_dit_adapter_config
+    assert isinstance(adapter_config, CacheDiTAdapterConfig)
+    assert adapter_config.block_forward_patterns == {"blocks": ForwardPattern.Pattern_3}
+    assert adapter_config.has_separate_cfg is True
+    assert "hidden_states" in inspect.signature(LingBotVideoBlock.forward).parameters
+
+
+def test_tiny_transformer_installs_and_refreshes_cache_dit():
+    import cache_dit
+
+    from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
+    from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+    model = _tiny_transformer(depth=2)
+    refiner = _tiny_transformer(depth=2)
+    pipeline_type = type("LingBotVideoPipeline", (), {})
+    pipeline = pipeline_type()
+    pipeline.transformer = model
+    pipeline.refiner_transformer = refiner
+    pipeline._cache_dit_stage_refreshers = {}
+    backend = CacheDiTBackend(DiffusionCacheConfig())
+
+    try:
+        backend.enable(pipeline)
+        refresh = pipeline._cache_dit_stage_refreshers["transformer"]
+        refresh(pipeline, 6, False)
+        assert backend.is_enabled()
+        assert cache_dit.BlockAdapter.is_cached(model)
+        assert cache_dit.BlockAdapter.is_cached(refiner)
+        assert set(pipeline._cache_dit_stage_refreshers) == {
+            "transformer",
+            "refiner_transformer",
+        }
+
+        hidden_states = torch.randn(1, 2, 1, 2, 2)
+        timestep = torch.tensor([300.0])
+        encoder_hidden_states = torch.randn(1, 3, 8)
+        encoder_attention_mask = torch.ones(1, 3, dtype=torch.long)
+
+        with torch.no_grad():
+            outputs = [
+                model(
+                    hidden_states,
+                    timestep,
+                    encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_dict=False,
+                )[0]
+                for _ in range(2)
+            ]
+        assert all(output.shape == hidden_states.shape for output in outputs)
+        assert all(torch.isfinite(output).all() for output in outputs)
+    finally:
+        backend.disable(pipeline)
+        assert not cache_dit.BlockAdapter.is_cached(model)
+        assert not cache_dit.BlockAdapter.is_cached(refiner)
+        assert pipeline._cache_dit_stage_refreshers == {}
 
 
 def test_joint_position_ids_video_then_text_order():
