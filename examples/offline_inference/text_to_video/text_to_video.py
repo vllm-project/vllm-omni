@@ -117,13 +117,17 @@ _MODEL_PRESETS = {
     },
 }
 
-_LINGBOT_CACHE_DIT_QUALITY_CONFIG = {
-    "Fn_compute_blocks": 12,
+_LINGBOT_CACHE_DIT_BALANCED_CONFIG = {
+    "Fn_compute_blocks": 4,
     "Bn_compute_blocks": 0,
     "max_warmup_steps": 8,
-    "max_cached_steps": 8,
-    "residual_diff_threshold": 0.06,
+    "max_cached_steps": 16,
+    "residual_diff_threshold": 0.12,
     "max_continuous_cached_steps": 1,
+    "enable_taylorseer": False,
+    "taylorseer_order": 1,
+    "scm_steps_mask_policy": "medium",
+    "scm_steps_policy": "dynamic",
 }
 
 
@@ -157,7 +161,7 @@ def _is_lingbot(model: str, model_class_name: str | None) -> bool:
     return "lingbot" in model.lower() or "lingbotvideo" in (model_class_name or "").lower()
 
 
-def build_text_to_video_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
+def build_text_to_video_prompt(prompt: Any, negative_prompt: str | None) -> dict[str, Any]:
     """Build the canonical request envelope for the shared T2V example."""
     result: dict[str, Any] = {
         "prompt": prompt,
@@ -208,6 +212,16 @@ def parse_extra_body(value: str) -> dict[str, Any]:
     return _parse_json_object(value, "--extra-body")
 
 
+def _load_prompt_json(path: Path) -> dict[str, Any]:
+    try:
+        prompt = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"--prompt-json must contain valid JSON: {e}") from e
+    if not isinstance(prompt, dict):
+        raise ValueError("--prompt-json must contain one structured prompt object")
+    return prompt
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
@@ -237,6 +251,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON object of engine-level, model-specific configuration.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
+    parser.add_argument(
+        "--prompt-json",
+        type=Path,
+        default=None,
+        help="Structured prompt JSON object; overrides --prompt.",
+    )
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument(
         "--extra-body",
@@ -483,7 +503,7 @@ def main():
     cache_config = None
     if args.cache_backend == "cache_dit":
         cache_config = (
-            dict(_LINGBOT_CACHE_DIT_QUALITY_CONFIG)
+            dict(_LINGBOT_CACHE_DIT_BALANCED_CONFIG)
             if _is_lingbot(args.model, model_class_name)
             else {
             "Fn_compute_blocks": 1,
@@ -592,7 +612,10 @@ def main():
     if negative_prompt is None and all(preset is not _MODEL_PRESETS[name] for name in ("lingbot", "ltx2", "ltx23")):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         negative_prompt = ""
-    prompt_dict = build_text_to_video_prompt(args.prompt, negative_prompt)
+    prompt_value: Any = args.prompt
+    if args.prompt_json is not None:
+        prompt_value = _load_prompt_json(args.prompt_json)
+    prompt_dict = build_text_to_video_prompt(prompt_value, negative_prompt)
 
     extra_args = {}
     if lora_request:
