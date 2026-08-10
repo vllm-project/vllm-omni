@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
-import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -14,6 +14,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45Duplex
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
+_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 
 
 @dataclass
@@ -35,7 +36,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
-    generated_text_tokens: list[int] = field(default_factory=list)
+    generated_tokens: list[int] = field(default_factory=list)
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -58,6 +59,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             else getattr(stage_model, "tokenizer", None)
         )
         self._init_token_ids()
+        if self.tokenizer is not None:
+            self._require_special_token_ids()
 
     def _stage_runtime_ready(self) -> bool:
         return self.processor is not None and self.tokenizer is not None and self.thinker is not None
@@ -196,19 +199,15 @@ class MiniCPMO45Stage0DuplexRuntime:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
-        # Consume every complete chunk in the buffer so the appended span and
-        # the scheduler's slot reservation for this append agree exactly. A
-        # final append may zero-pad a real residual chunk, but it must not add
-        # a whole silence unit after all input was already consumed: official
-        # duplex generation runs once per microphone unit and client commit is
-        # not an additional model decision.
+        # Consume every complete processor chunk in the buffer so the appended
+        # span and the scheduler's slot reservation agree exactly. The serving
+        # PCM buffer pads a final real residual before it reaches Stage0. Do not
+        # pad again here: the first processor chunk is hop-aligned below 1035ms
+        # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
         while True:
             if len(state.audio_buffer) < chunk_size:
-                if not final or len(state.audio_buffer) == 0:
-                    break
-                pad = np.zeros(chunk_size - len(state.audio_buffer), dtype=np.float32)
-                state.audio_buffer = np.concatenate([state.audio_buffer, pad])
+                break
             audio_chunk = state.audio_buffer[:chunk_size]
             batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx, processor=processor)
             for name, value in (
@@ -224,6 +223,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                 if units_built == 0:
                     return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
                 break
+            consumed_samples = self._consumed_audio_samples(
+                state.audio_chunk_idx,
+                chunk_size,
+                processor=processor,
+            )
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
@@ -255,9 +259,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
-            state.audio_buffer = state.audio_buffer[
-                self._consumed_audio_samples(state.audio_chunk_idx, chunk_size, processor=processor) :
-            ]
+            state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
             chunk_size = self._streaming_chunk_size(processor)
@@ -610,14 +612,33 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _load_processor_from_path(model_path: str | None) -> Any | None:
         if not model_path:
             return None
-        if model_path not in sys.path:
-            sys.path.insert(0, model_path)
         try:
-            from processing_minicpmo import MiniCPMOProcessor
+            from transformers import AutoImageProcessor, AutoProcessor
 
-            return MiniCPMOProcessor.from_pretrained(model_path, trust_remote_code=True)
-        except Exception:
-            return None
+            original_register = AutoImageProcessor.register
+
+            def register_image_processor(config_class, *args, **kwargs):
+                # The checkpoint's auto_map already loads this class. Its
+                # legacy string registration is incompatible with some
+                # Transformers versions and is otherwise redundant.
+                if config_class == "MiniCPMVImageProcessor":
+                    return None
+                return original_register(config_class, *args, **kwargs)
+
+            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
+                AutoImageProcessor.register = staticmethod(register_image_processor)
+                try:
+                    processor = AutoProcessor.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+                finally:
+                    AutoImageProcessor.register = staticmethod(original_register)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
+        if getattr(processor, "tokenizer", None) is None:
+            raise RuntimeError(f"MiniCPM-o duplex processor loaded from {model_path!r} does not expose a tokenizer")
+        return processor
 
     def _init_token_ids(self) -> None:
         if self.tokenizer is None:

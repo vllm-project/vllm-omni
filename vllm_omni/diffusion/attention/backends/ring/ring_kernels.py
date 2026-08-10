@@ -9,9 +9,11 @@ import torch
 from .ring_globals import (
     HAS_AITER,
     HAS_FA3,
+    HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
     fa3_fwd_func,
+    fa4_attn_func,
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
@@ -80,6 +82,19 @@ def pytorch_attn_forward(
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
+
+    # GQA/MQA support. Ring attention only ever *communicates* K/V with H_kv
+    # heads -- that is precisely the benefit of GQA -- so expanding here does
+    # not change communication volume. The expansion is needed because the aten
+    # SDPA ops below are required for the LSE output that ring accumulation
+    # consumes, and they do not accept `enable_gqa`.
+    if k.shape[1] != q.shape[1]:
+        num_heads, num_kv_heads = q.shape[1], k.shape[1]
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA/MQA.")
+        n_rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
 
     if op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
@@ -188,6 +203,40 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
 
 # Legacy alias for backward compatibility
 flash_attn3_func_forward = fa3_forward
+
+
+def flash_attn4_func_forward(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+):
+    """FA4 forward pass returning the LSE required by Ring Attention."""
+    del dropout_p, alibi_slopes, return_softmax
+    assert HAS_FA4, "FA4 is not available"
+    assert fa4_attn_func is not None, "FA4 high-level API is not available"
+
+    left, right = window_size if window_size else (-1, -1)
+    out, softmax_lse = fa4_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=(
+            None if left == -1 else left,
+            None if right == -1 else right,
+        ),
+        softcap=softcap or 0.0,
+        return_lse=True,
+    )
+    return out, softmax_lse
 
 
 def flash_attn_forward_aiter(

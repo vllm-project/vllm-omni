@@ -22,10 +22,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     _sample_token,
 )
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 
 class _MossTTSLocalAttention(nn.Module):
@@ -135,12 +139,31 @@ class MossTTSLocalDepthTransformer(nn.Module):
         rope_base = float(getattr(gpt2_config, "rope_base", 1_000_000.0))
         self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, n_head, inner_size, rope_base, eps)])
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
+        self._compiled_forward_prefix = None
 
     def _forward_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = seq_embeds
         for block in self.h:
             hidden_states = block(hidden_states)
         return self.ln_f(hidden_states)
+
+    def setup_compile(self) -> None:
+        if self._compiled_forward_prefix is not None:
+            return
+        if not current_omni_platform.supports_torch_inductor():
+            self._compiled_forward_prefix = self._forward_prefix
+            logger.warning_once("MOSS-TTS local depth torch.compile disabled on this platform")
+            return
+        self._compiled_forward_prefix = torch.compile(
+            self._forward_prefix,
+            dynamic=False,
+            options={"epilogue_fusion": False},
+        )
+        logger.info("MOSS-TTS local depth prefix enabled with torch.compile")
+
+    def _run_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
+        forward_prefix = self._compiled_forward_prefix or self._forward_prefix
+        return forward_prefix(seq_embeds)
 
     @torch.no_grad()
     def generate_frame(
@@ -180,7 +203,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
         embeds[:, 0, :] = backbone_last_hidden.to(dtype)
 
-        hidden = self._forward_prefix(embeds[:, :1, :])
+        hidden = self._run_prefix(embeds[:, :1, :])
         local_hidden = hidden[:, 0, :]
 
         binary_logits = local_text_lm_head(local_hidden).float()
@@ -231,7 +254,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
 
             if channel_index + 1 < n_vq:
                 embeds[:, channel_index + 1, :] = audio_embeddings[channel_index](channel_token).to(dtype)
-                hidden = self._forward_prefix(embeds[:, : channel_index + 2, :])
+                hidden = self._run_prefix(embeds[:, : channel_index + 2, :])
                 local_hidden = hidden[:, channel_index + 1, :]
 
         return should_continue, codes

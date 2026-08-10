@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
+from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
@@ -26,7 +27,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_scheduler_for_invalid_drafts,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache

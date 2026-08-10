@@ -1,23 +1,17 @@
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias, TypedDict
+from typing import Any, TypeAlias
 
-from vllm.inputs import PromptType
+import torch
+from typing_extensions import NotRequired, TypedDict
+from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
+from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
-try:
-    from typing import NotRequired
-except ImportError:
-    # Python < 3.11: use typing_extensions
-    from typing_extensions import NotRequired
-
-
-import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
-from vllm.inputs.engine import TokensInput
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
 class OmniTextPrompt(TextPrompt):
@@ -216,6 +210,10 @@ class OmniDiffusionSamplingParams:
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
 
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int | None = None
@@ -271,7 +269,7 @@ class OmniDiffusionSamplingParams:
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
     num_inference_steps: int | None = None
-    guidance_scale: float = 0.0
+    guidance_scale: float | None = None
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_scale_2_provided: bool = False
@@ -345,6 +343,10 @@ class OmniDiffusionSamplingParams:
     # results
     output: torch.Tensor | None = None
 
+    def __post_init__(self) -> None:
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+
     @property
     def batch_size(self):
         # This class is changed to only represent a single prompt request
@@ -379,6 +381,31 @@ class OmniDiffusionSamplingParams:
 
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
+
+    @classmethod
+    def from_params(cls, params: Any) -> "OmniDiffusionSamplingParams":
+        """Normalize caller params for diffusion stages.
+
+        Existing Omni params are returned unchanged. Plain vLLM SamplingParams
+        copy seed and matching extra_args fields; remaining extra_args stay nested.
+        Unsupported types raise TypeError.
+        """
+        if isinstance(params, cls):
+            return params
+        if isinstance(params, SamplingParams):
+            extra = dict(getattr(params, "extra_args", None) or {})
+            known = set(cls.__dataclass_fields__)
+            mapped = {k: extra.pop(k) for k in list(extra) if k in known}
+            if extra:
+                mapped["extra_args"] = extra
+            seed = getattr(params, "seed", None)
+            if seed is not None:
+                mapped.setdefault("seed", seed)
+            return cls(**mapped)
+        raise TypeError(
+            "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
+            f"got {type(params).__name__!r}."
+        )
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams

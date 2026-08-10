@@ -59,7 +59,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
+| **[CPU Offload](diffusion/cpu_offload.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
 | **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
 | **[VAE Parallelism](diffusion/parallelism/vae_parallelism.md)** | Distributes VAE decode work across GPUs | High-resolution generation with reduced VAE memory peak |
 
@@ -80,12 +80,11 @@ denoise steps.
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[Request-Level Batching](diffusion/request_batching.md)** | Scheduler batches compatible independent diffusion requests into one pipeline forward pass | Bursty online serving and multi-request throughput |
-| **[Step Execution](diffusion/step_execution.md)** | Per-step denoise execution with mid-request abort support | Request cancellation between denoise steps, fine-grained execution control |
+| **[Diffusion Execution Modes](diffusion/execution_modes.md)** | Configures serial requests, request batching, step execution, continuous batching, and streaming output | Matching latency, throughput, cancellation, and output-delivery requirements |
 
-**Note:** Request-level batching is available for pipelines that declare the
-request-batch forward contract. Step execution is currently supported by
-QwenImagePipeline only. See [Supported Models](#supported-models) for details.
+**Note:** Request-level batching and step execution are capability-based.
+Consult the execution guide and the selected pipeline's documentation for
+current support.
 
 ### Quantization Methods
 
@@ -105,8 +104,8 @@ The following tables show which models support each feature:
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload_diffusion.md).
-> 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
+> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload.md).
+> 2. The **💾Quantization** column is collapsed for readability. See [Quantization](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
 
@@ -160,7 +159,7 @@ The following tables show which models support each feature:
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-
+| **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
 
 **Frame Interpolation Support**
 
@@ -206,7 +205,7 @@ The following tables show which models support each feature:
     3. CPU Offloading (Layerwise) and CPU Offloading (Module-wise) are not compatible.
     4. CPU Offloading (Layerwise) supports single-card for now.
     5. Using FP8-Quant as an example of qunatization methods.
-    6. Step Execution is not compatible with cache backends (TeaCache, Cache-DiT). LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
+    6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
 
 
 ## Multi-Thread Weight Loading
@@ -275,9 +274,9 @@ Measured on NVIDIA H800:
 
 **Memory Optimization:**
 
-- **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
+- **[CPU Offload Guide](diffusion/cpu_offload.md)** - Offload model components to CPU, reduce GPU memory usage
 - **[VAE Parallelism Guide](diffusion/parallelism/vae_parallelism.md)** - Distribute VAE decode work across GPUs for high-resolution images and videos
-- **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
+- **[Quantization](quantization/overview.md)** - Quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
 
 **Extensions:**
 
@@ -286,7 +285,7 @@ Measured on NVIDIA H800:
 
 **Execution Modes:**
 
-- **[Step Execution Guide](diffusion/step_execution.md)** - Per-step denoise execution with mid-request abort support
+- **[Diffusion Execution Modes](diffusion/execution_modes.md)** - Configure request batching, step execution, continuous batching, and streaming output
 
 **Startup Optimization:**
 

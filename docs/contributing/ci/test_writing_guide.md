@@ -4,137 +4,20 @@ This document describes how to author tests for each CI level (L1–L5). For the
 
 ## Test Directory Structure
 
-Legend: `✅` = test exists, `⬜` = suggested to add.
-```
-vllm_omni/                                    tests/
-├── config/                             →     ├── config/
-│   ├── model.py                              │   └── test_model.py                    ⬜
-│   └── lora.py                               │   └── test_lora.py                      ⬜
-│
-├── core/                               →     ├── core/
-│   └── sched/                                 │   └── sched/
-│       ├── omni_ar_scheduler.py               │       ├── test_omni_ar_scheduler.py    ⬜
-│       ├── omni_generation_scheduler.py       │       ├── test_omni_generation_scheduler.py  ⬜
-│       └── output.py                          │       └── test_output.py               ✅ currently in entrypoints/test_omni_new_request_data.py (tests output.OmniNewRequestData)
-│
-├── diffusion/                          →     ├── diffusion/
-│   ├── diffusion_engine.py                    │   ├── test_diffusion_engine.py          ⬜
-│   ├── attention/                             │   ├── attention/
-│   │   ├── layer.py                            │   │   ├── test_attention_sp.py         ✅
-│   │   └── backends/                           │   │   └── test_flash_attn.py           ✅
-│   ├── distributed/                           │   ├── distributed/
-│   │   └── ...                                 │   │   ├── test_comm.py                 ✅
-│   │                                            │   │   ├── test_cfg_parallel.py        ✅
-│   │                                            │   │   └── test_sp_plan_hooks.py       ✅
-│   ├── lora/                                   │   ├── lora/
-│   │   └── ...                                 │   │   ├── test_base_linear.py          ✅
-│   │                                            │   │   └── test_lora_manager.py        ✅
-│   ├── models/                                 │   ├── models/
-│   │   ├── qwen_image/                         │   │   ├── qwen_image/                 (e2e coverage)
-│   │   ├── ovis_image/                         │   │   ├── ovis_image/
-│   │   │   └── ...                             │   │   │   └── test_ovis_image.py     ✅
-│   │   ├── z_image/                            │   │   └── z_image/
-│   │   └── ...                                 │   │       └── test_zimage_tp_constraints.py  ✅
-│   └── worker/                                 │   └── worker/
-│       ├── diffusion_worker.py                 │       └── test_diffusion_worker.py   ✅ file at diffusion/test_diffusion_worker.py
-│       └── diffusion_model_runner.py            │
-│
-├── distributed/                         →     ├── distributed/
-│   └── omni_connectors/                         │   └── omni_connectors/
-│       ├── adapter.py                           │       ├── test_adapter_and_flow.py   ✅
-│       ├── kv_transfer_manager.py               │       ├── test_basic_connectors.py   ✅
-│       ├── connectors/                           │       ├── test_kv_flow.py             ✅
-│       └── utils/                               │       └── test_omni_connector_configs.py  ✅
-│
-├── engine/                             →     ├── engine/
-│   ├── input_processor.py                      │   ├── test_input_processor.py         ⬜  (no processor.py in source)
-│   ├── output_processor.py                     │   └── test_output_processor.py         ⬜
-│   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
-│
-├── entrypoints/                        →     ├── entrypoints/
-│   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
-│   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
-│   │   └── ...                                  │   │   └── test_*.py                  ⬜
-│   └── openai/                                  │   └── openai_api/                    # maps to entrypoints/openai/
-│       ├── api_server.py                        │       ├── test_api_server.py         ⬜  (e2e indirect coverage)
-│       ├── serving_chat.py                       │       ├── test_serving_chat_sampling_params.py  ✅
-│       ├── serving_speech.py                     │       ├── test_serving_speech.py     ✅
-│       └── image_api_utils.py                   │       └── test_image_server.py      ✅
-│
-├── inputs/                             →     ├── inputs/
-│   ├── data.py                                 │   ├── test_data.py                   ⬜
-│   ├── parse.py                                │   ├── test_parse.py                 ⬜
-│   └── preprocess.py                            │   └── test_preprocess.py            ✅ currently in entrypoints/test_omni_input_preprocessor.py
-│
-├── model_executor/                     →     ├── model_executor/
-│   ├── layers/                                  │   ├── layers/
-│   │   └── mrope.py                             │   │   └── test_mrope.py              ⬜
-│   ├── model_loader/                            │   ├── model_loader/
-│   │   └── weight_utils.py                      │   │   └── test_weight_utils.py      ⬜
-│   ├── models/                                  │   ├── models/
-│   │   ├── qwen2_5_omni/                         │   │   ├── qwen2_5_omni/
-│   │   │   ├── qwen2_5_omni_thinker.py           │   │   │   ├── test_audio_length.py  ✅
-│   │   │   ├── qwen2_5_omni_talker.py            │   │   │   ├── test_qwen2_5_omni_thinker.py  ⬜
-│   │   │   └── qwen2_5_omni_token2wav.py         │   │   │   ├── test_qwen2_5_omni_talker.py  ⬜
-│   │   └── qwen3_omni/                          │   │   │   └── test_qwen2_5_omni_token2wav.py  ⬜
-│   │       └── ...                               │   │   └── qwen3_omni/
-│   ├── stage_configs/                           │   │       └── test_*.py              ⬜
-│   │   └── *.yaml                               │   └── stage_configs/                 (used by e2e, test_*.py can be added)  ⬜
-│   └── stage_input_processors/                  │   └── stage_input_processors/
-│       └── ...                                  │       └── test_*.py                 ⬜
-│
-├── sample/                             →     ├── sample/
-│   └── __init__.py                             │   └── test_*.py                      ⬜
-│
-├── utils/                              →     ├── utils/
-│   └── __init__.py                             │   └── test_*.py                       ⬜  (no platform_utils.py currently)
-│
-├── worker/                             →     ├── worker/
-│   ├── gpu_ar_model_runner.py                  │   ├── test_gpu_ar_model_runner.py    ⬜
-│   ├── gpu_ar_worker.py                        │   ├── test_gpu_ar_worker.py           ⬜
-│   ├── gpu_generation_model_runner.py          │   ├── test_gpu_generation_model_runner.py  ✅
-│   ├── gpu_generation_worker.py                │   ├── test_gpu_generation_worker.py  ⬜
-│   ├── gpu_model_runner.py                     │   ├── test_omni_gpu_model_runner.py   ✅
-│   └── mixins.py                               │   └── (npu under platforms/npu/worker/)  # not worker/npu/
-│
-├── platforms/                          →     (no tests/platforms/, e2e and stage_configs provide indirect coverage)
-│   ├── cuda/
-│   ├── npu/worker/                             # NPU worker here, not vllm_omni/worker/npu/
-│   ├── rocm/
-│   └── xpu/worker/
-│
-├── outputs.py                          →     test_outputs.py                         ✅ (at tests root)
-├── (logger, patch, request, version)    →     (no corresponding unit test)
-│
-└── e2e (tests side only)               →     ├── e2e/
-                                               ├── online_serving/                     ✅ non-empty
-                                               │   ├── test_qwen2_5_omni.py
-                                               │   ├── test_async_omni.py
-                                               │   ├── test_qwen3_omni.py
-                                               │   ├── test_qwen3_omni_expansion.py
-                                               │   ├── test_mimo_audio.py
-                                               │   └── test_images_generations_lora.py
-                                               └── offline_inference/                  ✅
-                                                   ├── test_qwen2_5_omni.py
-                                                   ├── test_qwen3_omni.py
-                                                   ├── test_bagel_text2img.py
-                                                   ├── test_z_image.py
-                                                   ├── test_wan22.py
-                                                   ├── test_zimage_tensor_parallel.py
-                                                   ├── test_cache_dit.py
-                                                   ├── test_teacache.py
-                                                   ├── test_stable_audio_expansion.py
-                                                   ├── test_diffusion_cpu_offload.py
-                                                   ├── test_diffusion_layerwise_offload.py
-                                                   ├── test_diffusion_lora.py
-                                                   ├── test_sequence_parallel.py
-                                                   └── stage_configs/                  (legacy schema, still
-                                                       ├── bagel_*.yaml                 present for unmigrated
-                                                       └── npu/, rocm/, etc.            models)
+Canonical placement by CI level is in the **Test Dir** column of the level matrix in [Test System Overview](./test_system_overview.md).
 
-# Migrated models (qwen3_omni_moe, qwen2_5_omni, qwen3_tts) live under
-# vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
-```
+Summary:
+
+- **Component / unit:** `tests/{component}/…` mirroring `vllm_omni/{component}/`
+- **Model E2E:** `tests/e2e/online_serving/`, `tests/e2e/offline_inference/`, `tests/e2e/accuracy/`
+- **Feature integration:** `tests/e2e/features/<feature>/`
+- **Doc example tests:** `tests/examples/online_serving/`, `tests/examples/offline_inference/`
+- **Performance:** `tests/dfx/perf/tests/` (JSON configs; runners under `tests/dfx/perf/scripts/`)
+- **Stability:** `tests/dfx/stability/tests/`
+- **Reliability:** `tests/dfx/reliability/`
+- Do **not** add new top-level `tests/` directories unrelated to a component (or to `e2e` / `dfx` / `helpers` / `examples` / `buildkite`)
+
+Deploy YAMLs: `vllm_omni/deploy/` via `tests.helpers.stage_config.get_deploy_config_path` (see [stage configs](../../configuration/stage_configs.md)).
 
 ## Markers for Tests
 
@@ -373,13 +256,13 @@ L2 level testing builds upon L1 by introducing GPU resources and verifying that 
 
 #### 1.3 Test Directory and Execution Files
 
-A clear directory structure is key to managing test cases efficiently.
+A clear directory structure is key to managing test cases efficiently. See the **Test Dir** column in [Test System Overview](./test_system_overview.md) for the canonical placement rules.
 
--   ***L1 Test Directory***: `/tests/{component_name}/test_xxx.py`
--   -   Here, `{component_name}` corresponds to modules in the source code, such as `distributed`, `entrypoints`, etc., and `test_xxx.py` is the specific test file.
--   ***L2 Test Directory***:
--   -   Online Serving: `/tests/e2e/online_serving/test_{model_name}.py`
-    -   Offline Inference: `/tests/e2e/offline_inference/test_{model_name}.py`
+-   ***L1 (component / unit)***: `tests/{component_name}/…` mirroring `vllm_omni/{component_name}/` (e.g. `tests/diffusion/`, `tests/entrypoints/`). Do **not** invent new top-level `tests/` folders unrelated to a component.
+-   ***L2 (basic model E2E)***:
+    -   Online serving: `tests/e2e/online_serving/test_{model_name}.py`
+    -   Offline inference: `tests/e2e/offline_inference/test_{model_name}.py`
+-   ***Feature-level integration*** (cross-cutting, not a single-model smoke): `tests/e2e/features/<feature>/` (e.g. `fullduplex/`, `custom_pipeline/`, `rlhf_test/`).
 
 #### 1.4 Execution Method and Example
 
@@ -485,10 +368,12 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
 #### 2.3 Test Directory and Execution Files
 
--   ***Functional Testing***:
--   -   Online Serving: `/tests/e2e/online_serving/test_{model_name}_expansion.py`
-    -   Offline Inference: `/tests/e2e/offline_inference/test_{model_name}_expansion.py`
-    -   (Note: `_expansion.py` likely means it contains more comprehensive scenario cases compared to L2 tests).
+-   ***Functional / model E2E***:
+    -   Online serving: `tests/e2e/online_serving/test_{model_name}_expansion.py`
+    -   Offline inference: `tests/e2e/offline_inference/test_{model_name}_expansion.py`
+    -   Accuracy / similarity: `tests/e2e/accuracy/`
+    -   (`_expansion.py` holds broader scenario coverage than the L2 smoke file.)
+-   ***Feature-level integration***: `tests/e2e/features/<feature>/` (not under a new top-level `tests/` directory).
 
 #### 2.4 Execution Method and Example
 
