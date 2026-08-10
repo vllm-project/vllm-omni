@@ -30,7 +30,11 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.config.yaml_util import create_config
-from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+from vllm_omni.diffusion.utils.hf_utils import (
+    _looks_like_dreamzero,
+    _looks_like_skyreels_v3_a2v,
+    _looks_like_skyreels_v3_r2v,
+)
 
 logger = init_logger(__name__)
 
@@ -136,6 +140,11 @@ class StageConfigFactory:
         Returns:
             model_type as a string; may be None on failure.
         """
+        if _looks_like_skyreels_v3_r2v(model):
+            return "skyreels_v3_r2v"
+        if _looks_like_skyreels_v3_a2v(model):
+            return "skyreels_v3_a2v"
+
         model_type = cls._try_infer_model_type(
             model=model,
             trust_remote_code=trust_remote_code,

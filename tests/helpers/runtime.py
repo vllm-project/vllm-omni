@@ -2396,6 +2396,7 @@ class OpenAIClientHandler:
         files: dict[str, tuple[str, BytesIO, str]] = {}
         image_reference = request_config.get("image_reference")
         video_reference = request_config.get("video_reference")
+        audio_reference = request_config.get("audio_reference")
         if image_reference and video_reference:
             raise ValueError("Only one of image_reference or video_reference can be provided")
         if image_reference:
@@ -2416,6 +2417,8 @@ class OpenAIClientHandler:
                 files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
             else:
                 normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
+        if audio_reference:
+            normalized_form_data["audio_reference"] = json.dumps({"audio_url": audio_reference})
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")

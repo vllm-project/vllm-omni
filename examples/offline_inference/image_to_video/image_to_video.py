@@ -3,13 +3,14 @@
 
 """
 Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
-HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE.
+HunyuanVideo-1.5, Cosmos3, SkyReels V3 R2V, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- SkyReels V3 R2V: 1-4 reference images, text CFG + image CFG
 - Wan2.1 VACE: first/last-frame, inpainting, and reference conditioning
 
 Usage:
@@ -87,13 +88,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a video from one or more images "
-            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, "
+            "SkyReels V3 R2V/A2V, or Wan2.1 VACE)."
         )
     )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
+        help=(
+            "Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, "
+            "HunyuanVideo-1.5, Cosmos3, SkyReels V3 R2V/A2V, or Wan2.1 VACE)."
+        ),
     )
     parser.add_argument(
         "--model-class-name",
@@ -106,6 +111,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
+    parser.add_argument("--audio", help="Path to driving audio for audio-conditioned video models.")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
     parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
     parser.add_argument(
@@ -335,6 +341,12 @@ def main():
     is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
     is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
+    is_skyreels_r2v = "skyreels-v3-r2v" in model_name or model_class_name_lower == "skyreelsv3r2vpipeline"
+    is_skyreels_a2v = (
+        "skyreels-v3-a2v" in model_name
+        or "skyreels-v3-talkingavatar" in model_name
+        or model_class_name_lower == "skyreelsv3a2vpipeline"
+    )
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -345,6 +357,11 @@ def main():
     dimension_image = image or last_image or (reference_images[0] if reference_images else None)
     if dimension_image is None:
         raise ValueError("Provide --image, --last-image, or at least one --reference-image.")
+    if is_skyreels_a2v:
+        if image is None or args.audio is None:
+            raise ValueError("SkyReels V3 A2V requires both --image and --audio.")
+        if last_image is not None or mask_image is not None or reference_images is not None:
+            raise ValueError("SkyReels V3 A2V supports --image plus --audio only in this example.")
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
@@ -390,6 +407,26 @@ def main():
             512 * 768,
             32,
         )
+    elif is_skyreels_r2v:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            7.5,
+            105,
+            50,
+            5.0,
+            544 * 960,
+            16,
+        )
+    elif is_skyreels_a2v:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            25,
+            1.0,
+            81,
+            40,
+            11.0,
+            1280 * 720,
+            16,
+        )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
 
@@ -403,22 +440,31 @@ def main():
     # Calculate dimensions if not provided (model-aware max area).
     height = args.height
     width = args.width
-    if height is None or width is None:
+    if is_skyreels_a2v:
+        height = args.height
+        width = args.width
+    elif height is None or width is None:
         calc_height, calc_width = calculate_dimensions(dimension_image, max_area=d_max_area, mod_value=d_mod)
         height = height or calc_height
         width = width or calc_width
 
     media_inputs: dict[str, Any] = {}
     if image is not None:
-        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        media_inputs["image"] = (
+            image if is_skyreels_r2v or is_skyreels_a2v else image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        )
+    if args.audio is not None:
+        media_inputs["audio"] = args.audio
     if last_image is not None:
         media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if mask_image is not None:
         media_inputs["mask"] = mask_image.resize((width, height), PIL.Image.Resampling.NEAREST)
     if reference_images is not None:
-        media_inputs["reference_images"] = [
-            reference.resize((width, height), PIL.Image.Resampling.LANCZOS) for reference in reference_images
-        ]
+        media_inputs["reference_images"] = (
+            reference_images
+            if is_skyreels_r2v
+            else [reference.resize((width, height), PIL.Image.Resampling.LANCZOS) for reference in reference_images]
+        )
 
     # Configure cache based on backend type
     cache_config = None

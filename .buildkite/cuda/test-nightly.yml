@@ -417,7 +417,7 @@ steps:
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
-          - pytest -s -v tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_ltx2_expansion.py -m "full_model and cuda" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_ltx2_expansion.py tests/e2e/online_serving/test_skyreels_v3_a2v_expansion.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
@@ -454,10 +454,13 @@ steps:
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
             EXIT2=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_skyreels_v3_a2v_vllm_omni.json
+            EXIT3=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
-            exit $$EXIT2
+            if [ $$EXIT2 -ne 0 ]; then exit $$EXIT2; fi
+            exit $$EXIT3
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax-H3"

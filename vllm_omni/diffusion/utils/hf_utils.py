@@ -71,6 +71,46 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+def _looks_like_skyreels_v3_r2v(model_name: str) -> bool:
+    try:
+        tf_cfg = get_hf_file_to_dict("transformer/config.json", model_name) or {}
+        return tf_cfg.get("_class_name") == "SkyReelsC1WanI2v3DModel"
+    except Exception:
+        return False
+
+
+def _looks_like_skyreels_v3_a2v(model_name: str) -> bool:
+    name = str(model_name).rstrip("/")
+    lowered_name = name.lower()
+    if "skyreels-v3-a2v" in lowered_name or "skyreels-v3-talkingavatar" in lowered_name:
+        return True
+
+    if os.path.isdir(model_name):
+        required_files = [
+            "config.json",
+            "models_t5_umt5-xxl-enc-bf16.pth",
+            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            "Wan2.1_VAE.pth",
+        ]
+        required_dirs = ["google/umt5-xxl", "xlm-roberta-large", "chinese-wav2vec2-base"]
+        if all(os.path.exists(os.path.join(model_name, item)) for item in required_files) and all(
+            os.path.isdir(os.path.join(model_name, item)) for item in required_dirs
+        ):
+            return True
+
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name) or {}
+    except Exception:
+        return False
+
+    audio_fields = {"audio_window", "intermediate_dim", "context_tokens", "vae_scale"}
+    if not audio_fields.issubset(cfg):
+        return False
+    if cfg.get("model_type") not in (None, "i2v"):
+        return False
+    return cfg.get("dim") == 5120 and cfg.get("num_heads") == 40 and cfg.get("num_layers") == 40
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -118,4 +158,4 @@ def is_diffusion_model(model_name: str) -> bool:
         # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
         # but are still diffusion-style models in vllm-omni. Detect them via
         # config.json.
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_skyreels_v3_a2v(model_name)
