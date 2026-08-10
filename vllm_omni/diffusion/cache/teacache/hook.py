@@ -231,7 +231,9 @@ class TeaCacheHook(ModelHook):
         state.accumulated_rel_l1_distance += abs(rescaled_distance)
 
         # Decision: below threshold = cache, above = compute
-        if state.accumulated_rel_l1_distance < self.config.rel_l1_thresh:
+        rel_l1_thresh = self.config.rel_l1_thresh
+        assert rel_l1_thresh is not None
+        if state.accumulated_rel_l1_distance < rel_l1_thresh:
             return False  # Use cache
         else:
             state.accumulated_rel_l1_distance = 0.0  # Reset accumulator

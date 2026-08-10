@@ -46,6 +46,8 @@ def apply_rotary_emb_mindiesd(
 ) -> torch.Tensor:
     from mindiesd import rotary_position_embedding
 
+    x, squeezed = _ensure_batch_dim(x)
+
     if cos.dim() == 3:
         # (B, S, D/2) -> (S, D/2)
         cos = cos[0]
@@ -57,13 +59,14 @@ def apply_rotary_emb_mindiesd(
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+    return _restore_batch_dim(out, squeezed)
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:

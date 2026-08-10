@@ -310,14 +310,16 @@ class DiffusionEngine:
         diffusion_engine_start_time = time.perf_counter()
 
         preprocess_time = 0.0
-        if self.pre_process_func is not None:
-            preprocess_start_time = time.perf_counter()
-            request = self.pre_process_func(request)
+        has_preprocessor = getattr(self, "pre_process_func", None) is not None
+        preprocess_start_time = time.perf_counter() if has_preprocessor else None
+        request = self._prepare_request_for_admission(request)
+        if preprocess_start_time is not None:
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
-        generator = self.async_add_req_and_stream_response(request)
+        request_id = self._add_prepared_request(request)
+        generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
             # Async mode: wait for background D2H/SHM to complete.
@@ -689,7 +691,17 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
-    def add_request(self, request: OmniDiffusionRequest) -> str:
+    def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        """Run model-owned preprocessing once, before entering Engine locks."""
+
+        pre_process_func = getattr(self, "pre_process_func", None)
+        if pre_process_func is None:
+            return request
+        return pre_process_func(request)
+
+    def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
+        """Admit a request whose model-owned preprocessing is complete."""
+
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -699,6 +711,10 @@ class DiffusionEngine:
             self._cv.notify_all()
 
         return request_id
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        request = self._prepare_request_for_admission(request)
+        return self._add_prepared_request(request)
 
     async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
         with self._cv:
@@ -742,6 +758,7 @@ class DiffusionEngine:
         return final_output
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -886,8 +903,7 @@ class DiffusionEngine:
             ),
         )
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 

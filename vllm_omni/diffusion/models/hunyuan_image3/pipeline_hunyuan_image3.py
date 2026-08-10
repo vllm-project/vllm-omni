@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
+from . import request_layout as request_layout_utils
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput, TokenizerWrapper
 from .hunyuan_image3_transformer import (
     CausalMMOutputWithPast,
@@ -50,7 +52,7 @@ from .hunyuan_image3_transformer import (
     real_batched_index_select,
     retrieve_timesteps,
 )
-from .system_prompt import get_system_prompt
+from .request_layout import HunyuanPreparedLayout
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -146,12 +148,6 @@ def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_hei
     return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
-def _to_python_scalar(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
 def _shift_full_attn_spans(
     spans: list[tuple[int, int]],
     prefix_len: int | None,
@@ -165,80 +161,12 @@ def _shift_full_attn_spans(
     return [(start + shift, end + shift) if start >= prefix_len else (start, end) for start, end in spans]
 
 
-def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
-    return {
-        "image_type": image_info.image_type,
-        "image_tensor": image_info.image_tensor,
-        "image_width": _to_python_scalar(image_info.image_width),
-        "image_height": _to_python_scalar(image_info.image_height),
-        "token_width": _to_python_scalar(image_info.token_width),
-        "token_height": _to_python_scalar(image_info.token_height),
-        "image_token_length": _to_python_scalar(image_info.image_token_length),
-        "base_size": _to_python_scalar(image_info.base_size),
-        "ratio_index": _to_python_scalar(image_info.ratio_index),
-        "add_timestep_token": image_info.add_timestep_token,
-        "add_guidance_token": image_info.add_guidance_token,
-        "use_front_boi_token": image_info.use_front_boi_token,
-        "add_image_shape_token": image_info.add_image_shape_token,
-    }
-
-
-def _to_tensor_if_needed(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, list):
-        return torch.tensor(value)
-    return value
-
-
-def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
-    return ImageInfo(
-        image_type=payload.get("image_type"),
-        image_tensor=_to_tensor_if_needed(payload.get("image_tensor")),
-        image_width=payload.get("image_width"),
-        image_height=payload.get("image_height"),
-        token_width=payload.get("token_width"),
-        token_height=payload.get("token_height"),
-        image_token_length=payload.get("image_token_length"),
-        base_size=payload.get("base_size"),
-        ratio_index=payload.get("ratio_index"),
-        add_timestep_token=payload.get("add_timestep_token", True),
-        add_guidance_token=payload.get("add_guidance_token", False),
-        use_front_boi_token=payload.get("use_front_boi_token", True),
-        add_image_shape_token=payload.get("add_image_shape_token", True),
-    )
-
-
-def _joint_image_info_to_payload(joint_image_info: JointImageInfo) -> dict[str, Any]:
-    return {
-        "type": "joint_image_info",
-        "vae_image_info": _image_info_to_payload(joint_image_info.vae_image_info),
-        "vision_image_info": _image_info_to_payload(joint_image_info.vision_image_info),
-        "vision_encoder_kwargs": joint_image_info.vision_encoder_kwargs,
-    }
-
-
-def _joint_image_info_from_payload(payload: Any) -> JointImageInfo:
-    if isinstance(payload, JointImageInfo):
-        return payload
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected dict or JointImageInfo for conditional image payload, got {type(payload)}.")
-
-    vae_image_info = _image_info_from_payload(payload["vae_image_info"])
-    vision_image_info = _image_info_from_payload(payload["vision_image_info"])
-    vision_encoder_kwargs = payload.get("vision_encoder_kwargs") or {}
-    if isinstance(vision_encoder_kwargs, dict):
-        vision_encoder_kwargs = {key: _to_tensor_if_needed(value) for key, value in vision_encoder_kwargs.items()}
-    return JointImageInfo(
-        vae_image_info=vae_image_info,
-        vision_image_info=vision_image_info,
-        vision_encoder_kwargs=vision_encoder_kwargs,
-    )
-
-
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
     hf_config = get_config(od_config.model, trust_remote_code=True)
     image_processor = HunyuanImage3ImageProcessor(hf_config)
+    prepare_diffusion_kv_layout = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+    tokenizer_wrapper = TokenizerWrapper(od_config.model) if prepare_diffusion_kv_layout else None
+    generation_config = GenerationConfig.from_pretrained(od_config.model) if prepare_diffusion_kv_layout else None
     vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
     vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
     vit_patch_size = getattr(image_processor.vision_encoder_processor, "patch_size", 1)
@@ -291,7 +219,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             image_token_length=int(vit_tensor.shape[1]),
         )
 
-        return _joint_image_info_to_payload(
+        return request_layout_utils.joint_image_info_to_payload(
             JointImageInfo(
                 vae_image_info=vae_info,
                 vision_image_info=vit_info,
@@ -329,6 +257,20 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 request.sampling_params.height = int(bridge_h or first_image_h)
 
         request.prompt = prompt
+        if prepare_diffusion_kv_layout:
+            assert tokenizer_wrapper is not None and generation_config is not None
+            prepared_layout = request_layout_utils.prepare_hunyuan_layout(
+                request,
+                tokenizer_wrapper=tokenizer_wrapper,
+                image_processor=image_processor,
+                generation_config=generation_config,
+                image_base_size=hf_config.image_base_size,
+            )
+            request.prepared_layout = prepared_layout
+            request.diffusion_kv_requests = request_layout_utils.build_hunyuan_diffusion_kv_requests(
+                request,
+                prepared_layout,
+            )
 
         return request
 
@@ -542,94 +484,6 @@ class HunyuanImage3Pipeline(
             raise ValueError("HunyuanImage3 step execution does not support diffusion cache backends yet.")
         if getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None):
             raise ValueError("HunyuanImage3 step execution does not support diffusion KV cache step skips yet.")
-
-    @staticmethod
-    def _normalize_single_stage_bot_task(bot_task: Any) -> str:
-        if isinstance(bot_task, str) and bot_task.lower() == "none":
-            bot_task = None
-        tokenizer_bot_task = bot_task
-        if tokenizer_bot_task == "think_recaption":
-            tokenizer_bot_task = "think"
-        elif tokenizer_bot_task == "vanilla":
-            tokenizer_bot_task = "image"
-        supported_bot_tasks = {"auto", "image", "think", "recaption", "img_ratio"}
-        if tokenizer_bot_task is not None and tokenizer_bot_task not in supported_bot_tasks:
-            raise ValueError(
-                f"Unsupported HunyuanImage3 single-stage bot_task: {tokenizer_bot_task!r}. "
-                f"Supported values are: {sorted(supported_bot_tasks)}."
-            )
-        return tokenizer_bot_task or "auto"
-
-    def _extract_prompt_inputs(
-        self,
-        prompts: list[Any],
-        extra_args: dict[str, Any],
-        *,
-        request_id: str,
-        allow_cond_image: bool,
-    ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
-        is_dummy_warmup = OmniDiffusionRequest.is_dummy_run_request_id(request_id)
-        bot_task = extra_args.get("bot_task")
-        use_system_prompt = extra_args.get("use_system_prompt")
-        system_prompt = extra_args.get("system_prompt")
-
-        first_prompt = prompts[0] if prompts else None
-        if isinstance(first_prompt, dict):
-            if bot_task is None:
-                bot_task = first_prompt.get("bot_task")
-            if use_system_prompt is None:
-                use_system_prompt = first_prompt.get("use_system_prompt")
-            if system_prompt is None:
-                system_prompt = first_prompt.get("system_prompt")
-        tokenizer_bot_task = self._normalize_single_stage_bot_task(bot_task)
-        if use_system_prompt is not None:
-            system_prompt_bot_task = "image" if tokenizer_bot_task == "auto" else tokenizer_bot_task
-            system_prompt = get_system_prompt(use_system_prompt, system_prompt_bot_task, system_prompt)
-            system_prompt = system_prompt.strip() if system_prompt is not None else ""
-
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts]
-        cot_text_list = [
-            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in prompts
-        ]
-
-        batch_cond_image_info: list[list[JointImageInfo]] | None = None
-        if any(not isinstance(p, str) for p in prompts):
-            batch_cond_image_info = []
-            for prompt_item in prompts:
-                if isinstance(prompt_item, str):
-                    batch_cond_image_info.append([])
-                    continue
-                additional_info = prompt_item.get("additional_information") or {}
-                cond_infos = additional_info.get("batch_cond_image_info", [])
-                if isinstance(cond_infos, JointImageInfo | dict):
-                    cond_infos = [cond_infos]
-                if cond_infos is None:
-                    cond_infos = []
-                batch_cond_image_info.append([_joint_image_info_from_payload(item) for item in cond_infos])
-
-            has_cond_image = [len(cond_infos) > 0 for cond_infos in batch_cond_image_info]
-            if any(has_cond_image) and (not allow_cond_image) and not is_dummy_warmup:
-                raise ValueError("HunyuanImage3 step execution does not support image editing requests yet.")
-            if allow_cond_image and any(has_cond_image) and not all(has_cond_image):
-                raise ValueError(
-                    "When batching Hunyuan image editing requests, every prompt must include input image(s)."
-                )
-            if not allow_cond_image or not any(has_cond_image):
-                batch_cond_image_info = None
-
-        return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task
-
-    def _extract_step_prompt_inputs(
-        self,
-        state: "StepRequestState",
-    ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
-        sampling = state.sampling
-        return self._extract_prompt_inputs(
-            [state.prompt] if state.prompt is not None else [],
-            getattr(sampling, "extra_args", {}) or {},
-            request_id=state.request_id,
-            allow_cond_image=False,
-        )
 
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
@@ -1081,27 +935,6 @@ class HunyuanImage3Pipeline(
         pred = self.final_layer(image_output, timestep_emb, token_h, token_w)
         return pred
 
-    @staticmethod
-    def build_batch_rope_image_info(output, sections):
-        rope_image_info = []
-        for image_slices, sections_i in zip(output.all_image_slices, sections):
-            image_shapes = []
-            for section in sections_i:
-                if "image" in section["type"]:
-                    if isinstance(section["token_height"], list):
-                        assert len(section["token_height"]) == len(section["token_width"]), (
-                            f"token_height and token_width should have the same length, "
-                            f"but got {len(section['token_height'])} and {len(section['token_width'])}"
-                        )
-                        image_shapes.extend(list(zip(section["token_height"], section["token_width"])))
-                    else:
-                        image_shapes.append((section["token_height"], section["token_width"]))
-            assert len(image_slices) == len(image_shapes), (
-                f"Size miss matching: Image slices({len(image_slices)}) != image shapes({len(image_shapes)})"
-            )
-            rope_image_info.append(list(zip(image_slices, image_shapes)))
-        return rope_image_info
-
     def vae_encode(self, image, cfg_factor=1, generator=None):
         config = self.vae.config
 
@@ -1210,26 +1043,6 @@ class HunyuanImage3Pipeline(
                     f"Each message should be a list of dicts or a dict, but got {type(message)}."
                 )
 
-    @staticmethod
-    def _normalize_cot_text(cot: str | None) -> str | None:
-        """
-        Ensure cot_text starts with the appropriate opening tag.
-
-        AR-generated text may omit the leading <think> or <recaption> tag
-        (since it was used as a generation trigger). This normalizes the text
-        so downstream parsing in get_cot_sections works correctly.
-        """
-        if not cot:
-            return cot
-
-        if "</think>" in cot and not cot.startswith("<think>"):
-            cot = "<think>" + cot
-            return cot
-        if "</recaption>" in cot and not cot.startswith("<recaption>"):
-            cot = "<recaption>" + cot
-            return cot
-        return cot
-
     def prepare_model_inputs(
         self,
         prompt=None,
@@ -1242,6 +1055,7 @@ class HunyuanImage3Pipeline(
         message_list=None,
         device=None,
         max_new_tokens=None,
+        prepared_layout: HunyuanPreparedLayout | None = None,
         **kwargs,
     ):
         # 1. Sanity check
@@ -1297,7 +1111,16 @@ class HunyuanImage3Pipeline(
                     )
 
             if mode == "gen_image":
-                batch_gen_image_info = [self.image_processor.build_image_info(image_size) for _ in range(batch_size)]
+                if prepared_layout is not None:
+                    # TODO: Support batch_size > 1 once prepared layouts can
+                    # preserve the public-request-to-CFG-branch mapping.
+                    if batch_size != 1:
+                        raise ValueError("Hunyuan prepared layout currently supports one public request at a time.")
+                    batch_gen_image_info = [prepared_layout.generated_image_info]
+                else:
+                    batch_gen_image_info = [
+                        self.image_processor.build_image_info(image_size) for _ in range(batch_size)
+                    ]
 
             if batch_cond_image_info is not None:
                 assert isinstance(batch_cond_image_info, list) and len(batch_cond_image_info) == batch_size, (
@@ -1314,30 +1137,41 @@ class HunyuanImage3Pipeline(
         # 3. apply chat template
         cfg_factor = {"gen_text": 1, "gen_image": 1 + int(guidance_scale > 1.0)}
         bot_task = kwargs.pop("bot_task", "auto")
-        # If `drop_think` enabled, always drop <think> parts in the context.
-        drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
-        # Pull sequence_template from the model's generation_config so the DiT
-        # text prefix matches how the model was trained (Instruct for the
-        # HunyuanImage-3.0-Instruct checkpoint).  Falling back to "pretrain"
-        # only if the config does not specify it.
-        sequence_template = getattr(self.generation_config, "sequence_template", "pretrain")
-        # Apply batched prompt or batched message_list to build input sequence with associated info.
-        out = self._tkwrapper.apply_chat_template(
-            batch_prompt=batch_prompt,
-            batch_message_list=batch_message_list,
-            mode=mode,
-            batch_gen_image_info=batch_gen_image_info,
-            batch_cond_image_info=batch_cond_image_info,
-            batch_system_prompt=batch_system_prompt,
-            batch_cot_text=batch_cot_text,
-            max_length=kwargs.get("max_length"),
-            bot_task=bot_task,
-            image_base_size=self.config.image_base_size,
-            sequence_template=sequence_template,
-            cfg_factor=cfg_factor[mode],
-            drop_think=drop_think,
-        )
-        output, sections = out["output"], out["sections"]
+        if prepared_layout is None:
+            # Pull template options from generation_config only when the
+            # Worker must tokenize locally.
+            drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
+            sequence_template = getattr(self.generation_config, "sequence_template", "pretrain")
+            # Apply batched prompt or batched message_list to build input
+            # sequence with associated info.
+            out = self._tkwrapper.apply_chat_template(
+                batch_prompt=batch_prompt,
+                batch_message_list=batch_message_list,
+                mode=mode,
+                batch_gen_image_info=batch_gen_image_info,
+                batch_cond_image_info=batch_cond_image_info,
+                batch_system_prompt=batch_system_prompt,
+                batch_cot_text=batch_cot_text,
+                max_length=kwargs.get("max_length"),
+                bot_task=bot_task,
+                image_base_size=self.config.image_base_size,
+                sequence_template=sequence_template,
+                cfg_factor=cfg_factor[mode],
+                drop_think=drop_think,
+            )
+            output = out["output"]
+            rope_image_info = request_layout_utils.build_hunyuan_batch_rope_image_info(output, out["sections"])
+        else:
+            if mode != "gen_image" or batch_message_list is not None:
+                raise ValueError("Hunyuan prepared layout only supports prompt-based gen_image execution.")
+            output = prepared_layout.tokenizer_output
+            rope_image_info = prepared_layout.rope_image_info
+            expected_rows = batch_size * cfg_factor[mode]
+            if prepared_layout.num_branches != expected_rows:
+                raise ValueError(
+                    "Hunyuan prepared branches do not match execution CFG layout: "
+                    f"expected_rows={expected_rows}, prepared_branches={prepared_layout.num_branches}"
+                )
 
         # 4. Encode conditional images
         # Skip encoding if AR KV reuse is enabled
@@ -1362,7 +1196,6 @@ class HunyuanImage3Pipeline(
             vit_kwargs = None
 
         # 5. Build position embeddings
-        rope_image_info = self.build_batch_rope_image_info(output, sections)
         if mode == "gen_text":
             seq_len = self.generation_config.max_length
         else:
@@ -1616,12 +1449,7 @@ class HunyuanImage3Pipeline(
                 raise ValueError("`batch_gen_image_info` should be provided when `mode` is `gen_image`.")
 
             image_info: ImageInfo = batch_gen_image_info[0]
-            num_image_tokens = (
-                image_info.image_token_length
-                + (1 if image_info.add_timestep_token else 0)
-                + (1 if image_info.add_guidance_token else 0)
-            )
-            kwargs["num_image_tokens"] = num_image_tokens
+            kwargs["num_image_tokens"] = request_layout_utils.hunyuan_num_image_tokens(image_info)
             # 50 and 5.0 hard code
             results = self.pipeline(
                 batch_size=len(batch_gen_image_info),
@@ -1888,9 +1716,14 @@ class HunyuanImage3Pipeline(
             system_prompt,
             batch_cond_image_info,
             tokenizer_bot_task,
-        ) = self._extract_step_prompt_inputs(state)
+        ) = request_layout_utils.extract_hunyuan_prompt_inputs(
+            [state.prompt] if state.prompt is not None else [],
+            getattr(sampling, "extra_args", {}) or {},
+            request_id=state.request_id,
+            allow_cond_image=False,
+        )
         cot_text = (
-            [self._normalize_cot_text(text) for text in cot_text_list]
+            [request_layout_utils.normalize_hunyuan_cot_text(text) for text in cot_text_list]
             if any(text is not None for text in cot_text_list)
             else None
         )
@@ -1899,7 +1732,7 @@ class HunyuanImage3Pipeline(
         width = sampling.width or 1024
         image_size = (height, width)
         num_inference_steps = sampling.num_inference_steps or 50
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        guidance_scale = request_layout_utils.resolve_hunyuan_guidance_scale(sampling)
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 step execution runs without classifier-free guidance.")
         pipe._guidance_scale = guidance_scale
@@ -1916,6 +1749,7 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
+            prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(state),
         )
         model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
         model_kwargs["use_cache"] = False
@@ -1923,14 +1757,9 @@ class HunyuanImage3Pipeline(
         input_ids = model_kwargs.pop("input_ids")
         batch_gen_image_info: list[ImageInfo] = model_kwargs["batch_gen_image_info"]
         image_info = batch_gen_image_info[0]
-        target_height = int(_to_python_scalar(image_info.image_height))
-        target_width = int(_to_python_scalar(image_info.image_width))
-        num_image_tokens = (
-            image_info.image_token_length
-            + (1 if image_info.add_timestep_token else 0)
-            + (1 if image_info.add_guidance_token else 0)
-        )
-        model_kwargs["num_image_tokens"] = num_image_tokens
+        target_height = int(image_info.image_height)
+        target_width = int(image_info.image_width)
+        model_kwargs["num_image_tokens"] = request_layout_utils.hunyuan_num_image_tokens(image_info)
 
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
@@ -2294,7 +2123,7 @@ class HunyuanImage3Pipeline(
             system_prompt,
             batch_cond_image_info,
             tokenizer_bot_task,
-        ) = self._extract_prompt_inputs(
+        ) = request_layout_utils.extract_hunyuan_prompt_inputs(
             req.prompts,
             extra_args,
             request_id=req.request_id,
@@ -2302,15 +2131,16 @@ class HunyuanImage3Pipeline(
         )
         prompt = prompt_from_req or prompt
         cot_text = (
-            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
+            [request_layout_utils.normalize_hunyuan_cot_text(t) for t in cot_text_list]
+            if any(t is not None for t in cot_text_list)
+            else None
         )
 
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        guidance_scale = request_layout_utils.resolve_hunyuan_guidance_scale(req.sampling_params, guidance_scale)
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
@@ -2329,6 +2159,7 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
+            prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
             **ar_kv_kwargs,
         )
 

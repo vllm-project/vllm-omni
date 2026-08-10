@@ -220,6 +220,25 @@ def _make_compile_runner(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_update_states_carries_prepared_layout() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    request = _make_request()
+    prepared_layout = object()
+    request.prepared_layout = prepared_layout
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert new_request_ids == [request.request_id]
+    assert states[0].prepared_layout is prepared_layout
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("use_hsdp", [False, True])
 def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
     runner = _make_compile_runner(use_hsdp=use_hsdp)

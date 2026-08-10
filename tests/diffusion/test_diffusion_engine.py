@@ -108,6 +108,17 @@ class MockScheduler:
         pass
 
 
+def _make_admission_engine(pre_process_func) -> DiffusionEngine:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = MockScheduler()
+    engine.pre_process_func = pre_process_func
+    engine._out_streams = {}
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._closed = False
+    return engine
+
+
 class _BatchCapablePipeline:
     supports_request_batch = True
 
@@ -681,6 +692,34 @@ async def _consume_final_output(generator):
     if final_output is None:
         raise RuntimeError("Diffusion execution finished without output.")
     return final_output
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
+def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
+    raw_request = OmniDiffusionRequest(
+        prompt="raw",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="admission",
+    )
+    prepared_request = OmniDiffusionRequest(
+        prompt="prepared",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="admission",
+        prepared_layout=object(),
+    )
+    preprocess_calls = []
+
+    def preprocess(request):
+        preprocess_calls.append(request)
+        return prepared_request
+
+    engine = _make_admission_engine(preprocess)
+
+    getattr(engine, entrypoint)(raw_request)
+
+    assert preprocess_calls == [raw_request]
+    assert engine.scheduler._waiting_queue == [prepared_request]
 
 
 @pytest.mark.cpu
