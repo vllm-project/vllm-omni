@@ -13,7 +13,6 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
@@ -23,6 +22,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import (
@@ -193,15 +194,6 @@ def _transformer_autocast(device: torch.device, transformer_dtype: torch.dtype):
     return torch.autocast(device_type="cuda", dtype=transformer_dtype)
 
 
-def _group_global_rank(group: Any | None, group_rank: int) -> int:
-    if group is None:
-        return group_rank
-    get_global_rank = getattr(dist, "get_global_rank", None)
-    if get_global_rank is None:
-        return group_rank
-    return int(get_global_rank(group, group_rank))
-
-
 def _validate_low_noise_sigmas(sigmas: np.ndarray, threshold: float | None = None) -> np.ndarray:
     arr = np.asarray(list(sigmas), dtype=np.float64)
     if arr.ndim != 1 or arr.size == 0:
@@ -260,8 +252,6 @@ class LingBotStageCondition:
     negative_prompt_embeds: torch.Tensor | None
     negative_prompt_mask: torch.Tensor | None
     image_condition: LingBotImageCondition | None
-    cfg_parallel_group: Any | None
-    cfg_parallel_rank: int
     clean_prefix: torch.Tensor | None = None
 
 
@@ -411,6 +401,7 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 
 class LingBotVideoPipeline(
     nn.Module,
+    CFGParallelMixin,
     SupportImageInput,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
@@ -733,6 +724,17 @@ class LingBotVideoPipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
 
+    def predict_noise(
+        self,
+        *,
+        transformer: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        stage_transformer = transformer or self.transformer
+        transformer_dtype = _module_dtype(stage_transformer)
+        with _transformer_autocast(self.device, transformer_dtype):
+            return stage_transformer(**kwargs)[0].float()
+
     @staticmethod
     def check_inputs(height: int, width: int, num_frames: int) -> None:
         if num_frames != 1 and (num_frames - 1) % 4 != 0:
@@ -962,7 +964,6 @@ class LingBotVideoPipeline(
         prompt_mask: torch.Tensor | None,
         negative_prompt_embeds: torch.Tensor | None,
         negative_prompt_mask: torch.Tensor | None,
-        cfg_parallel_group: Any | None,
         batch_cfg: bool,
         null_cond_clone_zero: bool,
     ) -> LingBotStageCondition:
@@ -985,19 +986,11 @@ class LingBotVideoPipeline(
         elif input_image is not None:
             raise ValueError(f"LingBot {mode.value} generation does not accept an input image.")
 
-        cfg_parallel = cfg_parallel_group is not None
-        cfg_parallel_rank = 0
-        if cfg_parallel:
-            if not dist.is_available() or not dist.is_initialized():
-                raise ValueError("`cfg_parallel_group` requires an initialized process group.")
-            if batch_cfg:
-                raise ValueError("`cfg_parallel_group` and `batch_cfg` are mutually exclusive.")
-            if not do_cfg:
-                raise ValueError("CFG parallel requires `guidance_scale > 1.0`.")
-            cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
-            cfg_parallel_world_size = dist.get_world_size(cfg_parallel_group)
-            if cfg_parallel_world_size != 2:
-                raise ValueError(f"CFG parallel currently requires exactly 2 ranks, got {cfg_parallel_world_size}.")
+        cfg_parallel_size = get_classifier_free_guidance_world_size()
+        if cfg_parallel_size not in {1, 2}:
+            raise ValueError(f"LingBot CFG parallel requires exactly 2 ranks, got {cfg_parallel_size}.")
+        if cfg_parallel_size > 1 and batch_cfg:
+            raise ValueError("CFG parallel and `batch_cfg` are mutually exclusive.")
 
         if prompt_embeds is not None:
             if prompt_mask is None:
@@ -1012,8 +1005,17 @@ class LingBotVideoPipeline(
 
         negative_embeds = None
         negative_mask = None
-        if cfg_parallel and cfg_parallel_rank == 1:
-            if negative_prompt_embeds is not None:
+        if prompt_embeds is None:
+            prompt_embeds, prompt_mask = self.encode_prompt(
+                prompt,
+                images=prompt_images,
+                device=device,
+            )
+        if do_cfg:
+            if null_cond_clone_zero:
+                negative_embeds = torch.zeros_like(prompt_embeds)
+                negative_mask = prompt_mask.clone()
+            elif negative_prompt_embeds is not None:
                 negative_embeds, negative_mask = negative_prompt_embeds, negative_prompt_mask
             else:
                 negative_embeds, negative_mask = self.encode_prompt(
@@ -1021,26 +1023,6 @@ class LingBotVideoPipeline(
                     images=prompt_images,
                     device=device,
                 )
-            prompt_embeds = prompt_mask = None
-        else:
-            if prompt_embeds is None:
-                prompt_embeds, prompt_mask = self.encode_prompt(
-                    prompt,
-                    images=prompt_images,
-                    device=device,
-                )
-            if do_cfg and not cfg_parallel:
-                if null_cond_clone_zero:
-                    negative_embeds = torch.zeros_like(prompt_embeds)
-                    negative_mask = prompt_mask.clone()
-                elif negative_prompt_embeds is not None:
-                    negative_embeds, negative_mask = negative_prompt_embeds, negative_prompt_mask
-                else:
-                    negative_embeds, negative_mask = self.encode_prompt(
-                        negative_prompt,
-                        images=prompt_images,
-                        device=device,
-                    )
 
         return LingBotStageCondition(
             prompt_embeds=prompt_embeds,
@@ -1048,8 +1030,6 @@ class LingBotVideoPipeline(
             negative_prompt_embeds=negative_embeds,
             negative_prompt_mask=negative_mask,
             image_condition=image_condition,
-            cfg_parallel_group=cfg_parallel_group,
-            cfg_parallel_rank=cfg_parallel_rank,
             clean_prefix=(image_condition.clean_latent if image_condition is not None else None),
         )
 
@@ -1116,109 +1096,75 @@ class LingBotVideoPipeline(
         condition: LingBotStageCondition,
         settings: LingBotStageSettings,
     ) -> torch.Tensor:
-        device = self.device
         transformer_dtype = _module_dtype(transformer)
-        cfg_parallel = condition.cfg_parallel_group is not None
         do_cfg = settings.guidance_scale > 1.0
-        cfg_latent_src = _group_global_rank(condition.cfg_parallel_group, 0)
-        cfg_uncond_src = _group_global_rank(condition.cfg_parallel_group, 1)
 
         for timestep in self.progress_bar(scheduler.timesteps):
-            if cfg_parallel:
-                dist.broadcast(latents, src=cfg_latent_src, group=condition.cfg_parallel_group)
-            timestep_batch = _transformer_timestep(timestep, transformer_dtype).expand(1).to(device)
-            if cfg_parallel:
-                if condition.cfg_parallel_rank == 0:
-                    branch_embeds = condition.prompt_embeds
-                    branch_mask = condition.prompt_mask
-                else:
-                    branch_embeds = condition.negative_prompt_embeds
-                    branch_mask = condition.negative_prompt_mask
-                if branch_embeds is None:
-                    raise RuntimeError("CFG branch embeddings were not initialized.")
-                with _transformer_autocast(device, transformer_dtype):
-                    branch_noise_pred = transformer(
-                        latents,
-                        timestep_batch,
-                        branch_embeds.to(transformer_dtype),
-                        encoder_attention_mask=branch_mask,
-                        return_dict=False,
-                    )[0].float()
-                if condition.cfg_parallel_rank == 0:
-                    noise_pred = branch_noise_pred
-                    noise_pred_uncond = torch.empty_like(noise_pred)
-                else:
-                    noise_pred_uncond = branch_noise_pred
-                dist.broadcast(noise_pred_uncond, src=cfg_uncond_src, group=condition.cfg_parallel_group)
-                if condition.cfg_parallel_rank != 0:
-                    continue
+            timestep_batch = _transformer_timestep(timestep, transformer_dtype).expand(1).to(self.device)
+            if condition.prompt_embeds is None or condition.prompt_mask is None:
+                raise RuntimeError("Prompt embeddings were not initialized.")
+            prompt_model_input = condition.prompt_embeds.to(transformer_dtype)
+            if do_cfg and settings.batch_cfg:
+                if condition.negative_prompt_embeds is None or condition.negative_prompt_mask is None:
+                    raise RuntimeError("Negative embeddings were not initialized for CFG.")
+                cfg_embeds, cfg_mask = _batch_cfg_prompt_inputs(
+                    prompt_model_input,
+                    condition.prompt_mask,
+                    condition.negative_prompt_embeds.to(transformer_dtype),
+                    condition.negative_prompt_mask,
+                    null_cond_clone_zero=False,
+                )
+                noise_batched = self.predict_noise(
+                    transformer=transformer,
+                    hidden_states=torch.cat([latents, latents], dim=0),
+                    timestep=torch.cat([timestep_batch, timestep_batch], dim=0),
+                    encoder_hidden_states=cfg_embeds,
+                    encoder_attention_mask=cfg_mask,
+                    return_dict=False,
+                )
+                noise_pred, noise_pred_uncond = noise_batched.chunk(2, dim=0)
                 noise_pred = noise_pred_uncond + settings.guidance_scale * (noise_pred - noise_pred_uncond)
             else:
-                if condition.prompt_embeds is None:
-                    raise RuntimeError("Prompt embeddings were not initialized.")
-                prompt_model_input = condition.prompt_embeds.to(transformer_dtype)
-                if do_cfg and settings.batch_cfg:
+                positive_kwargs: dict[str, Any] = {
+                    "transformer": transformer,
+                    "hidden_states": latents,
+                    "timestep": timestep_batch,
+                    "encoder_hidden_states": prompt_model_input,
+                    "encoder_attention_mask": condition.prompt_mask,
+                    "return_dict": False,
+                }
+                if do_cfg:
                     if condition.negative_prompt_embeds is None or condition.negative_prompt_mask is None:
                         raise RuntimeError("Negative embeddings were not initialized for CFG.")
-                    cfg_embeds, cfg_mask = _batch_cfg_prompt_inputs(
-                        prompt_model_input,
-                        condition.prompt_mask,
-                        condition.negative_prompt_embeds.to(transformer_dtype),
-                        condition.negative_prompt_mask,
-                        null_cond_clone_zero=False,
-                    )
-                    cfg_latents = torch.cat([latents, latents], dim=0)
-                    cfg_timesteps = torch.cat([timestep_batch, timestep_batch], dim=0)
-                    with _transformer_autocast(device, transformer_dtype):
-                        noise_batched = transformer(
-                            cfg_latents,
-                            cfg_timesteps,
-                            cfg_embeds,
-                            encoder_attention_mask=cfg_mask,
-                            return_dict=False,
-                        )[0].float()
-                    noise_pred, noise_pred_uncond = noise_batched.chunk(2, dim=0)
-                    noise_pred = noise_pred_uncond + settings.guidance_scale * (noise_pred - noise_pred_uncond)
+                    negative_kwargs: dict[str, Any] | None = {
+                        "transformer": transformer,
+                        "hidden_states": latents,
+                        "timestep": timestep_batch,
+                        "encoder_hidden_states": condition.negative_prompt_embeds.to(transformer_dtype),
+                        "encoder_attention_mask": condition.negative_prompt_mask,
+                        "return_dict": False,
+                    }
                 else:
-                    with _transformer_autocast(device, transformer_dtype):
-                        noise_pred = transformer(
-                            latents,
-                            timestep_batch,
-                            prompt_model_input,
-                            encoder_attention_mask=condition.prompt_mask,
-                            return_dict=False,
-                        )[0].float()
+                    negative_kwargs = None
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_cfg,
+                    true_cfg_scale=settings.guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
 
-                if do_cfg and not settings.batch_cfg:
-                    if condition.negative_prompt_embeds is None or condition.negative_prompt_mask is None:
-                        raise RuntimeError("Negative embeddings were not initialized for CFG.")
-                    with _transformer_autocast(device, transformer_dtype):
-                        noise_pred_uncond = transformer(
-                            latents,
-                            timestep_batch,
-                            condition.negative_prompt_embeds.to(transformer_dtype),
-                            encoder_attention_mask=condition.negative_prompt_mask,
-                            return_dict=False,
-                        )[0].float()
-                    noise_pred = noise_pred_uncond + settings.guidance_scale * (noise_pred - noise_pred_uncond)
-
-            latents = scheduler.step(
+            latents = self.scheduler_step_maybe_with_cfg(
                 noise_pred,
                 timestep,
                 latents,
-                return_dict=False,
+                do_cfg,
+                per_request_scheduler=scheduler,
                 generator=generator,
-            )[0]
+            )
             if condition.clean_prefix is not None:
                 latents = apply_clean_prefix(latents, condition.clean_prefix)
 
-        if cfg_parallel:
-            dist.broadcast(
-                latents,
-                src=cfg_latent_src,
-                group=condition.cfg_parallel_group,
-            )
-            dist.barrier(group=condition.cfg_parallel_group)
         return latents
 
     @torch.no_grad()
@@ -1299,24 +1245,16 @@ class LingBotVideoPipeline(
         mode: LingBotGenerationMode,
         base_condition: LingBotStageCondition,
         guidance_scale: float,
-        cfg_parallel_group: Any | None,
         options: LingBotRefinerOptions,
         clean_prefix: torch.Tensor | None,
     ) -> LingBotStageCondition:
         device = self.device
         do_cfg = guidance_scale > 1.0
-        cfg_parallel = cfg_parallel_group is not None
-        cfg_parallel_rank = 0
-        if cfg_parallel:
-            if not dist.is_available() or not dist.is_initialized():
-                raise ValueError("`cfg_parallel_group` requires an initialized process group.")
-            if options.batch_cfg:
-                raise ValueError("`cfg_parallel_group` and `refiner_batch_cfg` are mutually exclusive.")
-            if not do_cfg:
-                raise ValueError("Refiner CFG parallel requires `refiner_guidance_scale > 1.0`.")
-            cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
-            if dist.get_world_size(cfg_parallel_group) != 2:
-                raise ValueError("Refiner CFG parallel currently requires exactly 2 ranks.")
+        cfg_parallel_size = get_classifier_free_guidance_world_size()
+        if cfg_parallel_size not in {1, 2}:
+            raise ValueError(f"LingBot CFG parallel requires exactly 2 ranks, got {cfg_parallel_size}.")
+        if cfg_parallel_size > 1 and options.batch_cfg:
+            raise ValueError("CFG parallel and `refiner_batch_cfg` are mutually exclusive.")
 
         prompt_embeds = None
         prompt_mask = None
@@ -1328,37 +1266,25 @@ class LingBotVideoPipeline(
             and base_condition.prompt_embeds is not None
             and base_condition.prompt_mask is not None
         )
-        if cfg_parallel and cfg_parallel_rank == 1:
+        if can_reuse_positive:
+            prompt_embeds = base_condition.prompt_embeds
+            prompt_mask = base_condition.prompt_mask
+        else:
+            prompt_embeds, prompt_mask = self.encode_prompt(
+                prompt,
+                images=None,
+                device=device,
+            )
+        if do_cfg:
             if options.null_cond_clone_zero:
-                positive, positive_mask = self.encode_prompt(prompt, images=None, device=device)
-                negative_embeds = torch.zeros_like(positive)
-                negative_mask = positive_mask.clone()
+                negative_embeds = torch.zeros_like(prompt_embeds)
+                negative_mask = prompt_mask.clone()
             else:
                 negative_embeds, negative_mask = self.encode_prompt(
                     negative_prompt,
                     images=None,
                     device=device,
                 )
-        else:
-            if can_reuse_positive:
-                prompt_embeds = base_condition.prompt_embeds
-                prompt_mask = base_condition.prompt_mask
-            else:
-                prompt_embeds, prompt_mask = self.encode_prompt(
-                    prompt,
-                    images=None,
-                    device=device,
-                )
-            if do_cfg and not cfg_parallel:
-                if options.null_cond_clone_zero:
-                    negative_embeds = torch.zeros_like(prompt_embeds)
-                    negative_mask = prompt_mask.clone()
-                else:
-                    negative_embeds, negative_mask = self.encode_prompt(
-                        negative_prompt,
-                        images=None,
-                        device=device,
-                    )
 
         return LingBotStageCondition(
             prompt_embeds=prompt_embeds,
@@ -1366,8 +1292,6 @@ class LingBotVideoPipeline(
             negative_prompt_embeds=negative_embeds,
             negative_prompt_mask=negative_mask,
             image_condition=None,
-            cfg_parallel_group=cfg_parallel_group,
-            cfg_parallel_rank=cfg_parallel_rank,
             clean_prefix=clean_prefix,
         )
 
@@ -1442,7 +1366,6 @@ class LingBotVideoPipeline(
         negative_prompt_embeds: torch.Tensor | None = None,
         negative_prompt_mask: torch.Tensor | None = None,
         output_type: str = "pt",
-        cfg_parallel_group: Any | None = None,
         execution_options: LingBotExecutionOptions | None = None,
     ) -> torch.Tensor:
         self.check_inputs(height, width, num_frames)
@@ -1482,7 +1405,6 @@ class LingBotVideoPipeline(
             prompt_mask=prompt_mask,
             negative_prompt_embeds=negative_prompt_embeds,
             negative_prompt_mask=negative_prompt_mask,
-            cfg_parallel_group=cfg_parallel_group,
             batch_cfg=options.batch_cfg,
             null_cond_clone_zero=options.null_cond_clone_zero,
         )
@@ -1499,8 +1421,6 @@ class LingBotVideoPipeline(
         )
 
         if not run_refiner:
-            if condition.cfg_parallel_group is not None and condition.cfg_parallel_rank != 0:
-                return latents if output_type == "latent" else []
             if output_type == "latent":
                 return latents
             self._restore_vae_for_decode(vae_restore_device)
@@ -1527,7 +1447,6 @@ class LingBotVideoPipeline(
             mode=mode,
             base_condition=condition,
             guidance_scale=options.refiner.guidance_scale,
-            cfg_parallel_group=cfg_parallel_group,
             options=options.refiner,
             clean_prefix=refiner_inputs.clean_prefix,
         )
@@ -1538,8 +1457,6 @@ class LingBotVideoPipeline(
             options=options.refiner,
         )
 
-        if refiner_condition.cfg_parallel_group is not None and refiner_condition.cfg_parallel_rank != 0:
-            return latents if output_type == "latent" else []
         if output_type == "latent":
             return latents
 

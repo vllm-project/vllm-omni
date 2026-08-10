@@ -181,3 +181,57 @@ def test_sparse_moe_block_matches_upstream_reference() -> None:
     torch.testing.assert_close(actual_scores, expected_scores, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert torch.isfinite(actual).all()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_global_router_m_sparse_moe_matches_upstream_reference() -> None:
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    torch.manual_seed(42)
+    block = module.LingBotVideoSparseMoeBlock(
+        hidden_size=16,
+        num_experts=8,
+        top_k=2,
+        moe_intermediate_size=8,
+        score_func="sigmoid",
+        norm_topk_prob=True,
+        n_group=4,
+        topk_group=1,
+        routed_scaling_factor=1.5,
+        n_shared_experts=1,
+    )
+    with torch.no_grad():
+        block.router.weight.zero_()
+        block.router.e_score_correction_bias.copy_(torch.tensor([0.9, 0.8, 1.0, 0.0, 0.7, 0.6, 0.5, 0.4]))
+        for parameter in (
+            block.experts.w1,
+            block.experts.w2,
+            block.experts.w3,
+            block.shared_experts.gate_proj.weight,
+            block.shared_experts.up_proj.weight,
+            block.shared_experts.down_proj.weight,
+        ):
+            parameter.normal_(mean=0.0, std=0.02)
+    block = block.to(device="cuda", dtype=torch.bfloat16)
+
+    hidden_states = torch.randn(2, 5, 16, device="cuda", dtype=torch.bfloat16)
+    padding_mask = torch.tensor(
+        [1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        expected, _, _ = _upstream_sparse_moe_reference(
+            block,
+            hidden_states,
+            padding_mask,
+        )
+        actual = block(
+            hidden_states,
+            padding_mask=padding_mask,
+            router_target_m=14,
+        )
+
+    torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(actual).all()

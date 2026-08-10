@@ -16,6 +16,15 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.fixture(autouse=True)
+def _single_rank_cfg_state(monkeypatch):
+    from vllm_omni.diffusion.distributed import cfg_parallel
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video
+
+    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(pipeline_lingbot_video, "get_classifier_free_guidance_world_size", lambda: 1)
+
+
 def _make_pipeline():
     from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
 
@@ -62,8 +71,10 @@ def test_lingbot_video_pipeline_import_and_registry():
 
 
 def test_component_discovery_declarations():
+    from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
     from vllm_omni.diffusion.models.lingbot_video import LingBotVideoPipeline
 
+    assert issubclass(LingBotVideoPipeline, CFGParallelMixin)
     assert LingBotVideoPipeline._dit_modules == ["transformer"]
     assert LingBotVideoPipeline._encoder_modules == ["text_encoder"]
     assert LingBotVideoPipeline._vae_modules == ["vae"]
@@ -424,16 +435,16 @@ class _RecordingTransformer(nn.Module):
 
     def forward(
         self,
-        latents,
+        hidden_states,
         timestep,
-        prompt_embeds,
+        encoder_hidden_states,
         *,
         encoder_attention_mask,
         return_dict,
     ):
-        del timestep, prompt_embeds, encoder_attention_mask, return_dict
-        self.latent_inputs.append(latents.detach().clone())
-        return (torch.zeros_like(latents),)
+        del timestep, encoder_hidden_states, encoder_attention_mask, return_dict
+        self.latent_inputs.append(hidden_states.detach().clone())
+        return (torch.zeros_like(hidden_states),)
 
 
 class _CorruptingScheduler:
@@ -451,7 +462,7 @@ class _CorruptingScheduler:
         latents,
         *,
         return_dict,
-        generator,
+        generator=None,
     ):
         del noise_pred, timestep, return_dict, generator
         return (latents + 7.0,)
@@ -522,6 +533,117 @@ def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
     assert torch.equal(latents[:, :, 1:], torch.full((1, 1, 2, 1, 1), 14.0))
 
 
+def test_generate_routes_true_cfg_through_standard_mixin(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = _RecordingTransformer()
+    pipeline.scheduler = _CorruptingScheduler()
+    pipeline.progress_bar = lambda timesteps: timesteps
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 1, 1, 1, 1)
+    pipeline.encode_prompt = lambda prompt, **kwargs: (
+        torch.full((1, 2, 4), 1.0 if prompt == "positive" else -1.0),
+        torch.ones(1, 2, dtype=torch.long),
+    )
+    calls = []
+
+    def capture_cfg_call(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", capture_cfg_call)
+
+    latents = pipeline._generate(
+        prompt="positive",
+        negative_prompt="negative",
+        mode=LingBotGenerationMode.T2V,
+        height=16,
+        width=16,
+        num_frames=1,
+        num_inference_steps=2,
+        guidance_scale=3.0,
+        shift=3.0,
+        output_type="latent",
+    )
+
+    assert len(calls) == 2
+    assert all(call["do_true_cfg"] is True for call in calls)
+    assert all(call["true_cfg_scale"] == 3.0 for call in calls)
+    assert all(call["cfg_normalize"] is False for call in calls)
+    assert all(torch.all(call["positive_kwargs"]["encoder_hidden_states"] == 1) for call in calls)
+    assert all(torch.all(call["negative_kwargs"]["encoder_hidden_states"] == -1) for call in calls)
+    assert torch.equal(latents, torch.full_like(latents, 14.0))
+
+
+@pytest.mark.parametrize(
+    ("cfg_parallel_size", "guidance_scale", "batch_cfg", "match"),
+    [
+        pytest.param(2, 3.0, True, "mutually exclusive", id="batch-cfg-conflict"),
+        pytest.param(3, 3.0, False, "exactly 2 ranks", id="unsupported-degree"),
+    ],
+)
+def test_generate_rejects_invalid_cfg_parallel_configuration(
+    monkeypatch,
+    cfg_parallel_size,
+    guidance_scale,
+    batch_cfg,
+    match,
+):
+    from vllm_omni.diffusion.models.lingbot_video import (
+        LingBotExecutionOptions,
+        LingBotGenerationMode,
+    )
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    pipeline = _make_pipeline()
+    monkeypatch.setattr(module, "get_classifier_free_guidance_world_size", lambda: cfg_parallel_size)
+
+    with pytest.raises(ValueError, match=match):
+        pipeline._generate(
+            prompt="positive",
+            negative_prompt="negative",
+            mode=LingBotGenerationMode.T2V,
+            height=16,
+            width=16,
+            num_frames=1,
+            num_inference_steps=2,
+            guidance_scale=guidance_scale,
+            shift=3.0,
+            output_type="latent",
+            execution_options=LingBotExecutionOptions(batch_cfg=batch_cfg),
+        )
+
+
+def test_generate_allows_cfg_parallel_group_during_cfg_disabled_warmup(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    pipeline = _make_pipeline()
+    monkeypatch.setattr(module, "get_classifier_free_guidance_world_size", lambda: 2)
+    pipeline.transformer = _RecordingTransformer()
+    pipeline.scheduler = _CorruptingScheduler()
+    pipeline.progress_bar = lambda timesteps: timesteps
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 1, 1, 1, 1)
+    pipeline.encode_prompt = lambda *args, **kwargs: (
+        torch.ones(1, 2, 4),
+        torch.ones(1, 2, dtype=torch.long),
+    )
+
+    latents = pipeline._generate(
+        prompt="warmup",
+        mode=LingBotGenerationMode.T2V,
+        height=16,
+        width=16,
+        num_frames=1,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        shift=3.0,
+        output_type="latent",
+    )
+
+    assert latents.shape == (1, 1, 1, 1, 1)
+
+
 def test_t2i_decodes_and_returns_the_unique_frame():
     from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
 
@@ -580,8 +702,6 @@ def test_pipeline_profiler_records_condition_diffuse_and_decode_stages():
         negative_prompt_embeds=None,
         negative_prompt_mask=None,
         image_condition=None,
-        cfg_parallel_group=None,
-        cfg_parallel_rank=0,
     )
     pipeline._prepare_base_condition = lambda **kwargs: condition
     pipeline.diffuse = lambda **kwargs: torch.zeros(1, 1, 1, 2, 2)

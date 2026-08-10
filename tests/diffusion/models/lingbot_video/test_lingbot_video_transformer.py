@@ -292,7 +292,13 @@ def test_router_group_limited_topk_uses_bias_corrected_choice():
     assert high_score > 1.7
 
 
-def test_router_uses_explicit_global_padded_m(monkeypatch):
+def test_router_group_limited_topk_stays_outside_regional_compile():
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    assert module.LingBotVideoRouter._group_limited_topk._torchdynamo_disable is True
+
+
+def test_router_pads_local_tokens_to_explicit_global_m(monkeypatch):
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
     router = module.LingBotVideoRouter(
@@ -335,7 +341,7 @@ def test_router_uses_explicit_global_padded_m(monkeypatch):
     torch.testing.assert_close(actual_scores, expected_scores)
 
 
-def test_transformer_passes_global_padded_m_to_local_moe_block(monkeypatch):
+def test_transformer_passes_unpadded_global_m_to_local_moe_block(monkeypatch):
     from types import SimpleNamespace
 
     from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
@@ -383,7 +389,7 @@ def test_transformer_passes_global_padded_m_to_local_moe_block(monkeypatch):
             return_dict=False,
         )[0]
 
-    assert captured == [(8, (1, 4, 16))]
+    assert captured == [(7, (1, 4, 16))]
     assert output.shape == (1, 2, 1, 2, 2)
 
 

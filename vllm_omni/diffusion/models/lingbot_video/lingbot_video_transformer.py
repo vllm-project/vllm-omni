@@ -261,7 +261,15 @@ class LingBotVideoRouter(nn.Module):
             persistent=True,
         )
 
+    @torch.compiler.disable
     def _group_limited_topk(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
+        """Keep the discrete group-routing decision outside regional compile.
+
+        Compiled reductions and top-k can produce rank-dependent choices for
+        nearly tied scores.  A single changed expert is then amplified by all
+        following MoE blocks.  The surrounding router math remains compiled;
+        only this categorical decision uses the eager PyTorch kernels.
+        """
         if self.n_group is None or self.topk_group is None:
             raise ValueError("group-limited top-k requires n_group and topk_group.")
         seq_len = scores_for_choice.shape[0]
@@ -282,7 +290,7 @@ class LingBotVideoRouter(nn.Module):
         weight: torch.Tensor,
         target_m: int | None,
     ) -> torch.Tensor:
-        """Run the router GEMM eagerly with the pre-shard global padded M.
+        """Run the router GEMM eagerly with the pre-shard global M.
 
         Regional compilation must not fold the zero padding and output slice
         back into a local-M GEMM. Keeping this model-specific operation eager
@@ -924,8 +932,10 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         padded_global_token_validity = (
             F.pad(global_token_validity, (0, padding_size), value=False) if padding_size else global_token_validity
         )
-        sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
-        moe_router_target_m = int(padded_global_token_validity.numel()) if sp_size > 1 else None
+        # Keep the router GEMM's M dimension independent of the SP degree.
+        # SP auto-padding changes padded_global_token_validity by degree, while
+        # global_token_validity is the same pre-shard token set for SP1/2/4.
+        moe_router_target_m = int(global_token_validity.numel())
         if packed_batch:
             attention_mask = _packed_block_attention_mask(
                 sample_seq_lens,
@@ -943,23 +953,18 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:
-            if isinstance(block.ffn, LingBotVideoSparseMoeBlock):
-                joint = block(
-                    joint,
-                    temb6,
-                    rotary,
-                    attention_mask,
-                    moe_padding_mask,
-                    moe_router_target_m,
-                )
-            else:
-                joint = block(
-                    joint,
-                    temb6,
-                    rotary,
-                    attention_mask,
-                    moe_padding_mask,
-                )
+            # Pass target-M through every block. Dense blocks ignore it, while
+            # sparse-MoE blocks use it for router GEMM alignment. Avoid
+            # inspecting block.ffn here because Cache-DiT may replace a block
+            # range with an adapter that preserves forward but not internals.
+            joint = block(
+                joint,
+                temb6,
+                rotary,
+                attention_mask,
+                moe_padding_mask,
+                moe_router_target_m,
+            )
         final_mod = self.norm_out_modulation(temb_input.reshape(joint.shape[0] * joint.shape[1], -1))
         shift, scale = final_mod.reshape(joint.shape[0], joint.shape[1], -1).chunk(2, dim=-1)
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift

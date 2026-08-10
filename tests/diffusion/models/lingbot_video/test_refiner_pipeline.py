@@ -12,6 +12,15 @@ from torch import nn
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.fixture(autouse=True)
+def _single_rank_cfg_state(monkeypatch):
+    from vllm_omni.diffusion.distributed import cfg_parallel
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video
+
+    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(pipeline_lingbot_video, "get_classifier_free_guidance_world_size", lambda: 1)
+
+
 def _make_pipeline():
     from vllm_omni.diffusion.models.lingbot_video import LingBotVideoPipeline
 
@@ -142,8 +151,6 @@ def test_refiner_reuses_t2v_positive_but_rebuilds_ti2v_as_text_only():
         negative_prompt_embeds=None,
         negative_prompt_mask=None,
         image_condition=None,
-        cfg_parallel_group=None,
-        cfg_parallel_rank=0,
     )
     encode_calls = []
 
@@ -159,7 +166,6 @@ def test_refiner_reuses_t2v_positive_but_rebuilds_ti2v_as_text_only():
         mode=LingBotGenerationMode.T2V,
         base_condition=base_condition,
         guidance_scale=3.0,
-        cfg_parallel_group=None,
         options=options,
         clean_prefix=None,
     )
@@ -173,7 +179,6 @@ def test_refiner_reuses_t2v_positive_but_rebuilds_ti2v_as_text_only():
         mode=LingBotGenerationMode.TI2V,
         base_condition=base_condition,
         guidance_scale=3.0,
-        cfg_parallel_group=None,
         options=options,
         clean_prefix=torch.ones(1, 1, 1, 1, 1),
     )
@@ -209,8 +214,6 @@ def test_generate_runs_in_memory_refiner_handoff_and_returns_only_final_video():
         negative_prompt_embeds=None,
         negative_prompt_mask=None,
         image_condition=None,
-        cfg_parallel_group=None,
-        cfg_parallel_rank=0,
     )
     pipeline._prepare_base_condition = lambda **kwargs: condition
     pipeline.diffuse = lambda **kwargs: torch.zeros(1, 1, 3, 2, 2)
@@ -302,8 +305,6 @@ def test_refiner_offloads_vae_before_ti2v_text_condition():
         negative_prompt_embeds=None,
         negative_prompt_mask=None,
         image_condition=None,
-        cfg_parallel_group=None,
-        cfg_parallel_rank=0,
     )
     refiner_inputs = LingBotRefinerInputs(
         latents=torch.ones(1, 1, 1, 2, 2),
@@ -373,8 +374,6 @@ def test_pipeline_profiler_distinguishes_base_handoff_and_refiner_stages():
         negative_prompt_embeds=None,
         negative_prompt_mask=None,
         image_condition=None,
-        cfg_parallel_group=None,
-        cfg_parallel_rank=0,
     )
     refiner_inputs = LingBotRefinerInputs(
         latents=torch.ones(1, 1, 1, 2, 2),
