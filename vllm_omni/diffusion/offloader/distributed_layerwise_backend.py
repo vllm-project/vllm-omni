@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Distributed Layerwise Offload backend with double-buffered H2D.
+"""Distributed Layerwise Offload backend with chunked H2D + AllGather overlap.
 
 This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
-* Optionally shards model weights across DP ranks and reconstructs each block
-  with AllGather, or streams a complete rank-local block without a collective.
-* Can retain compatible checkpoint tensors as node-shared mmap sources instead
-  of creating a persistent private host copy in every rank.
+* Optionally shards model weights across the weight-shard (fully-shard) ranks
+  and reconstructs each block with chunked AllGather, or streams a complete
+  rank-local block without a collective.
+* Consumes the loader-owned host-weight plan (checkpoint mmap views) when the
+  loader skipped ordinary weight materialization, then packs each block into
+  pinned (or pageable fallback) private Host shards.
 * Uses a fixed double-buffer scheme that keeps only two layers' worth of
   weights on each device at any time.
-* Pipelines H2D transfers and, when enabled, AllGather communications on
-  dedicated streams, overlapping them with computation.
+* Pipelines chunked H2D transfers and, when enabled, AllGather communications
+  on dedicated streams, overlapping them with computation.
 * Is hardware-agnostic, supporting both NVIDIA GPU (CUDA) and Ascend NPU
   (CANN) platforms via vLLM-Omni's platform abstraction layer.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from itertools import chain
 from typing import Any
 
@@ -33,7 +40,18 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
-from .block_discovery import get_blocks_from_dit
+from .block_discovery import ChunkOwnedBlock, ChunkOwnership, get_blocks_from_dit
+from .chunked_transport import (
+    ChunkedWeightTransport,
+    PartManifest,
+    PinBudget,
+    PinFailurePolicy,
+    TransferTicket,
+    WeightLayout,
+    build_part_manifest,
+    is_chunk_transport_supported,
+    pack_local_shard,
+)
 from .module_collector import ModuleDiscovery
 from .offload_plan import (
     OffloadPlan,
@@ -56,6 +74,22 @@ logger = init_logger(__name__)
 # ones stay resident for lower latency.
 _ON_DEMAND_THRESHOLD_MB = 1024
 
+# Trace markers consumed by benchmarks/diffusion/extract_dlo_timeline.py.
+# H2D/AllGather ranges execute on the submit worker; ``submit`` is emitted on
+# the profiled main thread so every asynchronous submission remains visible
+# even when PyTorch's thread-local record_function state does not propagate.
+_TRACE_ENV = "VLLM_OMNI_DLO_TRACE"
+
+
+def _trace_marker(kind: str, block_id: int, chunk_id: int | None = None) -> str:
+    if chunk_id is None:
+        return f"dlo.{kind}.block_{block_id}"
+    return f"dlo.{kind}.block_{block_id}.chunk_{chunk_id}"
+
+
+def _prefetch_barrier() -> None:
+    """Sentinel queued on the single submit executor to drain prior work."""
+
 
 class DistributedLayerwiseOffloadHook(ModelHook):
     """Hook for distributed layerwise offloading with fixed double-buffer.
@@ -74,29 +108,53 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self,
         next_block: nn.Module,
         device: torch.device,
-        dp_group: torch.distributed.ProcessGroup | None,
-        dp_size: int,
-        rank: int,
+        weight_shard_group: torch.distributed.ProcessGroup | None,
+        weight_shard_size: int,
+        weight_shard_rank: int,
         copy_stream: Any | None = None,
         comm_stream: Any | None = None,
-        pin_memory: bool = True,
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
-        rank_local_mmap: bool = False,
-        tensor_transforms: dict[int, Any] | None = None,
+        shared_chunk_slot_events: list[Any | None] | None = None,
+        shared_output_slot_events: list[Any | None] | None = None,
+        shared_slot_owners: list[DistributedLayerwiseOffloadHook | None] | None = None,
+        prepared_host_part: dict[str, Any] | None = None,
+        h2d_done_events: list[Any] | None = None,
+        transport_done_events: list[Any] | None = None,
+        output_ready_events: list[Any] | None = None,
+        last_use_events: list[Any | None] | None = None,
+        prefetch_executor: concurrent.futures.Executor | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
+        if prepared_host_part is None:
+            raise RuntimeError("hook requires a backend-prepared Host part")
 
         self.next_block = next_block
         self.device = device
-        self.dp_group = dp_group
-        self.dp_size = dp_size
-        self.rank = rank
-        self.pin_memory = pin_memory
-        self.rank_local_mmap = rank_local_mmap
-        self.tensor_transforms = tensor_transforms or {}
+        self.weight_shard_group = weight_shard_group
+        self.weight_shard_size = weight_shard_size
+        self.weight_shard_rank = weight_shard_rank
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
+
+        # Backend-prepared Host storage for the block this hook transports.
+        self.cpu_shards: dict[torch.dtype, torch.Tensor] = prepared_host_part["cpu_shards"]
+        self.metadata: dict[torch.dtype, list[dict[str, Any]]] = prepared_host_part["metadata"]
+        self.manifest: PartManifest = prepared_host_part["manifest"]
+        self.fallback_reason: str | None = prepared_host_part.get("fallback_reason")
+
+        # The manifest is the canonical source of the block id.  The backend
+        # always populates it; the block_id and the memory-address fallback
+        # below are unreachable in production and would produce wrong ids.
+        self.block_id: int = self.manifest.block_id
+        # Block id used for the 'compute' marker, i.e. the module this hook is
+        # attached to rather than the block it transports.  The backend
+        # overwrites it right after construction.
+        self.compute_block_id = self.block_id
+
+        self.transport = ChunkedWeightTransport(self.block_id, slot_count=2)
+        self.transport.prepare(self.manifest, self.cpu_shards)
+        self.transport_state = self.transport.state
 
         # Double buffers: either shared (from backend) or self-allocated (lazy)
         if shared_buffers is not None:
@@ -105,27 +163,52 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         else:
             self.gpu_buffers = [None, None]
             self._owns_buffers = True
+        # Local chunk (AllGather input) buffers, indexed by *input* slot.
+        self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+
         self.ready_events: list[Any | None] = [None, None]
+        self.ready_tickets: list[TransferTicket | None] = [None, None]
 
-        # Sharded host weights for the next block, keyed by dtype
-        self.cpu_shards: dict[torch.dtype, torch.Tensor] = {}
-        # File-backed source tensors for rank-local mmap.  Unlike cpu_shards,
-        # these remain immutable views of the checkpoint and are never pinned
-        # or flattened into a model-sized private allocation.
-        self.cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
-        self.metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+        # Pre-allocated per-output-slot completion events.  Allocating them
+        # once keeps prefetch_layer free of Event construction.
+        self._output_ready_events: list[Any] = output_ready_events or [current_omni_platform.Event() for _ in range(2)]
+        # Per local-chunk input slot: H2D completion and AllGather completion.
+        self._h2d_done_events: list[Any] = h2d_done_events or [current_omni_platform.Event() for _ in range(2)]
+        self._transport_done_events: list[Any] = transport_done_events or [
+            current_omni_platform.Event() for _ in range(2)
+        ]
+        # Recorded on the main thread immediately before async submit.  The
+        # worker waits on this event instead of calling wait_stream() against
+        # a compute stream that the main thread is concurrently appending to.
+        self._submit_dependency_event = current_omni_platform.Event()
+        # Shared across the hook group: last-use event per output slot, and
+        # the event proving the prior AllGather finished reading an input slot.
+        self._output_slot_events: list[Any | None] = (
+            shared_output_slot_events if shared_output_slot_events is not None else [None, None]
+        )
+        self._chunk_slot_events: list[Any | None] = (
+            shared_chunk_slot_events if shared_chunk_slot_events is not None else [None, None]
+        )
+        self._last_use_events: list[Any | None] = last_use_events if last_use_events is not None else [None, None]
+        self._shared_slot_owners: list[DistributedLayerwiseOffloadHook | None] = (
+            shared_slot_owners if shared_slot_owners is not None else [None, None]
+        )
 
-        # Rank-local mmap uses two host staging slots shared by every hook in
-        # this worker.  They are assigned by the backend after all block sizes
-        # are known, mirroring the shared device-buffer allocation.
-        self.cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
-        self.cpu_staging_events: list[Any | None] = [None, None]
+        self._request_generation = 0
 
         # Current slot index (0 or 1).  Updated dynamically by the previous
         # hook's prefetch_layer call via _prefetched_slot.  This ensures
         # correct slot tracking for ALL block counts (including odd N).
         self.current_slot = 0
         self._prefetched_slot: int | None = None
+
+        # Async submit: the group's single-worker executor enqueues stream
+        # work for the next block while this block's compute is launched.
+        self._prefetch_executor = prefetch_executor
+        self._prefetch_future: concurrent.futures.Future | None = None
+
+        self.trace_enabled = os.environ.get(_TRACE_ENV, "0") not in ("", "0", "false", "False")
+        self._compute_trace: Any | None = None
 
         # Backward link to previous hook for fallback (cache-dit skip)
         self._prev_hook: DistributedLayerwiseOffloadHook | None = None
@@ -137,6 +220,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # weights, even if is_materialized sees a non-empty tensor left by
         # the other group.
         self._is_group_first: bool = False
+        # Marks the hook that transports the group's first block, i.e. the one
+        # whose submit crosses the group boundary.
+        self._is_group_tail: bool = False
 
         # Group ID for per-slot contamination tracking.  Shared across all
         # hooks in the same group.  When a hook prefetches into a slot, it
@@ -151,12 +237,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.block_buffers: dict[str, torch.Tensor] = {}
         self.next_block_parameters: dict[str, nn.Parameter] = {}
         self.next_block_buffers: dict[str, torch.Tensor] = {}
+        self._transported_names = {meta["name"] for metas in self.metadata.values() for meta in metas}
 
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: Any | None = None
-
-        # Shared shard (AllGather input) buffers — assigned by backend.
-        self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
 
         # Pending async AllGather work (prevent GC before completion).
         self._pending_work: Any | None = None
@@ -175,22 +259,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.next_block_parameters = dict(self.next_block.named_parameters())
         self.next_block_buffers = dict(self.next_block.named_buffers())
 
-        if self.rank_local_mmap:
-            self.cpu_sources, self.metadata = self._collect_mmap_sources(
-                self.next_block_parameters,
-                self.next_block_buffers,
-                self.tensor_transforms,
-            )
-        else:
-            # Shard next block's weights and store local shard in pinned CPU memory.
-            self.cpu_shards, self.metadata = self._shard_and_pin(
-                self.next_block_parameters,
-                self.next_block_buffers,
-                self.dp_size,
-                self.rank,
-                self.pin_memory,
-                self.tensor_transforms,
-            )
+        # Host storage was packed by the backend (_prepare_host_storage) before
+        # this hook was constructed; nothing to shard here.
 
         # Allocate device buffers only if not using shared buffers from backend
         if self._owns_buffers:
@@ -198,7 +268,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         # Cache parameter re-pointing metadata to avoid per-layer dict lookups.
         self._cached_repoint = []
-        for slot in range(2):
+        for _slot in range(2):
             repoint = []
             for dtype, metas in self.metadata.items():
                 for m in metas:
@@ -214,86 +284,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             m["offset"],
                             m["numel"],
                             m["shape"],
-                            m["stride"],
+                            m.get("stride"),
                         )
                     )
             self._cached_repoint.append(repoint)
 
-        # Pre-compute AG output sizes (avoid sum() per layer).
-        self._ag_output_sizes: dict[torch.dtype, int] = {}
-        for dtype, metas in self.metadata.items():
-            total_numel = sum(m["numel"] for m in metas)
-            if self.rank_local_mmap:
-                self._ag_output_sizes[dtype] = total_numel
-            else:
-                shard_numel = self.cpu_shards[dtype].numel()
-                self._ag_output_sizes[dtype] = shard_numel * self.dp_size if self.dp_size > 1 else total_numel
-
         return module
-
-    @staticmethod
-    def _collect_mmap_sources(
-        params: dict[str, nn.Parameter],
-        bufs: dict[str, torch.Tensor],
-        tensor_transforms: dict[int, Any] | None = None,
-    ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
-        """Retain file-backed tensors and replace module storage with placeholders.
-
-        The returned sources preserve safetensors mmap storage.  Runtime-layout
-        adapters are applied only while packing a bounded staging slot, so no
-        full-model anonymous CPU copy is retained by a worker.
-        """
-        cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
-        metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
-        offsets: dict[torch.dtype, int] = {}
-
-        for name, target in chain(params.items(), bufs.items()):
-            source = target.to_local() if hasattr(target, "to_local") else target
-            if source.device.type != "cpu":
-                raise ValueError(
-                    f"Rank-local mmap storage requires CPU checkpoint views, but {name!r} is on {source.device}."
-                )
-
-            dtype = source.dtype
-            offset = offsets.get(dtype, 0)
-            transform = (tensor_transforms or {}).get(id(target))
-            runtime_source = transform(source) if callable(transform) else source
-            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
-                raise ValueError(
-                    "mmap weight transform changed tensor metadata for "
-                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
-                    f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
-                )
-            stride = runtime_source.stride()
-            storage_numel = (
-                0
-                if runtime_source.numel() == 0
-                else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
-            )
-
-            cpu_sources.setdefault(dtype, []).append(
-                {
-                    "name": name,
-                    "tensor": source.detach(),
-                    "transform": transform,
-                }
-            )
-            metadata.setdefault(dtype, []).append(
-                {
-                    "name": name,
-                    "offset": offset,
-                    "numel": storage_numel,
-                    "shape": runtime_source.shape,
-                    "stride": stride,
-                }
-            )
-            offsets[dtype] = offset + storage_numel
-
-            # The detached source above keeps the mmap storage alive while the
-            # module parameter/buffer is rebound to the rotating device slot.
-            set_tensor_storage(target, make_offload_placeholder(target))
-
-        return cpu_sources, metadata
 
     @staticmethod
     def _shard_and_pin(
@@ -420,175 +416,309 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         return cpu_shards, dtype_metadata
 
     def _allocate_device_buffers(self) -> None:
-        """Pre-allocate exactly two device buffers (one per slot)."""
+        """Pre-allocate exactly two device buffers (one per slot).
+
+        The manifest's ``padded_numel`` is the AllGather output size, i.e. the
+        sum of every chunk's padded extent, so the same buffer serves both the
+        chunk-major and the whole-block fallback layout.
+        """
         for slot in range(2):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
-            for dtype, metas in self.metadata.items():
-                total_numel = sum(m["numel"] for m in metas)
-                # AllGather output = dp_size * shard_size (padded)
-                padded = total_numel
-                if self.dp_size > 1:
-                    shard_sz = (total_numel + self.dp_size - 1) // self.dp_size
-                    padded = shard_sz * self.dp_size
-                gpu_weights[dtype] = torch.empty(padded, dtype=dtype, device=self.device)
+            for dtype_manifest in self.manifest.dtypes:
+                gpu_weights[dtype_manifest.dtype] = torch.empty(
+                    dtype_manifest.padded_numel,
+                    dtype=dtype_manifest.dtype,
+                    device=self.device,
+                )
             self.gpu_buffers[slot] = gpu_weights
 
     @property
     def is_materialized(self) -> bool:
-        """Check whether this block's parameters hold real data on device."""
-        for param in self.block_parameters.values():
-            return is_materialized_tensor(param)
+        """Check whether every transported tensor for this block is materialized."""
+        producer = self._prev_hook
+        names = producer._transported_names if producer is not None else set(self.block_parameters)
+        for name in names:
+            target = self.block_parameters.get(name, self.block_buffers.get(name))
+            if target is not None and not is_materialized_tensor(target):
+                return False
         return True
+
+    # ------------------------------------------------------------------ #
+    #  Tracing                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _trace_range(self, kind: str, chunk_id: int | None = None, block_id: int | None = None) -> Any:
+        """Return a profiler range whose name the DLO timeline analyzer parses.
+
+        No-op unless ``VLLM_OMNI_DLO_TRACE`` is set.  The marker text must stay
+        in the ``dlo.<kind>.block_<id>[.chunk_<id>]`` shape consumed by
+        ``benchmarks/diffusion/extract_dlo_timeline.py``.
+        """
+        if not self.trace_enabled:
+            return contextlib.nullcontext()
+        marker_block = self.block_id if block_id is None else block_id
+        return torch.profiler.record_function(_trace_marker(kind, marker_block, chunk_id))
 
     # ------------------------------------------------------------------ #
     #  Prefetch: H2D + AllGather (overlapped on dedicated streams)      #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _pack_mmap_sources(
-        cpu_sources: dict[torch.dtype, list[dict[str, Any]]],
-        metadata: dict[torch.dtype, list[dict[str, Any]]],
-        slot_buffers: dict[torch.dtype, torch.Tensor],
-    ) -> dict[torch.dtype, torch.Tensor]:
-        staged: dict[torch.dtype, torch.Tensor] = {}
-        for dtype, metas in metadata.items():
-            total_numel = sum(meta["numel"] for meta in metas)
-            destination = slot_buffers[dtype][:total_numel]
-            sources = cpu_sources[dtype]
-            for source_info, meta in zip(sources, metas, strict=True):
-                source = source_info["tensor"]
-                transform = source_info["transform"]
-                if callable(transform):
-                    source = transform(source)
-                if source.dtype != dtype or source.shape != meta["shape"] or source.stride() != meta["stride"]:
-                    raise ValueError(
-                        "mmap weight transform changed tensor layout for "
-                        f"{source_info['name']!r}: expected dtype={dtype}, "
-                        f"shape={tuple(meta['shape'])}, stride={meta['stride']}; "
-                        f"got dtype={source.dtype}, shape={tuple(source.shape)}, "
-                        f"stride={source.stride()}"
-                    )
-                start = meta["offset"]
-                physical_storage = destination[start : start + meta["numel"]]
-                if source.is_contiguous():
-                    physical_storage.copy_(source.flatten())
-                else:
-                    torch.as_strided(
-                        physical_storage,
-                        size=source.shape,
-                        stride=source.stride(),
-                    ).copy_(source)
-            staged[dtype] = destination
-        return staged
-
-    def _stage_mmap_sources(self, slot: int) -> dict[torch.dtype, torch.Tensor]:
-        """Pack this block's mmap views into one bounded host staging slot."""
-        previous_copy = self.cpu_staging_events[slot]
-        if previous_copy is not None:
-            synchronize = getattr(previous_copy, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
-            else:
-                # Platform events normally expose synchronize().  Retain a
-                # correctness fallback for test and non-CUDA platform shims.
-                current_omni_platform.synchronize()
-            self.cpu_staging_events[slot] = None
-
-        slot_buffers = self.cpu_staging_buffers[slot]
-        if slot_buffers is None:
-            raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
-        return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
-
     @torch.compiler.disable
-    def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
-        """Prepare next block's weights into the shared device buffer for *slot*.
+    def _submit_prefetch(
+        self,
+        slot: int,
+        non_blocking: bool = True,
+        submit_after_event: Any | None = None,
+    ) -> bool:
+        """Enqueue the chunked H2D + AllGather pipeline for *slot*.
 
-        Uses the pre-allocated ``self.gpu_buffers[slot]`` instead of
-        allocating fresh tensors every layer.  This enforces the fixed
-        double-buffer memory bound (exactly 2 blocks on device).
+        This only enqueues stream work and touches no Python-level Parameter
+        storage, so it is safe to run on the group's prefetch worker thread.
+        ``_apply_repoint`` performs the Parameter re-pointing on the main
+        thread.  Returns True when a new submission was made.
+
+        ``submit_after_event`` is recorded on the MAIN thread before the
+        current block's compute kernels are launched.  Waiting on that fixed
+        boundary lets the next H2D overlap current compute without mutating
+        the compute stream from this worker thread.
         """
-        self.copy_stream.wait_stream(current_omni_platform.current_stream())
+        if self.fallback_reason is not None:
+            # Pageable Host memory: an async copy would race with the packer.
+            non_blocking = False
 
-        evt = current_omni_platform.Event()
+        if submit_after_event is None:
+            raise RuntimeError("prefetch submit requires a main-thread dependency event")
+        self.copy_stream.wait_event(submit_after_event)
+
         gpu_weights = self.gpu_buffers[slot]
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
 
-        if self.dp_size <= 1 or self.dp_group is None:
-            cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
-            with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in cpu_weights.items():
-                    gw = gpu_weights[dtype]
-                    async_copy = non_blocking and cpu_shard.is_pinned()
-                    gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
-                evt.record(self.copy_stream)
-            if self.rank_local_mmap:
-                # The CPU slot may be overwritten only after this H2D copy has
-                # finished.  The shared event protects reuse by another hook.
-                self.cpu_staging_events[slot] = evt
-        else:
-            gpu_shards: dict[torch.dtype, torch.Tensor] = {}
-            shard_bufs = self.gpu_shard_buffers[slot]
-            assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
-            with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in self.cpu_shards.items():
-                    gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
-                    gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
-                    gpu_shards[dtype] = gpu_shard
+        previous_ticket = self.ready_tickets[slot]
+        if previous_ticket is not None and self.transport_state.is_current(previous_ticket):
+            # Idempotent re-prefetch: the slot already owns a live submission.
+            return False
 
-            self.comm_stream.wait_stream(self.copy_stream)
+        previous_owner = self._shared_slot_owners[slot]
+        if previous_owner is not None and previous_owner is not self:
+            overwritten_ticket = previous_owner.ready_tickets[slot]
+            if overwritten_ticket is not None and previous_owner.transport_state.is_current(overwritten_ticket):
+                previous_owner.transport.record_last_use(
+                    overwritten_ticket,
+                    self._output_slot_events[slot],
+                )
+                previous_owner.ready_tickets[slot] = None
+                previous_owner.ready_events[slot] = None
+
+        evt = self._output_ready_events[slot]
+        ticket = self.transport.begin_submission(
+            output_slot=slot,
+            request_generation=self._request_generation,
+            ready_event=evt,
+            part_id=self.manifest.part_id,
+            last_collective_key=(
+                self._request_generation,
+                self.block_id,
+                slot,
+                self.manifest.digest[:16],
+            ),
+        )
+        self.ready_tickets[slot] = ticket
+
+        if self.weight_shard_size <= 1 or self.weight_shard_group is None:
+            last_use = self._output_slot_events[slot]
+            if last_use is not None:
+                self.copy_stream.wait_event(last_use)
+            with current_omni_platform.stream(self.copy_stream):
+                with self._trace_range("h2d"):
+                    for dtype, cpu_shard in self.cpu_shards.items():
+                        gw = gpu_weights[dtype]
+                        gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=non_blocking)
+                evt.record(self.copy_stream)
+        else:
+            shard_bufs = self.gpu_shard_buffers
+            assert len(shard_bufs) == 2, "DLO requires exactly two local chunk slots"
+            assert shard_bufs[0] is not None and shard_bufs[1] is not None, "chunk buffers not allocated"
+
+            if non_blocking:
+                for _dtype, _cpu_shard in self.cpu_shards.items():
+                    if not _cpu_shard.is_pinned():
+                        raise RuntimeError(
+                            f"chunk H2D requires pinned Host shard for block {self.block_id} "
+                            f"dtype={_dtype}; tensor is not pinned. Async overlap is unsafe "
+                            "with pageable source — set dlo_pin_failure_policy=whole_block_fallback "
+                            "to allow pageable fallback, or ensure pin_cpu_memory=True."
+                        )
+
+            chunk_specs = [
+                (dtype_manifest.dtype, chunk)
+                for dtype_manifest in self.manifest.dtypes
+                for chunk in dtype_manifest.chunks
+            ]
+
+            last_use = self._output_slot_events[slot]
+            if last_use is not None:
+                self.comm_stream.wait_event(last_use)
+
+            for transfer_index, (dtype, chunk) in enumerate(chunk_specs):
+                input_slot = transfer_index % 2
+                reuse_event = self._chunk_slot_events[input_slot]
+                h2d_done = self._h2d_done_events[input_slot]
+                transport_done = self._transport_done_events[input_slot]
+                cpu_shard = self.cpu_shards[dtype]
+
+                # The prior AllGather must finish reading this input slot
+                # before the next H2D overwrites it.
+                if reuse_event is not None:
+                    self.copy_stream.wait_event(reuse_event)
+                with current_omni_platform.stream(self.copy_stream):
+                    with self._trace_range("h2d", chunk.chunk_id):
+                        local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
+                        local_input.copy_(
+                            cpu_shard[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel],
+                            non_blocking=non_blocking,
+                        )
+                    h2d_done.record(self.copy_stream)
+
+                self.comm_stream.wait_event(h2d_done)
+                with current_omni_platform.stream(self.comm_stream):
+                    with self._trace_range("all_gather", chunk.chunk_id):
+                        output = gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel]
+                        torch.distributed.all_gather_into_tensor(
+                            output,
+                            local_input,
+                            group=self.weight_shard_group,
+                        )
+                    transport_done.record(self.comm_stream)
+                self._chunk_slot_events[input_slot] = transport_done
+
             with current_omni_platform.stream(self.comm_stream):
-                for dtype, local_shard in gpu_shards.items():
-                    # Slice the shared (max-sized) output buffer down to this
-                    # block's actual AllGather output size. The buffers are
-                    # sized to the *largest* block across all groups, so for any
-                    # smaller block the full buffer would violate the
-                    # all_gather_into_tensor contract
-                    # (output.numel() == world_size * input.numel()).
-                    # Repoint offsets are relative to the block's flattened
-                    # buffer, so a prefix slice is safe.
-                    gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                    torch.distributed.all_gather_into_tensor(
-                        gw,
-                        local_shard,
-                        group=self.dp_group,
-                    )
                 evt.record(self.comm_stream)
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
+        self.transport.mark_ready(ticket)
         self._prefetched_slot = slot
+        self._shared_slot_owners[slot] = self
 
         # Stamp the slot with this hook's group ID so that group-first
         # hooks can detect whether another group has overwritten the slot.
         if self._shared_slot_group is not None:
             self._shared_slot_group[slot] = self._group_id
+        return True
 
+    @torch.compiler.disable
+    def _apply_repoint(self, slot: int) -> None:
+        """Point the next block's Parameters at the slot's device buffer.
+
+        This mutates Python-level Parameter storage, so it must run on the
+        MAIN thread before the consuming forward reads the parameters.  It does
+        not need to run before the stream work is enqueued.
+        """
+        gpu_weights = self.gpu_buffers[slot]
+        if gpu_weights is None or self._cached_repoint is None:
+            return
         # Re-point using cached metadata (avoids per-layer dict lookups).
+        # The original stride is preserved so non-contiguous weights (e.g.
+        # online FP8 Cutlass transposed views) round-trip through the flat
+        # transport buffer without changing their physical layout.
         for target, dtype, offset, numel, shape, stride in self._cached_repoint[slot]:
+            flat = gpu_weights[dtype][offset : offset + numel]
             set_tensor_storage(
                 target,
-                torch.as_strided(
-                    gpu_weights[dtype][offset : offset + numel],
-                    size=shape,
-                    stride=stride,
-                ),
+                torch.as_strided(flat, size=shape, stride=stride) if stride is not None else flat.view(shape),
             )
 
+    @torch.compiler.disable
+    def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
+        """Synchronous prefetch: submit the transfers and re-point immediately.
+
+        Kept for the synchronous fallback call sites (group-first
+        contamination, cache-dit skip, and the enable() bootstrap).  The
+        asynchronous path in ``pre_forward`` splits this into
+        ``_submit_prefetch`` (off-thread) plus ``_apply_repoint`` (main thread,
+        drained in ``get_weights``).
+        """
+        # Never let a main-thread submit interleave with a worker submit: every
+        # FS rank must issue the identical collective sequence.
+        self._drain_prefetch(apply_repoint=True)
+        compute_stream = current_omni_platform.current_stream()
+        self._submit_dependency_event.record(compute_stream)
+        with self._trace_range("submit"):
+            if self._prefetch_executor is not None:
+                submitted = self._prefetch_executor.submit(
+                    self._submit_prefetch,
+                    slot,
+                    non_blocking,
+                    self._submit_dependency_event,
+                ).result()
+            else:
+                submitted = self._submit_prefetch(
+                    slot,
+                    non_blocking,
+                    submit_after_event=self._submit_dependency_event,
+                )
+        if submitted:
+            self._apply_repoint(slot)
+
+    def _drain_prefetch(self, apply_repoint: bool = True) -> None:
+        """Wait for this hook's outstanding async submit, then re-point.
+
+        Any exception raised inside the worker surfaces here via
+        ``Future.result()`` — it is never swallowed.
+        """
+        future = self._prefetch_future
+        if future is None:
+            return
+        self._prefetch_future = None
+        submitted = future.result()
+        if apply_repoint and self._prefetched_slot is not None and submitted is not False:
+            self._apply_repoint(self._prefetched_slot)
+
     def get_weights(self, slot: int) -> dict[torch.dtype, torch.Tensor] | None:
-        """Wait for AllGather completion and return full weights for the slot.
+        """Attach the producer's ready event and return full weights for *slot*.
 
         The ready event for this slot was set by the *previous* hook's
-        prefetch_layer (which prefetched THIS block's weights into the
-        shared buffer).  This hook's own ready_events[slot] is None because
-        it never prefetched into this slot itself.  Fall back to the
-        previous hook's event to ensure the compute stream waits for the
-        AllGather (or H2D) to complete before reading the buffer.
+        prefetch (which prefetched THIS block's weights into the shared
+        buffer).  This hook's own ready_events[slot] may be None because it
+        never prefetched into this slot itself, so fall back to the previous
+        hook's event.
+
+        Before waiting, drain the producer's async submit and run its
+        Parameter re-pointing on the main thread.
+
+        A missing or non-current ticket means the slot this compute is about to
+        read is not owned by the transfer that filled it.  Waiting on the raw
+        event anyway would reintroduce exactly the read-after-overwrite the
+        ticket state machine exists to prevent, so both cases fail fast.
         """
+        for producer in (self._prev_hook, self):
+            if producer is not None:
+                producer._drain_prefetch(apply_repoint=True)
+
+        owner = self
         evt = self.ready_events[slot]
         if evt is None and self._prev_hook is not None:
-            evt = self._prev_hook.ready_events[slot]
-        if evt is not None:
-            current_omni_platform.current_stream().wait_event(evt)
+            owner = self._prev_hook
+            evt = owner.ready_events[slot]
+
+        if evt is None:
+            raise RuntimeError(
+                f"block {self.block_id} has no ready event for output slot {slot}: "
+                "compute would read weights before any transfer published them"
+            )
+
+        ticket = owner.ready_tickets[slot]
+        if ticket is None or not owner.transport_state.is_current(ticket):
+            raise RuntimeError(
+                f"block {self.block_id} cannot consume output slot {slot}: the producing "
+                f"ticket is {'missing' if ticket is None else 'stale'} because another "
+                "transfer took the slot; refusing to wait on an event that no longer "
+                "proves this block's weights are ready"
+            )
+        owner.transport.attach_ready(
+            ticket,
+            lambda event: current_omni_platform.current_stream().wait_event(event),
+        )
         return self.gpu_buffers[slot]
 
     # ------------------------------------------------------------------ #
@@ -598,59 +728,159 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     @torch.compiler.disable
     def offload_layer(self) -> None:
         """Free GPU memory for current block by replacing tensors with placeholders."""
-        evt = self._prefetch_done
-        if evt is not None:
-            current_omni_platform.current_stream().wait_event(evt)
+        slot = self.current_slot
+        compute_stream = current_omni_platform.current_stream()
+
+        # Publish the last-use event for this output slot so the next producer
+        # waits for our compute to finish reading before overwriting it.
+        evt = self._last_use_events[slot]
+        if evt is None:
+            evt = current_omni_platform.Event()
+            self._last_use_events[slot] = evt
+        evt.record(compute_stream)
+        self._output_slot_events[slot] = evt
+
+        prev = self._prev_hook
+        if prev is not None:
+            ticket = prev.ready_tickets[slot]
+            if ticket is not None and prev.transport_state.is_current(ticket):
+                prev.transport.record_last_use(ticket, evt)
+                prev.ready_tickets[slot] = None
+                if self._shared_slot_owners[slot] is prev:
+                    self._shared_slot_owners[slot] = None
+
         self._prefetch_done = None
 
-        for _, param in self.block_parameters.items():
-            set_tensor_storage(param, make_offload_placeholder(param))
-        for _, buf in self.block_buffers.items():
-            set_tensor_storage(buf, make_offload_placeholder(buf))
+        transported_names = prev._transported_names if prev is not None else set(self.block_parameters)
+        for name in transported_names:
+            target = self.block_parameters.get(name, self.block_buffers.get(name))
+            if target is not None:
+                set_tensor_storage(target, make_offload_placeholder(target))
+
+    # ------------------------------------------------------------------ #
+    #  Request lifecycle                                                  #
+    # ------------------------------------------------------------------ #
+
+    def set_request_generation(self, generation: int) -> None:
+        if generation < self._request_generation:
+            raise RuntimeError(f"request generation moved backwards: {generation} < {self._request_generation}")
+        self._request_generation = generation
+
+    def drain_request(self) -> None:
+        """Release every live slot so the next request starts from a clean state."""
+        self._drain_prefetch(apply_repoint=False)
+
+        if self._compute_trace is not None:
+            self._compute_trace.__exit__(None, None, None)
+            self._compute_trace = None
+
+        for slot in range(2):
+            ticket = self.ready_tickets[slot]
+            if ticket is None or not self.transport_state.is_current(ticket):
+                continue
+            # A tail prefetch issued by the final block has no consumer in
+            # this request.  Retire it at producer-ready without wiring that
+            # unused transfer into the default compute stream; doing so would
+            # also block async output D2H behind weight transport that cannot
+            # affect the completed request output.
+            self.transport.record_last_use(ticket, self.ready_events[slot])
+            self.ready_tickets[slot] = None
+            self.ready_events[slot] = None
+            if self._shared_slot_owners[slot] is self:
+                self._shared_slot_owners[slot] = None
+
+        for name in self._transported_names:
+            target = self.next_block_parameters.get(name, self.next_block_buffers.get(name))
+            if target is not None:
+                set_tensor_storage(target, make_offload_placeholder(target))
+
+        self._prefetched_slot = None
+        self.transport.reset()
 
     # ------------------------------------------------------------------ #
     #  ModelHook interface                                                #
     # ------------------------------------------------------------------ #
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
-        # Dynamic slot tracking: read current_slot from the previous hook's
-        # _prefetched_slot (the slot where this block's data was actually
-        # loaded).  This corrects the initial i%2 assignment for odd block
-        # counts, where the circular tail→head prefetch would otherwise
-        # collide with the head's read slot.
-        if self._prev_hook is not None and self._prev_hook._prefetched_slot is not None:
-            self.current_slot = self._prev_hook._prefetched_slot
+        # Drain the producer before reading its selected slot.  With async
+        # submit, _prefetched_slot is published by the worker and may still
+        # contain the previous forward's value until Future.result() returns.
+        if self._prev_hook is not None:
+            self._prev_hook._drain_prefetch(apply_repoint=True)
+            if self._prev_hook._prefetched_slot is not None:
+                self.current_slot = self._prev_hook._prefetched_slot
+
+        compute_stream = current_omni_platform.current_stream()
 
         # Group-first hook: check whether the shared buffer slot was
         # overwritten by another group since our last forward.  If the
         # slot still contains our own data (from the tail hook's async
         # prefetch), skip the sync-prefetch and just wait for the event.
         if self._is_group_first and self._prev_hook is not None:
+            if self._prefetch_executor is not None:
+                # Another DiT group may have an outstanding tail submit on
+                # the shared single-worker executor.  Drain the global queue
+                # before reading the shared slot owner or issuing a sync
+                # repair, so every FS rank preserves one collective order.
+                self._prefetch_executor.submit(_prefetch_barrier).result()
             slot_contaminated = True
             if self._shared_slot_group is not None:
                 slot_contaminated = self._shared_slot_group[self.current_slot] != self._group_id
+            ticket = self._prev_hook.ready_tickets[self.current_slot]
+            has_current_ticket = ticket is not None and self._prev_hook.transport_state.is_current(ticket)
             if slot_contaminated:
+                if has_current_ticket:
+                    # Another group overwrote the buffer while our ticket was
+                    # still live.  Retire it so the re-prefetch really submits
+                    # instead of hitting the idempotent guard.
+                    self._prev_hook.transport.record_last_use(ticket, self._output_slot_events[self.current_slot])
+                    self._prev_hook.ready_tickets[self.current_slot] = None
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
-            # Always wait for data to be ready (handles both sync and async paths)
-            self._prev_hook.get_weights(self.current_slot)
         elif not self.is_materialized and self._prev_hook is not None:
-            # Previous hook was skipped (e.g. by cache-dit), sync-prefetch
-            self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
-            self._prev_hook.get_weights(self.current_slot)
+            # Previous hook was skipped (e.g. by cache-dit).  Only re-submit
+            # when no valid async prefetch is already in flight for this slot.
+            ticket = self._prev_hook.ready_tickets[self.current_slot]
+            has_current_ticket = ticket is not None and self._prev_hook.transport_state.is_current(ticket)
+            if not has_current_ticket:
+                self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
 
-        # Prefetch next layer into the other slot (overlapped with compute).
-        # No explicit get_weights() here — offload_layer() in the previous
-        # hook's post_forward already enqueued wait_event for the current
-        # layer's H2D/AllGather, which is sufficient to ensure compute_stream
-        # waits for weights before reading them.  The redundant wait_event
-        # caused cascading NPU stream synchronization stalls (~10ms/layer).
+        # Every block attaches the producer's ready event, including the case
+        # where draining above already made the Parameter view materialized.
+        self.get_weights(self.current_slot)
+
+        # Submit the next layer's transfers off-thread and return immediately,
+        # so this block's compute kernels are launched in parallel with the
+        # ~2 x chunk_count host-side launches of the next block's submit.
         next_slot = 1 - self.current_slot
-        self.prefetch_layer(next_slot, non_blocking=True)
+        self._drain_prefetch(apply_repoint=True)
+        self._submit_dependency_event.record(compute_stream)
+        with self._trace_range("submit"):
+            if self._prefetch_executor is not None:
+                self._prefetch_future = self._prefetch_executor.submit(
+                    self._submit_prefetch, next_slot, True, self._submit_dependency_event
+                )
+            else:
+                submitted = self._submit_prefetch(
+                    next_slot,
+                    True,
+                    self._submit_dependency_event,
+                )
+                if submitted:
+                    self._apply_repoint(next_slot)
+
+        if self._compute_trace is not None:
+            raise RuntimeError("compute trace range was not closed")
+        if self.trace_enabled:
+            self._compute_trace = self._trace_range("compute", block_id=self.compute_block_id)
+            self._compute_trace.__enter__()
 
         return args, kwargs
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
+        if self._compute_trace is not None:
+            self._compute_trace.__exit__(None, None, None)
+            self._compute_trace = None
         self.offload_layer()
         return output
 
@@ -664,30 +894,42 @@ def apply_distributed_block_hook(
     module: nn.Module,
     next_block: nn.Module,
     device: torch.device,
-    dp_group: torch.distributed.ProcessGroup | None,
-    dp_size: int,
-    rank: int,
+    weight_shard_group: torch.distributed.ProcessGroup | None,
+    weight_shard_size: int,
+    weight_shard_rank: int,
     copy_stream: Any | None = None,
     comm_stream: Any | None = None,
-    pin_memory: bool = True,
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
-    rank_local_mmap: bool = False,
-    tensor_transforms: dict[int, Any] | None = None,
+    shared_chunk_slot_events: list[Any | None] | None = None,
+    shared_output_slot_events: list[Any | None] | None = None,
+    shared_slot_owners: list[DistributedLayerwiseOffloadHook | None] | None = None,
+    prepared_host_part: dict[str, Any] | None = None,
+    h2d_done_events: list[Any] | None = None,
+    transport_done_events: list[Any] | None = None,
+    output_ready_events: list[Any] | None = None,
+    last_use_events: list[Any | None] | None = None,
+    prefetch_executor: concurrent.futures.Executor | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
     hook = DistributedLayerwiseOffloadHook(
         next_block=next_block,
         device=device,
-        dp_group=dp_group,
-        dp_size=dp_size,
-        rank=rank,
+        weight_shard_group=weight_shard_group,
+        weight_shard_size=weight_shard_size,
+        weight_shard_rank=weight_shard_rank,
         copy_stream=copy_stream,
         comm_stream=comm_stream,
-        pin_memory=pin_memory,
         shared_buffers=shared_buffers,
-        rank_local_mmap=rank_local_mmap,
-        tensor_transforms=tensor_transforms,
+        shared_chunk_slot_events=shared_chunk_slot_events,
+        shared_output_slot_events=shared_output_slot_events,
+        shared_slot_owners=shared_slot_owners,
+        prepared_host_part=prepared_host_part,
+        h2d_done_events=h2d_done_events,
+        transport_done_events=transport_done_events,
+        output_ready_events=output_ready_events,
+        last_use_events=last_use_events,
+        prefetch_executor=prefetch_executor,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -709,9 +951,8 @@ class PinnedResidentLayerGroup:
     distributed shard-and-pin operation becomes a shared storage primitive.
     It currently remains here because it depends on DLO's local-shard layout.
     Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
-    pinned CPU master copy (or mmap source plus bounded staging) and never
-    copies generated device weights back to host. Entering the denoise stage
-    performs one asynchronous H2D pass;
+    pinned CPU master copy and never copies generated device weights back to
+    host. Entering the denoise stage performs one asynchronous H2D pass;
     leaving it only restores zero-sized placeholders and releases the device
     buffers.  This lets the following VAE stage reuse the same HBM.
 
@@ -726,14 +967,11 @@ class PinnedResidentLayerGroup:
         device: torch.device,
         copy_stream: Any,
         pin_memory: bool,
-        rank_local_mmap: bool = False,
-        defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
         self.loaded = False
-        self.rank_local_mmap = rank_local_mmap
         self.pin_memory = pin_memory
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
@@ -742,48 +980,21 @@ class PinnedResidentLayerGroup:
             params = dict(block.named_parameters())
             bufs = dict(block.named_buffers())
             targets: dict[str, torch.Tensor] = {**params, **bufs}
-            if rank_local_mmap:
-                cpu_sources, metadata = DistributedLayerwiseOffloadHook._collect_mmap_sources(
-                    params,
-                    bufs,
-                    tensor_transforms,
-                )
-                cpu_shards = {}
-            else:
-                cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
-                    params,
-                    bufs,
-                    dp_size=1,
-                    rank=0,
-                    pin_memory=pin_memory,
-                    tensor_transforms=tensor_transforms,
-                )
-                cpu_sources = {}
+            cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+                params,
+                bufs,
+                dp_size=1,
+                rank=0,
+                pin_memory=pin_memory,
+                tensor_transforms=tensor_transforms,
+            )
             self._states.append(
                 {
                     "targets": targets,
                     "cpu_shards": cpu_shards,
-                    "cpu_sources": cpu_sources,
                     "metadata": metadata,
                 }
             )
-
-        self._cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor]] = []
-        self._cpu_staging_events: list[Any | None] = [None, None]
-        if rank_local_mmap and not defer_staging:
-            max_sizes: dict[torch.dtype, int] = {}
-            for state in self._states:
-                for dtype, metas in state["metadata"].items():
-                    total = sum(meta["numel"] for meta in metas)
-                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
-            for _ in range(2):
-                buffers = {}
-                for dtype, total in max_sizes.items():
-                    buffer = torch.empty(total, dtype=dtype, device="cpu")
-                    if pin_memory:
-                        buffer = buffer.pin_memory()
-                    buffers[dtype] = buffer
-                self._cpu_staging_buffers.append(buffers)
 
     def load(self) -> None:
         if self.loaded:
@@ -803,33 +1014,12 @@ class PinnedResidentLayerGroup:
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
-            for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
-                if self.rank_local_mmap:
-                    slot = index % 2
-                    previous_copy = self._cpu_staging_events[slot]
-                    if previous_copy is not None:
-                        synchronize = getattr(previous_copy, "synchronize", None)
-                        if callable(synchronize):
-                            synchronize()
-                        else:
-                            current_omni_platform.synchronize()
-                    cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
-                        state["cpu_sources"],
-                        state["metadata"],
-                        self._cpu_staging_buffers[slot],
-                    )
-                else:
-                    cpu_weights = state["cpu_shards"]
-
-                for dtype, cpu_weight in cpu_weights.items():
+            for state, block_buffers in zip(self._states, gpu_buffers):
+                for dtype, cpu_weight in state["cpu_shards"].items():
                     block_buffers[dtype].copy_(
                         cpu_weight,
                         non_blocking=cpu_weight.is_pinned(),
                     )
-                if self.rank_local_mmap:
-                    slot_ready = current_omni_platform.Event()
-                    slot_ready.record(self.copy_stream)
-                    self._cpu_staging_events[slot] = slot_ready
             ready.record(self.copy_stream)
 
         for state, block_buffers in zip(self._states, gpu_buffers):
@@ -892,9 +1082,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self.copy_stream = current_omni_platform.Stream()
         self.comm_stream = current_omni_platform.Stream()
-        self.dp_group: torch.distributed.ProcessGroup | None = None
-        self.dp_size = config.dp_size
-        self.rank = 0
+
+        # Weight-shard (FS) group.  Replaces the former (dp_group, dp_size,
+        # rank) triple: the chunked transport always shards along the HSDP
+        # fully-shard dimension.
+        self.weight_shard_group: torch.distributed.ProcessGroup | None = config.weight_shard_group
+        self.weight_shard_cpu_group: Any | None = config.weight_shard_cpu_group
+        # Use the FS degree resolved by OffloadConfig.from_od_config() only.
+        # Under HSDP this is hsdp_shard_size; otherwise it is dp_size passed
+        # through explicitly.  Falling back to dp_size here would silently
+        # wire weight collectives to the replica axis (design §3.2 prohibits
+        # this), so we do not attempt a fallback.
+        self.weight_shard_size: int = max(1, int(getattr(config, "weight_shard_size", 1) or 1))
+        self.weight_shard_rank: int = int(getattr(config, "weight_shard_rank", 0) or 0)
+
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
@@ -903,6 +1104,43 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_rank_local_mmap = False
         self.host_weight_plan = host_weight_plan
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
+
+        # Chunked transport planning state.
+        # Streaming block lists are collected during discovery and only turned
+        # into hooks after the Host plan and Host storage exist.
+        self._pending_block_groups: list[tuple[list[nn.Module], str]] = []
+        self._chunk_ownership: ChunkOwnership | None = None
+        self._block_ids: dict[int, int] = {}
+        self._planned_manifests: dict[int, PartManifest] = {}
+        self._prepared_host_parts: dict[int, dict[str, Any]] = {}
+        self.pin_budget: PinBudget | None = None
+        self._forced_fallback_reason: str | None = None
+
+        # Shared (per-engine) event arrays handed to every hook.
+        self._shared_h2d_done_events: list[Any] = []
+        self._shared_transport_done_events: list[Any] = []
+        self._shared_output_ready_events: list[Any] = []
+        self._shared_last_use_events: list[Any | None] = [None, None]
+        self._shared_chunk_slot_events: list[Any | None] = [None, None]
+        self._shared_output_slot_events: list[Any | None] = [None, None]
+        self._shared_slot_owners: list[DistributedLayerwiseOffloadHook | None] = [None, None]
+        # Per-slot "which hook group wrote this slot last" tracker.  Allocated
+        # here (not in enable()) because the request lifecycle can drain a
+        # backend whose enable() returned early with no streaming groups.
+        self._shared_slot_group: list[int] | None = None
+
+        # Request lifecycle.
+        self._request_generation = 0
+        self._request_active = False
+
+        # Async prefetch: single-worker thread pool for background prefetching.
+        # max_workers MUST stay 1 — every FS rank has to submit the identical
+        # (block, part, dtype, chunk) collective sequence, so concurrent
+        # submits would reorder the collectives and hang or corrupt.
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dlo_prefetch"
+        )
+        self._prefetch_future: concurrent.futures.Future | None = None
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
@@ -924,10 +1162,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         When the transformer is created on meta device, this method
         replaces meta params with mmap views of the checkpoint files.
-        The views point to OS page cache shared across ranks. AllGather mode
-        copies only the rank's 1/dp_size shard to a persistent private buffer;
-        rank-local mode retains the views and packs one block at a time into
-        bounded staging storage.
+        The views point to OS page cache shared across ranks.  The chunked
+        Host packing in ``_prepare_host_storage`` then copies only each
+        rank's local shard (or the rank-local full block) into private Host
+        storage, after which the views can be released.
 
         Non-DiT modules (VAE, encoders) are NOT affected — they were
         created on CPU with real weights via from_pretrained.
@@ -1103,57 +1341,633 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 f"(first 5: {remaining_meta[:5]})."
             )
 
-    def _init_dp_group(self) -> None:
-        """Reuse the process group initialized by parallel_state.
+    # ------------------------------------------------------------------ #
+    #  Weight shard (FS) group                                            #
+    # ------------------------------------------------------------------ #
 
-        When DP > 1, uses the DP group (handles strided groups with SP/CFG/PP).
-        When DP = 1 but SP > 1 (and dp_size was set to sp_size in OffloadConfig),
-        uses the SP group so weights are sharded across SP ranks.
-        """
-        if self.dp_size <= 1:
-            logger.info("Distributed layerwise offload: dp_size=1, running without AllGather")
-            self.dp_group = None
+    def _init_weight_shard_group(self) -> None:
+        """Resolve the FS group that owns the chunked weight shard dimension."""
+        if self.weight_shard_size <= 1:
+            logger.info("Distributed layerwise offload: weight_shard_size=1, running without AllGather")
+            self.weight_shard_group = None
+            self.weight_shard_cpu_group = None
+            self.weight_shard_rank = 0
+            self._publish_weight_shard_config()
             return
 
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "torch.distributed is not initialized. "
-                "Distributed layerwise offload with dp_size > 1 requires "
+                "Distributed layerwise offload with weight_shard_size > 1 requires "
                 "an initialized process group."
             )
 
-        from vllm_omni.diffusion.distributed.parallel_state import (
-            get_data_parallel_world_size,
-            get_dp_group,
-        )
-
-        # Determine which parallel group to use for sharding.
-        # When data_parallel_size > 1, use the DP group.
-        # When data_parallel_size == 1 but dp_size > 1 (set from sp_size in
-        # OffloadConfig), use the SP group for weight sharding.
-        dp_world = get_data_parallel_world_size()
-        if dp_world > 1:
-            coord = get_dp_group()
-        else:
-            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-
-            coord = get_sp_group()
-            logger.info(
-                "Distributed layerwise offload: DP=1, using SP group (world_size=%d) for weight sharding",
-                coord.world_size,
+        if not self.config.use_hsdp:
+            # Non-HSDP configurations reuse the established DP/SP resolver
+            # (previously _init_dp_group): with DP > 1 the weight collective
+            # runs on the DP group; with DP = 1 but SP > 1 it runs on the SP
+            # group (OffloadConfig derived weight_shard_size from sp_size).
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_data_parallel_world_size,
+                get_dp_group,
             )
 
-        self.dp_group = coord.device_group
-        self.rank = coord.rank_in_group
-        self.dp_size = coord.world_size
+            if get_data_parallel_world_size() > 1:
+                coord = get_dp_group()
+            else:
+                from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+                coord = get_sp_group()
+                logger.info(
+                    "Distributed layerwise offload: DP=1, using SP group (world_size=%d) for weight sharding",
+                    coord.world_size,
+                )
+            if coord.world_size != self.weight_shard_size:
+                raise ValueError(
+                    "DLO weight shard degree does not match the resolved group: "
+                    f"config={self.weight_shard_size}, group={coord.world_size}"
+                )
+            self.weight_shard_group = coord.device_group
+            self.weight_shard_cpu_group = coord.cpu_group
+            self.weight_shard_rank = coord.rank_in_group
+            self._publish_weight_shard_config()
+            logger.info(
+                "Distributed layerwise offload (non-HSDP): weight_shard_size=%d, rank_in_group=%d, group_ranks=%s",
+                self.weight_shard_size,
+                self.weight_shard_rank,
+                coord.ranks,
+            )
+            return
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_fs_group
+
+        fs_group = get_fs_group()
+        if fs_group.world_size != self.weight_shard_size:
+            raise ValueError(
+                "DLO weight shard degree does not match the FS group: "
+                f"config={self.weight_shard_size}, group={fs_group.world_size}"
+            )
+
+        # Chunk offsets are rank-major within one FS row, so a row must be a
+        # contiguous, replica-major rank range.  A strided row would make
+        # rank r's local chunk land at the wrong full-buffer offset.
+        ranks = list(fs_group.ranks)
+        if ranks != list(range(ranks[0], ranks[0] + len(ranks))):
+            raise ValueError(f"DLO requires replica-major, contiguous fully-shard rows; got FS ranks={ranks}")
+
+        self.weight_shard_group = fs_group.device_group
+        self.weight_shard_cpu_group = fs_group.cpu_group
+        self.weight_shard_rank = fs_group.rank_in_group
+        self._publish_weight_shard_config()
 
         logger.info(
-            "Distributed layerwise offload: dp_size=%d, rank_in_group=%d, global_rank=%d, group_ranks=%s",
-            self.dp_size,
-            self.rank,
-            coord.rank,
-            coord.ranks,
+            "Distributed layerwise offload: weight_shard_size=%d, rank_in_group=%d, global_rank=%d, group_ranks=%s",
+            self.weight_shard_size,
+            self.weight_shard_rank,
+            fs_group.rank,
+            ranks,
         )
+
+    def _publish_weight_shard_config(self) -> None:
+        """Mirror the resolved FS identity onto the config for other layers."""
+        self.config.weight_shard_size = self.weight_shard_size
+        self.config.weight_shard_rank = self.weight_shard_rank
+        self.config.weight_shard_group = self.weight_shard_group
+        self.config.weight_shard_cpu_group = self.weight_shard_cpu_group
+
+    # ------------------------------------------------------------------ #
+    #  Host plan and Host storage                                         #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def _pin_failure_policy(self) -> PinFailurePolicy:
+        return PinFailurePolicy(getattr(self.config, "dlo_pin_failure_policy", "fail"))
+
+    @property
+    def _alignment_bytes(self) -> int:
+        return int(getattr(self.config, "dlo_alignment_bytes", 256))
+
+    def _block_tensor_specs(self, module: nn.Module) -> list[tuple[str, torch.Tensor, bool]]:
+        """Collect the final, rank-local tensors a block contributes.
+
+        DTensor parameters are resolved with ``to_local``; checkpoint layout
+        adapters registered by the loader's host-weight plan are applied here
+        so the manifest describes the tensors that actually reach the device.
+        """
+        specs: list[tuple[str, torch.Tensor, bool]] = []
+        for name, tensor, is_buffer in chain(
+            ((n, t, False) for n, t in module.named_parameters()),
+            ((n, t, True) for n, t in module.named_buffers()),
+        ):
+            local = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+            transform = self._mmap_transforms_by_tensor_id.get(id(tensor))
+            if transform is None:
+                # Legacy attribute path kept for tests that install the
+                # transform directly on the tensor.
+                transform = getattr(tensor, "mmap_weight_transform", None)
+                if not getattr(tensor, "mmap_weight_transform_pending", False):
+                    transform = None
+            if callable(transform):
+                local = transform(local)
+            specs.append((name, local, is_buffer))
+        return specs
+
+    def _plan_chunk_manifests(self, ownership: ChunkOwnership) -> None:
+        """Build every final layout and enforce the pin cap before allocation."""
+        self.pin_budget = PinBudget(limit_bytes=self.config.dlo_pin_budget_bytes)
+        policy = self._pin_failure_policy
+        self._planned_manifests = {}
+        self._forced_fallback_reason = None
+
+        for block in ownership.blocks:
+            specs = [spec for spec in self._block_tensor_specs(block.module) if is_chunk_transport_supported(spec[1])]
+            manifest = build_part_manifest(
+                specs,
+                block_id=self._block_ids[id(block.module)],
+                part_id="block",
+                weight_shard_size=self.weight_shard_size,
+                weight_shard_rank=self.weight_shard_rank,
+                chunk_size_bytes=self.config.chunk_size_bytes,
+                alignment_bytes=self._alignment_bytes,
+                layout=WeightLayout.CHUNK_MAJOR,
+            )
+            try:
+                self.pin_budget.plan(block.path, manifest.pinned_bytes)
+            except MemoryError as exc:
+                if policy is PinFailurePolicy.FAIL:
+                    raise MemoryError(
+                        "pinned Host budget exceeded before allocation: "
+                        f"required={self.pin_budget.required_bytes + manifest.pinned_bytes} "
+                        f"limit={self.config.dlo_pin_budget_bytes}"
+                    ) from exc
+                # Keep the key so _prepare_host_storage can still reserve it;
+                # the pageable fallback consumes no pinned budget.
+                self._forced_fallback_reason = "pinned Host budget exceeded before allocation"
+                self.pin_budget.plan(block.path, 0)
+            self._planned_manifests[id(block.module)] = manifest
+
+        if self._forced_fallback_reason is not None:
+            # The budget fallback is engine-wide. Discard any pinned bytes
+            # planned before the first oversized block so accounting matches
+            # the pageable whole-block storage that will actually be built.
+            self.pin_budget = PinBudget(limit_bytes=self.config.dlo_pin_budget_bytes)
+            for block in ownership.blocks:
+                self.pin_budget.plan(block.path, 0)
+
+        logger.info(
+            "DLO Host plan: blocks=%d required_pinned=%.3f GiB budget=%s policy=%s fallback=%s",
+            len(ownership.blocks),
+            self.pin_budget.required_bytes / 1024**3,
+            self.config.dlo_pin_budget_bytes,
+            policy.value,
+            self._forced_fallback_reason,
+        )
+
+    def _prepare_host_storage(self, ownership: ChunkOwnership) -> None:
+        """Pack Host shards with one FS-wide fallback decision per block."""
+        policy = self._pin_failure_policy
+        pin_requested = bool(self.config.pin_cpu_memory)
+
+        # Validate the pin_cpu_memory + policy combination once before
+        # allocating anything.  With policy=fail the user has explicitly
+        # opted out of silent degradation, so combining it with
+        # pin_cpu_memory=False is a misconfiguration that should be caught
+        # early rather than producing a surprise whole-block run.
+        if self.config.dlo_use_allgather and not pin_requested and self._forced_fallback_reason is None:
+            if policy is PinFailurePolicy.FAIL:
+                raise ValueError(
+                    "pin_cpu_memory=False is incompatible with "
+                    "dlo_pin_failure_policy=fail: chunk transport requires "
+                    "pinned Host memory for async H2D overlap.  Either set "
+                    "pin_cpu_memory=True, or change dlo_pin_failure_policy "
+                    "to 'whole_block_fallback' to accept pageable (non-"
+                    "overlapping) whole-block transport."
+                )
+            # whole_block_fallback: treat as an engine-wide forced fallback so
+            # the per-block loop uses the same pageable path for every block.
+            self._forced_fallback_reason = "pin_cpu_memory=False"
+
+        pinned_bytes = 0
+        fallback_blocks = 0
+
+        for block in ownership.blocks:
+            module = block.module
+            specs = self._block_tensor_specs(module)
+            chunk_specs = [spec for spec in specs if is_chunk_transport_supported(spec[1])]
+            manifest = self._planned_manifests[id(module)]
+
+            fallback_reason = self._forced_fallback_reason
+
+            failed = 0
+            detail = fallback_reason
+            cpu_shards: dict[torch.dtype, torch.Tensor] | None = None
+            if fallback_reason is None:
+                try:
+                    cpu_shards = pack_local_shard(chunk_specs, manifest)
+                except MemoryError as exc:
+                    failed = 1
+                    detail = f"pinned Host allocation failed for {block.path}: {exc}"
+
+            # A pageable fallback changes the collective sequence, so every FS
+            # rank must take the same decision even if only one rank failed.
+            agreed = self._agree_pin_failure(failed)
+            if agreed:
+                if policy is PinFailurePolicy.FAIL:
+                    if detail is None:
+                        detail = "another FS rank failed"
+                    logger.error("DLO pinned Host allocation failed: %s", detail)
+                    raise RuntimeError("pinned allocation failed on at least one FS rank")
+                fallback_reason = detail or "another FS rank failed"
+                cpu_shards = None
+
+            if cpu_shards is None:
+                manifest = build_part_manifest(
+                    chunk_specs,
+                    block_id=self._block_ids[id(module)],
+                    part_id="block",
+                    weight_shard_size=self.weight_shard_size,
+                    weight_shard_rank=self.weight_shard_rank,
+                    chunk_size_bytes=self.config.chunk_size_bytes,
+                    alignment_bytes=self._alignment_bytes,
+                    layout=WeightLayout.WHOLE_BLOCK,
+                )
+                cpu_shards = pack_local_shard(
+                    chunk_specs,
+                    manifest,
+                    allocator=lambda numel, dtype: torch.empty(numel, dtype=dtype, device="cpu"),
+                )
+                fallback_blocks += 1
+            else:
+                pinned_bytes += manifest.pinned_bytes
+
+            self.pin_budget.reserve(block.path)
+            self._planned_manifests[id(module)] = manifest
+
+            metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+            for dtype_manifest in manifest.dtypes:
+                metadata[dtype_manifest.dtype] = [
+                    {
+                        "name": tensor.name,
+                        "offset": tensor.offset,
+                        "numel": tensor.numel,
+                        "shape": torch.Size(tensor.shape),
+                        "stride": tensor.stride,
+                    }
+                    for tensor in dtype_manifest.tensors
+                ]
+
+            # Host storage now owns the weights: drop the original storage so
+            # the mmap views and CPU copies can be released.
+            chunked_names = {tensor.name for dtype_manifest in manifest.dtypes for tensor in dtype_manifest.tensors}
+            sources = {name: tensor for name, tensor, _ in specs}
+            for name in chunked_names:
+                set_tensor_storage(sources[name], make_offload_placeholder(sources[name]))
+            # Tensors the chunk transport cannot carry (0-dim, integer dtypes)
+            # stay resident on device.
+            for name, tensor, _is_buffer in specs:
+                if name not in chunked_names and is_materialized_tensor(tensor):
+                    set_tensor_storage(tensor, tensor.detach().to(self.device))
+
+            self._prepared_host_parts[id(module)] = {
+                "cpu_shards": cpu_shards,
+                "metadata": metadata,
+                "manifest": manifest,
+                "fallback_reason": fallback_reason,
+            }
+
+        logger.info(
+            "DLO Host storage ready: pinned=%.3f GiB fallback_blocks=%d/%d",
+            pinned_bytes / 1024**3,
+            fallback_blocks,
+            len(ownership.blocks),
+        )
+
+    def _agree_pin_failure(self, failed: int) -> bool:
+        """Return the FS-wide OR of per-rank pinned allocation failure."""
+        group = self.config.weight_shard_cpu_group or self.weight_shard_cpu_group
+        if self.weight_shard_size <= 1 or group is None or not torch.distributed.is_initialized():
+            return bool(failed)
+        flag = torch.tensor([failed], dtype=torch.int32)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=group)
+        return bool(flag.item())
+
+    def _validate_manifest_consistency(self, ownership: ChunkOwnership) -> None:
+        """Fail before HCCL if any FS rank planned a different schedule."""
+        if self.weight_shard_size <= 1:
+            return
+        group = self.config.weight_shard_cpu_group or self.weight_shard_cpu_group
+        if group is None or not torch.distributed.is_initialized():
+            raise RuntimeError("DLO manifest validation requires the FS CPU process group")
+
+        signature = []
+        for block in ownership.blocks:
+            manifest = self._prepared_host_parts[id(block.module)]["manifest"]
+            signature.append(
+                (
+                    manifest.block_id,
+                    block.path,
+                    manifest.digest,
+                    manifest.layout.value,
+                    tuple(
+                        (
+                            str(dtype_manifest.dtype),
+                            len(dtype_manifest.chunks),
+                            dtype_manifest.total_numel,
+                            dtype_manifest.padded_numel,
+                            dtype_manifest.local_numel,
+                        )
+                        for dtype_manifest in manifest.dtypes
+                    ),
+                )
+            )
+
+        gathered: list[Any] = [None] * self.weight_shard_size
+        torch.distributed.all_gather_object(gathered, signature, group=group)
+        mismatched = [rank for rank, remote in enumerate(gathered) if remote != signature]
+        if mismatched:
+            raise RuntimeError(
+                "DLO manifest/schedule mismatch across the FS group before the first "
+                f"weight collective; mismatched_ranks={mismatched}"
+            )
+        logger.info("Validated identical DLO manifest schedule across %d FS ranks", self.weight_shard_size)
+
+    # ------------------------------------------------------------------ #
+    #  Request lifecycle                                                  #
+    # ------------------------------------------------------------------ #
+
+    def begin_request(self) -> None:
+        """Open one request's transport generation across every hook."""
+        if self._request_active:
+            raise RuntimeError("DLO request re-entry is not supported")
+        self._request_active = True
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.set_request_generation(self._request_generation)
+
+    def end_request(self) -> None:
+        """Drain in-flight transfers and retire this request's generation."""
+        if not self._request_active:
+            raise RuntimeError("DLO request lifecycle ended without a matching begin")
+        self._drain_transport()
+        self._request_generation += 1
+        self._request_active = False
+
+    @contextmanager
+    def request_context(self) -> Iterator[None]:
+        self.begin_request()
+        try:
+            yield
+        finally:
+            self.end_request()
+
+    def _drain_transport(self) -> None:
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.drain_request()
+        if self._shared_slot_group is not None:
+            for slot in range(len(self._shared_slot_group)):
+                self._shared_slot_group[slot] = -1
+                self._shared_slot_owners[slot] = None
+
+    def get_transport_metrics(self) -> dict[str, Any]:
+        """Report the exact Host/device staging cost of the chunked transport."""
+        manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
+        fallback_parts = sum(
+            1 for part in self._prepared_host_parts.values() if part.get("fallback_reason") is not None
+        )
+
+        logical_weight_bytes = 0
+        max_padded: dict[torch.dtype, int] = {}
+        max_local_chunk: dict[torch.dtype, int] = {}
+        for manifest in manifests:
+            for dtype_manifest in manifest.dtypes:
+                element_size = _dtype_size(dtype_manifest.dtype)
+                logical_weight_bytes += dtype_manifest.total_numel * element_size
+                dtype = dtype_manifest.dtype
+                max_padded[dtype] = max(max_padded.get(dtype, 0), dtype_manifest.padded_numel)
+                max_local_chunk[dtype] = max(max_local_chunk.get(dtype, 0), dtype_manifest.local_chunk_numel)
+
+        full_output_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_padded.items())
+        local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
+
+        submissions = 0
+        submitted_chunks = 0
+        consumer_attaches = 0
+        releases = 0
+        for group in self._all_hook_groups:
+            for hook in group:
+                counters = hook.transport.counters
+                submissions += counters.submissions
+                submitted_chunks += counters.submitted_chunks
+                consumer_attaches += counters.consumer_attaches
+                releases += counters.releases
+
+        parts = len(self._prepared_host_parts)
+        return {
+            "weight_shard_size": self.weight_shard_size,
+            "parts": parts,
+            "logical_weight_bytes": logical_weight_bytes,
+            "pinned_required_bytes": self.pin_budget.required_bytes if self.pin_budget is not None else 0,
+            "pinned_reserved_bytes": self.pin_budget.reserved_bytes if self.pin_budget is not None else 0,
+            "full_output_staging_bytes": full_output_staging_bytes,
+            "local_input_staging_bytes": local_input_staging_bytes,
+            "transport_staging_bytes": full_output_staging_bytes + local_input_staging_bytes,
+            # torch.distributed/HCCL does not expose its internal workspace
+            # allocation through this backend. Keep it separate from the two
+            # explicitly owned staging pools instead of double-counting them.
+            "collective_workspace_bytes": None,
+            "fallback_parts": fallback_parts,
+            "fallback_ratio": (fallback_parts / parts) if parts else 0.0,
+            "request_generation": self._request_generation,
+            "submissions": submissions,
+            "submitted_chunks": submitted_chunks,
+            "consumer_attaches": consumer_attaches,
+            "releases": releases,
+        }
+
+    def reset_transport_counters(self) -> None:
+        """Reset request activity counters at a benchmark boundary."""
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.transport.reset_counters()
+
+    # ------------------------------------------------------------------ #
+    #  Ownership, hook construction, shared events                        #
+    # ------------------------------------------------------------------ #
+
+    def _build_chunk_ownership(self) -> ChunkOwnership:
+        """Enumerate every streamed block and assign stable small block ids.
+
+        The trace analyzer selects a window of *consecutive* block ids, so ids
+        are consecutive integers in forward order rather than ``id(module)``.
+        """
+        ownership = ChunkOwnership()
+        next_block_id = 0
+        for blocks, group_path in self._pending_block_groups:
+            for index, block in enumerate(blocks):
+                key = id(block)
+                if key in self._block_ids:
+                    continue
+                self._block_ids[key] = next_block_id
+                ownership.block_ids[key] = next_block_id
+                next_block_id += 1
+                ownership.blocks.append(ChunkOwnedBlock(module=block, path=f"{group_path}.{index}"))
+        self._chunk_ownership = ownership
+        return ownership
+
+    def _resolve_chunk_ownership(self, pipeline: nn.Module) -> ChunkOwnership:
+        """Consume the loader ownership handoff and select streamed blocks.
+
+        The loader delegates every repeated block away from FSDP, including a
+        resident prefix.  This backend only builds chunk manifests for blocks
+        in ``_pending_block_groups``.  Filter the loader handoff to that subset
+        while preserving its stable paths and block ids, and fail before any
+        collective if loader and runtime discovery disagree.
+        """
+        loader_ownership = getattr(pipeline, "_dlo_chunk_ownership", None)
+        if loader_ownership is None:
+            if self.config.use_hsdp and self.config.dlo_use_allgather:
+                raise RuntimeError(
+                    "DLO loader ownership handoff is missing under HSDP+AllGather. "
+                    "The loader must call discover_chunk_owned_blocks() and attach "
+                    "_dlo_chunk_ownership to the pipeline before apply_hsdp_to_model(), "
+                    "so that every repeated-block parameter has exactly one owner. "
+                    "Without the handoff, FSDP would also claim those parameters and "
+                    "produce incorrect double-sharded AllGather results."
+                )
+            # Non-HSDP (standard-loader) path: no loader handoff exists, so
+            # build ownership from the runtime block list collected during enable().
+            return self._build_chunk_ownership()
+
+        loader_blocks = list(getattr(loader_ownership, "blocks", ()))
+        loader_block_ids = dict(getattr(loader_ownership, "block_ids", {}))
+        published_block_ids = dict(getattr(pipeline, "_dlo_block_ids", loader_block_ids))
+        if not loader_blocks or not loader_block_ids:
+            raise RuntimeError("DLO loader ownership handoff is empty or missing block_ids")
+        if published_block_ids != loader_block_ids:
+            raise RuntimeError("DLO loader ownership and published block_ids disagree")
+
+        loader_by_module: dict[int, Any] = {}
+        loader_order: list[int] = []
+        for entry in loader_blocks:
+            module_id = id(entry.module)
+            if module_id in loader_by_module:
+                raise RuntimeError(f"DLO loader ownership contains duplicate module path={entry.path!r}")
+            if module_id not in loader_block_ids:
+                raise RuntimeError(f"DLO loader ownership has no block id for path={entry.path!r}")
+            loader_by_module[module_id] = entry
+            loader_order.append(module_id)
+
+        ordered_ids = [loader_block_ids[module_id] for module_id in loader_order]
+        if ordered_ids != list(range(len(loader_order))):
+            raise RuntimeError(
+                f"DLO loader block ids must be consecutive and follow execution order: got={ordered_ids[:16]}"
+            )
+
+        pending_modules = [block for blocks, _group_path in self._pending_block_groups for block in blocks]
+        pending_order = [id(block) for block in pending_modules]
+        if len(pending_order) != len(set(pending_order)):
+            raise RuntimeError("DLO runtime discovery contains duplicate streamed blocks")
+
+        missing = [module_id for module_id in pending_order if module_id not in loader_by_module]
+        if missing:
+            raise RuntimeError(
+                "DLO runtime discovery found streamed blocks that were not delegated by the loader: "
+                f"count={len(missing)}"
+            )
+
+        loader_pending_order = [module_id for module_id in loader_order if module_id in set(pending_order)]
+        if loader_pending_order != pending_order:
+            raise RuntimeError("DLO loader and runtime block execution order disagree")
+
+        resident_ids = {id(block) for block in self._resident_blocks}
+        unclaimed = set(loader_order) - set(pending_order) - resident_ids
+        if unclaimed:
+            raise RuntimeError(
+                "DLO loader delegated blocks that runtime discovery neither streams nor keeps resident: "
+                f"count={len(unclaimed)}"
+            )
+
+        ownership = ChunkOwnership()
+        self._block_ids = {}
+        for module_id in pending_order:
+            entry = loader_by_module[module_id]
+            block_id = loader_block_ids[module_id]
+            ownership.blocks.append(ChunkOwnedBlock(module=entry.module, path=entry.path))
+            ownership.block_ids[module_id] = block_id
+            self._block_ids[module_id] = block_id
+
+        self._chunk_ownership = ownership
+        logger.info(
+            "Accepted DLO loader ownership handoff: delegated=%d streamed=%d resident=%d",
+            len(loader_blocks),
+            len(ownership.blocks),
+            len(resident_ids),
+        )
+        return ownership
+
+    def _create_block_hook(
+        self,
+        module: nn.Module,
+        next_block: nn.Module,
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None],
+    ) -> DistributedLayerwiseOffloadHook:
+        """Register one hook that transports *next_block* into a shared slot."""
+        prepared = self._prepared_host_parts[id(next_block)]
+        hook = apply_distributed_block_hook(
+            module,
+            next_block,
+            self.device,
+            self.weight_shard_group,
+            self.weight_shard_size,
+            self.weight_shard_rank,
+            copy_stream=self.copy_stream,
+            comm_stream=self.comm_stream,
+            shared_buffers=shared_buffers,
+            shared_chunk_slot_events=self._shared_chunk_slot_events,
+            shared_output_slot_events=self._shared_output_slot_events,
+            shared_slot_owners=self._shared_slot_owners,
+            prepared_host_part=prepared,
+            h2d_done_events=self._shared_h2d_done_events,
+            transport_done_events=self._shared_transport_done_events,
+            output_ready_events=self._shared_output_ready_events,
+            last_use_events=self._shared_last_use_events,
+            prefetch_executor=self._prefetch_executor,
+        )
+        # The 'compute' trace marker names the module being computed, not the
+        # block whose weights this hook transports.
+        hook.compute_block_id = self._block_ids[id(module)]
+        hook.set_request_generation(self._request_generation)
+        return hook
+
+    def _bootstrap_first_group(self) -> None:
+        """Synchronously materialize block 0 before the first forward."""
+        if not self._all_hook_groups:
+            return
+        group = self._all_hook_groups[0]
+        if len(group) < 2:
+            raise RuntimeError("DLO hook ring requires at least two blocks")
+        first_producer = group[0]  # tail block -> block 0
+        first_consumer = group[1]  # block 0 -> block 1
+        first_slot = first_consumer.current_slot
+        first_producer.prefetch_layer(slot=first_slot, non_blocking=False)
+        first_consumer.get_weights(first_slot)
+
+    def _allocate_shared_events(self) -> None:
+        """Allocate the per-slot event arrays once and share them everywhere.
+
+        Allocating here (instead of per hook, per forward) keeps the submit
+        path free of Event construction.
+        """
+        if not self._shared_h2d_done_events:
+            self._shared_h2d_done_events = [current_omni_platform.Event() for _ in range(2)]
+        if not self._shared_transport_done_events:
+            self._shared_transport_done_events = [current_omni_platform.Event() for _ in range(2)]
+        if not self._shared_output_ready_events:
+            self._shared_output_ready_events = [current_omni_platform.Event() for _ in range(2)]
+        self._shared_last_use_events = [current_omni_platform.Event() for _ in range(2)]
+        self._shared_chunk_slot_events = [None, None]
+        self._shared_output_slot_events = [None, None]
 
     def _register_on_demand_hook(self, module: nn.Module, label: str, *, stage_on_demand: bool = False) -> None:
         """Prepare a pipeline-managed stage component or keep it resident.
@@ -1267,12 +2081,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         num_blocks = len(blocks)
         logger.info(
-            "Distributed layerwise offload for submodule '%s.%s' (%d blocks, %.0f MB total, dp_size=%d)",
+            "Distributed layerwise offload for submodule '%s.%s' (%d blocks, %.0f MB total, weight_shard_size=%d)",
             name,
             blocks_attr,
             num_blocks,
             sum(p.nelement() * p.element_size() for p in module.parameters()) / 1048576,
-            self.dp_size,
+            self.weight_shard_size,
         )
 
         # Move non-block parts of the submodule to GPU (small: embeddings, norms)
@@ -1280,60 +2094,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             if child_name != blocks_attr:
                 child.to(self.device)
 
-        # Apply distributed hooks (1/4 sharding + AllGather, same as DiT)
-        # Pass shared_buffers=[None,None] to defer per-hook allocation
-        # (prevents OOM on large models where N hooks × 2 buffers >> HBM)
-        last_block, first_block = blocks[-1], blocks[0]
-        last_hook = apply_distributed_block_hook(
-            last_block,
-            first_block,
-            self.device,
-            self.dp_group,
-            self.dp_size,
-            self.rank,
-            self.copy_stream,
-            self.comm_stream,
-            self.config.pin_cpu_memory,
-            shared_buffers=[None, None],
-            rank_local_mmap=self._using_rank_local_mmap,
-            tensor_transforms=self._mmap_transforms_by_tensor_id,
-        )
-        sub_hooks = [last_hook]
-        for i, block in enumerate(blocks[:-1]):
-            next_block = blocks[(i + 1) % num_blocks]
-            hook = apply_distributed_block_hook(
-                block,
-                next_block,
-                self.device,
-                self.dp_group,
-                self.dp_size,
-                self.rank,
-                self.copy_stream,
-                self.comm_stream,
-                self.config.pin_cpu_memory,
-                shared_buffers=[None, None],
-                rank_local_mmap=self._using_rank_local_mmap,
-                tensor_transforms=self._mmap_transforms_by_tensor_id,
-            )
-            sub_hooks.append(hook)
-
-        # Wire backward references + slot alternation
-        for i in range(len(sub_hooks)):
-            sub_hooks[i]._prev_hook = sub_hooks[i - 1]
-        # Assign slots in list order: sub_hooks = [last_hook, block0, ..., blockN-2]
-        # This ensures last_hook.current_slot != block0_hook.current_slot,
-        # so the circular prefetch (last_hook -> block0) writes to a
-        # different slot than block0 reads from.  Correct for ALL N.
-        for i, hook in enumerate(sub_hooks):
-            hook.current_slot = i % 2
-        # Mark block0_hook (index 1) as group-first — it must sync-prefetch
-        # on entry because another group may have overwritten the shared slot.
-        if len(sub_hooks) > 1:
-            sub_hooks[1]._is_group_first = True
-
-        # Defer buffer allocation and prefetch to enable() unified allocation
-        self._all_hook_groups.append(sub_hooks)
-        self._blocks.append(blocks)
+        # Hook creation is deferred: the manifest plan must clear the pin cap
+        # for every block before any Host or device buffer is allocated.
+        self._pending_block_groups.append((list(blocks), f"{name}.{blocks_attr}"))
         return True
 
     def _prepare_dit_non_block_modules(
@@ -1412,9 +2175,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._on_demand_shard_infos: list[dict] = []
         self._on_demand_handles: list[Any] = []
 
-        # Initialize DP group (if not already done by early init)
-        if self.dp_group is None and self.dp_size > 1:
-            self._init_dp_group()
+        # Resolve the FS group that owns the weight shard dimension.
+        if self.weight_shard_group is None:
+            self._init_weight_shard_group()
 
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
@@ -1439,9 +2202,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Storage selection belongs to the loader.  DLO consumes the exact
         # prevalidated plan that caused the loader to skip materialization;
         # without a plan, all weights must already come from the ordinary
-        # loader.  The transfer protocol is selected independently below.
+        # loader (or, under HSDP, from the HSDP loader — the plan builder
+        # declines HSDP, so chunk-owned blocks arrive as ordinary tensors
+        # here).  The chunked transfer protocol is selected independently
+        # below.
         self._using_mmap = self.host_weight_plan is not None
-        self._using_rank_local_mmap = self._using_mmap and self.dp_size <= 1
+        self._using_rank_local_mmap = self._using_mmap and self.weight_shard_size <= 1
         if self._using_mmap:
             if self.host_weight_plan.backing_kind != "checkpoint_mmap":
                 raise ValueError(f"Unsupported DLO host-weight backing: {self.host_weight_plan.backing_kind}")
@@ -1450,11 +2216,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 modules,
                 self.host_weight_plan,
             )
-            if self._using_rank_local_mmap:
-                logger.info(
-                    "DLO rank-local mmap storage enabled: checkpoint pages are "
-                    "node-shared; each worker owns only two bounded host staging slots"
-                )
         else:
             remaining_meta = [
                 name
@@ -1551,46 +2312,65 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self._resident_blocks.extend(blocks)
                 continue
 
-            # Register hooks in a circular sliding window:
-            # last block prefetches first block, block i prefetches block (i+1)
-            # All hooks share 2 global device buffers (RFC: "exactly two layers on device")
-            last_block, first_block = blocks[-1], blocks[0]
+            # Hook creation is deferred: the Host plan must enforce the pin cap
+            # and pack every block's Host shard before any hook exists, because
+            # a hook requires a backend-prepared Host part.
+            self._pending_block_groups.append((list(blocks), dit_name))
 
-            # Pass 1: create hooks with deferred buffer allocation
-            # (shared_buffers=[None,None] prevents per-hook OOM on large models)
-            last_hook = apply_distributed_block_hook(
-                last_block,
-                first_block,
+        if self._resident_blocks:
+            self._resident_layer_group = PinnedResidentLayerGroup(
+                self._resident_blocks,
                 self.device,
-                self.dp_group,
-                self.dp_size,
-                self.rank,
                 self.copy_stream,
-                self.comm_stream,
                 self.config.pin_cpu_memory,
-                shared_buffers=[None, None],
-                rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
             )
+            pipeline._dlo_residency_controller = self
 
-            block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
+        if not self._pending_block_groups:
+            self.enabled = bool(self._resident_blocks)
+            if self._using_mmap:
+                # The resident group already copied every planned tensor out
+                # of the mmap views; nothing else will read them.
+                self._release_mmap_handles()
+            return
+
+        # 1. Ownership + stable block ids (small consecutive ints so the trace
+        #    analyzer sees contiguous block ranges).
+        ownership = self._resolve_chunk_ownership(pipeline)
+
+        # 2. Plan every final layout and enforce the pin cap before allocation.
+        self._plan_chunk_manifests(ownership)
+
+        # 3. Pack Host shards; this replaces the original parameter storage.
+        self._prepare_host_storage(ownership)
+        self._validate_manifest_consistency(ownership)
+
+        # 4. Unified allocation sized from the *prepared* manifests (which may
+        #    have been rebuilt as WHOLE_BLOCK by the fallback path).
+        prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
+        unified_buffers = self._allocate_shared_buffers(prepared_manifests)
+        unified_chunk_buffers = None
+        if self.weight_shard_size > 1:
+            unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
+        self._allocate_shared_events()
+
+        # Shared slot-group tracker: _shared_slot_group[slot] = group_id
+        # that last wrote to that slot.  Group-first hooks use this to
+        # skip sync-prefetch when the slot still contains their own data.
+        shared_slot_group = [-1, -1]
+        self._shared_slot_group = shared_slot_group
+
+        # 5. Create the hooks in a circular sliding window:
+        #    last block prefetches first block, block i prefetches block (i+1).
+        #    All hooks share 2 global device buffers.
+        for group_idx, (blocks, _group_path) in enumerate(self._pending_block_groups):
+            num_blocks = len(blocks)
+            block_hooks: list[DistributedLayerwiseOffloadHook] = [
+                self._create_block_hook(blocks[-1], blocks[0], unified_buffers)
+            ]
             for i, block in enumerate(blocks[:-1]):
-                next_block = blocks[(i + 1) % num_blocks]
-                hook = apply_distributed_block_hook(
-                    block,
-                    next_block,
-                    self.device,
-                    self.dp_group,
-                    self.dp_size,
-                    self.rank,
-                    self.copy_stream,
-                    self.comm_stream,
-                    self.config.pin_cpu_memory,
-                    shared_buffers=[None, None],
-                    rank_local_mmap=self._using_rank_local_mmap,
-                    tensor_transforms=self._mmap_transforms_by_tensor_id,
-                )
-                block_hooks.append(hook)
+                block_hooks.append(self._create_block_hook(block, blocks[(i + 1) % num_blocks], unified_buffers))
 
             # Wire backward references for cache-dit fallback
             for i in range(len(block_hooks)):
@@ -1602,76 +2382,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # different slot than block0 reads from.  Correct for ALL N.
             for i, hook in enumerate(block_hooks):
                 hook.current_slot = i % 2
+                hook._group_id = group_idx
+                hook._shared_slot_group = shared_slot_group
+                if unified_chunk_buffers is not None:
+                    hook.gpu_shard_buffers = unified_chunk_buffers
 
             # Mark block0_hook (index 1) as group-first
             if len(block_hooks) > 1:
                 block_hooks[1]._is_group_first = True
+            block_hooks[0]._is_group_tail = True
 
-            # Defer buffer allocation — collected for unified allocation below
             self._all_hook_groups.append(block_hooks)
             self._blocks.append(blocks)
-
-        if self._resident_blocks:
-            self._resident_layer_group = PinnedResidentLayerGroup(
-                self._resident_blocks,
-                self.device,
-                self.copy_stream,
-                self.config.pin_cpu_memory,
-                rank_local_mmap=self._using_rank_local_mmap,
-                defer_staging=bool(self._all_hook_groups),
-                tensor_transforms=self._mmap_transforms_by_tensor_id,
-            )
-            pipeline._dlo_residency_controller = self
-
-        if not self._all_hook_groups:
-            self.enabled = bool(self._resident_blocks)
-            if self._using_mmap and not self.enabled:
-                self._release_mmap_handles()
-            return
-
-        # Unified allocation: 2 shared output buffers + 2 shared shard buffers
-        # sized to the max block across ALL module groups (gen_layers +
-        # language_model).  Groups execute sequentially, so 2 buffers suffice.
-        all_hooks: list[DistributedLayerwiseOffloadHook] = []
-        for group in self._all_hook_groups:
-            all_hooks.extend(group)
-
-        unified_buffers = self._allocate_shared_buffers(all_hooks)
-        unified_shard_buffers = None
-        if self.dp_size > 1:
-            unified_shard_buffers = self._allocate_shared_shard_buffers(all_hooks)
-        unified_cpu_staging = None
-        cpu_staging_events = None
-        if self._using_rank_local_mmap:
-            unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
-                all_hooks,
-                self._resident_layer_group,
-            )
-            cpu_staging_events = [None, None]
-            if self._resident_layer_group is not None:
-                # Resident and streamed layers execute in the same stage and
-                # reuse the same host slots. Events serialize slot reuse.
-                self._resident_layer_group._cpu_staging_buffers = [
-                    buffers for buffers in unified_cpu_staging if buffers is not None
-                ]
-                self._resident_layer_group._cpu_staging_events = cpu_staging_events
-
-        # Shared slot-group tracker: _shared_slot_group[slot] = group_id
-        # that last wrote to that slot.  Group-first hooks use this to
-        # skip sync-prefetch when the slot still contains their own data.
-        shared_slot_group = [-1, -1]
-
-        for group_idx, group in enumerate(self._all_hook_groups):
-            for hook in group:
-                hook.gpu_buffers = unified_buffers
-                hook._owns_buffers = False
-                if unified_shard_buffers is not None:
-                    hook.gpu_shard_buffers = unified_shard_buffers
-                if unified_cpu_staging is not None and cpu_staging_events is not None:
-                    hook.cpu_staging_buffers = unified_cpu_staging
-                    hook.cpu_staging_events = cpu_staging_events
-                hook._group_id = group_idx
-                hook._shared_slot_group = shared_slot_group
 
         # Prefetch first block of the FIRST module group only.
         # Subsequent groups share the same 2 device buffers; prefetching
@@ -1681,25 +2403,22 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # pre_forward will sync-prefetch on-demand via the is_materialized
         # check — by which point the first group's forward has completed
         # and its buffer slots are free.
-        if self._all_hook_groups:
-            group = self._all_hook_groups[0]
-            first_slot = group[0].current_slot
-            group[-1].prefetch_layer(slot=first_slot, non_blocking=False)
-            group[-1].get_weights(first_slot)
+        self._bootstrap_first_group()
 
         total_blocks = sum(len(b) for b in self._blocks)
         logger.info(
             f"Distributed layer-wise offloading enabled on {total_blocks} blocks "
-            f"across {len(self._all_hook_groups)} group(s), dp_size={self.dp_size}, "
-            f"unified shared_buffers=2"
+            f"across {len(self._all_hook_groups)} group(s), "
+            f"weight_shard_size={self.weight_shard_size}, unified shared_buffers=2"
         )
 
         self.enabled = True
 
-        if self._using_mmap and not self._using_rank_local_mmap:
-            # AllGather mode copied each rank's persistent shard, so the source
-            # mappings are no longer needed. Rank-local mode retains them as
-            # the node-shared host master until disable().
+        if self._using_mmap:
+            # _prepare_host_storage packed every planned tensor into private
+            # Host shards and rebound the parameters to placeholders, so the
+            # mmap views (and their file handles) are no longer referenced in
+            # either AllGather or rank-local mode.
             self._release_mmap_handles()
 
         # Assign GPU buffers to sharded on-demand modules (VAE/encoders).
@@ -1710,8 +2429,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             out_bufs: dict[torch.dtype, torch.Tensor] = {}
             in_bufs: dict[torch.dtype, torch.Tensor] = {}
             for dtype, shard in si["cpu_shards"].items():
-                # AllGather output = dp_size * shard_size
-                full_size = shard.numel() * self.dp_size if self.dp_size > 1 else shard.numel()
+                # AllGather output = weight_shard_size * shard_size
+                full_size = shard.numel() * self.weight_shard_size if self.weight_shard_size > 1 else shard.numel()
                 out_bufs[dtype] = torch.empty(full_size, dtype=dtype, device=self.device)
                 in_bufs[dtype] = torch.empty(shard.shape, dtype=dtype, device=self.device)
             si["gpu_output"] = out_bufs
@@ -1746,8 +2465,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self.enabled and not hasattr(self, "_mmap_file_cache"):
             return
 
-        if self._using_rank_local_mmap:
-            current_omni_platform.synchronize()
+        # Join outstanding submits and retire every bootstrap/tail ticket
+        # before closing the transport state.
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.drain_request()
+
+        # Close every hook's transport so pinned Host shards are released and
+        # the slot state machine is locked against further use.
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.transport.close()
+                hook.cpu_shards = {}  # drop pinned-memory references
 
         for blocks in self._blocks:
             for block in blocks:
@@ -1767,36 +2496,39 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self.enabled = False
+
+        # Drain the single-worker executor.  Pending submits were already
+        # joined above; shutdown() here just releases the thread cleanly so
+        # repeated enable/disable cycles don't accumulate threads.
+        self._prefetch_executor.shutdown(wait=False)
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dlo_prefetch"
+        )
+
         logger.info("Distributed layer-wise offloading disabled")
 
-    @staticmethod
     def _allocate_shared_buffers(
-        hooks: list[DistributedLayerwiseOffloadHook],
+        self,
+        manifests: list[PartManifest],
     ) -> list[dict[torch.dtype, torch.Tensor] | None]:
-        """Allocate exactly 2 shared device buffers sized to the largest block.
+        """Allocate exactly 2 shared full-output buffers for the largest block.
 
-        All hooks share these 2 buffers. At any time, slot 0 holds the current
-        layer's weights and slot 1 holds the next layer's weights (or vice
-        versa). This ensures only 2 layers' worth of weights reside on device,
-        regardless of the total number of blocks.
+        Both slots are sized to the maximum *padded* per-dtype extent across
+        every group, because ``all_gather_into_tensor`` writes
+        ``weight_shard_size * local_numel`` elements per chunk and the last
+        chunk of a block is padded up to that multiple.
         """
         max_sizes: dict[torch.dtype, int] = {}
-        for hook in hooks:
-            dp = hook.dp_size
-            for dtype, metas in hook.metadata.items():
-                total = sum(m["numel"] for m in metas)
-                # AllGather output = dp * ceil(total/dp) (padded for equal shards)
-                if dp > 1:
-                    total = ((total + dp - 1) // dp) * dp
-                if dtype not in max_sizes or total > max_sizes[dtype]:
-                    max_sizes[dtype] = total
+        for manifest in manifests:
+            for dtype_manifest in manifest.dtypes:
+                dtype = dtype_manifest.dtype
+                max_sizes[dtype] = max(max_sizes.get(dtype, 0), dtype_manifest.padded_numel)
 
-        device = hooks[0].device
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
         for slot in range(2):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
             for dtype, total_numel in max_sizes.items():
-                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=device)
+                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=self.device)
             shared_buffers[slot] = gpu_weights
 
         logger.info(
@@ -1805,70 +2537,32 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         return shared_buffers
 
-    @staticmethod
-    def _allocate_shared_cpu_staging_buffers(
-        hooks: list[DistributedLayerwiseOffloadHook],
-        resident_group: PinnedResidentLayerGroup | None = None,
+    def _allocate_shared_chunk_buffers(
+        self,
+        manifests: list[PartManifest],
     ) -> list[dict[torch.dtype, torch.Tensor] | None]:
-        """Allocate two bounded host slots for rank-local mmap -> device copies."""
-        max_sizes: dict[torch.dtype, int] = {}
-        for hook in hooks:
-            for dtype, metas in hook.metadata.items():
-                total = sum(meta["numel"] for meta in metas)
-                max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
-        if resident_group is not None:
-            for state in resident_group._states:
-                for dtype, metas in state["metadata"].items():
-                    total = sum(meta["numel"] for meta in metas)
-                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
+        """Allocate 2 shared local-chunk (AllGather input) buffers.
 
-        pin_memory = hooks[0].pin_memory if hooks else bool(resident_group and resident_group.pin_memory)
-        shared_staging: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
-        for slot in range(2):
-            buffers: dict[torch.dtype, torch.Tensor] = {}
-            for dtype, total_numel in max_sizes.items():
-                buffer = torch.empty(total_numel, dtype=dtype, device="cpu")
-                if pin_memory:
-                    buffer = buffer.pin_memory()
-                buffers[dtype] = buffer
-            shared_staging[slot] = buffers
-
-        logger.info(
-            "Allocated 2 shared host staging buffers for rank-local mmap (max block size: %s, pinned=%s)",
-            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
-            pin_memory,
-        )
-        return shared_staging
-
-    @staticmethod
-    def _allocate_shared_shard_buffers(
-        hooks: list[DistributedLayerwiseOffloadHook],
-    ) -> list[dict[torch.dtype, torch.Tensor] | None]:
-        """Allocate 2 shared shard (AllGather input) buffers sized to the
-        largest per-rank shard.
-
-        All hooks share these 2 input buffers — the same device address is
-        reused for every layer's AllGather so HCCL can reuse its internal
-        communication buffers (preventing rank-dependent HBM imbalance).
-        Cost: 2 × max_shard_size (~184 MB) instead of 2 × N_hooks × shard.
+        These are indexed by *input* slot, not output slot: chunk ``i`` uses
+        input slot ``i % 2`` so the H2D of chunk ``i+1`` overlaps the AllGather
+        of chunk ``i``.  Reusing the same two device addresses for every block
+        lets HCCL reuse its internal communication buffers.
         """
-        max_shard_sizes: dict[torch.dtype, int] = {}
-        for hook in hooks:
-            for dtype, shard in hook.cpu_shards.items():
-                numel = shard.numel()
-                if dtype not in max_shard_sizes or numel > max_shard_sizes[dtype]:
-                    max_shard_sizes[dtype] = numel
+        max_chunk_sizes: dict[torch.dtype, int] = {}
+        for manifest in manifests:
+            for dtype_manifest in manifest.dtypes:
+                dtype = dtype_manifest.dtype
+                max_chunk_sizes[dtype] = max(max_chunk_sizes.get(dtype, 0), dtype_manifest.local_chunk_numel)
 
-        device = hooks[0].device
-        shared_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        shared_chunk_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
         for slot in range(2):
-            shard_bufs: dict[torch.dtype, torch.Tensor] = {}
-            for dtype, numel in max_shard_sizes.items():
-                shard_bufs[dtype] = torch.empty(numel, dtype=dtype, device=device)
-            shared_shard_buffers[slot] = shard_bufs
+            chunk_bufs: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, numel in max_chunk_sizes.items():
+                chunk_bufs[dtype] = torch.empty(numel, dtype=dtype, device=self.device)
+            shared_chunk_buffers[slot] = chunk_bufs
 
         logger.info(
-            "Allocated 2 shared shard buffers (max shard size: %s)",
-            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_shard_sizes.items()},
+            "Allocated 2 shared local chunk buffers (max chunk size: %s)",
+            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_chunk_sizes.items()},
         )
-        return shared_shard_buffers
+        return shared_chunk_buffers

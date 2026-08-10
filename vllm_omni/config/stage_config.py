@@ -384,6 +384,9 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    dlo_chunk_size_mb: int | None = None
+    dlo_pin_budget_gb: float | None = None
+    dlo_pin_failure_policy: str | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

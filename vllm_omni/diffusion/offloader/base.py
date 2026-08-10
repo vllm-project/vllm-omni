@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -52,6 +52,15 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    # Stage-1 chunked H2D + FS AllGather overlap
+    chunk_size_bytes: int = 64 * 1024 * 1024  # 64 MiB full-chunk target
+    dlo_pin_budget_bytes: int | None = None  # None = unlimited
+    dlo_pin_failure_policy: str = "fail"  # "fail" | "whole_block_fallback"
+    # Resolved FS group (set by _init_weight_shard_group, not user-configurable)
+    weight_shard_size: int = 1
+    weight_shard_rank: int = 0
+    weight_shard_group: Any | None = None
+    weight_shard_cpu_group: Any | None = None
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -139,15 +148,40 @@ class OffloadConfig:
                 "the backend will select mmap or standard-loader host storage"
             )
 
-        # HSDP already shards parameters into DTensors.  Running distributed
-        # layerwise offload on top would shard each to_local() again, producing
-        # incorrect reconstruction after AllGather.  Reject this combination.
-        if enable_distributed_layerwise_offload and use_hsdp and dlo_use_allgather:
+        # HSDP + DLO/AllGather is supported: ownership is split structurally.
+        # The repeated DiT blocks are resolved before HSDP wrapping and handed
+        # to the chunk engine, and those same tensors are added to FSDP's
+        # ignored_params so fully_shard never touches them. Every parameter
+        # therefore has exactly one owner (FSDP *or* the chunk engine), which
+        # is what previously made double-sharding possible.
+
+        # Explicit fully-shard (FS) axis for the chunked weight transport.
+        # This is deliberately NOT dp_size: under HSDP the replicate axis
+        # serves independent requests, so it must never take part in a weight
+        # collective. Only the fully-shard degree does.
+        weight_shard_size = dp_size
+        if use_hsdp and dlo_use_allgather:
+            hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if parallel_config else -1
+            if not hsdp_shard_size or hsdp_shard_size <= 0:
+                raise ValueError(
+                    "Distributed layerwise offload with AllGather under HSDP requires a "
+                    f"positive parallel_config.hsdp_shard_size, got {hsdp_shard_size}."
+                )
+            weight_shard_size = int(hsdp_shard_size)
+
+        chunk_size_mb = int(getattr(od_config, "dlo_chunk_size_mb", 64))
+        if chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be > 0, got {chunk_size_mb}")
+        chunk_size_bytes = chunk_size_mb * 1024 * 1024
+
+        pin_budget_gb = getattr(od_config, "dlo_pin_budget_gb", None)
+        dlo_pin_budget_bytes = None if pin_budget_gb is None else int(float(pin_budget_gb) * 1024**3)
+
+        dlo_pin_failure_policy = getattr(od_config, "dlo_pin_failure_policy", "fail")
+        if dlo_pin_failure_policy not in ("fail", "whole_block_fallback"):
             raise ValueError(
-                "Distributed layerwise offload with AllGather is incompatible with "
-                "HSDP: HSDP parameters are already sharded DTensors, and the offloader "
-                "would double-shard them. Use --dlo-no-use-allgather (standard-loader "
-                "rank-local weights) or disable HSDP."
+                "dlo_pin_failure_policy must be one of 'fail' or 'whole_block_fallback', "
+                f"got {dlo_pin_failure_policy!r}"
             )
 
         return cls(
@@ -157,6 +191,10 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            chunk_size_bytes=chunk_size_bytes,
+            dlo_pin_budget_bytes=dlo_pin_budget_bytes,
+            dlo_pin_failure_policy=dlo_pin_failure_policy,
+            weight_shard_size=weight_shard_size,
         )
 
 

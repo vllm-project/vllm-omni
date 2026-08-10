@@ -463,6 +463,57 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
+    def get_runtime_metrics(
+        self,
+        reset_peaks: bool = False,
+        reset_transport_counters: bool = False,
+    ) -> dict:
+        """Report weight-transport and device-memory accounting for this rank.
+
+        Exposed over ``collective_rpc`` so a benchmark can separate loader Host
+        peak from steady-state pinned bytes and runtime HBM staging, which the
+        chunked transport budgets independently.
+
+        Args:
+            reset_peaks: Clear the device peak counters after sampling, so a
+                later call reflects only inference rather than loader/setup
+                staging.
+            reset_transport_counters: Clear request activity counters after
+                sampling, so the next report covers only the measured window.
+        """
+        metrics: dict[str, Any] = {}
+
+        backend = self.offload_backend
+        if backend is not None:
+            get_transport_metrics = getattr(backend, "get_transport_metrics", None)
+            if callable(get_transport_metrics):
+                metrics["transport"] = get_transport_metrics()
+            metrics["offload_backend"] = backend.__class__.__name__
+
+            if reset_transport_counters:
+                reset_counters = getattr(backend, "reset_transport_counters", None)
+                if callable(reset_counters):
+                    reset_counters()
+
+        try:
+            metrics["device"] = {
+                "allocated_bytes": current_omni_platform.memory_allocated(),
+                "reserved_bytes": current_omni_platform.memory_reserved(),
+                "peak_allocated_bytes": current_omni_platform.max_memory_allocated(),
+                "peak_reserved_bytes": current_omni_platform.max_memory_reserved(),
+            }
+        except (AttributeError, NotImplementedError) as exc:
+            # Platform abstraction may not implement every memory counter.
+            metrics["device"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if reset_peaks:
+            try:
+                current_omni_platform.reset_peak_memory_stats()
+            except (AttributeError, NotImplementedError) as exc:
+                metrics["reset_peaks_error"] = f"{type(exc).__name__}: {exc}"
+
+        return metrics
+
     def _sample_peak_memory_mb(self) -> float:
         """Return peak GPU memory for the current forward pass in MB.
 
@@ -611,7 +662,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = od_config.parallel_config.use_hsdp
         use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
-        with grad_context:
+        request_context = getattr(self.offload_backend, "request_context", None)
+        offload_context = request_context() if callable(request_context) else nullcontext()
+        with grad_context, offload_context:
             for req in reqs:
                 self._prepare_request_for_forward(
                     req,

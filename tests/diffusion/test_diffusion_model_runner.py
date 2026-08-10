@@ -862,11 +862,17 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        max_num_seqs=1,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "init_diffusion_model_runner_runtime",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(
         model_runner_module,
         "get_offload_backend",

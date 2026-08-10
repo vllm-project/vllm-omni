@@ -442,7 +442,10 @@ class DiffusionEngine:
                         _ASYNC_OUTPUT_TIMEOUT_ENV,
                         describe(output.async_output_id) if describe else "unavailable",
                     )
-                    raise
+                    raise TimeoutError(
+                        "Async diffusion output "
+                        f"{output.async_output_id!r} was not ready within {_ASYNC_OUTPUT_TIMEOUT:g}s"
+                    ) from exc
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time
