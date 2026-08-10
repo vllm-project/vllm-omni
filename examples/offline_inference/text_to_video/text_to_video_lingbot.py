@@ -20,9 +20,9 @@ from vllm_omni.platforms import current_omni_platform
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate text-to-video with a LingBot-Video checkpoint.")
-    parser.add_argument("--model", default="/home/models/lingbot-video-dense-1.3b")
+    parser.add_argument("--model", default="robbyant/lingbot-video-dense-1.3b")
     parser.add_argument("--prompt", default="a robotic arm picks up a red block")
-    parser.add_argument("--negative-prompt", default="")
+    parser.add_argument("--negative-prompt", default=None)
     parser.add_argument("--output", default="lingbot_video_output.mp4")
     parser.add_argument("--height", type=int, default=192)
     parser.add_argument("--width", type=int, default=320)
@@ -58,9 +58,12 @@ def _to_frame_array(video: Any) -> np.ndarray:
     if isinstance(video, torch.Tensor):
         tensor = video.detach().cpu()
         if tensor.dim() == 5:
-            tensor = tensor[0] if tensor.shape[1] not in (3, 4) else tensor[0].permute(1, 2, 3, 0)
-        elif tensor.dim() == 4 and tensor.shape[0] in (3, 4):
-            tensor = tensor.permute(1, 2, 3, 0)
+            tensor = tensor[0]
+        if tensor.dim() == 4 and tensor.shape[-1] not in (3, 4):
+            if tensor.shape[0] in (3, 4):
+                tensor = tensor.permute(1, 2, 3, 0)
+            elif tensor.shape[1] in (3, 4):
+                tensor = tensor.permute(0, 2, 3, 1)
         if tensor.is_floating_point():
             if float(tensor.min()) < 0.0:
                 tensor = tensor.clamp(-1, 1) * 0.5 + 0.5
@@ -87,8 +90,12 @@ def main() -> None:
         parallel_config=DiffusionParallelConfig(),
     )
 
-    prompt: dict[str, str] = {"prompt": args.prompt}
-    if args.negative_prompt:
+    prompt: dict[str, Any] = {
+        "prompt": args.prompt,
+        "modalities": ["video"],
+        "num_frames": args.num_frames,
+    }
+    if args.negative_prompt is not None:
         prompt["negative_prompt"] = args.negative_prompt
 
     sampling_params = OmniDiffusionSamplingParams(

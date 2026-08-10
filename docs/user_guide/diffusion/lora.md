@@ -64,15 +64,13 @@ For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or
 
 ##### Supported pipelines
 
-For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization. LTX-2 two-stage pipelines load the stage-2 distilled LoRA internally during the second stage.
+For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
 
 | Pipeline | Supported distilled LoRA repo | Notes |
 |----------|--------------------------------|-------|
 | `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
-| `LTX2TwoStagesPipeline` | `Lightricks/LTX-2` | Loads `ltx-2-19b-distilled-lora-384.safetensors` from the model directory for stage 2. |
-| `LTX2ImageToVideoTwoStagesPipeline` | `Lightricks/LTX-2` | Loads `ltx-2-19b-distilled-lora-384.safetensors` from the model directory for stage 2. |
 
 Other diffusion pipelines are not currently listed as supporting distilled LoRA. Use the PEFT backend for request-time adapters, or bake converted weights into a local Diffusers directory before serving.
 

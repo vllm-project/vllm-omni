@@ -4,7 +4,6 @@ from collections.abc import Callable
 
 import torch
 from diffusers.loaders.lora_conversion_utils import (
-    _convert_non_diffusers_ltx2_lora_to_diffusers,
     _convert_non_diffusers_qwen_lora_to_diffusers,
     _convert_non_diffusers_wan_lora_to_diffusers,
 )
@@ -12,13 +11,11 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr, get_transformer_from_pipeline
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
 
 lora_convert_mapping: dict[str, Callable] = {
-    "LTX2Pipeline": _convert_non_diffusers_ltx2_lora_to_diffusers,
-    "LTX2TwoStagesPipeline": _convert_non_diffusers_ltx2_lora_to_diffusers,
     "QwenImagePipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
     "QwenImageEditPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
     "QwenImageEditPlusPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
@@ -370,73 +367,6 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
 
         transformer = get_transformer_from_pipeline(self)
         self.unload_module_lora(state_dict, transformer, prefix=self.transformer_name)
-
-        del self.lora_loaded[adapter_name]
-
-
-class LTX2LoraLoaderMixin(LoraLoaderMixin):
-    connectors_name = "connectors"
-
-    def load_lora_weights(
-        self,
-        pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor],
-        adapter_name: str | None = None,
-    ):
-        if adapter_name in self.lora_loaded:
-            return
-
-        if isinstance(pretrained_model_name_or_path_or_dict, dict):
-            state_dict = pretrained_model_name_or_path_or_dict
-        else:
-            state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
-
-        lora_state_dict = state_dict
-        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
-        has_connector = any(k.startswith("text_embedding_projection.") for k in state_dict)
-
-        converter = get_converter_by_pipeline(self)
-        if converter is None:
-            raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
-
-        if is_non_diffusers_format:
-            lora_state_dict = converter(state_dict)
-
-        if has_connector:
-            connector_state_dict = converter(state_dict, "text_embedding_projection")
-            lora_state_dict.update(connector_state_dict)
-
-        transformer_sd = {k: v for k, v in lora_state_dict.items() if k.startswith(self.transformer_name)}
-        connectors_sd = {k: v for k, v in lora_state_dict.items() if k.startswith(self.connectors_name)}
-
-        transformer = get_transformer_from_pipeline(self)
-        self.load_lora_into_module(
-            transformer_sd,
-            transformer,
-            prefix=self.transformer_name,
-        )
-
-        connectors = find_module_with_attr(self, self.connectors_name).connectors
-        if connectors_sd:
-            self.load_lora_into_module(
-                connectors_sd,
-                connectors,
-                prefix=self.connectors_name,
-            )
-
-        self.lora_loaded[adapter_name] = lora_state_dict
-
-    def unload_lora_weights(self, adapter_name: str):
-        if adapter_name not in self.lora_loaded:
-            return
-        state_dict = self.lora_loaded[adapter_name]
-        transformer_sd = {k: v for k, v in state_dict.items() if k.startswith(self.transformer_name)}
-        connectors_sd = {k: v for k, v in state_dict.items() if k.startswith(self.connectors_name)}
-
-        transformer = get_transformer_from_pipeline(self)
-        self.unload_module_lora(transformer_sd, transformer, prefix=self.transformer_name)
-
-        connectors = find_module_with_attr(self, self.connectors_name).connectors
-        self.unload_module_lora(connectors_sd, connectors, prefix=self.connectors_name)
 
         del self.lora_loaded[adapter_name]
 

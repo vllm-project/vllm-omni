@@ -12,6 +12,9 @@ from torch import nn
 
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 DEFAULT_OUT = "ECHO"
 OVERRIDE_OUT = "OVERRIDE"
 INPUT_KWARG = "inp"

@@ -449,9 +449,8 @@ Key configuration fields:
 !!! note
     New in-tree models should define frozen topology in `models/<model>/pipeline.py`,
     register it in `vllm_omni/config/pipeline_registry.py`, and put deployment
-    knobs in `vllm_omni/deploy/<model>.yaml`. Legacy `stage_args` YAMLs are still
-    accepted for custom configs via `--stage-configs-path`, but should not be used
-    for new bundled defaults.
+    knobs in `vllm_omni/deploy/<model>.yaml`. Use `--deploy-config` to load a
+    custom deployment YAML.
 
 ### Batch mode
 
@@ -673,99 +672,146 @@ down and spawn a new one mid-module. A few rules that save real CI debugging tim
 
 ## Online Serving Integration
 
-To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, add
-**all five** of the following integration points to
-`vllm_omni/entrypoints/openai/serving_speech.py` in a **single commit**. Adding them
-piecemeal causes partial-integration failures that are hard to debug.
+To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, write
+one adapter under `vllm_omni/entrypoints/openai/tts_adapters/`. The adapter declares
+how your model is recognized and owns its request handling; `serving_speech.py` should
+not need an edit.
 
-### 1. Stage constant
+### 1. Write the adapter
 
-Near the top of the file, alongside the other `_*_TTS_MODEL_STAGES` constants:
-
-```python
-_YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
-```
-
-### 2. Union into `_TTS_MODEL_STAGES`
-
-Add to the `_TTS_MODEL_STAGES` set union:
+Create `vllm_omni/entrypoints/openai/tts_adapters/your_model.py`:
 
 ```python
-_TTS_MODEL_STAGES: set[str] = (
-    ...
-    | _YOUR_MODEL_TTS_MODEL_STAGES
-)
+# SPDX-License-Identifier: Apache-2.0
+"""YourModel serving adapter."""
+
+from typing import TYPE_CHECKING
+
+from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+
+@register_tts_adapter
+class YourModelAdapter(ARTTSAdapter):
+    # The registry key, and the model-type string used in logs.
+    name = "your_model"
+    # The engine ``model_stage`` value(s) your deployment yaml sets. Detection,
+    # stage discovery and `/v1/audio/speech` routing all derive from this.
+    stage_keys = frozenset({"your_model_stage_key"})
+
+    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Return an error string, or None if the request is valid."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
+
+    async def build(
+        self,
+        request: "OpenAICreateSpeechRequest",
+        sampling_params_list: list,
+        has_inline_ref_audio: bool,
+    ) -> PreparedRequest:
+        """Build the engine prompt and per-model parameters."""
+        params: dict[str, list] = {"text": [request.input]}
+        if request.voice is not None:
+            params["voice"] = [request.voice]
+        return PreparedRequest(
+            prompt={"prompt": request.input},
+            tts_params=params,
+            model_type=self.name,
+        )
 ```
 
-### 3. Model type detection
+Then add it to the import block at the bottom of
+`vllm_omni/entrypoints/openai/tts_adapters/__init__.py` so it registers on import.
+That import line is the only shared file a new model has to touch.
 
-In `_detect_tts_model_type()`, add before the final `return None`:
+> **Pure-diffusion TTS does not go through adapters yet.** When the server is built
+> by `OmniOpenAIServingSpeech.for_diffusion()`, `create_speech()` routes straight to
+> `_create_diffusion_speech()` and never calls `validate()` or `build()`.
+> `DiffusionTTSAdapter` is scaffolding for that migration and has no production
+> subclass today, so validation or prompt construction placed in one would silently
+> never run. If your model is served by the diffusion engine rather than
+> `engine_client`, follow the existing diffusion path and say so on #4855 — wiring
+> that path through the adapter layer is open work, not something to do inside a
+> new-model PR.
+
+### 2. If a stage key alone cannot identify your model
+
+Two escape hatches, in order of preference:
 
 ```python
-if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
-    return "your_model"
+# The architecture is authoritative (e.g. your model has no dedicated
+# model_stage value, or shares one with another model).
+model_archs = frozenset({"YourModelForConditionalGeneration"})
+
+# Set this too if your model owns NO stage key, so stage discovery has to find
+# your AR entry stage by architecture.
+arch_identifies_entry_stage = True
 ```
 
-### 4. Request validation dispatch
-
-In `_validate_tts_request()`, add before the fallback `return`:
+If your rule is not a set-membership test, override `matches()` — see
+`covo_audio.py`, which shares the generic `fused_thinker_talker` stage key with
+non-CoVo deployments and confirms with the architecture:
 
 ```python
-if self._tts_model_type == "your_model":
-    return self._validate_your_model_request(request)
+@classmethod
+def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
+    return super().matches(model_stage, model_arch) and bool(model_arch) and "CovoAudio" in model_arch
 ```
 
-### 5. Validation and parameter-builder methods
+If your model can match the same deployment as another adapter, give one of them an
+explicit `detect_priority` (lower runs first). `tests/entrypoints/openai_api/
+test_tts_detection.py` fails if two same-priority detectors can both match one input,
+so an unordered overlap cannot be merged.
 
-Add two new methods:
+Models that are speech-capable only in some deployment topologies override
+`stage_serves_speech()` — see `audex.py`, whose omni thinker is text-final unless the
+speech decoder is deployed alongside it.
 
-```python
-def _validate_your_model_request(
-    self, request: OpenAICreateSpeechRequest
-) -> str | None:
-    """Validate YourModel request. Returns an error string or None."""
-    if not request.input or not request.input.strip():
-        return "Input text cannot be empty"
-    return None
+### 3. Reuse the shared helpers
 
-def _build_your_model_params(
-    self, request: OpenAICreateSpeechRequest
-) -> dict[str, Any]:
-    """Build additional_information dict for YourModel."""
-    params: dict[str, Any] = {"text": [request.input]}
-    if request.voice is not None:
-        params["voice"] = [request.voice]
-    # Add any other model-specific fields here
-    return params
-```
+Adapters reach shared serving helpers through `self.ctx.server`: reference-audio
+resolution (`_resolve_ref_audio`), uploaded-speaker handling
+(`_apply_uploaded_speaker`), format validation (`_validate_ref_audio_format`), and
+prompt-length limits (`_max_instructions_length`). Read a comparable adapter before
+writing your own — `fish_speech.py` for voice cloning, `higgs_audio_v3.py` for
+parameter-heavy models, `moss_tts.py` for a family sharing one base class.
 
-Then wire `_build_your_model_params` into the request-dispatch block in
-`_create_tts_request()` (search for the equivalent `_build_*_params` call for an
-existing model to find the right location). If the model supports voice cloning
-(`ref_audio` → `prompt_audio_path`, `ref_text` → `prompt_text`), add those mappings
-here too — follow any existing `_build_<model>_params` in `serving_speech.py` (e.g.
-`_build_moss_tts_params` for the voice-cloning variant) for the pattern.
+### 4. Test it
 
-> **Two dispatch patterns coexist:** Fish Speech uses a `self._is_fish_speech` boolean
-> checked *before* `elif self._is_tts`. All newer models use the `_tts_model_type`
-> string pattern shown above. For new models, always use the string pattern — do not
-> add new `_is_*` boolean flags.
+`tests/entrypoints/openai_api/test_tts_adapter.py` covers registry invariants and
+`test_tts_detection.py` covers detection. Add your model to
+`EXPECTED_MODEL_TYPES` in the former, and a case to the latter if you added a
+`model_archs` or `matches()` rule.
 
-> **Note on unused variables:** Only extract parameters in `_build_your_model_params`
-> that you actually pass to the model's generate / `inference_stream` call. Extracting
-> a variable without forwarding it will trigger a `ruff F841` pre-commit failure.
+### Do not add branches to `serving_speech.py`
+
+Older models predate the adapter framework and still have per-model branches in
+`serving_speech.py`; they are being migrated out (RFC #4327, #4855). Do not copy
+that pattern. `tools/pre_commit/check_tts_adapter.py` is a ratchet on the remaining
+`self._tts_model_type == ...` comparisons and fails the commit if the count grows.
+
+If your model genuinely needs behaviour that no adapter hook can express, that is a
+missing hook — propose it on the RFC rather than adding a branch.
 
 ### Merge conflicts
 
-`serving_speech.py` is modified by every new model PR and is the most common source of
-rebase conflicts. When rebasing onto `main` and a conflict appears here, the resolution
-is always to **keep both** the upstream model's additions and your own — never discard
-either side. After resolving:
+Your adapter is a new file, so it cannot conflict. The one shared line is your entry
+in the import block at the bottom of `tts_adapters/__init__.py`, which conflicts only
+when another model lands at the same time. The resolution is always to **keep both**
+imports — never discard either side. After resolving:
 
 ```bash
-git add vllm_omni/entrypoints/openai/serving_speech.py
+git add vllm_omni/entrypoints/openai/tts_adapters/__init__.py
 git rebase --continue
 ```
+
+If you find yourself resolving a conflict inside `serving_speech.py`, something in
+your model is still going through the legacy path; see the note above.
 
 ## Single-Stage Models
 

@@ -9,6 +9,9 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 SAGE_ATTN3_MODULE = "vllm_omni.diffusion.attention.backends.sage_attn3"
 
 

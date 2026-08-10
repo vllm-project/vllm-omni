@@ -40,6 +40,7 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization
 - [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
+- [@NickCao](https://github.com/NickCao): CI, Tests, Entrypoint, and TTS Model Support
 - [@princepride](https://github.com/princepride): Diffusion and Omni Support
 - [@RuixiangMa](https://github.com/RuixiangMa): Diffusion models, parallel, cache, and docs
 - [@SamitHuang](https://github.com/SamitHuang): RL, Diffusion, and cache
