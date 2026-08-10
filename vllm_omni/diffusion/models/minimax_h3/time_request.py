@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
+
+# Imported from the submodule so this module stays free of the torch-heavy
+# DMD2 package surface; torch itself is only pulled in on the uniform path.
+from vllm_omni.diffusion.models.dmd2.schedule import DMD2SigmaSchedule
 
 
 def _align_frame_count(frame_count: int) -> int:
@@ -34,21 +37,6 @@ def _audio_latent_t(duration_seconds: float) -> int:
     return int(round(float(duration_seconds) * 40.0))
 
 
-def _validate_base_schedule(base_schedule: Sequence[float]) -> list[float]:
-    values = [float(value) for value in base_schedule]
-    if len(values) < 2:
-        raise ValueError("MiniMax H3 base_schedule needs at least 2 entries")
-    # Ordering comparisons are all false against NaN, so non-finite entries have
-    # to be rejected before the monotonicity check rather than after it.
-    if any(not math.isfinite(value) for value in values):
-        raise ValueError("MiniMax H3 base_schedule entries must be finite")
-    if values[0] != 1.0 or values[-1] != 0.0:
-        raise ValueError("MiniMax H3 base_schedule must start at 1.0 and end at 0.0")
-    if any(curr <= nxt for curr, nxt in zip(values, values[1:], strict=False)):
-        raise ValueError("MiniMax H3 base_schedule must be strictly decreasing")
-    return values
-
-
 def _time_shift_sigmas(
     *,
     num_steps: int = 50,
@@ -59,21 +47,16 @@ def _time_shift_sigmas(
 
     ``base_schedule`` supplies the rectified-flow positions explicitly and takes
     precedence over ``num_steps``. Distilled checkpoints need it because their
-    few-step schedule is not the uniform one ``num_steps`` produces.
+    few-step schedule is not the uniform one ``num_steps`` produces; validation
+    and the shift itself live in the shared :class:`DMD2SigmaSchedule`.
     """
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
 
-    import torch
-
     if base_schedule is not None:
-        base = torch.tensor(
-            _validate_base_schedule(base_schedule),
-            device="cpu",
-            dtype=torch.float32,
-        )
-        shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-        return [float(value) for value in shifted.tolist()]
+        return DMD2SigmaSchedule.from_positions(base_schedule).shifted_sigmas(shift_scale)
+
+    import torch
 
     if num_steps <= 0:
         raise ValueError("MiniMax H3 num_steps must be > 0")
@@ -147,7 +130,3 @@ def minimax_h3_time_shift_sigmas(
         shift_scale=shift_scale,
         base_schedule=base_schedule,
     )
-
-
-def minimax_h3_validate_base_schedule(base_schedule: Sequence[float]) -> list[float]:
-    return _validate_base_schedule(base_schedule)

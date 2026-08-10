@@ -536,8 +536,13 @@ def test_base_schedule_rejects_malformed_positions(base_schedule):
 
 
 def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
+    from vllm_omni.diffusion.models.dmd2 import DMD2SigmaSchedule
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
+    schedules = {
+        partition: None if positions is None else DMD2SigmaSchedule.from_positions(positions)
+        for partition, positions in base_schedule_by_partition.items()
+    }
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "combined"
@@ -546,7 +551,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
-    pipeline._base_schedule_by_partition = base_schedule_by_partition
+    pipeline._base_schedule_by_partition = schedules
     pipeline._quality_policy = Mock()
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
@@ -596,8 +601,8 @@ def test_base_schedule_is_scoped_to_the_serving_partition():
     distilled = [1.0, 0.7, 0.4, 0.15, 0.0]
     pipeline = _distilled_pipeline([], {"fl2va": distilled, "ref2va": None})
 
-    assert pipeline._base_schedule_for_task("t2va") == distilled
-    assert pipeline._base_schedule_for_task("fl2va") == distilled
+    assert pipeline._base_schedule_for_task("t2va").base_schedule == tuple(distilled)
+    assert pipeline._base_schedule_for_task("fl2va").base_schedule == tuple(distilled)
     assert pipeline._base_schedule_for_task("ref2va") is None
 
 
@@ -616,7 +621,7 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
 
     pipeline.forward(_t2va_batch())
 
-    assert diffuse_calls[0]["base_schedule"] == base_schedule
+    assert diffuse_calls[0]["base_schedule"] == tuple(base_schedule)
     # Five boundaries describe four denoising steps.
     assert diffuse_calls[0]["num_steps"] == 4
     pipeline._quality_policy.resolve.assert_called_once_with(
@@ -650,7 +655,7 @@ def test_absent_base_schedule_key_differs_from_an_empty_list():
     )
 
     assert _read_base_schedule({}) is None
-    assert _read_base_schedule({"base_schedule": [1.0, 0.5, 0.0]}) == [1.0, 0.5, 0.0]
+    assert _read_base_schedule({"base_schedule": [1.0, 0.5, 0.0]}).base_schedule == (1.0, 0.5, 0.0)
     with pytest.raises(ValueError):
         _read_base_schedule({"base_schedule": []})
 
