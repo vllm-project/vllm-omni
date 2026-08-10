@@ -333,6 +333,7 @@ class MiniMaxH3Attention(nn.Module):
         )
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.rot_dim = 6 * arch.rope_inv_freq_len
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
@@ -365,7 +366,7 @@ class MiniMaxH3Attention(nn.Module):
         x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
         are cast to the activation dtype before the elementwise math.
         """
-        rot_dim = freqs.shape[-1]
+        rot_dim = self.rot_dim
         x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
         cos = torch.cos(freqs).to(x.dtype)  # [T, rot_dim]
         sin = torch.sin(freqs).to(x.dtype)
