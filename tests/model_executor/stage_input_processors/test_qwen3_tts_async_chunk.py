@@ -106,40 +106,31 @@ def test_flush_on_finish():
 
 
 _CASES = [
-    # ── IC boundary rule ──────────────────────────────────────────────
-    # initial_codec_chunk_frames only controls the first emitted chunk.
-    # After that, the processor returns to codec_chunk_frames-sized windows
-    # to avoid flooding Code2Wav with repeated tiny overlapping decodes.
+    # ── Cursor-based IC / steady emit (single snapshot, cursor starts at 0) ──
+    # With dynamic IC=16 and cs=25, first emit waits for 16 frames then sends
+    # the full buffered window from the start.
+    ((25, 25, 0), 15, False, None),
+    ((25, 25, 0), 16, False, (0, 16)),
+    ((25, 25, 0), 41, False, (0, 41)),
     #
-    # Dynamic IC=16, cs=25, initial_coverage=16
-    # Normal phase: adjusted = length - 16, emit when adjusted % 25 == 0.
-    ((25, 25, 0), 24, False, None),
-    ((25, 25, 0), 25, False, None),
-    ((25, 25, 0), 41, False, (16, 41)),  # normal: adjusted=25, 25%25==0 -> emit, lc=16
-    #
-    # Per-request IC=10, cs=25: first emit at 10, then 35, 60...
+    # Per-request IC=10, cs=25: first emit at >=10 frames.
     ((25, 25, 10), 9, False, None),
     ((25, 25, 10), 10, False, (0, 10)),
-    ((25, 25, 10), 25, False, None),
-    ((25, 25, 10), 35, False, (10, 35)),
-    ((25, 25, 10), 45, False, None),
+    ((25, 25, 10), 35, False, (0, 35)),
     ((25, 25, 10), 5, True, (0, 5)),  # finished flushes IC tail
-    ((25, 25, 10), 33, True, (10, 33)),  # finished flushes normal tail
+    ((25, 25, 10), 33, True, (0, 33)),  # finished flushes full buffer
     #
-    # IC=8, cs=16: first emit at 8, then 24, 40...
+    # IC=8, cs=16
     ((16, 25, 8), 8, False, (0, 8)),
-    ((16, 25, 8), 16, False, None),
-    ((16, 25, 8), 24, False, (8, 24)),
-    ((16, 25, 8), 32, False, None),
+    ((16, 25, 8), 7, False, None),
+    ((16, 25, 8), 24, False, (0, 24)),
     #
-    # IC=5, cs=25: first emit at 5, then 30, 55...
+    # IC=5, cs=25
     ((25, 25, 5), 5, False, (0, 5)),
-    ((25, 25, 5), 12, False, None),
-    ((25, 25, 5), 25, False, None),
-    ((25, 25, 5), 30, False, (5, 30)),
-    ((25, 25, 5), 50, False, None),
+    ((25, 25, 5), 4, False, None),
+    ((25, 25, 5), 30, False, (0, 30)),
     #
-    # Per-request override: IC=15 at n_frames=10 -> 10%15!=0 -> hold
+    # Per-request override: IC=15 at n_frames=10 -> hold
     ((25, 25, 15), 10, False, None),
 ]
 
@@ -158,6 +149,45 @@ def test_streaming_phases(config, n_frames, finished, expected):
         assert payload is not None
         assert payload.meta.left_context_size == exp_ctx
         assert len(payload.codes.audio) == _Q * exp_window
+
+
+def test_finished_flush_advances_frame_cursor_to_avoid_repeated_audio():
+    tm = _tm(chunk_frames=25, left_context=72, initial_chunk_frames=1)
+
+    first = _call(tm, "r", n_frames=1, req_ic=1)
+    assert first is not None
+    assert first.meta.left_context_size == 0
+    assert len(first.codes.audio) == _Q * 1
+
+    flushed = _call(tm, "r", n_frames=21, finished=True, req_ic=1)
+    assert flushed is not None
+    assert flushed.meta.left_context_size == 1
+    assert len(flushed.codes.audio) == _Q * 21
+
+    # Regression: the old modulo-based scheduler emitted frames 2..26 here,
+    # repeating the 20 frames already flushed above.
+    assert _call(tm, "r", n_frames=26, req_ic=1) is None
+
+    next_full = _call(tm, "r", n_frames=46, req_ic=1)
+    assert next_full is not None
+    assert next_full.meta.left_context_size == 21
+    assert len(next_full.codes.audio) == _Q * 46
+
+
+def test_cursor_advances_across_steady_chunks():
+    tm = _tm(chunk_frames=25, left_context=25, initial_chunk_frames=10)
+
+    first = _call(tm, "r", n_frames=10, req_ic=10)
+    assert first is not None
+    assert first.meta.left_context_size == 0
+    assert len(first.codes.audio) == _Q * 10
+
+    assert _call(tm, "r", n_frames=25, req_ic=10) is None
+
+    second = _call(tm, "r", n_frames=35, req_ic=10)
+    assert second is not None
+    assert second.meta.left_context_size == 10
+    assert len(second.codes.audio) == _Q * 35
 
 
 def test_dynamic_ic_adapts_to_load():
@@ -288,6 +318,7 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
     tm.put_req_chunk[rid] = 1
+    tm._qwen3_tts_emitted_frames = {rid: 10}
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
 
@@ -312,6 +343,7 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
     tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=4)
     rid = "r-ref-bounded"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(8)]
+    tm._qwen3_tts_emitted_frames = {rid: 4}
     ref_code = torch.tensor(
         [
             [1, 1, 1, 1],

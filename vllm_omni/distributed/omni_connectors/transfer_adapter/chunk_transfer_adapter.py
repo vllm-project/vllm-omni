@@ -21,6 +21,36 @@ from .base import OmniTransferAdapterBase
 logger = get_connector_logger(__name__)
 
 
+def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int]) -> bool:
+    """Replace a downstream request prompt before prefill has started.
+
+    Used when an upstream stage delivers concrete ``prompt_token_ids`` /
+    ``ids.prompt`` for a prewarmed async-chunk request. After prefill has
+    started, refuse the replacement so KV state stays consistent.
+    """
+    if not prompt_token_ids:
+        return False
+    if int(getattr(request, "num_computed_tokens", 0) or 0) > 0:
+        logger.warning(
+            "Received prompt_token_ids for req=%s after prefill started; keeping existing prompt_len=%s",
+            getattr(request, "request_id", None),
+            len(getattr(request, "prompt_token_ids", []) or []),
+        )
+        return False
+    request.prompt_token_ids = list(prompt_token_ids)
+    request.num_prompt_tokens = len(prompt_token_ids)
+    if hasattr(request, "_output_token_ids"):
+        request._output_token_ids.clear()
+    if hasattr(request, "_all_token_ids"):
+        request._all_token_ids.clear()
+        request._all_token_ids.extend(prompt_token_ids)
+    if hasattr(request, "block_hashes"):
+        request.block_hashes.clear()
+    if hasattr(request, "update_block_hashes"):
+        request.update_block_hashes()
+    return True
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -61,7 +91,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
-        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | dict[str, Any] | None] | None = (
+            None
+        )
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
@@ -235,6 +267,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
+                prompt_token_ids = payload_data.get("prompt_token_ids")
+                if prompt_token_ids is None and isinstance(payload_data.get("ids"), dict):
+                    prompt_token_ids = payload_data.get("ids", {}).get("prompt")
+                if isinstance(prompt_token_ids, list) and all(
+                    isinstance(token_id, int) for token_id in prompt_token_ids
+                ):
+                    _replace_request_prompt_token_ids(request, prompt_token_ids)
+                request.omni_stage_payload = payload_data
                 request.additional_information = payload_data
                 replace_prompt = meta.get("replace_streaming_prompt") is True
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
@@ -324,7 +364,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | dict[str, Any] | None = None
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
@@ -350,11 +390,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
-        if payload_data.meta is None:
-            payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        if payload_data.meta.is_segment_finished is None:
-            payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        if isinstance(payload_data, dict):
+            meta = payload_data.setdefault("meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                payload_data["meta"] = meta
+            meta["finished"] = torch.tensor(is_finished, dtype=torch.bool)
+            meta["is_segment_finished"] = torch.tensor(is_segment_finished, dtype=torch.bool)
+        else:
+            if payload_data.meta is None:
+                payload_data.meta = MetaStruct()
+            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+            if payload_data.meta.is_segment_finished is None:
+                payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -370,9 +418,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
             # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
-            # (no target type), so the wire round-trips struct -> dict. If you
-            # change the schema, update both ends — see test_wire_round_trip.
-            finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
+            # (no target type), so the wire round-trips struct -> dict. Dict
+            # payloads are also accepted for model-specific scalar metadata.
+            if isinstance(payload_data, dict):
+                finished_flag = payload_data.get("meta", {}).get("finished")
+            else:
+                finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
                 is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
@@ -391,6 +442,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
+            emitted_frames = getattr(self, "_qwen3_tts_emitted_frames", None)
+            if isinstance(emitted_frames, dict):
+                emitted_frames.pop(external_req_id, None)
 
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
@@ -466,6 +520,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+        emitted_frames = getattr(self, "_qwen3_tts_emitted_frames", None)
+        if isinstance(emitted_frames, dict):
+            emitted_frames.pop(external_req_id, None)
 
     def cleanup(
         self,

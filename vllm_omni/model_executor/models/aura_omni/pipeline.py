@@ -36,6 +36,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="text",
             model_arch="Qwen3ASRForConditionalGeneration",
+            async_chunk_process_next_stage_input_func=f"{_AURA_PROC}.asr2aura_async_chunk",
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -50,6 +51,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="text",
             model_arch="AuraQwen3VLForConditionalGeneration",
             custom_process_input_func=f"{_AURA_PROC}.asr2aura",
+            async_chunk_process_next_stage_input_func=f"{_AURA_PROC}.aura2tts_async_chunk",
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(

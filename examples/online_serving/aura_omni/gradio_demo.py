@@ -210,7 +210,7 @@ def build_interface(client: OpenAI, model: str):
 
     default_system = (
         "You are receiving a live video stream where the final frame is the present moment. "
-        "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
+        "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
     )
 
     def _toggle_tts_advanced(task_type: str):
@@ -228,7 +228,7 @@ def build_interface(client: OpenAI, model: str):
             video_input = gr.Video(label="Video input (optional)", sources=["upload"])
         prompt = gr.Textbox(
             label="Instruction",
-            value="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
+            value="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly.",
             lines=2,
         )
         with gr.Accordion("Advanced", open=False):
