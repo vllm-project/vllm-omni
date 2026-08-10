@@ -4,6 +4,7 @@ kind: module
 status: draft
 owners:
   - "@lishunyang12"
+  - "@vraiti"
 primary_code_paths:
   - vllm_omni/metrics/**
 related_code_paths:

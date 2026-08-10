@@ -69,6 +69,7 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
 
     attention = object.__new__(MiniMaxH3Attention)
     nn.Module.__init__(attention)
+    attention.rot_dim = 96
     attention.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
     attention.rope._forward_method = attention.rope.forward_native
 

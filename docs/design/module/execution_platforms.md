@@ -8,8 +8,15 @@ owners:
   - "@xuechendi"
 primary_code_paths:
   - vllm_omni/platforms/**
-related_code_paths:
   - vllm_omni/attention/**
+primary_code_path_owners:
+  # Additional owners scoped to attention kernels (quantized/custom attention)
+  - paths:
+      - vllm_omni/attention/**
+    owners:
+      - "@david6666666"
+      - "@lishunyang12"
+related_code_paths: []
 depends_on:
   - ar_runtime.md
   - diffusion/index.md
