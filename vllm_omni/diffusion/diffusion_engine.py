@@ -116,6 +116,16 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    dp_size = getattr(parallel_config, "data_parallel_size", 1)
+    return (
+        dp_size > 1
+        and getattr(od_config, "enable_distributed_layerwise_offload", False)
+        and getattr(od_config, "dlo_use_allgather", True)
+    )
+
+
 def _move_tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.cpu() if value.device.type != "cpu" else value
@@ -202,7 +212,7 @@ class DiffusionEngine:
             return DiffusionExecutionMode.STEP_BATCH
 
         self.supports_request_batch = supports_request_batch(od_config)
-        if not self.supports_request_batch and _max_num_seqs(od_config) > 1:
+        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
             raise ValueError(
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
                 "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
@@ -233,17 +243,10 @@ class DiffusionEngine:
         # for distributed layerwise offload (which shards weights and
         # needs all ranks active simultaneously).  Ordinary DP with a
         # non-batch pipeline should not schedule multiple requests.
-        dp_size = 1
-        if getattr(self.od_config, "parallel_config", None) is not None:
-            dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
-        dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-        if dp_size > 1 and dist_offload and getattr(self.od_config, "dlo_use_allgather", True):
+        dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
+        if _uses_dlo_dp_concurrency(self.od_config):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
-            # Set batch admission wait so concurrent requests accumulate
-            # before scheduling.  The scheduler reads this from od_config.
-            if getattr(self.od_config, "request_batch_max_wait_ms", 0) == 0:
-                self.od_config.request_batch_max_wait_ms = 500.0
             logger.info(
                 "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
                 dp_size,
@@ -307,14 +310,16 @@ class DiffusionEngine:
         diffusion_engine_start_time = time.perf_counter()
 
         preprocess_time = 0.0
-        if self.pre_process_func is not None:
-            preprocess_start_time = time.perf_counter()
-            request = self.pre_process_func(request)
+        has_preprocessor = getattr(self, "pre_process_func", None) is not None
+        preprocess_start_time = time.perf_counter() if has_preprocessor else None
+        request = self._prepare_request_for_admission(request)
+        if preprocess_start_time is not None:
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
-        generator = self.async_add_req_and_stream_response(request)
+        request_id = self._add_prepared_request(request)
+        generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
             # Async mode: wait for background D2H/SHM to complete.
@@ -671,7 +676,17 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
-    def add_request(self, request: OmniDiffusionRequest) -> str:
+    def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        """Run model-owned preprocessing once, before entering Engine locks."""
+
+        pre_process_func = getattr(self, "pre_process_func", None)
+        if pre_process_func is None:
+            return request
+        return pre_process_func(request)
+
+    def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
+        """Admit a request whose model-owned preprocessing is complete."""
+
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -681,6 +696,10 @@ class DiffusionEngine:
             self._cv.notify_all()
 
         return request_id
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        request = self._prepare_request_for_admission(request)
+        return self._add_prepared_request(request)
 
     async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
         with self._cv:
@@ -724,6 +743,7 @@ class DiffusionEngine:
         return final_output
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -868,8 +888,7 @@ class DiffusionEngine:
             ),
         )
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 

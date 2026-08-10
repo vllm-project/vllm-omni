@@ -138,12 +138,28 @@ nav:
       - Prometheus Metrics: design/metrics.md
       - Speech Generation Performance Optimizations: design/qwen3_omni_tts_performance_optimization.md
     - Module Design:
-      - Runtime Modules:
-        - AR Module: design/module/ar_module.md
-        - DIT Module: design/module/dit_module.md
-      - Orchestration:
-        - Entrypoint Module: design/module/entrypoint_module.md
-        - AsyncOmni Architecture: design/module/async_omni_architecture.md
+      - Entrypoints: design/module/entrypoints.md
+      - vLLM-Omni Configuration: design/module/vllm_omni_config.md
+      - Input, Output, and Modality Contracts: design/module/input_output_modality_contracts.md
+      - Error Contracts: design/module/error_contracts.md
+      - Engine Orchestration: design/module/engine_orchestration.md
+      - Stage Runtime: design/module/stage_runtime.md
+      - OmniConnector: design/module/omni_connector.md
+      - Model Integration: design/module/model_integration.md
+      - Autoregressive Runtime: design/module/ar_runtime.md
+      - Diffusion:
+        - Overview: design/module/diffusion/index.md
+        - Runtime: design/module/diffusion/diffusion_runtime.md
+        - Model Integration: design/module/diffusion/diffusion_model_integration.md
+        - Continuous Batching: design/module/diffusion/continuous_batching.md
+        - Parallelism: design/module/diffusion/parallelism.md
+        - Offloader: design/module/diffusion/offloader.md
+      - Execution Platforms: design/module/execution_platforms.md
+      - Cache Management: design/module/cache_management.md
+      - Quantization: design/module/quantization.md
+      - Observability: design/module/observability.md
+      - Profiling: design/module/profiling.md
+      - Benchmarking: design/module/benchmarking.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md

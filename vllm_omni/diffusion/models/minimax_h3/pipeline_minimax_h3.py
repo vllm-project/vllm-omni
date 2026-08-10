@@ -22,6 +22,10 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTBackend,
+    RequestScopedCacheDiTRuntime,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_dit_group,
@@ -73,6 +77,7 @@ from .presentation import (
     minimax_h3_ref2va_video_presentation,
     minimax_h3_text_only_ids,
 )
+from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .reference_video import (
     load_audio_file,
     load_video_audio,
@@ -538,6 +543,19 @@ class MiniMaxH3Pipeline(
     ]
     dummy_run_num_frames: ClassVar[int] = 0
 
+    def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
+        """Adopt runner-installed generic Cache-DiT for request transitions."""
+
+        self._cache_dit_runtime.adopt(
+            backend,
+            installation_key=MINIMAX_H3_GENERIC_CACHE_KEY,
+        )
+
+    def is_cache_dit_enabled(self) -> bool:
+        """Return the request-scoped Cache-DiT installation state."""
+
+        return self._cache_dit_runtime.is_enabled
+
     def __init__(
         self,
         *,
@@ -676,6 +694,9 @@ class MiniMaxH3Pipeline(
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
 
+        self._quality_policy = MiniMaxH3QualityPolicy(od_config)
+        self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
+
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
@@ -703,7 +724,10 @@ class MiniMaxH3Pipeline(
             loaded_with_prefix.update(prefix + name for name in loaded)
         # The text encoder and both VAEs load eagerly in ``__init__`` rather
         # than through ``weights_sources``. Record them for the runner's strict
-        # missing-parameter check.
+        # missing-parameter check. For the text encoder that report is exact
+        # because its loader raises on any unloaded parameter or partially filled
+        # fused parameter; weaken that and gaps here become invisible. The two
+        # VAEs carry no equivalent guarantee.
         for component_name in ("text_encoder", "video_vae", "audio_vae"):
             component = getattr(self, component_name)
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
@@ -1551,6 +1575,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
 
         sampling = request.sampling_params
+        quality = sampling.quality
+        logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)
 
@@ -1732,6 +1758,12 @@ class MiniMaxH3Pipeline(
         num_steps = int(sampling.num_inference_steps or 50)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        quality_plan = self._quality_policy.resolve(
+            quality=quality,
+            num_inference_steps=num_steps,
+            extra_args=extra,
+        )
+        self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         videos = []
         audios = []

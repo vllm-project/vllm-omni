@@ -127,6 +127,7 @@ def _make_request(tag: str):
         request_id=tag,
         prompt=f"prompt_{tag}",
         sampling_params=SimpleNamespace(**sampling_params),
+        diffusion_kv_requests=None,
     )
 
 
