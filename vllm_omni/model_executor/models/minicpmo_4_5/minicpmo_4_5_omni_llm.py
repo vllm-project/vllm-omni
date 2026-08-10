@@ -770,8 +770,11 @@ AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=Tru
 
 
 # ============== SigLIP Vision Transformer Classes ==============
+FlashAttentionUnpaddingMetadata: TypeAlias = tuple[torch.Tensor, torch.Tensor, int]
+
+
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
-def _get_unpad_data(attention_mask):
+def _get_unpad_data(attention_mask: torch.Tensor) -> FlashAttentionUnpaddingMetadata:
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
@@ -1116,6 +1119,7 @@ class SiglipFlashAttention2(SiglipAttention):
         past_key_value: tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         output_attentions = False
@@ -1178,7 +1182,13 @@ class SiglipFlashAttention2(SiglipAttention):
             value_states = value_states.to(target_dtype)
 
         attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            unpadding_metadata=unpadding_metadata,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.embed_dim).contiguous()
@@ -1190,7 +1200,15 @@ class SiglipFlashAttention2(SiglipAttention):
         return attn_output, attn_weights
 
     def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout=0.0,
+        softmax_scale=None,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -1218,7 +1236,12 @@ class SiglipFlashAttention2(SiglipAttention):
         if attention_mask is not None:
             batch_size = query_states.shape[0]
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
+                unpadding_metadata=unpadding_metadata,
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
@@ -1245,8 +1268,18 @@ class SiglipFlashAttention2(SiglipAttention):
 
         return attn_output
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    def _upad_input(
+        self,
+        query_layer,
+        key_layer,
+        value_layer,
+        attention_mask,
+        query_length,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
+    ):
+        if unpadding_metadata is None:
+            unpadding_metadata = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = unpadding_metadata
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
@@ -1316,6 +1349,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool | None = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -1330,11 +1364,19 @@ class SiglipEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-        )
+        if self._use_flash_attention_2:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                unpadding_metadata=unpadding_metadata,
+            )
+        else:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1435,6 +1477,7 @@ class SiglipEncoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
     # Ignore copy
     def forward(
@@ -1475,6 +1518,9 @@ class SiglipEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
+        unpadding_metadata = (
+            _get_unpad_data(attention_mask) if self._use_flash_attention_2 and attention_mask is not None else None
+        )
         for encoder_layer in self.layers:
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -1484,12 +1530,14 @@ class SiglipEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     output_attentions,
+                    unpadding_metadata,
                 )
             else:
                 layer_outputs = encoder_layer(
                     hidden_states,
                     attention_mask,
                     output_attentions=output_attentions,
+                    unpadding_metadata=unpadding_metadata,
                 )
 
             hidden_states = layer_outputs[0]
@@ -3412,10 +3460,23 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     ) -> bool:
         return False
 
-    def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
+    def get_image_prompt_texts(
+        self,
+        image_size: ImageSize,
+        image_idx: int = 0,
+        max_slice_nums: int | None = None,
+        use_image_id: bool | None = None,
+    ) -> str:
+        # ``process_images`` forwards ``mm_processor_kwargs`` to the pixel path, so the
+        # placeholder grid must honor the same ``max_slice_nums``; otherwise a request that
+        # sets it (e.g. interleaved omni frames with max_slice_nums=1) produces fewer image
+        # features than placeholder ``<unk>`` slots. ``use_image_id`` is likewise per-request
+        # so callers can match MiniCPM-o's omni path, which emits no ``<image_id>`` prefix.
         return self.info.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
+            max_slice_nums=max_slice_nums,
+            **({} if use_image_id is None else {"use_image_id": use_image_id}),
         )
 
     def get_video_prompt_texts(self, image_size: ImageSize, num_frames: int) -> str:
@@ -3605,13 +3666,21 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
+        image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
+
         def get_image_replacement(item_idx: int):
             images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
             image_size = images.get_image_size(item_idx)
 
             return PromptUpdateDetails.select_text(
-                self.get_image_prompt_texts(image_size, item_idx),
+                self.get_image_prompt_texts(
+                    image_size,
+                    item_idx,
+                    max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
+                    use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
+                ),
                 "<unk>",
             )
 
@@ -4234,15 +4303,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             torch.Tensor: mask
 
         """
-        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
-        for i in range(size):
-            if num_left_chunks < 0:
-                start = 0
-            else:
-                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
-            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
-            ret[i, start:ending] = True
-        return ret
+        indices = torch.arange(size, device=device)
+        chunk_index = indices // chunk_size
+        chunk_end = torch.clamp(
+            (chunk_index + 1) * chunk_size + num_lookhead,
+            max=size,
+        )
+
+        mask = indices.unsqueeze(0) < chunk_end.unsqueeze(1)
+        if num_left_chunks >= 0:
+            chunk_start = torch.clamp(
+                (chunk_index - num_left_chunks) * chunk_size,
+                min=0,
+            )
+            mask.logical_and_(indices.unsqueeze(0) >= chunk_start.unsqueeze(1))
+        return mask
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         input_lengths_after_cnn = (input_lengths - 1) // 2 + 1

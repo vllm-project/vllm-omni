@@ -362,6 +362,7 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self.log_stats = log_stats
         self._orch_monitor = create_orch_monitor(
             enabled=enable_orch_monitor,
             replica_sampler=self._sample_replica_metrics,
@@ -446,7 +447,10 @@ class Orchestrator:
         already no-ops on ``scheduler_stats is None`` (which is what
         the upstream scheduler returns when its own log_stats is False),
         so this gate is mainly to keep the ``/metrics`` surface clean
-        when the user did not request stats.
+        when the user did not request stats. When stats are enabled, record()
+        must still receive IterationStats even on ticks where scheduler_stats
+        is None; upstream PrometheusStatLogger records token/request metrics
+        from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
         self._transfer_emitter = transfer_emitter
@@ -937,19 +941,17 @@ class Orchestrator:
                                 )
                                 if req_state.streaming.enabled:
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
-                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
+                            iteration_stats = (
+                                IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
+                            )
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
                                 iteration_stats=iteration_stats,
                             )
-                            if record_stats:
+                            if self._stat_logger is not None and (
+                                raw_outputs.scheduler_stats is not None or iteration_stats is not None
+                            ):
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,

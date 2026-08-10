@@ -4,6 +4,8 @@ import asyncio
 import base64
 import inspect
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 
 import numpy as np
 from vllm.logger import init_logger
@@ -620,6 +622,17 @@ class NativeRuntimeBridgeMixin:
             return redacted
         if isinstance(value, list | tuple):
             return [cls._redact_runtime_control_result(item) for item in value]
+        if is_dataclass(value) and not isinstance(value, type):
+            # Control results carry typed values straight from the engine:
+            # `fence` and `accepted_fence` are `DuplexFence` instances added by
+            # `DuplexControlClient.execute`. This redacted value is emitted on
+            # the wire (for example `session.created.runtime_control` in
+            # `session_runner`), where `WebSocket.send_json` would raise
+            # `TypeError: Object of type DuplexFence is not JSON serializable`
+            # and kill the session during the handshake.
+            return {key: cls._redact_runtime_control_result(child) for key, child in asdict(value).items()}
+        if isinstance(value, Enum):
+            return value.value
         return value
 
     async def _send_native_duplex_events(

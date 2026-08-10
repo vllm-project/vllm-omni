@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
@@ -108,6 +109,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         num_computed = int(getattr(request, "num_computed_tokens", 0))
         num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
         return max(0, num_computed - num_placeholders)
+
+    @staticmethod
+    def _refresh_generation_chunk_prefill_state(request: Request) -> None:
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        if getattr(request, "prefill_stats", None) is None:
+            request.prefill_stats = PrefillStats()
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -249,15 +256,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 new_ids = payload_data.get("codes", {}).get("audio")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
                 use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
+                prompt_token_ids: list[int]
                 if use_tensor_codes:
-                    request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
+                    prompt_token_ids = [0] if new_ids.numel() > 0 else []
                 elif has_tensor_codes:
                     new_ids = new_ids.tolist()
+                    prompt_token_ids = new_ids
                 elif new_ids is None:
                     new_ids = []
-                    request.prompt_token_ids = new_ids
-                if not use_tensor_codes:
-                    request.prompt_token_ids = new_ids
+                    prompt_token_ids = new_ids
+                else:
+                    prompt_token_ids = new_ids
+                request.prompt_token_ids = prompt_token_ids
                 prev_info = getattr(request, "additional_information", None)
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
@@ -293,6 +303,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # chunk as ready, otherwise Stage1 can consume before the
                     # first DAC frame arrives.
                     return False
+                self._refresh_generation_chunk_prefill_state(request)
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)

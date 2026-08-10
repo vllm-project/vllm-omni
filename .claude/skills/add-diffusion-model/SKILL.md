@@ -309,7 +309,7 @@ For Omni or custom models, create:
 
 Required updates:
 1. `docs/user_guide/diffusion/parallelism/overview.md` — parallelism support overview/table
-2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
+2. `docs/user_guide/diffusion/cpu_offload.md` — if CPU offload supported (add to supported models table)
 3. `docs/user_guide/diffusion/cache_acceleration/teacache.md` — if TeaCache supported
 4. `docs/user_guide/diffusion/cache_acceleration/cache_dit.md` — if Cache-DiT supported
 5. Offline example docs under `examples/offline_inference/<name>/` (`README.md` or category-specific `.md`)

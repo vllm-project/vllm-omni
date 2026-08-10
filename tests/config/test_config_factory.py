@@ -1805,6 +1805,7 @@ class TestQwen2_5OmniPipeline:
         assert s.owns_tokenizer is True
         assert s.engine_output_type == "latent"
         assert s.requires_multimodal_data is True
+        assert s.hf_config_name == "thinker_config"
 
     def test_talker(self):
         p = resolve_pipeline_config("qwen2_5_omni")
@@ -1813,6 +1814,7 @@ class TestQwen2_5OmniPipeline:
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
+        assert s.hf_config_name == "talker_config"
         assert s.sampling_constraints["stop_token_ids"] == [8294]
         # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
         # so sync_process_input_func always wins and custom_process_input_func
@@ -1829,6 +1831,7 @@ class TestQwen2_5OmniPipeline:
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
         assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "thinker_config"
 
 
 class TestQwen3TTSPipeline:
@@ -2213,6 +2216,32 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+
+        # The CUDA memory budget must not leak into the existing NPU profile.
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        npu_stages = merge_pipeline_deploy(pipeline, npu)
+        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
+
+        # Multi-GPU replica profiles place Talker on dedicated devices and
+        # preserve their previous automatic KV-cache sizing.
+        for filename in (
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+        ):
+            replica = _apply_platform_overrides(
+                load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
+            )
+            replica_stages = merge_pipeline_deploy(pipeline, replica)
+            assert replica_stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

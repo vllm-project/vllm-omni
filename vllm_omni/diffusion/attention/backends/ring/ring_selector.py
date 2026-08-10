@@ -15,6 +15,7 @@ from .ring_globals import (
 )
 from .ring_kernels import (
     flash_attn3_func_forward,
+    flash_attn4_func_forward,
     flash_attn_forward,
     flash_attn_forward_aiter,
     flashinfer_attn_forward,
@@ -32,6 +33,7 @@ class AttnType(Enum):
     AITER = "aiter"
     FA = "fa"
     FA3 = "fa3"
+    FA4 = "fa4"
     FLASHINFER = "flashinfer"
     TORCH = "torch"
     SAGE_AUTO = "sage_auto"
@@ -76,6 +78,9 @@ def select_flash_attn_impl(
 
     elif impl_type == AttnType.FA3:
         return flash_attn3_func_forward
+
+    elif impl_type == AttnType.FA4:
+        return flash_attn4_func_forward
 
     elif impl_type == AttnType.FLASHINFER:
         return flashinfer_attn_forward

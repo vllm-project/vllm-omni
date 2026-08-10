@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import time
@@ -11,6 +12,17 @@ import aiohttp
 from tqdm import tqdm
 
 DEFAULT_EDITS_BOT_TASK = "think"
+
+
+def _is_minimax_h3_mixed_reference(model: str) -> bool:
+    """MiniMax-H3 Ref2VA consumes reference videos as file paths.
+
+    Its reference preparer ffprobes / ffmpegs the reference file, so single
+    ``video_reference`` uploads are sent as a base64 data URL: the server
+    persists them to disk and keeps ``source_path``, handing the pipeline a
+    real file path instead of a decoded frame list.
+    """
+    return "MiniMax-H3" in (model or "")
 
 
 @dataclass
@@ -355,13 +367,21 @@ async def async_request_v1_videos(
         )
     elif input.video_paths and len(input.video_paths) > 0:
         video_path = input.video_paths[0]
-        image_file = open(video_path, "rb")
-        form.add_field(
-            "input_reference",
-            image_file,
-            filename=os.path.basename(video_path),
-            content_type=_guess_mime_type(video_path),
-        )
+        if _is_minimax_h3_mixed_reference(input.model):
+            with open(video_path, "rb") as reference_file:
+                video_b64 = base64.b64encode(reference_file.read()).decode("ascii")
+            form.add_field(
+                "video_reference",
+                json.dumps([{"video_url": f"data:video/mp4;base64,{video_b64}"}]),
+            )
+        else:
+            image_file = open(video_path, "rb")
+            form.add_field(
+                "input_reference",
+                image_file,
+                filename=os.path.basename(video_path),
+                content_type=_guess_mime_type(video_path),
+            )
 
     job_id = None
     job_status = None

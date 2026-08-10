@@ -29,7 +29,7 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-SSIM_THRESHOLD = 0.94
+SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"
@@ -69,7 +69,15 @@ def _local_files_only(model: str) -> bool:
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    server_args = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--fa-deterministic",
+    ]
     with OmniServer(model, server_args, use_omni=True) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
