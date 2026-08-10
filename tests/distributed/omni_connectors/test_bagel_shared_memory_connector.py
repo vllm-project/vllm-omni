@@ -228,7 +228,6 @@ def _resolve_deploy_config(config_path: str, run_level: str) -> str:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.skip(reason="#issue 5475")
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_img2img_shared_memory_connector(run_level):

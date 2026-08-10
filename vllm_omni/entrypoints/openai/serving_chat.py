@@ -786,6 +786,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
+                    lora_request=lora_request,
                 )
 
                 generators.append(generator)

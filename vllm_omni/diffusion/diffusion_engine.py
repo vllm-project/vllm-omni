@@ -434,8 +434,7 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.supports_request_batch or self.dp_concurrent:
-                    self._wait_for_request_batch_admission_locked()
+                self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
 
@@ -469,53 +468,39 @@ class DiffusionEngine:
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
-    def _wait_for_request_batch_admission_locked(self) -> None:
-        """Wait for compatible requests to accumulate before scheduling a wave.
+    def _wait_for_admission_if_needed_locked(self) -> None:
+        """Apply scheduler admission policy while holding the engine condition.
 
         Caller must hold ``self._cv``.
         """
-        if self.step_execution or (not self.supports_request_batch and not self.dp_concurrent):
-            return
-
-        max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
-        if max_wait_s == 0:
-            return
-
-        max_batch = self.scheduler.max_num_running_reqs
-        waiting = self.scheduler.num_waiting_requests()
-        running = self.scheduler.num_running_requests()
-
-        if running > 0:
-            return
-
         start = time.monotonic()
-        deadline = start + max_wait_s
+        decision = self.scheduler.get_admission_wait_decision(
+            now=start,
+            dp_concurrent=self.dp_concurrent,
+        )
+        if not decision.should_wait:
+            return
+
         last_waiting = -1
         stable_since = start
-        # For dp_concurrent, use a longer stable window so all dp_size
-        # HTTP requests have time to land before scheduling.
-        if self.dp_concurrent:
-            stable_window_s = min(0.3, max_wait_s / 2.0)
-        else:
-            stable_window_s = min(0.05, max_wait_s / 5.0)
 
         while not self.stop_event.is_set():
             waiting = self.scheduler.num_waiting_requests()
             now = time.monotonic()
 
-            if waiting >= max_batch:
-                break
-            if waiting > 0 and (now - stable_since) >= stable_window_s:
-                break
-            if now >= deadline:
-                break
-
             if waiting > last_waiting:
                 stable_since = now
                 last_waiting = waiting
 
-            remaining = deadline - now
-            self._cv.wait(timeout=min(remaining, 0.002))
+            if self.scheduler.should_end_admission_wait(
+                decision,
+                now=now,
+                stable_since=stable_since,
+            ):
+                break
+
+            remaining = decision.deadline - now if decision.deadline is not None else 0.002
+            self._cv.wait(timeout=min(max(remaining, 0.0), 0.002))
 
         waited_ms = (time.monotonic() - start) * 1000.0
         final_waiting = self.scheduler.num_waiting_requests()
@@ -523,7 +508,7 @@ class DiffusionEngine:
             logger.info(
                 "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
                 final_waiting,
-                max_batch,
+                decision.max_batch,
                 waited_ms,
             )
 

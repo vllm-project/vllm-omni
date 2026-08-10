@@ -7,6 +7,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 
 import argparse
 import json
+import math
 import os
 import signal
 from types import FrameType
@@ -41,6 +42,17 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+def _nonneg_finite_float(value: str) -> float:
+    """Argparse type for finite, non-negative floats (rejects nan/inf)."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {value!r}")
+    return parsed
 
 
 def _ensure_vllm_platform():
@@ -599,7 +611,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
-            type=float,
+            type=_nonneg_finite_float,
             default=0.0,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "

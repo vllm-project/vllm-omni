@@ -146,7 +146,7 @@ def _make_engine_with_loop(
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
 
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace(max_num_seqs=1))
+    sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
     engine.scheduler = sched
     engine.step_execution = False
     engine.supports_request_batch = False
