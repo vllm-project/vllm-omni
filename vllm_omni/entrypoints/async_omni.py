@@ -599,6 +599,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             else:
                 await self.engine.add_request_async(
@@ -608,6 +609,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -627,6 +629,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 yield output
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
+
+            # The input pump can outlive a normally-completed generation
+            # (e.g. a realtime client that keeps streaming after the final
+            # output); a live pump keeps issuing streaming updates for a
+            # request the orchestrator no longer tracks.
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
 
             self._log_summary_and_cleanup(request_id)
 
@@ -652,6 +661,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        lora_request: Any = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -689,6 +699,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -701,6 +712,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
             except (asyncio.CancelledError, GeneratorExit):
@@ -732,6 +744,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
                     else:
@@ -743,6 +756,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
 
@@ -1059,7 +1073,10 @@ class AsyncOmni(EngineClient, OmniBase):
         """Submit request IDs to be aborted to the engine."""
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
-            self.request_states.pop(rid, None)
+            state = self.request_states.pop(rid, None)
+            input_stream_task = getattr(state, "input_stream_task", None)
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

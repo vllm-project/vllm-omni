@@ -24,7 +24,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     resolve_wan_flow_shift,
+    resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
     retrieve_latents,
 )
@@ -144,6 +145,7 @@ class Wan22I2VPipeline(
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
+    DenoiseProgressMixin,
     SupportsComponentDiscovery,
 ):
     """
@@ -354,7 +356,7 @@ class Wan22I2VPipeline(
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
 
-                set_forward_context_denoise_step_idx(step_idx)
+                self.record_denoise_step(step_idx, t)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -474,26 +476,10 @@ class Wan22I2VPipeline(
         num_frames = req.sampling_params.num_frames or 81
         num_steps = 40 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
 
-        # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        else:
-            guidance_scale = 5.0
-
         output_type = req.sampling_params.output_type or "np"
         attention_kwargs: dict | None = None
 
-        # Handle guidance scales
-        guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
-        guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
-            else (
-                guidance_scale[1]
-                if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
-                else guidance_low
-            )
-        )
+        guidance_low, guidance_high = resolve_wan_guidance_scales(req.sampling_params, default_guidance_scale=5.0)
 
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high

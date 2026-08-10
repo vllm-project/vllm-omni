@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.indextts2 import (
@@ -10,6 +11,9 @@ from vllm_omni.model_executor.stage_input_processors.indextts2 import (
     talker2s2mel_full_payload,
     talker2s2mel_token_only,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 STOP_MEL_TOKEN = 8193
 LATENT_DIM = 16

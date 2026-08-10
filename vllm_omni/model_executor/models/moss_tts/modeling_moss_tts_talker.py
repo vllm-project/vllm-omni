@@ -1513,6 +1513,59 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         mtp_control[:, :1] = 1.0 if active else 0.0
         return input_ids, text_embed, {"mtp_inputs": (mtp_hidden, mtp_control)}
 
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[dict[str, Any]],
+    ]:
+        """Batch the tensor work from the decode branch of ``preprocess``."""
+        input_ids = input_ids.reshape(-1)
+        batch_size = len(req_infos)
+        if input_ids.numel() != batch_size:
+            raise ValueError(
+                f"MOSS-TTS Local decode preprocess received {input_ids.numel()} token ids for {batch_size} requests"
+            )
+
+        text_embeds = self.model.embed_tokens(input_ids)
+        hidden_rows: list[torch.Tensor] = []
+        active_rows: list[bool] = []
+        for info in req_infos:
+            last_hidden = (info.get("hidden_states", {}) or {}).get("last")
+            if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
+                hidden_rows.append(
+                    last_hidden.to(
+                        device=text_embeds.device,
+                        dtype=text_embeds.dtype,
+                    ).reshape(1, -1)
+                )
+            else:
+                hidden_rows.append(text_embeds.new_zeros((1, self.hidden_size)))
+
+            state = info.get("audio_state", {}) or {}
+            active_rows.append(isinstance(state, dict) and not bool(state.get("is_stopping")))
+
+        last_talker_hidden = torch.cat(hidden_rows, dim=0)
+        text_step = torch.zeros_like(last_talker_hidden)
+        text_step[:, 0] = torch.tensor(
+            active_rows,
+            device=text_step.device,
+            dtype=text_step.dtype,
+        )
+        return (
+            input_ids,
+            text_embeds,
+            last_talker_hidden,
+            text_step,
+            [{} for _ in range(batch_size)],
+        )
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         if hidden_states.numel() == 0:
             return {}
@@ -1680,6 +1733,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w = torch.stack(
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
+
+        if not self.vllm_config.model_config.enforce_eager:
+            self.local_transformer.setup_compile()
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",

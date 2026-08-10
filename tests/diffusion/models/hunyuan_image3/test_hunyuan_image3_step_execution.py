@@ -7,7 +7,10 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
+import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -18,6 +21,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_PROMPT_KV,
     HunyuanImage3Pipeline,
 )
+from vllm_omni.diffusion.models.hunyuan_image3.request_layout import HunyuanPreparedLayout
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -76,6 +80,72 @@ def _sampling_params(**extra_args):
     )
 
 
+def _prepared_layout() -> HunyuanPreparedLayout:
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(
+            tokens=torch.arange(21).reshape(1, 21),
+            gen_image_mask=torch.ones(1, 21, dtype=torch.bool),
+            gen_timestep_scatter_index=torch.tensor([[4]]),
+            all_image_slices=[[slice(5, 21)]],
+            joint_image_slices=[[]],
+            gen_image_slices=[[slice(5, 21)]],
+            real_pos=torch.tensor([[21]]),
+        ),
+        rope_image_info=[[(slice(5, 21), (4, 4))]],
+        generated_image_info=ImageInfo(
+            image_type="gen_image",
+            image_width=512,
+            image_height=512,
+            token_width=4,
+            token_height=4,
+            image_token_length=16,
+        ),
+    )
+
+
+def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    rope_kwargs = {}
+
+    def fake_build_batch_2d_rope(**kwargs):
+        rope_kwargs.update(kwargs)
+        return torch.zeros(1), torch.zeros(1)
+
+    monkeypatch.setattr(hy3_module, "build_batch_2d_rope", fake_build_batch_2d_rope)
+
+    def fail_apply_chat_template(**_kwargs):
+        pytest.fail("prepared Hunyuan execution must not apply the chat template again")
+
+    pipeline._tkwrapper = SimpleNamespace(
+        apply_chat_template=fail_apply_chat_template,
+        eos_token_id=2,
+        boi_token_id=3,
+        end_recaption_token_id=4,
+        end_answer_token_id=5,
+    )
+    pipeline.config = SimpleNamespace(
+        attention_head_dim=2,
+        rope_theta=10000.0,
+    )
+    prepared = _prepared_layout()
+
+    model_inputs = pipeline.prepare_model_inputs(
+        prompt="prompt",
+        mode="gen_image",
+        guidance_scale=1.0,
+        image_size=(512, 512),
+        device=torch.device("cpu"),
+        generator=[torch.Generator().manual_seed(0)],
+        prepared_layout=prepared,
+    )
+
+    assert model_inputs["tokenizer_output"] is prepared.tokenizer_output
+    assert model_inputs["batch_gen_image_info"] == [prepared.generated_image_info]
+    assert rope_kwargs["image_infos"] is prepared.rope_image_info
+    torch.testing.assert_close(model_inputs["input_ids"], prepared.tokenizer_output.tokens)
+
+
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     pipeline = _pipeline()
     states = [_state("req-0", 1), _state("req-1", 3)]
@@ -131,12 +201,13 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
         captured.update(kwargs)
         raise RuntimeError("stop after prepare_model_inputs")
 
-    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    monkeypatch.setattr(hy3_layout_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
     state = StepRequestState(
         request_id="req-bot-task",
         sampling=sampling,
         prompt=prompt_item,
+        prepared_layout=_prepared_layout(),
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
@@ -144,6 +215,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
 
     assert captured["bot_task"] == expected_model_bot_task
     assert captured["system_prompt_bot_task"] == expected_system_bot_task
+    assert captured["prepared_layout"] is state.prepared_layout
 
 
 def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
@@ -159,23 +231,22 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
         captured.update(kwargs)
         raise RuntimeError("stop after prepare_model_inputs")
 
-    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    monkeypatch.setattr(hy3_layout_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
-    req = DiffusionRequestBatch(
-        requests=[
-            SimpleNamespace(
-                request_id="req-forward-bot-task",
-                sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
-                prompt={"prompt": "prompt", "bot_task": "vanilla"},
-            )
-        ]
+    request = SimpleNamespace(
+        request_id="req-forward-bot-task",
+        sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+        prompt={"prompt": "prompt", "bot_task": "vanilla"},
+        prepared_layout=_prepared_layout(),
     )
+    req = DiffusionRequestBatch(requests=[request])
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
         pipeline.forward(req)
 
     assert captured["bot_task"] == "think"
     assert captured["system_prompt_bot_task"] == "think"
+    assert captured["prepared_layout"] is request.prepared_layout
 
 
 def test_grouped_denoise_rejects_non_sdpa_attention_backend():

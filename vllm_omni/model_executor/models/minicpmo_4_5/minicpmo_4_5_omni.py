@@ -175,7 +175,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         token_ids = self._minicpmo45_native_duplex_token_ids()
         listen_id = int(token_ids.get("listen_token_id", -1))
-        tts_bos_id = int(token_ids.get("tts_bos_token_id", -1))
         turn_eos_id = int(token_ids.get("turn_eos_token_id", -1))
         if listen_id < 0 or listen_id >= logits.shape[-1]:
             return
@@ -199,7 +198,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 continue
             force_listen = payload.get("force_listen") is True
             is_speech = payload.get("is_speech")
-            redirect_listen = False
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
             session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
             if turn_eos_id >= 0 and session_key is not None:
@@ -209,8 +207,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 )
                 if is_speech is True:
                     if state is not None:
-                        if not getattr(state, "current_turn_ended", True):
-                            redirect_listen = True
                         with suppress(Exception):
                             state.last_terminator_token = None
                 else:
@@ -218,7 +214,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     if turn_ended and not pending_speech_context:
                         force_listen = True
 
-            if not force_listen and not redirect_listen:
+            if not force_listen:
                 continue
             if force_listen and segment_key in force_listen_segments:
                 continue
@@ -226,10 +222,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 logits[row_idx, :] = float("-inf")
                 logits[row_idx, listen_id] = 0.0
                 force_listen_segments.add(segment_key)
-            elif 0 <= tts_bos_id < logits.shape[-1]:
-                if logits[row_idx, listen_id] > logits[row_idx, tts_bos_id]:
-                    logits[row_idx, tts_bos_id] = logits[row_idx, listen_id]
-                logits[row_idx, listen_id] = float("-inf")
 
     # -------------------- Device utilities --------------------
     @staticmethod
@@ -730,6 +722,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         raw_recent_tokens = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
         recent_tokens = [int(token_id) for token_id in raw_recent_tokens if isinstance(token_id, int) and token_id >= 0]
+        temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
+        top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
+        top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
             max_speak_tokens = int(
                 getattr(
@@ -765,23 +761,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if valid_forbidden:
                 logits[:, valid_forbidden] = float("-inf")
 
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        state = self._minicpmo45_duplex_state_for_row(row_idx)
-        generated_text_tokens = getattr(state, "generated_text_tokens", None)
-        repetition_tokens = generated_text_tokens if generated_text_tokens else recent_tokens
+        generated_tokens = getattr(state, "generated_tokens", None)
+        repetition_tokens = generated_tokens if generated_tokens else recent_tokens
         repetition_penalty = 1.05
         if repetition_penalty != 1.0 and repetition_tokens:
             history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
             for token_id in set(repetition_tokens[-history_size:]):
-                if token_id in special_ids or token_id < 0 or token_id >= logits.shape[-1]:
+                if token_id < 0 or token_id >= logits.shape[-1]:
                     continue
                 logits[0, token_id] /= repetition_penalty
 
-        temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
-        top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
-        top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
             sampled = int(torch.argmax(logits, dim=-1).item())
+            self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
             sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
                 sampled,
                 recent_tokens,
@@ -793,6 +785,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
         sampled = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
+        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
         sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
             sampled,
             recent_tokens,
@@ -901,6 +894,28 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return int(tts_bos_id)
         return int(sampled)
 
+    def _record_minicpmo45_duplex_generation_token(self, row_idx: int, sampled: int) -> None:
+        """Track tokens returned by the model-policy decoder.
+
+        The released StreamDecoder is constructed without special_token_ids, so
+        every normally decoded token participates in repetition penalty. Forced
+        listen bypasses that decoder, while chunk_eos boundary decisions return
+        before this method is called.
+        """
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        if state is None:
+            return
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if isinstance(payload, dict) and payload.get("force_listen") is True:
+            return
+        generated_tokens = getattr(state, "generated_tokens", None)
+        if not isinstance(generated_tokens, list):
+            generated_tokens = []
+            state.generated_tokens = generated_tokens
+        generated_tokens.append(int(sampled))
+        history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
+        del generated_tokens[:-history_size]
+
     def _record_minicpmo45_duplex_terminator(self, row_idx: int, sampled: int, token_ids: dict[str, int]) -> None:
         """Remember sampled unit state for the next append.
 
@@ -928,15 +943,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        if sampled not in special_ids:
-            generated_text_tokens = getattr(state, "generated_text_tokens", None)
-            if not isinstance(generated_text_tokens, list):
-                generated_text_tokens = []
-                state.generated_text_tokens = generated_text_tokens
-            generated_text_tokens.append(int(sampled))
-            history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
-            del generated_text_tokens[:-history_size]
         if (
             sampled == tts_bos_id
             and getattr(state, "current_turn_ended", True)

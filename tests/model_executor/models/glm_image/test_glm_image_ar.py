@@ -91,6 +91,10 @@ GlmImageRotaryEmbedding = _ar_mod.GlmImageRotaryEmbedding
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_glm_image_ar_omits_hidden_pooler_payload():
+    assert GlmImageForConditionalGeneration.omni_pooler_payload_include_hidden is False
+
+
 # =============================================================================
 # Helper: Minimal config for testing
 # =============================================================================

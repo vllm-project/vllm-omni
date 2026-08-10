@@ -15,3 +15,10 @@ stages:
     devices: "1,2,3"
     num_replicas: 3
     async_scheduling: false
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Stage 1 has dedicated GPUs in this profile; retain automatic sizing.
+        kv_cache_memory_bytes: null

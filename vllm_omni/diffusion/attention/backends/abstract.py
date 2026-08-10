@@ -15,6 +15,25 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    # The backend can represent a contiguous valid K/V prefix by slicing the
+    # tensors instead of materializing a padding mask. Models may use this to
+    # avoid a slower masked-attention plan when tail padding is not semantic.
+    supports_prefix_kv_slicing: bool = False
+
+    # ``OmniPlatformEnum`` values this backend runs on; None means unrestricted.
+    # Platform resolution rejects an explicit selection outside this set, so a
+    # hardware-specific backend fails before the model is built.
+    supported_platforms: tuple[str, ...] | None = None
+
+    @classmethod
+    def validate_available(cls) -> None:
+        """Raise if this backend's optional dependencies are missing.
+
+        Called during platform resolution, i.e. before model construction, so a
+        backend that probes its kernel package lazily still reports the problem
+        while the user can still act on it.
+        """
+        return None
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -59,6 +78,23 @@ class QueryRange:
     global_start: int
 
 
+@dataclass(frozen=True, slots=True)
+class VideoTokenLayout:
+    """Where the video segment sits inside a packed multimodal sequence.
+
+    A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
+    publishes this so backends can recover spatiotemporal locality; the prefix
+    holds everything that is not video (text, visual conditions, audio).
+    Publishing it also asserts that any ``attn_mask`` masks only the trailing
+    padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
+
+    Plain ints, so reading it never forces a device-to-host sync.
+    """
+
+    prefix_len: int
+    latent_grid: tuple[int, int, int]
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -79,11 +115,21 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
+    #     variable-length query/key sequences for FlashAttention.
+    #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
+    #     the packed cu_seqlens tensors.
+    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
+    #     backend that advertises supports_prefix_kv_slicing.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
     query_ranges: tuple[QueryRange, ...] | None = None
+
+    # Geometry of the video segment for backends that exploit spatiotemporal
+    # locality (block-sparse selection, tiled masks). Dense backends ignore it.
+    video_layout: VideoTokenLayout | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

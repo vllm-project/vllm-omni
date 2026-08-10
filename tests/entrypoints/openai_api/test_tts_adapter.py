@@ -15,6 +15,9 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
@@ -58,12 +61,6 @@ def test_resolve_qwen3_tts_class():
 def test_resolve_unknown_returns_none():
     assert resolve_adapter("not_a_real_model") is None
     assert resolve_adapter(None) is None
-
-
-def test_ming_flash_omni_not_migrated():
-    """ming_flash_omni is intentionally excluded from the adapter migration in
-    this PR; it stays on the legacy inline dispatch in serving_speech.py."""
-    assert resolve_adapter("ming_flash_omni_tts") is None
 
 
 def test_voxcpm2_resolves():
