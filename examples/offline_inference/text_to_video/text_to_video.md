@@ -92,14 +92,16 @@ Enable Cache-DiT on the dense Base model with sequential two-pass CFG:
 python examples/offline_inference/text_to_video/text_to_video.py \
   --model robbyant/lingbot-video-dense-1.3b \
   --cache-backend cache_dit --enforce-eager \
-  --height 192 --width 320 --num-frames 9 --num-inference-steps 40 \
+  --prompt-json /path/to/lingbot-video/assets/cases/t2v/example_1/prompt.json \
+  --height 480 --width 832 --num-frames 121 --num-inference-steps 40 \
   --guidance-scale 3.0 --output lingbot_cache_dit_t2v.mp4
 ```
 
-The example applies a quality-first Dense T2V preset (`Fn=12`, eight warmup
-steps, at most eight cached steps, residual threshold `0.06`, and no consecutive
-cached steps). Tune these values and recheck output quality for other
-checkpoints, resolutions, frame counts, or step counts.
+The example applies a balanced Dense T2V preset (`Fn=4`, eight warmup steps,
+at most 16 cached steps, residual threshold `0.12`, medium dynamic SCM, and no
+consecutive cached steps). It was selected using LingBot-Video's official
+five-second `example_1` prompt. Tune these values and recheck output quality for
+other prompts, checkpoints, resolutions, frame counts, or step counts.
 
 Cache-DiT requires `guidance_scale > 1` and cannot use
 `--extra-body '{"batch_cfg": true}'`.

@@ -57,12 +57,13 @@ Enable Cache-DiT for the dense checkpoint with:
 ```bash
 MODEL=robbyant/lingbot-video-dense-1.3b \
   bash run_server.sh --cache-backend cache_dit --enforce-eager \
-  --cache-config '{"Fn_compute_blocks":12,"Bn_compute_blocks":0,"max_warmup_steps":8,"max_cached_steps":8,"residual_diff_threshold":0.06,"max_continuous_cached_steps":1}'
+  --cache-config '{"Fn_compute_blocks":4,"Bn_compute_blocks":0,"max_warmup_steps":8,"max_cached_steps":16,"residual_diff_threshold":0.12,"max_continuous_cached_steps":1,"enable_taylorseer":false,"taylorseer_order":1,"scm_steps_mask_policy":"medium","scm_steps_policy":"dynamic"}'
 ```
 
-This quality-first preset was validated on the Dense checkpoint with 40-step
-T2V. Recheck quality before using a more aggressive preset or changing the
-checkpoint, resolution, frame count, or step count.
+This balanced preset was validated on the Dense checkpoint with the official
+five-second, 40-step T2V example. Recheck quality before using a more aggressive
+preset or changing the prompt, checkpoint, resolution, frame count, or step
+count.
 
 LingBot uses sequential two-pass classifier-free guidance for Cache-DiT. Keep
 the default `batch_cfg=false` and set `guidance_scale > 1`. If the optional
