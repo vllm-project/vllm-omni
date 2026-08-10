@@ -9,14 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
-    run_lifecycle_probes,
-)
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
-    run_soft_interrupt,
-)
-from tests.helpers.mark import hardware_test
-from tests.helpers.minicpmo_4_5_duplex import (
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
     multi_session_args,
@@ -25,6 +18,13 @@ from tests.helpers.minicpmo_4_5_duplex import (
     validated_input_wav,
     validated_soft_interrupt_wav,
 )
+from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
+    run_lifecycle_probes,
+)
+from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
+    run_soft_interrupt,
+)
+from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 

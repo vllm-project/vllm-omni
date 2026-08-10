@@ -10,15 +10,7 @@ from pathlib import Path
 import pytest
 import websockets
 
-from tests.e2e.online_serving.minicpmo_realtime_duplex_scenarios import (
-    _ref_audio_data_url,
-    run_demo,
-)
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
-    run_multi_session,
-)
-from tests.helpers.mark import hardware_test
-from tests.helpers.minicpmo_4_5_duplex import (
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     CORE_SERVER_PARAMS,
     SERVER_PARAMS,
     demo_args,
@@ -27,6 +19,14 @@ from tests.helpers.minicpmo_4_5_duplex import (
     resolve_ref_audio,
     validated_input_wav,
 )
+from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
+    _ref_audio_data_url,
+    run_demo,
+)
+from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
+    run_multi_session,
+)
+from tests.helpers.mark import hardware_test
 from vllm_omni.experimental.fullduplex.client import build_realtime_url
 
 pytestmark = pytest.mark.omni

@@ -17,14 +17,15 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 @lru_cache(maxsize=1)
 def _scenario_module():
     """Delay heavyweight vLLM imports so ``--help`` remains directly executable."""
-    import minicpmo_realtime_duplex_scenarios
+    from tests.e2e.online_serving.helpers import minicpmo_realtime_duplex_scenarios
 
     return minicpmo_realtime_duplex_scenarios
 

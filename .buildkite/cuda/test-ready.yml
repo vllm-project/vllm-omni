@@ -192,10 +192,10 @@ steps:
           - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
           - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
           - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
-          - tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py
+          - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
-          - tests/helpers/minicpmo_4_5_duplex.py
+          - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
           - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/

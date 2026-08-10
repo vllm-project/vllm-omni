@@ -14,7 +14,7 @@ not a separate model-level barge-in contract.
 
 Run only after a MiniCPM-o 4.5 vLLM-Omni server is up:
 
-  python tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py \
+  python tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py \
       --url ws://localhost:8099/v1/realtime?duplex=1 \
       --model openbmb/MiniCPM-o-4_5 \
       --input-wav input_16k_mono_pcm16.wav \
@@ -37,7 +37,7 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 

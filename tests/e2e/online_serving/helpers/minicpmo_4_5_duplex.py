@@ -53,7 +53,7 @@ CORE_DEPLOY_CONFIG = modify_stage_config(
         }
     },
 )
-ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "minicpmo_4_5"
+ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
 SOFT_INTERRUPT_WAV = ASSET_DIR / "soft_interrupt_16k.wav"

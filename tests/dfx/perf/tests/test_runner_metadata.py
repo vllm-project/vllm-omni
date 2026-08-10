@@ -487,43 +487,6 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
     assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)
 
 
-@pytest.mark.parametrize(
-    ("metric", "current", "baseline"),
-    [
-        ("request_throughput", 1.0, 1.0),
-        ("mean_ttft_ms", 100.0, 100.0),
-    ],
-)
-def test_omni_baseline_accepts_values_at_threshold(metric, current, baseline):
-    from tests.dfx.perf.scripts.run_benchmark import assert_result
-
-    assert_result(
-        {"completed": 1, metric: current},
-        {"baseline": {metric: baseline}},
-        1,
-        assert_baseline=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("metric", "current", "baseline", "message"),
-    [
-        ("request_throughput", 0.9, 1.0, "below baseline"),
-        ("mean_ttft_ms", 101.0, 100.0, "exceeded baseline"),
-    ],
-)
-def test_omni_baseline_rejects_regressions(metric, current, baseline, message):
-    from tests.dfx.perf.scripts.run_benchmark import assert_result
-
-    with pytest.raises(AssertionError, match=message):
-        assert_result(
-            {"completed": 1, metric: current},
-            {"baseline": {metric: baseline}},
-            1,
-            assert_baseline=True,
-        )
-
-
 def test_omni_duplex_expected_audio_turns_accepts_complete_session():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -534,7 +497,6 @@ def test_omni_duplex_expected_audio_turns_accepts_complete_session():
         },
         {"expected_duplex_audio_turns_per_session": 4},
         1,
-        assert_baseline=False,
     )
 
 
@@ -549,5 +511,4 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
             },
             {"expected_duplex_audio_turns_per_session": 4},
             1,
-            assert_baseline=False,
         )

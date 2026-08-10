@@ -13,7 +13,8 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DRIVER_DIR = Path(__file__).resolve().parent
-DEMO_PATH = DRIVER_DIR / "minicpmo_realtime_duplex_scenarios.py"
+HELPERS_DIR = DRIVER_DIR / "helpers"
+DEMO_PATH = HELPERS_DIR / "minicpmo_realtime_duplex_scenarios.py"
 MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
 PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
 SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"

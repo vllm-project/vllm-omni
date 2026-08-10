@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "npu": "A3"
           },
           "num_cards": 1
         }
@@ -52,31 +53,33 @@
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
-          "request_throughput": [
-            0.7803,
-            1.1008,
-            1.2027
-          ],
-          "mean_ttft_ms": [
-            166.9764,
-            307.7133,
-            323.584
-          ],
-          "mean_e2el_ms": [
-            1361.1682,
-            3800.6332,
-            6961.8636
-          ],
-          "mean_audio_ttfp_ms": [
-            635.8099,
-            1615.6591,
-            2888.9831
-          ],
-          "mean_audio_rtf": [
-            0.3151,
-            0.8568,
-            1.5425
-          ]
+          "H100": {
+            "request_throughput": [
+              0.7803,
+              1.1008,
+              1.2027
+            ],
+            "mean_ttft_ms": [
+              166.9764,
+              307.7133,
+              323.584
+            ],
+            "mean_e2el_ms": [
+              1361.1682,
+              3800.6332,
+              6961.8636
+            ],
+            "mean_audio_ttfp_ms": [
+              635.8099,
+              1615.6591,
+              2888.9831
+            ],
+            "mean_audio_rtf": [
+              0.3151,
+              0.8568,
+              1.5425
+            ]
+          }
         }
       }
     ]
