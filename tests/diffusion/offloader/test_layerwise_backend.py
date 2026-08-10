@@ -249,9 +249,7 @@ def _round_trip(params: dict, bufs: dict | None = None) -> dict[str, torch.Tenso
     strides that LayerwiseOffloadHook.prefetch_layer would write back.
     """
     bufs = bufs or {}
-    cpu_weights, metadata = LayerwiseOffloadHook._to_cpu(
-        params, bufs, device=torch.device("cpu"), pin_memory=False
-    )
+    cpu_weights, metadata = LayerwiseOffloadHook._to_cpu(params, bufs, device=torch.device("cpu"), pin_memory=False)
 
     restored: dict[str, torch.Tensor] = {}
     for dtype, ordered_meta in metadata.items():
@@ -372,9 +370,5 @@ class TestNonContigRoundTrip:
 
         hook.prefetch_layer(non_blocking=False)
 
-        assert torch.equal(next_block.weight.data, original_weight), (
-            "weight data corrupted after prefetch_layer"
-        )
-        assert next_block.weight.data.stride() == original_stride, (
-            "strides changed after prefetch_layer"
-        )
+        assert torch.equal(next_block.weight.data, original_weight), "weight data corrupted after prefetch_layer"
+        assert next_block.weight.data.stride() == original_stride, "strides changed after prefetch_layer"

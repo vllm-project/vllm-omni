@@ -223,9 +223,7 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                base = gpu_weight[
-                    metadata["offset"] : metadata["offset"] + metadata["numel"]
-                ].view(metadata["shape"])
+                base = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"])
                 restored = base.t() if metadata.get("store_transposed") else base
                 LayerwiseOffloadHook._set_tensor_storage(target_param_or_buf, restored)
 
