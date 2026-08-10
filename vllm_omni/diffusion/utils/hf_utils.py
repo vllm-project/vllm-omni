@@ -4,6 +4,7 @@ from functools import lru_cache
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
+from vllm.transformers_utils.repo_utils import file_exists
 
 logger = init_logger(__name__)
 
@@ -71,6 +72,36 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+def _looks_like_skyreels_v3_v2v(model_name: str | None) -> bool:
+    """Best-effort detection for SkyReels-V3 video-extension checkpoints."""
+    if not model_name:
+        return False
+    normalized = str(model_name).lower().replace("_", "-")
+    if "skyreels-v3" in normalized and "video-extension" in normalized:
+        return True
+
+    required_files = (
+        "transformer/config.json",
+        "Wan2.1_VAE.pth",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+    )
+    required_dirs = (
+        os.path.join("google", "umt5-xxl"),
+        "transformer",
+    )
+    if os.path.isdir(model_name):
+        return all(os.path.exists(os.path.join(model_name, path)) for path in required_files) and all(
+            os.path.isdir(os.path.join(model_name, path)) for path in required_dirs
+        )
+    if "skyreels" not in normalized:
+        return False
+
+    try:
+        return all(file_exists(model_name, path) for path in required_files)
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -97,6 +128,10 @@ def is_diffusion_model(model_name: str) -> bool:
             except Exception as e:
                 logger.debug("Failed to read local %s: %s", filename, e)
 
+    if _looks_like_skyreels_v3_v2v(model_name):
+        logger.debug("Detected SkyReels V3 V2V diffusion model")
+        return True
+
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
     config_dict = get_diffusion_model_index(model_name)
     if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
@@ -118,4 +153,8 @@ def is_diffusion_model(model_name: str) -> bool:
         # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
         # but are still diffusion-style models in vllm-omni. Detect them via
         # config.json.
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
+    return (
+        _looks_like_bagel(model_name)
+        or _looks_like_dreamzero(model_name)
+        or _looks_like_skyreels_v3_v2v(model_name)
+    )

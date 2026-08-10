@@ -304,16 +304,18 @@ def resolve_model_config_path(model: str) -> str | None:
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
-            # No config.json at repo root (e.g. GLM-TTS stores configs in
-            # subdirectories only).  Try matching against registered deploy
-            # YAML filenames before giving up.
-            model_type = _try_resolve_omni_model_type(model)
-            if model_type is None:
-                raise ValueError(
-                    f"Could not determine model_type for model: {model}. "
-                    "Model is not in standard transformers or Diffusers format. "
-                    f"Please ensure the model has proper configuration files with 'model_type' field"
-                )
+            from vllm_omni.diffusion.utils.hf_utils import _looks_like_skyreels_v3_v2v
+
+            if _looks_like_skyreels_v3_v2v(model):
+                model_type = "skyreels_v3_v2v"
+            else:
+                model_type = _try_resolve_omni_model_type(model)
+                if model_type is None:
+                    raise ValueError(
+                        f"Could not determine model_type for model: {model}. "
+                        "Model is not in standard transformers or Diffusers format. "
+                        f"Please ensure the model has proper configuration files with 'model_type' field"
+                    )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type == "vla" and _looks_like_dreamzero(model):

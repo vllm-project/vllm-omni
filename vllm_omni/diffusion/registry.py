@@ -111,6 +111,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_s2v",
         "Wan22S2VPipeline",
     ),
+    "SkyReelsV3V2VPipeline": (
+        "skyreels_v3",
+        "pipeline_skyreels_v3_v2v",
+        "SkyReelsV3V2VPipeline",
+    ),
     "WanT2VDMD2Pipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -522,6 +527,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
+    "SkyReelsV3V2VPipeline": "get_skyreels_v3_v2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -580,6 +586,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
+    "SkyReelsV3V2VPipeline": "get_skyreels_v3_v2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",

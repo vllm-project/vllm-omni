@@ -106,6 +106,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
+    parser.add_argument("--video", help="Path to an input video for video-conditioned models (SkyReels V3 V2V).")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
     parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
     parser.add_argument(
@@ -335,6 +336,11 @@ def main():
     is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
     is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
+    is_skyreels_v2v = (
+        "skyreels-v3-v2v" in model_name
+        or "skyreels-v3-video-extension" in model_name
+        or model_class_name_lower == "skyreelsv3v2vpipeline"
+    )
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -343,7 +349,7 @@ def main():
         [PIL.Image.open(path).convert("RGB") for path in args.reference_image] if args.reference_image else None
     )
     dimension_image = image or last_image or (reference_images[0] if reference_images else None)
-    if dimension_image is None:
+    if dimension_image is None and not is_skyreels_v2v:
         raise ValueError("Provide --image, --last-image, or at least one --reference-image.")
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
@@ -403,12 +409,20 @@ def main():
     # Calculate dimensions if not provided (model-aware max area).
     height = args.height
     width = args.width
-    if height is None or width is None:
+    if is_skyreels_v2v:
+        # V2V's aspect_ratio bucket lookup happens inside the pipeline based on
+        # the input video's resolution.
+        pass
+    elif height is None or width is None:
         calc_height, calc_width = calculate_dimensions(dimension_image, max_area=d_max_area, mod_value=d_mod)
         height = height or calc_height
         width = width or calc_width
 
     media_inputs: dict[str, Any] = {}
+    if is_skyreels_v2v:
+        if args.video is None:
+            raise ValueError("SkyReels V3 V2V requires --video (path to the input video to extend).")
+        media_inputs["video"] = args.video
     if image is not None:
         media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if last_image is not None:

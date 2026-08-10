@@ -545,12 +545,15 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, _looks_like_skyreels_v3_v2v
 
     if not model:
         return None
 
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
+
+    if _looks_like_skyreels_v3_v2v(model):
+        return "SkyReelsV3V2VPipeline"
 
     # Diffusers models: read _class_name from the pipeline index.
     model_index = get_diffusion_model_index(model)
@@ -1176,11 +1179,18 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, _looks_like_skyreels_v3_v2v
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
             self.model_class_name = "DiffusersAdapterPipeline"
+
+        if self.diffusion_load_format != "diffusers" and _looks_like_skyreels_v3_v2v(self.model):
+            self.model_class_name = "SkyReelsV3V2VPipeline"
+            tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+            self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict or {}))
+            self.update_multimodal_support()
+            return
 
         try:
             config_dict = get_diffusion_model_index(

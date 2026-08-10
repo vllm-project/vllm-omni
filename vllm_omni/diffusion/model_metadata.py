@@ -56,6 +56,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanS2VPipeline": DiffusionModelMetadata(attention_mask_free=True),
+    "SkyReelsV3V2VPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        attention_mask_free=True,
+    ),
 }
 
 

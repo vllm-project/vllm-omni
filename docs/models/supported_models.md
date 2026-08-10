@@ -41,6 +41,7 @@ th {
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.2-VACE | `Pyros13/Wan2.2-VACE-Fun-A14B-Diffusers` | ✅︎ |   |   |   |
+| `SkyReelsV3V2VPipeline` | SkyReels V3 single-shot video extension | `Skywork/SkyReels-V3-Video-Extension` | ✅︎ | | | |
 | `LTX2Pipeline` | LTX-2 / LTX-2.3 one-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `LTX2DistilledPipeline` | LTX-2 distilled two-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | |

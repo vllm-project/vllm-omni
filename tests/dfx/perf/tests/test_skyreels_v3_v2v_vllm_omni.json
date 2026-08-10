@@ -1,0 +1,105 @@
+[
+  {
+    "test_name": "test_skyreels_v3_v2v_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "SkyReels V3 V2V single-shot extension baseline (720P bucket, 4 sampling steps, duration=5s, guidance=1 so CFG is off).",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Skywork/SkyReels-V3-V2V-14B",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "720p_duration5_steps4_g1",
+        "dataset": "random",
+        "task": "v2v",
+        "num-prompts": 3,
+        "max-concurrency": 1,
+        "num-input-videos": 1,
+        "seed": 42,
+        "random-request-config": [
+          {
+            "resolution": "720P",
+            "num_inference_steps": 4,
+            "duration": 5,
+            "fps": 24,
+            "guidance_scale": 1.0,
+            "weight": 1
+          }
+        ],
+        "baseline": {
+          "H100": {
+            "throughput_qps": 0.00115,
+            "latency_mean": 873.32,
+            "peak_memory_mb_mean": 77000.0
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_skyreels_v3_v2v_cfg_g5_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "SkyReels V3 V2V with guidance=5 on 1×H100 (three-branch CFG, ~2x the g=1 latency because pipeline currently runs cond+uncond sequentially without leveraging CFG-parallel — see BENCH_SUMMARY notes).",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Skywork/SkyReels-V3-V2V-14B",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "720p_duration5_steps4_g5",
+        "dataset": "random",
+        "task": "v2v",
+        "num-prompts": 2,
+        "max-concurrency": 1,
+        "num-input-videos": 1,
+        "seed": 42,
+        "enable-negative-prompt": true,
+        "random-request-config": [
+          {
+            "resolution": "720P",
+            "num_inference_steps": 4,
+            "duration": 5,
+            "fps": 24,
+            "guidance_scale": 5.0,
+            "weight": 1
+          }
+        ],
+        "baseline": {
+          "H100": {
+            "throughput_qps": 0.00059,
+            "latency_mean": 1696.47,
+            "peak_memory_mb_mean": 77000.0
+          }
+        }
+      }
+    ]
+  }
+]
