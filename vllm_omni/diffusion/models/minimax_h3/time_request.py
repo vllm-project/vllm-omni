@@ -3,9 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-# Imported from the submodule so this module stays free of the torch-heavy
-# DMD2 package surface; torch itself is only pulled in on the uniform path.
-from vllm_omni.diffusion.models.dmd2.schedule import DMD2SigmaSchedule
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 
 
 def _align_frame_count(frame_count: int) -> int:

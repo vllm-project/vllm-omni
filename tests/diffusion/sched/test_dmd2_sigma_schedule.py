@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 
-from vllm_omni.diffusion.models.dmd2 import DMD2SigmaSchedule
+from vllm_omni.diffusion.sched import DMD2SigmaSchedule
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

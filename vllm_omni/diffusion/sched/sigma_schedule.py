@@ -19,7 +19,8 @@ class DMD2SigmaSchedule:
     distilled release ships the exact positions instead of letting the server
     derive a uniform schedule from ``num_inference_steps``.
 
-    This is deliberately distinct from ``DMD2Config.denoising_timesteps``, which
+    This is deliberately distinct from
+    ``vllm_omni.diffusion.models.dmd2.DMD2Config.denoising_timesteps``, which
     carries integer scheduler timesteps for scheduler-backed pipelines. Here the
     entries are continuous positions in ``[0, 1]`` that still need a per-modality
     time shift applied, which is what lets one schedule drive several coupled

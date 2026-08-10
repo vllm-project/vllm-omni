@@ -536,8 +536,8 @@ def test_base_schedule_rejects_malformed_positions(base_schedule):
 
 
 def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
-    from vllm_omni.diffusion.models.dmd2 import DMD2SigmaSchedule
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.sched import DMD2SigmaSchedule
 
     schedules = {
         partition: None if positions is None else DMD2SigmaSchedule.from_positions(positions)
