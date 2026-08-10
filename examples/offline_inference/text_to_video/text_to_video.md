@@ -151,6 +151,21 @@ Refiner through `--model-config` makes the same HSDP topology shard both
 outermost DiTs; it does not create a separate Refiner-specific sharding
 implementation.
 
+LingBot also supports Ulysses sequence parallelism and two-way CFG Parallel.
+The degrees multiply, so this example uses four GPUs:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --height 480 --width 832 --num-frames 81 --num-inference-steps 30 \
+  --guidance-scale 3.0 --ulysses-degree 2 --cfg-parallel-size 2 \
+  --vae-use-tiling --output lingbot_sp2_cfg2.mp4
+```
+
+`--batch-cfg` and `--refiner-batch-cfg` are mutually exclusive with
+`--cfg-parallel-size 2` because they split the same positive and negative
+guidance branches.
+
 ### LTX-2
 
 ```bash

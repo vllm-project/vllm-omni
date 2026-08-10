@@ -549,6 +549,7 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
         ulysses_degree=args.ulysses_degree,
+        ulysses_mode=args.ulysses_mode,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,

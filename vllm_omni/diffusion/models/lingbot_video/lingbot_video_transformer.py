@@ -5,7 +5,6 @@
 import math
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from cache_dit import ForwardPattern
@@ -15,11 +14,16 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    flash_attn_varlen_func as flash_attn_varlen_func_v3,
-)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -40,19 +44,6 @@ LINGBOT_VIDEO_FP32_MODULES = (
 
 def should_keep_in_fp32(name: str) -> bool:
     return any(module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES)
-
-
-def _all_to_all_split_cat(
-    local_input: torch.Tensor,
-    scatter_dim: int,
-    gather_dim: int,
-    group: dist.ProcessGroup,
-) -> torch.Tensor:
-    world_size = dist.get_world_size(group)
-    input_list = [tensor.contiguous() for tensor in torch.tensor_split(local_input, world_size, scatter_dim)]
-    output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
-    dist.all_to_all(output_list, input_list, group=group)
-    return torch.cat(output_list, dim=gather_dim).contiguous()
 
 
 class LingBotVideoRMSNorm(nn.Module):
@@ -147,8 +138,16 @@ def _cat_interleave(
     return torch.cat(blocks, dim=1)
 
 
-def _packed_block_attention_mask(sample_seq_lens: list[int], device: torch.device) -> torch.Tensor:
-    total_seq_len = sum(sample_seq_lens)
+def _packed_block_attention_mask(
+    sample_seq_lens: list[int],
+    device: torch.device,
+    *,
+    total_seq_len: int | None = None,
+) -> torch.Tensor:
+    unpadded_seq_len = sum(sample_seq_lens)
+    total_seq_len = total_seq_len or unpadded_seq_len
+    if total_seq_len < unpadded_seq_len:
+        raise ValueError("Packed attention mask cannot truncate sample tokens.")
     mask = torch.zeros(
         1,
         1,
@@ -203,87 +202,18 @@ class LingBotVideoAttention(nn.Module):
         x,
         rotary_emb,
         attention_mask=None,
-        packed_indices: dict[str, torch.Tensor] | None = None,
-        parallel_config=None,
     ):
-        B, S, _ = x.shape
         q = self.to_q(x).unflatten(2, (self.num_heads, self.head_dim))
         k = self.to_k(x).unflatten(2, (self.num_heads, self.head_dim))
         v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
         q = apply_rotary_emb(self.norm_q(q), rotary_emb)
         k = apply_rotary_emb(self.norm_k(k), rotary_emb)
-        if packed_indices is None:
-            out = self.attn(q, k, v, attn_metadata=AttentionMetadata(attn_mask=attention_mask))
-        else:
-            packed_attention_mask = packed_indices.get("attention_mask")
-            if packed_attention_mask is not None and parallel_config is None:
-                out = self.attn.sdpa_fallback.forward(
-                    q,
-                    k,
-                    v,
-                    AttentionMetadata(attn_mask=packed_attention_mask),
-                )
-                return self.to_out(out.flatten(2, 3).type_as(x))
-            if flash_attn_varlen_func_v3 is None:
-                raise RuntimeError(
-                    "A flash attention varlen function is required for packed context parallel attention."
-                )
-            if parallel_config is None:
-                result = flash_attn_varlen_func_v3(
-                    q=q.reshape(-1, self.num_heads, self.head_dim),
-                    k=k.reshape(-1, self.num_heads, self.head_dim),
-                    v=v.reshape(-1, self.num_heads, self.head_dim),
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
-                )
-                out = result[0] if isinstance(result, tuple) else result
-                out = out.reshape(B, S, self.num_heads, self.head_dim)
-            else:
-                group = parallel_config.context_parallel_config._ulysses_mesh.get_group()
-                world_size = dist.get_world_size(group)
-                local_heads = self.num_heads // world_size
-                q_global = _all_to_all_split_cat(
-                    q.reshape(B, S, self.num_heads * self.head_dim),
-                    scatter_dim=2,
-                    gather_dim=1,
-                    group=group,
-                ).view(B, S * world_size, local_heads, self.head_dim)
-                k_global = _all_to_all_split_cat(
-                    k.reshape(B, S, self.num_heads * self.head_dim),
-                    scatter_dim=2,
-                    gather_dim=1,
-                    group=group,
-                ).view(B, S * world_size, local_heads, self.head_dim)
-                v_global = _all_to_all_split_cat(
-                    v.reshape(B, S, self.num_heads * self.head_dim),
-                    scatter_dim=2,
-                    gather_dim=1,
-                    group=group,
-                ).view(B, S * world_size, local_heads, self.head_dim)
-                q_flat = q_global.reshape(-1, local_heads, self.head_dim)
-                k_flat = k_global.reshape(-1, local_heads, self.head_dim)
-                v_flat = v_global.reshape(-1, local_heads, self.head_dim)
-                result = flash_attn_varlen_func_v3(
-                    q=q_flat,
-                    k=k_flat,
-                    v=v_flat,
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
-                )
-                out_global = result[0] if isinstance(result, tuple) else result
-                out_global = out_global.reshape(B, S * world_size, local_heads * self.head_dim)
-                out = _all_to_all_split_cat(
-                    out_global,
-                    scatter_dim=1,
-                    gather_dim=2,
-                    group=group,
-                ).view(B, S, self.num_heads, self.head_dim)
+        metadata = AttentionMetadata(attn_mask=attention_mask)
+        if attention_mask is not None and attention_mask.ndim > 2:
+            # Packed CFG uses a block-diagonal QK mask. Let the common Attention
+            # layer perform SP resharding, then select its exact SDPA fallback.
+            metadata.extra["force_sdpa"] = True
+        out = self.attn(q, k, v, attn_metadata=metadata)
         return self.to_out(out.flatten(2, 3).type_as(x))
 
 
@@ -660,8 +590,6 @@ class LingBotVideoBlock(nn.Module):
         rotary_emb,
         attention_mask=None,
         moe_padding_mask=None,
-        packed_indices: dict[str, torch.Tensor] | None = None,
-        parallel_config=None,
     ):
         expected_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
@@ -679,13 +607,7 @@ class LingBotVideoBlock(nn.Module):
         # compute dtype only at Linear boundaries.
         bulk_dtype = self.attn.to_q.weight.dtype
         attn_in = (self.norm1(hidden_states) * scale_msa + shift_msa).to(bulk_dtype)
-        attn_out = self.attn(
-            attn_in,
-            rotary_emb,
-            attention_mask,
-            packed_indices=packed_indices,
-            parallel_config=parallel_config,
-        )
+        attn_out = self.attn(attn_in, rotary_emb, attention_mask)
         hidden_states = hidden_states + (gate_msa * self.norm_post_attn(attn_out)).to(hidden_states.dtype)
 
         ffn_in = (self.norm2(hidden_states) * scale_mlp + shift_mlp).to(bulk_dtype)
@@ -696,6 +618,31 @@ class LingBotVideoBlock(nn.Module):
         ffn_normed = self.norm_post_ffn(ffn_out)
         hidden_states = hidden_states + (gate_mlp * ffn_normed).to(hidden_states.dtype)
         return hidden_states
+
+
+class _LingBotSPInputBoundary(nn.Module):
+    """Keep all token-aligned tensors on one standard SP split boundary."""
+
+    def forward(
+        self,
+        joint: torch.Tensor,
+        rotary: torch.Tensor,
+        temb_input: torch.Tensor,
+        temb6: torch.Tensor,
+        token_validity: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.sp_original_seq_len = None
+            ctx.sp_padding_size = 0
+        return joint, rotary, temb_input, temb6, token_validity
+
+
+class _LingBotSPOutputBoundary(nn.Module):
+    """Gather projected joint tokens and remove any SP auto-padding."""
+
+    def forward(self, projected: torch.Tensor) -> torch.Tensor:
+        return projected
 
 
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
@@ -722,6 +669,19 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     # FP32 while the bulk weights are BF16. Preserve those loaded dtypes when
     # FSDP all-gathers each block instead of applying one dtype to all params.
     _hsdp_preserve_param_dtype = True
+
+    # Auto-padding is exact for pure Ulysses. Ring/hybrid remain limited to
+    # divisible, unmasked sequences because Ring attention cannot consume masks.
+    _sp_plan = {
+        "sp_input_boundary": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            3: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            4: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        "sp_output_boundary": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -822,6 +782,8 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
         self.norm_out_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
         self.proj_out = nn.Linear(hidden_size, math.prod(patch_size) * out_channels)
+        self.sp_input_boundary = _LingBotSPInputBoundary()
+        self.sp_output_boundary = _LingBotSPOutputBoundary()
 
     def forward(
         self,
@@ -882,82 +844,18 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
 
-        parallel_config = getattr(self, "_parallel_config", None)
-        use_packed_attention = parallel_config is not None
-
-        attention_mask = None
-        moe_padding_mask = None
-        packed_indices = None
-        has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
-        if packed_batch or use_packed_attention:
-            sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
-            cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
-            cu_seqlens[1:] = torch.cumsum(
-                torch.tensor(sample_seq_lens, device=device, dtype=torch.int32),
-                dim=0,
+        sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
+        if packed_batch:
+            global_token_validity = torch.ones(1, sum(sample_seq_lens), dtype=torch.bool, device=device)
+        else:
+            text_validity = (
+                encoder_attention_mask.bool()
+                if encoder_attention_mask is not None
+                else torch.ones(B, L, dtype=torch.bool, device=device)
             )
-            packed_indices = {
-                "cu_seqlens_kv": cu_seqlens,
-                "max_seqlen_in_batch_kv": max(sample_seq_lens),
-            }
-            if packed_batch and not use_packed_attention:
-                packed_indices["attention_mask"] = _packed_block_attention_mask(sample_seq_lens, device)
-            has_padding = False
-        if has_padding:
-            key_mask = torch.cat(
-                [torch.ones(B, n_video, dtype=torch.bool, device=device), encoder_attention_mask.bool()],
-                dim=1,
+            global_token_validity = torch.cat(
+                [torch.ones(B, n_video, dtype=torch.bool, device=device), text_validity], dim=1
             )
-            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) -> SDPA broadcast
-            moe_padding_mask = key_mask.reshape(-1).float()  # (B*S,)
-        packed_cp = packed_indices is not None and parallel_config is not None
-        padding_size = 0
-        if packed_cp:
-            cp_config = parallel_config.context_parallel_config
-            cp_world_size = int(getattr(cp_config, "ulysses_degree", getattr(cp_config, "_world_size", 1)))
-            padding_size = (cp_world_size - (joint_seq_len % cp_world_size)) % cp_world_size
-            if padding_size:
-                joint = torch.cat(
-                    [
-                        joint,
-                        torch.zeros(
-                            joint.shape[0],
-                            padding_size,
-                            joint.shape[2],
-                            device=joint.device,
-                            dtype=joint.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-                rotary = torch.cat(
-                    [
-                        rotary,
-                        torch.zeros(
-                            rotary.shape[0],
-                            padding_size,
-                            rotary.shape[2],
-                            device=rotary.device,
-                            dtype=rotary.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-                if packed_indices is None:
-                    raise RuntimeError("packed_indices must be initialized for packed context parallel.")
-                packed_indices["cu_seqlens_kv"] = torch.cat(
-                    [
-                        packed_indices["cu_seqlens_kv"],
-                        packed_indices["cu_seqlens_kv"][-1:] + padding_size,
-                    ],
-                    dim=0,
-                )
-                packed_indices["max_seqlen_in_batch_kv"] = max(
-                    int(packed_indices["max_seqlen_in_batch_kv"]),
-                    int(padding_size),
-                )
-                joint_seq_len = joint.shape[1]
-
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)
         t_emb = self.time_embedder(timestep_proj)  # (B, D)
@@ -966,20 +864,6 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 [t_emb[i : i + 1].unsqueeze(1).expand(1, n_video + text_lens_list[i], -1) for i in range(B)],
                 dim=1,
             )
-            if padding_size:
-                temb_input = torch.cat(
-                    [
-                        temb_input,
-                        torch.zeros(
-                            temb_input.shape[0],
-                            padding_size,
-                            temb_input.shape[2],
-                            device=temb_input.device,
-                            dtype=temb_input.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
             temb6 = self.time_modulation(temb_input.reshape(joint_seq_len, -1))
             temb6 = temb6.reshape(1, joint_seq_len, -1)
         else:
@@ -987,6 +871,36 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             temb6 = self.time_modulation(temb_input.reshape(B * joint_seq_len, -1))
             temb6 = temb6.reshape(B, joint_seq_len, -1)  # (B, S, 6D)
 
+        joint, rotary, temb_input, temb6, local_token_validity = self.sp_input_boundary(
+            joint, rotary, temb_input, temb6, global_token_validity
+        )
+
+        ctx = get_forward_context() if is_forward_context_available() else None
+        padding_size = ctx.sp_padding_size if ctx is not None else 0
+        parallel_config = (
+            getattr(ctx.omni_diffusion_config, "parallel_config", None)
+            if ctx is not None and ctx.omni_diffusion_config is not None
+            else None
+        )
+        ring_degree = int(getattr(parallel_config, "ring_degree", 1))
+
+        padded_global_token_validity = (
+            F.pad(global_token_validity, (0, padding_size), value=False) if padding_size else global_token_validity
+        )
+        if packed_batch:
+            attention_mask = _packed_block_attention_mask(
+                sample_seq_lens,
+                device,
+                total_seq_len=padded_global_token_validity.shape[1],
+            )
+        else:
+            attention_mask = padded_global_token_validity
+            if bool(attention_mask.all()):
+                attention_mask = None
+
+        if ring_degree > 1 and attention_mask is not None:
+            raise ValueError("LingBot Ring SP requires divisible sequences without text padding or packed CFG.")
+        moe_padding_mask = local_token_validity.reshape(-1).float()
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:
@@ -996,16 +910,12 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 rotary,
                 attention_mask,
                 moe_padding_mask,
-                packed_indices=packed_indices,
-                parallel_config=parallel_config,
             )
         final_mod = self.norm_out_modulation(temb_input.reshape(joint.shape[0] * joint.shape[1], -1))
         shift, scale = final_mod.reshape(joint.shape[0], joint.shape[1], -1).chunk(2, dim=-1)
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift
         projected = self.proj_out(final_hidden.to(self.proj_out.weight.dtype))
-        if packed_cp:
-            if padding_size:
-                projected = projected[:, :-padding_size, :]
+        projected = self.sp_output_boundary(projected)
         if packed_batch:
             split_lengths: list[int] = []
             for text_len in text_lens_list:

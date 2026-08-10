@@ -128,10 +128,54 @@ def test_tiny_transformer_depth_zero_forward_shape():
     assert torch.isfinite(out).all()
 
 
-def test_packed_attention_uses_sdpa_fallback_without_flash_varlen(monkeypatch):
+def test_packed_attention_mask_excludes_sp_padding_tail():
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
-    monkeypatch.setattr(module, "flash_attn_varlen_func_v3", None)
+    mask = module._packed_block_attention_mask([2, 3], torch.device("cpu"), total_seq_len=8)
+
+    assert mask.shape == (1, 1, 8, 8)
+    assert not mask[..., 5:].any()
+    assert not mask[..., 5:, :].any()
+
+
+def test_tiny_transformer_packs_variable_text_lengths():
+    model = _tiny_transformer()
+    hidden_states = torch.randn(2, 2, 1, 2, 2)
+    timestep = torch.tensor([300.0, 300.0])
+    encoder_hidden_states = torch.randn(2, 3, 8)
+    encoder_attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    with torch.no_grad():
+        out = model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            return_dict=False,
+        )[0]
+
+    assert out.shape == hidden_states.shape
+    assert torch.isfinite(out).all()
+
+
+def test_transformer_exposes_standard_sp_plan():
+    from vllm_omni.diffusion.distributed.sp_plan import validate_sp_plan
+    from vllm_omni.diffusion.models.lingbot_video import LingBotVideoTransformer3DModel
+
+    model = _tiny_transformer()
+    plan = LingBotVideoTransformer3DModel._sp_plan
+    validate_sp_plan(plan)
+
+    assert set(plan) == {"sp_input_boundary", "sp_output_boundary"}
+    input_specs = plan["sp_input_boundary"]
+    assert all(spec.auto_pad for spec in input_specs.values())
+    assert model.sp_input_boundary is not None
+    assert model.sp_output_boundary is not None
+
+
+def test_packed_attention_uses_sdpa_after_standard_attention_resharding(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
     attn = module.LingBotVideoAttention(
         hidden_size=8,
         num_heads=2,
@@ -148,13 +192,7 @@ def test_packed_attention_uses_sdpa_fallback_without_flash_varlen(monkeypatch):
     monkeypatch.setattr(attn.attn.sdpa_fallback, "forward", fake_sdpa_forward)
     x = torch.randn(1, 5, 8)
     rotary = torch.ones(1, 5, 2, dtype=torch.complex64)
-    packed_indices = {
-        "cu_seqlens_kv": torch.tensor([0, 2, 5], dtype=torch.int32),
-        "max_seqlen_in_batch_kv": 3,
-        "attention_mask": module._packed_block_attention_mask([2, 3], x.device),
-    }
-
-    out = attn(x, rotary, packed_indices=packed_indices)
+    out = attn(x, rotary, attention_mask=module._packed_block_attention_mask([2, 3], x.device))
 
     assert out.shape == x.shape
     mask = captured["mask"]

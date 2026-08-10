@@ -332,6 +332,9 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
+        if attn_metadata is not None and attn_metadata.extra.get("force_sdpa", False):
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         self._assert_piecewise_compatible(attn_metadata)
 
         if query.dtype == torch.float32:

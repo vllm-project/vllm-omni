@@ -145,6 +145,8 @@ class AttentionMetadata:
     #     the packed cu_seqlens tensors.
     #   "valid_kv_length": int — contiguous valid K/V prefix length for a
     #     backend that advertises supports_prefix_kv_slicing.
+    #   "force_sdpa": bool - run the common SDPA fallback after any parallel
+    #     Q/K/V resharding, for masks unsupported by the selected fused backend.
     #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
     #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
     #     Requires the [real, pad] two-document packing contract; see
