@@ -83,12 +83,31 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
 
 
 def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply RoPE to x using precomputed complex freqs."""
+    """Apply RoPE to x, with ``freqs`` as a real ``(..., 2)`` cos/sin table.
+
+    Two forms of the same rotation, picked by whether inductor is generating code.
+
+    Compiled: inductor cannot generate code for complex operators, so a complex
+    multiply here falls back to eager, and being opaque to the scheduler it also
+    splits the surrounding qk-norm and layout work into separate fusion groups.
+    Written out in real arithmetic the whole segment fuses instead, measured on
+    gfx950 as three kernels collapsing to one.
+
+    Eager: the real form is the slower one by about 4x, because each of its
+    multiply-adds becomes its own pass over a float64 temporary while the complex
+    multiply is a single elementwise kernel.
+
+    Both branches evaluate the same products in the same order and agree bitwise
+    once the caller casts back to bfloat16.
+    """
     B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
-    freqs = freqs.unsqueeze(0)
-    x = torch.view_as_real(x * freqs).flatten(3)
-    return x
+    pairs = x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+    if not torch.compiler.is_compiling():
+        rotated = torch.view_as_complex(pairs) * torch.view_as_complex(freqs).unsqueeze(0)
+        return torch.view_as_real(rotated).flatten(3)
+    x_re, x_im = pairs[..., 0], pairs[..., 1]
+    cos, sin = freqs[..., 0].unsqueeze(0), freqs[..., 1].unsqueeze(0)
+    return torch.stack((x_re * cos - x_im * sin, x_re * sin + x_im * cos), dim=-1).flatten(3)
 
 
 def rope_action_apply(
@@ -133,9 +152,14 @@ def causal_rope_action_freqs(
     Single inference step (causal / KV-cache mode). A function of the step index
     only, so all layers and both q and k share one build -- see ``_forward_blocks``,
     which calls this once per forward and passes the result down.
+
+    Returned as a real ``(..., 2)`` cos/sin table: the complex form is only used
+    to build it, so no complex tensor reaches the compiled blocks, where inductor
+    would fall back to eager. Converting here costs one view of a table that is
+    four orders of magnitude smaller than the tensors it rotates.
     """
     if action_register_length is None:
-        return freqs
+        return torch.view_as_real(freqs)
     expected_length = num_action_per_block + num_state_per_block
     if action_register_length != expected_length:
         raise ValueError(
@@ -147,7 +171,7 @@ def causal_rope_action_freqs(
     ]
     freqs_state = freqs_state[action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block]
     freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
-    return torch.cat([freqs, freqs_1d], dim=0)
+    return torch.view_as_real(torch.cat([freqs, freqs_1d], dim=0))
 
 
 # ── Normalization ───────────────────────────────────────────────────
@@ -525,8 +549,8 @@ class CausalWanSelfAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Inference-only forward (KV cache path).
 
-        ``freqs`` already carries this step's action/state rows (built once per
-        forward by ``causal_rope_action_freqs``).
+        ``freqs`` is the real cos/sin table already carrying this step's
+        action/state rows (built once per forward by ``causal_rope_action_freqs``).
         """
         n, d = self.tp_num_heads, self.head_dim
 
