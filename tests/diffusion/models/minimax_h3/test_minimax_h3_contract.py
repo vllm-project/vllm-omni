@@ -484,6 +484,54 @@ def test_shifted_sigma_schedule_matches_reference_values():
     )
 
 
+def test_base_schedule_overrides_the_uniform_sigma_positions():
+    from vllm_omni.diffusion.models.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
+
+    video = minimax_h3_time_shift_sigmas(
+        num_steps=len(base_schedule),
+        shift_scale=12.0,
+        base_schedule=base_schedule,
+    )
+    audio = minimax_h3_time_shift_sigmas(
+        num_steps=len(base_schedule),
+        shift_scale=3.0,
+        base_schedule=base_schedule,
+    )
+
+    assert video == pytest.approx([1.0, 0.9655172, 0.8888889, 0.6792453, 0.0], abs=1e-6)
+    assert audio == pytest.approx([1.0, 0.875, 0.6666667, 0.3461539, 0.0], abs=1e-6)
+    assert video != pytest.approx(
+        minimax_h3_time_shift_sigmas(num_steps=len(base_schedule), shift_scale=12.0),
+        abs=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "base_schedule",
+    [
+        [0.9, 0.5, 0.0],
+        [1.0, 0.5, 0.1],
+        [1.0, 0.5, 0.5, 0.0],
+        [1.0],
+    ],
+)
+def test_base_schedule_rejects_malformed_positions(base_schedule):
+    from vllm_omni.diffusion.models.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    with pytest.raises(ValueError):
+        minimax_h3_time_shift_sigmas(
+            num_steps=len(base_schedule),
+            shift_scale=12.0,
+            base_schedule=base_schedule,
+        )
+
+
 def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,

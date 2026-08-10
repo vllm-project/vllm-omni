@@ -91,6 +91,7 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
     minimax_h3_time_shift_sigmas,
+    minimax_h3_validate_base_schedule,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
@@ -605,6 +606,11 @@ class MiniMaxH3Pipeline(
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
+        # Distilled releases pin their own few-step rectified-flow positions;
+        # the uniform schedule derived from num_inference_steps does not match
+        # what such a checkpoint was trained on.
+        base_schedule = release.get("base_schedule")
+        self.default_base_schedule = minimax_h3_validate_base_schedule(base_schedule) if base_schedule else None
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -1389,6 +1395,7 @@ class MiniMaxH3Pipeline(
         num_steps: int,
         video_shift: float,
         audio_shift: float,
+        base_schedule: Sequence[float] | None,
         visual_condition: torch.Tensor | None,
         visual_condition_shape: tuple[int, int, int] | None,
         audio_condition: torch.Tensor | None,
@@ -1490,10 +1497,12 @@ class MiniMaxH3Pipeline(
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
+            base_schedule=base_schedule,
         )
         audio_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=audio_shift,
+            base_schedule=base_schedule,
         )
         transformer = self._transformer_for_task(task)
         # The static DLO plan keeps leading blocks resident only for the
@@ -1755,7 +1764,17 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        num_steps = int(sampling.num_inference_steps or 50)
+        base_schedule = self.default_base_schedule
+        if base_schedule is None:
+            num_steps = int(sampling.num_inference_steps or 50)
+        else:
+            num_steps = len(base_schedule)
+            requested_steps = sampling.num_inference_steps
+            if requested_steps is not None and int(requested_steps) != num_steps:
+                raise OmniClientError(
+                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; num_inference_steps "
+                    f"must be {num_steps} or omitted, got {int(requested_steps)}"
+                )
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         quality_plan = self._quality_policy.resolve(
@@ -1781,6 +1800,7 @@ class MiniMaxH3Pipeline(
                 num_steps=num_steps,
                 video_shift=video_shift,
                 audio_shift=audio_shift,
+                base_schedule=base_schedule,
                 visual_condition=visual_condition,
                 visual_condition_shape=visual_shape,
                 audio_condition=audio_condition,

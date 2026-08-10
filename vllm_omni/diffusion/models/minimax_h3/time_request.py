@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 
 def _align_frame_count(frame_count: int) -> int:
     """Snap ``frame_count`` up to the MiniMax H3 17n+5 frame boundary."""
@@ -31,17 +33,45 @@ def _audio_latent_t(duration_seconds: float) -> int:
     return int(round(float(duration_seconds) * 40.0))
 
 
+def _validate_base_schedule(base_schedule: Sequence[float]) -> list[float]:
+    values = [float(value) for value in base_schedule]
+    if len(values) < 2:
+        raise ValueError("MiniMax H3 base_schedule needs at least 2 entries")
+    if values[0] != 1.0 or values[-1] != 0.0:
+        raise ValueError("MiniMax H3 base_schedule must start at 1.0 and end at 0.0")
+    if any(curr <= nxt for curr, nxt in zip(values, values[1:], strict=True)):
+        raise ValueError("MiniMax H3 base_schedule must be strictly decreasing")
+    return values
+
+
 def _time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
+    """Build a shifted sigma schedule.
+
+    ``base_schedule`` supplies the rectified-flow positions explicitly and takes
+    precedence over ``num_steps``. Distilled checkpoints need it because their
+    few-step schedule is not the uniform one ``num_steps`` produces.
+    """
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
-    if num_steps <= 0:
-        raise ValueError("MiniMax H3 num_steps must be > 0")
 
     import torch
+
+    if base_schedule is not None:
+        base = torch.tensor(
+            _validate_base_schedule(base_schedule),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
+        return [float(value) for value in shifted.tolist()]
+
+    if num_steps <= 0:
+        raise ValueError("MiniMax H3 num_steps must be > 0")
 
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
     base = torch.linspace(
@@ -81,10 +111,12 @@ class MiniMaxH3ShapePlanner:
         *,
         num_steps: int = 50,
         shift_scale: float = 6.0,
+        base_schedule: Sequence[float] | None = None,
     ) -> list[float]:
         return _time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=shift_scale,
+            base_schedule=base_schedule,
         )
 
 
@@ -103,8 +135,14 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     return MINIMAX_H3_SHAPE_PLANNER.time_shift_sigmas(
         num_steps=num_steps,
         shift_scale=shift_scale,
+        base_schedule=base_schedule,
     )
+
+
+def minimax_h3_validate_base_schedule(base_schedule: Sequence[float]) -> list[float]:
+    return _validate_base_schedule(base_schedule)
