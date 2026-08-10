@@ -130,32 +130,16 @@ def test_dense_when_no_forward_context():
     assert impl._should_use_dense() is False
 
 
-@pytest.mark.parametrize(
-    ("offsets", "total", "expected"),
-    [
-        ([0, 26, 26], 26, [0, 26]),
-        ([0, 26, 32], 32, [0, 26, 32]),
-    ],
-)
-def test_dense_fallback_drops_only_empty_packed_documents(
-    monkeypatch,
-    offsets,
-    total,
-    expected,
-):
+def test_sm120_dense_guard_uses_cudnn_fallback(monkeypatch):
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
 
-    captured = {}
-
     def fake_flash_attn_varlen_func(**kwargs):
-        captured["cu_seqlens_q"] = kwargs["cu_seqlens_q"].clone()
-        captured["cu_seqlens_k"] = kwargs["cu_seqlens_k"].clone()
-        return torch.zeros_like(kwargs["q"])
+        raise AssertionError("SM120 dense guard must not call FlashAttention")
 
     monkeypatch.setattr(fa_utils, "flash_attn_varlen_func", fake_flash_attn_varlen_func)
-    query = torch.randn(1, total, 8, 128)
-    cu_seqlens = torch.tensor(offsets, dtype=torch.int32)
+    query = torch.randn(1, 26, 8, 128)
+    cu_seqlens = torch.tensor([0, 26, 26], dtype=torch.int32)
     metadata = AttentionMetadata(
         extra={
             "cu_seqlens_q": cu_seqlens,
@@ -165,17 +149,27 @@ def test_dense_fallback_drops_only_empty_packed_documents(
             "valid_kv_length": 26,
         }
     )
+    expected = torch.empty_like(query)
+    impl = _impl("token_refiner.blocks.0.attn")
 
-    output = _impl("token_refiner.blocks.0.attn")._forward_dense_varlen(
+    def fake_cudnn(q, k, v, attn_metadata):
+        assert q is query
+        assert k is query
+        assert v is query
+        assert attn_metadata is metadata
+        return expected
+
+    monkeypatch.setattr(impl, "_requires_sm120_dense_fallback", lambda _: True)
+    monkeypatch.setattr(impl._cudnn_dense_fallback, "forward_cuda", fake_cudnn)
+
+    output = impl._forward_dense_varlen(
         query,
         query,
         query,
         metadata,
     )
 
-    assert output.shape == query.shape
-    assert captured["cu_seqlens_q"].tolist() == expected
-    assert captured["cu_seqlens_k"].tolist() == expected
+    assert output is expected
 
 
 def test_sol_attn_spec_validation():

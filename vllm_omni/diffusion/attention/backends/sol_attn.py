@@ -28,6 +28,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -119,11 +120,11 @@ class SolAttnBackend(AttentionBackend):
 
 
 class SolAttnImpl(AttentionImpl):
-    """Packed-varlen Sol-Attn kernel with a FlashAttention dense fallback.
+    """Packed-varlen Sol-Attn kernel with an exact dense fallback.
 
-    The dense fallback (early denoise steps / configured dense layers) runs the
-    exact same packed-varlen FlashAttention path as ``FLASH_ATTN`` so the
-    sparse kernel can be measured against a bit-identical dense baseline.
+    Dense guard steps use packed-varlen FlashAttention except on SM120, where
+    the CuTe varlen kernel cannot compile MiniMax-H3's packed shape. SM120 uses
+    the platform-native cuDNN dense backend while sparse steps still use Sol.
     """
 
     def __init__(
@@ -138,13 +139,21 @@ class SolAttnImpl(AttentionImpl):
         backend_kwargs: dict | None = None,
         **extra_impl_args,
     ) -> None:
-        del num_heads, num_kv_heads, qkv_layout, extra_impl_args
+        del qkv_layout, extra_impl_args
         if head_size != _SOL_ATTN_HEAD_DIM:
             raise ValueError(f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}")
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.config = SolAttnConfig.from_backend_kwargs(backend_kwargs)
         self.layer_idx = self._parse_layer_idx(prefix)
+        self._cudnn_dense_fallback = CuDNNAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+        )
 
     @staticmethod
     def _parse_layer_idx(prefix: str) -> int | None:
@@ -165,6 +174,10 @@ class SolAttnImpl(AttentionImpl):
         if self.layer_idx is not None and self.layer_idx in self.config.dense_layers:
             return True
         return False
+
+    @staticmethod
+    def _requires_sm120_dense_fallback(device: torch.device) -> bool:
+        return device.type == "cuda" and torch.cuda.get_device_capability(device) == (12, 0)
 
     @staticmethod
     def _clamp_sink_range(
@@ -200,7 +213,16 @@ class SolAttnImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        """Bit-identical packed-varlen FlashAttention dense fallback."""
+        """Run the exact packed dense fallback selected for this platform."""
+        if self._requires_sm120_dense_fallback(query.device):
+            logger.info_once("Using cuDNN for the Sol-Attn dense guard on SM120")
+            return self._cudnn_dense_fallback.forward_cuda(
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
         )
@@ -208,24 +230,12 @@ class SolAttnImpl(AttentionImpl):
         if flash_attn_varlen_func is None:
             raise ImportError("Sol-Attn dense fallback requires flash_attn_varlen_func")
         extra = attn_metadata.extra
-        q = query.flatten(0, 1)
-        k = key.flatten(0, 1)
-        v = value.flatten(0, 1)
-        cu_seqlens_q = extra["cu_seqlens_q"]
-        cu_seqlens_k = extra["cu_seqlens_k"]
-        # FA4's SM120 varlen kernel rejects a trailing zero-length document.
-        # When total == max_seqlen, every other packed document is empty and
-        # can be removed without changing attention semantics.
-        if q.shape[0] == extra["max_seqlen_q"]:
-            cu_seqlens_q = cu_seqlens_q.new_tensor((0, q.shape[0]))
-        if k.shape[0] == extra["max_seqlen_k"]:
-            cu_seqlens_k = cu_seqlens_k.new_tensor((0, k.shape[0]))
         out = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
+            q=query.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
+            cu_seqlens_q=extra["cu_seqlens_q"],
+            cu_seqlens_k=extra["cu_seqlens_k"],
             max_seqlen_q=extra["max_seqlen_q"],
             max_seqlen_k=extra["max_seqlen_k"],
             causal=self.causal,
