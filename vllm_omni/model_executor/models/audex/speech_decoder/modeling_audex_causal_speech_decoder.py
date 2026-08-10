@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -35,7 +36,6 @@ class RotaryPositionalEmbeddings(nn.Module):
         self.base = base
         self.max_seq_len = max_seq_len
         self.rope_init()
-        self._rope_ready = False
 
     def rope_init(self, device: torch.device | None = None) -> None:
         theta = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device)[: (self.dim // 2)].float() / self.dim))
@@ -49,19 +49,19 @@ class RotaryPositionalEmbeddings(nn.Module):
         cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
         self.register_buffer("cache", cache, persistent=False)
 
+    def prepare(self, needed_seq_len: int, device: torch.device) -> None:
+        """Ensure the RoPE cache is ready without reading a device tensor."""
+        if needed_seq_len < 0:
+            raise ValueError(f"needed_seq_len must be non-negative, got {needed_seq_len}")
+        if self.theta.device != device:
+            self.rope_init(device=device)
+        if needed_seq_len > self.cache.size(0):
+            self.build_rope_cache(max(needed_seq_len, self.cache.size(0) * 2))
+
     def forward(self, x: torch.Tensor, *, input_pos: torch.Tensor | None = None) -> torch.Tensor:
         seq_len = x.size(1)
-        needed_seq_len = seq_len if input_pos is None else int(input_pos.max().item()) + 1
-        if (
-            not getattr(self, "_rope_ready", False)
-            or self.theta.device != x.device
-            or needed_seq_len > self.cache.size(0)
-        ):
-            self.rope_init(device=x.device)
-            if needed_seq_len > self.cache.size(0):
-                self.build_rope_cache(max(needed_seq_len, self.cache.size(0) * 2))
-            self._rope_ready = True
-
+        if input_pos is None:
+            self.prepare(seq_len, x.device)
         rope_cache = self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
         xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
         rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
@@ -75,27 +75,97 @@ class RotaryPositionalEmbeddings(nn.Module):
         return x_out.flatten(3).type_as(x)
 
 
+@dataclass
+class _LayerKVCache:
+    key: Tensor
+    value: Tensor
+    length: int
+
+
 class CausalCodecDecoderCache:
-    def __init__(self) -> None:
-        self.key_values: dict[int, tuple[Tensor, Tensor]] = {}
+    """Per-request growable KV cache for streaming causal decoding."""
+
+    def __init__(self, initial_capacity: int = 16) -> None:
+        if initial_capacity <= 0:
+            raise ValueError(f"initial_capacity must be positive, got {initial_capacity}")
+        self._initial_capacity = initial_capacity
+        self._layers: dict[int, _LayerKVCache] = {}
         self.position = 0
+
+    @property
+    def key_values(self) -> dict[int, tuple[Tensor, Tensor]]:
+        """Return views of the initialized portion of every layer cache."""
+        return {
+            layer_idx: (layer.key[:, :, : layer.length], layer.value[:, :, : layer.length])
+            for layer_idx, layer in self._layers.items()
+        }
 
     def input_positions(self, length: int, device: torch.device) -> Tensor:
         return torch.arange(self.position, self.position + length, device=device).unsqueeze(0)
 
     def update(self, layer_idx: int, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
-        if layer_idx in self.key_values:
-            prev_key, prev_value = self.key_values[layer_idx]
-            key = torch.cat([prev_key, key], dim=2)
-            value = torch.cat([prev_value, value], dim=2)
-        self.key_values[layer_idx] = (key, value)
-        return key, value
+        if key.shape != value.shape:
+            raise ValueError(f"key and value shapes must match, got {key.shape} and {value.shape}")
+        if key.ndim != 4:
+            raise ValueError(f"key and value must have shape [batch, heads, time, dim], got {key.shape}")
+
+        chunk_length = key.size(2)
+        required_capacity = self.position + chunk_length
+        layer = self._layers.get(layer_idx)
+        if layer is None:
+            if self.position != 0:
+                raise RuntimeError(f"layer {layer_idx} was first initialized at cache position {self.position}")
+            capacity = self._next_capacity(0, required_capacity)
+            cache_shape = (*key.shape[:2], capacity, key.shape[3])
+            layer = _LayerKVCache(key=key.new_empty(cache_shape), value=value.new_empty(cache_shape), length=0)
+            self._layers[layer_idx] = layer
+        else:
+            if layer.length != self.position:
+                raise RuntimeError(
+                    f"layer {layer_idx} cache length {layer.length} does not match position {self.position}"
+                )
+            expected_shape = (*layer.key.shape[:2], chunk_length, layer.key.shape[3])
+            if key.shape != expected_shape:
+                raise ValueError(f"key shape changed from {expected_shape} to {key.shape}")
+            if key.device != layer.key.device or value.device != layer.value.device:
+                raise ValueError("key and value device must match the existing cache")
+            if key.dtype != layer.key.dtype or value.dtype != layer.value.dtype:
+                raise ValueError("key and value dtype must match the existing cache")
+
+        if required_capacity > layer.key.size(2):
+            capacity = self._next_capacity(layer.key.size(2), required_capacity)
+            cache_shape = (*layer.key.shape[:2], capacity, layer.key.shape[3])
+            new_key = layer.key.new_empty(cache_shape)
+            new_value = layer.value.new_empty(cache_shape)
+            # Geometric growth makes retained-prefix copies amortized O(total frames).
+            new_key[:, :, : self.position].copy_(layer.key[:, :, : self.position])
+            new_value[:, :, : self.position].copy_(layer.value[:, :, : self.position])
+            layer.key = new_key
+            layer.value = new_value
+
+        # The steady-state path copies only the new chunk, never the full history.
+        layer.key[:, :, self.position : required_capacity].copy_(key)
+        layer.value[:, :, self.position : required_capacity].copy_(value)
+        layer.length = required_capacity
+        return layer.key[:, :, :required_capacity], layer.value[:, :, :required_capacity]
+
+    def _next_capacity(self, current_capacity: int, required_capacity: int) -> int:
+        capacity = max(current_capacity, self._initial_capacity)
+        while capacity < required_capacity:
+            capacity *= 2
+        return capacity
 
     def advance(self, length: int) -> None:
-        self.position += length
+        if length < 0:
+            raise ValueError(f"length must be non-negative, got {length}")
+        next_position = self.position + length
+        incomplete_layers = [idx for idx, layer in self._layers.items() if layer.length != next_position]
+        if incomplete_layers:
+            raise RuntimeError(f"cache layers were not updated through position {next_position}: {incomplete_layers}")
+        self.position = next_position
 
     def reset(self) -> None:
-        self.key_values.clear()
+        self._layers.clear()
         self.position = 0
 
 
@@ -137,6 +207,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         qkv = self.c_attn(x)
@@ -152,8 +223,9 @@ class Attention(nn.Module):
             if input_pos is None:
                 raise ValueError("input_pos is required when cache is set")
             k, v = cache.update(self.layer_idx, k, v)
-            key_pos = torch.arange(k.size(2), device=x.device).view(1, 1, 1, -1)
-            attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
+            if attn_mask is None:
+                key_pos = torch.arange(k.size(2), device=x.device).view(1, 1, 1, -1)
+                attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.c_proj(y.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
 
@@ -171,8 +243,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.att(self.att_norm(x), cache=cache, input_pos=input_pos)
+        x = x + self.att(self.att_norm(x), cache=cache, input_pos=input_pos, attn_mask=attn_mask)
         return x + self.mlp(self.ffn_norm(x))
 
 
@@ -195,10 +268,10 @@ class CausalVocosBackbone(nn.Module):
         pos_meb_dim: int = 64,
     ):
         super().__init__()
-        rotary_embed = RotaryPositionalEmbeddings(dim=pos_meb_dim)
+        self.rotary_embed = RotaryPositionalEmbeddings(dim=pos_meb_dim)
         self.transformers = nn.ModuleList(
             [
-                TransformerBlock(dim=hidden_dim, n_heads=heads, rotary_embed=rotary_embed, layer_idx=idx)
+                TransformerBlock(dim=hidden_dim, n_heads=heads, rotary_embed=self.rotary_embed, layer_idx=idx)
                 for idx in range(depth)
             ]
         )
@@ -206,10 +279,16 @@ class CausalVocosBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor, cache: CausalCodecDecoderCache | None = None) -> torch.Tensor:
         input_pos = None
+        attn_mask = None
+        needed_seq_len = x.size(1)
         if cache is not None:
             input_pos = cache.input_positions(x.size(1), x.device).expand(x.size(0), -1)
+            needed_seq_len = cache.position + x.size(1)
+            key_pos = torch.arange(needed_seq_len, device=x.device).view(1, 1, 1, -1)
+            attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
+        self.rotary_embed.prepare(needed_seq_len, x.device)
         for block in self.transformers:
-            x = block(x, cache=cache, input_pos=input_pos)
+            x = block(x, cache=cache, input_pos=input_pos, attn_mask=attn_mask)
         if cache is not None:
             cache.advance(x.size(1))
         return self.final_layer_norm(x)
