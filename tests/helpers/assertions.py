@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
 
+import av
 import numpy as np
 import soundfile as sf
 from PIL import Image
@@ -19,6 +20,7 @@ from PIL import Image
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
+    decode_b64_image,
     preprocess_text,
 )
 
@@ -112,6 +114,34 @@ def assert_image_diffusion_response(
                     )
 
 
+def assert_images_generations_response(
+    response: dict[str, Any],
+    request_config: dict[str, Any],
+    run_level: str | None = None,
+) -> None:
+    """Validate a successful ``/v1/images/generations`` JSON response."""
+    del run_level
+    request_body = request_config.get("json") or {}
+    data = response.get("data")
+    assert isinstance(data, list), "Image generation response is missing data[]"
+
+    expected_count = int(request_body.get("n", 1))
+    assert len(data) == expected_count, f"Expected {expected_count} images, got {len(data)}"
+
+    width = height = None
+    size = request_body.get("size")
+    if isinstance(size, str) and "x" in size:
+        width_value, height_value = size.lower().split("x", 1)
+        width, height = int(width_value), int(height_value)
+
+    for item in data:
+        assert isinstance(item, dict), "Image generation data entries must be objects"
+        b64_json = item.get("b64_json")
+        assert isinstance(b64_json, str) and b64_json, "Image generation response is missing b64_json"
+        image = decode_b64_image(b64_json)
+        assert_image_valid(image, width=width, height=height)
+
+
 def assert_video_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
@@ -156,6 +186,29 @@ def assert_video_diffusion_response(
             height=expected_height,
             fps=expected_fps,
         )
+
+
+def assert_video_first_frame_matches(
+    video: Path | bytes | BytesIO,
+    expected: np.ndarray,
+    *,
+    max_mean_absolute_error: float,
+) -> None:
+    """Assert that an encoded video's first frame matches a reference image."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    else:
+        video_bytes = video if isinstance(video, bytes) else video.getvalue()
+        source = BytesIO(video_bytes)
+
+    with av.open(source) as container:
+        first_frame = next(container.decode(video=0)).to_ndarray(format="rgb24")
+
+    assert first_frame.shape == expected.shape
+    mean_absolute_error = float(np.abs(first_frame.astype(np.float32) - expected).mean() / 255.0)
+    assert mean_absolute_error < max_mean_absolute_error, (
+        f"Expected first-frame MAE < {max_mean_absolute_error}, got {mean_absolute_error:.6f}."
+    )
 
 
 def assert_audio_diffusion_response(

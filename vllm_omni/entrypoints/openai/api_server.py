@@ -39,6 +39,7 @@ from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, Tool
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
@@ -95,6 +96,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -513,6 +515,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        _remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
 
@@ -777,6 +780,10 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
         )
+        state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
+            diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+        )
 
         # audio related
         state.openai_serving_speech = None
@@ -950,30 +957,33 @@ async def omni_init_app_state(
         if "generate" in supported_tasks
         else None
     )
-    state.openai_serving_chat = (
-        OmniOpenAIServingChat(
-            engine_client,
-            state.openai_serving_models,
-            args.response_role,
-            online_renderer=state.online_renderer,
-            request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            default_chat_template_kwargs=args.default_chat_template_kwargs,
-            trust_request_chat_template=args.trust_request_chat_template,
-            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-            enable_auto_tools=args.enable_auto_tool_choice,
-            exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-            tool_parser=args.tool_call_parser,
-            reasoning_parser=args.structured_outputs_config.reasoning_parser,
-            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-            enable_force_include_usage=args.enable_force_include_usage,
-            enable_log_outputs=args.enable_log_outputs,
-            enable_log_deltas=args.enable_log_deltas,
-        )
-        if "generate" in supported_tasks
-        else None
+
+    _chat_kwargs = dict(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        response_role=args.response_role,
+        online_renderer=state.online_renderer,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        trust_request_chat_template=args.trust_request_chat_template,
+        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+        enable_force_include_usage=args.enable_force_include_usage,
+        enable_log_outputs=args.enable_log_outputs,
+        enable_log_deltas=args.enable_log_deltas,
     )
+
+    state.openai_serving_chat = OmniOpenAIServingChat(**_chat_kwargs) if "generate" in supported_tasks else None
+    state.openai_serving_chat_batch = (
+        OmniOpenAIServingChatBatch(**_chat_kwargs) if "generate" in supported_tasks else None
+    )
+
     # Warm up chat template processing to avoid first-request latency
     if state.openai_serving_chat is not None:
         state.openai_serving_chat.warmup()
@@ -1162,6 +1172,10 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
     return request.app.state.openai_serving_chat
 
 
+def OmniBatchChat(request: Request) -> OmniOpenAIServingChatBatch | None:
+    return request.app.state.openai_serving_chat_batch
+
+
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
@@ -1243,6 +1257,45 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post(
+    "/v1/chat/completions/batch",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_IMPLEMENTED.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_request: Request):
+    handler = OmniBatchChat(raw_request)
+    if handler is None:
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Chat Completions API",
+            )
+        return base_server.create_error_response(message="The model does not support Chat Completions API")
+    try:
+        result = await handler.create_batch_chat_completion(request, raw_request)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except Exception as e:
+        logger.exception("Batched chat completion failed: %s", e)
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(
+            content=result.model_dump(),
+            status_code=result.error.code if result.error else 400,
+        )
+    return JSONResponse(content=result.model_dump(mode="json"))
 
 
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
@@ -2811,6 +2864,7 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
         status=VideoGenerationStatus.QUEUED,
         size=req.size,
         prompt=req.prompt,
+        quality=req.quality or "default",
     )
     resp.seconds = str(req.seconds or resp.seconds)
     return resp
@@ -3150,6 +3204,7 @@ async def _parse_video_form(
     short_edge: int | None = Form(default=None, ge=1),
     num_outputs_per_prompt: int = Form(default=1, ge=1, le=10),
     start_time_seconds: float | None = Form(default=None, ge=0.0),
+    quality: str | None = Form(default=None),
     num_inference_steps: int | None = Form(default=None),
     guidance_scale: float | None = Form(default=None),
     guidance_scale_2: float | None = Form(default=None),
@@ -3218,6 +3273,7 @@ async def _parse_video_form(
         "short_edge": short_edge,
         "num_outputs_per_prompt": num_outputs_per_prompt,
         "start_time_seconds": start_time_seconds,
+        "quality": quality,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": guidance_scale,
         "guidance_scale_2": guidance_scale_2,

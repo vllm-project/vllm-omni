@@ -35,6 +35,7 @@ def _make_executor(step_execution=False):
     executor._pump_stop = threading.Event()
     executor._sync_result_buffer = queue.Queue()
     executor._result_mq = MagicMock()
+    executor._result_mqs = []
     executor._broadcast_mq = MagicMock()
     executor._closed = False
     executor._is_failed = False
@@ -157,6 +158,41 @@ class TestResultPumpDispatch:
         retrieved = executor._sync_result_buffer.get_nowait()
         assert isinstance(retrieved, DiffusionOutput)
 
+    def test_start_result_pump_reads_every_worker_queue(self):
+        executor = _make_executor()
+        messages = [DiffusionOutput(output="rank0"), DiffusionOutput(output="rank1")]
+        result_mqs = [MagicMock(), MagicMock()]
+
+        def make_dequeue(message):
+            emitted = False
+
+            def dequeue(timeout=None):
+                nonlocal emitted
+                if not emitted:
+                    emitted = True
+                    return message
+                executor._pump_stop.wait(0.01)
+                raise TimeoutError
+
+            return dequeue
+
+        for result_mq, message in zip(result_mqs, messages, strict=True):
+            result_mq.dequeue = make_dequeue(message)
+
+        executor._result_mqs = result_mqs
+        executor._result_mq = result_mqs[0]
+        executor._start_result_pump()
+        deadline = time.monotonic() + 2.0
+        while executor._sync_result_buffer.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        executor._pump_stop.set()
+        for thread in executor._result_pump_threads:
+            thread.join(timeout=2.0)
+
+        assert len(executor._result_pump_threads) == 2
+        received = [executor._sync_result_buffer.get_nowait().output for _ in range(2)]
+        assert sorted(received) == ["rank0", "rank1"]
+
     def test_compute_done_routes_to_rpc_future(self):
         executor = _make_executor()
         rpc_id = "42"
@@ -232,6 +268,20 @@ class TestResultPumpDispatch:
 
 class TestShutdownCleansUpFutures:
     """Test that shutdown cancels pending futures."""
+
+    def test_shutdown_joins_result_pump_threads(self):
+        executor = _make_executor()
+        pump = threading.Thread(
+            target=executor._pump_stop.wait,
+            name="test-result-pump",
+        )
+        executor._result_pump_threads = [pump]
+        pump.start()
+
+        executor.shutdown()
+
+        assert not pump.is_alive()
+        assert executor._result_pump_threads == []
 
     def test_shutdown_sets_exception_on_pending_futures(self):
         executor = _make_executor()
