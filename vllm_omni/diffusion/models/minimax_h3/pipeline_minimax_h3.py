@@ -538,6 +538,7 @@ class MiniMaxH3Pipeline(
         "encode_prompt",
         "_encode_video_conditions",
         "_encode_video_audio_conditions",
+        "_encode_audio_conditions",
         "diffuse",
         "decode",
     ]
@@ -1204,6 +1205,8 @@ class MiniMaxH3Pipeline(
     def _encode_audio_conditions(
         self,
         audios: list[tuple[torch.Tensor, int]],
+        *,
+        max_duration_seconds: float | None = None,
     ) -> tuple[torch.Tensor | None, list[int]]:
         if not audios:
             return None, []
@@ -1211,7 +1214,17 @@ class MiniMaxH3Pipeline(
         rows = None
         lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
         if rank == 0:
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in audios]
+            if max_duration_seconds is not None:
+                max_duration_seconds = float(max_duration_seconds)
+                if max_duration_seconds <= 0:
+                    raise ValueError("max_duration_seconds must be positive")
+            bounded_audios = []
+            for waveform, sample_rate in audios:
+                if max_duration_seconds is not None:
+                    max_samples = int(round(max_duration_seconds * int(sample_rate)))
+                    waveform = waveform[..., :max_samples]
+                bounded_audios.append((waveform, sample_rate))
+            encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
             rows = torch.cat([item[0] for item in encoded])
             lengths = torch.tensor(
                 [int(item[1]) for item in encoded],
@@ -1311,7 +1324,10 @@ class MiniMaxH3Pipeline(
                     *load_video_audio(
                         item["original_path"],
                         start_time_seconds=float(item.get("start_time_seconds", 0.0)),
-                        duration_seconds=item.get("duration_seconds"),
+                        duration_seconds=item.get(
+                            "audio_duration_seconds",
+                            item.get("duration_seconds"),
+                        ),
                     )
                 )
                 for item in prepared_videos
@@ -1710,7 +1726,10 @@ class MiniMaxH3Pipeline(
                     prepared_videos,
                     has_audio=has_audio,
                 )
-                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(standalone_audios)
+                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(
+                    standalone_audios,
+                    max_duration_seconds=float(num_frames) / float(sampling.fps or MINIMAX_H3_FPS),
+                )
                 audio_parts = [
                     item for item in (embedded_audio_condition, external_audio_condition) if item is not None
                 ]

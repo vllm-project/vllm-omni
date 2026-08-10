@@ -1196,8 +1196,35 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
     )
 
     assert prepared[0]["duration_seconds"] == pytest.approx(expected_duration)
+    assert prepared[0]["audio_duration_seconds"] == pytest.approx(min(expected_duration, 209 / 24.0))
     assert prepared[0]["start_time_seconds"] == pytest.approx(start_time or 0.0)
     assert transcode_calls[0][1]["duration_seconds"] == pytest.approx(expected_duration)
+    assert transcode_calls[0][1]["target_frame_count"] == 209
+
+
+def test_ref2va_qwen_sampling_decodes_prepared_video_once(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    decoded = np.arange(25 * 2 * 2 * 3, dtype=np.uint8).reshape(25, 2, 2, 3)
+    load_calls = []
+    monkeypatch.setattr(
+        reference_video_module,
+        "_probe_video",
+        lambda _path: {"frame_count": len(decoded)},
+    )
+    monkeypatch.setattr(
+        reference_video_module,
+        "load_video_frames",
+        lambda path: load_calls.append(path) or decoded,
+    )
+
+    sampled = reference_video_module.sample_reference_video_frames(
+        "prepared.mp4",
+        workdir="unused",
+    )
+
+    assert load_calls == ["prepared.mp4"]
+    assert [int(frame[0, 0, 0]) for frame in sampled["frames"]] == [0, int(decoded[12, 0, 0, 0]), int(decoded[24, 0, 0, 0])]
 
 
 def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
@@ -1435,6 +1462,32 @@ def test_g4_standalone_audio_duration_and_total_duration_contract():
                 (torch.zeros(1, 8 * sample_rate), sample_rate),
             ]
         )
+
+
+def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.device = torch.device("cpu")
+    observed = []
+
+    class FakeAudioVAE:
+        def encode_waveform(self, waveform, sample_rate):
+            observed.append((waveform.clone(), sample_rate))
+            return waveform, waveform.shape[-1]
+
+    pipeline.audio_vae = FakeAudioVAE()
+    waveform = torch.arange(40, dtype=torch.float32).reshape(1, 40)
+
+    encoded, lengths = pipeline._encode_audio_conditions(
+        [(waveform, 10)],
+        max_duration_seconds=2.5,
+    )
+
+    assert observed[0][0].shape == (1, 25)
+    assert observed[0][1] == 10
+    assert encoded.shape == (1, 25)
+    assert lengths == [25]
 
 
 @pytest.mark.parametrize(
