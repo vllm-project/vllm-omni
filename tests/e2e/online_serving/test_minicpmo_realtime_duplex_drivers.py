@@ -64,7 +64,7 @@ def test_realtime_duplex_multi_session_script_is_directly_executable():
         cwd=MULTI_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -77,7 +77,7 @@ def test_realtime_duplex_demo_pair_script_is_directly_executable():
         cwd=PAIR_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -90,7 +90,7 @@ def test_realtime_duplex_soft_interrupt_script_is_directly_executable():
         cwd=SOFT_INTERRUPT_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 

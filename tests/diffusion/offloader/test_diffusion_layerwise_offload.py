@@ -93,14 +93,9 @@ def run_inference(
     return peak, output
 
 
-<<<<<<< HEAD
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", LAYERWISE_MODEL_CASES)
-=======
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("model_name", list(MODELS.keys()))
->>>>>>> 4d70c3a6 (fix pre-commit)
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
 

@@ -236,14 +236,9 @@ def _build_diffusion_video_output() -> OmniRequestOutput:
 
 
 def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
-    request_output = SimpleNamespace(
-        images=[_build_image_output(color="blue")],
-        finished=True,
-    )
-    return OmniRequestOutput.from_stage_output(
-        request_output,
+    return OmniRequestOutput.from_diffusion(
         request_id="test_req_img_chat",
-        finished=True,
+        images=[_build_image_output(color="blue")],
         final_output_type="image",
     )
 
@@ -515,8 +510,19 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni):
+def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni, tmp_path):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
+    # Override the STORAGE_MANAGER path to a writable temp directory before
+    # forking the server subprocess.  The default /tmp/storage may be owned
+    # by a different user (e.g. from a previous CI run) and cause
+    # PermissionError when the server tries to save generated video files.
+    from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+
+    old_storage_path = STORAGE_MANAGER.storage_path
+    new_storage_path = tmp_path / "omni_storage"
+    new_storage_path.mkdir(exist_ok=True)
+    STORAGE_MANAGER.storage_path = str(new_storage_path)
+
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     cmd = OmniServeCommand()
@@ -554,6 +560,9 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
         pytest.fail(f"API server failed to start within {wait_time} seconds")
 
     yield f"http://127.0.0.1:{port}/v1"
+
+    # Restore the original storage path after the test.
+    STORAGE_MANAGER.storage_path = old_storage_path
 
     if server_process.is_alive():
         server_process.terminate()
