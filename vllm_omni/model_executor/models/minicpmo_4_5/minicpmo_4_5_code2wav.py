@@ -310,11 +310,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         normalized = [int(value) for value in counts]
         if any(value < 0 for value in normalized):
             raise _batch_error("negative_seq_token_count", counts=normalized)
-        if sum(normalized) != int(flat.numel()):
+        total = int(flat.numel())
+        expected = sum(normalized)
+        if expected < total:
+            # cudagraph/aclgraph decode pads the batch with trailing dummy tokens
+            # that are not codec data; trim them before segmenting.
+            flat = flat[:expected]
+        elif expected > total:
             raise _batch_error(
                 "seq_token_count_mismatch",
                 counts=normalized,
-                total=int(flat.numel()),
+                total=total,
             )
         return list(torch.split(flat, normalized))
 
