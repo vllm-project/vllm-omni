@@ -329,6 +329,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
                 "finished": empty_condition,
+                "native_duplex": native_duplex,
             }
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
@@ -379,25 +380,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     ) -> torch.Tensor:
         logits = self.head_code[0](hidden_state).float() / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
-        logits = _apply_repetition_penalty(
-            logits,
-            history,
-            penalty=self._codec_repetition_penalty,
-            window_size=_REPETITION_WINDOW,
-        )
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
         min_tokens = (
             int(state.get("min_tokens", self._codec_min_tokens)) if isinstance(state, dict) else self._codec_min_tokens
         )
-        if step < min_tokens:
-            logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
-        )
+        native_duplex = bool(state.get("native_duplex", False)) if isinstance(state, dict) else False
+        if native_duplex:
+            # Preserve the existing duplex sampling path. Its checkpoint API
+            # uses a separate generate_chunk implementation.
+            logits = _apply_repetition_penalty(
+                logits,
+                history,
+                penalty=self._codec_repetition_penalty,
+                window_size=_REPETITION_WINDOW,
+            )
+            if step < min_tokens:
+                logits[..., eos_id] = float("-inf")
+            logits = _apply_top_k_top_p(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+        else:
+            # Match MiniCPMTTS.generate: the audio-BOS step is sampled from
+            # raw logits, and later steps apply processors/warpers before the
+            # minimum-length EOS mask.
+            if step > 0:
+                logits = _apply_repetition_penalty(
+                    logits,
+                    history,
+                    penalty=self._codec_repetition_penalty,
+                    window_size=_REPETITION_WINDOW,
+                )
+                logits = _apply_top_k_top_p(
+                    logits,
+                    top_k=self._codec_top_k,
+                    top_p=self._codec_top_p,
+                    min_tokens_to_keep=3,
+                )
+            if step < min_tokens:
+                logits[..., eos_id] = float("-inf")
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,

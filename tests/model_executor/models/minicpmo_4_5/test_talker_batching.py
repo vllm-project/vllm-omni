@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _apply_top_k_top_p,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -82,6 +83,67 @@ def test_audio_token_limit_scales_with_condition_length(
     expected: int,
 ) -> None:
     assert _max_audio_tokens(condition_tokens) == expected
+
+
+def _configure_codec_sampler(talker: MiniCPMO45OmniTTSForConditionalGeneration) -> None:
+    talker.head_code = nn.ModuleList([nn.Identity()])
+    talker._codec_temperature = 1.0
+    talker._codec_repetition_penalty = 1.0
+    talker._codec_top_k = 25
+    talker._codec_top_p = 0.85
+
+
+def test_standard_talker_does_not_filter_the_first_audio_token(mocker) -> None:
+    talker = _make_talker()
+    _configure_codec_sampler(talker)
+    request_id = "req-first-code"
+    talker._request_audio_states[request_id] = {
+        "min_tokens": 1,
+        "native_duplex": False,
+    }
+    logits = torch.arange(8, dtype=torch.float32).unsqueeze(0)
+    multinomial = mocker.patch("torch.multinomial", return_value=torch.tensor([[0]]))
+
+    talker._sample_audio_code(
+        logits,
+        torch.empty(0, dtype=torch.long),
+        request_id,
+        step=0,
+    )
+
+    expected_logits = logits.clone()
+    expected_logits[..., -1] = float("-inf")
+    expected_probabilities = torch.softmax(expected_logits, dim=-1)
+    assert torch.equal(multinomial.call_args.args[0], expected_probabilities)
+
+
+def test_standard_talker_masks_eos_after_sampling_filters(mocker) -> None:
+    talker = _make_talker()
+    _configure_codec_sampler(talker)
+    request_id = "req-later-code"
+    talker._request_audio_states[request_id] = {
+        "min_tokens": 2,
+        "native_duplex": False,
+    }
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0]])
+    multinomial = mocker.patch("torch.multinomial", return_value=torch.tensor([[0]]))
+
+    talker._sample_audio_code(
+        logits,
+        torch.tensor([5]),
+        request_id,
+        step=1,
+    )
+
+    expected_logits = _apply_top_k_top_p(
+        logits,
+        top_k=talker._codec_top_k,
+        top_p=talker._codec_top_p,
+        min_tokens_to_keep=3,
+    )
+    expected_logits[..., -1] = float("-inf")
+    expected_probabilities = torch.softmax(expected_logits, dim=-1)
+    assert torch.equal(multinomial.call_args.args[0], expected_probabilities)
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
@@ -412,6 +474,7 @@ def test_native_duplex_prefill_uses_official_chunk_limits(
     state = talker._request_audio_states["req-duplex-chunk"]
     assert state["min_tokens"] == expected_min_tokens
     assert state["max_tokens"] == 26
+    assert state["native_duplex"] is True
 
 
 def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
