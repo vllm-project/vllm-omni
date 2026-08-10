@@ -6,12 +6,14 @@ from __future__ import annotations
 import os
 import socket
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -37,6 +39,33 @@ def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_advanced_uaa_hybrid_rejects_padded_mqa_heads(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.parallel.ulysses.get_ulysses_mode",
+        lambda default: "advanced_uaa",
+    )
+    sp_group = SimpleNamespace(
+        ulysses_group=None,
+        ulysses_world_size=2,
+        ulysses_rank=0,
+        ring_world_size=2,
+    )
+    strategy = UlyssesParallelAttention(
+        sp_group=sp_group,
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+    query = torch.zeros(1, 2, 8, 4)
+    key = torch.zeros(1, 2, 1, 4)
+    value = torch.zeros_like(key)
+
+    with pytest.raises(ValueError, match="does not support K/V head padding"):
+        strategy.pre_attention(query, key, value, None)
 
 
 def _run_attention_case(
@@ -241,7 +270,9 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     batch_size = 2
     head_size = 8
     seq_len = 10
-    num_heads = 3  # head_cnt not divisible by ulysses_degree=2 -> triggers head padding
+    # This is the positive Hybrid case: K/V heads must not require padding,
+    # which is unsupported by advanced_uaa when Ring is also enabled.
+    num_heads = 4
 
     # Ensure ring ranks see equal post-Ulysses seq_len:
     # rank0/1 -> 3+2=5, rank2/3 -> 3+2=5

@@ -393,6 +393,13 @@ class DiffusersPipelineLoader:
                             "DLO+AllGather active but model does not support mmap: loading weights via regular loader."
                         )
                     logger.debug("Loading weights on %s ...", load_device)
+                    if offload_after_quant:
+                        marked = self._request_offload_after_quant(model)
+                        if marked:
+                            logger.info(
+                                "Online quantization will return each of %d layers to CPU as it is quantized",
+                                marked,
+                            )
                     if load_format == "diffusers":
                         cast(DiffusersAdapterPipeline, model).load_weights()
                     else:
@@ -405,6 +412,29 @@ class DiffusersPipelineLoader:
 
         self._apply_skip_softmax_calibration(model)
         return model.eval()
+
+    @staticmethod
+    def _request_offload_after_quant(model: nn.Module) -> int:
+        """Ask online-quant layers to return to host memory once quantized.
+
+        The weights only visit the accelerator so the quant kernels can run on
+        them; ``load_model`` sends the model back to the host afterwards either
+        way. Without this the whole transformer accumulates on device until that
+        final move, which for MiniMax H3 is a ~43 GiB peak that no longer fits
+        beside a resident TP-sharded text encoder — even though layer-wise
+        offload means none of it is supposed to be resident at inference time.
+
+        Only quant methods that advertise ``supports_offload_after_quant`` are
+        asked, since the implementation has to know when a layer is finished.
+        Deferring materialization to the ``meta`` device does not imply that.
+        """
+        marked = 0
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if getattr(quant_method, "supports_offload_after_quant", False):
+                quant_method.enable_offload_after_quant()
+                marked += 1
+        return marked
 
     @staticmethod
     def _has_online_quant(model: nn.Module) -> bool:
@@ -458,6 +488,13 @@ class DiffusersPipelineLoader:
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            # Layers finished during loading would only be staged onto the target
+            # device for a process call that immediately returns. That round trip
+            # is wasted work in general, and undoes the point of the offload for
+            # layers that already went back to the host.
+            if getattr(module, "_already_called_process_weights_after_loading", False):
                 continue
 
             if has_online_quant:

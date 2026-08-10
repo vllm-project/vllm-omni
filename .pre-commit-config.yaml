@@ -61,6 +61,13 @@ repos:
       types: [python]
       files: ^tests/
 
+    - id: check-tts-adapter-migration
+      name: Ratchet TTS per-model branches out of serving_speech.py
+      entry: python tools/pre_commit/check_tts_adapter.py
+      language: python
+      pass_filenames: false
+      files: ^vllm_omni/entrypoints/openai/(serving_speech\.py|tts_adapters/__init__\.py)$
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion

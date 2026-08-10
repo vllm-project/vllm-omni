@@ -170,6 +170,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "width",
             "num_outputs_per_prompt",
             "seed",
+            "quality",
             "num_inference_steps",
             "guidance_scale",
             "true_cfg_scale",
@@ -759,6 +760,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
                     if isinstance(sp, OmniDiffusionSamplingParams):
+                        quality = extra_body.get("quality")
+                        self._set_if_supported(
+                            sp,
+                            quality=quality,
+                        )
                         apply_normalized_diffusion_request_extra_args(sp, normalized_extra_args)
                     else:
                         apply_declared_extra_args(
@@ -780,6 +786,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
+                    lora_request=lora_request,
                 )
 
                 generators.append(generator)
@@ -2062,15 +2069,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     now_ts = time.time()
                     if req_state is not None and req_state.first_audio_ts is None:
                         req_state.first_audio_ts = now_ts
-                        stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
-                        # The orchestrator binds requests by their internal id,
-                        # not the user-visible external id, so look up the
-                        # replica with req_state.request_id (internal).
-                        replica_id = (
-                            stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
-                            if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
-                            else None
-                        )
+                        replica_id = getattr(omni_res, "replica_id", None)
+                        if replica_id is None:
+                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                            # Fallback for older outputs. The orchestrator binds
+                            # requests by internal id, but can release that
+                            # binding before the API sees the final audio chunk,
+                            # so prefer the OutputMessage replica copied onto
+                            # OmniRequestOutput above.
+                            replica_id = (
+                                stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
+                                if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
+                                else None
+                            )
                         req_state.audio_emit_stage_id = omni_res.stage_id
                         req_state.audio_emit_replica_id = replica_id
                         observe_audio_first_packet(
@@ -2933,6 +2944,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         generator_device = gen_params.generator_device
         num_outputs_per_prompt = gen_params.num_outputs_per_prompt
         num_inference_steps = extra_body.get("num_inference_steps")
+        quality = extra_body.get("quality")
         guidance_scale = extra_body.get("guidance_scale")
         true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
         negative_prompt = extra_body.get("negative_prompt")
@@ -3083,6 +3095,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     seed=seed,
                     generator_device=generator_device,
                     num_outputs_per_prompt=num_outputs_per_prompt,
+                    quality=quality,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     true_cfg_scale=true_cfg_scale,
@@ -3147,6 +3160,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._set_if_supported(
             gen_params,
             generator_device=generator_device,
+            quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
             true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
@@ -3485,6 +3499,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # method apply its own model-specific default when the user does
             # not provide a value.
             num_inference_steps = extra_body.get("num_inference_steps")
+            quality = extra_body.get("quality")
             guidance_scale = extra_body.get("guidance_scale")
             true_cfg_scale = extra_body.get("true_cfg_scale")
             seed = extra_body.get("seed")
@@ -3539,6 +3554,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Only override defaults when the user explicitly provides values
             if num_inference_steps is not None:
                 gen_params.num_inference_steps = num_inference_steps
+            if quality is not None:
+                gen_params.quality = quality
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
             if true_cfg_scale is not None:

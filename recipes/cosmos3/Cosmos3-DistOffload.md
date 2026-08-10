@@ -56,10 +56,14 @@ vllm serve /path/to/Cosmos3-Super \
   --data-parallel-size 4
 ```
 
-### Without AllGather (full weights per rank, no sharding)
+### Without DLO AllGather (rank-local weights, no DLO sharding)
 
-Use `--dlo-no-use-allgather` when you want each rank to load full weights independently —
-no AllGather synchronization, no concurrent request requirement, but N× host memory.
+Use `--dlo-no-use-allgather` when you want each rank to stream the standard
+loader's rank-local weights independently — no DLO AllGather synchronization,
+no concurrent request requirement, but no DLO weight sharding and higher host
+memory use. In pure DP, this is equivalent to independent full-weight
+layerwise-offload replicas; with TP or HSDP, each rank retains the standard
+loader's local tensor layout.
 
 ```bash
 vllm serve /path/to/Cosmos3-Nano \
@@ -154,9 +158,9 @@ wait
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--enable-distributed-layerwise-offload` | Enable DLO with H2D + AllGather overlap | `false` |
-| `--data-parallel-size N` | Number of DP ranks (weight sharding + concurrent requests) | `1` |
+| `--data-parallel-size N` | Number of DP ranks; DLO weight sharding + concurrent requests when AllGather is enabled | `1` |
 | `--dlo-use-allgather` | Use shard + AllGather for weight reconstruction (recommended) | `true` |
-| `--dlo-no-use-allgather` | Each rank loads full weights independently (no sharding, no AllGather) | `false` |
+| `--dlo-no-use-allgather` | Stream standard-loader rank-local weights independently (no DLO sharding, no DLO AllGather) | `false` |
 | `--usp N` | Use SP instead of DP for weight sharding (long sequences) | `1` |
 
 ## Mode comparison
@@ -166,7 +170,7 @@ wait
 | DLO + AllGather (DP4) | `--enable-distributed-layerwise-offload --data-parallel-size 4` | 1/4 model | 2 blocks | **3.3× HSDP** | Max throughput, short sequences |
 | DLO + AllGather (DP2) | `--enable-distributed-layerwise-offload --data-parallel-size 2` | 1/2 model | 2 blocks | 2× HSDP | Balanced throughput + memory |
 | DLO + AllGather (SP4) | `--enable-distributed-layerwise-offload --usp 4` | 1/4 model | 2 blocks | 1× (single req) | Long sequences (720p+) |
-| DLO no-AllGather | `--enable-distributed-layerwise-offload --dlo-no-use-allgather` | Full model | 2 blocks | 0.4× HSDP | No AllGather overhead, high CPU |
+| DLO no-AllGather | `--enable-distributed-layerwise-offload --dlo-no-use-allgather` | Standard-loader rank-local weights | 2 blocks | 0.4× HSDP | No DLO AllGather overhead, high CPU |
 | HSDP | `--use-hsdp --hsdp-shard-size 4` | 0 | 1/4 model | 1× (baseline) | Weights fit in HBM |
 
 ## Memory expectations
@@ -185,7 +189,11 @@ wait
 
 - `--dlo-use-allgather` (default) requires all concurrent requests to have the same
   `num_inference_steps` (AllGather is a collective that needs all ranks synchronized)
-- Online quantization (FP8) is incompatible with mmap loading — falls back to regular
-  `load_weights()` automatically
-- Tensor Parallel is not supported (DLO uses DP-based sharding, a different dimension)
-- HSDP + AllGather is rejected (would double-shard weights)
+- Online quantization (FP8) is incompatible with the DLO+AllGather mmap path;
+  use `--dlo-no-use-allgather` or disable online quantization
+- Tensor Parallel > 1 is rejected in the DLO+AllGather mmap path. TP with
+  `--dlo-no-use-allgather` retains the standard TP loader and should be treated
+  as an experimental compatibility path
+- HSDP + AllGather is rejected (would double-shard weights). HSDP with
+  `--dlo-no-use-allgather` is accepted at configuration level, but is not yet a
+  broadly validated production combination

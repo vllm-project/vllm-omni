@@ -39,7 +39,8 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -81,6 +82,21 @@ def _from_pipeline_key(
     )
 
 
+def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
+    omni_config = _from_pipeline_key("personaplex")
+
+    assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
+
+
+def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "personaplex-turn.yaml"
+    deploy_path.write_text("session_mode: turn\n", encoding="utf-8")
+
+    omni_config = _from_pipeline_key("personaplex", deploy_config_path=str(deploy_path))
+
+    assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
@@ -105,13 +121,20 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         assert omni_stage.runtime_config.num_replicas == legacy_stage.yaml_runtime.get("num_replicas", 1)
 
         engine_args = legacy_stage.yaml_engine_args
+        assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
-        assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization", 0.90)
-        assert omni_stage.scheduler_config.max_num_seqs == engine_args.get("max_num_seqs", 128)
+        assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization")
+        assert omni_stage.cache_config.enable_prefix_caching == engine_args.get("enable_prefix_caching")
+        expected_disable_hybrid = engine_args.get("disable_hybrid_kv_cache_manager")
+        if omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_GENERATION:
+            expected_disable_hybrid = True if expected_disable_hybrid is None else expected_disable_hybrid
+        assert omni_stage.cache_config.disable_hybrid_kv_cache_manager == expected_disable_hybrid
+        assert omni_stage.scheduler_config.max_num_seqs == engine_args.get("max_num_seqs")
         assert omni_stage.scheduler_config.max_num_batched_tokens == engine_args.get("max_num_batched_tokens")
-        assert omni_stage.scheduler_config.async_scheduling == engine_args.get("async_scheduling", True)
+        assert omni_stage.scheduler_config.enable_chunked_prefill == engine_args.get("enable_chunked_prefill")
+        assert omni_stage.scheduler_config.async_scheduling == engine_args.get("async_scheduling")
         legacy_parallel_config = engine_args.get("parallel_config") or {}
         assert omni_stage.parallel_config.tensor_parallel_size == legacy_parallel_config.get(
             "tensor_parallel_size",
@@ -180,6 +203,64 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
+
+
+@pytest.mark.parametrize(
+    "cli_overrides",
+    [
+        {"enable_lora": True},
+        {"stage_0_enable_lora": True},
+    ],
+    ids=["global", "stage-scoped"],
+)
+def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_overrides):
+    with pytest.raises(ValueError, match=r"no structured config owner: enable_lora"):
+        _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
+
+
+@pytest.mark.parametrize(
+    ("engine_extras", "unowned_field"),
+    [
+        ({"enable_lora": True}, "enable_lora"),
+        ({"parallel_config": {"cfg_parallel_size": 2}}, "parallel_config.cfg_parallel_size"),
+    ],
+    ids=["top-level", "nested-parallel-config"],
+)
+def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras, unowned_field):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras=engine_extras)])
+
+    with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
+        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize(
+    ("cli_overrides", "stage_id"),
+    [
+        ({"kv_cache_dtype": "fp8"}, 0),
+        ({"stage_0_kv_cache_dtype": "fp8"}, 0),
+        ({"stage_1_kv_cache_dtype": "fp8"}, 1),
+    ],
+    ids=["global", "ar-stage", "generation-stage"],
+)
+def test_from_pipeline_config_rejects_diffusion_only_cli_fields_for_llm_stages(cli_overrides, stage_id):
+    with pytest.raises(ValueError, match=rf"Stage {stage_id} .*no structured config owner: kv_cache_dtype"):
+        _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
+
+
+def test_from_pipeline_config_accepts_diffusion_only_cli_fields_for_diffusion_stage():
+    stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path="dreamzero_tp1_cfg2",
+        cli_overrides={"kv_cache_dtype": "fp8"},
+    ).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.diffusion_kv_cache_dtype == "fp8"
+
+
+def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
+    assert omni_config_module._stage_cli_overrides(0, {"enable_lora": True}) == {"enable_lora": True}
 
 
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
@@ -364,8 +445,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert {f.name for f in fields(VllmOmniGenerationStageConfig)} == public_fields
 
 
-def test_runtime_config_fields_match_rfc_runtime_scope():
+def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "distributed_executor_backend",
+        "worker_cls",
         "devices",
         "num_replicas",
         "env",
@@ -376,9 +459,23 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
     }
 
 
-def test_sub_config_fields_match_rfc_scopes():
+def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
+        "model",
+        "model_arch",
+        "revision",
+        "tokenizer_revision",
+        "code_revision",
+        "seed",
+        "logits_processors",
+        "trust_remote_code",
+        "dtype",
+        "attention_backend",
+        "moe_backend",
+        "hf_overrides",
+        "limit_mm_per_prompt",
         "active_stream_window",
+        "duplex_max_sessions",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
@@ -387,6 +484,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "task_type",
         "codec_frame_rate_hz",
         "enforce_eager",
+        "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
         "compilation_config",
         "enable_multithread_weight_load",
@@ -399,12 +497,16 @@ def test_sub_config_fields_match_rfc_scopes():
         "tokenizer_subdir",
     }
     assert {f.name for f in fields(OmniStageLoadConfig)} == {
+        "tokenizer",
+        "download_dir",
+        "skip_tokenizer_init",
         "load_format",
         "tokenizer_mode",
         "config_format",
         "skip_mm_profiling",
     }
     assert {f.name for f in fields(OmniStageCacheConfig)} == {
+        "kv_cache_memory_bytes",
         "gpu_memory_utilization",
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
@@ -418,6 +520,8 @@ def test_sub_config_fields_match_rfc_scopes():
         "async_scheduling",
     }
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
+        "async_chunk",
+        "omni_kv_config",
         "stage_connector",
         "output_connectors",
         "input_connectors",
@@ -440,6 +544,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
+        "text_encoder_tp_size",
         "vae_parallel_mode",
         "use_hsdp",
         "mask_sp_padding",
@@ -809,7 +914,7 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
-    legacy_engine_args = build_engine_args_dict(
+    legacy_engine_args = build_legacy_engine_args_dict(
         omega_stage,
         model="/tmp/qwen3-tts",
         stage_connector_spec={"name": "SharedMemoryConnector", "extra": {}},
@@ -862,20 +967,24 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
 
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
+        fa_deterministic=True,
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
         kv_cache_skip_layers=[2],
         static_lora_scale=0.25,
+        diffusion_kv_mode="paged_scheduler",
         diffusers_load_kwargs=None,
         diffusers_call_kwargs=None,
     )
 
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
+    assert cfg.fa_deterministic is True
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
     assert cfg.lora_scale == 0.25
     assert cfg.cache_backend == "tea_cache"
+    assert cfg.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert cfg.diffusers_load_kwargs == {}
     assert cfg.diffusers_call_kwargs == {}
 
@@ -890,6 +999,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "stages:",
                 "  - stage_id: 0",
                 "    diffusion_attention_backend: flash_attn",
+                "    fa_deterministic: true",
+                "    diffusion_kv_mode: paged_scheduler",
             ]
         )
     )
@@ -901,9 +1012,34 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
+    assert stage.diffusion_config.fa_deterministic is True
+    assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+
+def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
+    deploy_path = tmp_path / "dreamzero_reserved_diffusion_kv.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_kv_mode: paged_worker_local",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="reserved but not implemented"):
+        _from_pipeline_key(
+            "dreamzero",
+            deploy_config_path=str(deploy_path),
+        )
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
     classified_fields = (
         omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
         | omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
@@ -911,10 +1047,15 @@ def test_diffusion_config_field_classification_covers_current_fields():
     )
 
     assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
+    assert {f.name for f in fields(OmniDiffusionConfig)} <= (
+        classified_fields | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+    )
     assert {
         "enable_prompt_embed_cache",
+        "enable_session_state_manager",
         "prompt_embed_cache_size",
         "diffusion_kv_cache_dtype",
+        "diffusion_kv_mode",
     } <= omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
     assert {
         "revision",

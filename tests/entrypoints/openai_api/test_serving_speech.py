@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
+from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -1389,6 +1390,20 @@ class TestTTSMethods:
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_load_supported_speakers_skips_non_tts_omni_model(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        warning = mocker.patch.object(serving_speech_module.logger, "warning")
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(tts_config=SimpleNamespace())
+        )
+
+        assert speech_server._is_tts is False
+        assert speech_server._load_supported_speakers() == set()
+        warning.assert_not_called()
 
     def test_load_supported_languages_from_config(self, speech_server):
         """Languages/dialects from codec_language_id are loaded title-cased; 'Auto' is added."""
@@ -3430,16 +3445,17 @@ class TestCosyVoice3Serving:
     def test_cosyvoice3_model_type_detection(self, cosyvoice3_server):
         assert cosyvoice3_server._tts_model_type == "cosyvoice3"
         assert cosyvoice3_server._is_tts is True
-        assert cosyvoice3_server._is_cosyvoice3 is True
 
     def test_cosyvoice3_stage_registered(self):
-        from vllm_omni.entrypoints.openai.serving_speech import (
-            _COSYVOICE3_TTS_MODEL_STAGES,
-            _TTS_MODEL_STAGES,
+        from vllm_omni.entrypoints.openai.tts_adapters import (
+            all_tts_stage_keys,
+            detect_tts_model_type,
+            resolve_adapter,
         )
 
-        assert "cosyvoice3_talker" in _COSYVOICE3_TTS_MODEL_STAGES
-        assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
+        assert "cosyvoice3_talker" in resolve_adapter("cosyvoice3").stage_keys
+        assert "cosyvoice3_talker" in all_tts_stage_keys()
+        assert detect_tts_model_type("cosyvoice3_talker", None) == "cosyvoice3"
 
     def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
@@ -3584,6 +3600,63 @@ class TestGLMTTSServing:
 
         assert text_token_len == 3
         load_tokenizer.assert_called_once()
+
+
+@pytest.fixture
+def ming_flash_omni_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="inclusionAI/Ming-omni-tts-0.5B",
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="ming_tts"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestMingFlashOmniTTSServing:
+    def test_validate_ming_flash_omni_tts_rejects_ref_text(self, ming_flash_omni_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = ming_flash_omni_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = ming_flash_omni_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+    def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server, mocker: MockerFixture):
+        ming_flash_omni_tts_server._build_ming_flash_omni_prompt = mocker.MagicMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+        ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
 
 
 class TestTTSAsyncOffloading:

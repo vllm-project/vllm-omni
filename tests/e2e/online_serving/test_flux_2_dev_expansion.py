@@ -136,3 +136,36 @@ def test_flux_2_dev(
     }
 
     openai_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_flux_2_dev_feature_cases(MODEL),
+    indirect=True,
+)
+def test_flux_2_dev_batched_chat_completions(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    """Validate batched chat completions for diffusion models."""
+    messages = [
+        [{"role": "user", "content": PROMPT}],
+        [{"role": "user", "content": "A sunset over the ocean."}],
+    ]
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                "num_inference_steps": 2,
+                "height": 512,
+                "width": 512,
+                "seed": 42,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert resp.success
+    choices = resp.json_body["choices"]
+    assert len(choices) == len(messages)
