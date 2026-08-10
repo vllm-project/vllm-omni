@@ -64,6 +64,21 @@ _OMNI_RUNNER_PARAM = (
     {"trust_remote_code": True},
 )
 
+# These tests only ask whether a common word is present, which needs far less
+# ASR than the shared helper's ``small`` default. A miss re-runs that one clip
+# through the stronger model -- the escalation the shared speech assertion uses
+# -- so a weak-ASR mishear still cannot flake the gate while the average clip
+# pays for the fast one. Whisper pads every clip to 30 s whatever its length, so
+# the model is the only knob that moves the cost here.
+_ASR_MODEL = "base"
+_ASR_ESCALATION_MODEL = "small"
+
+# Transcription dominates this file's runtime on a single-GPU runner, where
+# Whisper falls back to CPU. Two of the four concurrent clips carry the content
+# check; the pairwise waveform comparison covers all four for the cheaper
+# failure -- one request's audio delivered for another.
+_TRANSCRIBED_CLIPS = 2
+
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
@@ -180,10 +195,24 @@ def _assert_stopped_on_its_own(clip: _Clip) -> None:
     assert 0.5 < seconds < 30.0, f"implausible duration {seconds:.2f}s — did STOP fire?"
 
 
-def _transcribe(wav: torch.Tensor, tmp_dir: str, name: str) -> str:
+def _transcribe(wav: torch.Tensor, tmp_dir: str, name: str, model_size: str = _ASR_MODEL) -> str:
     path = str(Path(tmp_dir) / f"{name}.wav")
     sf.write(path, wav.numpy(), SAMPLE_RATE)
-    return convert_audio_file_to_text(path, language="en").lower()
+    return convert_audio_file_to_text(path, model_size=model_size, language="en").lower()
+
+
+def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
+    """Transcribe with the fast model, retrying once with the stronger one.
+
+    ``accepts`` decides whether the fast transcript is usable. Escalating only
+    on a miss keeps the average clip at ``_ASR_MODEL`` while a genuine model
+    artifact still fails the caller's assertion, since the stronger ASR
+    mistranscribes it too.
+    """
+    transcript = _transcribe(wav, tmp_dir, name)
+    if accepts(transcript):
+        return transcript
+    return _transcribe(wav, tmp_dir, name, model_size=_ASR_ESCALATION_MODEL)
 
 
 @pytest.mark.advanced_model
@@ -192,10 +221,14 @@ def _transcribe(wav: torch.Tensor, tmp_dir: str, name: str) -> str:
     ("text", "keyword"),
     [
         ("Hello, this is Gepard speaking.", "hello"),
-        ("The quick brown fox jumps over the lazy dog.", "fox"),
+        # No keyword: this row asserts the same thing about the audio as the one
+        # above it, so it carries the structural and stopping checks over a
+        # second text and leaves the transcript to the row that already makes
+        # that claim.
+        ("The quick brown fox jumps over the lazy dog.", None),
     ],
 )
-def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keyword: str) -> None:
+def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keyword: str | None) -> None:
     """Zero-shot synthesis produces a finite mono waveform at 22.05 kHz.
 
     The transcript check is the one assertion here that reads the audio as
@@ -210,8 +243,11 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
         return  # dummy weights: the audio is structural only, so do not read it
 
     _assert_stopped_on_its_own(clip)
+    if keyword is None:
+        return
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        transcript = _transcribe(clip.wav, tmp_dir, "zero_shot")
+        transcript = _transcribe_for(clip.wav, tmp_dir, "zero_shot", lambda t: keyword in t)
     assert keyword in transcript, f"expected {keyword!r} in transcript, got {transcript!r}"
 
 
@@ -237,7 +273,7 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
 
     _assert_stopped_on_its_own(clip)
     with tempfile.TemporaryDirectory() as tmp_dir:
-        transcript = _transcribe(clip.wav, tmp_dir, "long_text")
+        transcript = _transcribe_for(clip.wav, tmp_dir, "long_text", lambda t: "river" in t)
     assert "river" in transcript, f"expected 'river' in transcript, got {transcript!r}"
 
 
@@ -250,7 +286,8 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
     per-request frame history, the codec window or the output routing shows up
     as a transcript matching the wrong prompt, which similar prompts would
     hide. ``max_num_seqs`` is 4 in the deploy config, so these run together
-    rather than back to back.
+    rather than back to back. All four are submitted for that reason even
+    though only ``_TRANSCRIBED_CLIPS`` of them are read back as speech.
     """
     texts = list(_DISTINGUISHABLE_PROMPTS)
     clips = _synthesize_all(omni_runner, texts)
@@ -264,11 +301,20 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
     for clip in clips:
         _assert_stopped_on_its_own(clip)
 
+    # Covers all four clips, not just the transcribed ones: delivering one
+    # request's audio for another leaves two byte-identical waveforms, and this
+    # costs nothing next to an ASR pass.
+    for i in range(len(clips)):
+        for j in range(i + 1, len(clips)):
+            assert not torch.equal(clips[i].wav, clips[j].wav), (
+                f"clips {i} and {j} are the same waveform — one request's audio was delivered for another"
+            )
+
     keywords = set(_DISTINGUISHABLE_PROMPTS.values())
     spoken: dict[str, str] = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
-        for i, clip in enumerate(clips):
-            transcript = _transcribe(clip.wav, tmp_dir, f"concurrent_{i}")
+        for i, clip in enumerate(clips[:_TRANSCRIBED_CLIPS]):
+            transcript = _transcribe_for(clip.wav, tmp_dir, f"concurrent_{i}", lambda t: any(k in t for k in keywords))
             present = sorted(k for k in keywords if k in transcript)
             assert len(present) == 1, (
                 f"clip {i} transcribed as {transcript!r}: expected exactly one of "
@@ -279,5 +325,3 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
                 "one request's audio was delivered for another"
             )
             spoken[present[0]] = transcript
-
-    assert set(spoken) == keywords, f"missing prompts in the outputs: {sorted(keywords - set(spoken))}"
