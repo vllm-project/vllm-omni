@@ -76,8 +76,9 @@ def test_finish_requests_purges_finished_request_from_running(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        # super() returning the abort tuple but leaving self.running untouched
-        return [(finished.request_id, 0)]
+        # vLLM 0.26 super() returns the finished Request objects but here
+        # leaves self.running untouched to simulate the missed removal.
+        return [finished]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
@@ -88,7 +89,7 @@ def test_finish_requests_purges_finished_request_from_running(
     )
 
     assert scheduler.running == []
-    assert result == [(finished.request_id, 0)]
+    assert result == [finished]
 
 
 @pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
@@ -111,7 +112,7 @@ def test_finish_requests_purges_untracked_request_from_running(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        return [(untracked.request_id, 0)]
+        return [untracked]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
@@ -122,7 +123,7 @@ def test_finish_requests_purges_untracked_request_from_running(
     )
 
     assert scheduler.running == []
-    assert result == [(untracked.request_id, 0)]
+    assert result == [untracked]
 
 
 @pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
@@ -136,7 +137,7 @@ def test_finish_requests_leaves_healthy_running_intact(
     is conservative and won't aggressively drop healthy entries.
     """
     alive = _StubRequest("req-alive", RequestStatus.RUNNING)
-    leaving_id = "req-leaving"
+    leaving = _StubRequest("req-leaving", RequestStatus.FINISHED_STOPPED)
     scheduler = _make_scheduler(
         scheduler_cls,
         requests={alive.request_id: alive},
@@ -145,13 +146,13 @@ def test_finish_requests_leaves_healthy_running_intact(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        return [(leaving_id, 0)]
+        return [leaving]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
     scheduler_cls.finish_requests(
         scheduler,
-        [leaving_id],
+        [leaving.request_id],
         RequestStatus.FINISHED_STOPPED,
     )
 

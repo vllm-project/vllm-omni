@@ -3,7 +3,7 @@
 # The registered minicpmo_4_5 pipeline owns the fixed
 # Thinker -> Talker -> Code2Wav topology. This overlay changes session
 # lifetime and bounds all three stages to two live duplex sessions.
-base_config: minicpmo_4_5_batching.yaml
+base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 session_mode: duplex
 active_stream_window: 1
@@ -31,6 +31,7 @@ stages:
     # segment and turn boundaries travel as explicit output metadata.
     default_sampling_params:
       max_tokens: 2048
+      min_tokens: 0
       stop_token_ids: [1]
 
   - stage_id: 2

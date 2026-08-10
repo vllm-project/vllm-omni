@@ -207,3 +207,68 @@ def test_playback_worklet_waits_before_playing_and_rebuffers_after_underrun():
         capture_output=True,
         text=True,
     )
+
+
+def test_playback_worklet_fades_terminal_drain_to_zero():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        global.sampleRate = 1000;
+        const messages = [];
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = {
+              onmessage: null,
+              postMessage: (message) => messages.push(message),
+            };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const processor = new Processor();
+        const pcm = new Int16Array(100);
+        pcm.fill(16384);
+        processor.handleMessage({
+          type: 'audio',
+          pcm,
+          responseId: 'response-terminal',
+          initialBufferMs: 400,
+        });
+        processor.handleMessage({
+          type: 'drain',
+          responseId: 'response-terminal',
+        });
+
+        const output = new Float32Array(100);
+        processor.process([], [[output]]);
+        const assert = (condition, message) => {
+          if (!condition) throw new Error(message);
+        };
+
+        assert(output.some((sample) => sample !== 0), 'terminal audio must still play');
+        assert(output[output.length - 1] === 0, 'terminal drain must fade the final sample to zero');
+        const tail = Array.from(output.slice(-5), Math.abs);
+        assert(
+          tail.every((sample, index) => index === 0 || sample <= tail[index - 1]),
+          'terminal drain fade must decrease monotonically',
+        );
+        assert(
+          messages.filter((message) => message.type === 'playback-drained').length === 1,
+          'terminal drain must be reported exactly once after playback',
+        );
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "playback_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

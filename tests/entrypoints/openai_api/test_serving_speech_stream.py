@@ -72,12 +72,161 @@ class TestStreamingSpeechWebSocket:
                 assert audio.startswith(b"RIFF")
 
                 done = ws.receive_json()
-                assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": len(audio), "error": False}
+                assert done == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": len(audio),
+                    "error": False,
+                }
 
                 session_done = ws.receive_json()
-                assert session_done == {"type": "session.done", "total_sentences": 1}
+                assert session_done == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
         assert speech_service._generate_audio_bytes.await_count == 1
+
+    def test_input_done_flushes_and_keeps_connection_open(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+
+                # The same connection serves several utterances; the config sent
+                # once at the top keeps applying and utterance_index rises.
+                for expected_index, text in enumerate(("First utterance. ", "Second utterance. ")):
+                    ws.send_json({"type": "input.text", "text": text})
+                    ws.send_json({"type": "input.done"})
+
+                    start = ws.receive_json()
+                    assert start["type"] == "audio.start"
+                    assert start["utterance_index"] == expected_index
+                    assert start["sentence_text"] == text.strip()
+                    assert ws.receive_bytes().startswith(b"RIFF")
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {
+                        "type": "session.done",
+                        "utterance_index": expected_index,
+                        "total_sentences": 1,
+                    }
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+        assert [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Vivian",
+            "Vivian",
+        ]
+
+    def test_sentence_index_stays_within_the_flushed_utterance(self, mocker: MockerFixture):
+        # sentence_index counts within one flush and utterance_index counts the
+        # flushes, so a late utterance never reports "sentence 2 of 1".
+        app, _ = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+
+                for expected_index in range(3):
+                    ws.send_json({"type": "input.text", "text": "Hello world. "})
+                    ws.send_json({"type": "input.done"})
+
+                    start = ws.receive_json()
+                    assert start["utterance_index"] == expected_index
+                    assert start["sentence_index"] == 0
+                    ws.receive_bytes()
+
+                    done = ws.receive_json()
+                    assert done["utterance_index"] == expected_index
+                    assert done["sentence_index"] == 0
+
+                    session_done = ws.receive_json()
+                    assert session_done["utterance_index"] == expected_index
+                    assert session_done["total_sentences"] == 1
+                    assert start["sentence_index"] < session_done["total_sentences"]
+
+    def test_session_config_between_utterances_replaces_config(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                for expected_index, voice in enumerate(("Vivian", "Serena")):
+                    ws.send_json({"type": "session.config", "voice": voice})
+                    ws.send_json({"type": "input.text", "text": "Hello world. "})
+                    ws.send_json({"type": "input.done"})
+
+                    assert ws.receive_json()["type"] == "audio.start"
+                    ws.receive_bytes()
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {
+                        "type": "session.done",
+                        "utterance_index": expected_index,
+                        "total_sentences": 1,
+                    }
+
+        assert [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Vivian",
+            "Serena",
+        ]
+
+    def test_session_config_rejected_while_input_is_buffered(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "while input is buffered" in error["message"]
+
+                # The buffered text survives the rejected reconfiguration.
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json()["sentence_text"] == "Hello world."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].voice == "Vivian"
+
+    def test_session_close_ends_connection(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
+
+                ws.send_json({"type": "session.close"})
+                with pytest.raises(WebSocketDisconnect):
+                    ws.receive_json()
+
+    def test_idle_timeout_closes_reused_connection(self, mocker: MockerFixture):
+        app, _ = _build_test_app(idle_timeout=0.05, mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
+
+                # Holding a connection open is not free: an idle client still
+                # gets timed out after the flush.
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": "Idle timeout: no message received",
+                }
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
@@ -125,9 +274,15 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_bytes() == b"\x06"
 
                 done = ws.receive_json()
-                assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": 6, "error": False}
+                assert done == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": 6,
+                    "error": False,
+                }
 
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
         assert len(captured_requests) == 1
         assert captured_requests[0].stream is True
@@ -210,6 +365,8 @@ class TestStreamingSpeechWebSocket:
                 # is fully aligned.
                 chunk = ws.receive_json()
                 assert chunk["type"] == "audio.chunk"
+                assert chunk["utterance_index"] == 0
+                assert chunk["sentence_index"] == 0
                 assert chunk["chunk_id"] == 0
                 assert chunk["chunk_start_ms"] == 0
                 assert chunk["chunk_end_ms"] == 500
@@ -240,7 +397,13 @@ class TestStreamingSpeechWebSocket:
                 ]
 
                 done = ws.receive_json()
-                assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": 2000, "error": False}
+                assert done == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": 2000,
+                    "error": False,
+                }
 
         assert captured_requests[0].word_timestamps is True
         assert mock_align.await_count == 1
@@ -309,11 +472,12 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_bytes()
                 assert ws.receive_json() == {
                     "type": "audio.done",
+                    "utterance_index": 0,
                     "sentence_index": 0,
                     "total_bytes": 36,
                     "error": False,
                 }
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
     def test_invalid_streaming_config(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
@@ -341,7 +505,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.text", "text": ""})
                 ws.send_json({"type": "input.done"})
 
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 0}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 0}
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
@@ -361,11 +525,12 @@ class TestStreamingSpeechWebSocket:
                 ws.receive_bytes()
                 assert ws.receive_json() == {
                     "type": "audio.done",
+                    "utterance_index": 0,
                     "sentence_index": 0,
                     "total_bytes": 36,
                     "error": False,
                 }
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
     def test_unknown_message_type_keeps_session_open(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
@@ -384,12 +549,13 @@ class TestStreamingSpeechWebSocket:
                 ws.receive_bytes()
                 assert ws.receive_json() == {
                     "type": "audio.done",
+                    "utterance_index": 0,
                     "sentence_index": 0,
                     "total_bytes": 36,
                     "error": False,
                 }
 
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
     def test_config_timeout_closes_session(self, mocker: MockerFixture):
         app, _ = _build_test_app(config_timeout=0.01, mocker=mocker)
@@ -416,10 +582,19 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.done"})
 
                 assert ws.receive_json()["type"] == "audio.start"
-                assert ws.receive_json() == {"type": "error", "message": "Generation failed for sentence 0: boom"}
-                assert ws.receive_json() == {"type": "audio.done", "sentence_index": 0, "total_bytes": 0, "error": True}
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": "Generation failed for utterance 0, sentence 0: boom",
+                }
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": 0,
+                    "error": True,
+                }
 
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
     def test_streaming_generation_error_marks_audio_done(self, mocker: MockerFixture):
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
@@ -453,16 +628,17 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_bytes() == b"\x01\x02"
                 assert ws.receive_json() == {
                     "type": "error",
-                    "message": "Generation failed for sentence 0: stream boom",
+                    "message": "Generation failed for utterance 0, sentence 0: stream boom",
                 }
                 assert ws.receive_json() == {
                     "type": "audio.done",
+                    "utterance_index": 0,
                     "sentence_index": 0,
                     "total_bytes": 2,
                     "error": True,
                 }
 
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
     def test_invalid_input_text_type_returns_validation_error(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
@@ -478,7 +654,7 @@ class TestStreamingSpeechWebSocket:
                 }
 
                 ws.send_json({"type": "input.done"})
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 0}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 0}
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
@@ -497,7 +673,7 @@ class TestStreamingSpeechWebSocket:
                 }
 
                 ws.send_json({"type": "input.done"})
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 0}
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 0}
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
@@ -550,7 +726,15 @@ class TestStreamingSpeechWebSocket:
         config.word_timestamps = False
 
         with pytest.raises(WebSocketDisconnect):
-            asyncio.run(handler._generate_and_send(websocket, config, "Hello world.", 0))
+            asyncio.run(
+                handler._generate_and_send(
+                    websocket,
+                    config,
+                    "Hello world.",
+                    utterance_index=0,
+                    sentence_index=0,
+                )
+            )
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2

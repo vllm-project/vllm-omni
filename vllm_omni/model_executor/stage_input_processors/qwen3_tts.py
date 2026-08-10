@@ -29,13 +29,29 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
-def _qwen3_tts_empty_finished_payload():
-    """Empty-but-finished stage payload. Returned instead of None on a degenerate
-    talker take so the Stage-1 wait gate releases (code2wav handles empty codec
-    input -> 0-sample audio, request finished) rather than the connector silently
-    dropping the request and Stage-1 hanging to connector_get_max_wait."""
+def _qwen3_tts_degenerate_finished_payload():
+    """Single-placeholder-frame finished payload for a degenerate talker take.
+
+    Returning ``None`` here makes the connector silently drop the request, and
+    Stage-1's wait gate then polls to ``connector_get_max_wait`` (#4463).
+    Returning an *empty* finished payload (zero codec frames) is no better on
+    full-payload deploys: it produces a zero-token Stage-1 request, which the
+    generation scheduler placeholder-schedules once and then never collects
+    (the ``required_tokens <= 0`` branch only finishes requests through the
+    async-chunk transfer adapter). The request is left parked in ``running``
+    while the base-scheduler fallback schedules it at ``num_new_tokens = -1``,
+    which killed the whole stage EngineCore before #5269 and no-ops after it,
+    so the request never finishes either way (#5196, #5471).
+
+    The placeholder is one all-ones frame, emitted flat (codebook-major, the
+    same wire format the normal path below produces). Its values are valid by
+    ``_filter_audio_codes_qwen3_tts`` (non-negative, not all-zero, below
+    ``_CODEBOOK_SIZE``), so the request runs the normal one-shot code2wav
+    path and finishes cleanly with a single frame (~80 ms at 12 Hz) of
+    placeholder audio.
+    """
     return {
-        "codes": {"audio": torch.zeros(0, dtype=torch.long)},
+        "codes": {"audio": torch.ones(_NUM_QUANTIZERS_DEFAULT, dtype=torch.long)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
 
@@ -400,7 +416,7 @@ def talker2code2wav_full_payload(
             type(pooling_output).__name__,
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
 
     # codes.audio — try flat dotted first (flatten_payload), then nested fallback.
     audio = pooling_output.get("codes.audio")
@@ -415,7 +431,7 @@ def talker2code2wav_full_payload(
             list(pooling_output.keys()),
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
     audio = audio.to(torch.long)
     audio = _filter_audio_codes_qwen3_tts(audio)
     if audio.numel() == 0:
@@ -424,7 +440,7 @@ def talker2code2wav_full_payload(
             "filter (negative/all-zero/out-of-range rows dropped) for req=%s.",
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
 
     output_token_ids = list(getattr(request, "output_token_ids", None) or [])
     seq_len = max(len(output_token_ids) - 1, 0)

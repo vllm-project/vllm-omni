@@ -1,7 +1,7 @@
-# Target vllm version: v0.25.0 (releases/v0.25.0 branch).
+# Target vllm version: v0.26.0 (releases/v0.26.0 branch).
 # Keep VLLM_BASE_TAG aligned with the target vLLM release on every rebase.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.25.0
+ARG VLLM_BASE_TAG=v0.26.0
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
