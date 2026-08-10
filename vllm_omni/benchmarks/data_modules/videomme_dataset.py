@@ -476,7 +476,14 @@ class VideoMMEDataset(BenchmarkDataset):
             raise ImportError("pandas is required to load Video-MME parquet") from e
         if not path.is_file():
             raise FileNotFoundError(f"Video-MME parquet not found: {path}")
-        df = pd.read_parquet(path)
+        # aarch64 pyarrow 25 can segfault on dict-encoded pages; duckdb reader is safe.
+        try:
+            import duckdb
+
+            cur = duckdb.connect().execute(f"SELECT * FROM read_parquet('{path}')")
+            df = pd.DataFrame(cur.fetchall(), columns=[d[0] for d in cur.description])
+        except ImportError:
+            df = pd.read_parquet(path)
         self._set_rows([row.to_dict() for _, row in df.iterrows()])
 
     def _load_from_huggingface(self) -> None:
