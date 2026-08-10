@@ -517,6 +517,9 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
         [1.0, 0.5, 0.1],
         [1.0, 0.5, 0.5, 0.0],
         [1.0],
+        [],
+        [1.0, float("nan"), 0.4, 0.0],
+        [1.0, float("inf"), 0.4, 0.0],
     ],
 )
 def test_base_schedule_rejects_malformed_positions(base_schedule):
@@ -526,10 +529,130 @@ def test_base_schedule_rejects_malformed_positions(base_schedule):
 
     with pytest.raises(ValueError):
         minimax_h3_time_shift_sigmas(
-            num_steps=len(base_schedule),
+            num_steps=max(len(base_schedule), 1),
             shift_scale=12.0,
             base_schedule=base_schedule,
         )
+
+
+def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    pipeline._base_schedule_by_partition = base_schedule_by_partition
+    pipeline._quality_policy = Mock()
+    pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
+    pipeline.encode_prompt = Mock(
+        return_value=(
+            torch.ones(1, 2),
+            torch.ones(1, dtype=torch.long),
+        )
+    )
+
+    def diffuse(**kwargs):
+        diffuse_calls.append(kwargs)
+        return torch.zeros(1), torch.zeros(1)
+
+    pipeline.diffuse = diffuse
+    pipeline.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    return pipeline
+
+
+def _t2va_batch(num_inference_steps=None):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless",
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=num_inference_steps,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+    )
+    return DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="distilled schedule",
+                sampling_params=sampling,
+                request_id="distilled",
+            )
+        ]
+    )
+
+
+def test_base_schedule_is_scoped_to_the_serving_partition():
+    """A distilled FL2VA must not drag a regular Ref2VA onto its step count."""
+    distilled = [1.0, 0.7, 0.4, 0.15, 0.0]
+    pipeline = _distilled_pipeline([], {"fl2va": distilled, "ref2va": None})
+
+    assert pipeline._base_schedule_for_task("t2va") == distilled
+    assert pipeline._base_schedule_for_task("fl2va") == distilled
+    assert pipeline._base_schedule_for_task("ref2va") is None
+
+
+def test_partially_constructed_pipeline_falls_back_to_the_uniform_schedule():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+
+    assert pipeline._base_schedule_for_task("t2va") is None
+
+
+def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
+    diffuse_calls = []
+    base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": base_schedule, "ref2va": None})
+
+    pipeline.forward(_t2va_batch())
+
+    assert diffuse_calls[0]["base_schedule"] == base_schedule
+    # Five boundaries describe four denoising steps.
+    assert diffuse_calls[0]["num_steps"] == 4
+    pipeline._quality_policy.resolve.assert_called_once_with(
+        quality="lossless",
+        num_inference_steps=4,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+    )
+
+
+def test_distilled_forward_accepts_the_matching_explicit_step_count():
+    diffuse_calls = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+
+    pipeline.forward(_t2va_batch(num_inference_steps=4))
+
+    assert diffuse_calls[0]["num_steps"] == 4
+
+
+def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _distilled_pipeline([], {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+
+    with pytest.raises(OmniClientError, match="must be 4 or omitted"):
+        pipeline.forward(_t2va_batch(num_inference_steps=50))
+
+
+def test_absent_base_schedule_key_differs_from_an_empty_list():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _read_base_schedule,
+    )
+
+    assert _read_base_schedule({}) is None
+    assert _read_base_schedule({"base_schedule": [1.0, 0.5, 0.0]}) == [1.0, 0.5, 0.0]
+    with pytest.raises(ValueError):
+        _read_base_schedule({"base_schedule": []})
 
 
 def test_cudnn_packed_attention_uses_python_length_without_padding_mask():

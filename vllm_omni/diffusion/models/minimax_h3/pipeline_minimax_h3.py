@@ -170,6 +170,14 @@ def _resolve_minimax_h3_model_root(
     )
 
 
+def _read_base_schedule(release: Mapping[str, Any]) -> list[float] | None:
+    """Read a partition's distilled schedule. An absent key means legacy uniform."""
+    base_schedule = release.get("base_schedule")
+    if base_schedule is None:
+        return None
+    return minimax_h3_validate_base_schedule(base_schedule)
+
+
 def _resolve_component_quant_config(quant_config, component: str):
     if hasattr(quant_config, "resolve"):
         return quant_config.resolve(component)
@@ -543,6 +551,9 @@ class MiniMaxH3Pipeline(
         "decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    # Only distilled releases pin a schedule, so the default keeps the legacy
+    # uniform path available to partially constructed pipelines.
+    _base_schedule_by_partition: ClassVar[Mapping[str, list[float] | None]] = {}
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -606,11 +617,13 @@ class MiniMaxH3Pipeline(
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
-        # Distilled releases pin their own few-step rectified-flow positions;
-        # the uniform schedule derived from num_inference_steps does not match
-        # what such a checkpoint was trained on.
-        base_schedule = release.get("base_schedule")
-        self.default_base_schedule = minimax_h3_validate_base_schedule(base_schedule) if base_schedule else None
+        # Distilled releases pin their own few-step rectified-flow positions; the
+        # uniform schedule derived from num_inference_steps does not match what
+        # such a checkpoint was trained on. Each partition carries its own
+        # contract, so a distilled FL2VA must not drag Ref2VA onto its schedule.
+        self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        if ref2va_model_path is not None:
+            self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -743,6 +756,11 @@ class MiniMaxH3Pipeline(
         if task == "ref2va" and hasattr(self, "transformers_ref"):
             return self.transformers_ref
         return self.transformer
+
+    def _base_schedule_for_task(self, task: str) -> list[float] | None:
+        """Return the distilled schedule of the partition that serves ``task``."""
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._base_schedule_by_partition.get(partition)
 
     def _resolve_task(
         self,
@@ -1764,11 +1782,14 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        base_schedule = self.default_base_schedule
+        base_schedule = self._base_schedule_for_task(task)
         if base_schedule is None:
             num_steps = int(sampling.num_inference_steps or 50)
         else:
-            num_steps = len(base_schedule)
+            # The schedule lists sigma boundaries; the denoise loop runs one
+            # step per interval, and that count is what requests and Cache-DiT
+            # speak in.
+            num_steps = len(base_schedule) - 1
             requested_steps = sampling.num_inference_steps
             if requested_steps is not None and int(requested_steps) != num_steps:
                 raise OmniClientError(

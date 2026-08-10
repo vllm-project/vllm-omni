@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 
@@ -37,9 +38,13 @@ def _validate_base_schedule(base_schedule: Sequence[float]) -> list[float]:
     values = [float(value) for value in base_schedule]
     if len(values) < 2:
         raise ValueError("MiniMax H3 base_schedule needs at least 2 entries")
+    # Ordering comparisons are all false against NaN, so non-finite entries have
+    # to be rejected before the monotonicity check rather than after it.
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("MiniMax H3 base_schedule entries must be finite")
     if values[0] != 1.0 or values[-1] != 0.0:
         raise ValueError("MiniMax H3 base_schedule must start at 1.0 and end at 0.0")
-    if any(curr <= nxt for curr, nxt in zip(values, values[1:], strict=True)):
+    if any(curr <= nxt for curr, nxt in zip(values, values[1:], strict=False)):
         raise ValueError("MiniMax H3 base_schedule must be strictly decreasing")
     return values
 
