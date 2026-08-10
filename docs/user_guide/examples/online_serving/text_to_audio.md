@@ -9,6 +9,7 @@ This example demonstrates how to deploy Stable Audio models for online text-to-a
 | Model | Description |
 |-------|-------------|
 | `stabilityai/stable-audio-open-1.0` | Open-source audio generation, up to ~47 seconds, 44.1 kHz stereo |
+| `stabilityai/stable-audio-3-medium` | DiT successor to stable-audio-open, up to 380 s, 44.1 kHz stereo (gated; serve with `--model-class-name StableAudio3Pipeline`) |
 
 ## Start Server
 

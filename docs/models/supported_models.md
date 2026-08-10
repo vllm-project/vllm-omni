@@ -65,6 +65,7 @@ th {
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ |
+| `StableAudio3Pipeline` | Stable-Audio-3 | `stabilityai/stable-audio-3-medium` | ✅︎ | ✅︎ | | ✅︎ |
 | `SoulXSingerPipeline` | SoulX-Singer (SVS) | `Soul-AILab/SoulX-Singer` | ✅︎ | | | |
 | `SoulXSingerSVCPipeline` | SoulX-Singer-SVC | `Soul-AILab/SoulX-Singer` (`model-svc.pt`) | ✅︎ | | | |
 | `AudioXPipeline` | AudioX | `zhangj1an/AudioX` | ✅︎ | ✅︎ | | |

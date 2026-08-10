@@ -101,6 +101,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -519,6 +524,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
