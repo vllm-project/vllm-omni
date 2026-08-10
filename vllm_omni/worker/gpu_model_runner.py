@@ -85,6 +85,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._omni_request_generators: dict[str, torch.Generator] = {}
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -477,6 +478,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
+            self._omni_request_generators.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             if self.omni_prefix_cache is not None:
                 self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
@@ -1343,6 +1345,35 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Build extra keyword arguments passed to the model for this step."""
         self._sync_local_stage_payloads()
         model_kwargs_extra: dict[str, object] = {}
+        if getattr(self.model, "uses_request_scoped_omni_generators", False):
+            request_generators: list[torch.Generator] = []
+            for req_id in self.input_batch.req_ids:
+                generator = self._omni_request_generators.get(req_id)
+                if generator is None or generator.device != self.device:
+                    generator = torch.Generator(device=self.device)
+                    req_state = self.requests.get(req_id)
+                    sampling_params = (
+                        getattr(req_state, "sampling_params", None)
+                        if req_state is not None
+                        else None
+                    )
+                    extra_args = (
+                        getattr(sampling_params, "extra_args", None)
+                        if sampling_params is not None
+                        else None
+                    )
+                    seed = (
+                        extra_args.get("tts_local_seed")
+                        if isinstance(extra_args, dict)
+                        else None
+                    )
+                    if seed is None:
+                        generator.seed()
+                    else:
+                        generator.manual_seed(int(seed))
+                    self._omni_request_generators[req_id] = generator
+                request_generators.append(generator)
+            model_kwargs_extra["request_generators"] = request_generators
         try:
             buffer_map = self._gather_runtime_additional_information()
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
