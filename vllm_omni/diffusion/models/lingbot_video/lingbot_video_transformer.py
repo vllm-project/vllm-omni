@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -18,6 +19,7 @@ from vllm_omni.diffusion.attention.backends.utils.fa import (
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -653,7 +655,7 @@ class LingBotVideoBlock(nn.Module):
 
     def forward(
         self,
-        x,
+        hidden_states,
         temb6,
         rotary_emb,
         attention_mask=None,
@@ -661,14 +663,14 @@ class LingBotVideoBlock(nn.Module):
         packed_indices: dict[str, torch.Tensor] | None = None,
         parallel_config=None,
     ):
-        expected_tokens = x.shape[0] * x.shape[1]
+        expected_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
             raise ValueError(
                 "LingBotVideoBlock expects token-level temb6 with shape "
-                f"(B*S, 6D); got {tuple(temb6.shape)} for hidden states {tuple(x.shape)}."
+                f"(B*S, 6D); got {tuple(temb6.shape)} for hidden states {tuple(hidden_states.shape)}."
             )
         # AdaLN modulation and normalization stay in fp32 for the sensitive path.
-        mod = temb6.view(x.shape[0], x.shape[1], -1) + self.scale_shift_table.unsqueeze(0)
+        mod = temb6.view(hidden_states.shape[0], hidden_states.shape[1], -1) + self.scale_shift_table.unsqueeze(0)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
@@ -676,7 +678,7 @@ class LingBotVideoBlock(nn.Module):
         # AdaLN modulation and norms stay in fp32; cast to the transformer
         # compute dtype only at Linear boundaries.
         bulk_dtype = self.attn.to_q.weight.dtype
-        attn_in = (self.norm1(x) * scale_msa + shift_msa).to(bulk_dtype)
+        attn_in = (self.norm1(hidden_states) * scale_msa + shift_msa).to(bulk_dtype)
         attn_out = self.attn(
             attn_in,
             rotary_emb,
@@ -684,20 +686,24 @@ class LingBotVideoBlock(nn.Module):
             packed_indices=packed_indices,
             parallel_config=parallel_config,
         )
-        x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
+        hidden_states = hidden_states + (gate_msa * self.norm_post_attn(attn_out)).to(hidden_states.dtype)
 
-        ffn_in = (self.norm2(x) * scale_mlp + shift_mlp).to(bulk_dtype)
+        ffn_in = (self.norm2(hidden_states) * scale_mlp + shift_mlp).to(bulk_dtype)
         if isinstance(self.ffn, LingBotVideoSparseMoeBlock):
             ffn_out = self.ffn(ffn_in, padding_mask=moe_padding_mask)
         else:
             ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
-        x = x + (gate_mlp * ffn_normed).to(x.dtype)
-        return x
+        hidden_states = hidden_states + (gate_mlp * ffn_normed).to(hidden_states.dtype)
+        return hidden_states
 
 
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = False
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"blocks": ForwardPattern.Pattern_3},
+        has_separate_cfg=True,
+    )
     _repeated_blocks = ["LingBotVideoBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
     _no_split_modules = ["LingBotVideoBlock"]

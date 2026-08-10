@@ -50,6 +50,34 @@ GPU.
 CPU/layerwise offload does not load the optional Refiner by itself. Refiner
 loading is an explicit startup choice.
 
+### Cache-DiT
+
+Enable Cache-DiT for the dense checkpoint with:
+
+```bash
+MODEL=robbyant/lingbot-video-dense-1.3b \
+  bash run_server.sh --cache-backend cache_dit --enforce-eager \
+  --cache-config '{"Fn_compute_blocks":12,"Bn_compute_blocks":0,"max_warmup_steps":8,"max_cached_steps":8,"residual_diff_threshold":0.06,"max_continuous_cached_steps":1}'
+```
+
+This quality-first preset was validated on the Dense checkpoint with 40-step
+T2V. Recheck quality before using a more aggressive preset or changing the
+checkpoint, resolution, frame count, or step count.
+
+LingBot uses sequential two-pass classifier-free guidance for Cache-DiT. Keep
+the default `batch_cfg=false` and set `guidance_scale > 1`. If the optional
+Refiner is loaded and requested, its `refiner_batch_cfg` must also remain false
+and `refiner_guidance_scale` must be greater than 1. Base and Refiner have
+independent schedulers, so their cache contexts are refreshed separately using
+each stage's actual timestep count.
+
+Cache-DiT can be combined with model-level CPU offload or ordinary layerwise
+offload. It currently rejects pipeline, tensor, expert, sequence, and CFG
+parallelism, VAE patch parallelism, HSDP, and distributed layerwise offload
+before model loading. These are explicit validation boundaries, not measured
+performance or quality claims; benchmark the intended step count and cache
+configuration for production use.
+
 ### Optional Refiner
 
 The official MoE package stores a second 30B-A3B Transformer under `refiner/`.

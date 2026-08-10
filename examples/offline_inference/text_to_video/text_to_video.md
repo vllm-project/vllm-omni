@@ -86,6 +86,27 @@ python text_to_video.py \
   --extra-body '{"batch_cfg": true, "output_type": "np"}'
 ```
 
+Enable Cache-DiT on the dense Base model with sequential two-pass CFG:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --cache-backend cache_dit --enforce-eager \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 40 \
+  --guidance-scale 3.0 --output lingbot_cache_dit_t2v.mp4
+```
+
+The example applies a quality-first Dense T2V preset (`Fn=12`, eight warmup
+steps, at most eight cached steps, residual threshold `0.06`, and no consecutive
+cached steps). Tune these values and recheck output quality for other
+checkpoints, resolutions, frame counts, or step counts.
+
+Cache-DiT requires `guidance_scale > 1` and cannot use
+`--extra-body '{"batch_cfg": true}'`.
+When Refiner is loaded, Base and Refiner are cached and refreshed separately.
+CPU offload and ordinary layerwise offload remain available, but Cache-DiT
+cannot be combined with HSDP or distributed/model parallel execution.
+
 The official MoE package also contains an optional second 30B-A3B Transformer
 under `refiner/`. Enable it through `--model-config`, then opt into it for a
 request through `--extra-body`. For a single-GPU capacity smoke,

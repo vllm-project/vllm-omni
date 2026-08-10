@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -28,7 +29,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
-CacheDiTEnabler: TypeAlias = Callable[[Any, DiffusionCacheConfig], RefreshCacheContextFunc]
+
+
+@dataclass(frozen=True)
+class CacheDiTInstallation:
+    """Lifecycle details returned by a custom Cache-DiT enabler."""
+
+    refresh: RefreshCacheContextFunc
+    targets: tuple[Any, ...]
+    cleanup: Callable[[], None] | None = None
+
+
+CacheDiTEnabler: TypeAlias = Callable[
+    [Any, DiffusionCacheConfig],
+    RefreshCacheContextFunc | CacheDiTInstallation,
+]
 
 # Model-specific implementations register themselves when the package loads.
 CUSTOM_DIT_ENABLERS: dict[str, CacheDiTEnabler] = {}
@@ -246,16 +261,25 @@ class CacheDiTBackend(CacheBackend):
         super().__init__(config)
         self._refresh_funcs: list[RefreshCacheContextFunc] = []
         self._cache_targets: list[Any] = []
+        self._cleanup_funcs: list[Callable[[], None]] = []
 
     def enable(self, pipeline: SupportsComponentDiscovery) -> None:
         pipeline_name = type(pipeline).__name__
         custom_enabler = CUSTOM_DIT_ENABLERS.get(pipeline_name)
         self._refresh_funcs = []
         self._cache_targets = []
+        self._cleanup_funcs = []
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
-            self._refresh_funcs = [custom_enabler(pipeline, self.config)]
-            self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
+            installation = custom_enabler(pipeline, self.config)
+            if isinstance(installation, CacheDiTInstallation):
+                self._refresh_funcs = [installation.refresh]
+                self._cache_targets = list(installation.targets)
+                if installation.cleanup is not None:
+                    self._cleanup_funcs = [installation.cleanup]
+            else:
+                self._refresh_funcs = [installation]
+                self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
         else:
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
@@ -293,8 +317,11 @@ class CacheDiTBackend(CacheBackend):
             for target in self._cache_targets:
                 cache_dit.disable_cache(target)
         finally:
+            for cleanup in self._cleanup_funcs:
+                cleanup()
             self._refresh_funcs = []
             self._cache_targets = []
+            self._cleanup_funcs = []
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
@@ -314,6 +341,7 @@ class CacheDiTBackend(CacheBackend):
 __all__ = [
     "CUSTOM_DIT_ENABLERS",
     "CacheDiTBackend",
+    "CacheDiTInstallation",
     "cache_summary",
     "enable_cache_for_dit",
 ]

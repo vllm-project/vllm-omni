@@ -135,6 +135,15 @@ _MODEL_PRESETS = {
     },
 }
 
+_LINGBOT_CACHE_DIT_QUALITY_CONFIG = {
+    "Fn_compute_blocks": 12,
+    "Bn_compute_blocks": 0,
+    "max_warmup_steps": 8,
+    "max_cached_steps": 8,
+    "residual_diff_threshold": 0.06,
+    "max_continuous_cached_steps": 1,
+}
+
 
 def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
@@ -162,6 +171,10 @@ def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     if "helios" in model_lower or "helios" in class_lower:
         return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
+
+
+def _is_lingbot(model: str, model_class_name: str | None) -> bool:
+    return "lingbot" in model.lower() or "lingbotvideo" in (model_class_name or "").lower()
 
 
 def build_text_to_video_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -489,7 +502,10 @@ def main():
     # Cache-dit config (Wan2.2 only)
     cache_config = None
     if args.cache_backend == "cache_dit":
-        cache_config = {
+        cache_config = (
+            dict(_LINGBOT_CACHE_DIT_QUALITY_CONFIG)
+            if _is_lingbot(args.model, model_class_name)
+            else {
             "Fn_compute_blocks": 1,
             "Bn_compute_blocks": 0,
             "max_warmup_steps": 4,
@@ -500,7 +516,8 @@ def main():
             "taylorseer_order": 1,
             "scm_steps_mask_policy": None,
             "scm_steps_policy": "dynamic",
-        }
+            }
+        )
 
     profiler_enabled = args.profiler_config is not None
 

@@ -20,6 +20,7 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, CacheDiTBa
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
+from vllm_omni.diffusion.models.lingbot_video import LingBotVideoTransformer3DModel
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
@@ -30,6 +31,7 @@ SEPARATE_CFG_TRANSFORMERS = [
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,
+    LingBotVideoTransformer3DModel,
 ]
 
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
@@ -45,6 +47,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Cosmos3OmniDiffusersPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
+        "LingBotVideoPipeline": cd_model_specific.enable_cache_for_lingbot_video,
     }
 
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):

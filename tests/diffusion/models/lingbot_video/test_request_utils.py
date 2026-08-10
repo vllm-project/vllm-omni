@@ -340,6 +340,16 @@ def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
     )
     assert (config.height, config.width) == (192, 320)
 
+    # The online video API forwards model-specific size through extra_args.
+    config = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        width=480,
+        height=480,
+        num_frames=81,
+        extra_args={"size": "320x192"},
+    )
+    assert (config.height, config.width) == (192, 320)
+
     # Without a prompt size, the sampling dimensions are used.
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
