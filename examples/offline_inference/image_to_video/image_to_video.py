@@ -23,16 +23,14 @@ Usage:
 
     # LTX2 image-to-video
     python image_to_video.py --model /path/to/LTX-2 \
-        --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video
     python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
-        --model-class-name LTX23ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
+        --height 512 --width 768 --num-frames 121 --num-inference-steps 30 \
         --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
 
     # HunyuanVideo-1.5 I2V (480p)
@@ -100,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
+        help="Override model class name (LTX checkpoints default to LTX2Pipeline).",
     )
     parser.add_argument(
         "--deploy-config",
@@ -117,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to a reference image. Repeat to provide multiple references.",
     )
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -331,8 +329,12 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
-    is_ltx2 = model_class_name in {"LTX2ImageToVideoPipeline", "LTX23ImageToVideoPipeline"}
+    model_class_name_lower = (model_class_name or "").lower()
+    is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
+    is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
+    is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
+    is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -346,7 +348,19 @@ def main():
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
-    if is_cosmos:
+    if is_cosmos_edge:
+        # Cosmos3-Edge native defaults: 480x832, gs 5.0, flow_shift 3.0 — NOT the Nano/Super
+        # 720p / gs 6.0 / flow_shift 10.0 below, which produce degenerate output on Edge.
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            5.0,
+            189,
+            35,
+            3.0,
+            480 * 832,
+            16,
+        )
+    elif is_cosmos:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             24,
             6.0,
@@ -356,13 +370,23 @@ def main():
             1280 * 720,
             16,
         )
+    elif is_ltx2_distilled:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            None,
+            121,
+            8,
+            None,
+            1024 * 1536,
+            64,
+        )
     elif is_ltx2:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             24,
-            4.0,
+            None,
             121,
-            40,
-            5.0,
+            30 if is_ltx23 else 40,
+            None,
             512 * 768,
             32,
         )
@@ -445,7 +469,6 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
-        flow_shift=flow_shift,
         diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
@@ -460,6 +483,8 @@ def main():
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
+    if flow_shift is not None:
+        omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
@@ -492,10 +517,14 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
+    negative_prompt = args.negative_prompt
+    if negative_prompt is None and not is_ltx2:
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        negative_prompt = ""
     prompt_dict = build_image_to_video_prompt(
         model_class_name=model_class_name,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
+        negative_prompt=negative_prompt,
         media_inputs=media_inputs,
         height=height,
         width=width,
@@ -511,11 +540,10 @@ def main():
         num_inference_steps=num_inference_steps,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        extra_args={
-            "sample_solver": args.sample_solver,
-            "flow_shift": flow_shift,
-        },
+        extra_args={"sample_solver": args.sample_solver},
     )
+    if flow_shift is not None:
+        sampling_params.extra_args["flow_shift"] = flow_shift
 
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit

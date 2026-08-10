@@ -16,6 +16,7 @@ from PIL import Image
 from torch import nn
 
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -425,6 +426,29 @@ def test_distilled_generation_rejects_robolab_policy(make_cosmos3_pipeline) -> N
         pipeline._forward_robolab_policy(make_sampling_params(), None, 0.0)
 
 
+def test_forward_threads_request_id_to_robolab(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    robolab_inputs = object()
+    captured: dict[str, Any] = {}
+    expected = object()
+    pipeline._build_robolab_policy_inputs = lambda sp, prompt, request_id: robolab_inputs
+
+    def fake_forward_robolab(sp, inputs, pipeline_start, session_id=None):
+        del sp, inputs, pipeline_start
+        captured["session_id"] = session_id
+        return expected
+
+    pipeline._forward_robolab_policy = fake_forward_robolab
+    request = SimpleNamespace(
+        prompts=["policy"],
+        sampling_params=make_sampling_params(),
+        request_id="robolab-request-7",
+    )
+
+    assert pipeline.forward(request) is expected
+    assert captured["session_id"] == "robolab-request-7"
+
+
 @pytest.mark.parametrize(
     ("prompt", "sampling_params", "message"),
     [
@@ -595,6 +619,7 @@ def _make_od_config(
     return SimpleNamespace(
         enable_cpu_offload=False,
         enable_diffusion_pipeline_profiler=False,
+        enable_session_state_manager=False,
         model="/nonexistent/model/path",
         dtype=torch.float32,
         flow_shift=None,
@@ -1673,6 +1698,32 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
 
+def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._use_session_state = True
+    pipeline._memory_manager = SessionStateManager()
+
+    class FailingProgress:
+        def __iter__(self):
+            raise RuntimeError("progress failed before first step")
+
+    pipeline.progress_bar = lambda timesteps: FailingProgress()
+    with pytest.raises(RuntimeError, match="progress failed"):
+        pipeline.diffuse(
+            latents=torch.zeros(1, 2, 1, 1, 1),
+            timesteps=torch.tensor([7]),
+            cond_ids=_ids(2),
+            cond_mask=_mask(),
+            uncond_ids=_ids(1),
+            uncond_mask=_mask(),
+            guidance_scale=1.0,
+            shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+            session_id="request-that-fails",
+        )
+
+    assert "request-that-fails" not in pipeline._memory_manager
+
+
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -1700,6 +1751,28 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
         (1, True),
     ]
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+
+def test_diffuse_transfer_rejects_session_state_manager(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._use_session_state = True
+
+    with pytest.raises(NotImplementedError, match="richer cache keys"):
+        pipeline.diffuse_transfer(
+            latents=torch.zeros(1, 2, 1, 1, 1),
+            timesteps=torch.tensor([7]),
+            cond_ids=_ids(2),
+            cond_mask=_mask(),
+            uncond_ids=_ids(1),
+            uncond_mask=_mask(),
+            guidance_scale=1.0,
+            control_guidance=1.0,
+            control_guidance_interval=None,
+            control_latents=[],
+            shared_kwargs={},
+            velocity_mask=torch.ones(1, 1, 1, 1, 1),
+            condition_latents=torch.zeros(1, 2, 1, 1, 1),
+        )
 
 
 def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:

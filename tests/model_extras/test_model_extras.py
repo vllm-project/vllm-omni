@@ -114,6 +114,90 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_lingbot_extra_registry_declares_request_params() -> None:
+    assert get_extra_body_params("LingBotVideoPipeline") == frozenset(
+        {
+            "batch_cfg",
+            "duration",
+            "flow_shift",
+            "negative_prompt",
+            "null_cond_clone_zero",
+            "offload_vae_during_denoise",
+            "output_type",
+            "refiner_sigma_tail_steps",
+            "resolution",
+            "ratio",
+            "shift",
+            "t_thresh",
+        }
+    )
+    assert get_extra_output_params("LingBotVideoPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lingbot_text_to_image_prompt_builder_preserves_empty_negative_prompt() -> None:
+    assert build_text_to_image_prompt(
+        "LingBotVideoPipeline",
+        prompt="a red fox in fresh snow",
+        negative_prompt="",
+        height=192,
+        width=320,
+    ) == {
+        "prompt": "a red fox in fresh snow",
+        "modalities": ["image"],
+        "negative_prompt": "",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lingbot_image_to_video_prompt_builder() -> None:
+    image = Image.new("RGB", (320, 192), "red")
+    result = build_image_to_video_prompt(
+        "LingBotVideoPipeline",
+        prompt="the fox looks toward the camera",
+        negative_prompt=None,
+        media_inputs={"image": image},
+        height=192,
+        width=320,
+        num_frames=9,
+    )
+    assert result == {
+        "prompt": "the fox looks toward the camera",
+        "modalities": ["video"],
+        "multi_modal_data": {"image": image},
+        "num_frames": 9,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "media_inputs",
+    [
+        {},
+        {"image": "input.png"},
+        {"image": [Image.new("RGB", (16, 16))]},
+        {"image": Image.new("RGB", (16, 16)), "video": b"video"},
+    ],
+    ids=["missing", "path", "multiple", "extra-modality"],
+)
+def test_lingbot_image_to_video_prompt_builder_rejects_invalid_media(
+    media_inputs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="exactly one PIL image"):
+        build_image_to_video_prompt(
+            "LingBotVideoPipeline",
+            prompt="move",
+            negative_prompt=None,
+            media_inputs=media_inputs,
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
 def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_name: str) -> None:
     assert get_extra_body_params(pipeline_name) == frozenset(
@@ -179,6 +263,36 @@ def test_magi_human_extra_registry_declares_request_and_response_params() -> Non
     )
     assert get_extra_output_params("MagiHumanPipeline") == frozenset()
     assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_extra_registry_declares_official_guidance_params() -> None:
+    expected = frozenset(
+        {
+            "video_cfg_scale",
+            "audio_cfg_scale",
+            "video_cfg_guidance_scale",
+            "audio_cfg_guidance_scale",
+            "video_stg_scale",
+            "audio_stg_scale",
+            "video_stg_guidance_scale",
+            "audio_stg_guidance_scale",
+            "video_modality_scale",
+            "audio_modality_scale",
+            "a2v_guidance_scale",
+            "v2a_guidance_scale",
+            "video_rescale_scale",
+            "audio_rescale_scale",
+            "video_stg_blocks",
+            "audio_stg_blocks",
+        }
+    )
+
+    assert get_extra_body_params("LTX2Pipeline") == expected
+    assert get_extra_output_params("LTX2Pipeline") == frozenset()
+    assert get_extra_body_params("LTX2DistilledPipeline") == expected
+    assert get_extra_output_params("LTX2DistilledPipeline") == frozenset()
 
 
 @pytest.mark.core_model
@@ -533,15 +647,29 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
-        {
-            "text_guidance_scale",
-            "cfg_range",
-            "num_inference_steps",
-        }
+    for model_class_name in (
+        "MammothModa2DiTPipeline",
+        "MammothModa2ForConditionalGeneration",
+        "Mammothmoda2Model",
+    ):
+        assert get_extra_body_params(model_class_name) == frozenset(
+            {
+                "text_guidance_scale",
+                "cfg_range",
+                "num_inference_steps",
+            }
+        )
+        assert get_extra_output_params(model_class_name) == frozenset()
+        assert should_init_extra_args_for_non_diffusion_stages(model_class_name) is True
+
+    wrapper_prompt = build_text_to_image_prompt(
+        "MammothModa2ForConditionalGeneration",
+        prompt="a cat",
+        negative_prompt=None,
+        height=256,
+        width=256,
     )
-    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+    assert wrapper_prompt["additional_information"]["omni_task"] == ["t2i"]
 
 
 @pytest.mark.core_model
@@ -568,5 +696,8 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "ar_height": [32],
             "image_height": [512],
             "image_width": [768],
+            "eol_token_id": [152064],
+            "visual_token_start_id": [152072],
+            "visual_token_end_id": [168456],
         },
     }

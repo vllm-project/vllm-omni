@@ -69,6 +69,12 @@ class _TransferTopoConfig:
     sp_rank: int
     sp_group: Any
     world: Any
+    # The stage's tensor-model-parallel group (vLLM parallel state). Only the
+    # ranks in this group execute the same request in lockstep — DP replicas
+    # and PP stages in ``world`` do not — so per-request consensus exchanges
+    # must use this group, never ``world``.
+    tp_group: Any = None
+    tp_size: int = 1
 
     @property
     def is_leader(self) -> bool:
@@ -403,6 +409,7 @@ class OmniKVTransferManager:
         self._prefetch_executor: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch") if async_prefetch else None
         )
+
         self._prefetch_futures: dict[str, Any] = {}
         self._bg_copy_stream: current_omni_platform.Stream | None = None
 
@@ -414,6 +421,11 @@ class OmniKVTransferManager:
                 logger.info("Sender connector eagerly initialized")
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
+
+    @property
+    def tp_topology(self) -> KVTPTopology:
+        """Return the effective topology after config and runtime detection."""
+        return self._tp_topo
 
     @property
     def topo_config(self) -> _TransferTopoConfig:
@@ -636,6 +648,16 @@ class OmniKVTransferManager:
         else:
             role = ReceiveRole.LEADER if world_rank == 0 else ReceiveRole.FOLLOWER
 
+        # The stage's TP group comes from vLLM parallel state (the TP-sharded
+        # LM path); it may legitimately be uninitialized on non-TP stages.
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            tp_size = tp_group.world_size
+        except Exception:
+            tp_group, tp_size = None, 1  # vLLM TP not initialized
+
         return _TransferTopoConfig(
             role=role,
             tp_active=tp_active,
@@ -646,6 +668,8 @@ class OmniKVTransferManager:
             sp_rank=sp_rank,
             sp_group=sp_group,
             world=world,
+            tp_group=tp_group,
+            tp_size=tp_size,
         )
 
     def _resolve_sender_info(
@@ -757,6 +781,20 @@ class OmniKVTransferManager:
                         kv_payload[f"sp.{key}"] = val
 
         return kv_payload
+
+    @staticmethod
+    def _clear_request_kv_payload(req: Any) -> None:
+        """Drop every request-side KV field a receive may have applied.
+
+        Enumerates fields via ``_collect_request_kv_payload`` so clearing stays
+        symmetric with what apply/broadcast set — the pipeline then takes the
+        same no-KV path as a rank that never received.
+        """
+        for key in OmniKVTransferManager._collect_request_kv_payload(req):
+            if key.startswith("sp."):
+                setattr(req.sampling_params, key[3:], None)
+            else:
+                setattr(req, key, None)
 
     @staticmethod
     def _apply_request_kv_payload(
@@ -1023,7 +1061,7 @@ class OmniKVTransferManager:
         value_cache: list[torch.Tensor | None] = [None] * num_layers
 
         for layer_idx, layer_kv in enumerate(kv_caches):
-            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
+            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx, block_size=block_size)
             if kv_pair is None:
                 continue
             key_blocks, value_blocks = kv_pair
@@ -1747,6 +1785,64 @@ class OmniKVTransferManager:
         combined = combined.to(device)
         return self._unpack_kv_payload(combined)
 
+    def _tp_local_receive_consensus(self, req: Any, received: bool) -> bool:
+        """Identical-KV-state verdict across pure-TP ranks (LOCAL role).
+
+        In pure TP every rank fetches its own KV shard with an independent
+        timeout and ``distribute_kv_cache`` is a no-op, so a single rank's
+        silent miss sends only that rank into the pipeline's no-KV prefill —
+        it then enters TP collectives its peers never join, and the NCCL
+        watchdog kills the worker (#5627). Each rank reports a signature of
+        its applied KV state — the primary-receive flag plus the set of
+        applied payload roles, so partially-received CFG companion KV
+        (``cfg_text``/``cfg_img``) diverging between ranks is caught too. If
+        the signatures differ, every rank drops its KV so all take the same
+        fallback path together; identical-but-partial state is kept, since
+        symmetric absence is consistent (e.g. Bagel's empty unconditional
+        branch).
+
+        The exchange runs over the stage's tensor-parallel group only: those
+        are the ranks executing this request in lockstep. ``world`` would
+        also contain DP replicas / PP stages working on different requests —
+        mixing their flags corrupts the verdict, and a replica skipping the
+        exchange (dummy request) while another enters it would deadlock.
+        Within the TP group the skip guards below depend only on topology,
+        config, and the request id — identical on every TP rank — so ranks
+        always agree on whether the exchange happens.
+        """
+        pt = self.topo_config
+        group = pt.tp_group
+        if not (pt.is_local and pt.tp_active) or group is None or pt.tp_size <= 1:
+            return received
+        if not self.config.need_recv_cache:
+            return received
+        request_id = self._resolve_request_id(req)
+        if request_id is None or OmniDiffusionRequest.is_dummy_run_request_id(request_id):
+            return received
+
+        signature = (bool(received), tuple(sorted(self._collect_request_kv_payload(req))))
+        if group.rank_in_group == 0:
+            signatures = [signature]
+            signatures.extend(group.recv_object(src=src) for src in range(1, pt.tp_size))
+            consistent = all(sig == signature for sig in signatures)
+            group.broadcast_object(consistent, src=0)
+        else:
+            group.send_object(signature, dst=0)
+            consistent = bool(group.broadcast_object(None, src=0))
+
+        if not consistent:
+            logger.warning(
+                "KV state for %s diverged across TP ranks (this rank: received=%s, roles=%s); "
+                "dropping KV on every rank so all take the no-KV fallback together "
+                "instead of desyncing TP collectives",
+                request_id,
+                signature[0],
+                list(signature[1]),
+            )
+            self._clear_request_kv_payload(req)
+            return False
+        return received
+
     def receive_multi_kv_cache_distributed(
         self,
         req: Any,
@@ -1757,6 +1853,7 @@ class OmniKVTransferManager:
         received = False
         if not self.topo_config.is_follower:
             received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+        received = self._tp_local_receive_consensus(req, received)
         kv_payload = self.distribute_kv_cache(req, target_device, received=received)
         if kv_payload is not None:
             self._apply_request_kv_payload(req, kv_payload, target_device)
@@ -1785,6 +1882,7 @@ class OmniKVTransferManager:
         if not received and not self.topo_config.is_follower and not payload_consumed:
             logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
             received = self.receive_multi_kv_cache(req, None, target_device)
+        received = self._tp_local_receive_consensus(req, received)
         kv_payload = self.distribute_kv_cache(req, target_device, received=received)
         if kv_payload is not None:
             self._apply_request_kv_payload(req, kv_payload, target_device)

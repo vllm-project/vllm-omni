@@ -73,9 +73,21 @@ def orchestrator_factory():
 
 
 class FakeDeadLLMStageClient(FakeStageClient):
-    """LLM stage client that raises EngineDeadError on get_output_async."""
+    """LLM stage client that raises EngineDeadError once a request is in-flight.
+
+    Raising on the first poll races with ``add_request``: under suite load the
+    orchestrator can die and drain before the test enqueues anything, so no
+    fatal ErrorMessage is ever published. Keep returning empty outputs until
+    ``add_request_async`` has been called, then fail on the next poll.
+    """
 
     async def get_output_async(self):
+        if not self.add_request_calls:
+            return SimpleNamespace(
+                outputs=[],
+                scheduler_stats=None,
+                finished_requests=None,
+            )
         raise EngineDeadError("Stage-0 engine core is dead")
 
 

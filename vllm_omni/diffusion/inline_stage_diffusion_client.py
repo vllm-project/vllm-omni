@@ -8,6 +8,7 @@ IPC overhead. Used when there is only a single diffusion stage.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
@@ -66,6 +67,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self._tasks: dict[str, asyncio.Task] = {}
         self._engine_dead = False
         self._shutting_down = False
+        self._shutdown_complete = False
+        self._shutdown_lock = threading.Lock()
 
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
@@ -101,6 +104,10 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        # Each request mutates its sampling state while it is normalized and
+        # executed. Callers commonly reuse one params object for concurrent
+        # requests, so take the copy synchronously before either task starts.
+        sampling_params = sampling_params.clone()
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
@@ -298,19 +305,25 @@ class InlineStageDiffusionClient(StageClientBase):
             raise
 
     def shutdown(self) -> None:
-        self._shutting_down = True
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutting_down = True
 
-        # Cancel all pending tasks
-        for task in self._tasks.values():
-            task.cancel()
+            # Cancel all pending tasks
+            for task in self._tasks.values():
+                task.cancel()
 
-        try:
-            # Cancel queued futures and wait for the running one to complete deterministically
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        except Exception:
-            pass
+            try:
+                # Stop the engine first so any control RPC running in the thread
+                # pool can observe shutdown instead of keeping stage teardown
+                # blocked while the executor waits for that RPC.
+                self._engine.close()
+            except Exception:
+                pass
 
-        try:
-            self._engine.close()
-        except Exception:
-            pass
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            self._shutdown_complete = True

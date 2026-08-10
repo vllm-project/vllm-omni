@@ -175,6 +175,26 @@ def test_wakeup_engine_not_support(sleep_incapable_engine):
     assert "wake_up" in response.json()["detail"]
 
 
+def test_wakeup_route_propagates_not_implemented_error(sleep_capable_engine, mocker):
+    """``/v1/omni/wakeup`` must not swallow ``NotImplementedError`` from the engine.
+
+    Route exception-propagation only: the mock authors the exception on purpose.
+    The real level-2 discarded-weight path and live HTTP 501 mapping are covered by
+    ``test_wakeup_after_level2_sleep_fails``.
+    """
+    sleep_capable_engine.wake_up = mocker.AsyncMock(side_effect=NotImplementedError("engine wake_up refused"))
+    app = _make_app(sleep_capable_engine)
+    app.state.sleeping_stages = {0}
+    # Re-raise in-process; default TestClient would wrap this as a 500 response.
+    client = TestClient(app, raise_server_exceptions=True)
+
+    with pytest.raises(NotImplementedError, match="engine wake_up refused"):
+        client.post("/v1/omni/wakeup", json={"stage_ids": [0]})
+
+    # Failed wake must not clear the sleeping set.
+    assert app.state.sleeping_stages == {0}
+
+
 def test_wakeup_removes_only_requested_stages(sleep_capable_engine):
     app = _make_app(sleep_capable_engine)
     app.state.sleeping_stages = {0, 1, 2}

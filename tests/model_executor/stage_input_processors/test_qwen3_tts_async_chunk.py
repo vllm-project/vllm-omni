@@ -16,6 +16,8 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     ramp_cumulative,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+    _NUM_QUANTIZERS_DEFAULT,
+    _filter_audio_codes_qwen3_tts,
     talker2code2wav_async_chunk,
     talker2code2wav_full_payload,
     talker2code2wav_token_only,
@@ -534,17 +536,23 @@ def test_full_payload_omits_left_context_size_without_ref():
         pytest.param({"codes.audio": torch.zeros((3, _Q), dtype=torch.long)}, id="all_codes_filtered"),
     ],
 )
-def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_output):
-    """Regression for #4463.
+def test_full_payload_emits_placeholder_frame_on_degenerate_take(pooling_output):
+    """Regression for #4463 and #5471 (the producer half of #5196).
 
-    A degenerate talker take used to return ``None`` from
-    ``talker2code2wav_full_payload``. The connector treats ``None`` as "drop the
+    A degenerate talker take must not return ``None`` from
+    ``talker2code2wav_full_payload``: the connector treats ``None`` as "drop the
     request", but Stage-1 was already scheduled to receive it, so its wait gate
-    polls to ``connector_get_max_wait`` (~300s) and the orchestrator aborts — one
-    stuck request stalls the whole two-stage pipeline. Each degenerate case
-    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped by
-    the filter) must instead return an empty-but-finished payload so the gate
-    releases and the request finishes immediately with zero-length audio.
+    polls to ``connector_get_max_wait`` (~300s) and one stuck request stalls the
+    whole two-stage pipeline (#4463). It must not return an *empty* finished
+    payload either: zero codec frames produce a zero-token Stage-1 request,
+    which full-payload scheduling placeholder-schedules once and never
+    collects; the base-scheduler fallback then schedules it at a negative span,
+    which killed the stage EngineCore before #5269 and leaves the request
+    parked in ``running`` forever after it (#5196, #5471). Each degenerate case
+    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped
+    by the filter) must instead return a finished payload with at least one
+    frame that survives the codec validity filter, so the request runs the
+    normal one-shot path and finishes cleanly.
     """
     request = SimpleNamespace(request_id="r", output_token_ids=[0, 1, 2])
 
@@ -552,7 +560,14 @@ def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_ou
 
     assert payload is not None
     assert payload["meta"]["finished"].item() is True
-    assert payload["codes"]["audio"].numel() == 0
+    audio = payload["codes"]["audio"]
+    # Same wire format as the normal path: flat, codebook-major, one frame.
+    assert audio.ndim == 1
+    assert audio.numel() == _NUM_QUANTIZERS_DEFAULT
+    # The placeholder must survive the same validity filter real takes go
+    # through; a frame the filter would drop re-creates the zero-token request.
+    frames = audio.reshape(-1, _NUM_QUANTIZERS_DEFAULT)
+    assert int(_filter_audio_codes_qwen3_tts(frames).shape[0]) >= 1
 
 
 _RAMP = [1, 4, 8, 16, 25]
