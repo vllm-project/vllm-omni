@@ -173,20 +173,3 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
-
-
-def test_model_paths_and_model_config_roundtrip():
-    model_paths = {
-        "latent_upsampler": "/models/upsampler.safetensors",
-        "distilled_lora": "/models/distilled-lora.safetensors",
-    }
-    model_config = {"phase_lora_mode": "layer_fused"}
-
-    od = _roundtrip_diffusion_config(
-        model="x",
-        model_paths=model_paths,
-        model_config=model_config,
-    )
-
-    assert od.model_paths == model_paths
-    assert od.model_config == model_config

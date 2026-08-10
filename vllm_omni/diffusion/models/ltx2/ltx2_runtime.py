@@ -47,7 +47,7 @@ from .ltx2_guidance import (
     LTXGuidanceExecutor,
     LTXGuidancePlan,
 )
-from .ltx2_phase_weights import LTXPhaseWeights, build_ltx_phase_weights
+from .ltx2_phase_adapter import LTXPhaseAdapterRuntime, build_ltx_phase_adapter
 from .ltx2_recipes import (
     LTXPhaseRecipe,
     LTXPipelineRecipe,
@@ -147,7 +147,7 @@ class LTXRuntime(
         self.model_version = detect_ltx_model_version(od_config.model)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
-        if getattr(od_config, "cache_backend", "none") == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
+        if getattr(od_config, "cache_backend", "none") == "cache_dit" and len(self.pipeline_recipe.phases) > 1:
             raise ValueError(
                 f"{self.__class__.__name__} does not support cache_backend='cache_dit'. "
                 "Cache-DiT currently supports only one-stage LTX recipes; multi-stage recipes require "
@@ -163,7 +163,7 @@ class LTXRuntime(
         super().__init__()
         self._guidance_plan = LTXGuidancePlan.build(self.pipeline_recipe.request_guidance)
         initialize_pipeline_components(self, od_config)
-        self._phase_weights: LTXPhaseWeights | None = build_ltx_phase_weights(self)
+        self._phase_adapter: LTXPhaseAdapterRuntime | None = build_ltx_phase_adapter(self)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -230,8 +230,8 @@ class LTXRuntime(
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
-        phase_weights = getattr(self, "_phase_weights", None)
-        if phase_weights is not None and any(
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None and any(
             getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
         ):
             raise ValueError(
@@ -282,18 +282,18 @@ class LTXRuntime(
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
         self._active_phase_name = phase.name
-        phase_weights = getattr(self, "_phase_weights", None)
-        if phase_weights is None:
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is None:
             if phase.adapter_slot is not None:
                 raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
             return
-        phase_weights.activate(phase.adapter_slot)
+        phase_adapter.activate(phase.adapter_slot)
 
     def eval(self):
         result = super().eval()
-        phase_weights = getattr(self, "_phase_weights", None)
-        if phase_weights is not None:
-            phase_weights.finalize()
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None:
+            phase_adapter.finalize()
         return result
 
     def prepare_latents(
@@ -366,22 +366,15 @@ class LTXRuntime(
     def interrupt(self):
         return self._interrupt
 
-    @property
-    def denoise_transformer(self) -> nn.Module:
-        phase_weights = getattr(self, "_phase_weights", None)
-        if phase_weights is not None:
-            return phase_weights.transformer
-        return self.transformer
-
     def _transformer_cache_context(self, context_name: str):
-        cache_context = getattr(self.denoise_transformer, "cache_context", None)
+        cache_context = getattr(self.transformer, "cache_context", None)
         if callable(cache_context):
             return cache_context(context_name)
         return nullcontext()
 
     def predict_noise(self, **kwargs):
         with self._transformer_cache_context("cond_uncond"):
-            noise_pred_video, noise_pred_audio = self.denoise_transformer(**kwargs)
+            noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
         return noise_pred_video.float(), noise_pred_audio.float()
 
     def combine_cfg_noise(
@@ -552,7 +545,7 @@ class LTXRuntime(
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         latents = self.prepare_latents(
             batch_size=prompt_context.batch_size * request_inputs.num_videos_per_prompt,
-            num_channels_latents=self.denoise_transformer.config.in_channels,
+            num_channels_latents=self.transformer.config.in_channels,
             height=request_inputs.height,
             width=request_inputs.width,
             num_frames=request_inputs.num_frames,
@@ -894,7 +887,4 @@ class LTXRuntime(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        phase_weights = getattr(self, "_phase_weights", None)
-        if phase_weights is not None:
-            weights = phase_weights.prepare_weights(weights)
         return AutoWeightsLoader(self).load_weights(weights)

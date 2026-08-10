@@ -285,7 +285,7 @@ def prepare_rope_coords_stage(
     latents: torch.Tensor,
     audio_latents: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    transformer = pipeline.denoise_transformer
+    transformer = pipeline.transformer
     video_coords = transformer.rope.prepare_video_coords(
         latents.shape[0],
         forward_ctx.latent_num_frames,

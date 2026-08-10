@@ -59,6 +59,7 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "scheduler",
     "latent_upsampler",
 )
+_LTX_ARTIFACTS_DIR_ENV = "VLLM_OMNI_LTX_ARTIFACTS_DIR"
 logger = logging.getLogger(__name__)
 
 
@@ -74,11 +75,9 @@ class LTXComponentProfile:
     video_vae_cls: type = AutoencoderKLLTX2Video
     vocoder_cls: type = LTX2Vocoder
     vocoder_fallback_cls: type | None = None
-    latent_upsampler_cls: type | None = None
     artifact_repo_id: str | None = None
     latent_upsampler_filename: str | None = None
     distilled_lora_filename: str | None = None
-    checkpoint_kind: LTXCheckpointKind | None = None
 
 
 LTX2_COMPONENT_PROFILE = LTXComponentProfile(
@@ -108,40 +107,32 @@ LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     vae_modules=("vae", "audio_vae"),
     resident_modules=("vocoder", "latent_upsampler"),
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
-    latent_upsampler_cls=LTX2LatentUpsamplerModel,
-    checkpoint_kind="distilled",
 )
 
 LTX23_DISTILLED_COMPONENT_PROFILE = replace(
     LTX23_COMPONENT_PROFILE,
     name="ltx2_3_distilled",
     resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
-    latent_upsampler_cls=LTX2LatentUpsamplerModel,
     artifact_repo_id="Lightricks/LTX-2.3",
     latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-    checkpoint_kind="distilled",
 )
 
 LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
     LTX2_COMPONENT_PROFILE,
     name="ltx2_two_stage",
     resident_modules=(*LTX2_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
-    latent_upsampler_cls=LTX2LatentUpsamplerModel,
     artifact_repo_id="Lightricks/LTX-2",
     latent_upsampler_filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
     distilled_lora_filename="ltx-2-19b-distilled-lora-384.safetensors",
-    checkpoint_kind="regular",
 )
 
 LTX23_TWO_STAGE_COMPONENT_PROFILE = replace(
     LTX23_COMPONENT_PROFILE,
     name="ltx2_3_two_stage",
     resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
-    latent_upsampler_cls=LTX2LatentUpsamplerModel,
     artifact_repo_id="Lightricks/LTX-2.3",
     latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     distilled_lora_filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-    checkpoint_kind="regular",
 )
 
 
@@ -161,31 +152,28 @@ def resolve_ltx_artifact(
     model: str,
     repo_id: str,
     filename: str,
-    *,
-    override: str | None = None,
 ) -> str:
-    """Resolve an official LTX sidecar from a component override or the Hub."""
-    if override:
-        override_path = Path(override)
-        candidate = override_path / filename if override_path.is_dir() else override_path
+    """Resolve an official LTX sidecar from one artifact directory or the Hub."""
+    artifacts_dir = os.getenv(_LTX_ARTIFACTS_DIR_ENV)
+    if artifacts_dir:
+        candidate = Path(artifacts_dir) / filename
         if candidate.is_file():
             return str(candidate)
         raise FileNotFoundError(
-            f"Configured LTX artifact override {override!r} does not resolve required file {filename!r}: {candidate}"
+            f"{_LTX_ARTIFACTS_DIR_ENV}={artifacts_dir!r} does not contain required LTX artifact "
+            f"{filename!r}: {candidate}"
         )
 
-    candidates = [Path(model) / filename]
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    candidate = Path(model) / filename
+    if candidate.is_file():
+        return str(candidate)
 
     try:
         return hf_hub_download(repo_id=repo_id, filename=filename)
     except Exception as exc:
-        searched = ", ".join(str(path) for path in candidates)
         raise FileNotFoundError(
-            f"Unable to resolve LTX artifact {filename!r}. Searched {searched}; "
-            f"place the file in the model root, configure its component in model_paths, or make {repo_id} available."
+            f"Unable to resolve LTX artifact {filename!r}. Searched {candidate}; "
+            f"place the file in the model root or make {repo_id} available."
         ) from exc
 
 
@@ -501,24 +489,21 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             dtype=dtype,
         )
 
-    if profile.latent_upsampler_cls is not None:
+    if "latent_upsampler" in profile.resident_modules:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
-        model_paths = getattr(od_config, "model_paths", None) or {}
-        upsampler_override = model_paths.get("latent_upsampler")
-        if upsampler_override is not None and profile.latent_upsampler_filename is not None:
+        if os.getenv(_LTX_ARTIFACTS_DIR_ENV) and profile.latent_upsampler_filename is not None:
             if profile.artifact_repo_id is None:
                 raise FileNotFoundError(f"LTX latent upsampler artifact repository not configured for {profile.name}.")
             upsampler_path = resolve_ltx_artifact(
                 model,
                 profile.artifact_repo_id,
                 profile.latent_upsampler_filename,
-                override=str(upsampler_override),
             )
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
         elif os.path.isfile(upsampler_config) or not local_files_only:
             try:
                 pipeline.latent_upsampler = _load_component(
-                    profile.latent_upsampler_cls,
+                    LTX2LatentUpsamplerModel,
                     model,
                     "latent_upsampler",
                     local_files_only=local_files_only,
@@ -544,12 +529,6 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
     transformer_config = load_transformer_config(model, "transformer", local_files_only)
-    # Keep the complete checkpoint config for pipelines that construct another
-    # Transformer after the shared components have been initialized.  The
-    # runtime Transformer's ``config`` is a SimpleNamespace containing only
-    # the fields needed during inference, so it cannot faithfully recreate an
-    # LTX-2.3 Transformer on its own.
-    pipeline._transformer_init_config = dict(transformer_config)
     quant_config = getattr(od_config, "quantization_config", None)
     pipeline.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
     _place_aux_components(pipeline)
@@ -558,9 +537,14 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         subfolder="scheduler",
         local_files_only=local_files_only,
     )
+    expected_checkpoint_kind: LTXCheckpointKind | None = None
+    if pipeline.pipeline_kind == "two_stage":
+        expected_checkpoint_kind = "regular"
+    elif pipeline.pipeline_kind == "distilled_two_stage":
+        expected_checkpoint_kind = "distilled"
     validate_ltx_checkpoint(
         pipeline.scheduler.config,
-        expected_kind=profile.checkpoint_kind,
+        expected_kind=expected_checkpoint_kind,
         pipeline_name=type(pipeline).__name__,
     )
 

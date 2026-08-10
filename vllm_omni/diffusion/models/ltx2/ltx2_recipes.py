@@ -3,7 +3,7 @@
 
 """Declarative execution recipes for the LTX model family."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
@@ -24,6 +24,7 @@ LTX_DEFAULT_NEGATIVE_PROMPT = (
 
 LTX_DISTILLED_SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
 LTX_STAGE_2_DISTILLED_SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
+LTX_DISTILLED_ADAPTER_SLOT = "ltx_distilled"
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,6 @@ class LTXPipelineRecipe:
     allow_request_latents: bool = True
     allow_negative_prompt: bool = True
     fixed_num_inference_steps: bool = False
-    supports_cache_dit: bool = False
 
     def __post_init__(self) -> None:
         if not self.phases:
@@ -109,16 +109,13 @@ def _official_guidance(stg_block: int) -> LTXGuidanceSpec:
 
 
 LTX2_ONE_STAGE_RECIPE = LTXPipelineRecipe(
-    supports_cache_dit=True,
     phases=(LTXPhaseRecipe(name="generate", guidance=_official_guidance(29)),),
 )
 LTX23_ONE_STAGE_RECIPE = LTXPipelineRecipe(
-    supports_cache_dit=True,
     num_inference_steps=30,
     phases=(LTXPhaseRecipe(name="generate", guidance=_official_guidance(28)),),
 )
 LTX_POSITIVE_ONLY_RECIPE = LTXPipelineRecipe(
-    supports_cache_dit=True,
     phases=(
         LTXPhaseRecipe(
             name="generate",
@@ -166,7 +163,7 @@ LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
 # and request contract. Its distinct component profile selects the 22B merged
 # distilled Transformer, BWE vocoder, and matching spatial upsampler; no
 # distilled LoRA is loaded for either phase.
-LTX23_DISTILLED_TWO_STAGE_RECIPE = replace(LTX2_DISTILLED_TWO_STAGE_RECIPE)
+LTX23_DISTILLED_TWO_STAGE_RECIPE = LTX2_DISTILLED_TWO_STAGE_RECIPE
 
 
 def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipelineRecipe:
@@ -190,7 +187,7 @@ def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipeli
                 sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
                 noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
                 input_transform="spatial_upsample",
-                adapter_slot="ltx_distilled",
+                adapter_slot=LTX_DISTILLED_ADAPTER_SLOT,
                 allow_guidance_override=False,
                 use_official_sigma_schedule=False,
             ),

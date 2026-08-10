@@ -16,61 +16,22 @@
 Repositories in the table are download units. A full pipeline repository
 contains the Transformer, text encoder, connectors, VAEs, vocoder, scheduler,
 and tokenizer; an additional repository supplies LoRA or upsampler sidecars.
+To use predownloaded sidecars, set `VLLM_OMNI_LTX_ARTIFACTS_DIR` to one
+directory containing the applicable files under their official names. The
+directory is authoritative: startup fails if a required file is missing. When
+it is unset, the runtime searches the model root and then the matching
+Lightricks Hub repository.
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
-LTX version, and an optional initial image selects I2V instead of T2V. The
-class name is normally inferred. LTX-2.3 requires the Diffusers checkpoint;
-raw `Lightricks/LTX-2.3` safetensors are sidecars, not a loadable pipeline.
+LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
+image selects I2V. Both one-stage repositories declare this class, so
+`--model-class-name` is optional. LTX-2.3 requires the Diffusers checkpoint;
+the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 
 `LTX2TwoStagePipeline` samples the regular model at half resolution, upsamples,
-then refines with the distilled LoRA. `LTX2DistilledPipeline` instead uses the
-fully merged distilled Transformer in both stages and never loads that LoRA.
-Always select the distilled class explicitly. Both entries support T2V and I2V.
-
-Optional sidecar paths are configured in the bundled deploy YAML.
-
-## Diffusion Feature Matrix
-
-Support is pipeline-specific; a model-level mark does not imply support in
-every multi-stage entry.
-
-| Diffusion feature | `LTX2Pipeline` | `LTX2TwoStagePipeline` | `LTX2DistilledPipeline` |
-|---|:---:|:---:|:---:|
-| T2V / I2V | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| Request-level batching | ✅ | ❌ | ❌ |
-| Custom sigma schedule | ✅ | ❌ | ❌ |
-| Request video/audio latents | ✅ | ❌ | ❌ |
-| CFG | ✅ | ⚠️ Stage 1 | — positive-only |
-| STG | ✅ | ⚠️ Stage 1 | — positive-only |
-| Cross-modality guidance / rescale | ✅ | ⚠️ Stage 1 | — positive-only |
-| Tensor parallel | ✅ | ✅ | ✅ |
-| Ulysses sequence parallel | ⚠️ strict mode | ⚠️ strict mode | ⚠️ strict mode |
-| Ring sequence parallel | ⚠️ | ⚠️ | ⚠️ |
-| CFG parallel | ✅ full guidance plan | ⚠️ Stage 1, full guidance plan | — positive-only |
-| HSDP | ✅ | ✅ | ✅ |
-| Pipeline parallel | ❌ | ❌ | ❌ |
-| Expert parallel | — | — | — |
-| Module-wise CPU offload | ✅ | ✅ | ✅ |
-| Layerwise CPU offload | ✅ | ✅ | ✅ |
-| VAE patch parallel decode | ✅ | ✅ | ✅ |
-| Quantization | ⚠️ | ⚠️ | ⚠️ |
-| Internal distilled LoRA | — | ✅ layer-fused (default)/dynamic/resident | — merged weights |
-| Cache-DiT | ✅ | ❌ | ❌ |
-| TeaCache | ❌ | ❌ | ❌ |
-| Step execution | ❌ | ❌ | ❌ |
-
-Legend: ✅ supported; ⚠️ supported with the restriction shown below; ❌
-explicitly unsupported; — not applicable.
-
-- Ring SP requires audio latent length divisible by the SP size because it
-  cannot consume the padding mask; otherwise use pure Ulysses.
-- LTX accepts strict Ulysses only. `advanced_uaa` is rejected. Its 32 attention
-  heads support common strict degrees such as 2, 4, and 8.
-- LoRA determines quantization compatibility: `dynamic` supports a quantized
-  base, `layer_fused` requires unquantized BF16, and `resident` requires dense
-  source weights (serialized quantized checkpoints are rejected).
-- Cache-DiT is one-stage only. Multi-stage requests fail at startup instead of
-  using an uncached or stale Stage 2.
+then refines with the distilled LoRA. `LTX2DistilledPipeline` uses a fully
+merged distilled Transformer in both stages. Both entries support T2V and I2V;
+select their class explicitly.
 
 ## API Migration
 
@@ -97,8 +58,9 @@ The consolidation also removes these registry names without aliases:
 | `LTX2TwoStagesPipeline` | `LTX2DistilledPipeline` |
 | `LTX2ImageToVideoTwoStagesPipeline` | `LTX2DistilledPipeline` with `image=` |
 
-A second positional argument raises `TypeError`. Offline and serving
-entrypoints already use named fields and are unaffected.
+Passing any second positional argument now raises `TypeError`. These changes
+affect direct Python callers and explicit `--model-class-name` overrides;
+offline and serving entrypoints already use named fields and are unaffected.
 
 ## One-Stage Defaults
 
@@ -113,9 +75,10 @@ entrypoints already use named fields and are unaffected.
 | Video/audio rescale | 0.7 / 0.7 | 0.7 / 0.7 |
 | Video/audio STG blocks | `[29]` / `[29]` | `[28]` / `[28]` |
 
-The recipe supplies the default negative prompt. Top-level `guidance_scale`
-overrides both CFG values. The online API defaults `num_frames` to `1`, so set
-it explicitly; the offline examples default to `121`.
+The model recipe also supplies the default negative prompt. Top-level
+`guidance_scale` overrides both video and audio CFG values. The online video
+API defaults `num_frames` to `1`, so set it explicitly; the offline LTX scripts
+default to `121`.
 
 ## Two-Stage Defaults
 
@@ -133,20 +96,22 @@ LTX-2.3 one-stage defaults shown above. Distilled schedules are fixed, so
 `num_inference_steps`, when supplied, must be `8`. Both entries reject custom
 sigmas and input latents.
 
-Ordinary two-stage defaults to layer-fused LoRA. Other startup choices are
-shown in the bundled deploy YAML.
+Ordinary two-stage uses layer-fused LoRA for an unquantized BF16 Transformer
+and automatically switches to dynamic LoRA when quantization is enabled.
 
 ## Serving
 
-Start a one-stage checkpoint:
+Start either one-stage checkpoint:
 
 ```bash
 vllm serve Lightricks/LTX-2 --omni --stage-init-timeout 600
-# or
+```
+
+```bash
 vllm serve diffusers/LTX-2.3-Diffusers --omni --stage-init-timeout 600
 ```
 
-Select a two-stage class explicitly:
+Start a two-stage checkpoint with its explicit class:
 
 ```bash
 vllm serve rootonchair/LTX-2-19b-distilled --omni \
@@ -156,11 +121,13 @@ vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
   --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
 # Ordinary LTX-2.3 two-stage
 vllm serve diffusers/LTX-2.3-Diffusers --omni \
-  --deploy-config vllm_omni/deploy/ltx2.yaml \
+  --model-class-name LTX2TwoStagePipeline \
+  --enable-layerwise-offload \
   --stage-init-timeout 600
 ```
 
-All entries handle T2V and I2V. A T2V request is:
+The same server handles T2V and I2V. A T2V request using the selected recipe's
+default guidance is:
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/sync \
@@ -173,28 +140,28 @@ curl -X POST http://localhost:8000/v1/videos/sync \
   -o ltx_t2v.mp4
 ```
 
-An I2V request supplies exactly one initial image:
+For I2V, provide exactly one initial image:
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/sync \
-  -F "prompt=A cinematic close-up of ocean waves at golden hour." \
+  -F "prompt=A plush toy astronaut gently waving while the camera slowly pushes in." \
   -F "negative_prompt=worst quality, inconsistent motion, blurry, jittery, distorted" \
+  -F "input_reference=@/absolute/path/to/reference.png" \
   -F "size=768x512" \
   -F "num_frames=121" \
   -F "fps=24" \
   -F "seed=42" \
-  -F "input_reference=@/absolute/path/to/reference.png" \
   -o ltx_i2v.mp4
 ```
 
-Use `image_reference` for a URL or JSON-safe reference, but not together with
-`input_reference`.
+Use `image_reference` for a URL or JSON-safe image reference. Do not provide it
+together with `input_reference`.
 
 ## Guidance
 
-One-stage and ordinary Stage 1 support independent video/audio CFG, STG,
-cross-modality guidance, and rescaling. Distilled stages and ordinary Stage 2
-are fixed positive-only.
+One-stage and ordinary Stage 1 support independent video/audio CFG,
+spatio-temporal guidance (STG), cross-modality guidance, and rescaling.
+Distilled stages and ordinary Stage 2 are fixed positive-only.
 
 | Parameter | Default | Effect | Alias |
 |---|---:|---|---|
@@ -209,8 +176,9 @@ are fixed positive-only.
 | `video_stg_blocks` | `[29]` / `[28]` | Perturbed video transformer blocks | — |
 | `audio_stg_blocks` | `[29]` / `[28]` | Perturbed audio transformer blocks | — |
 
-STG block defaults are LTX-2 / LTX-2.3. Canonical names override aliases;
-top-level `guidance_scale` overrides both CFG fields.
+The STG block defaults are shown as LTX-2 / LTX-2.3. A canonical name wins
+over its alias. Explicit top-level `guidance_scale` wins over both CFG fields;
+omit it for independent video/audio CFG.
 
 Pass these fields in online `extra_params` or offline `--extra-body`:
 
@@ -224,10 +192,14 @@ Pass these fields in online `extra_params` or offline `--extra-body`:
 
 ### Guidance Parallelism
 
-`cfg_parallel_size` distributes the complete guidance plan—text CFG, STG, and
-cross-modality passes. Rescaling happens after predictions are gathered. The
-default plan has four Transformer passes per step: `cond`, `uncond`, `ptb`,
-and `mod`.
+For LTX, `cfg_parallel_size` is the number of ranks used to execute the
+complete guidance plan in parallel. Despite the legacy `cfg` name, it covers
+text CFG, STG, and cross-modality guidance passes; guidance rescaling is
+applied after all pass predictions are gathered.
+
+The default one-stage recipe and ordinary Stage 1 have four Transformer passes
+per denoise step: `cond`, `uncond`, `ptb` (STG), and `mod`
+(cross-modality). The useful balanced configurations are therefore:
 
 | `--cfg-parallel-size` | Passes per rank | Guidance-slot utilization | Notes |
 |---:|---:|---:|---|
@@ -235,8 +207,10 @@ and `mod`.
 | `2` | 2 | 100% | Recommended two-rank configuration |
 | `4` | 1 | 100% | One guidance pass per rank |
 
-Other positive sizes are accepted but may waste padded execution slots; LTX
-warns with the expected utilization.
+Other positive sizes are accepted. When the pass count is not divisible by
+`cfg_parallel_size`, ranks are padded to an equal number of execution slots
+and LTX emits a warning with the expected utilization. For example, four
+passes on three ranks use six slots and have 66.7% guidance-slot utilization.
 
 Start an LTX-2.3 server with two-way guidance parallelism:
 
@@ -245,13 +219,14 @@ vllm serve diffusers/LTX-2.3-Diffusers --omni \
   --cfg-parallel-size 2 --stage-init-timeout 600
 ```
 
-Device count is the product of all parallel dimensions. Positive-only
-distilled pipelines do not benefit from `cfg_parallel_size > 1`.
+The total device count is the product of `cfg_parallel_size` and the other
+configured parallel dimensions. Positive-only distilled phases do not benefit
+from `cfg_parallel_size > 1`.
 
 ### Python API
 
-Put per-request values in `OmniDiffusionSamplingParams`, then pass the
-`DiffusionRequestBatch` as the only positional argument:
+Normal per-request values belong in `OmniDiffusionSamplingParams`. Pass the
+resulting `DiffusionRequestBatch` as the only positional argument:
 
 ```python
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -279,42 +254,46 @@ t2v_output = pipe(req)
 i2v_output = pipe(req, image=image)
 ```
 
-Direct keywords such as `pipe(req, prompt=prompt, width=768)` are low-level
-fallbacks. Request fields take precedence unless noted below.
+Direct keyword arguments are low-level fallbacks, for example
+`pipe(req, prompt=prompt, width=768)`. Request fields take precedence unless
+noted below.
 
 ### Complete `forward` Surface
 
 | Argument | Type/default | Meaning and constraints |
 |---|---|---|
-| `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and sampling parameters. |
-| `image` | image or batch, `None` | Direct value wins. No image selects T2V; I2V needs one image per prompt. Batches cannot mix T2V/I2V. |
-| `prompt` | string or list, `None` | Positive-text fallback; exclusive with `prompt_embeds`. |
-| `negative_prompt` | string or list, `None` | Negative-text fallback; exclusive with negative embeddings. |
-| `height`, `width` | `int`, `None` | Request → keyword → recipe default; divisible by 32 one-stage or 64 two-stage. |
-| `num_frames` | `int`, `None` | Request → keyword → default; must be `8k+1`. With `frame_rate`, sets audio duration. |
+| `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and per-request sampling parameters. |
+| `image` | image or batch, `None` | Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
+| `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
+| `negative_prompt` | string or list, `None` | Fallback after request values and before the recipe default; mutually exclusive with negative embeddings. |
+| `height` | `int`, `None` | Request → direct value → recipe default; divisible by 32 one-stage or 64 two-stage. |
+| `width` | `int`, `None` | Same precedence and alignment as `height`. |
+| `num_frames` | `int`, `None` | Request → direct value → recipe default; must be `8k+1` and also determines audio duration with `frame_rate`. |
 | `frame_rate` | `float`, `None` | Request `frame_rate` → request `fps` → direct value → recipe default. |
-| `num_inference_steps` | `int`, `None` | Controls one-stage or ordinary Stage 1; distilled Stage 1 is fixed at 8. `sigmas` overrides it. |
-| `sigmas` | list of float, `None` | One-stage only; fused requests must share a schedule. |
-| `timesteps` | list of int, `None` | Must be `None`; use `sigmas`. |
-| `guidance_scale` | `float`, `None` | Common video/audio CFG fallback for one-stage and ordinary Stage 1. |
+| `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; minimum 2 one-stage and ordinary Stage 1, fixed at 8 for distilled Stage 1. Custom one-stage `sigmas` determine actual steps. |
+| `sigmas` | list of float, `None` | One-stage only. Request values win; every request in a fused batch must use the same schedule. |
+| `timesteps` | list of int, `None` | Compatibility slot; LTX accepts only `None`. Use `sigmas`. |
+| `guidance_scale` | `float`, `None` | One-stage and ordinary Stage 1 common video/audio CFG fallback; an explicit request value wins. Distilled phases use fixed positive-only guidance. |
 | `guidance_rescale` | `float`, `None` | Accepts only `None` or `0.0`; use the modality rescale fields. |
-| `noise_scale` | `float`, `0.0` | Must be `0.0`. |
-| `num_videos_per_prompt` | `int`, `1` | Output-count fallback; request `num_outputs_per_prompt` wins. |
-| `generator` | generator or list, `None` | Explicit RNG; lists must match the output batch. |
-| `latents`, `audio_latents` | tensor, `None` | One-stage only; request tensors win. Video accepts packed `[B, S, C]` or validated unpacked layouts. |
-| `prompt_embeds` | tensor, `None` | Positive conditioning; requires its mask and excludes `prompt`. |
-| `negative_prompt_embeds` | tensor, `None` | One-stage negative conditioning; requires its mask and excludes `negative_prompt`. |
-| `prompt_attention_mask` | tensor, `None` | Positive embedding mask; request mask wins. |
-| `negative_prompt_attention_mask` | tensor, `None` | Negative embedding mask; request mask wins. |
-| `decode_timestep` | float or list, `0.0` | Video-VAE decode timestep; lists may match 1, prompt batch, or output batch. |
-| `decode_noise_scale` | float or list, `None` | Same list rules; defaults to `decode_timestep`. |
-| `output_type` | string, `"np"` | `"np"` decodes; `"latent"` skips VAE/vocoder decode. |
-| `return_dict` | `bool`, `True` | Only `True` is accepted. |
-| `attention_kwargs` | dict, `None` | Unsupported per call; configure attention at startup. |
+| `noise_scale` | `float`, `0.0` | Compatibility slot; LTX accepts only `0.0`. |
+| `num_videos_per_prompt` | `int`, `1` | Output-count fallback; positive request `num_outputs_per_prompt` wins. |
+| `generator` | generator or list, `None` | Explicit RNG; otherwise request generators/seeds are collated. Lists must match the effective output batch. |
+| `latents` | tensor, `None` | One-stage only. Request tensors win; packed `[B, S, C]` and validated unpacked video layouts are accepted. |
+| `audio_latents` | tensor, `None` | One-stage only. Request tensors win and are collated. |
+| `prompt_embeds` | tensor, `None` | Precomputed positive conditioning; requires `prompt_attention_mask` and cannot accompany `prompt`. |
+| `negative_prompt_embeds` | tensor, `None` | One-stage and ordinary Stage 1 conditioning; requires its mask and cannot accompany `negative_prompt`. |
+| `prompt_attention_mask` | tensor, `None` | Mask for positive embeddings; request `prompt_attention_mask` or `attention_mask` wins. |
+| `negative_prompt_attention_mask` | tensor, `None` | Mask for negative embeddings; request negative mask fields win. |
+| `decode_timestep` | float or list, `0.0` | Video-VAE decode timestep; request value wins. Lists may match 1, prompt batch, or output batch. |
+| `decode_noise_scale` | float or list, `None` | Same list rules; request value wins. Defaults to `decode_timestep`. |
+| `output_type` | string, `"np"` | Request value wins. `"np"` decodes output; `"latent"` skips VAE/vocoder decode. |
+| `return_dict` | `bool`, `True` | Compatibility slot; only `True` is accepted. |
+| `attention_kwargs` | dict, `None` | Per-call values are unsupported; configure attention at engine startup. |
 | `max_sequence_length` | `int`, `None` | Request → direct value → tokenizer limit. |
 
-In requests, `num_videos_per_prompt` maps to `num_outputs_per_prompt`; images
-and prompt data live in the prompt payload; LTX guidance lives in `extra_args`.
+Request-object naming differs only in a few places: `num_videos_per_prompt`
+maps to `num_outputs_per_prompt`; images and prompt text/embeddings live in the
+request prompt payload; LTX guidance fields live in sampling `extra_args`.
 
 ### Recipe-Specific Request Capabilities
 
@@ -326,8 +305,9 @@ and prompt data live in the prompt payload; LTX guidance lives in `extra_args`.
 | Custom `sigmas` | Supported | Rejected | Rejected; both phases use fixed schedules |
 | Video/audio latents | Supported | Rejected | Rejected |
 
-Checks apply equally to `forward` keywords and sampling parameters;
-unsupported values fail instead of being ignored.
+These capability checks apply equally to direct `forward` keywords and
+values in `OmniDiffusionSamplingParams`; unsupported values fail instead of
+being silently ignored.
 
 ### Custom Sigma Schedules
 
@@ -337,31 +317,42 @@ One-stage Python requests may set final scheduler boundaries directly:
 params = OmniDiffusionSamplingParams(sigmas=[1.0, 0.75, 0.5, 0.25])
 ```
 
-Each nonterminal value is one denoise step; terminal `0.0` is appended when
-omitted. This overrides `num_inference_steps`. Fused requests must share the
-list. The video form API and bundled offline CLI do not expose `sigmas`.
+Each nonterminal value produces one denoise step, and a terminal `0.0` is
+appended when omitted. This schedule overrides `num_inference_steps`. All
+requests in a fused batch must use the same list. The video form API and
+bundled offline CLI do not currently expose `sigmas`.
 
 ### Constraints
 
 - LTX rejects non-default `timesteps`, `flow_shift`, `guidance_rescale`,
   `noise_scale`, `attention_kwargs`, and `return_dict=False`. Use final
-  `sigmas`, modality rescale fields, startup attention configuration, and
-  standard `DiffusionOutput`.
+  `sigmas`, modality rescale fields, startup attention configuration, and the
+  standard `DiffusionOutput` respectively.
 - Fused one-stage requests must resolve to identical LTX guidance and sigma
-  schedules; otherwise use `--max-num-seqs 1`.
+  schedules. Keep concurrent requests guidance-homogeneous or use
+  `--max-num-seqs 1`.
+- `--cfg-parallel-size` shards the complete LTX guidance plan, including STG,
+  modality guidance, and rescale-compatible prediction gathering.
 - Sequence parallelism may pad audio latents. Pure Ulysses masks the padding;
   Ring cannot, so audio length must be SP-divisible. Use `ring_degree=1` or a
   divisible request shape.
+- Cache-DiT is one-stage only; multi-stage configurations are rejected.
 
 ## Operational Notes
 
-- LTX-2 one-stage previously peaked near 73.5 GiB on an H200; remeasure on your
-  commit and hardware. LTX-2.3 generally needs a 96GB-class GPU or offload.
-- The upsampler uses the pipeline dtype and remains resident during denoise
-  offload because it runs only at the phase boundary.
-- Output audio sample rate comes from the loaded components.
+- LTX-2 one-stage previously loaded and peaked at about 73.5 GiB on one H200
+  141GB; remeasure on the deployed commit and hardware.
+- LTX-2.3 includes a 22B transformer, Gemma encoder, two VAEs, and a vocoder.
+  Start on a 96GB-class GPU or use CPU/layerwise offload on smaller devices.
+- The distilled upsampler uses the configured pipeline dtype and participates
+  in component discovery/device placement; it remains resident during denoise
+  offload because it is used only at the phase boundary.
+- The output audio sample rate comes from the loaded components and is not a
+  request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
   `tests/dfx/perf/scripts/run_diffusion_benchmark.py`.
+- Ordinary and full-distilled two-stage T2V/I2V are supported; HQ execution
+  remains out of scope.
 
 ## References
 

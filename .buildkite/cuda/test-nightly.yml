@@ -483,7 +483,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · LTX Accuracy Test"
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_one_stage_i2v]' -m full_model --run-level full_model
+          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
           - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]' -m full_model --run-level full_model
         mirror_hardwares: h100_1
 

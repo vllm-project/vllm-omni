@@ -1253,45 +1253,6 @@ stages:
         runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
         assert runtime_config == expected_runtime_config
 
-    def test_load_ltx_deploy_config(self):
-        deploy_path = get_deploy_config_path("ltx2.yaml")
-        deploy = load_deploy_config(deploy_path)
-
-        assert deploy.async_chunk is False
-        assert deploy.pipeline == "ltx2"
-        assert deploy.dtype == "bfloat16"
-        assert len(deploy.stages) == 1
-        stage = deploy.stages[0]
-        assert stage.model_class_name == "LTX2TwoStagePipeline"
-        assert stage.cfg_parallel_size == 1
-        assert stage.ulysses_degree == 1
-        assert stage.enable_layerwise_offload is True
-        assert stage.engine_extras["model_paths"] == {}
-        assert stage.engine_extras["model_config"] == {"phase_lora_mode": "layer_fused"}
-
-        merged = merge_pipeline_deploy(OMNI_PIPELINES["ltx2"], deploy)
-        engine_args = merged[0].yaml_engine_args
-        assert engine_args["model_class_name"] == "LTX2TwoStagePipeline"
-        assert engine_args["cfg_parallel_size"] == 1
-        assert engine_args["ulysses_degree"] == 1
-        assert engine_args["model_paths"] == {}
-        assert engine_args["model_config"] == {"phase_lora_mode": "layer_fused"}
-
-        stages, _ = StageConfigFactory._create_legacy_from_registry(
-            OMNI_PIPELINES["ltx2"],
-            {
-                "ulysses_degree": 2,
-                "cfg_parallel_size": 2,
-                "stage_0_devices": "0,1,2,3",
-            },
-            deploy_config_path=deploy_path,
-        )
-        resolved = stages[0].to_omegaconf()
-        assert resolved.engine_args.parallel_config.ulysses_degree == 2
-        assert resolved.engine_args.parallel_config.sequence_parallel_size == 2
-        assert resolved.engine_args.parallel_config.cfg_parallel_size == 2
-        assert resolved.runtime.devices == "0,1,2,3"
-
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
@@ -1304,7 +1265,6 @@ stages:
             ("step_audio_2_async_chunk.yaml", "step_audio_2", 2, "audio", None),
             ("step_audio2_ci.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
             ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
-            ("ltx2.yaml", "ltx2", 1, "video", "ltx2"),
             ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
         ],
     )

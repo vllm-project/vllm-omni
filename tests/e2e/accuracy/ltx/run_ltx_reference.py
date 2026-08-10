@@ -34,7 +34,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gemma-root", type=Path)
     parser.add_argument("--spatial-upsampler", type=Path)
     parser.add_argument("--distilled-lora", type=Path)
-    parser.add_argument("--two-stage-lora-mode", choices=("resident", "dynamic", "layer_fused"))
     parser.add_argument("--enable-layerwise-offload", action="store_true")
     return parser.parse_args()
 
@@ -336,14 +335,6 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    model_paths = {}
-    if args.spatial_upsampler is not None:
-        model_paths["latent_upsampler"] = str(args.spatial_upsampler)
-    if args.distilled_lora is not None:
-        model_paths["distilled_lora"] = str(args.distilled_lora)
-    model_config = {}
-    if args.two_stage_lora_mode is not None:
-        model_config["phase_lora_mode"] = args.two_stage_lora_mode
     omni = Omni(
         model=args.model,
         model_class_name=args.model_class_name,
@@ -351,8 +342,6 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
         enable_layerwise_offload=args.enable_layerwise_offload,
         diffusion_attention_config=attention_config,
         parallel_config=DiffusionParallelConfig(),
-        model_paths=model_paths,
-        model_config=model_config,
     )
     try:
         detected_model_class_name = get_model_class_name(omni)

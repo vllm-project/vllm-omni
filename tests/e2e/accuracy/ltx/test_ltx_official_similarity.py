@@ -3,13 +3,9 @@
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
-The original reduced one-stage guards remain unchanged. Additional cases cover
-text-to-video and image-to-video for one-stage, full-distilled two-stage,
-ordinary two-stage with resident weights matching official fused arithmetic,
-and dedicated layer-fused two-stage variants. Select an individual case with
-its pytest parameter node ID. Both runtimes use PyTorch SDPA. Full-resolution
-two-stage cases use official block streaming and Omni layerwise offload so they
-remain single-H100 accuracy tests without changing the bf16 arithmetic.
+The original reduced one-stage guards remain unchanged. Four complementary
+default-shape cases cover both model versions, both two-stage weight families,
+and T2V/I2V without expanding every combination into a duplicate golden.
 """
 
 from __future__ import annotations
@@ -79,6 +75,15 @@ class LTXAccuracyThresholds:
     audio_cosine_similarity: float
 
 
+STRICT_THRESHOLDS = LTXAccuracyThresholds(
+    video_ssim_mean=0.95,
+    video_ssim_min=0.90,
+    video_psnr_mean_db=30.0,
+    audio_relative_l2=0.20,
+    audio_cosine_similarity=0.95,
+)
+
+
 @dataclass(frozen=True)
 class LTXAccuracyCase:
     name: str
@@ -102,7 +107,6 @@ class LTXAccuracyCase:
     image: LTXArtifact | None = None
     spatial_upsampler: LTXArtifact | None = None
     distilled_lora: LTXArtifact | None = None
-    two_stage_lora_mode: Literal["dynamic", "layer_fused", "resident"] | None = None
     # Official uses block streaming; Omni uses layerwise offload. Both preserve
     # bf16 arithmetic while keeping full-resolution two-stage cases on one H100.
     enable_layerwise_offload: bool = False
@@ -179,13 +183,7 @@ LEGACY_CASES = (
         num_inference_steps=20,
         seed=42,
         stg_block=29,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
         name="ltx2_3",
@@ -201,13 +199,7 @@ LEGACY_CASES = (
         num_inference_steps=20,
         seed=42,
         stg_block=28,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
         name="ltx2_3_i2v",
@@ -223,65 +215,15 @@ LEGACY_CASES = (
         num_inference_steps=20,
         seed=42,
         stg_block=28,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
         image=I2V_IMAGE,
     ),
 )
 
 
-_DEFAULT_CONFIG_CASES = (
+TWO_STAGE_CASES = (
     LTXAccuracyCase(
-        name="ltx2_one_stage",
-        pipeline_kind="one_stage",
-        model_id="Lightricks/LTX-2",
-        model_revision=LTX2_REVISION,
-        model_env="VLLM_TEST_LTX2_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint=LTX2_CHECKPOINT,
-        width=768,
-        height=512,
-        num_frames=121,
-        num_inference_steps=40,
-        seed=10,
-        stg_block=29,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
-    ),
-    LTXAccuracyCase(
-        name="ltx23_one_stage",
-        pipeline_kind="one_stage",
-        model_id="diffusers/LTX-2.3-Diffusers",
-        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
-        model_env="VLLM_TEST_LTX23_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint=LTX23_CHECKPOINT,
-        width=768,
-        height=512,
-        num_frames=121,
-        num_inference_steps=30,
-        seed=10,
-        stg_block=28,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
-    ),
-    LTXAccuracyCase(
-        name="ltx2_distilled",
+        name="ltx2_distilled_t2v",
         pipeline_kind="distilled",
         model_id="rootonchair/LTX-2-19b-distilled",
         model_revision="388e2846f54aae51687498ffb6b27c7c2c9ce9e5",
@@ -298,16 +240,10 @@ _DEFAULT_CONFIG_CASES = (
         gemma_model_id="Lightricks/LTX-2",
         gemma_model_revision=LTX2_REVISION,
         gemma_model_env="VLLM_TEST_LTX2_MODEL",
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
-        name="ltx23_distilled",
+        name="ltx23_distilled_i2v",
         pipeline_kind="distilled",
         model_id="diffusers/LTX-2.3-Distilled-Diffusers",
         model_revision="432e0d3c2d1769aaa4d295f9243f7062bf6b47ee",
@@ -324,16 +260,11 @@ _DEFAULT_CONFIG_CASES = (
         gemma_model_id="diffusers/LTX-2.3-Diffusers",
         gemma_model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
         gemma_model_env="VLLM_TEST_LTX23_MODEL",
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
+        image=I2V_IMAGE,
     ),
     LTXAccuracyCase(
-        name="ltx2_two_stage",
+        name="ltx2_two_stage_layer_fused_t2v",
         pipeline_kind="two_stage",
         model_id="Lightricks/LTX-2",
         model_revision=LTX2_REVISION,
@@ -348,18 +279,11 @@ _DEFAULT_CONFIG_CASES = (
         num_inference_steps=40,
         seed=10,
         stg_block=29,
-        two_stage_lora_mode="resident",
         enable_layerwise_offload=True,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
-        name="ltx23_two_stage",
+        name="ltx23_two_stage_layer_fused_i2v",
         pipeline_kind="two_stage",
         model_id="diffusers/LTX-2.3-Diffusers",
         model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
@@ -374,52 +298,13 @@ _DEFAULT_CONFIG_CASES = (
         num_inference_steps=30,
         seed=10,
         stg_block=28,
-        # Official execution fuses the phase LoRA into the Transformer and
-        # unloads it after use. Omni resident mode keeps equivalent pre-fused
-        # phase weights in memory to preserve the bf16 arithmetic; dynamic mode
-        # avoids weight mutation but is not expected to be bitwise-equivalent.
-        two_stage_lora_mode="resident",
         enable_layerwise_offload=True,
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
+        thresholds=STRICT_THRESHOLDS,
+        image=I2V_IMAGE,
     ),
 )
 
-
-def _layer_fused_case(base_name: str) -> LTXAccuracyCase:
-    base_case = next(case for case in _DEFAULT_CONFIG_CASES if case.name == base_name)
-    return replace(
-        base_case,
-        name=f"{base_case.name}_layer_fused",
-        two_stage_lora_mode="layer_fused",
-        thresholds=LTXAccuracyThresholds(
-            video_ssim_mean=0.95,
-            video_ssim_min=0.90,
-            video_psnr_mean_db=30.0,
-            audio_relative_l2=0.20,
-            audio_cosine_similarity=0.95,
-        ),
-    )
-
-
-_LAYER_FUSED_TWO_STAGE_CASES = (
-    _layer_fused_case("ltx2_two_stage"),
-    _layer_fused_case("ltx23_two_stage"),
-)
-
-
-DEFAULT_CONFIG_CASES = tuple(
-    replace(case, name=f"{case.name}_{task}", image=I2V_IMAGE if task == "i2v" else None)
-    for case in (*_DEFAULT_CONFIG_CASES, *_LAYER_FUSED_TWO_STAGE_CASES)
-    for task in ("t2v", "i2v")
-)
-
-CASES = (*LEGACY_CASES, *DEFAULT_CONFIG_CASES)
+CASES = (*LEGACY_CASES, *TWO_STAGE_CASES)
 
 
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
@@ -696,6 +581,11 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
     env["PYTHONUNBUFFERED"] = "1"
+    sidecar_paths = [path for path in (spatial_upsampler, distilled_lora) if path is not None]
+    if sidecar_paths:
+        sidecar_dirs = {path.parent for path in sidecar_paths}
+        assert len(sidecar_dirs) == 1, f"LTX sidecars must share one artifact directory: {sidecar_paths}"
+        env["VLLM_OMNI_LTX_ARTIFACTS_DIR"] = str(sidecar_dirs.pop())
     repository_root = Path(__file__).resolve().parents[4]
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -739,12 +629,6 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
             case.model_class_name,
         ]
     )
-    if spatial_upsampler is not None:
-        omni_args.extend(["--spatial-upsampler", str(spatial_upsampler)])
-    if distilled_lora is not None:
-        omni_args.extend(["--distilled-lora", str(distilled_lora)])
-    if case.two_stage_lora_mode is not None:
-        omni_args.extend(["--two-stage-lora-mode", case.two_stage_lora_mode])
     _run(omni_args, env=env)
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
@@ -771,7 +655,6 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
         "checkpoint_revision": case.checkpoint.revision,
         "spatial_upsampler_revision": (case.spatial_upsampler.revision if case.spatial_upsampler is not None else None),
         "distilled_lora_revision": case.distilled_lora.revision if case.distilled_lora is not None else None,
-        "two_stage_lora_mode": case.two_stage_lora_mode,
         "enable_layerwise_offload": enable_layerwise_offload,
         "thresholds": asdict(case.thresholds),
         "request": _request(case, image),

@@ -20,31 +20,29 @@ from .ltx2_recipes import (
 from .ltx2_runtime import LTXRuntime
 
 
-class LTX2TwoStagePipeline(LTXI2VConditioningMixin, LTXRuntime):
+class _LTX2TwoStageBase(LTXI2VConditioningMixin, LTXRuntime):
+    """Static discovery contract shared by the two-stage public entries."""
+
+    _dit_modules: ClassVar[list[str]] = list(LTX2_TWO_STAGE_COMPONENT_PROFILE.dit_modules)
+    _encoder_modules: ClassVar[list[str]] = list(LTX2_TWO_STAGE_COMPONENT_PROFILE.encoder_modules)
+    _vae_modules: ClassVar[list[str]] = list(LTX2_TWO_STAGE_COMPONENT_PROFILE.vae_modules)
+    _resident_modules: ClassVar[list[str]] = list(LTX2_TWO_STAGE_COMPONENT_PROFILE.resident_modules)
+    supports_request_batch = False
+    support_image_input = True
+    unified_text_image_entry = True
+
+
+class LTX2TwoStagePipeline(_LTX2TwoStageBase):
     """Regular checkpoint with low-resolution generation and LoRA refinement."""
 
     pipeline_kind = "two_stage"
     component_profile = LTX2_TWO_STAGE_COMPONENT_PROFILE
     pipeline_recipe = LTX2_TWO_STAGE_RECIPE
-    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
-    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
-    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
-    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
-    supports_request_batch = False
-    support_image_input = True
-    unified_text_image_entry = True
 
 
-class LTX2DistilledPipeline(LTXI2VConditioningMixin, LTXRuntime):
+class LTX2DistilledPipeline(_LTX2TwoStageBase):
     """Unified LTX-2/LTX-2.3 full-distilled two-stage T2V/I2V entry."""
 
     pipeline_kind = "distilled_two_stage"
     component_profile = LTX2_DISTILLED_COMPONENT_PROFILE
     pipeline_recipe = LTX2_DISTILLED_TWO_STAGE_RECIPE
-    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
-    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
-    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
-    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
-    supports_request_batch = False
-    support_image_input = True
-    unified_text_image_entry = True
