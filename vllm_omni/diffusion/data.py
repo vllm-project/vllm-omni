@@ -948,8 +948,10 @@ class OmniDiffusionConfig:
 
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if self.request_batch_max_wait_ms < 0:
-            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
+        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+            raise ValueError(
+                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
+            )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

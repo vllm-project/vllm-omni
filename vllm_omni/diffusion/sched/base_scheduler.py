@@ -21,6 +21,7 @@ from vllm_omni.diffusion.sched.interface import (
     RequestBatchSamplingParamsKey,
     SchedulerRequestState,
     StepBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -157,6 +158,27 @@ class BaseScheduler(ABC):
 
     def num_running_requests(self) -> int:
         return len(self._running)
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        """Return the admission-delay policy for the next scheduling wave."""
+        del now, dp_concurrent
+        return _AdmissionWaitDecision(should_wait=False)
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        """Return whether an active admission delay should end."""
+        del decision, now, stable_since
+        return True
 
     def get_request_state(self, request_id: str) -> SchedulerRequestState | None:
         return self._request_states.get(request_id)
