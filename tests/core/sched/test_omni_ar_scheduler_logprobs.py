@@ -92,6 +92,7 @@ class _Request:
         self.num_computed_tokens = 0
         self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
+        self.async_tokens_to_discard = 0
         self.has_encoder_inputs = False
         self.pooling_params = None
         self.resumable = True
