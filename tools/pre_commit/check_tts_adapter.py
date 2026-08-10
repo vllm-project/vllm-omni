@@ -31,7 +31,7 @@ SERVING_SPEECH = Path("vllm_omni/entrypoints/openai/serving_speech.py")
 ADAPTERS_INIT = Path("vllm_omni/entrypoints/openai/tts_adapters/__init__.py")
 
 # Budgets. These may only go DOWN. See the module docstring.
-MAX_MODEL_TYPE_BRANCHES = 29
+MAX_MODEL_TYPE_BRANCHES = 27
 MAX_LEGACY_DETECTORS = 1
 
 _GUIDANCE = """
