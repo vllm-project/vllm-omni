@@ -84,8 +84,7 @@ def normalize_lingbot_refiner_config(
     transformer_subfolder = raw.get("transformer_subfolder", "refiner")
     if not isinstance(transformer_subfolder, str) or not transformer_subfolder:
         raise ValueError(
-            "LingBot Refiner `transformer_subfolder` must be a non-empty string, "
-            f"got {transformer_subfolder!r}."
+            f"LingBot Refiner `transformer_subfolder` must be a non-empty string, got {transformer_subfolder!r}."
         )
 
     revision = raw.get("revision")
@@ -175,10 +174,7 @@ def compute_refiner_frame_budget(
     if max_frames is not None and (
         max_frames <= 0 or (max_frames != 1 and (max_frames - 1) % vae_temporal_factor != 0)
     ):
-        raise ValueError(
-            "Refiner max_frames must be 1 or aligned to the VAE temporal factor, "
-            f"got {max_frames}."
-        )
+        raise ValueError(f"Refiner max_frames must be 1 or aligned to the VAE temporal factor, got {max_frames}.")
 
     if source_fps > sample_fps:
         raw = int(num_source_frames / source_fps * sample_fps)
@@ -199,8 +195,7 @@ def compute_refiner_frame_indices(
 ) -> torch.Tensor:
     if num_source_frames <= 0 or sample_frames <= 0:
         raise ValueError(
-            "Refiner frame counts must be positive, "
-            f"got source={num_source_frames}, sample={sample_frames}."
+            f"Refiner frame counts must be positive, got source={num_source_frames}, sample={sample_frames}."
         )
     if num_source_frames >= sample_frames:
         indices = np.linspace(0, num_source_frames - 1, sample_frames, dtype=np.int64)
@@ -220,12 +215,7 @@ def resize_refiner_video(video: torch.Tensor, *, height: int, width: int) -> tor
     batch, channels, frames, source_height, source_width = video.shape
     flat = video.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, source_height, source_width)
     resized = F.interpolate(flat, size=(height, width), mode="bicubic", align_corners=False)
-    return (
-        resized.clamp(0.0, 1.0)
-        .reshape(batch, frames, channels, height, width)
-        .permute(0, 2, 1, 3, 4)
-        .contiguous()
-    )
+    return resized.clamp(0.0, 1.0).reshape(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
 
 
 def prepare_refiner_latent(

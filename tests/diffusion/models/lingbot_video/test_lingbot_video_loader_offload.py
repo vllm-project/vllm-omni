@@ -34,7 +34,13 @@ def _tiny_transformer_config() -> dict:
     }
 
 
-def _build_pipeline(mocker, *, refiner_enabled: bool = False):
+def _build_pipeline(
+    mocker,
+    *,
+    refiner_enabled: bool = False,
+    refiner_model: str | None = None,
+    refiner_revision: str | None = None,
+):
     from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
 
     model = "test-org/lingbot-video"
@@ -51,6 +57,10 @@ def _build_pipeline(mocker, *, refiner_enabled: bool = False):
             "enabled": True,
             "transformer_subfolder": "custom_refiner",
         }
+        if refiner_model is not None:
+            subfolders["lingbot_refiner"]["model_dir"] = refiner_model
+        if refiner_revision is not None:
+            subfolders["lingbot_refiner"]["revision"] = refiner_revision
     od_config = SimpleNamespace(
         model=model,
         revision=revision,
@@ -123,6 +133,7 @@ def test_constructor_uses_native_transformer_source_and_component_revision(mocke
         calls.model,
         local_files_only=False,
         subfolders=component_subfolders,
+        revision=calls.revision,
     )
     calls.load_config.assert_called_once_with(
         calls.model,
@@ -319,7 +330,7 @@ def test_vae_is_restored_before_normal_decode(mocker):
     assert pipeline.vae.current_device == torch.device("cuda:0")
 
 
-def test_latent_early_return_keeps_vae_on_original_device(mocker):
+def test_latent_early_return_offloads_and_restores_vae(mocker):
     from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
 
     pipeline = _build_generation_pipeline(_PassingTransformer())
@@ -328,7 +339,7 @@ def test_latent_early_return_keeps_vae_on_original_device(mocker):
     result = pipeline._generate(**_generation_kwargs(output_type="latent"))
 
     assert isinstance(result, torch.Tensor)
-    assert pipeline.vae.moves == []
+    assert pipeline.vae.moves == [torch.device("cpu"), torch.device("cuda:0")]
     assert pipeline.vae.current_device == torch.device("cuda:0")
 
 
@@ -366,6 +377,7 @@ def test_constructor_builds_independent_native_refiner_source_and_scheduler(mock
                 "custom_scheduler",
                 "custom_refiner",
             ],
+            revision=calls.revision,
         )
     ]
     assert calls.load_config.call_args_list == [
@@ -393,8 +405,42 @@ def test_constructor_builds_independent_native_refiner_source_and_scheduler(mock
     assert discovered.outermost_dits()[0] == ["transformer", "refiner_transformer"]
 
 
+def test_constructor_prefetches_independent_refiner_revision(mocker):
+    refiner_model = "test-org/lingbot-video-refiner"
+    refiner_revision = "refiner-test-revision"
+
+    _, calls = _build_pipeline(
+        mocker,
+        refiner_enabled=True,
+        refiner_model=refiner_model,
+        refiner_revision=refiner_revision,
+    )
+
+    assert calls.prefetch.call_args_list == [
+        mocker.call(
+            calls.model,
+            local_files_only=False,
+            subfolders=[
+                "custom_transformer",
+                "custom_text_encoder",
+                "custom_processor",
+                "custom_vae",
+                "custom_scheduler",
+            ],
+            revision=calls.revision,
+        ),
+        mocker.call(
+            refiner_model,
+            local_files_only=False,
+            subfolders=["custom_refiner", "custom_scheduler"],
+            revision=refiner_revision,
+        ),
+    ]
+
+
 def test_native_weight_stream_strictly_loads_base_and_refiner_prefixes(mocker):
     from vllm.config.load import LoadConfig
+
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
     pipeline, calls = _build_pipeline(mocker, refiner_enabled=True)
