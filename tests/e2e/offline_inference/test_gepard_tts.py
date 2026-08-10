@@ -28,7 +28,12 @@ from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardCo
 from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
 
 # The codec decoder is an optional dependency; skip rather than fail the
-# engine inside the worker process when it is absent.
+# engine inside the worker process when it is absent. The CI image does not
+# carry it today, so this skip is why the nightly and weekly TTS sweeps
+# report nothing for this model, and why test-merge.yml has no per-file step
+# for it: pytest exits 5 when a file-scoped run collects nothing, which would
+# turn the merge gate red rather than pass it quietly. The install recipe is
+# in examples/offline_inference/text_to_speech/README.md.
 pytest.importorskip("nemo.collections.tts.models")
 
 MODEL_NAME = "nineninesix/gepard-1.0"
