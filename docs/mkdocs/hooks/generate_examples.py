@@ -24,6 +24,16 @@ SERVING_MODE_TITLES = {
     "online_serving": "Online serving",
 }
 
+# Generated example pages keep their source-derived URLs even when their
+# navigation category changes. Quantization helpers are feature documentation,
+# not user-serving examples, so keep them under the existing Features /
+# Quantization section instead of creating a second top-level Quantization
+# category under Examples.
+EXAMPLE_NAV_TARGETS = {
+    "quantization": "quantization",
+}
+GENERATED_QUANTIZATION_EXAMPLES_TITLE = "Generated Examples"
+
 
 def load_model_display_names() -> dict[str, str]:
     try:
@@ -340,25 +350,57 @@ def update_nav_file(examples: list[Example]):
             examples_by_category[category] = []
         examples_by_category[category].append(example)
 
-    # Build the new Examples section - start with preserved items
-    examples_section = preserved_items.copy()
-
-    # Add examples grouped by category, sorted by category name
-    for category in sorted(examples_by_category.keys()):
-        category_examples = sorted(examples_by_category[category], key=lambda e: e.path.stem)
-        category_items = []
-        for example in category_examples:
+    def category_items(category: str) -> list[dict[str, str]]:
+        items = []
+        for example in sorted(examples_by_category[category], key=lambda e: e.path.stem):
             doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
             rel_path = doc_path.relative_to(ROOT_DIR / "docs")
-            category_items.append({example.nav_title: rel_path.as_posix()})
+            items.append({example.nav_title: rel_path.as_posix()})
+        return items
 
-        if category_items:
-            # Format category name (e.g., "offline_inference" -> "Offline Inference")
+    # Build the new Examples section - start with preserved items. Categories
+    # not explicitly routed elsewhere retain the historical Examples behavior.
+    examples_section = preserved_items.copy()
+    for category in sorted(examples_by_category.keys()):
+        if EXAMPLE_NAV_TARGETS.get(category, "examples") != "examples":
+            continue
+        items = category_items(category)
+        if items:
             category_title = fix_case(category.replace("_", " ").title())
-            examples_section.append({category_title: category_items})
+            examples_section.append({category_title: items})
 
     # Update the nav structure
     nav_list[user_guide_idx]["User Guide"][examples_idx]["Examples"] = examples_section
+
+    features_content = next(
+        (item["Features"] for item in user_guide_content if isinstance(item, dict) and "Features" in item),
+        None,
+    )
+    quantization_content = None
+    if isinstance(features_content, list):
+        quantization_content = next(
+            (item["Quantization"] for item in features_content if isinstance(item, dict) and "Quantization" in item),
+            None,
+        )
+
+    if isinstance(quantization_content, list):
+        # Remove only the group owned by this hook so repeated builds are
+        # idempotent and hand-authored Quantization navigation is retained.
+        quantization_content[:] = [
+            item
+            for item in quantization_content
+            if not (isinstance(item, dict) and GENERATED_QUANTIZATION_EXAMPLES_TITLE in item)
+        ]
+
+    quantization_examples = examples_by_category.get("quantization")
+    if quantization_examples:
+        if not isinstance(quantization_content, list):
+            logger.warning(
+                "Could not find 'User Guide' -> 'Features' -> 'Quantization' section; "
+                "omitting generated quantization examples from navigation"
+            )
+        else:
+            quantization_content.append({GENERATED_QUANTIZATION_EXAMPLES_TITLE: category_items("quantization")})
 
     # Write back to file
     nav_data["nav"] = nav_list
