@@ -4,6 +4,8 @@
 
 import pytest
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -49,6 +51,10 @@ class TestXPUOmniPlatformRecordDeviceEvent:
     """
 
     def test_records_device_agnostic_torch_event(self, mocker):
+        # vLLM's XPUPlatform imports vllm_xpu_kernels at module scope, and that
+        # package is absent on non-XPU images.
+        pytest.importorskip("vllm_xpu_kernels")
+
         from vllm_omni.platforms.xpu.platform import XPUOmniPlatform
 
         mock_event = mocker.MagicMock()
@@ -61,7 +67,7 @@ class TestXPUOmniPlatformRecordDeviceEvent:
         mock_event.record.assert_called_once()
         xpu_event.assert_not_called()
 
-    @pytest.mark.xpu
+    @hardware_test(res={"xpu": "B60"})
     def test_recorded_event_orders_side_stream_d2h(self):
         """On-device: the event must make a side-stream D2H wait for compute."""
         import torch
