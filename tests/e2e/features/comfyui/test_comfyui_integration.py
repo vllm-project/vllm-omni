@@ -236,7 +236,12 @@ def _build_diffusion_video_output() -> OmniRequestOutput:
 
 
 def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
-    return OmniRequestOutput.from_diffusion(
+    request_output = SimpleNamespace(
+        images=[_build_image_output(color="blue")],
+        finished=True,
+    )
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_img_chat",
         images=[_build_image_output(color="blue")],
         final_output_type="image",

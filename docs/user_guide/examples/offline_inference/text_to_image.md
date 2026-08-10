@@ -184,7 +184,7 @@ if __name__ == "__main__":
 !!! info
 
     For diffusion request-level batching controls such as `max_num_seqs`, see
-    [Request-Level Batching](../../diffusion/request_batching.md).
+    [Diffusion Execution Modes](../../diffusion/execution_modes.md).
 
 ### Negative Prompts
 

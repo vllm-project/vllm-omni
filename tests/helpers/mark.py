@@ -2,10 +2,69 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pytest marks and decorators for hardware / resource selection (CUDA, ROCm, …)."""
 
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from pathlib import Path
+
 import pytest
 from vllm.platforms import current_platform
 
-# Re-exported from tests.helpers.env (GPU wait + DeviceMemoryMonitor).
+# Marker description tag in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
+# Example: ``"H100: [hardware-resource] Tests that require H100 GPU"``.
+_HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_pyproject() -> dict:
+    path = _repo_root() / "pyproject.toml"
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python < 3.11
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=1)
+def get_hardware_mark_list() -> frozenset[str]:
+    """Return hardware SKU marker names from ``pyproject.toml``.
+
+    A marker is treated as a hardware resource marker when its description
+    contains the ``[hardware-resource]`` tag, e.g.::
+
+        "H100: [hardware-resource] Tests that require H100 GPU"
+    """
+    data = _load_pyproject()
+    entries = data.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("markers", [])
+    if not entries:
+        # Fallback when TOML parsing fails: scan tagged marker lines.
+        text = (_repo_root() / "pyproject.toml").read_text(encoding="utf-8")
+        return frozenset(
+            re.findall(
+                rf'^\s*"([A-Za-z0-9_]+)\s*:\s*{re.escape(_HARDWARE_RESOURCE_MARKER_TAG)}',
+                text,
+                flags=re.M,
+            )
+        )
+
+    names: set[str] = set()
+    for entry in entries:
+        text = str(entry)
+        if _HARDWARE_RESOURCE_MARKER_TAG not in text:
+            continue
+        name = text.split(":", 1)[0].strip()
+        if name:
+            names.add(name)
+    return frozenset(names)
 
 
 def cuda_marks(*, res: str, num_cards: int):
