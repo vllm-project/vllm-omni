@@ -447,6 +447,41 @@ def tts2code2wav_full_payload(
     )
 
 
+def tts2code2wav_token_only(
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Build the sync Code2Wav placeholder; codec data arrives by connector."""
+    code2wav_inputs: list[OmniTokensPrompt] = []
+    for talker_output in source_outputs:
+        if not talker_output.finished:
+            continue
+        output = talker_output.outputs[0]
+        multimodal_output = getattr(output, "multimodal_output", None)
+        codes = multimodal_output.get("codes") if isinstance(multimodal_output, Mapping) else None
+        audio = (
+            codes.get("audio")
+            if isinstance(codes, Mapping)
+            else multimodal_output.get("codes.audio")
+            if isinstance(multimodal_output, Mapping)
+            else None
+        )
+        codec_codes = _codec_scalars(audio)
+        if not codec_codes:
+            continue
+        prompt_len = len(codec_codes) + 3
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0] * prompt_len,
+                additional_information=None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return code2wav_inputs
+
+
 def _special_token_ids_from_mm_output(mm_output):
     if not isinstance(mm_output, Mapping):
         return {}
