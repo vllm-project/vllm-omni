@@ -128,9 +128,9 @@ class RainFusionAttentionImpl(AttentionImpl):
     whose extent the model publishes as ``AttentionMetadata.video_layout``. Every
     other case — warmup denoise steps, exempt layers, a layer that does not declare
     ``qkv_layout="BSND"``, sequences without a published video segment, video
-    segments too short to pay for block selection or not aligned to the kernel's
-    block size — delegates to FlashAttention, so a model can select this backend
-    unconditionally.
+    segments too short to pay for block selection — delegates to FlashAttention,
+    so a model can select this backend unconditionally. MindIE-SD handles an
+    irregular video tail internally, retaining it outside the sparse blocks.
     """
 
     def __init__(
@@ -292,25 +292,6 @@ class RainFusionAttentionImpl(AttentionImpl):
                 _MIN_VIDEO_BLOCKS,
             )
             return None
-        if video_len % _BLOCK_SIZE != 0:
-            # rf_v2 tiles the sequence into ceil((video + prefix) / 128) blocks but
-            # builds its block mask from the two segments pooled apart. The counts
-            # only agree when the video segment ends on a block boundary; otherwise
-            # a prefix block is forced on out of range, and the block straddling the
-            # seam holds real prefix rows that selection may drop. Padding the
-            # sequence to realign it is not an option because rf_v2 ignores
-            # attn_mask, so pad keys would take a share of every softmax denominator.
-            logger.warning_once(
-                "RAINFUSION_ATTN staying dense: latent grid %s gives %d video rows, which is not a "
-                "multiple of the %d-row kernel block. Choose a geometry whose latent_t * h * w is a "
-                "multiple of %d to enable sparsity.",
-                tuple(latent_shape),
-                video_len,
-                _BLOCK_SIZE,
-                _BLOCK_SIZE,
-            )
-            return None
-
         logger.info_once(
             "RAINFUSION_ATTN active: sparsity=%.2f, start_step=%d, exempt_layers=%d, "
             "latent_grid=%s, prefix_rows=%d, video_rows=%d. Realized sparsity is lower than nominal "
