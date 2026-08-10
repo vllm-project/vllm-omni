@@ -535,6 +535,8 @@ class OmniStreamingVideoOutputHandler:
         provided_fields = request.model_fields_set
         if "num_inference_steps" in provided_fields and request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
+        if "quality" in provided_fields:
+            gen_params.quality = request.quality
         if "guidance_scale" in provided_fields and request.guidance_scale is not None:
             gen_params.guidance_scale = request.guidance_scale
         if "guidance_scale_2" in provided_fields and request.guidance_scale_2 is not None:

@@ -1805,6 +1805,7 @@ class TestQwen2_5OmniPipeline:
         assert s.owns_tokenizer is True
         assert s.engine_output_type == "latent"
         assert s.requires_multimodal_data is True
+        assert s.hf_config_name == "thinker_config"
 
     def test_talker(self):
         p = resolve_pipeline_config("qwen2_5_omni")
@@ -1813,6 +1814,7 @@ class TestQwen2_5OmniPipeline:
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
+        assert s.hf_config_name == "talker_config"
         assert s.sampling_constraints["stop_token_ids"] == [8294]
         # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
         # so sync_process_input_func always wins and custom_process_input_func
@@ -1829,6 +1831,7 @@ class TestQwen2_5OmniPipeline:
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
         assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "thinker_config"
 
 
 class TestQwen3TTSPipeline:

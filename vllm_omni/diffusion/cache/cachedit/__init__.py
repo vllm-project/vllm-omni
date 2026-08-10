@@ -20,6 +20,10 @@ from vllm_omni.diffusion.cache.cachedit.model_specific import (
 from vllm_omni.diffusion.cache.cachedit.model_specific import (
     register_custom_dit_enablers as _register_custom_dit_enablers,
 )
+from vllm_omni.diffusion.cache.cachedit.runtime import (
+    CacheDiTRequestSpec,
+    RequestScopedCacheDiTRuntime,
+)
 
 _register_custom_dit_enablers()
 
@@ -29,6 +33,8 @@ __all__ = [
     "CacheDiTAdapterConfig",
     "CacheDiTBackend",
     "CacheDiTConfig",
+    "CacheDiTRequestSpec",
+    "RequestScopedCacheDiTRuntime",
     "SensenovaCachedAdapter",
     "cache_summary",
     "enable_cache_for_dit",

@@ -12,7 +12,7 @@ The AR module of vLLM-Omni extends vLLM's core components to support:
 - **Hidden state exposure**: Exposing per-request hidden representations for downstream stages
 - **Basic generator support**: Support some basic heterogeneous architecture such as Convolution, LSTM, etc.
 
-As shown in the [end2end example](../../user_guide/examples/offline_inference/qwen3_omni.md), AR module can be widely applied across multiple stages, generating text tokens in thinker(AR), audio latent tokens in talker(AR) and audio wave in code2wav(Convolution).
+As shown in the [end2end example](../../../user_guide/examples/offline_inference/qwen3_omni.md), AR module can be widely applied across multiple stages, generating text tokens in thinker(AR), audio latent tokens in talker(AR) and audio wave in code2wav(Convolution).
 
 ## 2. Relationship with vLLM
 

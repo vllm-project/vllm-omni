@@ -25,6 +25,23 @@ def test_from_params_returns_existing_omni_params() -> None:
     assert converted is params
 
 
+@pytest.mark.parametrize("quality", ["lossless", "high"])
+def test_quality_accepts_supported_request_levels(quality: str) -> None:
+    params = OmniDiffusionSamplingParams(quality=quality)
+
+    assert params.quality == quality
+
+
+def test_quality_defaults_to_model_owned_policy() -> None:
+    params = OmniDiffusionSamplingParams()
+    assert params.quality is None
+
+
+def test_quality_rejects_unsupported_request_level() -> None:
+    with pytest.raises(ValueError, match="quality must be one of"):
+        OmniDiffusionSamplingParams(quality="medium")
+
+
 def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> None:
     params = _sampling_params(
         seed=1234,
@@ -33,6 +50,7 @@ def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> Non
             "height": 1024,
             "width": 768,
             "guidance_scale": 7.5,
+            "quality": "high",
         },
     )
 
@@ -43,6 +61,7 @@ def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> Non
     assert converted.height == 1024
     assert converted.width == 768
     assert converted.guidance_scale == 7.5
+    assert converted.quality == "high"
     assert converted.extra_args == {}
 
 
