@@ -37,6 +37,13 @@ from vllm_omni.model_extras.helios import (
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.lingbot_video import (
+    build_image_to_video_prompt as build_lingbot_image_to_video_prompt,
+)
+from vllm_omni.model_extras.lingbot_video import (
+    build_text_to_image_prompt as build_lingbot_text_to_image_prompt,
+)
+from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -222,6 +229,18 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "LingBotVideoPipeline": {
         "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+        "text_to_image_prompt_builder": build_lingbot_text_to_image_prompt,
+        "image_to_video_prompt_builder": build_lingbot_image_to_video_prompt,
+    },
+    **{
+        model_class_name: {
+            "extra_body_params": LTX_EXTRA_BODY_PARAMS,
+            "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+        }
+        for model_class_name in (
+            "LTX2Pipeline",
+            "LTX2DistilledPipeline",
+        )
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
@@ -242,6 +261,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
 }
+
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request adapters.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:

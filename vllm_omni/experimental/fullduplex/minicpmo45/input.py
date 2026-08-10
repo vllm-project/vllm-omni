@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True, slots=True)
+class _PcmSpan:
+    byte_count: int
+    force_listen: bool
+    is_speech: bool
 
 
 class MiniCPMO45PcmAppendReservation:
@@ -15,6 +23,7 @@ class MiniCPMO45PcmAppendReservation:
         "_owner",
         "_raw",
         "_sample_rate_hz",
+        "_spans",
         "_turn_had_speech",
         "_video_frames",
         "operation_id",
@@ -31,6 +40,7 @@ class MiniCPMO45PcmAppendReservation:
         sample_rate_hz: int,
         force_listen: bool,
         is_speech: bool,
+        spans: list[_PcmSpan] | None = None,
         turn_had_speech: bool = False,
         video_frames: list[str] | None = None,
     ) -> None:
@@ -41,6 +51,7 @@ class MiniCPMO45PcmAppendReservation:
         self._sample_rate_hz = sample_rate_hz
         self._force_listen = force_listen
         self._is_speech = is_speech
+        self._spans = list(spans or [])
         self._turn_had_speech = turn_had_speech
         self._video_frames = list(video_frames or [])
         self._active = True
@@ -97,9 +108,8 @@ class MiniCPMO45PcmAppendBuffer:
 
     def __init__(self) -> None:
         self._buffer = bytearray()
+        self._spans: list[_PcmSpan] = []
         self._sample_rate_hz: int | None = None
-        self._force_listen = False
-        self._is_speech = False
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
@@ -112,14 +122,13 @@ class MiniCPMO45PcmAppendBuffer:
             reservation._active = False
         self._reservations.clear()
         self._buffer.clear()
+        self._spans.clear()
         self._frame_queue.clear()
         self._sample_rate_hz = None
-        self._force_listen = False
-        self._is_speech = False
         self._turn_had_speech = False
 
     def clear_force_listen(self) -> None:
-        self._force_listen = False
+        self._spans = [_PcmSpan(span.byte_count, False, span.is_speech) for span in self._spans]
 
     def has_pending(self) -> bool:
         return bool(self._buffer)
@@ -130,6 +139,56 @@ class MiniCPMO45PcmAppendBuffer:
     @property
     def pending_byte_count(self) -> int:
         return len(self._buffer)
+
+    def _append_span(self, span: _PcmSpan) -> None:
+        if span.byte_count <= 0:
+            return
+        if (
+            self._spans
+            and self._spans[-1].force_listen == span.force_listen
+            and self._spans[-1].is_speech == span.is_speech
+        ):
+            previous = self._spans[-1]
+            self._spans[-1] = _PcmSpan(
+                previous.byte_count + span.byte_count,
+                span.force_listen,
+                span.is_speech,
+            )
+            return
+        self._spans.append(span)
+
+    def _consume_spans(self, byte_count: int) -> list[_PcmSpan]:
+        consumed: list[_PcmSpan] = []
+        remaining = byte_count
+        while remaining:
+            if not self._spans:
+                raise RuntimeError("MiniCPM-o PCM metadata is shorter than buffered audio")
+            span = self._spans.pop(0)
+            take = min(remaining, span.byte_count)
+            consumed.append(_PcmSpan(take, span.force_listen, span.is_speech))
+            if take < span.byte_count:
+                self._spans.insert(
+                    0,
+                    _PcmSpan(
+                        span.byte_count - take,
+                        span.force_listen,
+                        span.is_speech,
+                    ),
+                )
+            remaining -= take
+        return consumed
+
+    def _prepend_spans(self, spans: list[_PcmSpan]) -> None:
+        current = self._spans
+        self._spans = []
+        for span in [*spans, *current]:
+            self._append_span(span)
+
+    def _buffer_force_listen(self) -> bool:
+        return any(span.force_listen for span in self._spans)
+
+    def _buffer_is_speech(self) -> bool:
+        return any(span.is_speech for span in self._spans)
 
     def _reserve_passthrough(
         self,
@@ -180,12 +239,17 @@ class MiniCPMO45PcmAppendBuffer:
             raise ValueError("MiniCPM-o native duplex audio append sample_rate_hz changed within a session")
         self._sample_rate_hz = sample_rate_hz
         self._buffer.extend(raw)
+        self._append_span(
+            _PcmSpan(
+                len(raw),
+                bool(payload.get("force_listen", False)),
+                bool(payload.get("is_speech", False)),
+            )
+        )
         frames_in = payload.get("video_frames")
         if isinstance(frames_in, list):
             self._frame_queue.extend(frame for frame in frames_in if isinstance(frame, str) and frame)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
-        self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
-        self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
 
@@ -208,6 +272,7 @@ class MiniCPMO45PcmAppendBuffer:
             pad_samples = 0
         emit_bytes = emit_samples * 4
         reserved_raw = bytes(self._buffer[:emit_bytes])
+        reserved_spans = self._consume_spans(emit_bytes)
         emit_raw = reserved_raw + b"\x00" * (pad_samples * 4)
         del self._buffer[:emit_bytes]
 
@@ -227,11 +292,8 @@ class MiniCPMO45PcmAppendBuffer:
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
             attached_frames = [self._frame_queue.pop(0)]
             out["video_frames"] = attached_frames
-        out["force_listen"] = self._force_listen
-        out["is_speech"] = self._is_speech
-        if not self._buffer:
-            self._force_listen = False
-            self._is_speech = False
+        out["force_listen"] = any(span.force_listen for span in reserved_spans)
+        out["is_speech"] = any(span.is_speech for span in reserved_spans)
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,
@@ -240,6 +302,7 @@ class MiniCPMO45PcmAppendBuffer:
             sample_rate_hz=sample_rate_hz,
             force_listen=bool(out.get("force_listen", False)),
             is_speech=bool(out.get("is_speech", False)),
+            spans=reserved_spans,
             turn_had_speech=self._turn_had_speech,
             video_frames=attached_frames,
         )
@@ -261,8 +324,8 @@ class MiniCPMO45PcmAppendBuffer:
                 "audio": "",
                 "format": "pcm_f32le",
                 "sample_rate_hz": self._sample_rate_hz or 16000,
-                "force_listen": self._force_listen,
-                "is_speech": self._is_speech,
+                "force_listen": self._buffer_force_listen(),
+                "is_speech": self._buffer_is_speech(),
             }
             reservation = self.prepare_append(
                 payload,
@@ -280,8 +343,8 @@ class MiniCPMO45PcmAppendBuffer:
                 payload=None,
                 raw=b"",
                 sample_rate_hz=self._sample_rate_hz or 0,
-                force_listen=self._force_listen,
-                is_speech=self._is_speech,
+                force_listen=self._buffer_force_listen(),
+                is_speech=self._buffer_is_speech(),
                 turn_had_speech=had_speech,
             )
             self._reservations.append(reservation)
@@ -289,8 +352,6 @@ class MiniCPMO45PcmAppendBuffer:
         # Open the next physical input generation without touching already
         # reserved appends. A rollback restores this generation's metadata.
         self._sample_rate_hz = None
-        self._force_listen = False
-        self._is_speech = False
         self._turn_had_speech = False
         return reservation
 
@@ -335,12 +396,11 @@ class MiniCPMO45PcmAppendBuffer:
         rolled_back = self._reservations[index:]
         restored = b"".join(item._raw for item in rolled_back)
         self._buffer[:0] = restored
+        self._prepend_spans([span for item in rolled_back for span in item._spans])
         restored_frames = [frame for item in rolled_back for frame in item._video_frames]
         if restored_frames:
             self._frame_queue[:0] = restored_frames
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
-        self._force_listen = self._force_listen or any(item._force_listen for item in rolled_back)
-        self._is_speech = self._is_speech or any(item._is_speech for item in rolled_back)
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
         for item in rolled_back:
             item._active = False
@@ -354,8 +414,8 @@ class MiniCPMO45PcmAppendBuffer:
             "audio": "",
             "format": "pcm_f32le",
             "sample_rate_hz": self._sample_rate_hz or 16000,
-            "force_listen": self._force_listen,
-            "is_speech": self._is_speech,
+            "force_listen": self._buffer_force_listen(),
+            "is_speech": self._buffer_is_speech(),
         }
         return self.append(payload, chunk_period_ms=chunk_period_ms, flush=True)
 

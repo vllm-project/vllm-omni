@@ -84,6 +84,31 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "NemotronDenseForCausalLM": (
+        "audex",
+        "audex_thinker",
+        "NemotronDenseForCausalLM",
+    ),
+    "AudexCode2Wav": (
+        "audex",
+        "audex_code2wav",
+        "AudexCode2Wav",
+    ),
+    "AudexXCodec1": (
+        "audex",
+        "audex_xcodec",
+        "AudexXCodec1",
+    ),
+    "NemotronDenseAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronDenseAudexForConditionalGeneration",
+    ),
+    "NemotronHAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronHAudexForConditionalGeneration",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",
@@ -98,6 +123,16 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
     ),
     "MammothModa2DiTPipeline": (
         "mammoth_moda2",
@@ -128,6 +163,18 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
+    ),
+    ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
+    # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
+    "PersonaPlexTalkerForConditionalGeneration": (
+        "personaplex",
+        "personaplex_talker",
+        "PersonaPlexTalkerForConditionalGeneration",
+    ),
+    "PersonaPlexCode2Wav": (
+        "personaplex",
+        "personaplex_code2wav",
+        "PersonaPlexCode2Wav",
     ),
     ## higgs-audio v2
     "HiggsAudioV2ForConditionalGeneration": (
