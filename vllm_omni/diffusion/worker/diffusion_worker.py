@@ -63,6 +63,8 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
 
+_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
+
 
 @dataclass
 class _DiffusionVllmModelConfig:
@@ -429,8 +431,8 @@ class DiffusionWorker:
         ranks stay synchronised at each AllGather call while computing
         different activations.
 
-        Each rank returns its OWN DiffusionOutput (no gather).  The executor
-        collects N responses via result_mq (all ranks share one queue).
+        Each rank returns its OWN DiffusionOutput (no gather). The executor
+        collects N responses via the per-worker result queues.
         """
         assert self.model_runner is not None, "Model runner not initialized"
 
@@ -895,8 +897,11 @@ class WorkerProc:
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
-        while self._running:
-            output, async_output_id, gpu_event = self._async_output_queue.get()
+        while True:
+            item = self._async_output_queue.get()
+            if item is None:
+                break
+            output, async_output_id, gpu_event = item
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
@@ -924,6 +929,40 @@ class WorkerProc:
                         error="Background D2H/SHM packing failed",
                     )
                 )
+
+    def shutdown(self) -> None:
+        """Stop background work and release worker-owned IPC resources."""
+        self._running = False
+
+        if self._async_output_queue is not None:
+            self._async_output_queue.put(None)
+        if self._async_output_thread is not None:
+            self._async_output_thread.join(timeout=_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S)
+            if self._async_output_thread.is_alive():
+                logger.warning(
+                    "Worker %d: Async output thread did not stop before shutdown",
+                    self.gpu_id,
+                )
+
+        try:
+            self.worker.shutdown()
+        finally:
+            if self.mq is not None:
+                self.mq.shutdown()
+                self.mq = None
+
+            # The worker creates this queue's shared-memory ring buffer.
+            # Dropping the final creator reference invokes
+            # ShmRingBuffer.__del__, which closes and unlinks it before
+            # multiprocessing.resource_tracker exits.
+            if self.result_mq is not None and (
+                self._async_output_thread is None or not self._async_output_thread.is_alive()
+            ):
+                result_mq = self.result_mq
+                self.result_mq = None
+                result_mq.shutdown()
+                del result_mq
+                gc.collect()
 
     def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
         if not torch.distributed.is_initialized():
@@ -1196,7 +1235,7 @@ class WorkerProc:
         finally:
             if worker_proc is not None:
                 try:
-                    worker_proc.worker.shutdown()
+                    worker_proc.shutdown()
                 except Exception as exc:
                     logger.warning("Worker %d: Shutdown encountered an error: %s", rank, exc)
                 worker_proc.context.term()

@@ -1674,8 +1674,11 @@ class Cosmos3VFMTransformer(nn.Module):
             sound_tokens = self.pack_sound(sound_latents)
             s_sound = sound_tokens.shape[1]
 
-        # Run UND pathway once and cache K/V (replicated across all ranks)
-        if self.cached_kv is None:
+        # Run UND pathway once and cache K/V (replicated across all ranks).
+        # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
+        # cached alongside UND K/V by both the bespoke and session-state paths.
+        need_kv = self.cached_kv is None
+        if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
                 t,
@@ -1691,13 +1694,14 @@ class Cosmos3VFMTransformer(nn.Module):
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
-            with self._offload_context("reasoner"):
-                cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
-            # Trim to real text length (remove padding).  K/V stay replicated;
-            # the framework Attention layer head-slices them via joint_key/value.
-            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+            if need_kv:
+                with self._offload_context("reasoner"):
+                    cached_kv_full = self.language_model(text_ids, freqs_und)
+                # Trim to real text length (remove padding).  K/V stay replicated;
+                # the framework Attention layer head-slices them via joint_key/value.
+                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache
