@@ -168,9 +168,15 @@ def _assert_clip_is_sane(clip: _Clip) -> None:
     # not codec output.
     assert float(wav.abs().max()) <= 1.5, f"peak {float(wav.abs().max()):.2f} is out of range"
 
-    # The request must stop on its own rather than run to max_tokens: a short
-    # line is a few seconds of speech, not the ~190 s the 4096-token cap allows.
-    seconds = wav.numel() / SAMPLE_RATE
+
+def _assert_stopped_on_its_own(clip: _Clip) -> None:
+    """The request must stop on its own rather than run to ``max_tokens``.
+
+    Separate from the structural checks because it reads the stop head's
+    judgement, not the payload's shape: under ``load_format: dummy`` that head
+    is random and never fires, so every clip runs to the token cap.
+    """
+    seconds = clip.wav.numel() / SAMPLE_RATE
     assert 0.5 < seconds < 30.0, f"implausible duration {seconds:.2f}s — did STOP fire?"
 
 
@@ -203,6 +209,7 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
     if run_level not in {"advanced_model", "full_model"}:
         return  # dummy weights: the audio is structural only, so do not read it
 
+    _assert_stopped_on_its_own(clip)
     with tempfile.TemporaryDirectory() as tmp_dir:
         transcript = _transcribe(clip.wav, tmp_dir, "zero_shot")
     assert keyword in transcript, f"expected {keyword!r} in transcript, got {transcript!r}"
@@ -228,6 +235,7 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
     if run_level not in {"advanced_model", "full_model"}:
         return
 
+    _assert_stopped_on_its_own(clip)
     with tempfile.TemporaryDirectory() as tmp_dir:
         transcript = _transcribe(clip.wav, tmp_dir, "long_text")
     assert "river" in transcript, f"expected 'river' in transcript, got {transcript!r}"
@@ -252,6 +260,9 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
 
     if run_level not in {"advanced_model", "full_model"}:
         return  # dummy weights: the audio is structural only, so do not read it
+
+    for clip in clips:
+        _assert_stopped_on_its_own(clip)
 
     keywords = set(_DISTINGUISHABLE_PROMPTS.values())
     spoken: dict[str, str] = {}

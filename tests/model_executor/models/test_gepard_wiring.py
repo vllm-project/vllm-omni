@@ -283,7 +283,10 @@ def _install_scripted_sampling(talker: GepardTalkerForConditionalGeneration, eng
     """
     head0_vocab = talker.config.head0_vocab_size
 
-    def _sample_frame(rows: torch.Tensor):
+    # Signature mirrors the real ``_sample_frame`` minus ``self``; the scripted
+    # sampler ignores ``generators`` because seeding is decided in
+    # ``_build_with_real_sampler``, which keeps the model's own sampler.
+    def _sample_frame(rows: torch.Tensor, generators: list[torch.Generator | None] | None = None):
         n = int(rows.shape[0])
         head0 = torch.zeros(n, dtype=torch.long)
         heads = torch.zeros(n, NUM_HEADS - 1, dtype=torch.long)
