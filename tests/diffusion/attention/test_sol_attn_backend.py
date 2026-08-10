@@ -130,6 +130,54 @@ def test_dense_when_no_forward_context():
     assert impl._should_use_dense() is False
 
 
+@pytest.mark.parametrize(
+    ("offsets", "total", "expected"),
+    [
+        ([0, 26, 26], 26, [0, 26]),
+        ([0, 26, 32], 32, [0, 26, 32]),
+    ],
+)
+def test_dense_fallback_drops_only_empty_packed_documents(
+    monkeypatch,
+    offsets,
+    total,
+    expected,
+):
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
+
+    captured = {}
+
+    def fake_flash_attn_varlen_func(**kwargs):
+        captured["cu_seqlens_q"] = kwargs["cu_seqlens_q"].clone()
+        captured["cu_seqlens_k"] = kwargs["cu_seqlens_k"].clone()
+        return torch.zeros_like(kwargs["q"])
+
+    monkeypatch.setattr(fa_utils, "flash_attn_varlen_func", fake_flash_attn_varlen_func)
+    query = torch.randn(1, total, 8, 128)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32)
+    metadata = AttentionMetadata(
+        extra={
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_k": cu_seqlens,
+            "max_seqlen_q": 26,
+            "max_seqlen_k": 26,
+            "valid_kv_length": 26,
+        }
+    )
+
+    output = _impl("token_refiner.blocks.0.attn")._forward_dense_varlen(
+        query,
+        query,
+        query,
+        metadata,
+    )
+
+    assert output.shape == query.shape
+    assert captured["cu_seqlens_q"].tolist() == expected
+    assert captured["cu_seqlens_k"].tolist() == expected
+
+
 def test_sol_attn_spec_validation():
     spec = AttentionSpec(backend="SOL_ATTN", sol_attn={"tau": 1.0, "sink_tokens": 951})
     assert spec.sol_attn.tau == 1.0

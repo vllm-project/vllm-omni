@@ -208,12 +208,24 @@ class SolAttnImpl(AttentionImpl):
         if flash_attn_varlen_func is None:
             raise ImportError("Sol-Attn dense fallback requires flash_attn_varlen_func")
         extra = attn_metadata.extra
+        q = query.flatten(0, 1)
+        k = key.flatten(0, 1)
+        v = value.flatten(0, 1)
+        cu_seqlens_q = extra["cu_seqlens_q"]
+        cu_seqlens_k = extra["cu_seqlens_k"]
+        # FA4's SM120 varlen kernel rejects a trailing zero-length document.
+        # When total == max_seqlen, every other packed document is empty and
+        # can be removed without changing attention semantics.
+        if q.shape[0] == extra["max_seqlen_q"]:
+            cu_seqlens_q = cu_seqlens_q.new_tensor((0, q.shape[0]))
+        if k.shape[0] == extra["max_seqlen_k"]:
+            cu_seqlens_k = cu_seqlens_k.new_tensor((0, k.shape[0]))
         out = flash_attn_varlen_func(
-            q=query.flatten(0, 1),
-            k=key.flatten(0, 1),
-            v=value.flatten(0, 1),
-            cu_seqlens_q=extra["cu_seqlens_q"],
-            cu_seqlens_k=extra["cu_seqlens_k"],
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=extra["max_seqlen_q"],
             max_seqlen_k=extra["max_seqlen_k"],
             causal=self.causal,
