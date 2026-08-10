@@ -1,0 +1,9 @@
+stepaudio2-minicpmo
+step-audio2
+librosa
+s3tokenizer
+hyperpyyaml
+omegaconf
+tqdm
+websockets
+jiwer

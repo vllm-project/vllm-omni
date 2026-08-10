@@ -6,6 +6,7 @@ with the Orchestrator (running in a background thread) via janus queues.
 """
 
 from __future__ import annotations
+from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
 import asyncio
 import concurrent.futures
