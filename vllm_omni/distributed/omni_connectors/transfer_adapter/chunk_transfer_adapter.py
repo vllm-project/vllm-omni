@@ -1124,14 +1124,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         clean up ready chunks from scheduler output.
         """
         stage_id = self.connector.stage_id
-        import os as _os
-        if _os.getenv("VLLM_OMNI_PD_TRACE","0") not in ("","0","false","False"):
-            _cr = getattr(scheduler_output, "scheduled_cached_reqs", None)
-            logger.info(
-                "[PD_TRACE] postproc stage=%s recv_chunks=%s has_reqs=%s cached_ids=%s",
-                stage_id, self.receives_chunks, requests is not None,
-                list(getattr(_cr, "req_ids", []) or []) if _cr else None,
-            )
 
         if stage_id == 0:
             return

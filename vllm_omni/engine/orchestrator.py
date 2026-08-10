@@ -2551,11 +2551,6 @@ class Orchestrator:
         # [PD] The PD prefill stage MUST be exempt from the async-chunk early
         # return: PD yamls set async_chunk: true, so returning here drops every
         # prefill->decode handoff and D silently regenerates from scratch.
-        if self._pd_trace_enabled:
-            logger.info(
-                "[PD_TRACE] kvready_enter stage=%d async_chunk=%s is_pd_prefill=%s n_out=%d",
-                stage_id, self.async_chunk, self._is_pd_prefill_stage(stage_id), len(raw_outputs.outputs),
-            )
         if self.async_chunk and not self._is_pd_prefill_stage(stage_id):
             return
 
@@ -2569,11 +2564,6 @@ class Orchestrator:
             is_pd_prefill = self._is_pd_prefill_stage(stage_id)
             pd_submit_ready = is_pd_prefill and bool(kv_params.get("pd_submit_ready"))
             kv_extraction_ack = bool(kv_params.get("kv_ready"))
-            if self._pd_trace_enabled:
-                logger.info(
-                    "[PD_TRACE] kvready_probe req=%s stage=%d is_pd_prefill=%s submit_ready=%s ack=%s keys=%s",
-                    req_id, stage_id, is_pd_prefill, pd_submit_ready, kv_extraction_ack, sorted(kv_params),
-                )
             if not pd_submit_ready and not kv_extraction_ack:
                 continue
             # The extraction ACK arrives only after D has pulled KV. It is a
@@ -3022,15 +3012,6 @@ class Orchestrator:
                     pd_decode_state,
                 )
 
-            if self._pd_trace_enabled:
-                _dp_ai = decode_prompt.get("additional_information")
-                logger.info(
-                    "[PD_TRACE] decode_build req=%s next=%d ai_keys=%s meta=%s n_tok=%d",
-                    req_id, next_logical,
-                    sorted(_dp_ai) if isinstance(_dp_ai, dict) else None,
-                    (_dp_ai.get("meta") if isinstance(_dp_ai, dict) else None),
-                    len(decode_prompt.get("prompt_token_ids") or []),
-                )
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=decode_prompt,
@@ -3040,11 +3021,6 @@ class Orchestrator:
                 resumable=next_stage_resumable,
             )
             request.external_req_id = request.request_id
-            if self._pd_trace_enabled:
-                logger.info(
-                    "[PD_TRACE] decode_submit req=%s next=%d already_submitted=%s submit_ts_keys=%s",
-                    req_id, next_logical, already_submitted, sorted(req_state.stage_submit_ts),
-                )
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
@@ -3373,9 +3349,6 @@ class Orchestrator:
             # stage_submit_ts, makes _pd_decode_already_submitted() true, and the
             # real handoff is then silently dropped -- D regenerates the whole
             # utterance from scratch (~65s of audio instead of ~4s).
-            if self._pd_trace_enabled:
-                logger.info("[PD_TRACE] prewarm_check stage=%d is_pd_decode=%s decode_ids=%s",
-                            next_stage_id, self._is_pd_decode_stage(next_stage_id), self._pd_decode_ids)
             if self._is_pd_decode_stage(next_stage_id):
                 continue
             # PD prefill siblings likewise receive KV via Mooncake, not chunks.
