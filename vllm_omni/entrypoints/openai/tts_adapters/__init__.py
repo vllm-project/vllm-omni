@@ -31,16 +31,7 @@ TTS_ADAPTER_REGISTRY: dict[str, type[TTSModelAdapter]] = {}
 
 #: Model types the serving layer detects that have no adapter yet. See
 #: :class:`LegacyDetector`. This list must only ever shrink.
-LEGACY_TTS_DETECTORS: tuple[LegacyDetector, ...] = (
-    # Ming *flash-omni* claims the ``ming_tts`` stage key, while Ming *dense*
-    # (which does have an adapter) is identified by architecture. The stage key
-    # must therefore be tested first, hence the explicit priority.
-    LegacyDetector(
-        name="ming_flash_omni_tts",
-        stage_keys=frozenset({"ming_tts"}),
-        detect_priority=50,
-    ),
-)
+LEGACY_TTS_DETECTORS: tuple[LegacyDetector, ...] = ()
 
 
 def register_tts_adapter(cls: type[TTSModelAdapter]) -> type[TTSModelAdapter]:

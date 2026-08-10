@@ -31,6 +31,16 @@ class DiffusionRequestStatus(enum.IntEnum):
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
 
 
+@dataclass(frozen=True)
+class _AdmissionWaitDecision:
+    """Internal scheduler policy for delaying the next admission wave."""
+
+    should_wait: bool
+    deadline: float | None = None
+    stable_window_s: float = 0.0
+    max_batch: int = 1
+
+
 @dataclass(frozen=True, eq=True)
 class StepBatchSamplingParamsKey:
     """Denoise step level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
