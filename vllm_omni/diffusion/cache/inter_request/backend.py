@@ -532,17 +532,26 @@ class InterRequestCacheBackend(CacheBackend):
         runner: Any,
         is_dummy: bool = False,
     ) -> list:
-        """Store computed outputs for future reuse; annotate outputs with cache hashes."""
+        """Store computed outputs for future reuse; annotate outputs with cache hashes.
+
+        For semantic-hit requests that resumed from a cached step, the final
+        latent is complete and worth caching, but the step latents are partial
+        (only the post-resume steps were recorded) so they are skipped.
+        """
         if not self.enabled or self._pipeline is None:
             return outputs
+        # The recorder's resume_from_step survives across forward(); use it to
+        # detect whether this batch was a resume. req.sampling_params may have
+        # been reset by the pipeline between short_circuit and here.
+        recorder_resumed = (
+            self._recorder is not None and self._recorder.resume_from_step > 0
+        )
         for req, output in zip(reqs, outputs):
             if output.output is None or is_dummy:
                 continue
-            _resume = getattr(req.sampling_params, "resume_from_step", 0) or 0
-            if _resume > 0:
-                continue
+            # Skip step latents when this was a resume (incomplete step history).
             step_latents_data = None
-            if self._recorder is not None and self._recorder.num_steps > 0:
+            if not recorder_resumed and self._recorder is not None and self._recorder.num_steps > 0:
                 step_latents_data = [
                     StepLatentData(
                         step_index=r.step_index,
@@ -552,13 +561,16 @@ class InterRequestCacheBackend(CacheBackend):
                     for r in self._recorder.records
                 ]
             cache_key_hash = self.store(req, output.output, step_latents=step_latents_data)
-            logger.info("STORE_DEBUG: hash=%s output_shape=%s", cache_key_hash,
-                        output.output.shape if hasattr(output.output, "shape") else "N/A")
+            logger.info("STORE_DEBUG: hash=%s output_shape=%s resumed=%s",
+                        cache_key_hash,
+                        output.output.shape if hasattr(output.output, "shape") else "N/A",
+                        recorder_resumed)
             if cache_key_hash is not None:
                 output.custom_output["cache_key_hash"] = cache_key_hash
                 if runner is not None and hasattr(runner, "_update_cache_image_embedding"):
                     runner._update_cache_image_embedding(cache_key_hash, output.output)
-            logger.info("Inter-request cache: stored DiT output for future reuse")
+            logger.info("Inter-request cache: stored DiT output for future reuse (step_latents=%s)",
+                        "skipped(resumed)" if recorder_resumed else f"{len(step_latents_data) if step_latents_data else 0} steps")
         return outputs
 
     def merge_hit_outputs(

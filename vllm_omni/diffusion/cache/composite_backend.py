@@ -75,14 +75,17 @@ class CompositeCacheBackend(InterRequestCacheBackend):
         verbose: bool = True,
         resume_from_step: int = 0,
     ) -> None:
-        """Refresh cache_dit context, adjusting for resume_from_step.
+        """Refresh cache_dit context.
 
-        When inter_request resumes from step N, only
-        (num_inference_steps - N) steps execute through the transformer.
-        cache_dit is configured for this effective step count.
+        When inter_request resumes from step N, the pipeline's denoise loop
+        still iterates over ``num_inference_steps`` steps — inter_request
+        simply skips the first N via the step hook. cache_dit operates inside
+        the transformer and sees the original step indices, so it must be
+        configured with the full ``num_inference_steps`` (not reduced).
+        Reducing the step count here would cause cache_dit to re-run its
+        warmup, losing the block-level acceleration for steps N..N+warmup.
         """
-        effective_steps = max(1, num_inference_steps - resume_from_step)
-        self._cache_dit_backend.refresh(pipeline, effective_steps, verbose)
+        self._cache_dit_backend.refresh(pipeline, num_inference_steps, verbose)
 
     @property
     def cache_dit_backend(self):
