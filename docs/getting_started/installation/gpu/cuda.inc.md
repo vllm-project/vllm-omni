@@ -5,7 +5,7 @@
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni depends vLLM. So please follow instructions below mainly for vLLM.
+vLLM-Omni depends on the matching major/minor release of vLLM. The vLLM-Omni 0.26.x release line uses vLLM 0.26.x.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -124,7 +124,7 @@ If you want to specify the base vLLM version:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.cuda \
-  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.22.1 \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.26.0 \
   -t vllm-omni-cuda .
 ```
 

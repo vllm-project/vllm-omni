@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_omni.config.model import OmniModelConfig
@@ -128,6 +128,24 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
+def test_qwen3_tts_startup_task_type_is_validated():
+    vllm_config = EngineArgs().create_model_config()
+
+    config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+        task_type="Base",
+    )
+    assert config.task_type == "Base"
+
+    with pytest.raises(ValueError, match="Qwen3-TTS --task-type must be one of"):
+        OmniModelConfig.from_vllm_model_config(
+            vllm_config,
+            model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+            task_type="fl2va",
+        )
+
+
 def test_from_cli_args_picks_up_stage_configs_path():
     """from_cli_args should pick up stage_configs_path from namespace."""
     ns = argparse.Namespace(
@@ -224,6 +242,28 @@ def test_stage_specific_text_config_override():
     assert omni_config.get_num_attention_heads(parallel_config) == talker_num_heads
     assert omni_config.get_num_kv_heads(parallel_config) == talker_num_kv_heads
     assert omni_config.get_head_size() == talker_head_dim
+
+
+def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
+    """A stage without an embedding-size override keeps the default input width."""
+    vllm_config = EngineArgs().create_model_config()
+    vllm_config.hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
+
+    omni_config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_stage="talker",
+        hf_config_name="talker_config",
+    )
+
+    assert (
+        getattr(
+            omni_config.hf_config.talker_config,
+            "embedding_size",
+            None,
+        )
+        is None
+    )
+    assert omni_config.get_inputs_embeds_size() == omni_config.hf_text_config.hidden_size
 
 
 def test_stage_configs_path_field():

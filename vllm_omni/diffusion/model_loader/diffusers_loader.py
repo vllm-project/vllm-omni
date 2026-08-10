@@ -362,17 +362,49 @@ class DiffusersPipelineLoader:
                 )
             else:
                 model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
-                logger.debug("Loading weights on %s ...", load_device)
-                if load_format == "diffusers":
-                    # DiffusersAdapterPipeline.load_weights() calls
-                    # DiffusionPipeline.from_pretrained() internally; it does
-                    # not use our native customized pipeline classes.
-                    cast(DiffusersAdapterPipeline, model).load_weights()
+
+                # Skip load_weights only for DLO+AllGather when the model
+                # supports mmap loading and no online quantization is active.
+                # This condition MUST match the gate in
+                # DistributedLayerwiseOffloadBackend.enable() so that the
+                # loader skips ⟺ enable() uses mmap.
+                from vllm_omni.diffusion.offloader.offload_plan import supports_mmap_loading
+
+                _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+                _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
+                _has_online_quant = self._has_online_quant(model)
+                _supports_mmap = supports_mmap_loading(model)
+
+                _skip_load = _dist_offload and _use_ag and _supports_mmap and not _has_online_quant
+
+                if _skip_load:
+                    logger.info("DLO+AllGather active: skipping load_weights (will load via mmap in enable())")
                 else:
-                    self.load_weights(model)
-                # HSDP processes quantized weights before wrapping parameters as
-                # DTensors. The non-HSDP path can process them here as usual.
-                self._process_weights_after_loading(model, target_device)
+                    if _dist_offload and _use_ag and _has_online_quant:
+                        raise ValueError(
+                            "Online quantization is incompatible with DLO+AllGather: "
+                            "the sharding + AllGather mechanism flattens weights by "
+                            "dtype, which breaks quantized weight/scale layouts. "
+                            "Please use --dlo-no-use-allgather or disable online "
+                            "quantization."
+                        )
+                    if _dist_offload and _use_ag and not _supports_mmap:
+                        logger.info(
+                            "DLO+AllGather active but model does not support mmap: loading weights via regular loader."
+                        )
+                    logger.debug("Loading weights on %s ...", load_device)
+                    if offload_after_quant:
+                        marked = self._request_offload_after_quant(model)
+                        if marked:
+                            logger.info(
+                                "Online quantization will return each of %d layers to CPU as it is quantized",
+                                marked,
+                            )
+                    if load_format == "diffusers":
+                        cast(DiffusersAdapterPipeline, model).load_weights()
+                    else:
+                        self.load_weights(model)
+                    self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
                 model.to("cpu")
@@ -380,6 +412,29 @@ class DiffusersPipelineLoader:
 
         self._apply_skip_softmax_calibration(model)
         return model.eval()
+
+    @staticmethod
+    def _request_offload_after_quant(model: nn.Module) -> int:
+        """Ask online-quant layers to return to host memory once quantized.
+
+        The weights only visit the accelerator so the quant kernels can run on
+        them; ``load_model`` sends the model back to the host afterwards either
+        way. Without this the whole transformer accumulates on device until that
+        final move, which for MiniMax H3 is a ~43 GiB peak that no longer fits
+        beside a resident TP-sharded text encoder — even though layer-wise
+        offload means none of it is supposed to be resident at inference time.
+
+        Only quant methods that advertise ``supports_offload_after_quant`` are
+        asked, since the implementation has to know when a layer is finished.
+        Deferring materialization to the ``meta`` device does not imply that.
+        """
+        marked = 0
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if getattr(quant_method, "supports_offload_after_quant", False):
+                quant_method.enable_offload_after_quant()
+                marked += 1
+        return marked
 
     @staticmethod
     def _has_online_quant(model: nn.Module) -> bool:
@@ -433,6 +488,13 @@ class DiffusersPipelineLoader:
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            # Layers finished during loading would only be staged onto the target
+            # device for a process call that immediately returns. That round trip
+            # is wasted work in general, and undoes the point of the offload for
+            # layers that already went back to the host.
+            if getattr(module, "_already_called_process_weights_after_loading", False):
                 continue
 
             if has_online_quant:
