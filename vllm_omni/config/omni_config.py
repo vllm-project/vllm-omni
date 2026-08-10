@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
@@ -548,6 +549,7 @@ class _DiffusionConfigProjection:
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
@@ -567,6 +569,7 @@ class _DiffusionConfigProjection:
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
+    fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None
@@ -621,6 +624,7 @@ class _DiffusionConfigProjection:
             build_attention_config,
             parse_kv_cache_skip_selector,
         )
+        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
         if self.tf_model_config is None:
@@ -682,6 +686,7 @@ class _DiffusionConfigProjection:
                 f"got {type(self.diffusion_attention_config)!r}"
             )
 
+        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 

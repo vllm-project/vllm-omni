@@ -6,9 +6,12 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -54,6 +57,10 @@ class StepBatchSamplingParamsKey:
     guidance_rescale: float = 0.0
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
+
+    # Request-scoped execution policy. A batch must use one quality mode
+    # because model acceleration hooks are shared by the whole worker batch.
+    quality: str | None = None
 
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
@@ -108,6 +115,11 @@ class RequestBatchSamplingParamsKey:
     layers: int = 4
     use_en_prompt: bool = False
 
+    # Request-scoped execution policy. Keep accelerated and reference-path
+    # requests in separate worker batches. ``None`` delegates the default to
+    # the model and must remain distinct from explicit ``lossless``.
+    quality: str | None = None
+
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
@@ -120,6 +132,7 @@ class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 

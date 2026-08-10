@@ -28,6 +28,11 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
 
 stages:
   - stage_id: 0

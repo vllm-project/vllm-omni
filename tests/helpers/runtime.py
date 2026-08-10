@@ -1252,6 +1252,28 @@ class OpenAIClientHandler:
         )
         return [resp]
 
+    def send_batched_chat_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """Post to batched chat completions."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/chat/completions/batch", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
     def send_completions_http_request(
         self,
         request_config: dict[str, Any],
