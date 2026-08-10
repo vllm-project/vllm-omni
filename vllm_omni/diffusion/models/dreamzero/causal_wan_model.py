@@ -70,6 +70,12 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
     """Precompute complex-valued RoPE frequencies (polar form).
+
+    The angles are accumulated in float64 -- at the far end of the table they
+    reach 1e4 radians, where float32 would resolve them to only ~1e-3 -- and the
+    table is handed out as complex64, since cos and sin land in [-1, 1] and the
+    rotation they feed ends in bfloat16.
+
     Returns: complex tensor [max_seq_len, dim // 2]
     """
     if dim % 2 != 0:
@@ -79,7 +85,7 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
         1.0 / torch.pow(10000, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
     )
     freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+    return freqs.to(torch.complex64)
 
 
 def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -94,14 +100,19 @@ def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     gfx950 as three kernels collapsing to one.
 
     Eager: the real form is the slower one by about 4x, because each of its
-    multiply-adds becomes its own pass over a float64 temporary while the complex
+    multiply-adds becomes its own pass over a temporary while the complex
     multiply is a single elementwise kernel.
 
     Both branches evaluate the same products in the same order and agree bitwise
     once the caller casts back to bfloat16.
+
+    The rotation runs in float32. Only the angles need anything wider, and they
+    are already spent by the time ``rope_params`` hands over cos and sin: those
+    live in [-1, 1], where float32 carries four more decimal digits than the
+    bfloat16 this result is cast back to.
     """
     B, seq_len, n, _ = x.shape
-    pairs = x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+    pairs = x.to(torch.float32).reshape(B, seq_len, n, -1, 2)
     if not torch.compiler.is_compiling():
         rotated = torch.view_as_complex(pairs) * torch.view_as_complex(freqs).unsqueeze(0)
         return torch.view_as_real(rotated).flatten(3)
@@ -121,7 +132,7 @@ def rope_action_apply(
 ) -> torch.Tensor:
     """RoPE with action/state frequency tables for multi-step sequences."""
     B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
+    x = torch.view_as_complex(x.to(torch.float32).reshape(B, seq_len, n, -1, 2))
     if action_register_length is not None:
         if num_action_per_block is None:
             raise ValueError("num_action_per_block is required when action_register_length is set.")
