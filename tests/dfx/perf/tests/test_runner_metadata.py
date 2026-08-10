@@ -486,6 +486,7 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
     assert "A3" in sweeps[2]["params"]["baseline"]
     assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)
 
+
 @pytest.mark.parametrize(
     ("metric", "current", "baseline"),
     [
