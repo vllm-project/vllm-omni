@@ -12,6 +12,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     RequestBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
 
 if TYPE_CHECKING:
@@ -24,17 +25,57 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {"lora_int_id"}
 
 
+def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    """Build the compatibility key shared by scheduling and DP dispatch."""
+    sampling = request.sampling_params
+    # LoRA identity is optional on sampling params (and on test stubs).
+    lora_request = getattr(sampling, "lora_request", None)
+    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    return RequestBatchSamplingParamsKey(**key_kwargs)
+
+
 class RequestScheduler(BaseScheduler):
-    """Diffusion scheduler with vLLM-style waiting/running queues."""
+    """Scheduler for static request waves, including admission coalescing."""
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        assert self.od_config is not None
+        max_wait_ms = self.od_config.request_batch_max_wait_ms
+        if max_wait_ms <= 0.0 or self.max_num_running_reqs <= 1:
+            return _AdmissionWaitDecision(should_wait=False)
+        if self.num_running_requests() > 0:
+            return _AdmissionWaitDecision(should_wait=False)
+
+        max_wait_s = max_wait_ms / 1000.0
+        stable_window_s = min(0.3, max_wait_s / 2.0) if dp_concurrent else min(0.05, max_wait_s / 5.0)
+        return _AdmissionWaitDecision(
+            should_wait=True,
+            deadline=now + max_wait_s,
+            stable_window_s=stable_window_s,
+            max_batch=self.max_num_running_reqs,
+        )
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        waiting = self.num_waiting_requests()
+        return (
+            waiting >= decision.max_batch
+            or (waiting > 0 and now - stable_since >= decision.stable_window_s)
+            or (decision.deadline is not None and now >= decision.deadline)
+        )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        """Build a request-batch compatibility key from sampling parameters."""
-        sampling = request.sampling_params
-        # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
-        key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-        return RequestBatchSamplingParamsKey(**key_kwargs)
+        return build_request_batch_sampling_params_key(request)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

@@ -158,3 +158,16 @@ def test_extract_stage_metadata_preserves_legacy_one_argument_api():
     assert metadata.stage_id == 0
     assert metadata.model_stage == "thinker"
     assert metadata.custom_process_input_func is operator.add
+
+
+def test_extract_stage_metadata_defaults_missing_engine_input_source():
+    pipeline, deploy = _metadata_inputs()
+    legacy_config = merge_pipeline_deploy(
+        pipeline,
+        deploy,
+    )[0].to_omegaconf()
+    del legacy_config["engine_input_source"]
+
+    metadata = extract_stage_metadata(legacy_config)
+
+    assert metadata.engine_input_source == []

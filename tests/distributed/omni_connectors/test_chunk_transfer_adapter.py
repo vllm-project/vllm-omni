@@ -10,8 +10,10 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -37,8 +39,10 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         external_req_id=external_req_id or req_id,
         status=status,
         prompt_token_ids=[],
+        num_prompt_tokens=0,
         num_computed_tokens=0,
         num_output_placeholders=0,
+        prefill_stats=None,
         additional_information=None,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
@@ -386,6 +390,105 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
+def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
+    build_adapter,
+):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(
+        stage_id=0,
+        connector_extra={
+            "initial_codec_chunk_frames": 1,
+            "codec_chunk_frames": 5,
+        },
+    )
+    request = _req(
+        "req-personaplex",
+        RequestStatus.WAITING,
+        external_req_id="ext-personaplex",
+    )
+    request.resumable = True
+    request.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, dtype=torch.long).reshape(1, 8),
+        }
+    }
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": True,
+        }
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.codes is None
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
+def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(
+        stage_id=0,
+        connector_extra={
+            "initial_codec_chunk_frames": 1,
+            "codec_chunk_frames": 5,
+        },
+    )
+    request = _req(
+        "req-personaplex-first",
+        RequestStatus.WAITING,
+        external_req_id="ext-personaplex-reused",
+    )
+    request.resumable = True
+    request.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, dtype=torch.long).reshape(1, 8),
+        }
+    }
+
+    first = talker2code2wav_async_chunk(
+        adapter,
+        multimodal_output=None,
+        request=request,
+        is_finished=True,
+    )
+    assert first is not None
+    assert first.codes is None
+
+    adapter.cleanup_sender(request.external_req_id)
+
+    replacement = _req(
+        "req-personaplex-replacement",
+        RequestStatus.WAITING,
+        external_req_id=request.external_req_id,
+    )
+    replacement.resumable = True
+    replacement.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, 16, dtype=torch.long).reshape(1, 8),
+        }
+    }
+    second = talker2code2wav_async_chunk(
+        adapter,
+        multimodal_output=None,
+        request=replacement,
+        is_finished=True,
+    )
+
+    assert second is not None
+    assert second.codes is None
+
+
 def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
@@ -483,6 +586,48 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     # AR mode now forwards the latest payload directly.
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-later-chunk", RequestStatus.WAITING, external_req_id="ext-later-chunk")
+    request.prefill_stats = PrefillStats()
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+
+    connector.get.return_value = (
+        {
+            "codes": {"audio": torch.tensor([7, 8], dtype=torch.long)},
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        },
+        8,
+    )
+    assert adapter._poll_single_request(request) is True
+    OmniGenerationScheduler._record_prefill_stats(request)
+    first_chunk_stats = request.prefill_stats
+    request.prefill_stats = None
+
+    connector.get.return_value = (
+        {
+            "codes": {"audio": torch.tensor([9, 10, 11], dtype=torch.long)},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        },
+        8,
+    )
+    assert adapter._poll_single_request(request) is True
+    assert isinstance(request.prefill_stats, PrefillStats)
+    OmniGenerationScheduler._record_prefill_stats(request)
+    second_chunk_stats = request.prefill_stats
+
+    assert first_chunk_stats is not None
+    assert first_chunk_stats.num_prompt_tokens == 2
+    assert second_chunk_stats is not None
+    assert second_chunk_stats.num_prompt_tokens == 3
+
+    prompt_token_stats = PromptTokenStats()
+    prompt_token_stats.update_from_output(first_chunk_stats)
+    prompt_token_stats.update_from_output(second_chunk_stats)
+    assert prompt_token_stats.total == 5
+    assert prompt_token_stats.computed == 5
 
 
 def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):

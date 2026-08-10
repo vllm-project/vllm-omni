@@ -23,6 +23,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.diffusion_kv.config import (
+    DiffusionKVCacheMode,
+    parse_diffusion_kv_cache_mode,
+)
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -191,6 +195,16 @@ class DiffusionParallelConfig:
 
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
+    text_encoder_tp_size: int = 1
+    """Number of ranks used to tensor-parallel shard the diffusion text encoder.
+
+    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
+    which keeps the encoder fully resident on the DiT main rank (historical
+    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
+    ranks and run the encode with distributed collectives over the encoder
+    process group.
+    """
 
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
@@ -402,14 +416,14 @@ class DiffusionCacheConfig:
         >>> # Access via attribute
         >>> print(config.rel_l1_thresh)  # 0.3 (from dict)
         >>> print(config.Fn_compute_blocks)  # 8 (default)
-        >>> # Empty dict uses all defaults
+        >>> # Empty dict defers model-specific defaults to the TeaCache backend
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(default_config.rel_l1_thresh)  # None
     """
 
     # TeaCache parameters [tea_cache only]
-    # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
-    rel_l1_thresh: float = 0.2
+    # None defers to the model-specific TeaCache default (0.2 fallback).
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
 
     # MagCache parameters [mag_cache only]
@@ -531,16 +545,15 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+
     if not model:
         return None
 
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from model_index.json.
-    try:
-        model_index = get_hf_file_to_dict("model_index.json", model)
-    except Exception:
-        model_index = None
+    # Diffusers models: read _class_name from the pipeline index.
+    model_index = get_diffusion_model_index(model)
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -593,6 +606,10 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Optional model-defined startup task. Pipelines may use this to select
+    # task-specific components or weights before serving requests.
+    task_type: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -600,6 +617,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    fa_deterministic: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -644,6 +662,9 @@ class OmniDiffusionConfig:
     # the string form only).
     engine_backend: str | type = "default"
 
+    # Local Diffusion KV ownership and cache-layout mode.
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+
     # Optional override for the diffusion model runner class (import path).
     # Precedence in the worker: this override > the runner declared by the
     # selected engine class (``default_diffusion_model_runner_cls``) > the
@@ -677,9 +698,13 @@ class OmniDiffusionConfig:
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
-    # concurrent requests in DP mode). If False: each rank loads full weights
-    # via H2D only (N× CPU memory, but no AllGather synchronization needed).
+    # concurrent requests in DP mode). If False: each rank streams the standard
+    # loader's rank-local tensors (including TP-local shards) via H2D only.
+    # This avoids AllGather synchronization, while host memory follows the
+    # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    # Leading main-DiT blocks kept resident by distributed layerwise offload.
+    dlo_resident_layers: int = 0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -774,6 +799,7 @@ class OmniDiffusionConfig:
     # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
 
     log_level: str = "info"
 
@@ -904,10 +930,28 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+
+        if self.omni_kv_config is None:
+            self.omni_kv_config = {}
+        elif isinstance(self.omni_kv_config, Mapping):
+            self.omni_kv_config = dict(self.omni_kv_config)
+        else:
+            raise TypeError("omni_kv_config must be a mapping")
+        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
+            "need_recv_cache", False
+        ):
+            raise ValueError(
+                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
+                "disable need_recv_cache until connector-aware admission is implemented"
+            )
+
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if self.request_batch_max_wait_ms < 0:
-            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
+        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+            raise ValueError(
+                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
+            )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1108,6 +1152,7 @@ class OmniDiffusionConfig:
         metadata = get_diffusion_model_metadata(self.model_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
@@ -1127,18 +1172,23 @@ class OmniDiffusionConfig:
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
-        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Diffusers-style models expose a pipeline index with ``_class_name``.
         Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
             self.model_class_name = "DiffusersAdapterPipeline"
 
         try:
-            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            config_dict = get_diffusion_model_index(
+                self.model,
+                revision=self.revision,
+            )
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1153,7 +1203,7 @@ class OmniDiffusionConfig:
                         self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
                     except (KeyError, AttributeError) as exc:
                         logger.warning(
-                            "Could not find valid _class_name for diffusers pipeline in model_index.json: %s. "
+                            "Could not find a valid _class_name in the Diffusers pipeline index: %s. "
                             "Without the underlying pipeline class the dummy run may omit required inputs.",
                             exc,
                         )
@@ -1166,16 +1216,16 @@ class OmniDiffusionConfig:
                     else:
                         self.set_tf_model_config(TransformerConfig())
             else:
-                raise FileNotFoundError("model_index.json not found")
+                raise FileNotFoundError("Diffusers pipeline index not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
-                    "Could not find valid model_index.json per diffusers format. "
+                    "Could not find a valid pipeline index per Diffusers format. "
                     "This model is likely unsupported by the diffusers backend. "
-                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
+                    "Also, without knowing the underlying pipeline class from its index, "
                     "the dummy run will input only text prompt, which may cause errors for pipelines "
                     "that require additional inputs."
                 )
@@ -1191,7 +1241,7 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
                         return
-                    raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+                    raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 model_type = cfg.get("model_type")
@@ -1418,6 +1468,63 @@ class SkipSoftmaxSpec:
         if self.target_sparsity is not None and self.threshold is not None:
             raise ValueError("skip_softmax: set either target_sparsity or threshold, not both.")
 
+    @property
+    def enabled(self) -> bool:
+        return self.threshold is not None or self.target_sparsity is not None
+
+
+@dataclass
+class AttnQuantSpec:
+    dtype_qk: str | None = None
+    dtype_vo: str | None = None
+    q_block_size: int = 1
+    k_block_size: int = 16
+    flashinfer_backend: str | None = None
+
+    _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
+    _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
+
+    def __post_init__(self) -> None:
+        for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
+            if v is not None and v not in self._VALID_DTYPES:
+                raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
+        for name, v in (("q_block_size", self.q_block_size), ("k_block_size", self.k_block_size)):
+            if v not in self._VALID_BLOCK_SIZES:
+                raise ValueError(
+                    f"quant.{name}={v!r} unsupported; kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
+                )
+
+    @property
+    def enabled(self) -> bool:
+        return self.dtype_qk is not None or self.dtype_vo is not None
+
+
+# Backends that select key blocks instead of attending densely, and so accept
+# a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
+BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
+
+
+@dataclass
+class BlockSparseSpec:
+    """User-facing controls shared by block-sparse attention backends.
+
+    ``sparsity`` is the nominal fraction of key blocks dropped per query block;
+    ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
+    index selector such as "0-3,38") exempts individual DiT blocks. Those two are
+    the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    """
+
+    sparsity: float = 0.8
+    start_step: int = 0
+    skip_layers: str | list[int] | None = None
+    skip_layer_indices: set[int] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
+        if self.start_step < 0:
+            raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
+
 
 @dataclass
 class AttentionSpec:
@@ -1425,38 +1532,73 @@ class AttentionSpec:
 
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
+    quant: AttnQuantSpec | None = None
+    block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
-        self.skip_softmax = self._coerce_skip_softmax(self.skip_softmax)
+        self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
+        self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
-                f"Remove skip_softmax or set backend to TRTLLM_ATTN."
+                "Remove skip_softmax or set backend to TRTLLM_ATTN."
+            )
+        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+            raise ValueError(
+                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                f"backend={self.backend!r}. Remove quant or set a supported backend."
+            )
+        if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
+            # Selecting the backend is the opt-in; without an explicit block the
+            # defaults apply rather than silently running dense.
+            self.block_sparse = self.block_sparse or BlockSparseSpec()
+        elif self.block_sparse is not None:
+            raise ValueError(
+                f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
+                f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
             )
 
     @staticmethod
-    def _coerce_skip_softmax(value: Any) -> SkipSoftmaxSpec | None:
-        if value is None or isinstance(value, SkipSoftmaxSpec):
+    def _coerce(value: Any, cls: type, field_name: str) -> Any:
+        if value is None or isinstance(value, cls):
             return value
         if isinstance(value, Mapping):
-            return SkipSoftmaxSpec(**dict(value))
-        raise TypeError(f"Expected dict or SkipSoftmaxSpec for skip_softmax, got {type(value)!r}")
+            return cls(**dict(value))
+        raise TypeError(f"Expected dict or {cls.__name__} for {field_name}, got {type(value)!r}")
 
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
-        if self.skip_softmax is None:
-            return None
-        ss = self.skip_softmax
         kw: dict[str, Any] = {}
-        if ss.threshold is not None:
-            kw["skip_softmax_threshold"] = ss.threshold
-        if ss.target_sparsity is not None:
-            kw["target_sparsity"] = ss.target_sparsity
-        if ss.disabled_until_timestep:
-            kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        if self.skip_softmax is not None:
+            ss = self.skip_softmax
+            if ss.threshold is not None:
+                kw["skip_softmax_threshold"] = ss.threshold
+            if ss.target_sparsity is not None:
+                kw["target_sparsity"] = ss.target_sparsity
+            if ss.disabled_until_timestep:
+                kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        if self.quant is not None and self.quant.enabled:
+            q = self.quant
+            quant_kw: dict[str, Any] = {
+                "dtype_qk": q.dtype_qk,
+                "q_block_size": q.q_block_size,
+                "k_block_size": q.k_block_size,
+            }
+            if q.dtype_vo is not None:
+                quant_kw["dtype_vo"] = q.dtype_vo
+            if q.flashinfer_backend is not None:
+                quant_kw["flashinfer_backend"] = q.flashinfer_backend
+            kw["quant"] = quant_kw
+        if self.block_sparse is not None:
+            bs = self.block_sparse
+            kw["sparsity"] = bs.sparsity
+            kw["start_step"] = bs.start_step
+            if bs.skip_layer_indices:
+                kw["skip_layers"] = sorted(bs.skip_layer_indices)
         return kw or None
 
 
@@ -1526,7 +1668,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax"}
+        spec_keys = {"backend", "skip_softmax", "quant", "block_sparse"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

@@ -47,15 +47,17 @@ steps:
           - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · Distributed Test"
+      - label: "Diffusion · Distributed & Attention Test"
         source_file_dependencies:
           - tests/diffusion/distributed/
+          - tests/diffusion/attention/test_attention_sp.py
           - vllm_omni/diffusion/distributed/
-          - vllm_omni/diffusion/attention/parallel/
+          - vllm_omni/diffusion/attention/
           - vllm_omni/diffusion/data.py
           - vllm_omni/diffusion/models/
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"

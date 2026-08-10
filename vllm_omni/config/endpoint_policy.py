@@ -21,7 +21,6 @@ class RouteTarget(NamedTuple):
 class OmniServingCapability(Enum):
     """Serving capabilities that pipelines can shut down."""
 
-    CHAT_COMPLETIONS_BATCH = RouteTarget("/v1/chat/completions/batch", frozenset({"POST"}))
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
 
     @property
@@ -37,16 +36,6 @@ class OmniServingCapability(Enum):
 class EndpointRestriction:
     capability: OmniServingCapability
     reason: str
-
-
-# Routes that are not supported for any model, but are supported in vLLM.
-# This is only temporary to avoid 500s for batched chat completions.
-UNSUPPORTED_ROUTES: tuple[EndpointRestriction, ...] = (
-    EndpointRestriction(
-        OmniServingCapability.CHAT_COMPLETIONS_BATCH,
-        "Batched chat completions are not yet supported by vLLM Omni.",
-    ),
-)
 
 
 def build_rejection_handler(reason: str):
@@ -71,11 +60,7 @@ def shutdown_unsupported_routes(
     """
     from vllm_omni.entrypoints.openai.api_server import _remove_route_from_app
 
-    # Generally these should not overlap since there is no point. If they do,
-    # we use the reason message in UNSUPPORTED_ROUTES, for consistent error messages.
-    restricted_endpoints = (*endpoint_restrictions, *UNSUPPORTED_ROUTES)
-
-    for end_restrict in restricted_endpoints:
+    for end_restrict in endpoint_restrictions:
         capability = end_restrict.capability
         # Remove the route from the app
         _remove_route_from_app(app, capability.path, capability.methods)

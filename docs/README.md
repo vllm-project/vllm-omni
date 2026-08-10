@@ -52,15 +52,16 @@ vLLM-Omni is flexible and easy to use with:
 - Tensor, pipeline, data and expert parallelism support for distributed inference
 - Streaming outputs
 - OpenAI-compatible API server
+- Full-duplex realtime serving with streaming audio input and output (experimental)
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- Omni-modality models (e.g. Qwen3-Omni, Cosmos3, HunyuanImage, BAGEL)
+- Omni-modality models (e.g. Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
 - TTS models (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
-- Diffusion models — image, video, and audio generation (e.g. Qwen-Image, Wan2.2, FLUX)
+- Diffusion models — image, video, and audio generation (e.g. MiniMax H3, Qwen-Image, Wan2.2, FLUX)
 - Robot-policy and action models (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
 
 For more information, checkout the following:
 
-- [vllm-omni architecture design and recent roadmaps](https://docs.google.com/presentation/d/1XJWgv79lORl8rbaVvp2d5Sqs6ZEBgAgj/edit?slide=id.p1#slide=id.p1)
+- [vllm-omni architecture design and recent roadmaps](https://docs.google.com/presentation/d/1aPj0OGl_-ZVoib-Qne5dGDAlrRFB-PdHl6E-EE99g8E/edit?usp=sharing)
 - [vllm-omni announcement blogpost](https://blog.vllm.ai/2025/11/30/vllm-omni.html)

@@ -14,6 +14,11 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
 
 stages:
   - stage_id: 0
@@ -24,9 +29,10 @@ stages:
     max_num_batched_tokens: 16384
     devices: "0"
     limit_mm_per_prompt:
-      video:
-        count: 1
-        num_frames: 32
+      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      image: 64
+      audio: 64
+      video: 1
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -34,7 +40,8 @@ stages:
       max_tokens: 2048
       seed: 42
       detokenize: true
-      repetition_penalty: 1.1
+      # 1.0 for MCQ accuracy; 1.1 can bias short A–D answers.
+      repetition_penalty: 1.0
 
   - stage_id: 1
     max_num_seqs: 4
@@ -75,6 +82,13 @@ stages:
       detokenize: true
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Four Talker streams need much less KV than automatic sizing.
+        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
+        kv_cache_memory_bytes: 2147483648  # 2 GiB
+
   npu:
     stages:
       - stage_id: 0

@@ -7,7 +7,9 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -105,6 +107,34 @@ def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: M
     info = request.model_intermediate_buffer
     assert info["ids"]["tts"] == [11, 12]
     assert torch.equal(info["hidden_states"]["tts"], hidden)
+
+
+def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    engine._enqueue_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    message = engine.request_queue.sync_q.put.call_args.args[0]
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert metadata["omni_final_stage_id"] == 0
+    assert metadata["omni_force_kv_transfer"] is True
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):
