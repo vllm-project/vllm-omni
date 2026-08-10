@@ -788,6 +788,7 @@ class DiffusionResponse:
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before
     #: ``chat.completions.create`` through local image / audio decode.
     e2e_latency: float | None = None
+    stage_durations: dict[str, float] | None = None
     success: bool = False
 
 
@@ -2457,12 +2458,14 @@ class OpenAIClientHandler:
         response.raise_for_status()
         job_data = response.json()
         video_id = job_data["id"]
-        self._wait_until_video_completed(video_id)
+        status_data = self._wait_until_video_completed(video_id)
         end_time = time.perf_counter()
         video_content = self._download_video_content(video_id)
         result.success = True
         result.videos = [video_content]
         result.e2e_latency = end_time - start_time
+        stage_durations = status_data.get("stage_durations")
+        result.stage_durations = stage_durations if isinstance(stage_durations, dict) else None
         assert_diffusion_response(result, request_config, run_level=self.run_level)
         if result.e2e_latency is not None:
             self._print_client_stat(f"[diffusion] request#1 success in {result.e2e_latency:.3f}s")
@@ -2616,7 +2619,7 @@ class OpenAIClientHandler:
 
     def _wait_until_video_completed(
         self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
-    ) -> None:
+    ) -> dict[str, Any]:
         status_url = self._build_url(f"/v1/videos/{video_id}")
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
@@ -2625,7 +2628,7 @@ class OpenAIClientHandler:
             status_data = status_resp.json()
             current_status = status_data["status"]
             if current_status == "completed":
-                return
+                return status_data
             if current_status == "failed":
                 error_msg = status_data.get("last_error", "Unknown error")
                 raise RuntimeError(f"Job failed: {error_msg}")
