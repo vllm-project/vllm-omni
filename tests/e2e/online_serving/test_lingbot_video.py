@@ -19,6 +19,17 @@ MODEL = "robbyant/lingbot-video-dense-1.3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}'
+CACHE_DIT_CONFIG = json.dumps(
+    {
+        "Fn_compute_blocks": 12,
+        "Bn_compute_blocks": 0,
+        "max_warmup_steps": 1,
+        "max_cached_steps": 3,
+        "residual_diff_threshold": 0.06,
+        "max_continuous_cached_steps": 1,
+    },
+    separators=(",", ":"),
+)
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 
@@ -56,6 +67,28 @@ def _get_cpu_offload_cases(model: str):
                 ],
             ),
             id="cpu-offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+    ]
+
+
+def _get_cache_dit_profiler_cases(model: str):
+    return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--cache-backend",
+                    "cache_dit",
+                    "--cache-config",
+                    CACHE_DIT_CONFIG,
+                    "--enable-diffusion-pipeline-profiler",
+                    "--enforce-eager",
+                ],
+            ),
+            id="cache-dit-profiler",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
@@ -143,3 +176,29 @@ def test_cpu_offload_t2v_001(omni_server: OmniServer, openai_client: OpenAIClien
             },
         }
     )
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_cache_dit_profiler_cases(MODEL), indirect=True)
+def test_cache_dit_profiler_t2v_dense(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    responses = openai_client.send_video_diffusion_request(
+        {
+            "model": omni_server.model,
+            "form_data": {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "height": 192,
+                "width": 320,
+                "num_frames": 9,
+                "fps": 24,
+                "num_inference_steps": 4,
+                "guidance_scale": 3.0,
+                "flow_shift": 3.0,
+                "seed": 42,
+            },
+        }
+    )
+    assert responses[0].stage_durations
+    assert "LingBotVideoPipeline.diffuse" in responses[0].stage_durations
