@@ -111,18 +111,18 @@ async def test_watch_replica_list_unregisters_disappeared_replicas(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_closes_hub_then_cancels_watcher(monkeypatch):
+async def test_shutdown_closes_hub_and_watcher_exits_on_its_own(monkeypatch):
     pool = FakePool(stage_id=0)
     hub = FakeHub()
     controller = _controller(monkeypatch, pool, hub)
-    watcher = asyncio.create_task(asyncio.sleep(10))
-    controller._watcher_task = watcher
+    watcher = controller.start()
 
     controller.shutdown()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(watcher, timeout=1)
 
     assert hub.closed is True
-    assert watcher.cancelled()
+    assert watcher.done()
+    assert not watcher.cancelled()
 
 
 @pytest.mark.asyncio

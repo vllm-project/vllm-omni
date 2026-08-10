@@ -101,8 +101,6 @@ class MembershipController:
         if self._hub is not None:
             self._hub.close()
             self._hub = None
-        if self._watcher_task is not None and not self._watcher_task.done():
-            self._watcher_task.cancel()
 
     async def drain_tasks(self, timeout: float = 10.0) -> None:
         """Wait for in-flight membership tasks to complete."""
