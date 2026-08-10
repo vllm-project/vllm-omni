@@ -960,6 +960,15 @@ class Orchestrator:
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
+                            if pool.clients[replica_id] is None:
+                                logger.info(
+                                    "[Orchestrator] Stage-%s replica-%s poll failed after the replica"
+                                    " was already detached, ignoring stale error: %s",
+                                    stage_id,
+                                    replica_id,
+                                    e,
+                                )
+                                continue
                             logger.error(
                                 "[Orchestrator] Stage-%s replica-%s is dead: %s",
                                 stage_id,

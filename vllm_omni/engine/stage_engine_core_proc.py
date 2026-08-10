@@ -173,6 +173,9 @@ class StageEngineCoreProc(EngineCoreProc):
             signal_callback = SignalCallback(wakeup_engine)
 
             def signal_handler(signum: int, frame: Any) -> None:
+                # Ignore a repeat signal once shutdown is already underway.
+                if engine_core.shutdown_state != EngineShutdownState.RUNNING:
+                    return
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
                 raise SystemExit(_signal_exit_code(signum))
@@ -193,8 +196,6 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core._send_engine_dead()
             raise
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
                 signal_callback.stop()
             if coord_client is not None:
@@ -202,3 +203,6 @@ class StageEngineCoreProc(EngineCoreProc):
                     coord_client.close()
             if engine_core is not None:
                 engine_core.shutdown()
+            # Reset handlers only after cleanup finishes, not before.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)

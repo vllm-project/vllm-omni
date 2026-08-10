@@ -224,7 +224,7 @@ class OmniCoordClientForStage:
                 pass  # Socket may already be broken, proceed with close
 
             # Close DEALER socket and terminate this client's context.
-            self._socket.close(0)
+            self._socket.close(linger=1000)
             try:
                 self._ctx.term()
             except zmq.ZMQError:
