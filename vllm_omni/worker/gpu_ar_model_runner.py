@@ -556,6 +556,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         gc.unfreeze()
 
         # 2. Destroy talker MTP CUDA graph wrapper to release captured graphs.
+        if hasattr(self, "_talker_mtp_eager"):
+            self._talker_mtp_eager = None
         if hasattr(self, "talker_mtp") and self.talker_mtp is not None:
             self.talker_mtp = None
         self.has_talker_mtp = False
@@ -596,7 +598,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         from vllm.compilation.monitor import set_cudagraph_capturing_enabled
         from vllm.distributed.parallel_state import graph_capture
 
-        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        capture_sizes = self._talker_mtp_graph_capture_sizes()
+        if not capture_sizes:
+            return
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
         capture_sizes = sorted(capture_sizes, reverse=True)
         logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)

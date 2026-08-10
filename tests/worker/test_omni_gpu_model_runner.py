@@ -1,9 +1,13 @@
+import gc
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import CUDAGraphMode
 
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -244,6 +248,155 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 
     # Ensure no changes were made
     assert torch.allclose(inputs_embeds, before)
+
+
+def test_talker_mtp_graph_capture_sizes_only_cover_reachable_batches():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.talker_mtp_uses_outer_graph = True
+    runner.max_num_reqs = 64
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 128, 256, 512]
+    )
+
+    runner.talker_mtp_outer_graph_max_batch_size = 8
+    assert runner._talker_mtp_graph_capture_sizes() == [1, 2, 4, 8]
+
+    runner.talker_mtp_outer_graph_max_batch_size = None
+    assert runner._talker_mtp_graph_capture_sizes() == [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+
+
+def test_gpu_ar_runner_shutdown_releases_eager_talker_reference(monkeypatch):
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+    import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+
+    class TalkerOwner:
+        def talker_mtp(self):
+            pass
+
+    monkeypatch.setattr(ar_mod.gc, "unfreeze", lambda: None)
+    monkeypatch.setattr(CUDAGraphWrapper, "clear_all_graphs", staticmethod(lambda: None))
+    monkeypatch.setattr(BreakableCUDAGraphWrapper, "clear_all_graphs", staticmethod(lambda: None))
+    monkeypatch.setattr(OmniGPUModelRunner, "shutdown", lambda self: setattr(self, "model", None))
+
+    runner = object.__new__(GPUARModelRunner)
+    owner = TalkerOwner()
+    owner_ref = weakref.ref(owner)
+    runner.model = owner
+    runner._talker_mtp_eager = owner.talker_mtp
+    runner.talker_mtp = None
+    runner.has_talker_mtp = True
+    runner.input_ids = None
+    runner.inputs_embeds = None
+    runner._downstream_payload_cache = {}
+    runner.model_intermediate_buffer = {}
+
+    del owner
+    runner.shutdown()
+    gc.collect()
+
+    assert runner._talker_mtp_eager is None
+    assert owner_ref() is None
+
+
+def test_talker_mtp_forward_uses_eager_path_above_graph_batch_limit(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    seen_context = {}
+
+    @contextmanager
+    def capture_forward_context(*args, **kwargs):
+        seen_context.update(kwargs)
+        yield
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", capture_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "is_cuda", lambda: True)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.talker_mtp_uses_outer_graph = True
+    runner.talker_mtp_outer_graph_max_batch_size = 1
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"tts_local_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    assert not hasattr(runner, "_talker_mtp_eager")
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=False,
+        talker_mtp_supports_per_row_generators=True,
+    )
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return CUDAGraphMode.FULL, batch_desc, None, None, None
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert seen_context["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    row_generators = runner.talker_mtp.calls[0]["generators"]
+    assert [generator.initial_seed() for generator in row_generators] == [11, 22]
+    assert runner._talker_mtp_generators == {
+        "r1": row_generators[0],
+        "r2": row_generators[1],
+    }
+
+
+def test_talker_mtp_outer_graph_keeps_default_seeded_requests_batched(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    seen_context = {}
+
+    @contextmanager
+    def capture_forward_context(*args, **kwargs):
+        seen_context.update(kwargs)
+        yield
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", capture_forward_context)
+    monkeypatch.setattr(mod.current_omni_platform, "is_cuda", lambda: True)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.talker_mtp_uses_outer_graph = True
+    runner.talker_mtp_outer_graph_max_batch_size = 8
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"tts_local_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=False,
+        talker_mtp_supports_per_row_generators=True,
+    )
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return CUDAGraphMode.FULL, batch_desc, None, None, None
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert seen_context["cudagraph_runtime_mode"] == CUDAGraphMode.FULL
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert runner.talker_mtp.calls[0]["generators"] is None
+    assert not hasattr(runner, "_talker_mtp_generators")
 
 
 def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker(monkeypatch):
