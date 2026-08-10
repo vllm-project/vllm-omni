@@ -726,6 +726,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         state = self._minicpmo45_duplex_state_for_row(row_idx)
+        pending_terminator = getattr(state, "pending_terminator_token", None)
+        terminator_ids = {
+            token_ids.get("listen_token_id", -1),
+            token_ids.get("chunk_eos_token_id", -1),
+            token_ids.get("chunk_tts_eos_token_id", -1),
+            token_ids.get("turn_eos_token_id", -1),
+        }
+        if isinstance(pending_terminator, int) and pending_terminator >= 0 and pending_terminator in terminator_ids:
+            # Async scheduling can execute one stale decode frame before the
+            # scheduler observes the segment stop. Keep the model-owned policy
+            # state frozen until the next append consumes this terminator.
+            return int(pending_terminator)
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
             max_speak_tokens = int(
                 getattr(

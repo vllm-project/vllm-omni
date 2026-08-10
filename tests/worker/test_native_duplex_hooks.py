@@ -1698,6 +1698,60 @@ def test_minicpmo_stage0_records_bounded_model_policy_history():
     assert state.generated_tokens == [*expected_history[len(token_ids) :], *token_ids.values()]
 
 
+def test_minicpmo_stage0_async_lookahead_preserves_pending_terminator():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = ("sid-async-lookahead", 0)
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    state.pending_terminator_token = 8
+    state.last_terminator_token = 8
+    state.generated_tokens = [198]
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    model._minicpmo45_duplex_row_payloads = {0: {"is_speech": True}}
+
+    token_ids = {
+        "unit_token_id": 1,
+        "unit_end_token_id": 2,
+        "listen_token_id": 3,
+        "speak_token_id": 4,
+        "tts_bos_token_id": 5,
+        "tts_eos_token_id": 6,
+        "tts_pad_token_id": 7,
+        "chunk_eos_token_id": 8,
+        "chunk_tts_eos_token_id": 9,
+        "turn_eos_token_id": 10,
+    }
+    logits = torch.full((1, 32), -100.0)
+    logits[0, 11] = 20.0
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        output_token_ids=[[]],
+    )
+
+    sampled = model._sample_minicpmo45_native_duplex_row(
+        logits,
+        sampling_metadata,
+        row_idx=0,
+        token_ids=token_ids,
+    )
+
+    # Async scheduling may execute one decode frame after the segment
+    # terminator is sampled but before the scheduler processes it. That stale
+    # frame must not advance the Python-owned duplex policy state.
+    assert sampled == token_ids["chunk_eos_token_id"]
+    assert state.pending_terminator_token == token_ids["chunk_eos_token_id"]
+    assert state.last_terminator_token == token_ids["chunk_eos_token_id"]
+    assert state.generated_tokens == [198]
+
+
 def test_minicpmo_stage0_native_sampler_does_not_override_model_at_punctuation():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
