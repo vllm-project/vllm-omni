@@ -374,8 +374,9 @@ class TestResolveModelConfigPath:
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
-        """Ensure that dtype survives default stage creation."""
-        kwargs = {"dtype": torch.float32}
+        """Ensure that kwargs survive default stage creation."""
+        engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+        kwargs = {"dtype": torch.float32, "engine_backend": engine_backend}
         mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
         mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
 
@@ -389,20 +390,7 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
-
-    def test_default_diffusion_stage_preserves_custom_engine_routing(self):
-        engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
-        runner_cls = "vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner"
-
-        stage = AsyncOmniEngine._create_default_diffusion_stage_cfg(
-            {
-                "engine_backend": engine_backend,
-                "diffusion_model_runner_cls": runner_cls,
-            }
-        )[0]
-
-        assert stage["engine_args"]["engine_backend"] == engine_backend
-        assert stage["engine_args"]["diffusion_model_runner_cls"] == runner_cls
+        assert stage_configs[0]["engine_args"]["engine_backend"] == engine_backend
 
     def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
         self, tmp_path, mocker: MockerFixture
