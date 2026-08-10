@@ -224,47 +224,6 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     assert payload.meta.turn_end is True
 
 
-def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
-    manager = _manager()
-    request = _request("req")
-    request.additional_information = {
-        "codes": {"ref": [0.1, -0.1]},
-        "meta": {
-            "ref_audio_sr": 16000,
-            "native_duplex_segment_text": "hello",
-            "segment_end": True,
-            "turn_end": True,
-        },
-        "duplex": {"epoch": 3, "model_turn_id": 7},
-    }
-
-    payload = tts2code2wav_full_payload(
-        transfer_manager=manager,
-        pooling_output={
-            "codes.audio": torch.arange(7, dtype=torch.long).reshape(-1, 1),
-            "meta.finished": torch.tensor(True),
-        },
-        request=request,
-    )
-
-    assert _codes(payload) == [4218, 4218, 4218, *range(7)]
-    assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
-    assert payload.meta.request_id == "req"
-    assert payload.meta.chunk_seq == 0
-    assert payload.meta.code_flat_numel == 10
-    assert payload.meta.codec_chunk_frames == 7
-    assert payload.meta.codec_left_context_frames == 3
-    assert payload.meta.left_context_size == 3
-    assert payload.meta.last_chunk is True
-    assert payload.meta.finished.item() is True
-    assert payload.meta.ref_audio_sr == 16000
-    assert payload.meta.native_duplex_segment_text == "hello"
-    assert payload.meta.duplex_epoch == 3
-    assert payload.meta.duplex_turn_id == 7
-    assert payload.meta.segment_end is True
-    assert payload.meta.turn_end is True
-
-
 def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
     output = SimpleNamespace(
         finished=True,
