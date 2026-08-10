@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """E2E offline inference tests for the Gepard-1.0 single-stage native-AR TTS.
 
-Zero-shot only (the model's default learned voice). These tests need
-a GPU and the NeMo NanoCodec (pytest.mark.slow / tts). The window arithmetic
-behind the streaming decode is covered on CPU in
-``tests/model_executor/models/test_gepard_window.py``.
+Zero-shot only (the model's default learned voice). These tests need a GPU and
+the NeMo NanoCodec, and are spread across CI tiers by level marker -- see the
+comment above ``pytestmark``. The window arithmetic behind the streaming decode
+is covered on CPU in ``tests/model_executor/models/test_gepard_window.py``.
 """
 
 from __future__ import annotations
@@ -79,8 +79,16 @@ _ASR_ESCALATION_MODEL = "small"
 # failure -- one request's audio delivered for another.
 _TRANSCRIBED_CLIPS = 2
 
+# No level marker at module scope: each test below carries the one that matches
+# how often its claim needs re-checking, so the tiers do not all pay for all of
+# it. L3 (advanced_model, every merge) gets the one canonical path; L4
+# (full_model, nightly) gets the layout variants; L5 (slow, weekly) gets the
+# concurrency batch, the most expensive test here and the one covering code that
+# changes least. There is deliberately no L2 (core_model) row: under
+# ``load_format: dummy`` the stop head is random, so every request runs to
+# gepard.yaml's ``max_tokens: 4096`` -- ~190 s of audio through NanoCodec with
+# ``enforce_eager``, far past what the L2 budget is for.
 pytestmark = [
-    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
@@ -215,17 +223,28 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
     return _transcribe(wav, tmp_dir, name, model_size=_ASR_ESCALATION_MODEL)
 
 
-@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     ("text", "keyword"),
     [
-        ("Hello, this is Gepard speaking.", "hello"),
+        # The canonical path, and the only row on the merge gate: one request,
+        # one transcript, the cheapest check that reads the audio as speech.
+        pytest.param(
+            "Hello, this is Gepard speaking.",
+            "hello",
+            marks=pytest.mark.advanced_model,
+            id="canonical",
+        ),
         # No keyword: this row asserts the same thing about the audio as the one
         # above it, so it carries the structural and stopping checks over a
         # second text and leaves the transcript to the row that already makes
-        # that claim.
-        ("The quick brown fox jumps over the lazy dog.", None),
+        # that claim. A second text is worth a nightly run, not a merge one.
+        pytest.param(
+            "The quick brown fox jumps over the lazy dog.",
+            None,
+            marks=pytest.mark.full_model,
+            id="second_text",
+        ),
     ],
 )
 def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keyword: str | None) -> None:
@@ -251,7 +270,7 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
     assert keyword in transcript, f"expected {keyword!r} in transcript, got {transcript!r}"
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) -> None:
     """The other branch of the prompt layout, end to end.
@@ -277,7 +296,7 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
     assert "river" in transcript, f"expected 'river' in transcript, got {transcript!r}"
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level: str) -> None:
     """Four requests in one batch, each holding its own generation state.

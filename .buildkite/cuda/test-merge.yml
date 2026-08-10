@@ -103,6 +103,22 @@ steps:
             "
         mirror_hardwares: l4_1
 
+      - label: "TTS · Gepard-1.0 Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_gepard_tts.py
+          - vllm_omni/model_executor/models/gepard/
+          - vllm_omni/config/pipeline_registry.py
+          - vllm_omni/deploy/gepard.yaml
+        timeout_in_minutes: 20
+        commands:
+          - |
+            timeout 20m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/offline_inference/test_gepard_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        mirror_hardwares: l4_1
+
       - label: "TTS · Higgs-Audio-V3 Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_higgs_audio_v3.py
