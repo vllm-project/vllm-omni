@@ -240,6 +240,10 @@ class TestGetRequestBatchSamplingParamsKey:
 
 
 class TestRequestScheduler:
+    def setup_method(self) -> None:
+        self.scheduler: RequestScheduler = RequestScheduler()
+        self.scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+
     def test_admission_wait_disabled_with_zero_max_wait(self) -> None:
         self.scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
         decision = self.scheduler.get_admission_wait_decision(now=10.0)
