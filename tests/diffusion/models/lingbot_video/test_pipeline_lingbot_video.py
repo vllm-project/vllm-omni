@@ -97,9 +97,7 @@ def test_execution_options_separates_base_aliases_from_refiner_fields():
     assert options.base_low_noise_threshold == pytest.approx(0.3)
     assert options.base_sigma_tail_steps == 4
 
-    separated = normalize_lingbot_execution_options(
-        {"t_thresh": 0.25, "refiner_sigma_tail_steps": 3}
-    )
+    separated = normalize_lingbot_execution_options({"t_thresh": 0.25, "refiner_sigma_tail_steps": 3})
     assert separated.base_low_noise_threshold == pytest.approx(0.25)
     assert separated.base_sigma_tail_steps == 2
     assert separated.refiner.sigma_tail_steps == 3

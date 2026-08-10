@@ -540,6 +540,7 @@ class LingBotVideoPipeline(
             model,
             local_files_only=local_files_only,
             subfolders=component_subfolders,
+            revision=revision,
         )
         if self.refiner_config.enabled and not refiner_shares_source:
             if refiner_model is None:
@@ -548,6 +549,7 @@ class LingBotVideoPipeline(
                 refiner_model,
                 local_files_only=refiner_local_files_only,
                 subfolders=[refiner_subfolder, scheduler_subfolder],
+                revision=refiner_revision,
             )
 
         text_encoder_kwargs: dict[str, Any] = {
@@ -914,8 +916,8 @@ class LingBotVideoPipeline(
             return frames[0, 0]
         return frames[0]
 
-    def _offload_vae_for_denoise(self, *, enabled: bool, output_type: str) -> torch.device | None:
-        if not enabled or output_type == "latent":
+    def _offload_vae_for_denoise(self, *, enabled: bool) -> torch.device | None:
+        if not enabled:
             return None
         vae_device = _module_device(self.vae)
         if vae_device.type != "cuda":
@@ -1471,10 +1473,7 @@ class LingBotVideoPipeline(
             null_cond_clone_zero=options.null_cond_clone_zero,
         )
 
-        vae_restore_device = self._offload_vae_for_denoise(
-            enabled=options.offload_vae_during_denoise,
-            output_type="pt" if run_refiner else output_type,
-        )
+        vae_restore_device = self._offload_vae_for_denoise(enabled=options.offload_vae_during_denoise)
         latents = self.diffuse(
             num_frames=num_frames,
             height=height,
@@ -1506,8 +1505,7 @@ class LingBotVideoPipeline(
             options=options.refiner,
         )
         refiner_vae_restore_device = self._offload_vae_for_denoise(
-            enabled=self.refiner_config.offload_vae_during_denoise,
-            output_type="pt",
+            enabled=self.refiner_config.offload_vae_during_denoise
         )
         refiner_condition = self._prepare_refiner_condition(
             prompt=prompt,

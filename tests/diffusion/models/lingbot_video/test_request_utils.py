@@ -408,3 +408,27 @@ def test_resolve_lingbot_output_dimensions_reads_extra_fields():
         sampling_height=480,
         extra_fields={"resolution": "720p", "ratio": "16:9"},
     ) == (736, 1280)
+
+
+def test_normalize_lingbot_request_extra_size_overrides_prompt_dimensions():
+    config = _normalize(
+        {"prompt": {"caption": "motion", "width": 480, "height": 480}, "modalities": ["video"]},
+        width=640,
+        height=640,
+        num_frames=81,
+        extra_args={"size": "320x192"},
+    )
+
+    assert (config.height, config.width) == (192, 320)
+
+
+def test_normalize_lingbot_request_extra_dimensions_override_prompt_size():
+    config = _normalize(
+        {"prompt": {"caption": "motion", "size": "480x480"}, "modalities": ["video"]},
+        width=640,
+        height=640,
+        num_frames=81,
+        extra_args={"width": 320, "height": 192},
+    )
+
+    assert (config.height, config.width) == (192, 320)

@@ -42,9 +42,7 @@ def _resolve_hsdp_param_dtype(
     FP8 models require the same behavior for their GEMM kernels.
     """
     preserve_param_dtype = bool(getattr(model, "_hsdp_preserve_param_dtype", False))
-    has_fp8_params = any(
-        p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters()
-    )
+    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
     return None if preserve_param_dtype or has_fp8_params else configured_dtype
 
 

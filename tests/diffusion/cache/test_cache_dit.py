@@ -236,42 +236,45 @@ def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group):
     pipeline.transformer = model
     backend = CacheDiTBackend(DiffusionCacheConfig())
     backend.enable(pipeline)
-    backend.refresh(pipeline, num_inference_steps=5)
+    try:
+        backend.refresh(pipeline, num_inference_steps=5)
 
-    # Wrap call_Fn_blocks in CacheDiT so that we can verify the
-    # hidden/encoder states are what we expect them to be
-    captured = {}
-    original = CachedBlocks_Pattern_0_1_2.call_Fn_blocks
+        # Wrap call_Fn_blocks in CacheDiT so that we can verify the
+        # hidden/encoder states are what we expect them to be
+        captured = {}
+        original = CachedBlocks_Pattern_0_1_2.call_Fn_blocks
 
-    def call_Fn_blocks_and_capture(self, hidden_states, encoder_hidden_states, *a, **kw):
-        captured["hidden_states"] = hidden_states
-        captured["encoder_hidden_states"] = encoder_hidden_states
-        return original(self, hidden_states, encoder_hidden_states, *a, **kw)
+        def call_Fn_blocks_and_capture(self, hidden_states, encoder_hidden_states, *a, **kw):
+            captured["hidden_states"] = hidden_states
+            captured["encoder_hidden_states"] = encoder_hidden_states
+            return original(self, hidden_states, encoder_hidden_states, *a, **kw)
 
-    # Also, map projections to identity so that we can just check
-    # the captured tensors directly instead of having to reproject
-    identity = torch.nn.Identity()
-    with (
-        patch.object(model, "proj_in", identity),
-        patch.object(model, "audio_proj_in", identity),
-        patch.object(CachedBlocks_Pattern_0_1_2, "call_Fn_blocks", call_Fn_blocks_and_capture),
-        torch.no_grad(),
-    ):
-        model(
-            hidden_states=video_in,
-            audio_hidden_states=audio_in,
-            encoder_hidden_states=text_in,
-            audio_encoder_hidden_states=audio_text_in,
-            timestep=torch.tensor([[1000.0] * seq_len]),
-            num_frames=1,
-            height=2,
-            width=2,
-            audio_num_frames=seq_len,
-        )
+        # Also, map projections to identity so that we can just check
+        # the captured tensors directly instead of having to reproject
+        identity = torch.nn.Identity()
+        with (
+            patch.object(model, "proj_in", identity),
+            patch.object(model, "audio_proj_in", identity),
+            patch.object(CachedBlocks_Pattern_0_1_2, "call_Fn_blocks", call_Fn_blocks_and_capture),
+            torch.no_grad(),
+        ):
+            model(
+                hidden_states=video_in,
+                audio_hidden_states=audio_in,
+                encoder_hidden_states=text_in,
+                audio_encoder_hidden_states=audio_text_in,
+                timestep=torch.tensor([[1000.0] * seq_len]),
+                num_frames=1,
+                height=2,
+                width=2,
+                audio_num_frames=seq_len,
+            )
 
-    # Pattern_0 maps (hidden_states, encoder_hidden_states) to (video, audio)
-    assert torch.equal(captured["hidden_states"], video_in)
-    assert torch.equal(captured["encoder_hidden_states"], audio_in)
+        # Pattern_0 maps (hidden_states, encoder_hidden_states) to (video, audio)
+        assert torch.equal(captured["hidden_states"], video_in)
+        assert torch.equal(captured["encoder_hidden_states"], audio_in)
+    finally:
+        backend.disable(pipeline)
 
 
 def test_summary_with_no_transformer_is_nonfatal():
