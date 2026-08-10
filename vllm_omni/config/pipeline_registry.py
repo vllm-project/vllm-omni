@@ -85,6 +85,12 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_REALTIME_PIPELINE,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
+from vllm_omni.model_executor.models.omni_diffusion.pipeline import (
+    OMNI_DIFFUSION_AUDIO_PIPELINE,
+    OMNI_DIFFUSION_S2I_PIPELINE,
+    OMNI_DIFFUSION_T2I_PIPELINE,
+    OMNI_DIFFUSION_TEXT_PIPELINE,
+)
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
@@ -159,6 +165,10 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
+    "omni_diffusion_t2i": OMNI_DIFFUSION_T2I_PIPELINE,
+    "omni_diffusion_text": OMNI_DIFFUSION_TEXT_PIPELINE,
+    "omni_diffusion_audio": OMNI_DIFFUSION_AUDIO_PIPELINE,
+    "omni_diffusion_s2i": OMNI_DIFFUSION_S2I_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,

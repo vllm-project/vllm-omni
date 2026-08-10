@@ -369,6 +369,16 @@ _OMNI_MODELS = {
         "indextts2_s2mel_decoder",
         "IndexTTS2S2MelDecoder",
     ),
+    "OmniDiffusionForConditionalGeneration": (
+        "omni_diffusion",
+        "omni_diffusion",
+        "OmniDiffusionForConditionalGeneration",
+    ),
+    "OmniDiffusionTextAdapterForConditionalGeneration": (
+        "omni_diffusion",
+        "text_adapter",
+        "OmniDiffusionTextAdapterForConditionalGeneration",
+    ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (
         "ming_flash_omni",

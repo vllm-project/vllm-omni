@@ -1,0 +1,34 @@
+# Omni-Diffusion speech-to-image uses a model-specific diffusion wrapper.
+# The image-output chat route passes input audio through
+# sampling_params.extra_args["audio_path"], which the wrapper decodes before
+# running the official DreamModel generation and image-token decoding flow.
+async_chunk: false
+pipeline: omni_diffusion_s2i
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    max_num_seqs: 1
+    default_sampling_params:
+      seed: 42
+    model_config:
+      # null downloads showlab/magvitv2; set a local directory to override.
+      image_tokenizer_path: null
+      # null downloads FunAudioLLM/SenseVoiceSmall.
+      sensevoice_path: null
+      attn_implementation: eager
+      output_text_only: false
+      task: S2I
+      steps: 260
+      max_new_tokens: 260
+      alg: entropy-penalty
+      repeat_penalty: 1.2
+      max_position_penalty: 2.0
+      # Keep the official S2I classifier-free guidance setting.
+      cfg: 2.0
+      temperature: 0.0
+      top_p: 0.9
+      seed: 42

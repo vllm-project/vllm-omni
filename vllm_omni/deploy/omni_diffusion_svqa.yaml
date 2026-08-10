@@ -1,0 +1,31 @@
+base_config: omni_diffusion.yaml
+pipeline: omni_diffusion_text
+
+stages:
+  - stage_id: 0
+    engine_extras:
+      additional_config:
+        output_text_only: true
+        task: SVQA
+        steps: 64
+        max_new_tokens: 64
+        alg: entropy
+        repeat_penalty: 1.0
+        max_position_penalty: 2.0
+        cfg: 0.0
+        temperature: 0.0
+        top_p: 0.9
+        seed: 42
+
+  # The parameter-free text adapter returns CPU tensors during warmup to skip
+  # unsupported sampler kernels, so it must not be captured in a CUDA graph.
+  - stage_id: 1
+    devices: "0"
+    gpu_memory_utilization: 0.1
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    default_sampling_params:
+      # Stage 0 can return 64 text tokens; reserve one more AR step for EOS.
+      max_tokens: 65

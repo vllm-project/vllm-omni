@@ -1,0 +1,19 @@
+# Omni-Diffusion text-to-image through Dream generation.
+base_config: omni_diffusion.yaml
+pipeline: omni_diffusion_t2i
+
+stages:
+  - stage_id: 0
+    engine_extras:
+      additional_config:
+        output_text_only: false
+        task: T2I
+        steps: 260
+        max_new_tokens: 260
+        alg: entropy-penalty
+        repeat_penalty: 1.2
+        max_position_penalty: 2.0
+        cfg: 0.0
+        temperature: 0.0
+        top_p: 0.9
+        seed: 42

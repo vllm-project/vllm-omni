@@ -1,0 +1,27 @@
+# Shared Omni-Diffusion stage and side-component configuration.
+#
+# Task deploys inherit this file and provide their own pipeline topology and
+# generation settings. Null component paths use the official Hugging Face
+# repositories; set a local directory to override the downloaded snapshot.
+async_chunk: false
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    engine_extras:
+      additional_config:
+        # null downloads showlab/magvitv2; set an existing local directory to override.
+        image_tokenizer_path: null
+        audio_tokenizer_type: sensevoice_glm4voice
+        # null downloads THUDM/glm-4-voice-decoder for TTS.
+        flow_path: null
+        # null downloads FunAudioLLM/SenseVoiceSmall for audio-input tasks.
+        sensevoice_path: null
+        attn_implementation: eager
+        add_boa_token: 0

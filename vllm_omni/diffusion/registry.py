@@ -316,6 +316,11 @@ _DIFFUSION_MODELS = {
         "pipeline_krea2",
         "Krea2Pipeline",
     ),
+    "OmniDiffusionS2IPipeline": (
+        "omni_diffusion",
+        "pipeline_s2i",
+        "OmniDiffusionS2IPipeline",
+    ),
 }
 
 
@@ -333,6 +338,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    "OmniDiffusionS2IPipeline",
 }
 
 

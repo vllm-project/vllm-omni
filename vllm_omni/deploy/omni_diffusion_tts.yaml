@@ -1,0 +1,18 @@
+base_config: omni_diffusion.yaml
+pipeline: omni_diffusion_audio
+
+stages:
+  - stage_id: 0
+    engine_extras:
+      additional_config:
+        output_text_only: false
+        task: TTS
+        steps: 25
+        max_new_tokens: 50
+        alg: entropy
+        repeat_penalty: 1.0
+        max_position_penalty: 2.0
+        cfg: 0.0
+        temperature: 0.0
+        top_p: 0.9
+        seed: 42

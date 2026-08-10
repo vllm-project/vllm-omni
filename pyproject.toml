@@ -89,6 +89,25 @@ local = [
     "FlagEmbedding",
 ]
 
+# Optional runtime dependencies for Omni-Diffusion side components.  The base
+# vLLM-Omni environment owns torch/torchaudio/transformers, so keep those out of
+# this extra and only list the packages needed by the official Omni-Diffusion
+# image/audio tokenizers and GLM-4-Voice decoder.
+omni-diffusion = [
+    "conformer==0.3.2",
+    "funasr",
+    "gdown==6.1.0",
+    "hyperpyyaml==1.2.2",
+    "ruamel.yaml>=0.17.28,<0.19",
+    "lightning==2.6.5",
+    "matplotlib>=3.7.5",
+    "modelscope",
+    "peft",
+    "pytorch-lightning==2.6.5",
+    "wget==3.2",
+    "wetextprocessing",
+]
+
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [

@@ -1,0 +1,9 @@
+GLM-4-Voice decoder runtime
+Copyright 2024 GLM-4-Voice Model Team @ Zhipu AI
+
+This product includes source derived from THUDM/GLM-4-Voice revision
+54d667262bc1b92a62211aca44c7fcfe290e5df9. The vendored runtime has been
+modified for integration with vLLM-Omni as described in ../README.md.
+
+GLM-4-Voice is licensed under the Apache License, Version 2.0. A copy of the
+license is provided in the root LICENSE file of this repository.

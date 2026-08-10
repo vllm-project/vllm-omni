@@ -6,6 +6,7 @@ dynin_omni: Dynin-Omni
 lance: Lance
 mimo_audio: MiMo-Audio
 ming_flash_omni: Ming-flash-omni 2.0
+omni_diffusion: Omni-Diffusion
 qwen2_5_omni: Qwen2.5-Omni
 qwen3_omni: Qwen3-Omni
 step_audio2: Step-Audio2
