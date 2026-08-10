@@ -207,7 +207,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
         talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+        use_talker_mtp_graph = cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe)
+        if use_talker_mtp_graph:
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
             self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
@@ -219,6 +220,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        sampling_noise_shape = getattr(self.model, "talker_mtp_sampling_noise_shape", None)
+        if use_talker_mtp_graph and sampling_noise_shape:
+            self.talker_mtp_sampling_noise = self._make_buffer(
+                max_batch_size, *tuple(int(dim) for dim in sampling_noise_shape), dtype=torch.float32, numpy=False
+            )
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -1883,8 +1889,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             for stale_id in [rid for rid in cache if rid not in self.requests]:
                 del cache[stale_id]
 
+        sampling_noise_buf = getattr(self, "talker_mtp_sampling_noise", None)
+
         if (
             decode_batch_size > 1
+            and sampling_noise_buf is None
             and any(generator is not None for generator in row_generators)
             and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
         ):
@@ -1916,7 +1925,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
         }
-        if decode_batch_size == 1:
+
+        if sampling_noise_buf is not None:
+            sampling_noise = sampling_noise_buf.gpu[:num_tokens_padded]
+            sampling_noise.exponential_()
+            for row, generator in enumerate(row_generators):
+                if generator is not None:
+                    sampling_noise[row : row + 1].exponential_(generator=generator)
+            talker_kwargs["sampling_noise"] = sampling_noise
+        elif decode_batch_size == 1:
             if row_generators[0] is not None:
                 talker_kwargs["generator"] = row_generators[0]
         elif any(generator is not None for generator in row_generators):

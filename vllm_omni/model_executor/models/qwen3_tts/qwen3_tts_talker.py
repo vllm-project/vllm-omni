@@ -348,6 +348,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
         )
         self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
+        self.talker_mtp_sampling_noise_shape = (self.talker_config.num_code_groups - 1, self._codebook_vocab_size)
         self.use_async_omni_output = True
         self.eager_omni_postprocess_before_async_output = True
         self.omni_pooler_payload_include_hidden = False
@@ -1089,6 +1090,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         top_p: float | None = None,
         generator: torch.Generator | None = None,
         generators: Sequence[torch.Generator | None] | None = None,
+        sampling_noise: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
@@ -1129,6 +1131,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             top_p=top_p,
             generator=generator,
             generators=generators,
+            sampling_noise=sampling_noise,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

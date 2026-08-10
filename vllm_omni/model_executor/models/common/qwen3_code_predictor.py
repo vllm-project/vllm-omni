@@ -664,8 +664,17 @@ class CodePredictorWrapper(nn.Module):
         return row_generators
 
     @classmethod
-    def _sample_codes_gumbel(cls, logits: torch.Tensor, generator: _GeneratorLike = None) -> torch.Tensor:
-        """Sample ``logits`` via Gumbel-max with optional per-row generators."""
+    def _sample_codes(
+        cls,
+        logits: torch.Tensor,
+        generator: _GeneratorLike = None,
+        sampling_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sample logits using pre-generated exponential noise or a generator."""
+        if sampling_noise is not None:
+            return (logits.float() - sampling_noise.log()).argmax(dim=-1, keepdim=True)
+
+        # Sampling logits via gumbel-max
         row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
         u = torch.empty_like(logits, dtype=torch.float32)
         if isinstance(row_generators, list):
@@ -845,6 +854,7 @@ class CodePredictorWrapper(nn.Module):
         top_p: float = 1.0,
         generator: torch.Generator | None = None,
         generators: Sequence[torch.Generator | None] | None = None,
+        sampling_noise: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
@@ -926,20 +936,10 @@ class CodePredictorWrapper(nn.Module):
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
-            # Sample next code via Gumbel-max.
-            #
-            # ``argmax_i(logits_i + Gumbel_i)`` with
-            # ``Gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0, 1)`` is
-            # distributionally identical to sampling from ``softmax(logits)``.
-            # In this file the motivations are practical rather than graph
-            # related: it is measurably cheaper than ``softmax + multinomial``
-            # on the B x 2048 shapes used here, it stays well-defined for
-            # degenerate masked rows with a surviving finite entry (and is more
-            # defensive than ``multinomial`` around fully-masked/NaN inputs),
-            # and the helper below can honor either one batch generator or one
-            # generator per seeded row.
+            # Sample next code. Graph-backed calls provide pre-generated
+            # exponential noise; eager calls use request-local generators(sampling via gumbel-max).
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> Gumbel-max
+                # "stored" mode: top-k -> top-p -> sampling
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -950,15 +950,23 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                code = self._sample_codes_gumbel(logits, generator=sample_generator)
+                code = self._sample_codes(
+                    logits,
+                    generator=sample_generator,
+                    sampling_noise=None if sampling_noise is None else sampling_noise[:, step - 1, :],
+                )
             else:
-                # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
+                # "per_call" mode: temperature-scaled + top-k -> sampling
                 if use_sampling:
                     scaled = logits * inv_temperature
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    code = self._sample_codes_gumbel(scaled, generator=sample_generator)
+                    code = self._sample_codes(
+                        scaled,
+                        generator=sample_generator,
+                        sampling_noise=None if sampling_noise is None else sampling_noise[:, step - 1, :],
+                    )
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 

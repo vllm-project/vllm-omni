@@ -98,6 +98,39 @@ class CaptureTalkerMTP(torch.nn.Module):
         return req_embeds, codes
 
 
+class CaptureSamplingNoiseTalkerMTP(torch.nn.Module):
+    """A fake talker_mtp module that records graph-safe sampling noise."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(
+        self,
+        req_input_ids,
+        req_embeds,
+        last_talker_hidden,
+        text_step,
+        do_sample=None,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+        generator=None,
+        generators=None,
+        sampling_noise=None,
+    ):
+        self.calls.append(
+            {
+                "batch_size": int(req_embeds.shape[0]),
+                "generator": generator,
+                "generators": generators,
+                "sampling_noise": sampling_noise,
+            }
+        )
+        codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
+        return req_embeds, codes
+
+
 class StrictMRoPEModel:
     def get_mrope_input_positions(self, input_tokens, mm_features):
         raise NotImplementedError
@@ -311,6 +344,57 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
         }
     ]
     assert runner.talker_mtp.calls[0]["generator"] is not None
+
+
+def test_talker_mtp_forward_batch_seeds_graph_sampling_noise_per_row(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    def run_with_seeds(seed1, seed2):
+        runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+        runner.requests["r1"].sampling_params = SimpleNamespace(
+            seed=seed1,
+            extra_args={"tts_local_seed": seed1},
+        )
+        runner.requests["r2"].sampling_params = SimpleNamespace(
+            seed=seed2,
+            extra_args={"tts_local_seed": seed2},
+        )
+        runner.talker_mtp = CaptureSamplingNoiseTalkerMTP()
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+        runner.talker_mtp_sampling_noise = DummyBuffer(torch.empty((2, 3, 5), dtype=torch.float32))
+
+        def fake_determine(
+            self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn
+        ):
+            batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+            return (False, batch_desc, None, None, None)
+
+        monkeypatch.setattr(
+            runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner))
+        )
+        inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+        OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+        return runner
+
+    runner = run_with_seeds(11, 22)
+    replay_runner = run_with_seeds(11, 22)
+    changed_row_runner = run_with_seeds(11, 23)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    call = runner.talker_mtp.calls[0]
+    assert call["sampling_noise"].data_ptr() == runner.talker_mtp_sampling_noise.gpu.data_ptr()
+    assert call["sampling_noise"].shape == runner.talker_mtp_sampling_noise.gpu.shape
+    assert call["generator"] is None
+    assert call["generators"] is None
+
+    noise = call["sampling_noise"]
+    replay_noise = replay_runner.talker_mtp.calls[0]["sampling_noise"]
+    changed_row_noise = changed_row_runner.talker_mtp.calls[0]["sampling_noise"]
+    assert torch.equal(noise, replay_noise)
+    assert torch.equal(noise[0], changed_row_noise[0])
+    assert not torch.equal(noise[1], changed_row_noise[1])
 
 
 def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):

@@ -109,3 +109,29 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "ref_text": REF_TEXT,
     }
     openai_client.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_text_to_audio_seed_reproducible_with_cudagraph(omni_server, openai_client) -> None:
+    """Two independent single requests with the same seed produce identical audio."""
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt(),
+        "stream": False,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
+        "response_format": "wav",
+        "task_type": "Base",
+        "voice": "clone",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+        "seed": 42,
+    }
+
+    first = openai_client.send_audio_speech_request(request_config)[0]
+    replay = openai_client.send_audio_speech_request(request_config)[0]
+
+    assert first.audio_bytes == replay.audio_bytes

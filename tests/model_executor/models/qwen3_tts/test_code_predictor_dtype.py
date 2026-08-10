@@ -593,7 +593,7 @@ class TestGumbelMaxSampling:
     @staticmethod
     def _sample(logits: torch.Tensor, generator=None) -> torch.Tensor:
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
-        return common_mod.CodePredictorWrapper._sample_codes_gumbel(logits, generator=generator)
+        return common_mod.CodePredictorWrapper._sample_codes(logits, generator=generator)
 
     def test_gumbel_max_picks_unique_high_logit(self, loaded_target_classes) -> None:
         """If one logit is dominant, Gumbel-max must always pick it."""
