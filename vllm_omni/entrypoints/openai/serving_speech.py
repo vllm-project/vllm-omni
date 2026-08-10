@@ -1447,9 +1447,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
-        if self._tts_model_type == "ming_flash_omni_tts":
-            return self._validate_ming_flash_omni_tts_request(request)
-
         adapter = self._get_tts_adapter()
         if adapter is not None:
             return adapter.validate(request)
@@ -1482,41 +1479,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._voxcpm2_split_map)
-
-    def _validate_ming_flash_omni_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate Ming-flash-omni standalone-talker request parameters."""
-        if not request.input or not request.input.strip():
-            return "Input text cannot be empty"
-        if request.instructions is not None:
-            if not isinstance(request.instructions, str):
-                return "instructions must be a string"
-            if len(request.instructions) > self._max_instructions_length:
-                return f"instructions exceeds max length {self._max_instructions_length}"
-
-        if request.task_type is not None:
-            return "'task_type' is not supported for Ming-flash-omni TTS"
-        if request.language is not None:
-            return "'language' is not supported for Ming-flash-omni TTS (language is inferred from input text)"
-        if request.x_vector_only_mode is not None:
-            return "'x_vector_only_mode' is not supported for Ming-flash-omni TTS"
-        if request.initial_codec_chunk_frames is not None:
-            return "'initial_codec_chunk_frames' is not supported for Ming-flash-omni TTS"
-
-        # Per-request voice cloning from raw audio is not yet wired up: Ming
-        # extracts spk_emb / prompt_wav_lat / prompt_wav_emb model-side via
-        # register_prompt_wav() at engine init. For ad-hoc cloning, callers
-        # should pre-compute speaker_embedding and pass it directly.
-        if request.ref_audio is not None:
-            return (
-                "'ref_audio' is not yet supported for Ming-flash-omni TTS; "
-                "use a preset 'voice' or 'speaker_embedding' instead"
-            )
-        if request.ref_text is not None:
-            return "'ref_text' is not yet supported for Ming-flash-omni TTS"
-
-        if request.max_new_tokens is not None and request.max_new_tokens <= 0:
-            return "'max_new_tokens' must be a positive integer"
-        return None
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -3173,18 +3135,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # inline vs. via an uploaded voice.
         model_type: str | None = None
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
-        if self._tts_model_type == "ming_flash_omni_tts":
-            # ming_flash_omni is intentionally NOT migrated onto the adapter
-            # framework in this PR (it has no registered adapter); keep it on the
-            # legacy inline dispatch so serving still works.
-            model_type = "ming_flash_omni_tts"
-            validation_error = self._validate_ming_flash_omni_tts_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-            prompt = self._build_ming_flash_omni_prompt(request)
-            tts_params = {}
-            qwen3_ref_audio_warmup_artifact_key = None
-        elif (adapter := self._get_tts_adapter()) is not None:
+        if (adapter := self._get_tts_adapter()) is not None:
             validation_error = adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)

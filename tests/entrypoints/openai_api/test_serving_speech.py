@@ -3602,6 +3602,63 @@ class TestGLMTTSServing:
         load_tokenizer.assert_called_once()
 
 
+@pytest.fixture
+def ming_flash_omni_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="inclusionAI/Ming-omni-tts-0.5B",
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="ming_tts"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestMingFlashOmniTTSServing:
+    def test_validate_ming_flash_omni_tts_rejects_ref_text(self, ming_flash_omni_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = ming_flash_omni_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = ming_flash_omni_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+    def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server, mocker: MockerFixture):
+        ming_flash_omni_tts_server._build_ming_flash_omni_prompt = mocker.MagicMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+        ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
+
+
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 
