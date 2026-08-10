@@ -90,6 +90,14 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match=match):
             AttentionSpec(**spec)
 
+    def test_fastvideo_vsa_topk_serialized(self):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
+        assert spec.backend_kwargs() == {"topk": 96}
+
+    def test_fastvideo_vsa_topk_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
+            AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
+
 
 class TestAttentionConfig:
     def test_empty_config(self):

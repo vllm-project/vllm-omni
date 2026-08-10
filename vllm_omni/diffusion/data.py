@@ -1462,6 +1462,7 @@ class AttentionSpec:
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    fastvideo_vsa_topk: int | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1479,6 +1480,11 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
+        if self.fastvideo_vsa_topk is not None:
+            if self.backend.upper() != "FASTVIDEO_VSA":
+                raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
+            if self.fastvideo_vsa_topk <= 0:
+                raise ValueError("fastvideo_vsa_topk must be positive.")
 
     @staticmethod
     def _coerce(value: Any, cls: type, field_name: str) -> Any:
@@ -1511,6 +1517,8 @@ class AttentionSpec:
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
             kw["quant"] = quant_kw
+        if self.fastvideo_vsa_topk is not None:
+            kw["topk"] = self.fastvideo_vsa_topk
         return kw or None
 
 
@@ -1619,6 +1627,7 @@ def parse_attention_config(
     attention_config: AttentionConfig | Mapping[str, Any] | None = None,
     *,
     attention_backend: str | None = None,
+    fastvideo_vsa_topk: int | None = None,
 ) -> AttentionConfig:
     """Pure type-conversion: coerce *attention_config* to an AttentionConfig.
 
@@ -1645,6 +1654,14 @@ def parse_attention_config(
             )
         if attention_backend.lower() != "auto":
             normalized.default = AttentionSpec(backend=attention_backend)
+
+    if fastvideo_vsa_topk is not None:
+        if normalized.default is None:
+            raise ValueError("--fastvideo-vsa-topk requires --diffusion-attention-backend FASTVIDEO_VSA.")
+        if normalized.default.backend.upper() != "FASTVIDEO_VSA":
+            raise ValueError("--fastvideo-vsa-topk is only valid with the FASTVIDEO_VSA backend.")
+        normalized.default.fastvideo_vsa_topk = fastvideo_vsa_topk
+        normalized.default.__post_init__()
 
     return normalized
 

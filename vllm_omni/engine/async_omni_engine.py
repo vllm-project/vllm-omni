@@ -1001,10 +1001,12 @@ class AsyncOmniEngine:
         if (
             kwargs.get("diffusion_attention_config") is not None
             or kwargs.get("diffusion_attention_backend") is not None
+            or kwargs.get("fastvideo_vsa_topk") is not None
         ):
             attention_config = parse_attention_config(
                 kwargs.get("diffusion_attention_config"),
                 attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
             )
 
         stage_engine_args = {
@@ -1237,6 +1239,7 @@ class AsyncOmniEngine:
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None
+                    or kwargs.get("fastvideo_vsa_topk") is not None
                 ):
                     has_stage_attention = (
                         hasattr(cfg.engine_args, "diffusion_attention_config")
@@ -1246,6 +1249,7 @@ class AsyncOmniEngine:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
+                            fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
                         )
                 quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:

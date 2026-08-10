@@ -32,7 +32,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -1006,13 +1006,25 @@ class Wan22Pipeline(
         return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load checkpoint weights, allowing optional zero-initialized VSA gates."""
-        loader = AutoWeightsLoader(self)
-        loaded_weights = loader.load_weights(weights)
-        # Public FullAttn/DMD checkpoints do not contain gate projections. The
-        # model initializes those projections to zero, which intentionally means
-        # sparse-only VSA. A VSA-trained checkpoint still overwrites them above.
-        loaded_weights.update(name for name, _ in self.named_parameters() if ".to_gate_compress." in name)
+        """Load checkpoint weights and discard unused optional VSA gates."""
+        gate_param_names = {name for name, _ in self.named_parameters() if ".to_gate_compress." in name}
+        has_gate_compress_weights = False
+
+        def tracked_weights():
+            nonlocal has_gate_compress_weights
+            for name, weight in weights:
+                if ".to_gate_compress." in name:
+                    has_gate_compress_weights = True
+                yield name, weight
+
+        loaded_weights = AutoWeightsLoader(self).load_weights(tracked_weights())
+        self.has_gate_compress_weights = has_gate_compress_weights
+        if not has_gate_compress_weights:
+            for module in self.modules():
+                if isinstance(module, WanSelfAttention):
+                    module.to_gate_compress = None
+        # Optional gate parameters are absent from public FullAttn/DMD checkpoints.
+        loaded_weights.update(gate_param_names)
         return loaded_weights
 
     def check_inputs(

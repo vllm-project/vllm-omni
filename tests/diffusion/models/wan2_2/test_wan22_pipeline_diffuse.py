@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -239,3 +240,48 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def _make_gate_loading_pipeline():
+    pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
+    nn.Module.__init__(pipeline)
+    gate = WanSelfAttention.__new__(WanSelfAttention)
+    nn.Module.__init__(gate)
+    gate.to_gate_compress = nn.Linear(1, 1)
+    pipeline.gate_holder = gate
+    return pipeline, gate
+
+
+def test_load_weights_removes_unloaded_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("other.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is False
+    assert gate.to_gate_compress is None
+
+
+def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+    original_gate = gate.to_gate_compress
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("gate_holder.to_gate_compress.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is True
+    assert gate.to_gate_compress is original_gate

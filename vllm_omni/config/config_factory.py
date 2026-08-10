@@ -190,7 +190,10 @@ class StageConfigFactory:
                     # If we have a resolver, call it with the optional hf_config
                     # to get the default pipeline config for this key
                     pipeline_cfg = obj(hf_config) if callable(obj) else obj
-                    if pipeline_cfg is not None and pipeline_cfg.diffusers_class_name == class_name:
+                    if pipeline_cfg is not None and class_name in (
+                        pipeline_cfg.diffusers_class_name,
+                        *pipeline_cfg.diffusers_class_aliases,
+                    ):
                         logger.info(
                             "Detected pipeline %r from model_index.json (_class_name=%r)",
                             pipeline_cfg.model_type,

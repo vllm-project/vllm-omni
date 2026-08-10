@@ -544,6 +544,12 @@ class OmniServeCommand(CLISubcommand):
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
         )
         omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-attention-config",
             "-dac",
             dest="diffusion_attention_config",
