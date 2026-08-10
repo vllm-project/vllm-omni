@@ -244,7 +244,86 @@ class TestGetRequestBatchSamplingParamsKey:
 class TestRequestScheduler:
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
-        self.scheduler.initialize(SimpleNamespace())
+        self.scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+
+    def test_admission_wait_disabled_with_zero_max_wait(self) -> None:
+        self.scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+        decision = self.scheduler.get_admission_wait_decision(now=10.0)
+
+        assert decision.should_wait is False
+
+    @pytest.mark.parametrize(
+        ("dp_concurrent", "expected_stable_window_s"),
+        [(False, 0.05), (True, 0.3)],
+    )
+    def test_admission_wait_decision_encodes_coalescing_policy(
+        self,
+        dp_concurrent: bool,
+        expected_stable_window_s: float,
+    ) -> None:
+        self.scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=4,
+                request_batch_max_wait_ms=1000.0,
+            )
+        )
+
+        decision = self.scheduler.get_admission_wait_decision(
+            now=10.0,
+            dp_concurrent=dp_concurrent,
+        )
+
+        assert decision.should_wait is True
+        assert decision.deadline == 11.0
+        assert decision.stable_window_s == expected_stable_window_s
+        assert decision.max_batch == 4
+
+    def test_admission_wait_disabled_while_wave_is_running(self) -> None:
+        self.scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=1,
+                request_batch_max_wait_ms=1000.0,
+            )
+        )
+        self.scheduler.add_request(_make_request("running"))
+        self.scheduler.schedule()
+
+        decision = self.scheduler.get_admission_wait_decision(now=10.0)
+
+        assert decision.should_wait is False
+
+    def test_admission_wait_end_conditions(self) -> None:
+        self.scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=2,
+                request_batch_max_wait_ms=1000.0,
+            )
+        )
+        decision = self.scheduler.get_admission_wait_decision(now=10.0)
+        self.scheduler.add_request(_make_request("a"))
+
+        assert not self.scheduler.should_end_admission_wait(
+            decision,
+            now=10.01,
+            stable_since=10.0,
+        )
+        assert self.scheduler.should_end_admission_wait(
+            decision,
+            now=10.05,
+            stable_since=10.0,
+        )
+        assert self.scheduler.should_end_admission_wait(
+            decision,
+            now=11.0,
+            stable_since=11.0,
+        )
+
+        self.scheduler.add_request(_make_request("b"))
+        assert self.scheduler.should_end_admission_wait(
+            decision,
+            now=10.01,
+            stable_since=10.01,
+        )
 
     def test_single_request_success_lifecycle(self) -> None:
         req_id = self.scheduler.add_request(_make_request("a"))
@@ -897,6 +976,14 @@ class TestStepScheduler:
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
         self.scheduler.initialize(SimpleNamespace())
+
+    def test_admission_wait_is_not_supported(self) -> None:
+        decision = self.scheduler.get_admission_wait_decision(
+            now=10.0,
+            dp_concurrent=True,
+        )
+
+        assert decision.should_wait is False
 
     def test_single_request_step_lifecycle(self) -> None:
         request = _make_step_request("step", num_inference_steps=3)
