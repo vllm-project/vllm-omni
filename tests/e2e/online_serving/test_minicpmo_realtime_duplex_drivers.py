@@ -333,6 +333,71 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
 
     assert args.ref_audio == "ref.wav"
     assert args.validation_mode == "model-policy"
+    assert args.temperature is None
+
+
+def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(tmp_path, monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    input_wav = tmp_path / "input.wav"
+    with wave.open(str(input_wav), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 320)
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"ref")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"ok": true}', b""
+
+        def kill(self):
+            return None
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        demo,
+        "summarize_artifacts",
+        lambda **kwargs: {"ok": True, "returncode": 0},
+    )
+
+    result = asyncio.run(
+        demo.run_soft_interrupt(
+            SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                input_wav=str(input_wav),
+                ref_audio=str(ref_audio),
+                output_dir=str(output_dir),
+                summary_output=None,
+                chunk_ms=200,
+                timeout_s=5.0,
+                require_audio=True,
+                no_realtime_pacing=False,
+                validation_mode="response-required",
+                temperature=None,
+                min_responses=2,
+                min_audio_deltas_per_response=2,
+                input_sha256=None,
+                expect_followup_response_substring=None,
+            )
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--temperature" in command
+    assert command[command.index("--temperature") + 1] == "0.0"
+    assert result["ok"] is True
 
 
 def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
@@ -495,6 +560,43 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     assert summary["enough_responses"] is True
     assert summary["response_before_final_commit"] is True
     assert summary["listen_after_response_before_commit"] is True
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_commit_during_speak"
+    output.mkdir()
+    response_id = "resp-long"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 4.0},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 5.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=1,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["response_before_final_commit"] is True
+    assert summary["listen_after_response_before_commit"] is False
+    assert summary["final_listen_after_commit"] is False
 
 
 def test_realtime_duplex_soft_interrupt_response_required_rejects_single_response(tmp_path):

@@ -415,6 +415,7 @@ class RealtimeDuplexClient:
         initial_user_text: str | None = None,
         native_duplex: bool = True,
         auto_response: bool = True,
+        temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
         timeout_s: float = 20.0,
@@ -440,6 +441,8 @@ class RealtimeDuplexClient:
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }
+        if temperature is not None:
+            session["temperature"] = float(temperature)
         if ref_audio is not None:
             session["ref_audio"] = ref_audio
         if instructions is not None:
