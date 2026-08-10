@@ -337,24 +337,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
-    )
-    parser.add_argument(
-        "--profiler-config",
-        type=parse_profiler_config,
-        default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
-    )
-    parser.add_argument(
-        "--quantization",
-        type=str,
-        default=None,
-        choices=["fp8", "gguf"],
-        help="Quantization method for the transformer (fp8 for online FP8 quantization).",
-    )
-    parser.add_argument(
         "--lora-path",
         type=str,
         nargs="+",
