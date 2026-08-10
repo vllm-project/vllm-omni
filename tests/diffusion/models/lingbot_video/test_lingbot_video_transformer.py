@@ -292,6 +292,101 @@ def test_router_group_limited_topk_uses_bias_corrected_choice():
     assert high_score > 1.7
 
 
+def test_router_uses_explicit_global_padded_m(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    router = module.LingBotVideoRouter(
+        hidden_size=4,
+        num_experts=4,
+        top_k=2,
+        score_func="sigmoid",
+        norm_topk_prob=True,
+        n_group=2,
+        topk_group=1,
+        route_scale=1.0,
+    )
+    with torch.no_grad():
+        router.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.5, 0.0, 0.0, 0.0],
+                    [-0.5, 0.0, 0.0, 0.0],
+                    [-1.0, 0.0, 0.0, 0.0],
+                ]
+            )
+        )
+        router.e_score_correction_bias.zero_()
+
+    tokens = torch.tensor([[1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]])
+    expected_indices, expected_scores = router(tokens)
+    captured = []
+    original = router._pad_to_m_linear
+
+    def capture_target_m(tokens, weight, target_m):
+        captured.append((int(tokens.shape[0]), target_m))
+        return original(tokens, weight, target_m)
+
+    monkeypatch.setattr(router, "_pad_to_m_linear", capture_target_m)
+    actual_indices, actual_scores = router(tokens, target_m=8)
+
+    assert captured == [(2, 8)]
+    torch.testing.assert_close(actual_indices, expected_indices)
+    torch.testing.assert_close(actual_scores, expected_scores)
+
+
+def test_transformer_passes_global_padded_m_to_local_moe_block(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+
+    model = _tiny_transformer(
+        depth=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        n_group=2,
+        topk_group=1,
+    )
+    captured = []
+
+    def fake_sp_boundary(joint, rotary, temb_input, temb6, token_validity):
+        get_forward_context().sp_padding_size = 1
+        return (
+            joint[:, :4],
+            rotary[:, :4],
+            temb_input[:, :4],
+            temb6[:, :4],
+            token_validity[:, :4],
+        )
+
+    def fake_block(
+        x,
+        temb6,
+        rotary_emb,
+        attention_mask=None,
+        moe_padding_mask=None,
+        moe_router_target_m=None,
+    ):
+        captured.append((moe_router_target_m, tuple(x.shape)))
+        return x
+
+    monkeypatch.setattr(model.sp_input_boundary, "forward", fake_sp_boundary)
+    monkeypatch.setattr(model.blocks[0], "forward", fake_block)
+    diffusion_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=2, ring_degree=1))
+    with set_forward_context(omni_diffusion_config=diffusion_config), torch.no_grad():
+        output = model(
+            torch.randn(1, 2, 1, 2, 2),
+            torch.tensor([300.0]),
+            torch.randn(1, 3, 8),
+            encoder_attention_mask=torch.ones(1, 3, dtype=torch.long),
+            return_dict=False,
+        )[0]
+
+    assert captured == [(8, (1, 4, 16))]
+    assert output.shape == (1, 2, 1, 2, 2)
+
+
 def test_sparse_moe_block_masks_padding_tokens():
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 

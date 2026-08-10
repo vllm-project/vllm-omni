@@ -275,9 +275,40 @@ class LingBotVideoRouter(nn.Module):
         masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    @torch.compiler.disable
+    def _pad_to_m_linear(
+        tokens: torch.Tensor,
+        weight: torch.Tensor,
+        target_m: int | None,
+    ) -> torch.Tensor:
+        """Run the router GEMM eagerly with the pre-shard global padded M.
+
+        Regional compilation must not fold the zero padding and output slice
+        back into a local-M GEMM. Keeping this model-specific operation eager
+        also makes SP1 and SP>1 select the same GEMM implementation.
+        """
+        if target_m is None:
+            return F.linear(tokens, weight)
+        seq_len = int(tokens.shape[0])
+        if target_m < seq_len:
+            raise ValueError(f"router target_m={target_m} is smaller than seq_len={seq_len}")
+        if seq_len == 0 or target_m == seq_len:
+            return F.linear(tokens, weight)
+        padded = torch.zeros(
+            target_m,
+            tokens.shape[-1],
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        padded[:seq_len] = tokens
+        return F.linear(padded, weight)[:seq_len]
+
+    def forward(self, tokens: torch.Tensor, target_m: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.amp.autocast(tokens.device.type, enabled=False):
-            logits = F.linear(tokens.float(), self.weight.float())
+            tokens_f = tokens.float()
+            weight_f = self.weight.float()
+            logits = self._pad_to_m_linear(tokens_f, weight_f, target_m)
         if self.score_func == "softmax":
             scores = F.softmax(logits, dim=-1)
         elif self.score_func == "sigmoid":
@@ -516,10 +547,11 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
+        router_target_m: int | None = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         tokens = hidden_states.reshape(-1, self.hidden_size)
-        top_indices, top_scores = self.router(tokens)
+        top_indices, top_scores = self.router(tokens, target_m=router_target_m)
         if padding_mask is not None:
             mask = padding_mask.unsqueeze(-1).to(top_scores.dtype)
             top_scores = top_scores * mask
@@ -590,6 +622,7 @@ class LingBotVideoBlock(nn.Module):
         rotary_emb,
         attention_mask=None,
         moe_padding_mask=None,
+        moe_router_target_m: int | None = None,
     ):
         expected_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
@@ -612,7 +645,11 @@ class LingBotVideoBlock(nn.Module):
 
         ffn_in = (self.norm2(hidden_states) * scale_mlp + shift_mlp).to(bulk_dtype)
         if isinstance(self.ffn, LingBotVideoSparseMoeBlock):
-            ffn_out = self.ffn(ffn_in, padding_mask=moe_padding_mask)
+            ffn_out = self.ffn(
+                ffn_in,
+                padding_mask=moe_padding_mask,
+                router_target_m=moe_router_target_m,
+            )
         else:
             ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
@@ -887,6 +924,8 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         padded_global_token_validity = (
             F.pad(global_token_validity, (0, padding_size), value=False) if padding_size else global_token_validity
         )
+        sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
+        moe_router_target_m = int(padded_global_token_validity.numel()) if sp_size > 1 else None
         if packed_batch:
             attention_mask = _packed_block_attention_mask(
                 sample_seq_lens,
@@ -904,13 +943,23 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:
-            joint = block(
-                joint,
-                temb6,
-                rotary,
-                attention_mask,
-                moe_padding_mask,
-            )
+            if isinstance(block.ffn, LingBotVideoSparseMoeBlock):
+                joint = block(
+                    joint,
+                    temb6,
+                    rotary,
+                    attention_mask,
+                    moe_padding_mask,
+                    moe_router_target_m,
+                )
+            else:
+                joint = block(
+                    joint,
+                    temb6,
+                    rotary,
+                    attention_mask,
+                    moe_padding_mask,
+                )
         final_mod = self.norm_out_modulation(temb_input.reshape(joint.shape[0] * joint.shape[1], -1))
         shift, scale = final_mod.reshape(joint.shape[0], joint.shape[1], -1).chunk(2, dim=-1)
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift
