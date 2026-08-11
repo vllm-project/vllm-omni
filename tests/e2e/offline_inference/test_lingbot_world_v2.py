@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tests.helpers.mark import hardware_test
@@ -74,5 +75,10 @@ def test_lingbot_world_v2_tp1_one_block(omni_runner_handler: OmniRunnerHandler) 
     )
 
     assert response.success
-    assert response.videos is not None
-    assert len(response.videos) == 1
+    assert response.images is not None
+    assert len(response.images) == 1
+    video = np.asarray(response.images[0])
+    assert video.shape == (1, 9, 480, 832, 3)
+    assert np.isfinite(video).all()
+    assert float(np.ptp(video)) > 1e-6
+    assert float(np.mean(np.abs(np.diff(video, axis=1)))) > 1e-6
