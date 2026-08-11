@@ -2276,6 +2276,16 @@ class TestPlatformOverrides:
         # Stage 2 unaffected fields stay at base
         assert deploy.stages[2].enforce_eager is False
 
+    def test_qwen2_5_omni_xpu_uses_eager_ar_stages(self):
+        deploy_path = Path(get_deploy_config_path("qwen2_5_omni.yaml"))
+
+        deploy = load_deploy_config(deploy_path)
+        deploy = _apply_platform_overrides(deploy, platform="xpu")
+
+        assert deploy.stages[0].enforce_eager is True
+        assert deploy.stages[1].enforce_eager is True
+        assert deploy.stages[2].enforce_eager is True
+
     def test_xpu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         if not deploy_path.exists():

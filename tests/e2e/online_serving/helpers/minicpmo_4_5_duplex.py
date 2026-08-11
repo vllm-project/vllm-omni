@@ -19,38 +19,11 @@ DEPLOY_CONFIG = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-        # Cap per-stage KV so Thinker/Talker/Code2Wav share one GPU with
-        # max_sessions=2. Talker must stay within its 4096 context so the
-        # 0.5 GiB budget passes vLLM's min-KV check at init.
+        # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
+        # is left automatic so duplex matches the simplex deploy profiles.
         "stages": {
-            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
-            1: {
-                "max_model_len": 4096,
-                "kv_cache_memory_bytes": 512 * 1024 * 1024,
-            },
-            2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
+            1: {"max_model_len": 4096},
         },
-        # Platform overrides apply after ordinary stage settings and would
-        # otherwise reinstate the base CUDA 2 GiB Talker default.
-        "platforms": {
-            "cuda": {
-                "stages": [
-                    {
-                        "stage_id": 1,
-                        "kv_cache_memory_bytes": 512 * 1024 * 1024,
-                    }
-                ]
-            }
-        },
-    },
-)
-CORE_DEPLOY_CONFIG = modify_stage_config(
-    DEPLOY_CONFIG,
-    updates={
-        "stages": {
-            0: {"enforce_eager": True},
-            1: {"enforce_eager": True},
-        }
     },
 )
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
@@ -65,17 +38,6 @@ SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            use_stage_cli=False,
-            server_args=["--trust-remote-code"],
-        ),
-        id="three-stage-single-gpu",
-    )
-]
-CORE_SERVER_PARAMS = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=CORE_DEPLOY_CONFIG,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
@@ -112,9 +74,11 @@ def validated_soft_interrupt_wav() -> Path:
 
 
 def resolve_ref_audio(model_prefix: str) -> Path:
-    if model_prefix:
-        model_root = Path(model_prefix) / MODEL
-    else:
+    # ``MODEL`` may be a local checkpoint directory instead of a Hub repo id
+    # (``Path("/prefix") / "/abs/path"`` collapses to the absolute path), so only
+    # fall back to the Hub cache when no such directory exists on disk.
+    model_root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
+    if not model_root.is_dir():
         model_root = Path(snapshot_download(MODEL, local_files_only=True))
     ref_audio = model_root / REF_AUDIO_RELATIVE_PATH
     if not ref_audio.is_file():

@@ -103,6 +103,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2",
+    "indextts2_5",
     "audex",
     "audex_tta",
 }
@@ -514,6 +515,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
         return self._adapter
+
+    def _uses_native_speed_control(self) -> bool:
+        adapter = self._get_tts_adapter()
+        return bool(adapter is not None and adapter.native_speed_control)
+
+    def _audio_encode_speed(self, request: OpenAICreateSpeechRequest) -> float:
+        if self._uses_native_speed_control():
+            return 1.0
+        return float(request.speed or 1.0)
 
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
@@ -3556,7 +3566,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
+                speed=self._audio_encode_speed(request),
                 base64_encode=base64_encode,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3670,7 +3680,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
+                speed=self._audio_encode_speed(request),
                 base64_encode=False,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3712,7 +3722,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return response_format, self.create_error_response(
                 f"{mode_label} is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
             )
-        if request.speed is not None and request.speed != 1.0:
+        if request.speed is not None and request.speed != 1.0 and not self._uses_native_speed_control():
             return response_format, self.create_error_response(
                 f"{mode_label} is not supported with speed adjustment. "
                 "Use a non-streaming request or remove the speed parameter."

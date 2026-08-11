@@ -128,6 +128,21 @@ steps:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
               always-pull: true
               propagate-environment: true
+              # vLLM 0.27 added a pre-flight capacity check in
+              # distributed/device_communicators/shm_broadcast.py. Without this
+              # the container gets Docker's 64 MiB default and every test in
+              # this step dies at engine start with
+              #   RuntimeError: Insufficient space in /dev/shm:
+              #                 240 MiB required, 64 MiB available
+              # (9 failed in 8.7s on build #2949). vLLM 0.26 had no such check
+              # and allocated regardless, so this step passed on main while
+              # being under-provisioned the whole time — 0.27 turned a silent
+              # risk into an explicit error.
+              #
+              # This is the only inline docker plugin block in .buildkite/cuda/;
+              # every other step inherits common/ci_mirror_hardwares.yml, which
+              # already sets 8gb. Matching that rather than inventing a value.
+              shm-size: "8gb"
               environment:
                 - "HF_HOME=/fsx/hf_cache"
               volumes:

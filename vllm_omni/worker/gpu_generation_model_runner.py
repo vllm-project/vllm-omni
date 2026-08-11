@@ -577,6 +577,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -836,6 +837,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
+                # Never randomize generation-stage dummy ids: they are
+                # structured payloads (e.g. packed RVQ codec codes that get
+                # code_offset added before embedding), so vocab-uniform random
+                # ids index past the codebook tables — CUDA device-side assert
+                # in code2wav warmup. The expert-balance rationale behind
+                # randomize_inputs targets text-MoE models, which generation
+                # stages are not. The kwarg stays accepted for vLLM API compat.
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
                     attn_metadata,
