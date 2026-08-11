@@ -89,6 +89,7 @@ class ChatFallbackProjectorMixin:
         if response_config.max_tokens is not None:
             kwargs["max_tokens"] = response_config.max_tokens
         model_extra = dict(response_config.extra_body)
+        model_extra.pop("minicpmo45_native_duplex", None)
         tools = model_extra.pop("realtime_response_tools", model_extra.pop("realtime_tools", None))
         tool_choice = model_extra.pop(
             "realtime_response_tool_choice",

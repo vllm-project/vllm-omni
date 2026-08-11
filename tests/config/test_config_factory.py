@@ -2241,7 +2241,8 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            assert replica_stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
+            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

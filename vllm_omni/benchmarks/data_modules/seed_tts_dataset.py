@@ -55,6 +55,16 @@ class SeedTTSSampleRequest(SampleRequest):
     seed_tts_system_prompt: str = ""
     #: Local path to reference prompt WAV (for SIM vs. synthesized PCM in ``seed_tts_eval``).
     seed_tts_ref_wav_path: str = ""
+    #: Ordered text targets evaluated as turns in one Realtime session.
+    seed_tts_turns: tuple[SeedTTSTurn, ...] = ()
+
+
+@dataclass(frozen=True)
+class SeedTTSTurn:
+    """One target utterance within a grouped Realtime Seed-TTS session."""
+
+    utterance_id: str
+    target_text: str
 
 
 @dataclass
@@ -216,24 +226,39 @@ class SeedTTSDataset(BenchmarkDataset):
     ) -> list[SampleRequest]:
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
+        turns_per_session = int(kwargs.pop("turns_per_session", 1))
+        if turns_per_session < 1:
+            raise ValueError("turns_per_session must be at least 1")
 
         tok = get_cached_tokenizer(tokenizer)
         out: list[SampleRequest] = []
-        for i, row in enumerate(self._rows):
-            if len(out) >= num_requests:
-                break
+        valid_rows: list[tuple[_SeedTTSRow, Path]] = []
+        for row in self._rows:
             wav_path = (self._root / self.locale / row.prompt_wav_rel).resolve()
             if not wav_path.is_file():
                 logger.warning("Missing prompt wav for %s: %s", row.utterance_id, wav_path)
                 continue
+            valid_rows.append((row, wav_path))
 
-            target = row.target_text
-            prompt_len = len(tok.encode(f"{self._system_prompt}\n{target}"))
+        for session_index in range(num_requests):
+            offset = session_index * turns_per_session
+            group = valid_rows[offset : offset + turns_per_session]
+            if len(group) < turns_per_session:
+                break
+            reference_row, reference_wav_path = group[0]
+            turns = tuple(
+                SeedTTSTurn(
+                    utterance_id=row.utterance_id,
+                    target_text=row.target_text,
+                )
+                for row, _ in group
+            )
+            prompt_len = sum(len(tok.encode(f"{self._system_prompt}\n{turn.target_text}")) for turn in turns)
             lang = "English" if self.locale == "en" else "Chinese"
-            ref_uri = _ref_audio_payload(wav_path, inline=self.inline_ref_audio)
+            ref_uri = _ref_audio_payload(reference_wav_path, inline=self.inline_ref_audio)
             speech_extra: dict[str, Any] = {
                 "ref_audio": ref_uri,
-                "ref_text": row.ref_text,
+                "ref_text": reference_row.ref_text,
                 "task_type": "Base",
                 "language": lang,
                 "max_new_tokens": output_len,
@@ -241,20 +266,26 @@ class SeedTTSDataset(BenchmarkDataset):
 
             out.append(
                 SeedTTSSampleRequest(
-                    prompt=target,
+                    prompt=turns[0].target_text,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
                     multi_modal_data=None,
-                    request_id=f"{request_id_prefix}{i}",
+                    request_id=f"{request_id_prefix}{session_index}",
                     seed_tts_speech_extra=speech_extra,
-                    seed_tts_utterance_id=row.utterance_id,
+                    seed_tts_utterance_id=turns[0].utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
-                    seed_tts_ref_wav_path=str(wav_path),
+                    seed_tts_ref_wav_path=str(reference_wav_path),
+                    seed_tts_turns=turns,
                 )
             )
 
-        logger.info("Seed-TTS: built %d requests (asked %d)", len(out), num_requests)
+        logger.info(
+            "Seed-TTS: built %d sessions (asked %d, turns_per_session=%d)",
+            len(out),
+            num_requests,
+            turns_per_session,
+        )
         self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
         return out
 

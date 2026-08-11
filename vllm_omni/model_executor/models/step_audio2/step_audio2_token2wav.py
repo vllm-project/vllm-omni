@@ -364,7 +364,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def stream_chunk_for(
         self,
-        audio_tokens: list[int],
+        audio_tokens: list[int] | torch.Tensor,
         prompt_wav: str,
         last_chunk: bool,
         state: _StreamState,
@@ -377,7 +377,14 @@ class StepAudio2Token2WavCore(nn.Module):
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
 
-        token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
+        if isinstance(audio_tokens, torch.Tensor):
+            # Already on device; avoids the D2H->H2D round-trip of rebuilding from a list.
+            # clone() so token_tensor never aliases the caller's input_ids: when the ids
+            # already arrive int32-on-device the .to() is a no-op and would share storage,
+            # so an in-place write inside inference_chunk could corrupt input_ids.
+            token_tensor = audio_tokens.reshape(1, -1).to(device=self.device, dtype=torch.int32).clone()
+        else:
+            token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
 
         with torch.amp.autocast(
             str(self.device.type),
@@ -651,10 +658,11 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         state = self._stream_states[0]
 
         # --- Extract audio tokens ---
-        audio_tokens = input_ids.flatten().cpu().tolist()
+        # Kept on device; stream_chunk_for takes the tensor directly.
+        audio_tokens = input_ids.flatten()
 
         # Empty chunk (e.g. EOF with no audio tokens)
-        if not audio_tokens:
+        if audio_tokens.numel() == 0:
             if state.setup_done:
                 self.token2wav.reset_stream_for(state)
             else:

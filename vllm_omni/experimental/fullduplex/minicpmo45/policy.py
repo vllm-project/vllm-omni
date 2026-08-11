@@ -43,7 +43,11 @@ class MiniCPMO45DuplexPolicy:
         return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
 
     @staticmethod
-    def session_context_texts(instructions: object, has_ref_audio: bool) -> tuple[str, str]:
+    def session_context_texts(
+        instructions: object,
+        has_ref_audio: bool,
+        initial_user_text: object = None,
+    ) -> tuple[str, str]:
         """System-context prefix/suffix, matching MiniCPMODuplex.prepare()."""
         system_prompt = (
             instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
@@ -53,6 +57,8 @@ class MiniCPMO45DuplexPolicy:
         if has_ref_audio:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
+        if isinstance(initial_user_text, str) and initial_user_text:
+            suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>\n<|im_start|>assistant\n"
         return prefix, suffix
 
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {

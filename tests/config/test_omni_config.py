@@ -474,6 +474,8 @@ def test_sub_config_fields_match_structured_scopes():
         "moe_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
+        "interleave_mm_strings",
+        "media_io_kwargs",
         "active_stream_window",
         "duplex_max_sessions",
         "enable_sleep_mode",
