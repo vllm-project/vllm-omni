@@ -488,6 +488,14 @@ class _MiniMaxH3FakeAttention(nn.Module):
     class FakeBackend:
         supports_prefix_kv_slicing = False
 
+        # Mirror AttentionBackend.supports_packed_mask_free: H3's packed
+        # attention path calls attn_backend.supports_packed_mask_free() to decide
+        # whether to build the padding mask. Return False so the fake exercises
+        # the masked path (the abstract backend default).
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
     def __init__(self, **kwargs):
         del kwargs
         super().__init__()
