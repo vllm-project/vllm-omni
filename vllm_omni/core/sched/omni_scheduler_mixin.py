@@ -91,22 +91,20 @@ class OmniSchedulerMixin:
 
     def _maybe_decode_pooling_output(self, request: Request, pooler_output: Any) -> Any:
         """Apply the stage's pooling-output decoder hook to the pooler tensor
-        before IPC, or pass it through unchanged when none is configured."""
+        before IPC, or pass it through unchanged when none is configured.
+        Decoder exceptions propagate; callers fail the request with
+        FinishReason.ERROR rather than emitting an empty success."""
         if self._pooling_output_decoder is None:
             return pooler_output
         if pooler_output is None or getattr(request, "pooling_params", None) is None:
             return pooler_output
         if not isinstance(pooler_output, torch.Tensor):
             return pooler_output
-        try:
-            return self._pooling_output_decoder(
-                pooler_output,
-                request,
-                self.vllm_config.model_config.hf_config,
-            )
-        except Exception:
-            logger.exception("[pooling] decoder hook failed; dropping pooler output")
-            return None
+        return self._pooling_output_decoder(
+            pooler_output,
+            request,
+            self.vllm_config.model_config.hf_config,
+        )
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""

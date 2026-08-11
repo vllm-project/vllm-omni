@@ -88,11 +88,12 @@ def inject_forced_aligner_stage(
     cli_overrides: dict[str, Any],
 ) -> tuple[PipelineConfig, DeployConfig]:
     """Append a forced-aligner pooling stage to the pipeline tail when
-    ``--forced-aligner`` is set; no-op otherwise. The stage runs the aligner
-    model with ``runner="pooling"``, consuming the previous stage's audio and
-    emitting a terminal word-timestamps side-output.
+    ``--forced-aligner`` or ``--forced-aligner-config`` resolves an aligner
+    model; no-op otherwise. The stage runs the aligner model with
+    ``runner="pooling"``, consuming the previous stage's audio and emitting a
+    terminal word-timestamps side-output.
     """
-    if not cli_overrides.get("forced_aligner"):
+    if not (cli_overrides.get("forced_aligner") or cli_overrides.get("forced_aligner_config")):
         return pipeline, deploy
 
     from vllm_omni.config.stage_config import (

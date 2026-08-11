@@ -237,9 +237,8 @@ class OmniServeCommand(CLISubcommand):
             "VoiceDesign, or Base, while diffusion models may use it to select "
             "task-specific weights. If omitted, the model default is used.",
         )
-        # Forced aligner / word timestamps. --forced-aligner is the opt-in
-        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-        # live in the deploy YAML passed via --forced-aligner-config.
+        # Forced aligner / word timestamps. Either flag opts in (--forced-aligner-config
+        # alone works when its YAML sets the model); heavier knobs live in that YAML.
         omni_config_group.add_argument(
             "--forced-aligner",
             type=str,

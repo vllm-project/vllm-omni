@@ -3816,6 +3816,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if len(ts_json) <= 4096:
                     headers["X-Word-Timestamps"] = ts_json
                 else:
+                    # Marker header so clients can tell an oversized alignment from no alignment.
+                    headers["X-Word-Timestamps-Omitted"] = f"oversize; bytes={len(ts_json)}; limit=4096"
                     logger.warning(
                         "X-Word-Timestamps header omitted: %d bytes exceeds the 4 KB budget "
                         "(use the WebSocket streaming path for long transcripts)",

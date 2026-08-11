@@ -415,6 +415,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            # Decode the pooling output before stop handling so a decoder
+            # failure finishes the request with FinishReason.ERROR (500).
+            try:
+                pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
+            except Exception as exc:
+                logger.exception("[pooling] decoder hook failed for request %s", req_id)
+                pooling_output_payload = None
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = f"pooling output decode failed: {exc}"
+                request.resumable = False
+
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
@@ -428,7 +439,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
-                request.status = RequestStatus.FINISHED_STOPPED
+                if request.status != RequestStatus.FINISHED_ERROR:
+                    request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
             # If criteria returns True, it means we must STOP the request.
@@ -513,8 +525,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            # Emit condition below tests the UNdecoded pooler_output so a failed decode still terminates the request.
-            pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 OmniSchedulerMixin._append_request_output(
                     self,
