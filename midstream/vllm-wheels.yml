@@ -1,7 +1,8 @@
+# Only run_id is used by midstream-build.yml — branch and note are provenance metadata.
 v0.26.0:
-  run_id: "30396358991"
-  branch: "main"
-  note: "v0.26.0 wheel, INFERENG-9284, built for TP sync"
+  run_id: "31477956333"
+  branch: "sync-v0.26.0"
+  note: "v0.26.0 wheel, includes PR #655 contract test 500 fix (3e97ca7)"
 
 v0.25.1:
   run_id: "29766140891"
