@@ -107,6 +107,15 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
+# Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
+# (consumed only via the "laser_input_scale" extra key; other backends and
+# platforms ignore it). The kernel stores unscaled QK^T in an fp16 GM
+# workspace, and H3's outlier activations (per-element amax in the hundreds)
+# push dot products past fp16 max 65504, turning whole 128-row blocks NaN.
+# 256 is a power of two, so pre-dividing q/k/v and the compensating
+# kernel-scale/output multiplies are exact in floating point.
+MINIMAX_H3_LASER_INPUT_SCALE = 256.0
+
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
     if key not in kwargs or kwargs[key] is None:
@@ -333,6 +342,7 @@ class MiniMaxH3Attention(nn.Module):
         )
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.rot_dim = 6 * arch.rope_inv_freq_len
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
@@ -365,7 +375,7 @@ class MiniMaxH3Attention(nn.Module):
         x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
         are cast to the activation dtype before the elementwise math.
         """
-        rot_dim = freqs.shape[-1]
+        rot_dim = self.rot_dim
         x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
         cos = torch.cos(freqs).to(x.dtype)  # [T, rot_dim]
         sin = torch.sin(freqs).to(x.dtype)
@@ -401,11 +411,16 @@ class MiniMaxH3Attention(nn.Module):
         used = min(max_seqlen, packed_total)
         attn_mask = None
         # Ring attention can dispatch to a different implementation from the
-        # configured backend, so this no-mask fast path is local-only.
-        prefix_slice = (
-            not getattr(self.attention, "use_ring", False) and self.attention.attn_backend.supports_prefix_kv_slicing
+        # configured backend, so the no-mask fast paths are local-only.
+        # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
+        # supports_packed_mask_free: backend consumes the packed metadata
+        # without ever reading attn_mask (CUDA packed varlen, NPU
+        # npu_attn_varlen opt-in with its own fallback rebuild).
+        no_mask = not getattr(self.attention, "use_ring", False) and (
+            self.attention.attn_backend.supports_prefix_kv_slicing
+            or self.attention.attn_backend.supports_packed_mask_free()
         )
-        if used < packed_total and not prefix_slice:
+        if used < packed_total and not no_mask:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -415,6 +430,15 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
+                # Opt the NPU flash backend into the packed varlen path so the
+                # quadratic full_qk mask is never materialized. Ring attention
+                # is excluded: it keeps the aligned padding rows for its
+                # fixed-size P2P buffers and still needs the mask.
+                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                # fp16-range protection for the ascend_laser_attention kernel
+                # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
+                # backend/path.
+                "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
             },
             video_layout=video_layout,
         )

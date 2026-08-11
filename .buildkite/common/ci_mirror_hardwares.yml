@@ -8,7 +8,7 @@
 # NPU naming: {queue}_{resource_class}
 #   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
 #   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
-#   a3_npu_2    — ascend-a3, resource_class npu-2 (A3 CI image tag …:$BUILDKITE_COMMIT-a3)
+#   a3_npu_2    — ascend-a3, resource_class npu-2
 
 x-npu-k8s-plugins: &npu_k8s_plugins
   - kubernetes:

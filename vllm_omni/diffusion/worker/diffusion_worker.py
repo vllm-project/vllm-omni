@@ -41,6 +41,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
@@ -422,6 +423,7 @@ class DiffusionWorker:
         req: OmniDiffusionRequest | list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner.
 
@@ -457,7 +459,10 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
+            if diffusion_kv_metadata is not None:
+                kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
+            output = self.model_runner.execute_model(req, **kwargs)
         if profiler:
             profiler.step()
 
@@ -1350,6 +1355,7 @@ class WorkerWrapperBase:
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1362,7 +1368,10 @@ class WorkerWrapperBase:
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(req, od_config, kv_prefetch_job=kv_prefetch_job)
+        kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
+        if diffusion_kv_metadata is not None:
+            kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
+        return self.worker.execute_model(req, od_config, **kwargs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

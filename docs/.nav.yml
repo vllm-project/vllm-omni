@@ -16,31 +16,21 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
-      - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
-      - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
-      - MiMo-Audio: user_guide/examples/offline_inference/mimo_audio.md
-      - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
-      - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
+      - Speech-To-Video: user_guide/examples/offline_inference/speech_to_video.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Speech: user_guide/examples/offline_inference/text_to_speech.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
+      - X-To-Text: user_guide/examples/offline_inference/x_to_text.md
       - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
-      - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
-      - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
-      - Diffusers Backend Adapter: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
-      - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
-      - MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
-      - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
-      - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
-      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
+      - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
+      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*

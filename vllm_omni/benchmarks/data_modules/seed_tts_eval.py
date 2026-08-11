@@ -54,6 +54,8 @@ import string
 import tempfile
 import threading
 import wave
+from copy import copy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -123,10 +125,24 @@ def _get_eval_device() -> str:
         return explicit
     try:
         import torch
-
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda:0"
+
+    # Ascend: ``torch.npu`` only exists once ``torch_npu`` has been imported, which does
+    # not necessarily happen in the benchmark client process. Without this branch the
+    # eval silently lands on CPU, where Whisper-large-v3 needs hours for a full Seed-TTS
+    # run and the CI job is killed by its timeout instead of reporting a WER.
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        pass
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu:0"
+
+    return "cpu"
 
 
 def _punctuation_all() -> str:
@@ -512,6 +528,42 @@ def _missing_deps_message(lang: str) -> str | None:
     return None
 
 
+def _expand_seed_tts_turn_outputs(
+    input_requests: list[SeedTTSSampleRequest],
+    outputs: list[Any],
+) -> tuple[list[SeedTTSSampleRequest], list[Any]]:
+    """Expand grouped Realtime sessions into one request/output pair per turn."""
+    expanded_requests: list[SeedTTSSampleRequest] = []
+    expanded_outputs: list[Any] = []
+    for request, output in zip(input_requests, outputs, strict=True):
+        turns = request.seed_tts_turns
+        if not turns:
+            expanded_requests.append(request)
+            expanded_outputs.append(output)
+            continue
+        turn_pcm = getattr(output, "tts_turn_pcm_bytes", None)
+        session_pcm = getattr(output, "tts_output_pcm_bytes", None)
+        for turn_index, turn in enumerate(turns):
+            expanded_requests.append(
+                replace(
+                    request,
+                    prompt=turn.target_text,
+                    seed_tts_utterance_id=turn.utterance_id,
+                    seed_tts_turns=(),
+                )
+            )
+            turn_output = copy(output)
+            if isinstance(turn_pcm, list) and turn_index < len(turn_pcm):
+                turn_output.tts_output_pcm_bytes = turn_pcm[turn_index]
+            elif len(turns) == 1:
+                # openai-chat-omni Seed-TTS only fills the session-level PCM field.
+                turn_output.tts_output_pcm_bytes = session_pcm
+            else:
+                turn_output.tts_output_pcm_bytes = None
+            expanded_outputs.append(turn_output)
+    return expanded_requests, expanded_outputs
+
+
 def compute_seed_tts_wer_metrics(
     input_requests: list[SampleRequest],
     outputs: list[Any],
@@ -524,6 +576,8 @@ def compute_seed_tts_wer_metrics(
         return None
     if not all(isinstance(r, SeedTTSSampleRequest) for r in input_requests):
         return None
+    session_count = len(input_requests)
+    input_requests, outputs = _expand_seed_tts_turn_outputs(input_requests, outputs)
 
     first = input_requests[0]
     assert isinstance(first, SeedTTSSampleRequest)
@@ -759,6 +813,8 @@ def compute_seed_tts_wer_metrics(
 
     result: dict[str, Any] = {
         "seed_tts_eval_protocol": "seed-tts-eval",
+        "seed_tts_session_count": session_count,
+        "seed_tts_turn_count": len(input_requests),
         "seed_tts_content_evaluated": len(errs),
         "seed_tts_content_error_mean": statistics.fmean(errs) if errs else None,
         "seed_tts_content_error_median": statistics.median(errs) if errs else None,
