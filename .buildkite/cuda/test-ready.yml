@@ -182,6 +182,19 @@ steps:
             "
         mirror_hardwares: h100_2
 
+      - label: "Omni · Falcon Perception Offline Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_falcon_perception.py
+          - vllm_omni/model_executor/models/falcon_perception/
+          - vllm_omni/model_executor/stage_input_processors/falcon_perception.py
+          - vllm_omni/deploy/falcon_perception.yaml
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/offline_inference/test_falcon_perception.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
       - label: "Omni · MiniCPM-o 4.5 Offline Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_minicpmo_4_5.py

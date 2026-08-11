@@ -49,6 +49,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.falcon_perception.configuration_falcon_perception import (
+            FalconPerceptionConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -89,6 +92,7 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
+        ("falcon_perception", FalconPerceptionConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),

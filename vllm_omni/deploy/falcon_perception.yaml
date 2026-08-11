@@ -1,0 +1,103 @@
+# Falcon Perception — A100-80GB throughput-tuned deployment.
+#
+# This is the canonical Falcon Perception profile for batched offline inference
+# when both stages share one A100-80GB GPU. The settings below were measured,
+# not copied from the reference engine's scheduler. The tuning workload used
+# 100 fixed, distinct PBench level-1 requests in one `generate()` call, with two
+# warmups and three measured passes. Model load, warmup, and artifact writes
+# were outside the timer. On an A100-SXM4-80GB:
+#
+# * `max_num_seqs: 4` was fastest; Falcon's vision prefill and structured decode
+#   make oversized vLLM batches counterproductive.
+# * `max_num_batched_tokens: 16384` and stage-0
+#   `gpu_memory_utilization: 0.66` create a ~236k-token KV cache. Going higher
+#   did not improve runtime.
+# * the AnyUp cache was swept over 0, 4096, 8192, 12288, and 14336 MiB. 12288
+#   MiB was the knee:
+# * these scheduler and cache settings completed the full 1108-request level-1
+#   split in 180.4 s (6.14 images/s, 18,971 prompt+output tokens/s processed),
+#   with about 73 GiB observed peak VRAM.
+#
+# Treat these numbers as tuning guidance. Output length and image size change
+# the optimum; retune on materially different hardware or workloads.
+# `gpu_memory_utilization` is a per-engine reservation, while `hr_cache_mb` is
+# allocated afterward and shares the card.
+#
+# Prefix caching is deliberately disabled
+# `torch.compile` is only partly matched. The reference compiles the whole
+# model; here the transformer backbone and AnyUp are compiled independently,
+# while request-aware position reconstruction and geometry feedback stay eager.
+# `load_and_prepare_model(compile=True)` compiles the reference's transformer
+# FFNs, its coord/size heads, and `itok_upsampler`. On this side:
+#
+# * stage 0 compiles `FalconPerceptionBackbone` with Inductor and captures its
+#   decode with CUDA graphs. Spatial-position reconstruction and the geometry
+#   callbacks remain outside that compiled submodule;
+# * stage 1 compiles AnyUp through the model-local toggle below. In a separate
+#   Nsight sweep, this reduced total GPU time by 3X
+#   by fusing the encoders' GroupNorm (`RowwiseMomentsCUDAKernel`: 8.78 s eager
+#   to 0.19 s compiled) and reflection padding. `compile_anyup` defaults to
+#   false when omitted.
+#
+# Memory is split because both stages share one GPU:
+#
+# * the stage-0 KV cache is ~50 GiB (~236k tokens);
+# * stage 1 and the AnyUp feature cache must fit on the same card;
+# * stage 1 also uses `max_num_seqs: 4`. It is a single-step stage, but each
+#   request can hold an (n_instances, H, W) mask tensor; keeping its cap aligned
+#   with stage 0 avoids an unsafe dense-scene backlog;
+# * `hr_cache_mb: 12288` holds ~100-130 entries. An entry is
+#   (256, gh*8, gw*8) bf16, or roughly 90-134 MB. The reference pool is host
+#   pinned memory and sized by entry count; this cache lives on the GPU next to
+#   the KV cache and is sized in bytes.
+
+pipeline: falcon_perception
+async_chunk: false
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    max_num_batched_tokens: 16384
+    max_model_len: 8192
+    gpu_memory_utilization: 0.66
+    # Compile the transformer backbone and capture autoregressive decode. NVTX
+    # ranges and dynamic position/geometry work stay outside the backbone.
+    enforce_eager: false
+    tensor_parallel_size: 1
+    devices: "0"
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
+    default_sampling_params:
+      # Greedy: geometry is read from the hidden state that produced each
+      # <coord>/<size> token, so sampling would desynchronise boxes from tokens.
+      temperature: 0.0
+      max_tokens: 2048
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.10
+    # This stage runs max_tokens=1 and has no decode loop to capture. Its main
+    # compilation lever is AnyUp's model-local torch.compile toggle below.
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: NONE
+    tensor_parallel_size: 1
+    devices: "0"
+    hf_overrides:
+      # Allocated after vLLM profiles peak memory, so gpu_memory_utilization
+      # above must leave room for it. Set to 0 to disable the cache.
+      hr_cache_mb: 12288
+      # The largest GPU-time lever on this stage. Compilation can cause small
+      # floating-point mask-boundary differences, so validate on new hardware.
+      compile_anyup: true
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      detokenize: false
+
+# Verified on CUDA only.
+platforms: {}
