@@ -192,13 +192,6 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
         for row in range(batch_size)
     ]
 
-    bincount = mocker.spy(torch, "bincount")
-    actual = _apply_batched_repetition_penalty(
-        logits,
-        histories,
-        penalty=1.2,
-        window_size=5,
-    )
     expected = torch.cat(
         [
             _reference_repetition_penalty(
@@ -210,6 +203,13 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
             for row, history in enumerate(histories)
         ],
         dim=0,
+    )
+    bincount = mocker.spy(torch, "bincount")
+    actual = _apply_batched_repetition_penalty(
+        logits,
+        histories,
+        penalty=1.2,
+        window_size=5,
     )
 
     assert torch.equal(actual, expected)
