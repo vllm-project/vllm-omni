@@ -544,7 +544,11 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     torch.testing.assert_close(norm_out, torch.tensor([[2.0, 3.0]]))
 
 
-def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+def _load_qwen3_tts_code2wav_npu_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    platform_dtype_override: bool = True,
+):
     linear_weights = []
     conv_weights = []
 
@@ -574,15 +578,16 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
             self.prefix = prefix
             self.decoder = FakeDecoder()
 
-        def _npu_decoder_runtime_dtype(self, _device):
-            return torch.float16
-
         def load_weights(self, weights):
             assert list(weights) == []
             return {"loaded"}
 
-    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None)
+    if platform_dtype_override:
+        FakeCode2Wav._npu_decoder_runtime_dtype = lambda self, _device: torch.float16
+
+    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None, warning=lambda *_: None)
     current_platform = SimpleNamespace(is_npu=lambda: False)
+
     target = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav",
@@ -603,11 +608,23 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
     path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts_code2wav.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_npu_patch", path)
     module.apply_qwen3_tts_code2wav_patch()
+    return module, target, linear_weights, conv_weights
 
-    model = target.Qwen3TTSCode2Wav(
-        vllm_config=SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu"))),
+
+def _make_patched_code2wav(target, *, code2wav_dtype=None):
+    return target.Qwen3TTSCode2Wav(
+        vllm_config=SimpleNamespace(
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            model_config=SimpleNamespace(code2wav_dtype=code2wav_dtype),
+        ),
         prefix="stage1",
     )
+
+
+def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, target, linear_weights, conv_weights = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
+    model = _make_patched_code2wav(target, code2wav_dtype="bf16")
+
     assert model.load_weights(iter(())) == {"loaded"}
 
     assert model.prefix == "stage1"
@@ -618,4 +635,48 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
         model.decoder.deconv.weight.data_ptr(),
     }
     assert all(fmt == module._ACL_FORMAT_FRACTAL_Z for _, fmt in conv_weights)
+    assert model.decoder.cache_precompute_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("configured_dtype", "expected_dtype"),
+    [
+        (None, torch.float32),
+        ("fp32", torch.float32),
+        ("bf16", torch.bfloat16),
+        ("fp16", torch.float16),
+    ],
+)
+def test_qwen3_tts_code2wav_npu_dtype_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_dtype,
+    expected_dtype: torch.dtype,
+) -> None:
+    module, _, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
+    config = SimpleNamespace(model_config=SimpleNamespace(code2wav_dtype=configured_dtype))
+
+    assert module.resolve_npu_code2wav_runtime_dtype(config) is expected_dtype
+
+
+@pytest.mark.parametrize("configured_dtype", ["float32", "bfloat16", "float16", "half", "auto"])
+def test_qwen3_tts_code2wav_npu_dtype_rejects_non_enum_value(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_dtype: str,
+) -> None:
+    module, _, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
+    config = SimpleNamespace(model_config=SimpleNamespace(code2wav_dtype=configured_dtype))
+
+    with pytest.raises(ValueError, match="expected one of: fp32, bf16, fp16"):
+        module.resolve_npu_code2wav_runtime_dtype(config)
+
+
+def test_qwen3_tts_code2wav_npu_patch_uses_stage_dtype_without_platform_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch, platform_dtype_override=False)
+    model = _make_patched_code2wav(target, code2wav_dtype="fp16")
+
+    assert model.load_weights(iter(())) == {"loaded"}
+
+    assert model.decoder.linear.weight.dtype is torch.float16
     assert model.decoder.cache_precompute_calls == 1

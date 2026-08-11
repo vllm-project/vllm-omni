@@ -164,6 +164,10 @@ class OmniEngineArgs(EngineArgs):
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    # Qwen3-TTS Code2Wav decoder compute dtype: fp32, bf16, or fp16.
+    # None means "not explicitly overridden" so a stage-local deploy value
+    # create_model_config() materializes the framework default fp32.
+    code2wav_dtype: str | None = None
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -344,6 +348,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
+            code2wav_dtype=self.code2wav_dtype if self.code2wav_dtype is not None else "fp32",
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,

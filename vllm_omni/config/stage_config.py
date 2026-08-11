@@ -356,6 +356,8 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+    # Qwen3-TTS Code2Wav decoder compute dtype: fp32, bf16, or fp16.
+    code2wav_dtype: str | None = None
 
     # Generic compilation, profiling, tokenizer/config parsing, and model
     # loading controls.

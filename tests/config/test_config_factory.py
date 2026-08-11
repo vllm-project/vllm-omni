@@ -2214,6 +2214,21 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    def test_qwen3_tts_npu_sets_stage1_code2wav_dtype(self, deploy_name):
+        pipeline = resolve_pipeline_config("qwen3_tts")
+        deploy_path = Path(get_deploy_config_path(deploy_name))
+
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        stages = merge_pipeline_deploy(pipeline, npu)
+
+        assert "code2wav_dtype" not in stages[0].yaml_engine_args
+        assert stages[1].yaml_engine_args["code2wav_dtype"] == "fp16"
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
+        assert structured.stage_by_id(0).model_config.code2wav_dtype == "fp32"
+        assert structured.stage_by_id(1).model_config.code2wav_dtype == "fp16"
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)

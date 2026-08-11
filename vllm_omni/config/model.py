@@ -137,6 +137,8 @@ class OmniModelConfig(ModelConfig):
     subtalker_sampling_params: dict[str, Any] | None = None
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
+    # Qwen3-TTS Code2Wav decoder compute dtype: fp32, bf16, or fp16.
+    code2wav_dtype: str = "fp32"
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False

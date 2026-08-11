@@ -36,9 +36,33 @@ def test_default_stage_id_is_concrete_int():
     assert engine_args.stage_id == 0
     assert isinstance(engine_args.stage_id, int)
     assert engine_args.log_stats is False
+    assert engine_args.code2wav_dtype is None
 
     cfg = engine_args.create_model_config()
     assert cfg.stage_id == 0
+    assert cfg.code2wav_dtype == "fp32"
+
+
+def test_code2wav_dtype_is_propagated_to_model_config(mocker):
+    """The Stage 1 deploy knob must survive OmniEngineArgs construction."""
+    fake_model_config = SimpleNamespace(multimodal_config=None)
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=fake_model_config)
+    convert = mocker.patch.object(OmniModelConfig, "from_vllm_model_config", return_value=fake_model_config)
+
+    OmniEngineArgs(code2wav_dtype="fp16").create_model_config()
+
+    assert convert.call_args.kwargs["code2wav_dtype"] == "fp16"
+
+
+def test_code2wav_dtype_default_is_materialized_without_masking_stage_config(mocker):
+    """The engine sentinel must become FP32 only after stage merging."""
+    fake_model_config = SimpleNamespace(multimodal_config=None)
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=fake_model_config)
+    convert = mocker.patch.object(OmniModelConfig, "from_vllm_model_config", return_value=fake_model_config)
+
+    OmniEngineArgs().create_model_config()
+
+    assert convert.call_args.kwargs["code2wav_dtype"] == "fp32"
 
 
 def test_multimodal_kwarg_overrides(mocker):

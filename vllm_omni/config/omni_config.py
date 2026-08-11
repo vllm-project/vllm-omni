@@ -56,6 +56,7 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
+    code2wav_dtype: str
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
@@ -258,6 +259,8 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
+    # Qwen3-TTS Code2Wav decoder compute dtype: fp32, bf16, or fp16.
+    code2wav_dtype: str = "fp32"
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None

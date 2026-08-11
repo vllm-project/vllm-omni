@@ -101,3 +101,7 @@ platforms:
     stages:
       - stage_id: 0
         enforce_eager: true
+      - stage_id: 1
+        # Code2Wav decoder compute dtype. Supported values: fp32, bf16, fp16.
+        # The framework fallback is fp32; this NPU profile selects fp16.
+        code2wav_dtype: fp32
