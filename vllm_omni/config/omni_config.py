@@ -916,6 +916,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.requires_multimodal_data
 
     @property
+    def request_side_input_modalities(self) -> tuple[str, ...]:
+        return self.stage_pipeline_config.request_side_input_modalities
+
+    @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
 

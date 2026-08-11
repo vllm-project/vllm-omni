@@ -262,6 +262,24 @@ def test_full_payload_forwards_reference_voice_from_model_intermediate_buffer() 
     assert payload.meta.ref_audio_sr == 24000
 
 
+def test_full_payload_forwards_reference_voice_from_runner_request_state() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.additional_information_cpu = {
+        "codes": {"ref": [0.3, -0.3]},
+        "meta": {"ref_audio_sr": 22050},
+    }
+
+    payload = tts2code2wav_full_payload(
+        transfer_manager=manager,
+        pooling_output={"codes.audio": torch.arange(7, dtype=torch.long)},
+        request=request,
+    )
+
+    assert payload.codes.ref.tolist() == pytest.approx([0.3, -0.3])
+    assert payload.meta.ref_audio_sr == 22050
+
+
 def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
     output = SimpleNamespace(
         finished=True,

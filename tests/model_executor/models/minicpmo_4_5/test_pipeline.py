@@ -100,6 +100,8 @@ class TestPipelineTopology:
         assert talker.final_output is False
         assert talker.final_output_type is None
         assert talker.engine_output_type == "latent"
+        assert talker.requires_multimodal_data is False
+        assert talker.request_side_input_modalities == ("audio",)
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
         assert talker.custom_process_next_stage_input_func == (

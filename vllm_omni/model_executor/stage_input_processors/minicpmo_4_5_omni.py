@@ -129,6 +129,9 @@ def _request_intermediate_buffer(request: Any) -> Mapping[str, Any]:
     runtime_buffer = getattr(request, "model_intermediate_buffer", None)
     if isinstance(runtime_buffer, Mapping):
         return runtime_buffer
+    runtime_buffer = getattr(request, "additional_information_cpu", None)
+    if isinstance(runtime_buffer, Mapping):
+        return runtime_buffer
     legacy_buffer = getattr(request, "additional_information", None)
     return legacy_buffer if isinstance(legacy_buffer, Mapping) else {}
 
@@ -683,6 +686,7 @@ def llm2tts(
     _streaming_context=None,
 ):
     """Build Talker conditioning for ordinary and full-duplex streaming."""
+    del requires_multimodal_data  # Kept in the shared stage-input hook signature.
     if not source_outputs:
         raise ValueError("source_outputs cannot be empty")
 
@@ -697,19 +701,19 @@ def llm2tts(
         if isinstance(p, dict):
             request_multi_modal_data = p.get("multi_modal_data")
             additional_information = p.get("additional_information") or {}
-            deferred_multi_modal_data = (
-                additional_information.get("deferred_multi_modal_data")
-                if isinstance(additional_information, dict)
-                else None
+            request_side_inputs = (
+                additional_information.get("request_side_inputs") if isinstance(additional_information, dict) else None
             )
-            if isinstance(deferred_multi_modal_data, dict):
+            if not isinstance(request_side_inputs, dict) and isinstance(additional_information, dict):
+                request_side_inputs = additional_information.get("deferred_multi_modal_data")
+            if isinstance(request_side_inputs, dict):
                 if isinstance(request_multi_modal_data, dict):
                     request_multi_modal_data = {
                         **request_multi_modal_data,
-                        **deferred_multi_modal_data,
+                        **request_side_inputs,
                     }
                 else:
-                    request_multi_modal_data = deferred_multi_modal_data
+                    request_multi_modal_data = request_side_inputs
             multi_modal_data[llm_output.request_id] = request_multi_modal_data
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
@@ -982,11 +986,10 @@ def llm2tts(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,
                 model_intermediate_buffer=model_intermediate_buffer,
-                multi_modal_data=(
-                    multi_modal_data[llm_output.request_id]
-                    if requires_multimodal_data and multi_modal_data.get(llm_output.request_id) is not None
-                    else None
-                ),
+                # The Talker consumes only the structured handoff above.  Raw
+                # request media is bridge-side input and must not be profiled
+                # or reprocessed as Talker multimodal model input.
+                multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
         )

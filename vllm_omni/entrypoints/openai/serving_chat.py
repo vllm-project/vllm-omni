@@ -772,9 +772,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        deferred_multi_modal_data: dict[str, Any] | None = None
+        request_side_inputs: dict[str, Any] | None = None
         if self._needs_multistage_multimodal_split():
-            messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
+            messages, request_side_inputs = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
@@ -828,9 +828,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
             prompt_additional_information.update(additional_information)
 
-        if deferred_multi_modal_data:
+        if request_side_inputs:
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
-            prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
+            prompt_additional_information["request_side_inputs"] = request_side_inputs
+            deferred_modalities = self._deferred_multimodal_modalities()
+            deferred_multi_modal_data = {
+                modality: value for modality, value in request_side_inputs.items() if modality in deferred_modalities
+            }
+            if deferred_multi_modal_data:
+                # Compatibility for existing downstream model-input bridges.
+                prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
@@ -870,7 +877,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         downstream_modalities: set[str] = set()
         for stage in stage_configs[1:]:
             downstream_modalities.update(self._stage_input_modalities(stage))
+            downstream_modalities.update(self._stage_request_side_input_modalities(stage))
         return downstream_modalities
+
+    @classmethod
+    def _stage_request_side_input_modalities(cls, stage: Any) -> set[str]:
+        runtime = cls._stage_get(stage, "runtime")
+        explicit = cls._stage_get(
+            runtime,
+            "request_side_input_modalities",
+            cls._stage_get(stage, "request_side_input_modalities", ()),
+        )
+        return {str(modality) for modality in as_list(explicit)}
 
     def _deferred_multimodal_modalities(self) -> set[str]:
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
@@ -922,7 +940,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         messages: list[ChatCompletionMessageParam],
         request: ChatLikeRequest | ResponsesRequest,
     ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
-        """Hide modalities unsupported by stage 0 and stash them for downstream stages."""
+        """Materialize downstream side inputs and hide any stage-0-unsupported media."""
         downstream_modalities = self._downstream_multimodal_modalities()
         deferred_modalities = self._deferred_multimodal_modalities()
         downstream_parts: dict[str, list[Any]] = {modality: [] for modality in downstream_modalities}
