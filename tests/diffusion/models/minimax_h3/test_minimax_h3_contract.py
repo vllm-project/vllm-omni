@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1466,8 +1467,11 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     assert sampled["block_timestamps"] == [0.25, 1.0]
 
 
-@pytest.mark.parametrize("indices", [[0, 12], None])
-def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices):
+@pytest.mark.parametrize(
+    ("indices", "frame_count"),
+    [([0, 12], 25), (None, 2)],
+)
+def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame_count):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
@@ -1481,7 +1485,7 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices):
 
     actual = reference_video_module._decode_video_frames_ffmpeg(
         "prepared.mp4",
-        frame_count=2,
+        frame_count=frame_count,
         indices=indices,
         width=3,
         height=2,
@@ -1497,6 +1501,61 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices):
         assert command[command.index("-vf") + 1] == "select=eq(n\\,0)+eq(n\\,12)"
     assert command[-1] == "pipe:1"
     assert kwargs == {"check": True, "capture_output": True}
+
+
+def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
+    decode_calls = []
+    monkeypatch.setitem(sys.modules, "decord", None)
+    monkeypatch.setattr(
+        reference_video_module,
+        "_probe_video",
+        lambda _path: {
+            "frame_count": 2,
+            "width": 3,
+            "height": 2,
+        },
+    )
+    monkeypatch.setattr(
+        reference_video_module,
+        "_decode_video_frames_ffmpeg",
+        lambda path, **kwargs: decode_calls.append((path, kwargs)) or expected,
+    )
+
+    actual = reference_video_module.load_video_frames("prepared.mp4")
+
+    assert actual is expected
+    assert decode_calls == [
+        (
+            "prepared.mp4",
+            {
+                "frame_count": 2,
+                "width": 3,
+                "height": 2,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"frame_count": 0, "width": 3, "height": 2}, "video has no frames"),
+        ({"frame_count": 1, "width": 0, "height": 2}, "invalid dimensions"),
+        (
+            {"frame_count": 1, "indices": [], "width": 3, "height": 2},
+            "invalid frame indices",
+        ),
+    ],
+)
+def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match=message):
+        reference_video_module._decode_video_frames_ffmpeg("prepared.mp4", **kwargs)
 
 
 def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):

@@ -427,7 +427,17 @@ def _decode_video_frames_ffmpeg(
     height: int,
     indices: list[int] | None = None,
 ) -> np.ndarray:
-    output_frame_count = int(frame_count) if indices is None else len(indices)
+    frame_count = int(frame_count)
+    width = int(width)
+    height = int(height)
+    if frame_count <= 0:
+        raise OmniClientError(f"video has no frames: {path}")
+    if width <= 0 or height <= 0:
+        raise OmniClientError(f"video has invalid dimensions {width}x{height}: {path}")
+    if indices is not None and (not indices or any(index < 0 or index >= frame_count for index in indices)):
+        raise OmniClientError(f"invalid frame indices for {path}: {indices}")
+
+    output_frame_count = frame_count if indices is None else len(indices)
     command = [
         "ffmpeg",
         "-loglevel",
@@ -461,14 +471,14 @@ def _decode_video_frames_ffmpeg(
         check=True,
         capture_output=True,
     )
-    frame_size = int(width) * int(height) * 3
+    frame_size = width * height * 3
     expected_size = output_frame_count * frame_size
     if len(result.stdout) != expected_size:
         raise OmniClientError(f"decoded {len(result.stdout)} bytes from {path}, expected {expected_size}")
     return np.frombuffer(result.stdout, dtype=np.uint8).reshape(
         output_frame_count,
-        int(height),
-        int(width),
+        height,
+        width,
         3,
     )
 
