@@ -4,33 +4,21 @@
 # Publish Docker images from ECR staging to DockerHub.
 #
 # Usage:
-#   publish-release-images.sh                 # release mode (default)
+#   publish-release-images.sh            # release mode (default)
 #   publish-release-images.sh release
-#   publish-release-images.sh nightly [TAG_VARIANT]
+#   publish-release-images.sh nightly
 #
-# Release mode tags: latest, v<version>
-# Nightly mode tags: nightly (or <variant>-nightly), plus commit-pinned manifest
-#
-# Reserved (no current callers): TAG_VARIANT / ECR_SUFFIX. Pipeline today only
-# builds the default CUDA image and invokes `nightly` with no second arg.
-# Keep this path for future multi-variant builds (e.g. cu129): it retags ECR
-# `$COMMIT-*-<variant>` to DockerHub `<variant>-nightly` so cleanup can retain
-# per-variant history independently.
+# Release tags: latest, v<version>
+# Nightly tags: nightly, nightly-<commit>
 
 set -euo pipefail
 
 MODE="${1:-release}"
-# Reserved: unused by current pipeline; see header comment.
-TAG_VARIANT="${2:-}"
 
 DOCKERHUB_REPO="vllm/vllm-omni"
 ECR_REPO="public.ecr.aws/q9t5s3a7/vllm-omni-release-repo"
 COMMIT="$BUILDKITE_COMMIT"
-# Reserved: only set when TAG_VARIANT is provided; empty for current callers.
-ECR_SUFFIX=""
-# Primary floating tags that each get their own per-arch DockerHub tags.
 PRIMARY_TAGS=()
-# Extra multi-arch manifest names that reuse the first primary tag's arch images.
 EXTRA_MANIFEST_TAGS=()
 
 case "${MODE}" in
@@ -43,20 +31,12 @@ case "${MODE}" in
     PRIMARY_TAGS=("latest" "v${RELEASE_VERSION}")
     ;;
   nightly)
-    # Reserved branch: TAG_VARIANT path has no pipeline caller yet.
-    if [ -n "${TAG_VARIANT}" ]; then
-      ECR_SUFFIX="-${TAG_VARIANT}"
-      PRIMARY_TAG="${TAG_VARIANT}-nightly"
-    else
-      PRIMARY_TAG="nightly"
-    fi
-    # Per-arch tags only for the floating nightly name; commit-pinned is
-    # a multi-arch manifest alias reusing those same arch images.
-    PRIMARY_TAGS=("${PRIMARY_TAG}")
-    EXTRA_MANIFEST_TAGS=("${PRIMARY_TAG}-${COMMIT}")
+    # Commit-pinned manifest reuses nightly-{x86_64,aarch64} arch images.
+    PRIMARY_TAGS=("nightly")
+    EXTRA_MANIFEST_TAGS=("nightly-${COMMIT}")
     ;;
   *)
-    echo "Usage: $0 {release|nightly} [TAG_VARIANT]"
+    echo "Usage: $0 {release|nightly}"
     exit 2
     ;;
 esac
@@ -64,19 +44,17 @@ esac
 echo "========================================"
 echo "Publishing ${MODE} images to ${DOCKERHUB_REPO}"
 echo "  Commit: ${COMMIT}"
-echo "  ECR suffix: '${ECR_SUFFIX}'"
 echo "  Primary tags: ${PRIMARY_TAGS[*]}"
 if [ ${#EXTRA_MANIFEST_TAGS[@]} -gt 0 ]; then
   echo "  Extra manifests: ${EXTRA_MANIFEST_TAGS[*]}"
 fi
 echo "========================================"
 
-# Login to ECR to pull staging images
 aws ecr-public get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7
 
-SRC_X86="${ECR_REPO}:${COMMIT}-x86_64${ECR_SUFFIX}"
-SRC_ARM="${ECR_REPO}:${COMMIT}-aarch64${ECR_SUFFIX}"
+SRC_X86="${ECR_REPO}:${COMMIT}-x86_64"
+SRC_ARM="${ECR_REPO}:${COMMIT}-aarch64"
 
 docker pull "${SRC_X86}"
 docker pull "${SRC_ARM}"
@@ -100,7 +78,6 @@ for tag in "${PRIMARY_TAGS[@]}"; do
   publish_manifest "${tag}" "${tag}"
 done
 
-# Extra manifests reuse the first primary tag's per-arch images.
 ARCH_BASE="${PRIMARY_TAGS[0]}"
 for tag in "${EXTRA_MANIFEST_TAGS[@]}"; do
   publish_manifest "${tag}" "${ARCH_BASE}"

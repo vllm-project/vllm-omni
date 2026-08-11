@@ -1,29 +1,17 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Clean up old nightly builds from DockerHub, keeping only the last 14 builds.
-# Uses DockerHub API to list and delete old tags with the specified prefix.
-#
-# Usage: cleanup-nightly-builds.sh [TAG_PREFIX] [REPO]
-# Example: cleanup-nightly-builds.sh
-# Example: cleanup-nightly-builds.sh "nightly-"
-# Example: cleanup-nightly-builds.sh "nightly-" "vllm/vllm-omni"
-#
-# Reserved (no current callers): non-default TAG_PREFIX such as "cu129-nightly-".
-# Keep for when publish-release-images.sh is invoked with a TAG_VARIANT.
+# Clean up old nightly builds from DockerHub (vllm/vllm-omni), keeping the
+# newest 14 tags with the nightly- prefix.
 
 set -ex
 
-# Get tag prefix and repo from arguments
-TAG_PREFIX="${1:-nightly-}"
-REPO="${2:-vllm/vllm-omni}"
+TAG_PREFIX="nightly-"
+REPO="vllm/vllm-omni"
+REPO_API_URL="https://hub.docker.com/v2/repositories/${REPO}/tags"
 
 echo "Cleaning up tags with prefix: $TAG_PREFIX in repository: $REPO"
 
-# DockerHub API endpoint for the repository
-REPO_API_URL="https://hub.docker.com/v2/repositories/${REPO}/tags"
-
-# Get DockerHub credentials from environment
 if [ -z "$DOCKERHUB_TOKEN" ]; then
   echo "Error: DOCKERHUB_TOKEN environment variable is not set"
   exit 1
@@ -34,7 +22,6 @@ if [ -z "$DOCKERHUB_USERNAME" ]; then
   exit 1
 fi
 
-# Get DockerHub bearer token
 echo "Getting DockerHub bearer token..."
 set +x
 BEARER_TOKEN=$(curl -s -X POST \
@@ -48,32 +35,38 @@ if [ -z "$BEARER_TOKEN" ] || [ "$BEARER_TOKEN" = "null" ]; then
   exit 1
 fi
 
-# Function to get all tags from DockerHub
 get_all_tags() {
   local page=1
   local all_tags=""
+  # Hub `name` is a partial match (not a strict prefix). Use it to narrow the
+  # list, then enforce startswith() client-side. Exhaust API pages; do not
+  # stop merely because a page has no matching tags after filtering.
+  local name_query
+  name_query=$(printf '%s' "$TAG_PREFIX" | jq -sRr @uri)
 
   while true; do
     set +x
     local response
     response=$(curl -s -H "Authorization: Bearer $BEARER_TOKEN" \
-      "$REPO_API_URL?page=$page&page_size=100")
+      "$REPO_API_URL?page=$page&page_size=100&name=${name_query}")
     set -x
 
-    # Get both last_updated timestamp and tag name, separated by |
+    local page_count
+    page_count=$(echo "$response" | jq -r '.results | length')
+    if [ -z "$page_count" ] || [ "$page_count" = "0" ] || [ "$page_count" = "null" ]; then
+      break
+    fi
+
     local tags
     tags=$(echo "$response" | jq -r --arg prefix "$TAG_PREFIX" \
       '.results[] | select(.name | startswith($prefix)) | "\(.last_updated)|\(.name)"')
 
-    if [ -z "$tags" ]; then
-      break
+    if [ -n "$tags" ]; then
+      all_tags="$all_tags$tags"$'\n'
     fi
-
-    all_tags="$all_tags$tags"$'\n'
     page=$((page + 1))
   done
 
-  # Sort by timestamp (newest first) and extract just the tag names
   echo "$all_tags" | sort -r | cut -d'|' -f2
 }
 
@@ -83,18 +76,30 @@ delete_tag() {
 
   local delete_url="https://hub.docker.com/v2/repositories/${REPO}/tags/$tag_name"
   set +x
-  local response
-  response=$(curl -s -X DELETE -H "Authorization: Bearer $BEARER_TOKEN" "$delete_url")
+  local response http_code body
+  response=$(curl -s -w "\n%{http_code}" -X DELETE \
+    -H "Authorization: Bearer $BEARER_TOKEN" "$delete_url")
   set -x
+  http_code=$(printf '%s\n' "$response" | tail -n1)
+  body=$(printf '%s\n' "$response" | sed '$d')
 
-  if echo "$response" | jq -e '.detail' > /dev/null 2>&1; then
-    echo "Warning: Failed to delete tag $tag_name: $(echo "$response" | jq -r '.detail')"
-  else
-    echo "Successfully deleted tag: $tag_name"
+  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+    echo "Successfully deleted tag: $tag_name (HTTP ${http_code})"
+    return 0
   fi
+
+  local detail=""
+  if echo "$body" | jq -e '.detail' > /dev/null 2>&1; then
+    detail=$(echo "$body" | jq -r '.detail')
+  elif [ -n "$body" ]; then
+    detail="$body"
+  else
+    detail="(empty response body)"
+  fi
+  echo "Error: Failed to delete tag $tag_name (HTTP ${http_code}): ${detail}"
+  return 1
 }
 
-# Get all nightly- prefixed tags, sorted by last_updated timestamp (newest first)
 echo "Fetching all tags from DockerHub..."
 all_tags=$(get_all_tags)
 
@@ -103,11 +108,9 @@ if [ -z "$all_tags" ]; then
   exit 0
 fi
 
-# Count total tags
 total_tags=$(echo "$all_tags" | wc -l)
 echo "Found $total_tags tags"
 
-# Keep only the last 14 builds (including the current one)
 tags_to_keep=14
 tags_to_delete=$((total_tags - tags_to_keep))
 
@@ -118,7 +121,6 @@ fi
 
 echo "Will delete $tags_to_delete old tags, keeping the newest $tags_to_keep"
 
-# Get tags to delete (skip the first $tags_to_keep tags)
 tags_to_delete_list=$(echo "$all_tags" | tail -n +$((tags_to_keep + 1)))
 
 if [ -z "$tags_to_delete_list" ]; then
@@ -126,14 +128,20 @@ if [ -z "$tags_to_delete_list" ]; then
   exit 0
 fi
 
-# Delete old tags
 echo "Deleting old tags..."
+delete_failures=0
 while IFS= read -r tag; do
   if [ -n "$tag" ]; then
-    delete_tag "$tag"
-    # Add a small delay to avoid rate limiting
+    if ! delete_tag "$tag"; then
+      delete_failures=$((delete_failures + 1))
+    fi
     sleep 1
   fi
 done <<< "$tags_to_delete_list"
+
+if [ "$delete_failures" -gt 0 ]; then
+  echo "Cleanup finished with ${delete_failures} deletion failure(s)"
+  exit 1
+fi
 
 echo "Cleanup completed successfully"
