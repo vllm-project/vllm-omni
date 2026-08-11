@@ -410,10 +410,18 @@ def normalize_lingbot_request(
     else:
         num_frames = normalize_lingbot_num_frames(default_num_frames)
 
+    dimension_fields = dict(prompt_fields)
+    dimension_fields.update(
+        {
+            key: value
+            for key in ("width", "height", "size", "resolution", "ratio")
+            if (value := _pick(extra_args, key)) is not None
+        }
+    )
     width, height = resolve_lingbot_output_dimensions(
         sampling_width=sampling.width,
         sampling_height=sampling.height,
-        prompt_fields=prompt_fields,
+        prompt_fields=dimension_fields,
         default_width=default_width,
         default_height=default_height,
     )

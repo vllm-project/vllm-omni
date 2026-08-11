@@ -340,6 +340,20 @@ def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
     )
     assert (config.height, config.width) == (192, 320)
 
+    # Online TI2V requests carry model-scoped dimensions through extra_params.
+    config = _normalize(
+        {
+            "prompt": "motion",
+            "modalities": ["video"],
+            "multi_modal_data": {"image": Image.new("RGB", (320, 192))},
+        },
+        width=480,
+        height=480,
+        num_frames=9,
+        extra_args={"size": "320x192"},
+    )
+    assert (config.height, config.width) == (192, 320)
+
     # Without a prompt size, the sampling dimensions are used.
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
