@@ -6,6 +6,7 @@ owners:
   - "@princepride"
   - "@yuanheng-zhao"
   - "@xuechendi"
+  - "@Bounty-hunter"
 primary_code_paths:
   - vllm_omni/diffusion/distributed/**
   - vllm_omni/diffusion/attention/parallel/**

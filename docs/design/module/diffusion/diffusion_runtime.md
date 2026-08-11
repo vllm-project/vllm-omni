@@ -6,6 +6,7 @@ owners:
   - "@Isotr0py"
   - "@princepride"
   - "@SamitHuang"
+  - "@fhfuih"
 primary_code_paths:
   - vllm_omni/diffusion/sched/**
   - vllm_omni/diffusion/executor/**
