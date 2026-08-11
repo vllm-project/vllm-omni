@@ -641,6 +641,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
+                    prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                 )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
+
+from .cuda_graph_wrapper import HiFTGraphWrapper
+
+logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
 
@@ -60,7 +66,14 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any, trt_stepper: Any | None = None):
+    def __init__(
+        self,
+        token2wav: Any,
+        trt_stepper: Any | None = None,
+        *,
+        connector_config: Mapping[str, int] | None = None,
+        hift_graph_config: Mapping[str, Any] | None = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
         # Optional TrtDiTStepper (step_audio2_dit_trt): replaces only the
@@ -82,7 +95,7 @@ class BatchedToken2Wav(nn.Module):
                 _autocast_disabled(device),
             ):
                 # 50 mel frames match the default first streamed vocoder chunk.
-                speech, source = self.hift(
+                speech, source = self.hift.inference(
                     torch.zeros((1, mel_channels, 50), device=device, dtype=dtype),
                     torch.zeros((1, 1, 0), device=device, dtype=dtype),
                 )
@@ -98,7 +111,40 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self.hift_graph_wrapper: HiFTGraphWrapper | None = None
+        graph_config = dict(hift_graph_config or {})
+        if bool(graph_config.get("enabled", False)):
+            if hift_parameter is None:
+                raise ValueError("MiniCPM-o HiFT Graph requires a parameterized HiFT module")
+            if hift_parameter.device.type != "cuda":
+                logger.info("HiFT CUDA Graph is disabled on device type %s", hift_parameter.device.type)
+            else:
+                if connector_config is None:
+                    raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
+                if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
+                    raise ValueError(
+                        "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
+                    )
+                capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
+                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                self.hift_graph_wrapper = HiFTGraphWrapper(
+                    token2wav=token2wav,
+                    connector_config=dict(connector_config),
+                    capture_batch_sizes=capture_batch_sizes,
+                )
+                with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
+                    self.hift_graph_wrapper.capture()
+                logger.info("HiFT CUDA Graph captured successfully")
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+
+    def _hift_inference(
+        self,
+        mel: torch.Tensor,
+        source_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.hift_graph_wrapper is None:
+            return self.hift.inference(mel, source_cache)
+        return self.hift_graph_wrapper.replay(mel, source_cache)
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -463,7 +509,7 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
-        speech, source = self.hift(mel, old_source)
+        speech, source = self._hift_inference(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)

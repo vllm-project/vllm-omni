@@ -41,6 +41,7 @@ from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_images_generations_response,
     assert_omni_response,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
@@ -1504,6 +1505,11 @@ class OpenAIClientHandler:
             err_code=cfg.get("err_code"),
             err_message=cfg.get("err_message"),
         )
+        if cfg.get("err_code") is None:
+            assert resp.success, resp.error_message
+            payload = resp.json_body
+            assert isinstance(payload, dict)
+            assert_images_generations_response(payload, cfg, run_level=self.run_level)
         return [resp]
 
     def send_images_edits_http_request(

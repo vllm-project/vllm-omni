@@ -23,6 +23,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.diffusion_kv.config import (
+    DiffusionKVCacheMode,
+    parse_diffusion_kv_cache_mode,
+)
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -412,14 +416,14 @@ class DiffusionCacheConfig:
         >>> # Access via attribute
         >>> print(config.rel_l1_thresh)  # 0.3 (from dict)
         >>> print(config.Fn_compute_blocks)  # 8 (default)
-        >>> # Empty dict uses all defaults
+        >>> # Empty dict defers model-specific defaults to the TeaCache backend
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(default_config.rel_l1_thresh)  # None
     """
 
     # TeaCache parameters [tea_cache only]
-    # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
-    rel_l1_thresh: float = 0.2
+    # None defers to the model-specific TeaCache default (0.2 fallback).
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
 
     # MagCache parameters [mag_cache only]
@@ -657,6 +661,9 @@ class OmniDiffusionConfig:
     # directly — hence ``str | type`` (structured-config mirrors should expose
     # the string form only).
     engine_backend: str | type = "default"
+
+    # Local Diffusion KV ownership and cache-layout mode.
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
 
     # Optional override for the diffusion model runner class (import path).
     # Precedence in the worker: this override > the runner declared by the
@@ -923,10 +930,28 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+
+        if self.omni_kv_config is None:
+            self.omni_kv_config = {}
+        elif isinstance(self.omni_kv_config, Mapping):
+            self.omni_kv_config = dict(self.omni_kv_config)
+        else:
+            raise TypeError("omni_kv_config must be a mapping")
+        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
+            "need_recv_cache", False
+        ):
+            raise ValueError(
+                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
+                "disable need_recv_cache until connector-aware admission is implemented"
+            )
+
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if self.request_batch_max_wait_ms < 0:
-            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
+        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+            raise ValueError(
+                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
+            )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

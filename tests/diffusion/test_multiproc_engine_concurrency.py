@@ -48,6 +48,7 @@ def _mock_request(tag: str):
         request_id=tag,
         prompt=f"prompt_{tag}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        diffusion_kv_requests=None,
     )
 
 
