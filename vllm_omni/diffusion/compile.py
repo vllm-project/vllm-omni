@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -7,6 +8,59 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+class _FallbackCompiledCallable:
+    """Run a compiled callable until it fails, then permanently use eager."""
+
+    def __init__(
+        self,
+        eager: Callable[..., Any],
+        compiled: Callable[..., Any],
+        *,
+        label: str,
+    ) -> None:
+        self._eager = eager
+        self._compiled: Callable[..., Any] | None = compiled
+        self._label = label
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        compiled = self._compiled
+        if compiled is None:
+            return self._eager(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            self._compiled = None
+            logger.warning(
+                "%s failed during lazy torch.compile execution (%s); disabling compilation and retrying eagerly.",
+                self._label,
+                exc,
+            )
+            return self._eager(*args, **kwargs)
+
+
+def compile_callable_with_fallback(
+    fn: Callable[..., Any],
+    *,
+    label: str,
+    **compile_kwargs: Any,
+) -> tuple[Callable[..., Any], bool]:
+    """Compile ``fn`` with a fail-closed eager fallback.
+
+    The boolean return value reports whether lazy compilation was activated.
+    Synchronous setup failures return the original callable unchanged.
+    """
+    try:
+        compiled = torch.compile(fn, **compile_kwargs)
+    except Exception as exc:
+        logger.warning(
+            "%s torch.compile setup failed (%s); continuing eagerly.",
+            label,
+            exc,
+        )
+        return fn, False
+    return _FallbackCompiledCallable(fn, compiled, label=label), True
 
 
 def _matches_repeated_block(

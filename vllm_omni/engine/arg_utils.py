@@ -488,6 +488,7 @@ class OrchestratorArgs:
     diffusion_attention_config: str | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    diffusion_compile_vae: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False

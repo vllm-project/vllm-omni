@@ -5,7 +5,7 @@ import pytest
 import torch.nn as nn
 
 import vllm_omni.diffusion.compile as compile_module
-from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.compile import compile_callable_with_fallback, regionally_compile
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -74,3 +74,50 @@ def test_regionally_compile_does_not_partially_mutate_on_setup_failure(monkeypat
         regionally_compile(model, dynamic=True)
 
     assert [block.forward.__func__ for block in model.transformer_blocks] == original_forwards
+
+
+def test_compile_callable_falls_back_once_after_lazy_failure(monkeypatch, caplog):
+    compiled_calls = 0
+    eager_calls = 0
+
+    def eager(value):
+        nonlocal eager_calls
+        eager_calls += 1
+        return value + 1
+
+    def compile_fn(fn, **kwargs):
+        assert fn is eager
+        assert kwargs == {"mode": "default"}
+
+        def compiled(value):
+            nonlocal compiled_calls
+            compiled_calls += 1
+            raise RuntimeError("lazy failure")
+
+        return compiled
+
+    monkeypatch.setattr(compile_module.torch, "compile", compile_fn)
+    callable_fn, activated = compile_callable_with_fallback(eager, label="test callable", mode="default")
+
+    assert activated
+    assert callable_fn(1) == 2
+    assert callable_fn(2) == 3
+    assert compiled_calls == 1
+    assert eager_calls == 2
+    assert "disabling compilation and retrying eagerly" in caplog.text
+
+
+def test_compile_callable_keeps_eager_on_setup_failure(monkeypatch, caplog):
+    def eager(value):
+        return value + 1
+
+    def compile_fn(*args, **kwargs):
+        raise RuntimeError("setup failure")
+
+    monkeypatch.setattr(compile_module.torch, "compile", compile_fn)
+    callable_fn, activated = compile_callable_with_fallback(eager, label="test callable")
+
+    assert not activated
+    assert callable_fn is eager
+    assert callable_fn(1) == 2
+    assert "continuing eagerly" in caplog.text

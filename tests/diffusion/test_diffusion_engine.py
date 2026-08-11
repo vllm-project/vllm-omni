@@ -515,16 +515,19 @@ class TestDiffusionCompileConfig:
 
         assert config.diffusion_compile_granularity == "regional"
         assert config.diffusion_compile_dynamic is True
+        assert config.diffusion_compile_vae is True
 
     def test_from_kwargs_preserves_compile_controls(self) -> None:
         config = OmniDiffusionConfig.from_kwargs(
             model="test",
             diffusion_compile_granularity="full",
             diffusion_compile_dynamic=False,
+            diffusion_compile_vae=False,
         )
 
         assert config.diffusion_compile_granularity == "full"
         assert config.diffusion_compile_dynamic is False
+        assert config.diffusion_compile_vae is False
 
     def test_config_rejects_invalid_compile_granularity(self) -> None:
         with pytest.raises(ValueError, match="diffusion_compile_granularity"):
@@ -533,6 +536,10 @@ class TestDiffusionCompileConfig:
     def test_config_rejects_non_boolean_compile_dynamic(self) -> None:
         with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
             OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
+
+    def test_config_rejects_non_boolean_compile_vae(self) -> None:
+        with pytest.raises(TypeError, match="diffusion_compile_vae"):
+            OmniDiffusionConfig(model="test", diffusion_compile_vae="false")
 
     @pytest.mark.parametrize(
         "kwargs, feature",

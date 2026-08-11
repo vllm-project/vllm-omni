@@ -728,6 +728,9 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # Compile discovered VAE ``decode`` callables whenever generic diffusion
+    # torch.compile is enabled. Runtime failures permanently fall back to eager.
+    diffusion_compile_vae: bool = True
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -932,6 +935,8 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_compile_vae, bool):
+            raise TypeError(f"diffusion_compile_vae must be a bool, got {type(self.diffusion_compile_vae)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
 
         if self.omni_kv_config is None:

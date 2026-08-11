@@ -480,6 +480,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-vae",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Compile discovered VAE decode callables when diffusion torch.compile is enabled. "
+                "Use --no-diffusion-compile-vae to keep VAE decode eager."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",

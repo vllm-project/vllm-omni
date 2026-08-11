@@ -87,6 +87,7 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
             "enforce_eager": None,
             "diffusion_compile_granularity": None,
             "diffusion_compile_dynamic": None,
+            "diffusion_compile_vae": None,
         }
     )[0]
 
@@ -98,6 +99,7 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
     assert stage_cfg["engine_args"]["enforce_eager"] is False
     assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "regional"
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is True
+    assert stage_cfg["engine_args"]["diffusion_compile_vae"] is True
 
 
 def test_default_stage_config_propagates_ulysses_mode():
@@ -346,7 +348,7 @@ def test_serve_cli_forwards_distributed_offload_residency():
 
 
 def test_serve_cli_accepts_diffusion_compile_controls():
-    """Ensure both compile controls reach the diffusion stage."""
+    """Ensure all compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -359,6 +361,7 @@ def test_serve_cli_accepts_diffusion_compile_controls():
             "--diffusion-compile-granularity",
             "full",
             "--no-diffusion-compile-dynamic",
+            "--no-diffusion-compile-vae",
         ]
     )
 
@@ -367,8 +370,10 @@ def test_serve_cli_accepts_diffusion_compile_controls():
 
     assert args.diffusion_compile_granularity == "full"
     assert args.diffusion_compile_dynamic is False
+    assert args.diffusion_compile_vae is False
     assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "full"
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
+    assert stage_cfg["engine_args"]["diffusion_compile_vae"] is False
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():

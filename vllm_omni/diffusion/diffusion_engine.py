@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_VAE_COMPILE_WARMUP_REQUEST_ID = "vae_compile_warmup_req_id"
 
 __all__ = [
     "DiffusionEngine",
@@ -865,28 +866,26 @@ class DiffusionEngine:
         num_inference_steps = 1
         height = 512
         width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
 
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
-        if supports_image_input:
-            # Provide a dummy image input if the model supports it
-            color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
-
-        if supports_audio_input:
-            audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
-
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
-        req = OmniDiffusionRequest(
-            prompt=prompt,
-            request_id=DUMMY_DIFFUSION_REQUEST_ID,
-            sampling_params=OmniDiffusionSamplingParams(
+
+        def build_request(request_id: str, prompt_text: str, *, real_path: bool) -> OmniDiffusionRequest:
+            prompt: OmniTextPrompt = {"prompt": prompt_text}
+            if supports_image_input:
+                color_format = image_color_format(self.od_config.model_class_name)
+                prompt.setdefault("multi_modal_data", {})["image"] = PIL.Image.new(
+                    color_format,
+                    (width, height),
+                )
+            if supports_audio_input:
+                audio_sr = 16000
+                prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
+
+            sampling_params = OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
@@ -899,12 +898,46 @@ class DiffusionEngine:
                 # Disable CFG for warmup to avoid triggering CFG parallel
                 # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-            ),
-        )
+            )
+            if real_path:
+                # Internal pretraffic must exercise ordinary pipeline branches
+                # without waiting for KV produced by an upstream stage.
+                sampling_params.need_kv_receive = False
+            return OmniDiffusionRequest(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params=sampling_params,
+            )
+
+        req = build_request(DUMMY_DIFFUSION_REQUEST_ID, "dummy run", real_path=False)
         logger.info("dummy run to warm up the model")
         output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
+
+        compile_real_path = bool(
+            getattr(self.od_config, "diffusion_compile_vae", False)
+            and not getattr(self.od_config, "enforce_eager", True)
+        )
+        if not compile_real_path:
+            return
+
+        logger.info("real request-path warmup for compiled VAE decode")
+        real_path_req = build_request(
+            _VAE_COMPILE_WARMUP_REQUEST_ID,
+            "A detailed image.",
+            real_path=True,
+        )
+        try:
+            real_path_output = self.add_req_and_wait_for_response(real_path_req)
+        except Exception as exc:
+            logger.warning("Real request-path compile warmup failed (%s); serving will continue.", exc)
+            return
+        if real_path_output.error:
+            logger.warning(
+                "Real request-path compile warmup returned an error (%s); serving will continue.",
+                real_path_output.error,
+            )
 
     def _submit_rpc(
         self,

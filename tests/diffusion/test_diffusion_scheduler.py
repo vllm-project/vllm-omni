@@ -971,6 +971,44 @@ class TestDiffusionEngine:
         admitted_request = engine.add_req_and_wait_for_response.call_args.args[0]
         assert admitted_request.request_id == "dummy_req_id"
 
+    def test_compile_warmup_repeats_through_normal_request_path(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            diffusion_load_format="default",
+            diffusion_compile_vae=True,
+            enforce_eager=False,
+        )
+        engine.add_req_and_wait_for_response = mocker.Mock(
+            side_effect=[DiffusionOutput(output=None), DiffusionOutput(output=None)]
+        )
+
+        engine._dummy_run()
+
+        requests = [call.args[0] for call in engine.add_req_and_wait_for_response.call_args_list]
+        assert len(requests) == 2
+        assert requests[0].is_dummy_run()
+        assert not requests[1].is_dummy_run()
+        assert requests[1].prompt == {"prompt": "A detailed image."}
+        assert requests[1].sampling_params.need_kv_receive is False
+        assert requests[1].sampling_params.num_inference_steps == 1
+
+    def test_compile_real_path_warmup_failure_is_non_fatal(self, mocker: MockerFixture, caplog) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            diffusion_load_format="default",
+            diffusion_compile_vae=True,
+            enforce_eager=False,
+        )
+        engine.add_req_and_wait_for_response = mocker.Mock(
+            side_effect=[DiffusionOutput(output=None), RuntimeError("prewarm failure")]
+        )
+
+        engine._dummy_run()
+
+        assert "serving will continue" in caplog.text
+
 
 class TestStepScheduler:
     def setup_method(self) -> None:

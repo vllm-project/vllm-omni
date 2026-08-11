@@ -753,6 +753,7 @@ def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
                 "  - stage_id: 0",
                 "    diffusion_compile_granularity: regional",
                 "    diffusion_compile_dynamic: false",
+                "    diffusion_compile_vae: false",
             ]
         )
     )
@@ -764,18 +765,26 @@ def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
         cli_overrides={
             "diffusion_compile_granularity": "full",
             "diffusion_compile_dynamic": True,
+            "diffusion_compile_vae": True,
         },
     ).stage_by_id(0)
 
     assert configured_stage.diffusion_config.diffusion_compile_granularity == "regional"
     assert configured_stage.diffusion_config.diffusion_compile_dynamic is False
+    assert configured_stage.diffusion_config.diffusion_compile_vae is False
     assert overridden_stage.diffusion_config.diffusion_compile_granularity == "full"
     assert overridden_stage.diffusion_config.diffusion_compile_dynamic is True
+    assert overridden_stage.diffusion_config.diffusion_compile_vae is True
 
 
 def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
     with pytest.raises(ValidationError, match="diffusion_compile_dynamic"):
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
+
+
+def test_structured_diffusion_config_rejects_non_boolean_compile_vae():
+    with pytest.raises(ValidationError, match="diffusion_compile_vae"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_vae="false")
 
 
 def test_structured_diffusion_config_rejects_invalid_compile_granularity():

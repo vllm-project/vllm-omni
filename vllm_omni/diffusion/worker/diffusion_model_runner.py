@@ -28,7 +28,7 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
     resolve_prompt_embed_cache_config,
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
-from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.compile import compile_callable_with_fallback, regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
@@ -42,6 +42,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -211,6 +212,39 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_dynamic,
         )
 
+    def _compile_vae_decodes(self) -> None:
+        """Compile declared VAE decode callables with eager fallback."""
+        assert self.pipeline is not None
+        modules = ModuleDiscovery.discover(self.pipeline)
+        compiled_count = 0
+        for name, vae in zip(modules.vae_names, modules.vaes, strict=True):
+            decode = getattr(vae, "decode", None)
+            if not callable(decode):
+                logger.debug("Model runner: VAE component %s has no decode callable; skipping compile.", name)
+                continue
+
+            label = f"VAE component {name}.decode"
+            compiled_decode, activated = compile_callable_with_fallback(
+                decode,
+                label=label,
+                mode="default",
+                fullgraph=False,
+                dynamic=None,
+            )
+            if not activated:
+                continue
+            setattr(vae, "decode", compiled_decode)
+            compiled_count += 1
+
+        if compiled_count:
+            logger.info(
+                "Model runner: configured lazy torch.compile for %d VAE decode callable(s); "
+                "startup warmup will compile the real request path.",
+                compiled_count,
+            )
+        else:
+            logger.info("Model runner: no compile-compatible VAE decode callable was discovered.")
+
     def load_model(
         self,
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
@@ -300,7 +334,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                if hasattr(self.pipeline, "setup_compile"):
+                pipeline_owns_compile = hasattr(self.pipeline, "setup_compile")
+                if pipeline_owns_compile:
                     try:
                         self.pipeline.setup_compile()
                     except Exception as exc:
@@ -314,6 +349,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         transformer_attrs = ("transformer", "transformer_2")
                     for attr_name in transformer_attrs:
                         self._compile_transformer(attr_name)
+
+                if self.od_config.diffusion_compile_vae and not pipeline_owns_compile:
+                    self._compile_vae_decodes()
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",

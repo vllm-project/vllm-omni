@@ -130,6 +130,23 @@ class _CompileTrackingModel:
         return self
 
 
+class _DecodeVAE(torch.nn.Module):
+    def decode(self, value):
+        return value + 1
+
+
+class _PipelineWithVAE(torch.nn.Module):
+    _dit_modules = []
+    _encoder_modules = []
+    _vae_modules = ["vae", "vae_alias"]
+    _resident_modules = []
+
+    def __init__(self):
+        super().__init__()
+        self.vae = _DecodeVAE()
+        self.vae_alias = self.vae
+
+
 def _make_request():
     sampling_params = SimpleNamespace(
         generator=None,
@@ -318,6 +335,31 @@ def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypa
     assert runner.pipeline.transformer is model
     assert "failed before activation" in caplog.text
     assert "lazy compilation errors" in caplog.text
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_vae_decodes_uses_discovery_and_deduplicates_aliases(monkeypatch):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = _PipelineWithVAE()
+    compile_calls = []
+
+    def compile_fn(fn, **kwargs):
+        compile_calls.append((fn, kwargs))
+        return lambda *args, **call_kwargs: fn(*args, **call_kwargs) + 10
+
+    monkeypatch.setattr(model_runner_module.torch, "compile", compile_fn)
+
+    DiffusionModelRunner._compile_vae_decodes(runner)
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0][1] == {
+        "mode": "default",
+        "fullgraph": False,
+        "dynamic": None,
+    }
+    assert runner.pipeline.vae.decode(1) == 12
+    assert runner.pipeline.vae_alias.decode is runner.pipeline.vae.decode
 
 
 @pytest.mark.core_model
