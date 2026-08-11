@@ -32,9 +32,9 @@ lower the resident count and re-measure before trusting it.
 ## Two RTX 4090s: 1024x576, 5 seconds
 
 Use TP2 and 12 resident DiT layers. This is the `rtx4090` profile from the main
-recipe. A 1024x576 capacity run of this profile peaked at 18,888 MiB per rank on
-two B300 ranks; the B300 numbers are an allocation and correctness proxy, not an
-RTX 4090 latency claim.
+recipe. On two RTX 4090s it peaked at 15,620 MiB per rank for T2VA and
+14,918 MiB per rank for Ref2VA, leaving roughly 9 GiB of headroom per card. See
+[Target-hardware validation](#target-hardware-validation) for the full numbers.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -49,43 +49,80 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/MiniMax-H3/FL2VA \
   --dlo-resident-layers 12 --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
+
+For Ref2VA, stop the FL2VA server and restart the same command with
+`/path/to/MiniMax-H3/Ref2VA`. Ref2VA reference image count and prompt length can
+increase activation memory; begin with one request at a time.
+
+`VLLM_OMNI_VIDEO_SYNC_TIMEOUT` matters more here than on larger cards. DLO
+streams non-resident DiT blocks over PCIe on every denoising step, so a 60-step
+request takes several minutes and would otherwise hit the 600-second default.
+
 ## Target-hardware validation
 
-<TODO: describe the validated host: socket and NUMA layout, PCIe-only or not, CUDA version, driver version, PyTorch version, output shape, frame count, warmup count, and the device order used for the eight-GPU run.>
+Measured on 2 x RTX 4090 (24,564 MiB each, driver 580.126.09) with the serve
+command above, at vLLM-Omni `0.26.1.dev55+g81b48e83e`, vLLM `0.26.0`, and
+PyTorch `2.11.0+cu130`. Both GPUs were dedicated to this server. `Client E2E`
+and `Peak per GPU` come from the `/v1/videos/sync` response headers
+`x-inference-time-s` and `x-peak-memory-mb`; the latter is the rank-0 CUDA
+reserved high-water mark, so it is a per-GPU figure.
 
-| Measurement | Two GPUs | Four GPUs | Eight GPUs |
-| --- | ---: | ---: | ---: |
-| Client E2E (60-step T2VA) | ~8 min | Not measured| Not measured |
-| Client E2E (60-step ref2va) | ~15 min | Not measured| Not measured |
+| Task | Shape | Frames | Steps | Client E2E | Peak per GPU | Output validation |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| T2VA (`FL2VA`) | 1024x576 | 124 at 24 FPS | 60 | 7 min 9 s | 15.3 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+| Ref2VA | 1024x576 | 124 at 24 FPS | 60 | 14 min 52 s | 14.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
 
+Both rows use `seed=1101`, `flow_shift=12`, and `audio_flow_shift=3.0`, and each
+was run twice. T2VA measured 434.9 s and 429.3 s; Ref2VA measured 891.9 s and
+892.1 s. Peak memory was identical across repeats for both tasks, and the two
+outputs of each pair agreed to within 115 bytes. These are single-request
+validation runs, not concurrent throughput benchmarks.
 
+## Request examples
 
-## request example
+`t2va` requires an explicit `aspect_ratio`. Without it the request fails with
+`t2va requires an explicit aspect_ratio`, even when `width` and `height` are set.
 
-*request curl must add -F 'aspect_ratio=16:9'
+Text to video and audio, against the `FL2VA` server:
+
 ```bash
-curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
-  -F 'prompt=傍晚小厨房的真人实拍的手 与手绘发光2d动画 融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。' \
+curl -sS -D headers_t2va.txt -o out_t2va.mp4 --max-time 14400 \
+  -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'prompt=傍晚的小厨房，夕阳余晖从窗边洒进来，旧木桌上放着洗到一半的马克杯和起雾的玻璃瓶，悬挂的抹布轻轻晃动。画面带有手持拍摄的轻微晃动和逆光曝光波动，生活感十足。环境音是安静的厨房底噪。' \
   -F 'aspect_ratio=16:9' \
   -F 'width=1024' -F 'height=576' -F 'fps=24' \
   -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
-  -o out.mp4
+  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}'
 ```
+
+Reference to video and audio, against the `Ref2VA` server:
+
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/videos/sync" \
-  --fail-with-body \
-  -w '\nHTTP %{http_code}\n' \
-  --max-time 1200 \
-  -F "input_reference=@/root/hand.jpg;type=image/jpeg" \
-  -F "audio_reference=</root/audio_ref.json" \
-  -F "prompt=EOF 2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
-  -F "width=1344" \
-  -F "height=768" \
-  -F "fps=24" \
-  -F "num_inference_steps=60" \
-  -F "flow_shift=12" \
-  -F "seed=1101" \
-  -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
-  -o /root/out_ref2va.mp4
+curl -sS -D headers_ref2va.txt -o out_ref2va.mp4 --max-time 14400 \
+  -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'prompt=傍晚的小厨房，夕阳余晖从窗边洒进来，旧木桌上放着洗到一半的马克杯和起雾的玻璃瓶，悬挂的抹布轻轻晃动。画面带有手持拍摄的轻微晃动和逆光曝光波动，生活感十足。环境音是安静的厨房底噪。' \
+  -F 'input_reference=@/path/to/reference.jpg;type=image/jpeg' \
+  -F 'audio_reference=</path/to/audio_reference.json' \
+  -F 'width=1024' -F 'height=576' -F 'fps=24' \
+  -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
+  -F 'extra_params={"task":"ref2va","duration":5,"audio_flow_shift":3.0}'
+```
+
+`audio_reference` is a JSON object, which is why the example loads it from a file
+with curl's `<` syntax. Its `audio_url` must be an `http(s)` URL or a data URL;
+a bare filesystem path is rejected with `Invalid audio_reference.audio_url`.
+
+```json
+{"audio_url": "https://example.com/reference.wav"}
+```
+
+Reference images are validated before inference: the short edge must be at least
+256 pixels, the long edge at most 5760, and the aspect ratio must fall between
+0.4 and 2.5.
+
+The response headers carry the measurements used in the table above:
+
+```bash
+cat headers_t2va.txt
+ffmpeg -v error -i out_t2va.mp4 -f null - && echo DECODE_OK
 ```
