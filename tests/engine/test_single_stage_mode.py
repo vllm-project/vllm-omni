@@ -436,7 +436,8 @@ class TestSingleStageModeDetection:
         )
         load_deploy_config = mocker.patch(
             "vllm_omni.engine.async_omni_engine.load_deploy_config",
-            return_value=SimpleNamespace(duplex_session=duplex_session),
+            # Mirrors the DeployConfig surface async_omni_engine reads.
+            return_value=SimpleNamespace(duplex_session=duplex_session, audio_decode_procs=0),
         )
 
         engine = self._make_engine_no_thread(

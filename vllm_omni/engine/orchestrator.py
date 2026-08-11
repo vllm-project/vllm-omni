@@ -57,6 +57,12 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+#: Stages that consume the *source* multimodal features rather than a previous
+#: stage's output, so the encoder pass done for stage 0 can be reused instead of
+#: repeated. Forwarding these to a stage that does not re-read the source
+#: modality costs encoder-cache misses, so this stays an explicit list.
+_MM_FEATURE_CONSUMER_STAGES = frozenset({"thinker", "forced_aligner"})
+
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
         DuplexControlPlanePort,
@@ -1547,13 +1553,32 @@ class Orchestrator:
             request_id=req_id,
             prompt=next_input,
             params=params,
-            supported_tasks=("generate",),
+            supported_tasks=self._stage_supported_tasks(next_stage_id),
             arrival_time=_time.time(),
             resumable=resumable,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
         return request
+
+    def _stage_supported_tasks(self, stage_id: int) -> tuple[str, ...]:
+        """Tasks the given stage's model can actually run.
+
+        This used to be hard-coded to ``("generate",)``, which quietly made a
+        pooling stage impossible: vLLM's input processor validates the params
+        against this tuple, so ``PoolingParams`` was rejected before the stage
+        ever saw them. Reading it off the stage's own model config keeps the
+        generative path identical while letting a pooling stage through.
+        """
+        model_config = getattr(self.stage_pools[stage_id].stage_vllm_config, "model_config", None)
+        if getattr(model_config, "runner_type", None) == "pooling":
+            tasks = getattr(model_config, "supported_tasks", None)
+            # supported_tasks is resolved inside the stage's engine process, so
+            # it can still be unset on the config the orchestrator holds. The
+            # engine validates the task again on arrival, so naming the pooling
+            # task here only has to get the request past this check.
+            return tuple(tasks) if tasks else ("token_classify",)
+        return ("generate",)
 
     @staticmethod
     def _duplex_output_context(
@@ -2169,10 +2194,14 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only AR thinker stages consume encoder mm_features; downstream
-            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+            # Only stages that re-read the *source* modality consume encoder
+            # mm_features; the rest (talker/code2wav/…) must not see them, which
+            # would cost encoder-cache misses. A forced-aligner stage does
+            # re-read the input audio, and its feature extractor is configured
+            # identically to the ASR stage's, so forwarding what stage 0 already
+            # extracted saves a second mel pass over the same waveform.
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
-            mm_features = req_state.mm_features if model_stage == "thinker" else None
+            mm_features = req_state.mm_features if model_stage in _MM_FEATURE_CONSUMER_STAGES else None
             request = self._build_next_stage_request(
                 req_id,
                 next_logical,

@@ -233,8 +233,13 @@ class AsyncOmniEngine:
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
+        # Frontend audio-decode parallelism is pipeline-wide, not per stage: it
+        # governs work the API server does before the engine sees a request.
+        self.audio_decode_procs: int = 0
         if deploy_config_path is not None:
-            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+            _deploy = load_deploy_config(deploy_config_path)
+            self.duplex_session_config = _deploy.duplex_session
+            self.audio_decode_procs = _deploy.audio_decode_procs
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a
@@ -382,9 +387,59 @@ class AsyncOmniEngine:
         supported_tasks: set[str] = set()
         if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
             supported_tasks.add("generate")
+            if self._probe_transcription_support():
+                supported_tasks.add("transcription")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+
+    def _probe_transcription_support(self) -> bool:
+        """Whether a text-terminal comprehension stage implements ``SupportsTranscription``.
+
+        Gates ``/v1/audio/transcriptions`` on the weights that are already
+        loaded, so the endpoint costs no extra VRAM and no second process. The
+        probe is capability-based rather than an allowlist, so any model whose
+        comprehension stage implements the interface gets the route for free.
+
+        The stage must also be a text final-output stage. A request carries no
+        stage address: ``output_modalities`` resolves to the *last* stage
+        emitting the requested modality (see ``get_final_stage_id_for_e2e``), so
+        an intermediate ASR stage cannot be addressed on its own. ``aura_omni``
+        is the motivating case -- its stage 0 is Qwen3-ASR, but stage 1 is the
+        text terminal, so a transcription request there would return a
+        conversational reply rather than a transcript. Advertising the endpoint
+        only for text-terminal stages keeps it correct by construction; serving
+        ASR out of a deeper pipeline needs stage-addressed routing, which does
+        not exist yet.
+
+        Resolution failures are non-fatal: an architecture the registry cannot
+        resolve simply leaves the endpoint disabled.
+        """
+        from vllm.model_executor.models.interfaces import supports_transcription
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        for pool in self.stage_pools:
+            client = pool.stage_client
+            if client is None or not getattr(client, "is_comprehension", False):
+                continue
+            if not getattr(client, "final_output", False) or getattr(client, "final_output_type", None) != "text":
+                continue
+            model_config = getattr(pool.stage_vllm_config, "model_config", None)
+            architectures = getattr(model_config, "architectures", None) or []
+            if not architectures:
+                continue
+            try:
+                model_cls, _ = ModelRegistry.resolve_model_cls(architectures, model_config)
+            except Exception as e:
+                logger.warning(
+                    "[AsyncOmniEngine] transcription capability probe could not resolve %s: %s",
+                    architectures,
+                    e,
+                )
+                continue
+            if supports_transcription(model_cls):
+                return True
+        return False
 
     def _bootstrap_orchestrator(
         self,

@@ -20,6 +20,7 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -394,8 +395,18 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = stage_config.final_output_type
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's own
+    # signal), and it takes PoolingParams rather than SamplingParams. Key off
+    # the runner rather than execution_type: "does this stage sample tokens" is
+    # a property of the runner, not of where it sits in the pipeline. Its task
+    # comes from default_pooling_params, declared where the stage is declared.
+    if stage_type == "diffusion":
+        default_sampling_params: OmniSamplingParams = OmniDiffusionSamplingParams(**default_sp)
+    elif _is_pooling_stage(stage_config):
+        default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
+        default_sampling_params = PoolingParams(**default_pp)
+    else:
+        default_sampling_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
@@ -455,6 +466,24 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     )
 
 
+def _is_pooling_stage(stage_config: Any) -> bool:
+    """Whether this stage runs a pooling model rather than a generative one.
+
+    Keys off vLLM's own ``runner="pooling"`` signal, which is what decides
+    whether the engine wants PoolingParams or SamplingParams. Deliberately not
+    keyed off execution_type: a pooling stage is still an LLM stage, it just
+    does not sample tokens.
+    """
+    engine_args = _get_attr_or_item(stage_config, "engine_args", None)
+    for source in (engine_args, stage_config):
+        if source is None:
+            continue
+        runner = _get_attr_or_item(source, "runner", None)
+        if runner is not None:
+            return str(runner).lower() == "pooling"
+    return False
+
+
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     """Preserve the legacy one-argument API for external callers."""
     return extract_legacy_stage_metadata(stage_config)
@@ -477,10 +506,14 @@ def extract_stage_metadata_from_omni_stage_config(
     require the legacy StageConfig/OmegaConf shape.
     """
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
-    sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    sampling_params: OmniSamplingParams = sampling_params_cls(
-        **(stage_config.model_config.default_sampling_params or {})
-    )
+    if stage_type == "diffusion":
+        sampling_params: OmniSamplingParams = OmniDiffusionSamplingParams(
+            **(stage_config.model_config.default_sampling_params or {})
+        )
+    elif _is_pooling_stage(stage_config.model_config):
+        sampling_params = PoolingParams(**(getattr(stage_config.model_config, "default_pooling_params", None) or {}))
+    else:
+        sampling_params = SamplingParams(**(stage_config.model_config.default_sampling_params or {}))
     custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
 
     if stage_type == "diffusion":

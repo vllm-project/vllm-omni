@@ -111,6 +111,7 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
         self.endpoint_restrictions = ()
+        self.audio_decode_procs = 0
         self.duplex_session_config = None
         self.duplex_serving_adapter_path = None
 
