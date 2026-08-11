@@ -89,7 +89,12 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
 
 
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
-    """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
+    """Build online or checkpoint-native BitsAndBytes config."""
+    if "_load_in_4bit" in kw or "_load_in_8bit" in kw:
+        from .bitsandbytes_config import DiffusionCheckpointBitsAndBytesConfig
+
+        return DiffusionCheckpointBitsAndBytesConfig.from_config({"quant_method": "bitsandbytes", **kw})
+
     from .bitsandbytes_config import DiffusionBitsAndBytesConfig
 
     return DiffusionBitsAndBytesConfig(**kw)

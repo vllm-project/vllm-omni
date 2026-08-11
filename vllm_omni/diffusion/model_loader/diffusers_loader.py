@@ -15,6 +15,10 @@ from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
+from vllm.model_executor.model_loader.bitsandbytes_loader import (
+    BitsAndBytesModelLoader,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -298,6 +302,62 @@ class DiffusersPipelineLoader:
         for source in sources:
             yield from self._get_weights_iterator(source, model=model)
 
+    def _get_prequant_bitsandbytes_weights(
+        self,
+        model: nn.Module,
+    ) -> tuple[
+        Generator[tuple[str, torch.Tensor], None, None],
+        BitsAndBytesModelLoader,
+        dict[str, object],
+    ]:
+        if self.parallel_config.tensor_parallel_size > 1:
+            raise ValueError(
+                "Prequant BitsAndBytes diffusion checkpoints do not support "
+                "tensor parallelism. Use tensor_parallel_size=1."
+            )
+
+        bnb_loader = BitsAndBytesModelLoader(self.load_config)
+        bnb_loader.pre_quant = True
+        bnb_loader.load_8bit = self.quant_config.load_in_8bit
+        bnb_loader._initialize_loader_state(model, model_config=None)
+        quant_state_dict: dict[str, object] = {}
+
+        def _iter_weights() -> Generator[tuple[str, torch.Tensor], None, None]:
+            base_weight_mapper = bnb_loader.weight_mapper
+            try:
+                for source in self._get_weight_sources(model):
+                    _, weight_files, use_safetensors = self._prepare_weights(
+                        source.model_or_path,
+                        source.subfolder,
+                        source.revision,
+                        source.fall_back_to_pt,
+                        source.allow_patterns_overrides,
+                    )
+                    prefix = source.prefix
+                    bnb_loader.weight_mapper = lambda name, mapper=base_weight_mapper, source_prefix=prefix: (
+                        source_prefix + mapper(name)
+                    )
+                    source_quant_states: dict[str, object] = {}
+                    if bnb_loader.load_8bit:
+                        source_weights = bnb_loader._quantized_8bit_generator(
+                            weight_files,
+                            use_safetensors,
+                            source_quant_states,
+                        )
+                    else:
+                        source_weights = bnb_loader._quantized_4bit_generator(
+                            weight_files,
+                            use_safetensors,
+                            source_quant_states,
+                        )
+                    for name, tensor in source_weights:
+                        yield prefix + name, tensor
+                    quant_state_dict.update(source_quant_states)
+            finally:
+                bnb_loader.weight_mapper = base_weight_mapper
+
+        return _iter_weights(), bnb_loader, quant_state_dict
+
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
             cast(
@@ -341,8 +401,10 @@ class DiffusersPipelineLoader:
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
+            is_offline = (
+                isinstance(quant_cfg, BitsAndBytesConfig)
+                or getattr(quant_cfg, "data_type", None) == "mx_fp"
+                or getattr(quant_cfg, "is_checkpoint_quantized", False)
             )
             if not is_offline:
                 load_device = device.type
@@ -537,7 +599,20 @@ class DiffusersPipelineLoader:
 
     def load_weights(self, model: nn.Module) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
-        loaded_weights = model.load_weights(self.get_all_weights(model))
+        if isinstance(self.quant_config, BitsAndBytesConfig):
+            weights, bnb_loader, quant_state_dict = self._get_prequant_bitsandbytes_weights(model)
+            loaded_weights = model.load_weights(weights)
+            expert_quant_states = bnb_loader._fuse_moe_quant_states(model, quant_state_dict)
+            stacked_quant_states = bnb_loader._stack_quantization_states(model, quant_state_dict)
+            bnb_loader._bind_quant_states_to_params(
+                model,
+                {
+                    **expert_quant_states,
+                    **stacked_quant_states,
+                },
+            )
+        else:
+            loaded_weights = model.load_weights(self.get_all_weights(model))
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

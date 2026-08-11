@@ -186,6 +186,7 @@ class QwenTimestepProjEmbeddings(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
+        protected_quant_config = safe_quant_config(quant_config)
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
@@ -197,7 +198,7 @@ class QwenTimestepProjEmbeddings(nn.Module):
             embedding_dim,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="timestep_embedder.linear_1",
         )
         self.timestep_embedder.linear_2 = ReplicatedLinear(
@@ -205,7 +206,7 @@ class QwenTimestepProjEmbeddings(nn.Module):
             embedding_dim,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="timestep_embedder.linear_2",
         )
         self.use_additional_t_cond = use_additional_t_cond
@@ -730,7 +731,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        txt_mod_quant_config = safe_quant_config(quant_config)
+        protected_quant_config = safe_quant_config(quant_config)
 
         # Image processing modules.
         # The re-quantized W4A16 checkpoint keeps img_mod.1 in full precision.
@@ -741,7 +742,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=None,
+                quant_config=protected_quant_config,
                 prefix=f"{prefix}.img_mod.1",
             ),
         )
@@ -772,7 +773,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=txt_mod_quant_config,
+                quant_config=protected_quant_config,
                 prefix=f"{prefix}.txt_mod.1",
             ),
         )
@@ -994,6 +995,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
         self.quant_config = quant_config
+        protected_quant_config = safe_quant_config(quant_config)
 
         if not use_layer3d_rope:
             self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
@@ -1015,7 +1017,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="img_in",
         )
         self.txt_in = ReplicatedLinear(
@@ -1023,7 +1025,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="txt_in",
         )
 
@@ -1050,7 +1052,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             2 * self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="norm_out.linear",
         )
         self.proj_out = ReplicatedLinear(
@@ -1058,7 +1060,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             patch_size * patch_size * self.out_channels,
             bias=True,
             return_bias=False,
-            quant_config=None,
+            quant_config=protected_quant_config,
             prefix="proj_out",
         )
 

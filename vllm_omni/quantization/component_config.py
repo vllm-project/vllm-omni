@@ -55,9 +55,10 @@ def safe_quant_config(
 
     Norm and modulation layers (LayerNorm, RMSNorm, AdaLayerNorm, img_mod,
     txt_mod, etc.) produce precision-sensitive shift/scale/gate values and
-    should not receive FP8 quant configs (see #2728).  Pre-quantized methods
-    like INC/AutoRound W4A16 need the config propagated so packed weights
-    load correctly.
+    should not receive online quant configs (see #2728). Pre-quantized methods
+    like INC/AutoRound W4A16 and BitsAndBytes need the config propagated so
+    packed weights load correctly and their checkpoint skip lists decide
+    which layers remain full precision.
 
     This is the inverse of :func:`resolve_encoder_quant_config`: that function
     strips pre-quantized configs from encoders, while this one strips
@@ -65,9 +66,12 @@ def safe_quant_config(
     """
     if quant_config is None:
         return None
+    from vllm.model_executor.layers.quantization.bitsandbytes import (
+        BitsAndBytesConfig,
+    )
     from vllm.model_executor.layers.quantization.inc import INCConfig
 
-    if isinstance(quant_config, INCConfig):
+    if isinstance(quant_config, (BitsAndBytesConfig, INCConfig)):
         return quant_config
     return None
 

@@ -3,11 +3,13 @@
 ## Overview
 
 BitsAndBytes 4-bit quantization supports weight-only NF4/FP4 diffusion transformer
-inference on CUDA GPUs. It quantizes BF16/FP16 weights at load time; activations
-stay in BF16/FP16. No pre-quantized checkpoint is required.
+inference on CUDA GPUs. It can either quantize BF16/FP16 weights at load time or
+load a checkpoint that already contains BitsAndBytes weights and quantization
+state tensors. Activations stay in BF16/FP16.
 
-This is an online (dynamic) path: load the normal HuggingFace checkpoint and
-quantize during model loading via the `bitsandbytes` CUDA kernels.
+For online (dynamic) quantization, load a normal HuggingFace checkpoint and
+select `bitsandbytes` explicitly. For pre-quantized checkpoints, vLLM-Omni
+auto-detects the `quantization_config` in `transformer/config.json`.
 
 ## Hardware Support
 
@@ -34,6 +36,7 @@ Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
 |-------|-----------|:----:|------|----------------|
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Online W4 weight-only | All heavy linear layers; sensitive embedders stay BF16 |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Not validated | Online W4 weight-only | Compare vs BF16 before enabling |
+| Qwen-Image 2512 BnB | `ovedrive/Qwen-Image-2512-4bit` | Not validated | Pre-quantized NF4 checkpoint | Single-GPU loading path |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Online W4 weight-only | Validate before enabling in docs |
 
 Other diffusion models may work if their transformer uses supported linear
@@ -85,6 +88,15 @@ python text_to_image.py --model Tongyi-MAI/Z-Image-Turbo --quantization bitsandb
 vllm serve Tongyi-MAI/Z-Image-Turbo --omni --quantization bitsandbytes
 ```
 
+Pre-quantized checkpoint:
+
+```bash
+vllm serve ovedrive/Qwen-Image-2512-4bit --omni --tensor-parallel-size 1
+```
+
+Do not pass `--quantization bitsandbytes` for a pre-quantized checkpoint. Its
+`transformer/config.json` selects the checkpoint-native loader automatically.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
@@ -100,9 +112,10 @@ On Z-Image-Turbo (single GPU, 1024×1024, 50 steps), BitsAndBytes W4 typically
 reduces peak VRAM from roughly 24.5 GiB (BF16) to roughly 17 GiB. Compare output
 quality against a BF16 baseline before enabling on new models.
 
-Multi-GPU tensor parallelism (`tensor_parallel_size` > 1) is not validated for
-BitsAndBytes in diffusion models; each rank quantizes its own weight shard
-independently.
+Online quantization with multiple tensor-parallel ranks remains unvalidated;
+each rank quantizes its own weight shard independently. Pre-quantized
+BitsAndBytes checkpoints require `tensor_parallel_size=1` because their
+quantization states cannot be split across tensor-parallel ranks.
 
 If quality regresses, use `ignored_layers` to keep sensitive projections in BF16
 (for example `to_out` or `w2`).

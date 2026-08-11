@@ -20,7 +20,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
@@ -266,6 +266,12 @@ def apply_rotary_emb_qwen(
 class QwenImagePipeline(
     nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
+    packed_modules_mapping = QwenImageTransformer2DModel.packed_modules_mapping
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".to_out.0.": ".to_out.",
+        }
+    )
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -1090,7 +1096,7 @@ class QwenImagePipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class QwenImageDMD2Pipeline(DMD2PipelineMixin, QwenImagePipeline):

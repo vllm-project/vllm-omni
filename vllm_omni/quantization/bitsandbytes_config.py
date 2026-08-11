@@ -20,6 +20,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
+    BitsAndBytesLinearMethod,
+)
 from vllm.model_executor.layers.quantization.fp8 import _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
@@ -33,6 +37,25 @@ from vllm_omni.quantization.int8_config import LazyWeightMixin
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
+
+
+class DiffusionCheckpointBitsAndBytesConfig(BitsAndBytesConfig):
+    """Checkpoint-native BnB config with diffusion fused-layer skip support."""
+
+    def get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> Optional["QuantizeMethodBase"]:
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.llm_int8_skip_modules,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedLinearMethod()
+            return BitsAndBytesLinearMethod(self)
+        return super().get_quant_method(layer, prefix)
 
 
 class DiffusionBitsAndBytesConfig(QuantizationConfig):

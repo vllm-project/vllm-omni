@@ -11,6 +11,7 @@ import torch
 from pytest_mock import MockerFixture
 from torch.nn import Module, Parameter
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
@@ -50,16 +51,112 @@ def test_bitsandbytes_config_creation():
 
 def test_bitsandbytes_config_with_custom_params():
     """Test BitsAndBytes config with custom parameters."""
+    from vllm_omni.quantization.bitsandbytes_config import DiffusionBitsAndBytesConfig
+
     config = build_quant_config(
         "bitsandbytes",
         quant_type="fp4",
         compress_statistics=False,
         ignored_layers=["to_out"],
     )
-    assert config is not None
+    assert isinstance(config, DiffusionBitsAndBytesConfig)
     assert config.quant_type == "fp4"
     assert config.compress_statistics is False
     assert "to_out" in config.ignored_layers
+
+
+def test_bitsandbytes_checkpoint_config_uses_vllm_loader():
+    """Pre-quantized HF checkpoints must use vLLM's BnB weight loader."""
+    checkpoint_config = {
+        "quant_method": "bitsandbytes",
+        "_load_in_4bit": True,
+        "_load_in_8bit": False,
+        "load_in_4bit": True,
+        "load_in_8bit": False,
+        "bnb_4bit_compute_dtype": "bfloat16",
+        "bnb_4bit_quant_storage": "uint8",
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_use_double_quant": True,
+        "llm_int8_skip_modules": [
+            "transformer_blocks.0.attn.to_q",
+            "proj_out",
+        ],
+    }
+
+    config = build_quant_config(checkpoint_config)
+
+    assert isinstance(config, BitsAndBytesConfig)
+    assert config.load_in_4bit is True
+    assert config.load_in_8bit is False
+    assert config.bnb_4bit_compute_dtype == "bfloat16"
+    assert config.bnb_4bit_quant_type == "nf4"
+    assert config.bnb_4bit_use_double_quant is True
+    assert config.llm_int8_skip_modules == [
+        "transformer_blocks.0.attn.to_q",
+        "proj_out",
+    ]
+
+
+def test_bitsandbytes_online_config_stays_on_diffusion_path():
+    from vllm_omni.quantization.bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    config = build_quant_config(
+        {
+            "quant_method": "bitsandbytes",
+            "quant_type": "nf4",
+            "compress_statistics": True,
+        }
+    )
+
+    assert isinstance(config, DiffusionBitsAndBytesConfig)
+
+
+def test_bitsandbytes_checkpoint_config_is_auto_detected():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    transformer_config = TransformerConfig.from_dict(
+        {
+            "quantization_config": {
+                "quant_method": "bitsandbytes",
+                "_load_in_4bit": True,
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+            }
+        }
+    )
+
+    config = OmniDiffusionConfig(
+        model="test",
+        tf_model_config=transformer_config,
+    )
+
+    assert isinstance(config.quantization_config, BitsAndBytesConfig)
+    assert config.quantization_config.bnb_4bit_quant_type == "nf4"
+
+
+def test_bitsandbytes_checkpoint_config_skips_fused_linear(mocker):
+    config = build_quant_config(
+        {
+            "quant_method": "bitsandbytes",
+            "_load_in_4bit": True,
+            "load_in_4bit": True,
+            "llm_int8_skip_modules": [
+                "transformer_blocks.0.attn.to_q",
+                "transformer_blocks.0.attn.to_k",
+                "transformer_blocks.0.attn.to_v",
+            ],
+        }
+    )
+    config.packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
+
+    method = config.get_quant_method(
+        mocker.Mock(spec=LinearBase),
+        "transformer_blocks.0.attn.to_qkv",
+    )
+
+    assert isinstance(method, UnquantizedLinearMethod)
 
 
 def test_supported_methods():
