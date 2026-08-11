@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     MAX_IMAGES_PER_REQUEST,
@@ -40,6 +41,31 @@ _MODALITY_MODE = {
     "img2text": "image-to-text",
     "text2text": "text-to-text",
 }
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
+
+
+def print_profile_results(profile_results: Any, profiler_config: dict[str, Any]) -> None:
+    trace_dir = profiler_config.get("torch_profiler_dir")
+
+    print("\n" + "=" * 60)
+    print("PROFILING:")
+    if trace_dir:
+        print(f"  Trace artifacts are exported under: {trace_dir}")
+        print(f"  To list generated traces: find {trace_dir} -maxdepth 5 -type f | sort")
+    else:
+        print("  Profiling stopped. Check the output directory configured by --profiler-config.")
+    if isinstance(profile_results, list):
+        print(f"  Profiler RPC completed for {len(profile_results)} stage response(s).")
+    print("=" * 60)
 
 
 def parse_args():
@@ -112,6 +138,12 @@ def parse_args():
             "Contents must be hashable."
         ),
     )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
 
     return parser.parse_args()
 
@@ -168,6 +200,8 @@ def main():
 
     if additional_config is not None:
         omni_kwargs["additional_config"] = additional_config
+    if args.profiler_config is not None:
+        omni_kwargs["profiler_config"] = args.profiler_config
     if deploy_config is not None:
         omni_kwargs["deploy_config"] = deploy_config
     else:
@@ -293,41 +327,73 @@ def main():
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
-    # When --stream is set, print AR CoT text token-by-token in real time.
-    # Otherwise, collect and print the full AR text once when stage 0 finishes.
-    omni_outputs = omni.generate(
-        prompts=formatted_prompts,
-        sampling_params_list=params_list,
-        py_generator=True,
-        use_tqdm=False,
-    )
-    img_idx = 0
-    for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
-        stage_id = getattr(req_output, "stage_id", None)
+    profiler_enabled = args.profiler_config is not None
+    profile_results = None
 
-        # AR stage text — each CompletionOutput.text is already a delta when
-        # output_kind=DELTA, so we can print it directly (matching the pattern
-        # in serving_chat.py).
-        if stage_id == 0 and ro and getattr(ro, "outputs", None):
-            for o in ro.outputs:
-                text = getattr(o, "text", "") or ""
-                if text:
-                    print(text, end="", flush=True)
-            # Non-streaming: one shot with full text — emit a trailing newline.
-            if not args.stream:
-                print(flush=True)
+    def process_outputs(omni_outputs):
+        img_idx = 0
+        for req_output in omni_outputs:
+            ro = getattr(req_output, "request_output", None)
+            stage_id = getattr(req_output, "stage_id", None)
+            printed_text = False
 
-        # Collect images from diffusion stage
-        images = getattr(req_output, "images", None)
-        if not images and ro and hasattr(ro, "images"):
-            images = ro.images
-        if images:
-            for j, img in enumerate(images):
-                save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
-                img.save(save_path)
-                print(f"\n[Output] Saved image to {save_path}")
-            img_idx += 1
+            # AR stage text — each CompletionOutput.text is already a delta when
+            # output_kind=DELTA, so we can print it directly (matching the pattern
+            # in serving_chat.py).
+            if stage_id == 0 and ro and getattr(ro, "outputs", None):
+                for o in ro.outputs:
+                    text = getattr(o, "text", "") or ""
+                    if text:
+                        print(text, end="", flush=True)
+                        printed_text = True
+                # Non-streaming: one shot with full text — emit a trailing newline.
+                if printed_text and not args.stream:
+                    print(flush=True)
+
+            if not printed_text and not args.stream:
+                ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+                if isinstance(ar_text, list):
+                    ar_text = "\n".join(text for text in ar_text if text)
+                if ar_text:
+                    print(f"[Output] Text:\n{ar_text}")
+
+            # Collect images from diffusion stage
+            images = getattr(req_output, "images", None)
+            if not images and ro and hasattr(ro, "images"):
+                images = ro.images
+            if images:
+                for j, img in enumerate(images):
+                    save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
+                    img.save(save_path)
+                    print(f"\n[Output] Saved image to {save_path}")
+                img_idx += 1
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
+        try:
+            omni_outputs = list(
+                omni.generate(
+                    prompts=formatted_prompts,
+                    sampling_params_list=params_list,
+                    use_tqdm=False,
+                )
+            )
+        finally:
+            print("\n[Profiler] Stopping profiler and collecting results...")
+            profile_results = omni.stop_profile()
+        process_outputs(omni_outputs)
+        print_profile_results(profile_results, args.profiler_config)
+    else:
+        # When --stream is set, print AR CoT text token-by-token in real time.
+        # Otherwise, collect and print the full AR text once when stage 0 finishes.
+        omni_outputs = omni.generate(
+            prompts=formatted_prompts,
+            sampling_params_list=params_list,
+            py_generator=True,
+            use_tqdm=False,
+        )
+        process_outputs(omni_outputs)
 
 
 if __name__ == "__main__":

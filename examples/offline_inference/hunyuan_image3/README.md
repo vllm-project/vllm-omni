@@ -7,7 +7,7 @@ YAMLs under `vllm_omni/deploy/`.
 
 | File | Topology | Default use |
 | :--- | :--- | :--- |
-| `vllm_omni/deploy/hunyuan_image3.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
+| `vllm_omni/deploy/hunyuan_image_3_moe.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
 | `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Default for `img2text` and `text2text`. |
 | `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. Pass it explicitly with `--deploy-config`. |
 
@@ -16,8 +16,8 @@ The example chooses a deploy config automatically when `--deploy-config` and
 
 | `--modality` | `mode` passed to Omni | Default deploy |
 | :--- | :--- | :--- |
-| `text2img` | `text-to-image` | `hunyuan_image3.yaml` |
-| `img2img` | `image-editing` | `hunyuan_image3.yaml` |
+| `text2img` | `text-to-image` | `hunyuan_image_3_moe.yaml` |
+| `img2img` | `image-editing` | `hunyuan_image_3_moe.yaml` |
 | `img2text` | `image-to-text` | `hunyuan_image3_ar.yaml` |
 | `text2text` | `text-to-text` | `hunyuan_image3_ar.yaml` |
 
@@ -35,8 +35,8 @@ path; the image endpoints infer the image task from the endpoint and payload.
 
 | Online scenario | Server deploy | Request |
 | :--- | :--- | :--- |
-| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
-| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/edits`. |
+| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
+| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml` | `POST /v1/images/edits`. |
 | Image/text to text | `--deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml` | `POST /v1/chat/completions` for text output, for example with `"modalities": ["text"]`. |
 | DiT-only image generation | `--deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml` | `POST /v1/images/generations`. |
 
@@ -96,7 +96,7 @@ Override the default full AR + DiT deploy explicitly:
 python examples/offline_inference/hunyuan_image3/end2end.py \
   --model tencent/HunyuanImage-3.0-Instruct \
   --modality text2img \
-  --deploy-config vllm_omni/deploy/hunyuan_image3.yaml \
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
   --prompts "A cute cat"
 ```
 
@@ -112,6 +112,33 @@ python end2end.py --modality text2img \
                   --additional-config '{"torchair_graph_config":{"enabled":true}}'
 ```
 
+## Profiling
+
+Use `--profiler-config` to enable torch profiling for the offline e2e script. The
+script starts profiling immediately before `Omni.generate(...)` and stops it
+after generation finishes.
+
+```bash
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality text2img \
+  --prompts "A cute cat" \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"./perf/hunyuan_image3"}'
+```
+
+Torch profiler artifacts are written under `torch_profiler_dir`. Each run creates
+a timestamped subdirectory containing trace and operator-table artifacts, for
+example `trace_rank*.json` or `trace_rank*.json.gz`.
+
+For the default AR + DiT topology, expect AR traces under directories containing
+`stage0_rank*` and DiT traces under directories containing
+`stage_1_rep_0_diffusion`. The profiler RPC itself may not return structured
+payloads; use the exported trace files as the profiling result:
+
+```bash
+find ./perf/hunyuan_image3 -maxdepth 5 -type f | sort
+```
+
 
 ## Key Arguments
 
@@ -120,6 +147,7 @@ python end2end.py --modality text2img \
 | `--deploy-config` | Preferred config path for unified deploy YAMLs. |
 | `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
 | `--additional-config` | JSON object forwarded to diffusion worker `additional_config`. |
+| `--profiler-config` | JSON object forwarded to Omni `profiler_config`; when set, the script wraps generation with `start_profile()` / `stop_profile()`. |
 | `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
 | `--steps` | Number of diffusion inference steps for image generation. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |
