@@ -166,6 +166,10 @@ index patch, worktree patch, and untracked-content manifest. Any mismatch makes
 the review stale; discard the affected evidence and restart. Prefer one
 root-cause comment to several symptom comments.
 
+When the root cause is an unchanged line made newly load-bearing by the diff,
+cite it in the consolidated review body instead of moving the comment to an
+unrelated changed line merely to make it inline.
+
 Local presentation is the default. Only explicit authorization permits GitHub
 posting. When authorized, publish one consolidated final review after
 validation; do not post preliminary or incremental comments. Submit a review

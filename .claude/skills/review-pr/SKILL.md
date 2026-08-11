@@ -94,6 +94,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 | --- | --- |
 | [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, or stage config is added. |
 | [perf-verification.md](references/checks/perf-verification.md) | The PR makes a latency, throughput, memory, or quality claim. |
+| [config-provenance.md](references/checks/config-provenance.md) | Changed or newly load-bearing behavior reads config, CLI, environment, legacy, or default values. |
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
 | [verification.md](references/checks/verification.md) | Hardware, a server, or a runnable affected path is available for active verification. |
@@ -152,12 +153,18 @@ contract they protect or use only the applicable evidence checks.
 Apply every category in [general-checks.md](references/process/general-checks.md) before
 lower-priority comments.
 
-For each changed value or behavior, trace:
+For each changed or newly load-bearing value or behavior, trace:
 
 ```text
 public ingress -> validation/defaulting -> producer -> transformations
   -> stage/worker/connector boundary -> final consumer -> terminal cleanup
 ```
+
+Treat unchanged context as in scope when the diff makes it authoritative for a
+new consumer. When config, CLI, environment, legacy, or default sources can
+control that value, apply
+[config-provenance.md](references/checks/config-provenance.md) and prove the
+documented source at the final sink with distinct sentinel values.
 
 Cover every applicable offline/online, streaming/non-streaming, sync/async,
 feature-on/off, topology, and compatibility path. Search bounded callers and

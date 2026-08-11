@@ -16,6 +16,9 @@ were reverted or broken. Check:
   instead of the changed behavior being mocked away;
 - fakes preserve relevant types, MRO, shapes, devices, async behavior, and
   lifecycle transitions;
+- configuration tests give competing config, CLI, environment, legacy, and
+  default sources distinct non-default values and assert the final consumer;
+  setting only the source read by the implementation does not prove precedence;
 - seeds, ordering, timing, synchronization, external services, and numeric
   tolerances are deterministic or explicitly controlled;
 - normal, invalid, boundary, feature-off, failure/cancellation, and regression

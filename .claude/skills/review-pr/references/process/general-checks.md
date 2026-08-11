@@ -15,6 +15,9 @@ and [design documents](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/
 - Trace each changed value through public ingress, validation/defaulting,
   producer, transformations, process or device boundaries, final consumer, and
   terminal cleanup.
+- Treat unchanged code as in scope when the diff makes its value newly
+  load-bearing for a changed consumer; validate that value's origin and contract
+  rather than reviewing only added lines.
 - Check every applicable sync/async, offline/online, streaming/non-streaming,
   feature-off, topology, and compatibility path without demanding unsupported
   modes merely for symmetry.
@@ -123,7 +126,9 @@ distinct live caller, invariant, or compatibility need.
 
 ## Finding bar
 
-Anchor each finding to a changed `path:line`; name the trigger or call path,
-current behavior, impact, and smallest fix direction. Treat pending CI, missing
-hardware, or unsupported measurements as validation gaps unless the repository
-contract makes that evidence a merge requirement.
+Anchor each finding to the exact `path:line` that causes the behavior; it may be
+unchanged when the diff makes it newly load-bearing, in which case name the
+changed call path that brings it into scope. Include the trigger, impact, and
+smallest fix direction. Treat pending CI, missing hardware, or unsupported
+measurements as validation gaps unless the repository contract makes that
+evidence a merge requirement.
