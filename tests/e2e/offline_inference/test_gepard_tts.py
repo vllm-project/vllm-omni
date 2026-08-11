@@ -48,8 +48,18 @@ STOP_TOKEN = GepardConfig().stop_token
 
 # Prompt -> a word that appears in no other prompt. Concurrency is only
 # testable if a clip can be traced back to the request that asked for it.
+#
+# These are not interchangeable, and swapping one is not free. Batched decoding
+# perturbs every request's sampling trajectory — bf16 matmuls are not row-wise
+# reproducible, and a request's codes here diverge from its solo run by frame 8,
+# long before any neighbour finishes — and on some trajectories this
+# checkpoint's stop head never fires, so the request runs to the token budget.
+# "The weather is sunny today." sat in the first slot until it was measured at
+# 0/10 runaways alone and 8/10 in this batch. Its replacement was screened over
+# 10 batched runs with no runaway on any row. Re-screen the whole set, not just
+# the row being changed: one different prompt changes all four trajectories.
 _DISTINGUISHABLE_PROMPTS = {
-    "The weather is sunny today.": "sunny",
+    "He drinks coffee every morning.": "coffee",
     "Machine learning is interesting.": "learning",
     "Please close the window before leaving.": "window",
     "My favorite color is purple.": "purple",
@@ -91,8 +101,8 @@ _TRANSCRIBED_CLIPS = 2
 # concurrency batch, the most expensive test here and the one covering code that
 # changes least. There is deliberately no L2 (core_model) row: under
 # ``load_format: dummy`` the stop head is random, so every request runs to
-# gepard.yaml's ``max_tokens: 4096`` -- ~190 s of audio through NanoCodec with
-# ``enforce_eager``, far past what the L2 budget is for.
+# gepard.yaml's ``max_tokens`` -- 1000 frames, ~46 s of audio per request
+# through NanoCodec with ``enforce_eager``, far past what the L2 budget is for.
 pytestmark = [
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),

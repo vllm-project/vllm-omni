@@ -44,6 +44,14 @@ stages:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 4096
+      # One output token is one frame, so this is the frame budget: 1000 frames
+      # is ~46 s at 21.5 fps, matching the reference server's TTS_MAX_TOKENS.
+      # It is a backstop, not a target -- a normal utterance here is 40-420
+      # frames. It matters because the checkpoint's stop head is not always
+      # reliable: batched decoding perturbs the sampling trajectory (bf16
+      # matmuls are not row-wise reproducible), and on some trajectories the
+      # head never fires, leaving the budget as the only thing that ends the
+      # request.
+      max_tokens: 1000
       seed: 42
       detokenize: false
