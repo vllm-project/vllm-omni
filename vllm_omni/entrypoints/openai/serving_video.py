@@ -503,11 +503,22 @@ class OmniOpenAIServingVideo:
 
     def _extract_video_outputs(self, result: object) -> list[DiffusionPayloadValue]:
         videos = None
-        if hasattr(result, "images") and result.images:
+        # Lance/BAGEL video pipelines store all frames in custom_output.
+        custom_output = getattr(result, "custom_output", None) or {}
+        if custom_output.get("video_frames"):
+            videos = custom_output["video_frames"]
+        elif hasattr(result, "images") and result.images:
             videos = result.images
         elif hasattr(result, "request_output"):
             request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
+            ro_custom = (
+                request_output.get("custom_output")
+                if isinstance(request_output, dict)
+                else getattr(request_output, "custom_output", None)
+            ) or {}
+            if ro_custom.get("video_frames"):
+                videos = ro_custom["video_frames"]
+            elif isinstance(request_output, dict) and request_output.get("images"):
                 videos = request_output["images"]
             elif hasattr(request_output, "images") and request_output.images:
                 videos = request_output.images
