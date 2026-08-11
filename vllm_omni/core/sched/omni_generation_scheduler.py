@@ -417,6 +417,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_logprobs = None
             new_token_ids = generated_token_ids
             kv_transfer_params = None
+            ec_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
@@ -451,7 +452,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if self.chunk_transfer_adapter:
                         self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
-                    kv_transfer_params, _ = self._free_request(request)
+                    kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
                         self.chunk_transfer_adapter.cleanup(
                             request.request_id,
@@ -495,6 +496,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stop_reason=request.stop_reason,
                     prefill_stats=request.take_prefill_stats(),
                     kv_transfer_params=kv_transfer_params,
+                    ec_transfer_params=ec_transfer_params,
                     routed_experts=routed_experts,
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
@@ -513,8 +515,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
             kv_transfer_params = None
+            ec_transfer_params = None
             if finished:
-                kv_transfer_params, _ = self._free_request(request)
+                kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if self.chunk_transfer_adapter is not None:
                     self.chunk_transfer_adapter.cleanup(
                         request.request_id,
@@ -528,6 +531,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason=finish_reason,
                 stop_reason=request.stop_reason,
                 kv_transfer_params=kv_transfer_params,
+                ec_transfer_params=ec_transfer_params,
                 is_segment_finished=is_segment_finished,
             )
             stopped_running_reqs.add(request)

@@ -189,6 +189,30 @@ def test_cumulative_emits_consolidated_audio_each_step():
     assert "audio" in s.mm_accumulated
 
 
+def test_codes_nested_payload_accumulates_per_step():
+    """Per-step {"codes": {"audio": [n, 8]}} payloads must accumulate into
+    [T, 8], not be replaced by the most recent step's row.
+
+    Regression for the LongCat-Next thinker: talker_mtp emits one code frame
+    per decode step, and the output processor is what concatenates them into
+    the final per-request [T, 8] tensor the decoder reads. Before the fix,
+    the nested "codes" dict was routed to metadata (REPLACE semantics), so
+    only the last step's row survived.
+    """
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    for step in range(5):
+        frame = torch.full((1, 8), step, dtype=torch.long)
+        s.add_multimodal_tensor({"codes": {"audio": frame}}, mm_type=LATENT)
+
+    result = s.make_request_output([0], None, FinishReason.STOP, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    codes = result.outputs[0].multimodal_output["codes"]
+    assert isinstance(codes, dict)
+    audio = codes["audio"]
+    assert isinstance(audio, torch.Tensor) and audio.shape == (5, 8)
+    assert audio[0, 0].item() == 0 and audio[4, 0].item() == 4
+
+
 def test_finish_consolidates_hidden_states():
     """Ensure consolidation merges hidden-state tensor lists on finish."""
     s = _make_state(RequestOutputKind.CUMULATIVE)
