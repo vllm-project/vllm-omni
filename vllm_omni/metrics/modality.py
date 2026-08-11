@@ -234,35 +234,22 @@ def observe_modality_at_finalize(
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
     mm_out = extract_mm_output(engine_outputs)
 
-    sample_rate = defs.resolve_audio_sample_rate(mm_out)
-    # `stage_metrics.audio_generated_frames` is the legacy per-chunk
-    # accumulator field on StageRequestStats. No production path currently
-    # fills it, so the fallback below is the live source — but we leave the
-    # field lookup in place in case the accumulator gets re-wired upstream.
-    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-    if n_frames == 0:
-        n_frames = count_audio_frames(mm_out)
-    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-    if duration_s > 0:
-        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-        mod_metrics.observe_audio_rtf(
-            stage_label,
-            replica_label,
-            defs.compute_audio_rtf(gen_time_s, duration_s),
-        )
-    else:
-        # Request completed (finish_reason ∈ {stop, length} — error paths
-        # don't reach finalize) but no audio samples were produced. Covers
-        # silent `return None` skips in the talker→code2wav stage
-        # processors and the `parsed.append((0,0))` malformed-length path
-        # in qwen3-tts code2wav. raise-paths surface via the upstream
-        # vllm:request_success_total{finished_reason="error"} channel and
-        # never reach this branch.
-        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-    # audio_underrun / continuity are emitted from the streaming path in
-    # observe_audio_streaming_finalize; finalize is too late for the
-    # per-chunk timeline they need.
+    if output_type == "audio":
+        sample_rate = defs.resolve_audio_sample_rate(mm_out)
+        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+        if n_frames == 0:
+            n_frames = count_audio_frames(mm_out)
+        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+        if duration_s > 0:
+            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+            mod_metrics.observe_audio_rtf(
+                stage_label,
+                replica_label,
+                defs.compute_audio_rtf(gen_time_s, duration_s),
+            )
+        else:
+            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
 
     dm = getattr(stage_metrics, "diffusion_metrics", None)
     if dm:
