@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-CI-Inspection
-description: Triages vLLM-Omni CI failures from Buildkite API or pasted logs. Single-job mode extracts first error, classifies failures (build/install, pytest, infra/resource, config/credentials, timeout/perf), attributes PR vs pre-existing, and outputs evidence-based hypotheses with <=5-minute verification. Batch mode inventories many nightly logs (full_moon_*, nightly-*), clusters root causes across GPU pools (H800/H100/A100), detects incomplete logs, and supports cross-run comparison. Use when CI is red/flaky/slow, user pastes nightly log paths, asks nightly red/green summary, compares H800 vs A100, or mentions L1-L5, timeout, pytest, build. By default excludes main branch builds unless user explicitly asks to include them.
+description: Triages vLLM-Omni CI failures from Buildkite API or pasted logs. Single-job mode extracts first error, classifies failures (build/install, pytest, infra/resource, config/credentials, timeout/perf), attributes PR vs pre-existing, and outputs evidence-based hypotheses with <=5-minute verification. Batch mode inventories many nightly logs (full_moon_*, nightly-*), clusters root causes across GPU pools (H800/H100/A100), detects incomplete logs, and supports cross-run comparison. Buildkite auto-fetch supports PR dedup (latest build per branch), scheduled READY/MERGE triage, Feishu alert forwarding, and GitHub issue prefill. Use when CI is red/flaky/slow, user pastes nightly log paths, asks nightly red/green summary, compares H800 vs A100, or mentions L1-L5, timeout, pytest, build. By default excludes main branch builds unless user explicitly asks to include them.
 ---
 
 # CI Failure & Duration Triage
@@ -443,6 +443,34 @@ def filter_builds_by_branch(builds, ci_type):
 
 | User specifies a specific build number | No filtering; follow user request |
 
+#### PR Deduplication (highest priority for READY CI)
+
+The same PR (identified by `branch`, usually `user:pr-name`) may trigger multiple builds from repeated commits. **Analyze only the latest build per branch** (`created_at` most recent); skip older builds for that branch.
+
+- If the **latest** build for a branch is `state=passed`, skip that PR entirely (even if earlier builds failed).
+- Implementation: after fetching builds in the time window, group by `branch`. For each branch, find the latest build (any state). If latest is passed → drop the branch. If latest is failed → keep only that build for analysis; discard older failed builds on the same branch.
+
+```python
+def dedupe_builds_by_branch_latest(all_builds_in_window, failed_builds):
+    """Keep at most one failed build per branch: the latest build, only if it failed."""
+    from collections import defaultdict
+    by_branch = defaultdict(list)
+    for b in all_builds_in_window:
+        by_branch[b.get('branch', '')].append(b)
+    keep = []
+    for branch, builds in by_branch.items():
+        if not branch or branch == 'main':
+            continue
+        latest = max(builds, key=lambda x: x['created_at'])
+        if latest.get('state') == 'passed':
+            continue
+        if latest.get('state') in ('failed', 'timed_out'):
+            keep.append(latest)
+    return keep
+```
+
+Fetch `all_builds_in_window` with `state=` omitted (or separate query per branch) so passed latest builds can be detected—not only `state=failed`.
+
 ## Input Requirements (list missing items if insufficient)
 
 ### Mode A: User provides log text
@@ -577,6 +605,136 @@ When analyzing multiple failed jobs, output **cluster summary table** first, the
 - <🔴 PR-introduced fix direction suggestions>
 - <🔵 Infra/env ops intervention points>
 ```
+
+## Scheduled Tasks & Automation Rules
+
+Use these rules when running CI triage on a **cron schedule** so output format, issue filing, Feishu alerts, and CSV logging stay consistent.
+
+### Scheduled Task Configuration
+
+| Task | Cron | Trigger time | Buildkite pipeline | CI type |
+|------|------|--------------|-------------------|---------|
+| READY CI | `0 9,11,17,19 * * *` | 09:00 / 11:00 / 17:00 / 19:00 | vllm-omni | Ready CI |
+| NPU READY CI | `10 9,11,17,19 * * *` | 09:10 / 11:10 / 17:10 / 19:10 | vllm-omni-npu-ci | Ready CI |
+| MERGE CI | `20 9,11,17,19 * * *` | 09:20 / 11:20 / 17:20 / 19:20 | vllm-omni | Merge CI |
+
+- **session_mode**: `new-per-run`
+- **timeout_mins**: 60
+- **BUILDKITE_TOKEN**: must be set in env or prompt
+- **Alert group session_key**: `feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1`
+
+Apply **PR deduplication** (see above) for READY CI runs.
+
+### Issue Filing & Alert Forwarding
+
+| CI type | 🔴 PR-introduced | Other attribution (pre-existing / infra / uncertain) |
+|---------|------------------|------------------------------------------------------|
+| READY CI | Do not file issue; do not forward to alert group | File issue; forward to alert group |
+| NPU READY CI | Do not file issue; do not forward to alert group | File issue; forward to alert group |
+| MERGE CI | File issue; forward to alert group | File issue; forward to alert group |
+
+**Summary**:
+- **READY CI**: only PR-introduced failures are silent (PR author fixes); all other attributions → issue + alert
+- **MERGE CI**: all failures → issue + alert (merged-to-main problems must be tracked)
+
+### Issue Template
+
+**Title format**:
+```
+[Bug]: <CI type> CI, <failed test case> - <first error keyword summary>
+```
+
+Examples:
+- `[Bug]: Ready CI, tests/tools/test_check_tts_adapter.py::test_gate_passes_on_current_tree - assert 1 == 0`
+- `[Bug]: Merge CI, tests/config/test_omni_config.py::test_diffusion_config_field_classification_covers_current_fields - AssertionError: Extra items: fa_deterministic`
+
+**Body format** (English only; use GitHub issue form structure):
+
+- `### Your current environment` with collapsible `<details>` and `CI` placeholder in a fenced code block
+- `### Your code version` with two `<details>` blocks (vllm commit + vllm-omni commit), each containing `CI`
+- `### 🐛 Describe the bug` with:
+  - Buildkite build URL
+  - One line: `issue happened since pr #<N> merged` (PR-introduced) or `repo-existing issue`
+  - Fenced plain-text block with first error excerpt
+
+**Issue link column rules**:
+- Attribution = 🔴 PR-introduced **and** CI type = READY CI → show `N/A`
+- Any other attribution, or CI type = MERGE CI → generate clickable prefill link
+- Link format: `[File issue](https://github.com/vllm-project/vllm-omni/issues/new?labels=bug,ci-failure&title=<URLEncodedTitle>&body=<URLEncodedBody>)`
+- URL-encode title and body with `python3 urllib.parse.quote`
+
+### Diagnosis Taxonomy (root cause, not symptom)
+
+**Required for scheduled runs**: classify by **root cause**, not error symptom.
+
+| Category | Description | Examples |
+|----------|-------------|----------|
+| 🔴 Product code defect | API/signature change, logic bug, memory leak | Caller breaks after API change |
+| 🔴 Test code defect | Insufficient test resources, wrong assertion, bad test config | Mock missing attribute; stale expected count |
+| 🔴 Config defect | Field validation, whitelist drift, yaml misconfiguration | New field not added to classification set |
+| 🟡 Pre-existing repo defect | Bug already on base branch | Same error on main in same window |
+| 🟢 Infrastructure | CI env, network, port conflict | buildkitd disconnect; agent allocation failure |
+
+OOM / TypeError / Timeout are **symptoms**—put them in the First Error summary column, not Diagnosis category.
+
+### Summary Output Format (Feishu)
+
+**Do not use markdown tables** for alert-group messages. Feishu splits long messages into multiple bubbles; table headers and rows land in separate bubbles and become unreadable.
+
+**Use one record per line**, fields separated by `|`, each line self-contained:
+
+```
+📋 CI Triage Summary
+
+Build#11824 | https://buildkite.com/... | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🔴 PR-introduced | AssertionError: ... | Hypothesis 1 | [File issue](...)
+Build#11825 | https://buildkite.com/... | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](...)
+```
+
+**Column order**:
+1. Failed build number
+2. Build URL
+3. Failed job name
+4. Failed test case (pytest node id)
+5. Diagnosis (root-cause taxonomy above)
+6. Attribution (🔴 PR-introduced / 🟡 Pre-existing / 🔵 Infra/env / 🟠 PR worsens existing / ⚪ Uncertain)
+7. First error summary (≤120 chars)
+8. Top hypothesis (one sentence)
+9. File issue (clickable link or `N/A`)
+
+### CSV Persistence
+
+Append each scheduled run to CSV:
+
+- **READY CI**: `/home/zmj/ci_triage_data/ready_ci.csv`
+- **NPU READY CI**: `/home/zmj/ci_triage_data/ready_npu_ci.csv`
+- **MERGE CI**: `/home/zmj/ci_triage_data/merge_ci.csv`
+
+CSV columns: `time_window,failed_build,build_url,failed_job,failed_test,diagnosis,attribution,first_error_summary,hypothesis`
+
+- Create file with header if missing; append rows only (no duplicate headers)
+- Time window format: `YYYYMMDD_HHMM-HHMM`, e.g. `20260707_1800-0900`
+
+### Alert Group Forwarding
+
+After analysis, forward summary + per-job details to the alert group:
+
+```bash
+cc-connect send -s "feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1" --stdin <<EOF
+<summary and per-job analysis>
+EOF
+```
+
+**Filtering**:
+- **READY CI**: exclude 🔴 PR-introduced rows from the **alert-group** copy (summary and per-job). Full report in the triage session stays unfiltered. If nothing remains after filtering, **send nothing** to the alert group (stay silent)
+- **MERGE CI**: forward all rows including 🔴 PR-introduced. If no failed builds, send nothing
+
+### Root-Cause Evidence Validation
+
+Evidence cited in a hypothesis must be **unique to the failing build**. Before stating a hypothesis, fetch a **passing** build in the same window with the same CI type and job name; confirm the cited log signal appears only in the failure, not in the pass.
+
+### Silent Intermediate Steps
+
+During scheduled runs, do not stream intermediate tool output to chat. Emit the **complete report once** after all analysis finishes.
 
 ## Additional Resources
 
