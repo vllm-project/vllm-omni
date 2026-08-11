@@ -139,7 +139,11 @@ def test_prepare_multistage_multimodal_inputs_preserves_shared_talker_audio(serv
     serving_chat.engine_client = SimpleNamespace(
         stage_configs=[
             SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
-            SimpleNamespace(model_stage="tts", requires_multimodal_data=True),
+            SimpleNamespace(
+                model_stage="tts",
+                requires_multimodal_data=False,
+                request_side_input_modalities=("audio",),
+            ),
             SimpleNamespace(model_stage="code2wav", requires_multimodal_data=False),
         ]
     )
@@ -180,7 +184,10 @@ def test_prepare_multistage_multimodal_inputs_reads_resolved_stage_runtime(servi
             },
             {
                 "engine_args": {"model_stage": "tts"},
-                "runtime": {"requires_multimodal_data": True},
+                "runtime": {
+                    "requires_multimodal_data": False,
+                    "request_side_input_modalities": ["audio"],
+                },
             },
             {
                 "engine_args": {"model_stage": "code2wav"},
@@ -235,6 +242,21 @@ def test_needs_multistage_multimodal_split_noops_for_qwen3_omni(serving_chat):
     )
 
     assert serving_chat._needs_multistage_multimodal_split() is False
+
+
+def test_needs_multistage_multimodal_split_detects_request_side_input(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+            SimpleNamespace(
+                model_stage="talker",
+                requires_multimodal_data=False,
+                request_side_input_modalities=("audio",),
+            ),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is True
 
 
 def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):

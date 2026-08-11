@@ -220,6 +220,10 @@ class StagePipelineConfig:
     final_output_type: str | None = None
     owns_tokenizer: bool = False
     requires_multimodal_data: bool = False
+    # Original request modalities needed by this stage's input bridge, but
+    # not consumed by the stage model itself.  Serving materializes and
+    # retains these inputs independently from ``requires_multimodal_data``.
+    request_side_input_modalities: tuple[str, ...] = ()
     hf_config_name: str | None = None
     engine_output_type: str | None = None
     model_arch: str | None = None
@@ -946,6 +950,7 @@ def merge_pipeline_deploy(
             if ds.env is not None:
                 runtime["env"] = ds.env
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
+        runtime["request_side_input_modalities"] = list(ps.request_side_input_modalities)
 
         result.append(
             StageConfig(

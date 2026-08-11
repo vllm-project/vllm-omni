@@ -650,6 +650,7 @@ class TestStagePipelineConfig:
         assert s.sampling_constraints == {}
         assert s.engine_output_type is None
         assert s.scheduler_cls is None
+        assert s.request_side_input_modalities == ()
 
 
 class TestPipelineConfigNew:
@@ -1444,6 +1445,24 @@ stages:
 
         assert stages[0].yaml_runtime["requires_multimodal_data"] is True
 
+    def test_merge_pipeline_deploy_preserves_request_side_input_modalities(self):
+        pipeline = PipelineConfig(
+            model_type="test_request_side_inputs",
+            model_arch="TestModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    request_side_input_modalities=("audio", "image"),
+                ),
+            ),
+        )
+        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].yaml_runtime["request_side_input_modalities"] == ["audio", "image"]
+
     def test_merge_pipeline_deploy_preserves_pipeline_scheduler_cls(self):
         scheduler_cls = "tests.fake.CustomScheduler"
         pipeline = PipelineConfig(
@@ -1874,7 +1893,7 @@ class TestQwen3TTSPipeline:
 
 
 class TestMiniCPMO45Pipeline:
-    def test_talker_preserves_request_multimodal_data(self):
+    def test_talker_declares_bridge_side_audio_without_model_multimodal_input(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
 
@@ -1882,7 +1901,8 @@ class TestMiniCPMO45Pipeline:
         assert isinstance(talker, StagePipelineConfig)
         assert talker.model_stage == "tts"
         assert talker.custom_process_input_func is not None
-        assert talker.requires_multimodal_data is True
+        assert talker.requires_multimodal_data is False
+        assert talker.request_side_input_modalities == ("audio",)
 
     @pytest.mark.parametrize(
         "filename",
