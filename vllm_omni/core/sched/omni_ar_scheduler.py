@@ -99,6 +99,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
         self.kv_transfer_criteria = self._get_kv_transfer_criteria()
 
+        # ``hbm_limit_gb`` has already been converted into the native
+        # kv_cache_memory_bytes hard limit by OmniEngineArgs. Keep an explicit
+        # scheduler-side admission guard so a full budget does not admit more
+        # waiting requests only to immediately preempt them.
+        configured_guard = getattr(
+            self.vllm_config.model_config,
+            "hbm_admission_guard",
+            None,
+        )
+        self._hbm_admission_enabled = (
+            getattr(self.vllm_config.model_config, "hbm_limit_gb", None) is not None
+            if configured_guard is None
+            else configured_guard
+        )
+        self.hbm_admission_deferred_steps = 0
+        self.hbm_admission_deferred_requests = 0
+        self.hbm_admission_resume_count = 0
+        self._hbm_admission_was_active = False
+
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
 
@@ -146,7 +165,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return result
 
     def _should_defer_waiting_admission(self) -> bool:
-        return False
+        enabled = getattr(self, "_hbm_admission_enabled", False)
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        should_defer = enabled and free_blocks == 0
+        was_active = getattr(self, "_hbm_admission_was_active", False)
+
+        if should_defer:
+            self.hbm_admission_deferred_steps = getattr(self, "hbm_admission_deferred_steps", 0) + 1
+            waiting_count = len(self.waiting)
+            self.hbm_admission_deferred_requests = getattr(self, "hbm_admission_deferred_requests", 0) + waiting_count
+            if not was_active:
+                logger.info(
+                    "[HBMAdmission] paused free_blocks=%d total_blocks=%s waiting=%d running=%d deferred_steps=%d",
+                    free_blocks,
+                    getattr(getattr(self, "kv_cache_config", None), "num_blocks", "unknown"),
+                    waiting_count,
+                    len(self.running),
+                    self.hbm_admission_deferred_steps,
+                )
+        elif was_active:
+            self.hbm_admission_resume_count = getattr(self, "hbm_admission_resume_count", 0) + 1
+            logger.info(
+                "[HBMAdmission] resumed free_blocks=%d waiting=%d running=%d "
+                "deferred_steps=%d deferred_requests=%d resume_count=%d",
+                free_blocks,
+                len(self.waiting),
+                len(self.running),
+                getattr(self, "hbm_admission_deferred_steps", 0),
+                getattr(self, "hbm_admission_deferred_requests", 0),
+                self.hbm_admission_resume_count,
+            )
+
+        self._hbm_admission_was_active = should_defer
+        return should_defer
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """

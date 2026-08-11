@@ -39,6 +39,28 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     return sched
 
 
+@pytest.mark.parametrize(
+    ("enabled", "free_blocks", "expected"),
+    [
+        (False, 0, False),
+        (True, 1, False),
+        (True, 0, True),
+    ],
+)
+def test_hbm_budget_waiting_admission_guard(enabled, free_blocks, expected):
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._hbm_admission_enabled = enabled
+    sched.waiting = []
+    sched.running = []
+    sched.kv_cache_manager = SimpleNamespace(
+        block_pool=SimpleNamespace(
+            get_num_free_blocks=lambda: free_blocks,
+        )
+    )
+
+    assert sched._should_defer_waiting_admission() is expected
+
+
 def _make_request() -> Request:
     return Request(
         request_id="req-ar-streaming-test",
