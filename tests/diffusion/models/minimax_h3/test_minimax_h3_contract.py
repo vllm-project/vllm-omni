@@ -1038,6 +1038,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     )
     expected = torch.ones(2, 3)
     pipeline.text_encoder = Mock(return_value=expected)
+    pipeline._model_cpu_offload_modules = [pipeline.text_encoder]
     input_ids = torch.tensor([1, 2])
     vision_kwargs = {"pixel_values": torch.ones(1, 4)}
 

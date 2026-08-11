@@ -44,7 +44,12 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader import (
+    OffloadPlan,
+    apply_sequential_offload,
+    remove_sequential_offload,
+    sequential_offload_component,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -1129,9 +1134,7 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.od_config.enable_cpu_offload and not getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
+        if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
@@ -1160,8 +1163,53 @@ class MiniMaxH3Pipeline(
             or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
 
+    def _model_cpu_offload_dits(self) -> list[nn.Module]:
+        return [module for module in (self.transformer, getattr(self, "transformers_ref", None)) if module is not None]
+
+    def _model_cpu_offload_stages(self) -> list[nn.Module]:
+        return [self.text_encoder, self.video_vae, self.audio_vae]
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None:
+        if getattr(self, "_model_cpu_offload_modules", None):
+            return
+
+        dits = self._model_cpu_offload_dits()
+        stages = self._model_cpu_offload_stages()
+        modules = [*dits, *stages]
+        apply_sequential_offload(
+            dit_modules=dits,
+            encoder_modules=stages,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+            offload_initial_dits=True,
+        )
+
+        self._model_cpu_offload_modules = modules
+        logger.info(
+            "MiniMax-H3 model-level CPU offload enabled for %d DiT(s), text encoder, video VAE, and audio VAE",
+            len(dits),
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        modules = getattr(self, "_model_cpu_offload_modules", None)
+        if not modules:
+            return
+        remove_sequential_offload(modules)
+        self._model_cpu_offload_modules = []
+
     @contextmanager
     def _component_on_device(self, component: nn.Module):
+        if getattr(self, "_model_cpu_offload_modules", None):
+            with sequential_offload_component(component):
+                yield
+            return
         staged = self._uses_manual_component_offload()
         if staged:
             component.load_to_device()
@@ -1170,21 +1218,6 @@ class MiniMaxH3Pipeline(
         finally:
             if staged:
                 component.offload_to_cpu()
-
-    def _encode_visual_condition(
-        self,
-        image: Image.Image,
-    ) -> torch.Tensor:
-        _, rank, _ = _dit_rank_world()
-        rows = None
-        if rank == 0:
-            with self._component_on_device(self.video_vae):
-                rows = self.video_vae.encode_image(image)
-        return _broadcast_tensor(
-            rows,
-            dtype=torch.float32,
-            device=self.device,
-        )
 
     def _encode_visual_conditions(
         self,
@@ -1195,9 +1228,20 @@ class MiniMaxH3Pipeline(
     ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
-        for image in images:
-            rows.append(self._encode_visual_condition(image))
-            shapes.append((1, image.height // 16, image.width // 16))
+        if images:
+            _, rank, _ = _dit_rank_world()
+            image_rows = None
+            if rank == 0:
+                with self._component_on_device(self.video_vae):
+                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
+            rows.append(
+                _broadcast_tensor(
+                    image_rows,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            )
+            shapes.extend((1, image.height // 16, image.width // 16) for image in images)
         if video_count:
             video_rows, video_shapes = self._encode_video_conditions(
                 prepared_videos,
