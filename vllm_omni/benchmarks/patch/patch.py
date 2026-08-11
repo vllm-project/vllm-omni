@@ -1644,6 +1644,7 @@ async def async_request_openai_realtime_duplex(
             turn_transcripts: list[str] = []
             measurement_origin = {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
+                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "conversation.item.create client send to first audio packet",
                 "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
             }
@@ -1730,16 +1731,21 @@ async def async_request_openai_realtime_duplex(
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
-            output.tts_turn_pcm_bytes = turn_pcm_bytes
-            output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
-            if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
-                output.duplex_request_metrics = turn_metrics
-                output.duplex_session_metrics = session_metrics
             output.output_tokens = sum(
                 int(stage0.get("output_token_count") or 0)
                 for timing in turn_timings
                 if isinstance((stage0 := timing.get("stage0_tokens")), dict)
             )
+            mean_tpot_s = float(session_metrics.get("mean_tpot_ms") or 0.0) / 1000.0
+            if output.output_tokens > 1 and mean_tpot_s > 0:
+                # Preserve the benchmark's standard TPOT calculation while
+                # sourcing duplex token timing from Stage 0 engine metrics.
+                output.text_latency = output.ttft + mean_tpot_s * (output.output_tokens - 1)
+            output.tts_turn_pcm_bytes = turn_pcm_bytes
+            output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
+            if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+                output.duplex_request_metrics = turn_metrics
+                output.duplex_session_metrics = session_metrics
             output.success = True
     except Exception:
         output.success = False

@@ -40,10 +40,11 @@
         "seed_tts_locale": "en",
         "seed_tts_turns_per_session": 4,
         "expected_duplex_audio_turns_per_session": 4,
+        "require_duplex_tpot": true,
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
             "request_throughput": [

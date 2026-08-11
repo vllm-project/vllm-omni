@@ -512,3 +512,27 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
             {"expected_duplex_audio_turns_per_session": 4},
             1,
         )
+
+
+def test_omni_duplex_tpot_requires_global_and_session_metrics():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 1,
+            "mean_tpot_ms": 12.0,
+            "duplex_session_metrics": [{"mean_tpot_ms": 12.0}],
+        },
+        {"require_duplex_tpot": True},
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="Duplex TPOT metric is missing"):
+        assert_result(
+            {
+                "completed": 1,
+                "duplex_session_metrics": [{"mean_tpot_ms": 12.0}],
+            },
+            {"require_duplex_tpot": True},
+            1,
+        )

@@ -346,10 +346,12 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "source": "client_monotonic_receive",
         "measurement_origin": {
             "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+            "tpot": "Stage-0 engine mean time per output token",
             "ttfp": "input_audio_buffer.commit client send to first audio packet",
             "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
         },
         "ttft_ms": 250.0,
+        "tpot_ms": 15.0,
         "ttfp_ms": 300.0,
         "rtf": pytest.approx(1.916667),
         "audio_generation_ms": 460.0,

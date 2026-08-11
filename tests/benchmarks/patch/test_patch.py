@@ -97,7 +97,17 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
                     "response_id": response_id,
                     "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
                     "sample_rate_hz": 24_000,
-                    "metadata": {"audio_duration_ms": 100},
+                    "metadata": {
+                        "audio_duration_ms": 100,
+                        "vllm_omni": {
+                            "stage_metrics": {
+                                "0": {
+                                    "num_tokens_out": 5,
+                                    "vllm_tpot_ms": 12.0 + self.response_count,
+                                }
+                            }
+                        },
+                    },
                 },
                 received_at_s=now + 0.03,
             )
@@ -167,6 +177,8 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
+    assert output.output_tokens == 20
+    assert output.text_latency - output.ttft == pytest.approx(14.5e-3 * 19)
     assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
     assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
     session_id = output.duplex_request_metrics[0]["session_id"]
@@ -180,10 +192,12 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             "source": "client_monotonic_receive",
             "measurement_origin": {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
+                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "conversation.item.create client send to first audio packet",
                 "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
             },
             "ttft_ms": pytest.approx(20.0, abs=2.0),
+            "tpot_ms": 13.0 + index,
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
@@ -193,6 +207,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         "session_id": session_id,
         "audio_turn_count": 4,
         "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
+        "mean_tpot_ms": 14.5,
         "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
         "mean_rtf": pytest.approx(0.3, abs=0.03),
     }

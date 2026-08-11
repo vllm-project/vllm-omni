@@ -1014,6 +1014,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
                         "stage_metrics": {
                             "0": {
                                 "num_tokens_out": token_count,
+                                "vllm_tpot_ms": float(token_count),
                                 "vllm_itls_ms": [10.0],
                             }
                         }
@@ -1047,6 +1048,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             "request_index": 0,
             "response_id": "resp-1",
             "ttft_ms": 150.0,
+            "tpot_ms": 3.0,
             "ttfp_ms": 200.0,
             "rtf": 2.5,
             "audio_generation_ms": 200.0,
@@ -1054,6 +1056,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             "source": "client_monotonic_receive",
             "measurement_origin": {
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
             },
@@ -1063,6 +1066,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             "request_index": 1,
             "response_id": "resp-2",
             "ttft_ms": 150.0,
+            "tpot_ms": 5.0,
             "ttfp_ms": 300.0,
             "rtf": 3.75,
             "audio_generation_ms": 300.0,
@@ -1070,6 +1074,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             "source": "client_monotonic_receive",
             "measurement_origin": {
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
             },
@@ -1079,6 +1084,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
         "session_id": "seed-tts-session",
         "audio_turn_count": 2,
         "mean_ttft_ms": 150.0,
+        "mean_tpot_ms": 4.0,
         "mean_ttfp_ms": 250.0,
         "mean_rtf": 3.125,
     }

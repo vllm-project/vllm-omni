@@ -63,7 +63,7 @@ def summarize_session_request_metrics(
     *,
     session_id: str | None,
 ) -> dict[str, object]:
-    """Average client-observed metrics across turns that emitted audio."""
+    """Average client- and engine-observed metrics across audio turns."""
 
     def mean(metric: str, *, digits: int = 3) -> float | None:
         values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
@@ -73,6 +73,7 @@ def summarize_session_request_metrics(
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
+        "mean_tpot_ms": mean("tpot_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
     }
@@ -395,6 +396,7 @@ class RealtimeEventCollector:
                     "measurement_origin": measurement_origin
                     or {
                         "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                        "tpot": "Stage-0 engine mean time per output token",
                         "ttfp": "input_audio_buffer.commit client send to first audio packet",
                         "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
                     },
@@ -402,6 +404,9 @@ class RealtimeEventCollector:
                         _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
                         if first_text_received_at_s is not None
                         else None
+                    ),
+                    "tpot_ms": (
+                        float(stage0_metrics.get("vllm_tpot_ms") or 0.0) if stage0_metrics is not None else None
                     ),
                     "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
                     "rtf": round(
