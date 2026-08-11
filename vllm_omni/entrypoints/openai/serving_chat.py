@@ -12,6 +12,7 @@ from typing import Any, Final, cast
 import jinja2
 import torch
 from fastapi import Request
+from fastapi.sse import format_sse_event
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
@@ -1452,8 +1453,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except Exception as e:
             logger.exception("Error in tool parser creation.")
             data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
-            yield "data: [DONE]\n\n"
+            yield format_sse_event(data_str=data)
+            yield format_sse_event(data_str="[DONE]")
             return
 
         stream_options = request.stream_options
@@ -1537,7 +1538,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
-                        yield f"data: {data}\n\n"
+                        yield format_sse_event(data_str=data)
 
                     # Send response to echo the input portion of the
                     # last message
@@ -1570,7 +1571,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     )
 
                                 data = chunk.model_dump_json(exclude_unset=True)
-                                yield f"data: {data}\n\n"
+                                yield format_sse_event(data_str=data)
                     first_iteration_dict[final_output_type] = False
 
                 if final_output_type == "text":
@@ -2056,7 +2057,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
-                        yield f"data: {data}\n\n"
+                        yield format_sse_event(data_str=data)
 
                 elif final_output_type == "audio":
                     # Observe audio_ttfp_s on first audio packet for this request_id
@@ -2143,7 +2144,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         total_tokens=num_prompt_tokens,
                     )
                     data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    yield format_sse_event(data_str=data)
 
                 elif final_output_type == "image":
                     role = self.get_chat_request_role(request)
@@ -2182,7 +2183,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # of the full generator. TODO (Alex): Add support for usage on all stages for
                     # both streaming and non-streaming.
                     data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    yield format_sse_event(data_str=data)
 
                 else:
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
@@ -2206,7 +2207,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         model=model_name,
                     )
                     data = stop_chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    yield format_sse_event(data_str=data)
             # Emit audio_underrun_s + audio_continuity_ok_total once per
             # request after the audio chunk stream is exhausted. The
             # captured reference (req_state_audio_ref) outlives the inner
@@ -2247,7 +2248,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     metrics=self._filter_stage_metrics_detail(last_metrics, request),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
-                yield f"data: {final_usage_data}\n\n"
+                yield format_sse_event(data_str=final_usage_data)
 
             # report to FastAPI middleware aggregate usage across all choices
             num_completion_tokens = sum(previous_num_tokens)
@@ -2282,7 +2283,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 e,
             )
             data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
+            yield format_sse_event(data_str=data)
             # Actively signal shutdown instead of waiting for the watchdog
             # (5s polling interval).
             if raw_request is not None:
@@ -2293,9 +2294,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
+            yield format_sse_event(data_str=data)
         # Send the final done message after all response.n are finished
-        yield "data: [DONE]\n\n"
+        yield format_sse_event(data_str="[DONE]")
 
     async def chat_completion_full_generator(
         self,
@@ -3380,7 +3381,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             model=model,
                             metrics=metrics,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield format_sse_event(data_str=chunk.model_dump_json())
                 elif final_output_type == "image":
                     images = self._flatten_diffusion_images(getattr(output.request_output, "images", []))
                     if not images:
@@ -3404,14 +3405,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         model=model,
                         metrics=metrics,
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    yield format_sse_event(data_str=chunk.model_dump_json())
                     emitted_image = True
             if not emitted_image:
                 raise RuntimeError("Streaming image edit completed without a final image output.")
         except EngineDeadError as exc:
             logger.error("EngineDeadError during streaming image edit: %s", exc)
             data = self.create_streaming_error_response(exc)
-            yield f"data: {data}\n\n"
+            yield format_sse_event(data_str=data)
             if raw_request is not None:
                 terminate_if_errored(
                     server=raw_request.app.state.server,
@@ -3433,7 +3434,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "code": exc.status_code,
                 },
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield format_sse_event(data_str=chunk.model_dump_json())
         except Exception as exc:
             logger.exception("Streaming image edit failed: %s", exc)
             chunk = ImageEditStreamError(
@@ -3445,8 +3446,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "code": 500,
                 },
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-        yield "data: [DONE]\n\n"
+            yield format_sse_event(data_str=chunk.model_dump_json())
+        yield format_sse_event(data_str="[DONE]")
 
     @staticmethod
     def _flatten_diffusion_images(images: Any) -> list[Image.Image]:
