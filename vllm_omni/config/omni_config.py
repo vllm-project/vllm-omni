@@ -573,6 +573,7 @@ class _DiffusionConfigProjection:
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiling: Literal["auto", "true", "false"] = "false"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0

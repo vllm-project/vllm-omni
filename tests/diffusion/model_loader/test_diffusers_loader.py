@@ -142,6 +142,54 @@ def test_initialize_model_sets_current_diffusion_config_during_model_constructio
     assert get_current_diffusion_config_or_none() is None
 
 
+def test_configure_vae_stack_tiling_enables_tiling_and_native_capability():
+    from vllm_omni.diffusion.registry import _configure_vae_stack_tiling
+
+    calls = []
+    vae = SimpleNamespace(
+        supports_stack_tiling=True,
+        set_stack_tiling=lambda enabled: calls.append(enabled),
+    )
+    model = SimpleNamespace(vae=vae)
+    od_config = SimpleNamespace(
+        model_class_name="MiniMaxH3Pipeline",
+        vae_stack_tiling="auto",
+        vae_use_tiling=False,
+    )
+
+    _configure_vae_stack_tiling(model, od_config)
+
+    assert od_config.vae_use_tiling is True
+    assert calls == ["auto"]
+
+
+def test_configure_vae_stack_tiling_rejects_unsupported_vae():
+    from vllm_omni.diffusion.registry import _configure_vae_stack_tiling
+
+    od_config = SimpleNamespace(
+        model_class_name="UnsupportedPipeline",
+        vae_stack_tiling="true",
+        vae_use_tiling=False,
+    )
+
+    with pytest.raises(ValueError, match="does not declare stacked-tiling support"):
+        _configure_vae_stack_tiling(SimpleNamespace(vae=SimpleNamespace()), od_config)
+
+
+def test_configure_vae_stack_tiling_auto_falls_back_for_unsupported_vae():
+    from vllm_omni.diffusion.registry import _configure_vae_stack_tiling
+
+    od_config = SimpleNamespace(
+        model_class_name="UnsupportedPipeline",
+        vae_stack_tiling="auto",
+        vae_use_tiling=False,
+    )
+
+    _configure_vae_stack_tiling(SimpleNamespace(vae=SimpleNamespace()), od_config)
+
+    assert od_config.vae_use_tiling is False
+
+
 def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 

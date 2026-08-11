@@ -284,6 +284,28 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
 
 
+def test_serve_cli_forwards_vae_stack_tiling():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--vae-stack-tiling",
+            "auto",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.vae_stack_tiling == "auto"
+    assert stage_cfg["engine_args"]["vae_stack_tiling"] == "auto"
+
+
 def test_serve_cli_forwards_distributed_offload_residency():
     """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()

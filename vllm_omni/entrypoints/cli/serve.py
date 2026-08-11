@@ -629,6 +629,15 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
+        omni_config_group.add_argument(
+            "--vae-stack-tiling",
+            choices=("auto", "true", "false"),
+            default="false",
+            help=(
+                "Batch native VAE tiles into fewer model calls. 'auto' enables it "
+                "when each VAE-parallel rank has multiple tiles (default: false)."
+            ),
+        )
 
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(

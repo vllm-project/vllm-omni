@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -491,6 +491,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiling: Literal["auto", "true", "false"] = "false"
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False

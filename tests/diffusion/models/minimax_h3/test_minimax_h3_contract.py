@@ -100,6 +100,82 @@ def test_pipeline_import_registry_and_component_discovery():
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
 
 
+def test_h3_profiler_records_video_and_audio_vae_decode(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.profiler import diffusion_pipeline_profiler as profiler_module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.video_vae = SimpleNamespace(decode_latent=lambda latent: latent + 1)
+    pipeline.audio_vae = SimpleNamespace(decode_latent=lambda latent: latent + 2)
+    monkeypatch.setattr(profiler_module.current_omni_platform, "is_available", lambda: False)
+
+    pipeline.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler=True)
+
+    assert pipeline.video_vae.decode_latent(1) == 2
+    assert pipeline.audio_vae.decode_latent(1) == 3
+    assert pipeline.stage_durations["MiniMaxH3Pipeline.video_vae.decode_latent"] >= 0
+    assert pipeline.stage_durations["MiniMaxH3Pipeline.audio_vae.decode_latent"] >= 0
+    assert "decode" in MiniMaxH3Pipeline._PROFILER_TARGETS
+
+
+def test_h3_video_vae_exposes_native_stack_tiling_capability():
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.model = SimpleNamespace(stack_tiling=False)
+    vae.stack_tiling_mode = "false"
+
+    assert vae.supports_stack_tiling
+    vae.set_stack_tiling(True)
+    assert vae.model.stack_tiling is True
+    vae.set_stack_tiling(False)
+    assert vae.model.stack_tiling is False
+
+
+@pytest.mark.parametrize(
+    ("parallel_size", "tile_rows", "tile_columns", "expected"),
+    [
+        (1, 1, 2, True),
+        (2, 1, 2, False),
+        (2, 2, 2, True),
+        (4, 2, 4, True),
+    ],
+)
+def test_h3_video_vae_auto_stacks_only_multiple_local_tiles(parallel_size, tile_rows, tile_columns, expected):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    def split_tiles(input_len, is_decoder=False):
+        assert is_decoder
+        count = tile_rows if input_len == 16 else tile_columns
+        return list(range(count)), [1] * count, [0] * max(0, count - 1)
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.model = SimpleNamespace(
+        stack_tiling=False,
+        vae_ratio=16,
+        split_tiles=split_tiles,
+    )
+    vae.parallel_size = parallel_size
+    vae.stack_tiling_mode = "auto"
+    latent = torch.zeros(1, 32, 1, 1, 2)
+
+    assert vae._should_stack_decode_tiles(latent) is expected
+
+
+def test_h3_video_vae_rejects_remote_without_stack_tiling():
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.model = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="does not expose stack_tiling"):
+        vae.set_stack_tiling(True)
+
+
 def _write_partition_index(path, *, partition, tasks):
     path.mkdir(parents=True)
     (path / "model_index.json").write_text(

@@ -540,6 +540,8 @@ class MiniMaxH3Pipeline(
         "_encode_video_audio_conditions",
         "diffuse",
         "decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
 

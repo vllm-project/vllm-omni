@@ -352,6 +352,37 @@ def _prepare_diffusion_quant_config(
     configure_quant_config(quant_config, model_class)
 
 
+def _configure_vae_stack_tiling(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    mode = getattr(od_config, "vae_stack_tiling", "false")
+    if isinstance(mode, bool):
+        mode = "true" if mode else "false"
+    if mode not in ("auto", "true", "false"):
+        raise ValueError(f"invalid vae_stack_tiling mode: {mode!r}")
+    if mode == "false":
+        return
+
+    vae = getattr(model, "vae", None)
+    if vae is None or not getattr(vae, "supports_stack_tiling", False):
+        if mode == "auto":
+            logger.info(
+                "VAE stacked tiling auto mode is unavailable for %s; using sequential tiles.",
+                od_config.model_class_name,
+            )
+            return
+        raise ValueError(
+            f"vae_stack_tiling was requested, but {od_config.model_class_name} does not declare stacked-tiling support"
+        )
+    setter = getattr(vae, "set_stack_tiling", None)
+    if not callable(setter):
+        raise ValueError("vae_stack_tiling was requested, but the VAE does not provide set_stack_tiling()")
+
+    if not od_config.vae_use_tiling:
+        logger.info("vae_stack_tiling requires vae_use_tiling; automatically enabling it.")
+        od_config.vae_use_tiling = True
+    setter(mode)
+    logger.info("VAE stacked tiling mode set to %s for %s.", mode, od_config.model_class_name)
+
+
 def initialize_model(
     od_config: OmniDiffusionConfig,
 ) -> nn.Module:
@@ -392,6 +423,8 @@ def initialize_model(
                 vae_pp_size,
             )
             od_config.vae_use_tiling = True
+
+        _configure_vae_stack_tiling(model, od_config)
 
         # Configure VAE memory optimization settings from config
         if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):

@@ -7,7 +7,7 @@ import importlib
 import json
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -105,6 +105,8 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
+    supports_stack_tiling: ClassVar[bool] = True
+
     def __init__(
         self,
         component_path: str,
@@ -136,6 +138,29 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
+        self.stack_tiling_mode = "false"
+
+    def set_stack_tiling(self, mode: str | bool) -> None:
+        if not hasattr(self.model, "stack_tiling"):
+            raise RuntimeError("MiniMax H3 video VAE remote model does not expose stack_tiling")
+        if isinstance(mode, bool):
+            mode = "true" if mode else "false"
+        if mode not in ("auto", "true", "false"):
+            raise ValueError(f"invalid VAE stacked-tiling mode: {mode!r}")
+        self.stack_tiling_mode = mode
+        self.model.stack_tiling = mode == "true"
+
+    def _should_stack_decode_tiles(self, latent: torch.Tensor) -> bool:
+        if self.stack_tiling_mode != "auto":
+            return self.stack_tiling_mode == "true"
+
+        ratio = int(self.model.vae_ratio)
+        height = int(latent.shape[-2]) * ratio
+        width = int(latent.shape[-1]) * ratio
+        y_idx, _, _ = self.model.split_tiles(height, is_decoder=True)
+        x_idx, _, _ = self.model.split_tiles(width, is_decoder=True)
+        global_tile_count = len(y_idx) * len(x_idx)
+        return global_tile_count >= 2 * self.parallel_size
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -293,7 +318,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1, 1, 1)
-        decoded = self.model.decode_base(latent * std + mean)
+        previous_stack_tiling = self.model.stack_tiling
+        self.model.stack_tiling = self._should_stack_decode_tiles(latent)
+        try:
+            decoded = self.model.decode_base(latent * std + mean)
+        finally:
+            self.model.stack_tiling = previous_stack_tiling
         frames = self.model.processor.revert_tensor(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
