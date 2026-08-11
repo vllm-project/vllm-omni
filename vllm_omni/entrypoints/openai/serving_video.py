@@ -294,7 +294,10 @@ class OmniOpenAIServingVideo:
         actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
         model_fps = self._resolve_fps(result)
-        output_fps_base = (vp.fps if fps_provided else None) or model_fps or vp.fps or 24
+        # Canonical output metadata describes the media the model actually
+        # produced, so it must override an input/base rate supplied by the
+        # client (for example after a LingBot Refiner changes the FPS).
+        output_fps_base = model_fps or (vp.fps if fps_provided else None) or vp.fps or 24
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         return VideoGenerationArtifacts(
             videos=videos,
@@ -707,33 +710,27 @@ class OmniOpenAIServingVideo:
     @staticmethod
     def _resolve_fps(result: object) -> int | None:
         """Extract fps from multimodal_output if the model reported it."""
+        candidates = []
         multimodal_output = getattr(result, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
-            fps = multimodal_output.get("fps")
-            if fps is not None:
-                try:
-                    fps_val = fps.item() if hasattr(fps, "item") else int(fps)
-                    if fps_val > 0:
-                        return fps_val
-                except (TypeError, ValueError):
-                    pass
+            candidates.append(multimodal_output)
 
         request_output = result
         if isinstance(request_output, dict):
-            mm = request_output.get("multimodal_output") or {}
-            if isinstance(mm, Mapping):
-                fps = mm.get("fps")
-                if fps is not None:
-                    try:
-                        fps_val = fps.item() if hasattr(fps, "item") else int(fps)
-                        if fps_val > 0:
-                            return fps_val
-                    except (TypeError, ValueError):
-                        pass
-        elif hasattr(request_output, "multimodal_output"):
-            mm = getattr(request_output, "multimodal_output", None)
-            if isinstance(mm, Mapping):
-                fps = mm.get("fps")
+            request_multimodal_output = request_output.get("multimodal_output") or {}
+        else:
+            request_multimodal_output = getattr(request_output, "multimodal_output", None)
+        if isinstance(request_multimodal_output, Mapping):
+            candidates.append(request_multimodal_output)
+
+        for candidate in candidates:
+            metadata = candidate.get("metadata")
+            video_metadata = metadata.get("video") if isinstance(metadata, Mapping) else None
+            canonical_fps = video_metadata.get("fps") if isinstance(video_metadata, Mapping) else None
+
+            # Prefer the canonical metadata contract, while retaining the
+            # legacy top-level field emitted by older output formatters.
+            for fps in (canonical_fps, candidate.get("fps")):
                 if fps is not None:
                     try:
                         fps_val = fps.item() if hasattr(fps, "item") else int(fps)

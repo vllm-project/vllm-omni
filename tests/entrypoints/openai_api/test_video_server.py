@@ -947,6 +947,54 @@ def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: M
     assert fps_values == [8]
 
 
+def test_refiner_metadata_fps_overrides_requested_base_fps(test_client, mocker: MockerFixture):
+    fps_values = []
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, **kwargs):
+        del video, audio, audio_sample_rate, kwargs
+        fps_values.append(fps)
+        return b"fake-video"
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult(
+            [object()],
+            multimodal_output={
+                "video": [object()],
+                "metadata": {
+                    "video": {
+                        "fps": 24,
+                        "refined": True,
+                        "source_fps": 12.0,
+                    }
+                },
+            },
+        )
+
+    engine.generate = _generate
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "refined fps", "fps": "12"},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.fps == 12
+    assert captured.frame_rate == 12.0
+    assert fps_values == [24]
+
+
 def test_size_param_sets_width_height(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
