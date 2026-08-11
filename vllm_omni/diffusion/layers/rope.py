@@ -193,7 +193,16 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        # Keep the full-dimension NeoX form inline for MUSA compilation.
+        # Other layouts use the shared native implementation.
+        if self.half_head_dim or self.interleaved:
+            return self.forward_native(x, cos, sin)
+        if cos.dim() == 3:
+            cos, sin = cos[0], sin[0]
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
     def forward_native(
         self,

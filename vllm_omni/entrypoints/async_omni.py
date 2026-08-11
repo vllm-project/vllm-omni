@@ -906,17 +906,27 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.duplex_lifecycle_events.put(msg)
                         continue
 
-                    if isinstance(msg, ErrorMessage) and not msg.fatal:
-                        req_state = self.request_states.get(msg.request_id)
-                        if req_state is not None:
-                            await req_state.queue.put(msg)
-                        else:
-                            logger.warning(
-                                "[%s] dropping non-fatal error for unknown req %s",
-                                self._name,
-                                msg.request_id,
-                            )
-                        continue
+                    if isinstance(msg, ErrorMessage):
+                        # Route request-scoped errors to that request's queue and
+                        # keep the loop alive. A request whose stage replica died
+                        # and was evicted gets a fatal error delivered here; only
+                        # that request fails (its consumer raises), the server
+                        # stays up for other stages/requests (#4285). A fatal
+                        # error without a request_id is a genuine engine-wide
+                        # death and falls through to the except handler below.
+                        if msg.request_id is not None:
+                            req_state = self.request_states.get(msg.request_id)
+                            if req_state is not None:
+                                await req_state.queue.put(msg)
+                            else:
+                                logger.warning(
+                                    "[%s] dropping error for unknown req %s",
+                                    self._name,
+                                    msg.request_id,
+                                )
+                            continue
+                        if not msg.fatal:
+                            continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:
@@ -1317,10 +1327,11 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        Delegates to ``OmniBase.errored`` which checks the orchestrator
-        thread and all stage clients.  Redeclared here to satisfy the
+        Delegates to ``OmniBase.errored``, which is true only when the
+        orchestrator thread is dead; per-stage liveness is reported via
+        ``check_health`` instead.  Redeclared here to satisfy the
         ``EngineClient`` abstract-property requirement (Python's ABC
         mechanism does not resolve abstract methods from sibling MRO
         entries).
