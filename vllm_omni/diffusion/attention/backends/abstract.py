@@ -20,6 +20,17 @@ class AttentionBackend(ABC):
     # avoid a slower masked-attention plan when tail padding is not semantic.
     supports_prefix_kv_slicing: bool = False
 
+    @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        """Whether packed attention never reads attn_mask on this platform.
+
+        When True, models that pack a [real, pad] two-document layout and
+        carry cu_seqlens/max_seqlen in ``AttentionMetadata.extra`` may skip
+        constructing the padding mask entirely. Backends whose mask-free
+        behavior is platform-dependent must check current_omni_platform.
+        """
+        return False
+
     # ``OmniPlatformEnum`` values this backend runs on; None means unrestricted.
     # Platform resolution rejects an explicit selection outside this set, so a
     # hardware-specific backend fails before the model is built.
@@ -121,6 +132,17 @@ class AttentionMetadata:
     #     the packed cu_seqlens tensors.
     #   "valid_kv_length": int — contiguous valid K/V prefix length for a
     #     backend that advertises supports_prefix_kv_slicing.
+    #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
+    #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
+    #     Requires the [real, pad] two-document packing contract; see
+    #     FlashAttentionImpl._forward_varlen_packed_npu.
+    #   "laser_input_scale": float — model opt-in input pre-scale for the NPU
+    #     ascend_laser_attention path. The kernel stores unscaled QK^T in an
+    #     fp16 workspace, so outlier activations overflow 65504 into NaN rows;
+    #     with this set (>1), q/k/v are divided by the factor before the op,
+    #     the kernel scale_value is multiplied by its square, and the output
+    #     is scaled back (exact for power-of-two factors). Absent means no
+    #     pre-scaling. See FlashAttentionImpl._forward_prefix_kv_slice_npu.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
