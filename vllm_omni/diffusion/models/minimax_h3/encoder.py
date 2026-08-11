@@ -294,7 +294,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
 
 
 class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
-    """Qwen3-VL RMSNorm using the common NPU-fused implementation.
+    """Qwen3-VL RMSNorm using the common implementation.
 
     The model-specific name keeps checkpoint weight keys stable, while the
     common RMSNorm dispatches to torch_npu.npu_rms_norm on Ascend. Gamma uses
