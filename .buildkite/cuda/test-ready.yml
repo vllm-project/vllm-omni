@@ -361,6 +361,7 @@ steps:
           - tests/e2e/online_serving/test_qwen_image.py
           - vllm_omni/diffusion/models/qwen_image/
           - vllm_omni/diffusion/models/dmd2/
+          - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
         commands:
           - |
             timeout 40m bash -c "
