@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -41,3 +43,21 @@ def test_wan_vae_execution_context_uses_platform_autocast(mocker):
         dtype=torch.bfloat16,
         enabled=True,
     )
+
+
+def test_prepare_pipeline_installs_data_movement_before_compile(monkeypatch):
+    model = _DummyOmniAutoencoderKLWan(dtype=torch.float32)
+    installed = []
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.offloader.module_collector.ModuleDiscovery.discover",
+        lambda pipeline: SimpleNamespace(vaes=[model]),
+    )
+    monkeypatch.setattr(
+        wan_vae_module,
+        "install_wan_vae_data_movement",
+        lambda vae: installed.append(vae),
+    )
+
+    wan_vae_module.prepare_pipeline_wan_vae_data_movement(torch.nn.Identity())
+
+    assert installed == [model]

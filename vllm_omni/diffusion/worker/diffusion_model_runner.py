@@ -30,6 +30,9 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+    prepare_pipeline_wan_vae_data_movement,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -243,6 +246,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                prepare_pipeline_wan_vae_data_movement(self.pipeline)
         time_after_load = time.perf_counter()
 
         logger.info(

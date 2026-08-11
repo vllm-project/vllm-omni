@@ -728,6 +728,8 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+    prepared_pipelines = []
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
@@ -775,6 +777,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
+    monkeypatch.setattr(
+        model_runner_module,
+        "prepare_pipeline_wan_vae_data_movement",
+        lambda pipeline: prepared_pipelines.append(pipeline),
+    )
     monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
@@ -785,6 +792,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+    assert prepared_pipelines == [runner.pipeline]
 
 
 @pytest.mark.core_model

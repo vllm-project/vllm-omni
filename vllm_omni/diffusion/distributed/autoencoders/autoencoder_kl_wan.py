@@ -18,13 +18,26 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_data_movement import (
+    install_wan_vae_data_movement,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
+def prepare_pipeline_wan_vae_data_movement(pipeline: torch.nn.Module) -> None:
+    """Install Wan data-movement methods before offload or compilation setup."""
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    for vae in ModuleDiscovery.discover(pipeline).vaes:
+        if isinstance(vae, OmniAutoencoderKLWan):
+            install_wan_vae_data_movement(vae)
+
+
 class OmniAutoencoderKLWan(AutoencoderKLWan):
     def _execution_context(self):
+        install_wan_vae_data_movement(self)
         try:
             first_param = next(self.parameters())
         except StopIteration:

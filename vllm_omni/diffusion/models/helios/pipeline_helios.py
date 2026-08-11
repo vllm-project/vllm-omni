@@ -21,6 +21,7 @@ from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_data_movement import install_wan_vae_data_movement
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -215,6 +216,7 @@ class HeliosPipeline(
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
+        install_wan_vae_data_movement(self.vae)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = create_transformer_from_config(

@@ -19,6 +19,7 @@ from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_data_movement import install_wan_vae_data_movement
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
@@ -374,6 +375,7 @@ class LingBotVideoPipeline(
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        install_wan_vae_data_movement(self.vae)
         self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
             model,
             subfolder=scheduler_subfolder,
