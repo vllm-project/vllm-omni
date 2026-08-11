@@ -39,6 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers.sdpa import ScaledDotProductAttention as DiffusionScaledDotProductAttention
+
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
@@ -303,6 +305,10 @@ class MiniMaxH3Qwen3VLRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+class MiniMaxH3Qwen3VLScaledDotProductAttention(DiffusionScaledDotProductAttention):
+    """Qwen3-VL SDPA using the common platform-dispatched implementation."""
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -687,6 +693,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.sdpa = MiniMaxH3Qwen3VLScaledDotProductAttention(causal=True)
 
     def forward(
         self,
@@ -709,19 +716,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Expand GQA keys/values to the local query-head count so SDPA works
-        # uniformly across backends (mirrors the reference eager path).
-        num_key_value_groups = self.num_heads // self.num_kv_heads
-        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
-        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            dropout_p=0.0,
-            is_causal=True,
-        )
+        attn_output = self.sdpa(query_states, key_states, value_states)
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
