@@ -576,6 +576,14 @@ class DiffusionWorker:
 
         usage_before = allocator.get_current_usage()
 
+        if self.model_runner is not None and self.model_runner.pipeline is not None:
+            from vllm_omni.diffusion.vae_optimizations import clear_pipeline_vae_fast_path_caches
+
+            # Folded weights are allocated lazily on the request path rather
+            # than in the tagged weight pool. Drop them before sleep so they
+            # neither remain resident nor need a separate CPU backup.
+            clear_pipeline_vae_fast_path_caches(self.model_runner.pipeline)
+
         if level == 2 and self.model_runner is not None:
             if hasattr(self.model_runner, "graph_runners"):
                 self.model_runner.graph_runners.clear()

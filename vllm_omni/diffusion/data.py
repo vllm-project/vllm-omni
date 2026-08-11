@@ -711,6 +711,9 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # Optional Wan decode-only precision. When set, the VAE encoder remains
+    # FP32 while decoder-side modules use the selected precision.
+    vae_decode_precision: str | None = None
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -923,6 +926,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.vae_decode_precision not in (None, "fp32", "fp16", "bf16"):
+            raise ValueError(
+                "vae_decode_precision must be one of {'fp32', 'fp16', 'bf16'} or None, "
+                f"got {self.vae_decode_precision!r}"
+            )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

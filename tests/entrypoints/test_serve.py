@@ -76,6 +76,17 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_accepts_wan_decode_precision() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-decode-precision", "bf16"])
+
+    assert args.vae_decode_precision == "bf16"
+    assert args.get_explicit_kwargs_dict()["vae_decode_precision"] == "bf16"
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

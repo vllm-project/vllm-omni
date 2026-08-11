@@ -106,7 +106,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             split_dims=(3, 4),
             grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
             tile_spec=tile_spec,
-            output_dtype=self.dtype,
+            output_dtype=getattr(self, "_vllm_decode_dtype", self.dtype),
         )
         return tiletask_list, grid_spec
 

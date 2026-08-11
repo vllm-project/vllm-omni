@@ -113,6 +113,14 @@ class TestCreateDefaultDiffusion:
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
 
+    def test_vae_decode_precision_roundtrip(self):
+        od = _roundtrip_diffusion_config(model="x", vae_decode_precision="bf16")
+        assert od.vae_decode_precision == "bf16"
+
+    def test_invalid_vae_decode_precision_is_rejected(self):
+        with pytest.raises(ValueError, match="vae_decode_precision"):
+            OmniDiffusionConfig(model="x", vae_decode_precision="int8")
+
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["runtime"]["devices"] == "0"

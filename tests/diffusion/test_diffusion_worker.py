@@ -102,6 +102,7 @@ class TestDiffusionWorkerSleep:
 
     def test_sleep_level_1(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
+        clear_vae_caches = mocker.patch("vllm_omni.diffusion.vae_optimizations.clear_pipeline_vae_fast_path_caches")
         mock_allocator_class = patch_cumem_allocator(mocker)
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
@@ -128,6 +129,7 @@ class TestDiffusionWorkerSleep:
 
         # Verify sleep was called with correct tags
         mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+        clear_vae_caches.assert_called_once_with(mock_gpu_worker.model_runner.pipeline)
         assert bool(result) is True
         # Verify buffers were NOT saved (level 1 doesn't save buffers)
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0

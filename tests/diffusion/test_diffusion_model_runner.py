@@ -512,6 +512,35 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     assert runner.pipeline.last_req.num_reqs == 1
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("quality", "expected_enabled"),
+    [(None, False), ("lossless", False), ("high", True)],
+)
+def test_execute_model_scopes_vae_fast_path_to_request_quality(monkeypatch, quality, expected_enabled):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    req = _make_request()
+    req.sampling_params.quality = quality
+    gate_calls = []
+
+    @contextmanager
+    def _record_gate(pipeline, enabled):
+        gate_calls.append((pipeline, enabled, "enter"))
+        yield
+        gate_calls.append((pipeline, enabled, "exit"))
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "use_pipeline_vae_fast_path", _record_gate)
+
+    DiffusionModelRunner.execute_model(runner, req)
+
+    assert gate_calls == [
+        (runner.pipeline, expected_enabled, "enter"),
+        (runner.pipeline, expected_enabled, "exit"),
+    ]
+
+
 class _BatchPipeline:
     """Pipeline returning a configurable list of outputs from forward()."""
 
@@ -576,6 +605,18 @@ def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
     sched = _make_scheduler_output(num_reqs=2)
 
     with pytest.raises(RuntimeError, match="returned 1 outputs for 2 requests"):
+        DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_rejects_mixed_vae_quality() -> None:
+    runner = _make_batch_runner(_BatchPipeline(outputs=[DiffusionOutput(output="a"), DiffusionOutput(output="b")]))
+    sched = _make_scheduler_output(num_reqs=2)
+    sched.scheduled_new_reqs[0].req.sampling_params.quality = "lossless"
+    sched.scheduled_new_reqs[1].req.sampling_params.quality = "high"
+
+    with pytest.raises(RuntimeError, match="cannot mix request quality levels"):
         DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
 
 
@@ -728,6 +769,19 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+    memory_pool_active = False
+    optimization_pool_states = []
+
+    @contextmanager
+    def _memory_pool_context(tag):
+        nonlocal memory_pool_active
+        assert tag == "weights"
+        memory_pool_active = True
+        try:
+            yield
+        finally:
+            memory_pool_active = False
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
@@ -775,16 +829,22 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
+    monkeypatch.setattr(
+        model_runner_module,
+        "optimize_pipeline_vaes",
+        lambda pipeline, od_config: optimization_pool_states.append(memory_pool_active),
+    )
     monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
 
-    DiffusionModelRunner.load_model(runner)
+    DiffusionModelRunner.load_model(runner, memory_pool_context_fn=_memory_pool_context)
 
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+    assert optimization_pool_states == [True]
 
 
 @pytest.mark.core_model

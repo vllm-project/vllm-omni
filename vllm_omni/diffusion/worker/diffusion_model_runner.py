@@ -43,6 +43,10 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.vae_optimizations import (
+    optimize_pipeline_vaes,
+    use_pipeline_vae_fast_path,
+)
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -243,6 +247,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                # Keep precision rematerialization in the tagged weights pool
+                # so sleep level 1 can offload every resulting parameter.
+                optimize_pipeline_vaes(self.pipeline, self.od_config)
         time_after_load = time.perf_counter()
 
         logger.info(
@@ -499,6 +506,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
 
+        quality = getattr(reqs[0].sampling_params, "quality", None)
+        if any(getattr(req.sampling_params, "quality", None) != quality for req in reqs[1:]):
+            raise RuntimeError("A diffusion worker batch cannot mix request quality levels.")
+        use_fast_vae = quality == "high"
+
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
@@ -523,7 +535,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    with use_pipeline_vae_fast_path(self.pipeline, use_fast_vae):
+                        raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
@@ -774,7 +787,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                             if should_decode:
                                 clear_pipeline_stage_durations(self.pipeline)
-                                result = self.pipeline.post_decode(req)
+                                with use_pipeline_vae_fast_path(
+                                    self.pipeline,
+                                    getattr(req.sampling, "quality", None) == "high",
+                                ):
+                                    result = self.pipeline.post_decode(req)
                                 if result is not None:
                                     self._attach_stepwise_metrics(
                                         req,
