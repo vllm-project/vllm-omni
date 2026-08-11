@@ -493,7 +493,8 @@ def test_omni_duplex_expected_audio_turns_accepts_complete_session():
     assert_result(
         {
             "completed": 1,
-            "duplex_session_metrics": [{"audio_turn_count": 4}],
+            "mean_tpot_ms": 12.0,
+            "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
         },
         {"expected_duplex_audio_turns_per_session": 4},
         1,
@@ -507,32 +508,34 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
         assert_result(
             {
                 "completed": 1,
-                "duplex_session_metrics": [{"audio_turn_count": 3}],
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 3, "mean_tpot_ms": 12.0}],
             },
             {"expected_duplex_audio_turns_per_session": 4},
             1,
         )
 
 
-def test_omni_duplex_tpot_requires_global_and_session_metrics():
+def test_omni_duplex_always_requires_tpot_with_session_turns():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
-
-    assert_result(
-        {
-            "completed": 1,
-            "mean_tpot_ms": 12.0,
-            "duplex_session_metrics": [{"mean_tpot_ms": 12.0}],
-        },
-        {"require_duplex_tpot": True},
-        1,
-    )
 
     with pytest.raises(AssertionError, match="Duplex TPOT metric is missing"):
         assert_result(
             {
                 "completed": 1,
-                "duplex_session_metrics": [{"mean_tpot_ms": 12.0}],
+                "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
             },
-            {"require_duplex_tpot": True},
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+    with pytest.raises(AssertionError, match="Duplex session TPOT metrics are missing"):
+        assert_result(
+            {
+                "completed": 1,
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 4}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
             1,
         )

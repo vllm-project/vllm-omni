@@ -170,10 +170,9 @@ def assert_result(result, params, num_prompt) -> None:
             isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
             for metric in session_metrics
         ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
-    if params.get("require_duplex_tpot"):
+        # Duplex Realtime WebSocket CI always records Stage-0 TPOT.
         assert float(result.get("mean_tpot_ms") or 0.0) > 0, "Duplex TPOT metric is missing"
-        session_metrics = result.get("duplex_session_metrics")
-        assert isinstance(session_metrics, list) and all(
+        assert all(
             isinstance(metric, dict) and float(metric.get("mean_tpot_ms") or 0.0) > 0 for metric in session_metrics
         ), "Duplex session TPOT metrics are missing"
 
@@ -230,7 +229,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "eval_phase",
         "trust_remote_code",
         "expected_duplex_audio_turns_per_session",
-        "require_duplex_tpot",
     }
 
     for key, value in params.items():

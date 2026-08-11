@@ -44,19 +44,21 @@ class ChatFallbackProjectorMixin:
                 await self._emit_full_response(session, result, epoch, response_id, send_json)
             if session.epoch == epoch:
                 should_commit = self._should_commit_response_to_history(session, response_id)
+                stage_metrics = session.accumulate_response_stage_metrics(None)
                 committed_message = session.end_response(commit_text=should_commit)
                 if should_commit:
                     session.register_history_item(f"item_{response_id}", committed_message)
-                await send_json(
-                    {
-                        "type": "response.done",
-                        "session_id": session.session_id,
-                        "response_id": response_id,
-                        "epoch": epoch,
-                        "committed": committed_message is not None,
-                        "playback": session.playback.as_dict(),
-                    }
-                )
+                done_event: dict[str, object] = {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": epoch,
+                    "committed": committed_message is not None,
+                    "playback": session.playback.as_dict(),
+                }
+                if stage_metrics:
+                    done_event["vllm_omni"] = {"stage_metrics": stage_metrics}
+                await send_json(done_event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -90,6 +92,8 @@ class ChatFallbackProjectorMixin:
             kwargs["max_tokens"] = response_config.max_tokens
         model_extra = dict(response_config.extra_body)
         model_extra.pop("minicpmo45_native_duplex", None)
+        # Duplex Realtime TTS CI records Stage-0 TPOT from WebSocket events.
+        model_extra.setdefault("return_stage_metrics", True)
         tools = model_extra.pop("realtime_response_tools", model_extra.pop("realtime_tools", None))
         tool_choice = model_extra.pop(
             "realtime_response_tool_choice",
@@ -116,6 +120,29 @@ class ChatFallbackProjectorMixin:
             {"use_tts_template": response_config.use_tts_template},
         )
         return request
+
+    @staticmethod
+    def _stage_metrics_from_chat_payload(payload: dict[str, object]) -> dict[str, object] | None:
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        stage_metrics = metrics.get("stage_metrics")
+        if not isinstance(stage_metrics, dict):
+            return None
+        cleaned = {
+            str(stage_id): dict(values) for stage_id, values in stage_metrics.items() if isinstance(values, dict)
+        }
+        return cleaned or None
+
+    def _attach_chat_stage_metrics(
+        self,
+        event: dict[str, object],
+        session: DuplexSession,
+        payload: dict[str, object],
+    ) -> None:
+        accumulated = session.accumulate_response_stage_metrics(self._stage_metrics_from_chat_payload(payload))
+        if accumulated:
+            event["vllm_omni"] = {"stage_metrics": accumulated}
 
     async def _drain_streaming_response(
         self,
@@ -217,27 +244,27 @@ class ChatFallbackProjectorMixin:
             if isinstance(content, str) and content:
                 if modality == "audio":
                     session.mark_audio_sent()
-                    await send_json(
-                        {
-                            "type": "response.output_audio.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "audio": content,
-                            "format": session.response_config.response_format,
-                        }
-                    )
+                    audio_event: dict[str, object] = {
+                        "type": "response.output_audio.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": epoch,
+                        "audio": content,
+                        "format": session.response_config.response_format,
+                    }
+                    self._attach_chat_stage_metrics(audio_event, session, payload)
+                    await send_json(audio_event)
                 else:
                     session.append_assistant_text(content)
-                    await send_json(
-                        {
-                            "type": "response.text.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "delta": content,
-                        }
-                    )
+                    text_event: dict[str, object] = {
+                        "type": "response.text.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": epoch,
+                        "delta": content,
+                    }
+                    self._attach_chat_stage_metrics(text_event, session, payload)
+                    await send_json(text_event)
 
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None and modality != "audio":

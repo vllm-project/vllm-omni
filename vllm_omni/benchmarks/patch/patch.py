@@ -1741,6 +1741,10 @@ async def async_request_openai_realtime_duplex(
                 # Preserve the benchmark's standard TPOT calculation while
                 # sourcing duplex token timing from Stage 0 engine metrics.
                 output.text_latency = output.ttft + mean_tpot_s * (output.output_tokens - 1)
+            elif output.text_latency <= 0:
+                # Avoid default text_latency=0 producing negative TPOT when
+                # Stage-0 metrics were unavailable for a successful session.
+                output.text_latency = max(output.latency, output.ttft)
             output.tts_turn_pcm_bytes = turn_pcm_bytes
             output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
             if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
