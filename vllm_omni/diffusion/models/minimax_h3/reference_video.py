@@ -44,31 +44,33 @@ def _nearest_multiple(value: float, multiple: int) -> int:
 
 
 def _probe_video(path: str) -> dict[str, Any]:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-count_frames",
-            "-show_entries",
-            (
-                "stream=codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,nb_frames,duration,"
-                "sample_aspect_ratio:format=format_name,size,duration"
-            ),
-            "-of",
-            "json",
-            path,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    show_entries = (
+        "stream=codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,nb_frames,duration,"
+        "sample_aspect_ratio:format=format_name,size,duration"
     )
+    command = ["ffprobe", "-v", "error", "-show_entries", show_entries, "-of", "json", path]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
     probe = json.loads(result.stdout)
     streams = probe.get("streams") or []
     video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
     if not video_streams:
         raise OmniClientError(f"media has no video stream: {path}")
     stream = video_streams[0]
+    raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
+    if raw_count in (None, "", "N/A"):
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", *command[3:]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        probe = json.loads(result.stdout)
+        streams = probe.get("streams") or []
+        video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+        if not video_streams:
+            raise OmniClientError(f"media has no video stream: {path}")
+        stream = video_streams[0]
+        raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
     try:
         numerator, denominator = str(stream["r_frame_rate"]).split("/", 1)
         fps = float(numerator) / float(denominator)
@@ -76,7 +78,6 @@ def _probe_video(path: str) -> dict[str, Any]:
         raise OmniClientError(f"cannot determine video FPS: {path}") from exc
     if not math.isfinite(fps) or fps <= 0:
         raise OmniClientError(f"cannot determine video FPS: {path}")
-    raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
     if raw_count in (None, "", "N/A"):
         raise OmniClientError(f"cannot determine video frame count: {path}")
     raw_duration = stream.get("duration")
