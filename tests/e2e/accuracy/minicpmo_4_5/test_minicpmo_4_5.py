@@ -129,8 +129,8 @@ def _optional_local_videomme_dataset_path() -> str | None:
     """Return an explicit local Video-MME root, or ``None`` to use the Hub default.
 
     Same rule as Daily-Omni / Seed-TTS: only an env-provided existing directory counts as
-    local. Hard-coded workspace paths are intentionally not probed so CI defaults to
-    ``lmms-lab/Video-MME`` via ``--videomme-repo``.
+    local. Hard-coded workspace paths are intentionally not probed so CI defaults to the
+    Hub id in ``VIDEOMME_DEFAULT_HF_REPO`` (``lmms-eval/Video-MME``).
     """
     for key in ("VLLM_VIDEOMME_DATASET_PATH", "VIDEOMME_ROOT"):
         raw = os.environ.get(key, "").strip()

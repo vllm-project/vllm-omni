@@ -16,7 +16,6 @@ import numpy as np
 import soundfile as sf
 import vllm
 from PIL import Image
-from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
@@ -25,8 +24,6 @@ from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
-
-SEED = 42
 
 default_system = (
     "You are MiniCPM-o, a helpful multimodal assistant that can "
@@ -285,27 +282,17 @@ def main(args):
     omni_kwargs["trust_remote_code"] = True
     omni = Omni(**omni_kwargs)
 
-    # Stage 0 (thinker): multimodal understanding → text (+ TTS span when enabled).
-    thinker_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=2048,
-        seed=SEED,
-        detokenize=True,
-        repetition_penalty=1.1,
-    )
-    # Stage 1 (talker + Token2Wav): max_tokens=1 satisfies the scheduler;
-    # waveform is produced in-process by Token2Wav.
-    talker_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=1,
-        seed=SEED,
-        detokenize=False,
-    )
-    sampling_params_list = [thinker_sampling_params, talker_sampling_params][: omni.num_stages]
+    # Per-stage sampling defaults live in the deploy YAML
+    # (``vllm_omni/deploy/minicpmo_4_5*.yaml``, ``default_sampling_params``),
+    # which is the single source of truth that tracks the pipeline topology.
+    # Passing None makes ``resolve_sampling_params_list`` load exactly those,
+    # so adding or removing a stage cannot desynchronize this example.
+    #
+    # This used to hardcode a two-element list built for the old two-stage
+    # topology (thinker → talker+Token2Wav). Since Code2Wav became its own
+    # Stage 2, that list was both the wrong length and wrong in content
+    # (talker ``max_tokens=1`` truncated the codec stream to one frame).
+    sampling_params_list = None
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]

@@ -85,6 +85,9 @@ steps:
         commands:
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:1
+          # Video-MME needs no repo override here: the NPU runners pre-stage the dataset under
+          # the lmms-eval mirror, which is now VIDEOMME_DEFAULT_HF_REPO, so snapshot_download
+          # resolves it straight out of the hub cache.
           - |
             set +e
             pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
@@ -115,6 +118,7 @@ steps:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
+          HF_HUB_OFFLINE: "1"
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |

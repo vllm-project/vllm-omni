@@ -11,7 +11,7 @@ and ``huggingface_hub.snapshot_download`` inside ``resolve_seed_tts_root`` pulls
 
 Video-MME follows the same pattern: an existing local directory via ``VLLM_VIDEOMME_DATASET_PATH`` /
 ``VIDEOMME_ROOT`` (or ``--videomme-dataset-path`` / ``--dataset-path``) wins; otherwise the Hub id
-``lmms-lab/Video-MME`` is used and ``resolve_videomme_root`` downloads parquet + video archives.
+``lmms-eval/Video-MME`` is used and ``resolve_videomme_root`` downloads parquet + video archives.
 
 Use :func:`build_acc_benchmark_cli_argv` to assemble ``argv`` for a live Omni server (host/port/model
 and small bench defaults) before ``parse_args`` / ``run_acc_benchmark`` in the accuracy driver.
@@ -29,7 +29,7 @@ from typing import Any, Protocol
 
 DEFAULT_DAILY_OMNI_HF_REPO = "liarliar/Daily-Omni"
 DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
-DEFAULT_VIDEOMME_HF_REPO = "lmms-lab/Video-MME"
+DEFAULT_VIDEOMME_HF_REPO = "lmms-eval/Video-MME"
 
 
 class OmniBenchServerEndpoint(Protocol):
@@ -122,7 +122,7 @@ def videomme_bench_argv() -> list[str]:
 
     * If ``VLLM_VIDEOMME_DATASET_PATH`` / ``VIDEOMME_ROOT`` names an existing directory,
       use that local mirror as ``--dataset-path``.
-    * Otherwise pass the Hub id (``VLLM_VIDEOMME_REPO`` / ``lmms-lab/Video-MME``); the child
+    * Otherwise pass the Hub id (``VLLM_VIDEOMME_REPO`` / ``lmms-eval/Video-MME``); the child
       bench downloads via ``huggingface_hub.snapshot_download``.
     """
     root = os.environ.get("VLLM_VIDEOMME_DATASET_PATH", "").strip() or os.environ.get("VIDEOMME_ROOT", "").strip()

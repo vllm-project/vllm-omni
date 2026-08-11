@@ -35,7 +35,7 @@ Prerequisites
   the dataset repo with ``--daily-omni-repo`` or ``VLLM_DAILY_OMNI_REPO``; override the tar repo
   with ``VLLM_DAILY_OMNI_MEDIA_REPO`` if needed.
 
-* **Video-MME** — by default ``--dataset-path`` is the Hub id ``lmms-lab/Video-MME`` (override with
+* **Video-MME** — by default ``--dataset-path`` is the Hub id ``lmms-eval/Video-MME`` (override with
   ``--videomme-repo`` / ``VLLM_VIDEOMME_REPO``). The child bench downloads parquet + video archives via
   ``huggingface_hub.snapshot_download`` (needs ``huggingface_hub``, network or HF cache). Pass an
   existing local root with ``--videomme-dataset-path`` / ``VLLM_VIDEOMME_DATASET_PATH`` /
@@ -466,7 +466,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Hugging Face dataset id for Video-MME Hub mode (sets VLLM_VIDEOMME_REPO). "
-        "Default when no local path is set: lmms-lab/Video-MME. "
+        "Default when no local path is set: lmms-eval/Video-MME. "
         "Ignored when a local --videomme-dataset-path / VLLM_VIDEOMME_DATASET_PATH is used.",
     )
     p.add_argument(

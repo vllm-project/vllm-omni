@@ -1,6 +1,6 @@
 """Video-MME dataset loader for vLLM-Omni bench serve.
 
-Video-MME (lmms-lab/Video-MME) is a full-spectrum video MLLM benchmark with
+Video-MME (lmms-eval/Video-MME) is a full-spectrum video MLLM benchmark with
 900 videos / 2,700 MCQ pairs across short / medium / long durations.
 
 This loader follows OpenBMB OmniEvalKit's MiniCPM-o recipe
@@ -55,7 +55,7 @@ _MINICPM_AUDIO_SR = 16000
 # OmniEvalKit MiniCPM ``videomme`` / ``videomme_short`` defaults.
 VIDEOMME_DEFAULT_MAX_FRAMES = 96
 VIDEOMME_SHORT_MAX_FRAMES = 64
-VIDEOMME_DEFAULT_HF_REPO = "lmms-lab/Video-MME"
+VIDEOMME_DEFAULT_HF_REPO = "lmms-eval/Video-MME"
 
 #: Decode forward to reach a target this close, seek to the preceding keyframe beyond it.
 _SEEK_THRESHOLD_S = 3.0
@@ -114,7 +114,7 @@ def _resolve_hf_cache_snapshot(path: Path) -> Path:
 def resolve_videomme_local_root(dataset_path: str | None) -> Path | None:
     """Return a local Video-MME root if ``dataset_path`` points at an on-disk mirror.
 
-    Hub ids such as ``lmms-lab/Video-MME`` return ``None`` (they are not directories).
+    Hub ids such as ``lmms-eval/Video-MME`` return ``None`` (they are not directories).
     """
     raw = (dataset_path or "").strip()
     if not raw:
@@ -173,7 +173,7 @@ def resolve_videomme_root(dataset_path: str | None) -> Path:
     * Existing local directories (absolute or relative) are used as-is.
     * Otherwise ``dataset_path`` is treated as a Hugging Face dataset id and
       downloaded via :func:`ensure_videomme_hub_root` (default
-      ``lmms-lab/Video-MME``).
+      ``lmms-eval/Video-MME``).
     """
     local = resolve_videomme_local_root(dataset_path)
     if local is not None:
