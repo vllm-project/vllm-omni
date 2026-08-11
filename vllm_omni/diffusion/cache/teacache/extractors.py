@@ -1249,6 +1249,152 @@ def extract_sensenova_u1_context(
     )
 
 
+def extract_minimax_h3_context(
+    module: nn.Module,
+    **kwargs: Any,
+) -> CacheContext:
+    """Extract cache context for MiniMaxH3DiTModel.
+
+    Mirrors the packed multimodal forward in ``MiniMaxH3DiTModel.forward``:
+    preprocessing via ``_embed``, cacheable ``blocks`` loop, and
+    ``final_layer`` postprocessing with row selection and update masks.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _BF16_DTYPE,
+        _FORWARD_SUPPORTED_KWARGS,
+        MINIMAX_H3_ADALN_MODALITY_NUM,
+        _modulate_scale_shift,
+        _required_kwarg,
+    )
+
+    if not hasattr(module, "blocks") or len(module.blocks) == 0:
+        raise ValueError("Module must have blocks")
+
+    unexpected = sorted(set(kwargs) - _FORWARD_SUPPORTED_KWARGS)
+    if unexpected:
+        raise TypeError(
+            "MiniMaxH3DiTModel.forward received unexpected kwargs: "
+            f"{unexpected}; supported kwargs: "
+            f"{sorted(_FORWARD_SUPPORTED_KWARGS)}"
+        )
+
+    x = _required_kwarg(kwargs, "x")
+    audio_x = _required_kwarg(kwargs, "audio_x")
+    img_position_ids = _required_kwarg(kwargs, "img_position_ids")
+    unique_timesteps = _required_kwarg(kwargs, "unique_timesteps")
+    inverse_indices = _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
+    update_mask = _required_kwarg(kwargs, "update_mask")
+    token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
+    skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
+    update_audio_mask = kwargs.get("update_audio_mask")
+
+    text_selected = _required_kwarg(kwargs, "prompt_embeds")
+
+    img_pos = module._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
+    audio_pos = module._pos_ids(_required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info")
+    text_pos = module._pos_ids(
+        _required_kwarg(kwargs, "text_pos_info"),
+        "text_pos_info",
+    )
+    infer_out_pos = module._pos_ids(
+        _required_kwarg(kwargs, "img_pos_for_infer_output_info"),
+        "img_pos_for_infer_output_info",
+    )
+
+    psp = _required_kwarg(kwargs, "packed_seq_params")
+    cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
+    max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
+    refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
+    refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+    video_layout = kwargs.get("video_token_layout")
+
+    if x.dim() != 3 or x.shape[0] != 1:
+        raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
+    seq_len = int(x.shape[1])
+    if token_tags.shape[0] != seq_len:
+        raise ValueError(f"token_tags must cover the full packed sequence ({seq_len}), got {token_tags.shape[0]}.")
+    if inverse_indices.shape[0] != seq_len:
+        raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
+    device = x.device
+
+    rope_freqs = module.rope(img_position_ids).to(device)
+
+    decoder_input, t_emb = module._embed(
+        x=x,
+        audio_x=audio_x,
+        text_embeddings_selected=text_selected,
+        unique_timesteps=unique_timesteps.view(-1).to(device),
+        img_pos=img_pos.to(device),
+        audio_pos=audio_pos.to(device),
+        text_pos=text_pos.to(device),
+        refiner_cu_seqlens=refiner_cu.to(device),
+        refiner_max_seqlen=refiner_max,
+        seq_len=seq_len,
+        device=device,
+    )
+
+    combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
+    inverse_indices = inverse_indices.to(device)
+    cu_seqlens = cu_seqlens.to(device)
+
+    shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
+    modulated_hidden = module.blocks[0].norm1(decoder_input)
+    modulated_input = _modulate_scale_shift(
+        modulated_hidden,
+        shift_msa,
+        scale_msa,
+        combined_indices,
+        dtype=_BF16_DTYPE,
+    )
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        hidden, block_rope, block_combined = module.sp_prepare(
+            decoder_input,
+            rope_freqs,
+            combined_indices,
+        )
+        for block in module.blocks:
+            hidden = block(
+                hidden,
+                t_emb=t_emb,
+                combined_indices=block_combined,
+                rope_freqs=block_rope,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=seq_len,
+                video_layout=video_layout,
+            )
+        hidden = module.sp_gather(hidden)
+        return (hidden,)
+
+    def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        video_logits, audio_logits = module.final_layer(
+            hidden,
+            t_emb=t_emb,
+            inverse_indices=inverse_indices,
+        )
+        video_logits = video_logits.index_select(0, infer_out_pos.to(device))
+        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        if not skip_mask_out_condition:
+            mask = update_mask.view(-1).to(device)
+            if mask.shape[0] != video_logits.shape[0]:
+                raise ValueError(f"update_mask length mismatch: {mask.shape[0]} != {video_logits.shape[0]}")
+            video_logits = video_logits * mask.unsqueeze(-1)
+            if update_audio_mask is not None:
+                audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
+        return video_logits, audio_logits
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=decoder_input,
+        encoder_hidden_states=None,
+        temb=t_emb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1265,6 +1411,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
+    "MiniMaxH3DiTModel": extract_minimax_h3_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }

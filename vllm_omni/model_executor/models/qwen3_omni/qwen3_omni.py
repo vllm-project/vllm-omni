@@ -152,6 +152,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            # The outer wrapper exposes talker_mtp for every stage, but only
+            # the talker stage owns the module that the method invokes.
+            self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True

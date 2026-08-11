@@ -17,8 +17,16 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class MingTTSAdapter(ARTTSAdapter):
-    # Detected by model_arch (MingTTSForConditionalGeneration), not stage key.
+    # Ming dense has no dedicated model_stage value, so both stage discovery and
+    # model-type detection go through the architecture. ``ming_flash_omni_tts``
+    # is the model that owns the ``ming_tts`` *stage key*, and is matched first.
     name = "ming_tts"
+    model_archs = frozenset({"MingTTSForConditionalGeneration"})
+    arch_identifies_entry_stage = True
+    # Ming dense deploys its AR stage as the generic ``model_stage="llm"``, so
+    # this is an architecture *fallback*: it must run after every adapter that
+    # owns a real stage key, or it would claim stages those adapters own.
+    detect_priority = 200
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Ming TTS request parameters. Returns error message or None."""

@@ -114,6 +114,90 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_lingbot_extra_registry_declares_request_params() -> None:
+    assert get_extra_body_params("LingBotVideoPipeline") == frozenset(
+        {
+            "batch_cfg",
+            "duration",
+            "flow_shift",
+            "negative_prompt",
+            "null_cond_clone_zero",
+            "offload_vae_during_denoise",
+            "output_type",
+            "refiner_sigma_tail_steps",
+            "resolution",
+            "ratio",
+            "shift",
+            "t_thresh",
+        }
+    )
+    assert get_extra_output_params("LingBotVideoPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lingbot_text_to_image_prompt_builder_preserves_empty_negative_prompt() -> None:
+    assert build_text_to_image_prompt(
+        "LingBotVideoPipeline",
+        prompt="a red fox in fresh snow",
+        negative_prompt="",
+        height=192,
+        width=320,
+    ) == {
+        "prompt": "a red fox in fresh snow",
+        "modalities": ["image"],
+        "negative_prompt": "",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lingbot_image_to_video_prompt_builder() -> None:
+    image = Image.new("RGB", (320, 192), "red")
+    result = build_image_to_video_prompt(
+        "LingBotVideoPipeline",
+        prompt="the fox looks toward the camera",
+        negative_prompt=None,
+        media_inputs={"image": image},
+        height=192,
+        width=320,
+        num_frames=9,
+    )
+    assert result == {
+        "prompt": "the fox looks toward the camera",
+        "modalities": ["video"],
+        "multi_modal_data": {"image": image},
+        "num_frames": 9,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "media_inputs",
+    [
+        {},
+        {"image": "input.png"},
+        {"image": [Image.new("RGB", (16, 16))]},
+        {"image": Image.new("RGB", (16, 16)), "video": b"video"},
+    ],
+    ids=["missing", "path", "multiple", "extra-modality"],
+)
+def test_lingbot_image_to_video_prompt_builder_rejects_invalid_media(
+    media_inputs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="exactly one PIL image"):
+        build_image_to_video_prompt(
+            "LingBotVideoPipeline",
+            prompt="move",
+            negative_prompt=None,
+            media_inputs=media_inputs,
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
 def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_name: str) -> None:
     assert get_extra_body_params(pipeline_name) == frozenset(

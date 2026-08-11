@@ -752,3 +752,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
     )
+    parser.addoption(
+        "--assert-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
+            "(default: off)."
+        ),
+    )

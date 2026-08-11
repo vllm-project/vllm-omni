@@ -188,6 +188,11 @@ def mux_video_audio_bytes(
             raise ValueError("Audio samples were not prepared for muxing.")
         audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
         audio_frame.sample_rate = audio_sample_rate
+        # AAC has a one-frame encoder delay. Mark the input waveform as
+        # starting at t=0 so the MP4 muxer writes the corresponding negative
+        # priming timestamp instead of exposing the delay as leading silence.
+        audio_frame.pts = 0
+        audio_frame.time_base = Fraction(1, audio_sample_rate)
         for packet in a_stream.encode(audio_frame):
             container.mux(packet)
         for packet in a_stream.encode():

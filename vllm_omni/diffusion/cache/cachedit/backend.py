@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import cache_dit
@@ -38,14 +39,27 @@ def _dit_module_names(pipeline: SupportsComponentDiscovery) -> tuple[str, ...]:
     names = getattr(pipeline, "_dit_modules", None)
     if not isinstance(names, (list, tuple)):
         names = ("transformer",)
-    return tuple(name for name in names if isinstance(name, str) and getattr(pipeline, name, None) is not None)
+
+    resolved_names = []
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        try:
+            module = attrgetter(name)(pipeline)
+        except AttributeError:
+            continue
+        if module is not None:
+            resolved_names.append(name)
+    return tuple(resolved_names)
 
 
 def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) -> None:
     """Log Cache-DiT statistics for every transformer on the pipeline."""
 
-    transformers = [getattr(pipeline, name) for name in _dit_module_names(pipeline)]
+    transformers = [attrgetter(name)(pipeline) for name in _dit_module_names(pipeline)]
     for transformer in transformers:
+        if not BlockAdapter.is_cached(transformer):
+            continue
         cache_dit.summary(transformer, details=details)
 
     if not transformers:
@@ -64,7 +78,7 @@ def _make_pipeline_transformer_getter(
     def get_pipeline_transformer(
         pipeline: SupportsComponentDiscovery,
     ) -> nn.Module:
-        return cast(nn.Module, getattr(pipeline, name))
+        return cast(nn.Module, attrgetter(name)(pipeline))
 
     return get_pipeline_transformer
 
@@ -85,19 +99,37 @@ def _build_cache_context_refresh(
         # Cache-DiT has no predefined SCM mask for these small step counts.
         scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
         if projected_config.scm_steps_mask_policy is None or not scm_supported_steps:
+            if projected_config.force_refresh_step_hint is not None:
+                # Cache-DiT's ``once`` policy clears the hint after it fires.
+                # Reapply it at every request boundary so a repeated request
+                # with the same configured policy receives the same behavior.
+                cache_dit.refresh_context(
+                    transformer,
+                    cache_config=DBCacheConfig().reset(
+                        num_inference_steps=num_inference_steps,
+                        force_refresh_step_hint=projected_config.force_refresh_step_hint,
+                        force_refresh_step_policy=projected_config.force_refresh_step_policy,
+                    ),
+                    verbose=verbose,
+                )
+                return
             cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
             return
 
+        refresh_config = DBCacheConfig().reset(
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=projected_config.scm_steps_mask_policy,
+                total_steps=num_inference_steps,
+            ),
+            steps_computation_policy=projected_config.scm_steps_policy,
+        )
+        if projected_config.force_refresh_step_hint is not None:
+            refresh_config.force_refresh_step_hint = projected_config.force_refresh_step_hint
+            refresh_config.force_refresh_step_policy = projected_config.force_refresh_step_policy
         cache_dit.refresh_context(
             transformer,
-            cache_config=DBCacheConfig().reset(
-                num_inference_steps=num_inference_steps,
-                steps_computation_mask=cache_dit.steps_mask(
-                    mask_policy=projected_config.scm_steps_mask_policy,
-                    total_steps=num_inference_steps,
-                ),
-                steps_computation_policy=projected_config.scm_steps_policy,
-            ),
+            cache_config=refresh_config,
             verbose=verbose,
         )
 
@@ -213,19 +245,23 @@ class CacheDiTBackend(CacheBackend):
 
         super().__init__(config)
         self._refresh_funcs: list[RefreshCacheContextFunc] = []
+        self._cache_targets: list[Any] = []
 
     def enable(self, pipeline: SupportsComponentDiscovery) -> None:
         pipeline_name = type(pipeline).__name__
         custom_enabler = CUSTOM_DIT_ENABLERS.get(pipeline_name)
+        self._refresh_funcs = []
+        self._cache_targets = []
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
             self._refresh_funcs = [custom_enabler(pipeline, self.config)]
+            self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
         else:
-            self._refresh_funcs = []
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
                 block_adapter = _maybe_build_block_adapter(pipeline, get_transformer)
                 adapter_cls = _maybe_get_cached_adapter_cls(pipeline, get_transformer)
+                cache_target = get_transformer(pipeline) if block_adapter is None else block_adapter
                 self._refresh_funcs.append(
                     enable_cache_for_dit(
                         pipeline,
@@ -235,11 +271,31 @@ class CacheDiTBackend(CacheBackend):
                         get_transformer,
                     )
                 )
+                self._cache_targets.append(cache_target)
             if not self._refresh_funcs:
                 raise ValueError(f"Pipeline {pipeline_name} has no declared DiT modules for Cache-DiT")
 
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)
+
+    def disable(self, pipeline: SupportsComponentDiscovery) -> None:
+        """Remove Cache-DiT hooks so later requests use native forwards."""
+
+        if not self.enabled:
+            return
+
+        logger.info(
+            "Disabling cache-dit on %d DiT target(s) for %s",
+            len(self._cache_targets),
+            type(pipeline).__name__,
+        )
+        try:
+            for target in self._cache_targets:
+                cache_dit.disable_cache(target)
+        finally:
+            self._refresh_funcs = []
+            self._cache_targets = []
+            self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
         if not self.enabled or not self._refresh_funcs:

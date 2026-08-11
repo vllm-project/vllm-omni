@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import av
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -28,6 +29,7 @@ from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationStatus,
+    VideoParams,
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
@@ -248,6 +250,25 @@ def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
     return mux_video_audio_bytes(frames, fps=8, video_codec_options={"preset": "ultrafast", "threads": "0"})
 
 
+def test_mux_video_audio_marks_aac_priming_timestamp():
+    frames = np.zeros((2, 16, 16, 3), dtype=np.uint8)
+    audio = np.zeros((2, 2048), dtype=np.float32)
+
+    payload = mux_video_audio_bytes(
+        frames,
+        fps=24,
+        audio_waveform=audio,
+        audio_sample_rate=32000,
+        video_codec_options={"preset": "ultrafast", "threads": "0"},
+    )
+
+    with av.open(io.BytesIO(payload)) as container:
+        audio_stream = container.streams.audio[0]
+        first_packet = next(packet for packet in container.demux(audio_stream) if packet.pts is not None)
+
+    assert first_packet.pts < 0
+
+
 def _make_test_video_data_url(size=(32, 24), num_frames=3) -> str:
     encoded = base64.b64encode(_make_test_video_bytes(size, num_frames)).decode("utf-8")
     return f"data:video/mp4;base64,{encoded}"
@@ -438,6 +459,75 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (96, 64)
+
+
+def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
+    image_bytes = _make_test_image_bytes((48, 48))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A bear playing with yarn.",
+            "extra_params": json.dumps({"width": 96, "height": 64}),
+        },
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 48)
+    sampling_params = engine.captured_sampling_params_list[0]
+    assert sampling_params.extra_args["width"] == 96
+    assert sampling_params.extra_args["height"] == 64
+
+
+@pytest.mark.parametrize(
+    ("generation_request", "expected_num_frames", "expected_duration"),
+    [
+        (
+            VideoGenerationRequest(prompt="top-level frames", seconds="5", num_frames=9),
+            9,
+            5.0,
+        ),
+        (
+            VideoGenerationRequest(prompt="nested frames", video_params=VideoParams(num_frames=9)),
+            9,
+            None,
+        ),
+        (
+            VideoGenerationRequest(prompt="seconds only", seconds="5"),
+            120,
+            5.0,
+        ),
+    ],
+)
+def test_video_generation_bridges_request_fields(generation_request, expected_num_frames, expected_duration):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    )
+
+    asyncio.run(handler._run_and_extract(generation_request, "field-bridge"))
+
+    sampling = engine.captured_sampling_params_list[0]
+    # Top-level ``seconds`` bridges into extra_args["duration"]; num_frames is
+    # passed through (or derived as seconds x fps when omitted). No private
+    # provenance channel is injected.
+    assert "_vllm_request_context" not in sampling.extra_args
+    assert sampling.num_frames == expected_num_frames
+    if expected_duration is None:
+        assert "duration" not in sampling.extra_args
+    else:
+        assert sampling.extra_args["duration"] == expected_duration
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
@@ -868,6 +958,7 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
         OmniDiffusionSamplingParams(
             num_inference_steps=4,
             guidance_scale=7.5,
+            quality="high",
             generator_device="cpu",
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
@@ -890,6 +981,7 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_inference_steps == 4
     assert captured.guidance_scale == 7.5
+    assert captured.quality == "high"
     assert captured.generator_device == "cpu"
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
@@ -1445,6 +1537,7 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
+    assert req.quality is None
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
@@ -1464,6 +1557,8 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", frame_interpolation_scale=0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", sound_duration=0)
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", quality="medium")
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -1975,6 +2070,7 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
             "num_inference_steps": "30",
             "guidance_scale": "6.5",
             "seed": "42",
+            "quality": "high",
         },
     )
     assert response.status_code == 200
@@ -1983,6 +2079,7 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.num_inference_steps == 30
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
+    assert captured.quality == "high"
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
@@ -2018,6 +2115,7 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
         OmniDiffusionSamplingParams(
             num_inference_steps=4,
             guidance_scale=7.5,
+            quality="high",
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
             frame_interpolation_scale=0.5,
@@ -2038,6 +2136,7 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_inference_steps == 4
     assert captured.guidance_scale == 7.5
+    assert captured.quality == "high"
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
