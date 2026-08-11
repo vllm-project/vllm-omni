@@ -766,9 +766,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
         self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
-        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
-        )
+        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )

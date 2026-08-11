@@ -18,11 +18,7 @@ def test_qwen3_vl_rmsnorm_uses_common_fused_rmsnorm_contract() -> None:
     )
 
     x_fp32 = x.float()
-    expected = (
-        x_fp32
-        * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + eps)
-        * norm.weight.float()
-    ).to(x.dtype)
+    expected = (x_fp32 * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + eps) * norm.weight.float()).to(x.dtype)
 
     assert isinstance(norm, RMSNorm)
     assert norm.weight.dtype == torch.bfloat16
