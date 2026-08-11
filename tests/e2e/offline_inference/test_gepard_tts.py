@@ -137,6 +137,12 @@ class _Clip(NamedTuple):
 def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
     """Submit every text in one call and return one clip per request.
 
+    Clips come back in COMPLETION order, not submission order: ``Omni.generate``
+    yields each request as the engine finishes it and never sorts, unlike
+    vLLM's ``LLM.generate``. So callers must not pair ``clips[i]`` with
+    ``texts[i]`` — identify a clip by what it contains, or recover the index
+    from the request id, which is prefixed with it.
+
     No SamplingParams on purpose: a caller-supplied object replaces the stage
     defaults rather than merging over them, dropping the pipeline's
     stop_token_ids.

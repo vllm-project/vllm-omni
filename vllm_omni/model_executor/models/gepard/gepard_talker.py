@@ -326,10 +326,14 @@ class GepardTalkerForConditionalGeneration(nn.Module):
     def _gumbel_noise(ref: torch.Tensor, generators: list[torch.Generator | None] | None) -> torch.Tensor:
         """Gumbel noise shaped like ``ref``; row i uses ``generators[i]`` if set.
 
-        A seeded row draws its own noise of a fixed shape, so what a request
-        samples does not depend on which other requests shared its batch. With
-        no seeded row anywhere this is one batched draw from the global RNG,
-        which is the unseeded path.
+        A seeded row draws its own noise of a fixed shape, so the noise a
+        request sees does not depend on which other requests shared its batch.
+        The claim stops there: that noise is added to logits from a batched
+        matmul, which in bf16 is not row-wise reproducible, so a batched
+        request can still sample differently from a solo one -- dropping the
+        noise entirely and forcing argmax does not remove that divergence.
+        With no seeded row anywhere this is one batched draw from the global
+        RNG, which is the unseeded path.
         """
         if not generators or all(g is None for g in generators):
             u = torch.rand_like(ref)

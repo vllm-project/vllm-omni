@@ -520,8 +520,14 @@ def test_different_seeds_produce_different_audio() -> None:
 
 
 def test_a_seeded_request_is_unaffected_by_its_batch() -> None:
-    """Each seeded request draws its own noise, so what it samples cannot
-    depend on who else was scheduled alongside it."""
+    """Each seeded request draws its own noise, so the noise it sees cannot
+    depend on who else was scheduled alongside it.
+
+    The stub backbone is what makes that checkable. A real one is a bf16
+    batched matmul whose rows are not reproducible across batch shapes, so
+    end-to-end batch invariance is not attainable there; this pins the half
+    the model actually controls.
+    """
     torch.testing.assert_close(_run_seeded(1234), _run_seeded(1234, neighbour=True, neighbour_seed=999))
 
 
