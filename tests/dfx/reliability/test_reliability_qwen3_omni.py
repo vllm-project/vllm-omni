@@ -315,11 +315,32 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
     pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
 
 
+def _assert_server_alive_after_fault(host: str, port: int, *, scenario: str) -> None:
+    """#4285: a single-stage engine death must NOT take down the API server.
+
+    The process must stay up and keep answering /health (503 is acceptable —
+    errored but listening). A connection-refused means the server process
+    exited, which is the bug this fix closes.
+    """
+    deadline = time.monotonic() + 15.0
+    responded = False
+    while time.monotonic() < deadline:
+        try:
+            status, _ = get_health_raw(host, port, timeout_sec=5)
+            responded = True
+            assert status in (200, 503), f"[{scenario} alive] unexpected /health status={status}"
+        except Exception as exc:  # noqa: BLE001
+            if _looks_like_server_unreachable(exc):
+                pytest.fail(f"[{scenario} alive] server exited after single-stage OOM (#4285): {exc!r}")
+            raise
+        time.sleep(0.5)
+    assert responded, f"[{scenario} alive] /health never responded after fault"
+
+
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
@@ -386,9 +407,11 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
     assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
 
+    # #4285: a single dead stage must not take the whole API server down.
+    _assert_server_alive_after_fault(host, port, scenario="oom_contract")
+
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
@@ -431,7 +454,6 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
@@ -774,7 +796,11 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
+@pytest.mark.skip(
+    reason="needs request-scoped OOM recovery: under transient pressure the stage "
+    "EngineCore still dies and is evicted (not respawned), so the engine does not "
+    "recover after the hog stops. Out of scope for the #4285 fault-isolation fix."
+)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(

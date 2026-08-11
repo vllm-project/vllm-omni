@@ -283,23 +283,20 @@ blocks — use Ulysses SP (`ring_degree=1`).
 
 ### Which geometries run sparse
 
-Sparsity is only applied when the video segment is a **multiple of 128 rows**, where the row count
-is `latent_t × (height / 32) × (width / 32)`. Otherwise `rf_v2`'s block mask and the kernel's own
-tiling disagree on the block count, and the block straddling the seam mixes video and prefix rows
-that selection may then drop. Any resolution still runs — an unaligned geometry falls back to dense
-attention and logs `RAINFUSION_ATTN staying dense` with the row count it computed — but it gets no
-speedup, so pick an aligned geometry when you want one.
+MindIE-SD rf_v2 handles arbitrary video grids by spatially rearranging video first and, when
+necessary, promoting a real-video suffix to its always-kept prefix segment. It never pads: rf_v2
+does not consume an attention mask for padded keys. The remaining video rows stay sparse, while the
+promoted rows remain visible to every query and key.
 
-Alignment is necessary, not sufficient, for good quality. `rf_v2` groups video positions into 8x8
-spatial tiles (two tiles fill one 128-row block), which is what makes a selected block a compact
-patch of the frame. When the latent `h` or `w` is not a multiple of 8, the leftover rows or columns
-are peeled off and appended as a flat run instead of being tiled, so they get pooled with spatially
-distant positions and selection can no longer rank them meaningfully. This is silent, and invisible
-to a `sparsity=0` check, because a fully populated mask does not care how blocks are grouped.
+For example, MiniMax-H3 at 1344x768 has grid `(62, 24, 42)`: its 62496 video rows leave a 32-row
+128-block residue, and its two non-8-wide latent columns form a 2928-row rearranged suffix.
+MindIE-SD promotes 2976 rows, leaving 59520 sparse rows (`465 × 128`). This keeps the block mask
+and kernel tiling aligned, at the cost of retaining more blocks.
 
-"Multiple of 8" on the latent grid means **width and height that are multiples of 256**. Aligned
-resolutions off that grid still run sparse; they just lose more fidelity at the same `sparsity`,
-which you can buy back with `start_step`.
+8x8-aligned spatial grids remain preferable for performance. A latent `h` or `w` not divisible by 8
+creates an always-kept residual suffix and lowers realized sparsity. "Multiple of 8" on the latent
+grid means **width and height that are multiples of 256**. This path requires a MindIE-SD release
+that implements protected video tails for rf_v2.
 
 ## End-to-End Benchmark (BF16, sm_120 RTX Pro 6000 Blackwell)
 
