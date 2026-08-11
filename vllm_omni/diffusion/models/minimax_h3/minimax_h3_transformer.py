@@ -26,13 +26,15 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -105,6 +107,15 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
+# Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
+# (consumed only via the "laser_input_scale" extra key; other backends and
+# platforms ignore it). The kernel stores unscaled QK^T in an fp16 GM
+# workspace, and H3's outlier activations (per-element amax in the hundreds)
+# push dot products past fp16 max 65504, turning whole 128-row blocks NaN.
+# 256 is a power of two, so pre-dividing q/k/v and the compensating
+# kernel-scale/output multiplies are exact in floating point.
+MINIMAX_H3_LASER_INPUT_SCALE = 256.0
+
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
     if key not in kwargs or kwargs[key] is None:
@@ -132,6 +143,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_pos_for_infer_output_info",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        "video_token_layout",
     }
 )
 
@@ -168,16 +180,11 @@ def _reorder_grouped_qkv_to_qkv(
     )
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
+def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
-    return nn.RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+    return RMSNorm(size, eps=eps, dtype=dtype)
 
 
 def _modulate_scale_shift(
@@ -228,20 +235,6 @@ class MiniMaxH3Rope(nn.Module):
         t_f, h_f, w_f = per_axis.unbind(dim=1)  # each [S, 16]
         half = torch.cat((t_f, h_f, w_f), dim=-1)  # [S, 48]
         return torch.cat((half, half), dim=-1)  # [S, 96]
-
-
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Rotate the first rot_dim head dims; pass the rest through.
-
-    x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
-    are cast to the activation dtype before the elementwise math.
-    """
-    rot_dim = freqs.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)  # [T, 1, rot_dim]
-    sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
-    x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
-    return torch.cat((x_rot, x_pass), dim=-1)
 
 
 class MiniMaxH3TimeEmbedder(nn.Module):
@@ -327,6 +320,8 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        role: str = "self",
+        role_category: str | None = None,
         skip_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -347,8 +342,10 @@ class MiniMaxH3Attention(nn.Module):
         )
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.rot_dim = 6 * arch.rope_inv_freq_len
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
+        self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
         self.out_proj = RowParallelLinear(
             inner_dim,
             arch.hidden_size,
@@ -364,8 +361,26 @@ class MiniMaxH3Attention(nn.Module):
             head_size=self.head_dim,
             softmax_scale=self.softmax_scale,
             causal=False,
+            # Packed rows reach the impl as [B, S, N, D].
+            qkv_layout="BSND",
+            role=role,
+            role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
+            prefix=prefix,
         )
+
+    def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Rotate the first rot_dim head dims; pass the rest through.
+
+        x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
+        are cast to the activation dtype before the elementwise math.
+        """
+        rot_dim = self.rot_dim
+        x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+        cos = torch.cos(freqs).to(x.dtype)  # [T, rot_dim]
+        sin = torch.sin(freqs).to(x.dtype)
+        x_rot = self.rope(x_rot, cos, sin)
+        return torch.cat((x_rot, x_pass), dim=-1)
 
     @torch.compiler.disable
     def _run_packed_attention(
@@ -376,18 +391,36 @@ class MiniMaxH3Attention(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
-        The scalar packed-layout metadata and the CuTe FlashAttention-4 DSL
-        are intentionally opaque to Dynamo. Keeping this boundary narrow lets
-        regional compile fuse projections, norms, RoPE, and the surrounding
-        DiT block without repeatedly graph-breaking inside the FA4 compiler.
+        The scalar packed-layout metadata and backend-specific attention
+        kernels are intentionally opaque to Dynamo. Keeping this boundary
+        narrow lets regional compile fuse projections, norms, RoPE, and the
+        surrounding DiT block without repeated graph breaks.
         """
-        used = int(cu_seqlens[1].item())
-        packed_total = int(cu_seqlens[-1].item())
+        # max_seqlen is already the first (real) packed document length. Do
+        # not read the CUDA cu_seqlens scalars here: this function runs once
+        # per layer and .item() would serialize every attention launch.
+        if not 0 < max_seqlen <= packed_total:
+            raise ValueError(
+                f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
+            )
+        used = min(max_seqlen, packed_total)
         attn_mask = None
-        if used < packed_total:
+        # Ring attention can dispatch to a different implementation from the
+        # configured backend, so the no-mask fast paths are local-only.
+        # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
+        # supports_packed_mask_free: backend consumes the packed metadata
+        # without ever reading attn_mask (CUDA packed varlen, NPU
+        # npu_attn_varlen opt-in with its own fallback rebuild).
+        no_mask = not getattr(self.attention, "use_ring", False) and (
+            self.attention.attn_backend.supports_prefix_kv_slicing
+            or self.attention.attn_backend.supports_packed_mask_free()
+        )
+        if used < packed_total and not no_mask:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -396,7 +429,18 @@ class MiniMaxH3Attention(nn.Module):
                 "cu_seqlens_k": cu_seqlens,
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
+                "valid_kv_length": used,
+                # Opt the NPU flash backend into the packed varlen path so the
+                # quadratic full_qk mask is never materialized. Ring attention
+                # is excluded: it keeps the aligned padding rows for its
+                # fixed-size P2P buffers and still needs the mask.
+                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                # fp16-range protection for the ascend_laser_attention kernel
+                # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
+                # backend/path.
+                "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
             },
+            video_layout=video_layout,
         )
         return self.attention(
             q.unsqueeze(0),
@@ -412,7 +456,9 @@ class MiniMaxH3Attention(nn.Module):
         rope_freqs: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int | None = None,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -436,8 +482,8 @@ class MiniMaxH3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         if rope_freqs is not None:
-            q = _apply_rope(q, rope_freqs)
-            k = _apply_rope(k, rope_freqs)
+            q = self._apply_rope(q, rope_freqs)
+            k = self._apply_rope(k, rope_freqs)
 
         # The packed layout uses a second document for alignment padding.
         # Local/Ulysses backends unpad it, while Ring keeps aligned rows for
@@ -448,6 +494,11 @@ class MiniMaxH3Attention(nn.Module):
             v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            # Before Ulysses, q contains only this rank's row shard. The
+            # backend receives the global sequence after all-to-all, so carry
+            # its Python length explicitly instead of inferring it from q.
+            packed_total=packed_total if packed_total is not None else q.shape[0],
+            video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -558,6 +609,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
             skip_sequence_parallel=True,
         )
         self.mlp = MiniMaxH3MLP(
@@ -627,6 +680,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
+        # The prefix also carries the block index that block-sparse attention
+        # backends match against their skip_layers selector.
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -655,7 +710,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         rope_freqs: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        packed_total: int,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -681,7 +738,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             rope_freqs=rope_freqs,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            packed_total=packed_total,
             sp_seq_lens=sp_seq_lens,
+            video_layout=video_layout,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -814,6 +873,10 @@ class MiniMaxH3DiTModel(nn.Module):
         },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
+    # The checkpoint already stores qkv and the MLP gate/up as single tensors
+    # (see the reordering in load_weights), so there are no unfused names for
+    # quantization or LoRA to map onto. Address the fused layers directly, e.g.
+    # ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
@@ -1080,6 +1143,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+        video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1127,6 +1191,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 rope_freqs=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                packed_total=seq_len,
+                video_layout=video_layout,
             )
         hidden = self.sp_gather(hidden)
 

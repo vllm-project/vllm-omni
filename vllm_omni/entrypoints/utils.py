@@ -16,7 +16,10 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
-from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+from vllm_omni.diffusion.utils.hf_utils import (
+    _looks_like_dreamzero,
+    get_diffusion_model_index,
+)
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -25,6 +28,15 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+
+def is_new_format_deploy_config(path: str | None) -> bool:
+    """Return True when *path* is a deploy YAML (``stages:`` without legacy ``stage_args:``)."""
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        peek = yaml.safe_load(f) or {}
+    return isinstance(peek, dict) and "stages" in peek and "stage_args" not in peek
 
 
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
@@ -74,9 +86,9 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     Returns:
         Model type string if found, None otherwise
     """
-    model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+    model_index = get_diffusion_model_index(model)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
-        logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
+        logger.debug(f"Found Diffusers model type '{model_index['_class_name']}'")
         return model_index["_class_name"]
 
     return None
@@ -278,12 +290,12 @@ def resolve_model_config_path(model: str) -> str | None:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if file_or_path_exists(model, "model_index.json", revision=None):
+        if get_diffusion_model_index(model) is not None:
             model_type = _try_get_class_name_from_diffusers_config(model)
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
-                    f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
+                    "Please ensure its Diffusers pipeline index contains '_class_name'"
                 )
         elif file_or_path_exists(model, "config.json", revision=None):
             # Try to read config.json manually for custom models like Bagel that fail get_config
@@ -308,7 +320,7 @@ def resolve_model_config_path(model: str) -> str | None:
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for model: {model}. "
-                    f"Model is not in standard transformers format and does not have model_index.json. "
+                    "Model is not in standard transformers or Diffusers format. "
                     f"Please ensure the model has proper configuration files with 'model_type' field"
                 )
 
@@ -639,9 +651,7 @@ def load_and_resolve_stage_configs(
                 "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
                 "use --deploy-config. See docs/configuration/stage_configs.md."
             )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
+        if is_new_format_deploy_config(stage_configs_path):
             deploy_config_path = stage_configs_path
             stage_configs_path = None
         else:

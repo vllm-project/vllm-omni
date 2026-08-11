@@ -87,9 +87,8 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion request-level batching controls such as `max_num_seqs` and
-    `request_batch_max_wait_ms`, see
-    [Request-Level Batching](../user_guide/diffusion/request_batching.md).
+    For diffusion request batching, step execution, and streaming controls, see
+    [Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 

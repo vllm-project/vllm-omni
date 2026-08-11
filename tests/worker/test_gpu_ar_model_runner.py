@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from collections.abc import Sequence
 from types import SimpleNamespace
 
@@ -30,6 +31,160 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     )
     runner._request_needs_downstream_stage_payload = lambda rid: rid in downstream_req_ids
     return runner
+
+
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
+    received: dict[str, object] = {}
+
+    def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
+        received.update(
+            input_ids=input_ids.clone(),
+            hidden_states=hidden_states.clone(),
+            req_ids=list(req_ids),
+            req_infos=copy.deepcopy(req_infos),
+        )
+        return torch.tensor([[11, 12, 13]], dtype=torch.long)
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = async_scheduling
+    runner.model = SimpleNamespace(post_sample_talker_mtp=post_sample_talker_mtp)
+    runner.requests = {req_id: SimpleNamespace() for req_id in buffers}
+    runner.model_intermediate_buffer = buffers
+    return runner, received
+
+
+def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=False,
+        buffers={
+            "ready": {"duplex": {"data_plane": True}},
+            "partial-prefill": {
+                "duplex": {"data_plane": True},
+                "codes": {"audio": torch.tensor([[99]])},
+            },
+            "offline": {},
+        },
+    )
+
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["ready", "partial-prefill", "offline"],
+        valid_sampled_token_ids=[[101], [], [102]],
+        sampled_token_ids=torch.tensor([[101], [0], [102]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        ),
+        multimodal_outputs={
+            "codes": {
+                "audio": torch.tensor(
+                    [[70, 71, 72], [80, 81, 82], [90, 91, 92]],
+                    dtype=torch.long,
+                )
+            },
+            "meta": {"source": "temporal"},
+        },
+    )
+
+    assert received["req_ids"] == ["ready"]
+    assert received["input_ids"].tolist() == [101]
+    assert received["hidden_states"].tolist() == [[1.0, 2.0]]
+    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert runner.model_intermediate_buffer["ready"]["codes"]["audio"].tolist() == [[11, 12, 13]]
+    # A partial-prefill row has no sampled token yet. It must not replay the
+    # prior frame's codes into the current connector payload.
+    audio = multimodal["codes"]["audio"]
+    assert audio[0].tolist() == [[11, 12, 13]]
+    assert audio[1].numel() == 0
+    # Mixed batches must retain outputs produced by non-duplex rows.
+    assert audio[2].tolist() == [[90, 91, 92]]
+    assert multimodal["meta"] == {"source": "temporal"}
+
+
+def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=True,
+        buffers={
+            "ready": {"duplex": {"data_plane": True}},
+            "discarded-prefill": {"duplex": {"data_plane": True}},
+        },
+    )
+
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["ready", "discarded-prefill"],
+        valid_sampled_token_ids=[],
+        sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.long),
+        invalid_req_indices=[1],
+        sample_hidden_states=torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+        ),
+        multimodal_outputs=None,
+    )
+
+    assert received["req_ids"] == ["ready"]
+    assert received["input_ids"].tolist() == [101]
+    assert received["hidden_states"].tolist() == [[1.0, 2.0]]
+    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert multimodal["codes"]["audio"][0].tolist() == [[11, 12, 13]]
+    assert multimodal["codes"]["audio"][1].numel() == 0
+
+
+def test_post_sample_talker_mtp_skips_shape_validation_without_duplex_rows() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = False
+    runner.model = SimpleNamespace(
+        post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
+    )
+    runner.model_intermediate_buffer = {"offline": {}}
+    multimodal = {"codes": {"audio": torch.tensor([[7, 8]], dtype=torch.long)}}
+
+    result = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["offline"],
+        valid_sampled_token_ids=[[101, 102]],
+        sampled_token_ids=torch.tensor([[101, 102]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor([[1.0, 2.0]]),
+        multimodal_outputs=multimodal,
+    )
+
+    assert result is multimodal
+
+
+@pytest.mark.parametrize(
+    ("sampled_token_ids", "error_match"),
+    [
+        (torch.tensor([101], dtype=torch.long), "rows do not match requests"),
+        (
+            torch.tensor([[101, 102]], dtype=torch.long),
+            "does not support speculative token rows",
+        ),
+    ],
+)
+def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
+    sampled_token_ids: torch.Tensor,
+    error_match: str,
+) -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = False
+    runner.model = SimpleNamespace(
+        post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
+    )
+    runner.model_intermediate_buffer = {
+        "duplex": {"duplex": {"data_plane": True}},
+    }
+
+    with pytest.raises(ValueError, match=error_match):
+        GPUARModelRunner._run_post_sample_talker_mtp(
+            runner,
+            req_ids=["duplex"],
+            valid_sampled_token_ids=[[101]],
+            sampled_token_ids=sampled_token_ids,
+            invalid_req_indices=[],
+            sample_hidden_states=torch.tensor([[1.0, 2.0]]),
+            multimodal_outputs=None,
+        )
 
 
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):

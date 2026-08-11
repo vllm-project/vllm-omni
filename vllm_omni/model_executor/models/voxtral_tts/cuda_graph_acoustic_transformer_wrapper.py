@@ -74,6 +74,12 @@ class CUDAGraphAcousticTransformerWrapper:
 
         # Pre-create persistent buffers
         self.timesteps = torch.linspace(0, 1, self.n_steps + 1, device=device, dtype=dtype)
+        # Precompute schedule constants (dt, projected time embeddings) so the captured
+        # graph indexes a table instead of re-running them on every replay.
+        self.dts = self.timesteps[1:] - self.timesteps[:-1]
+        with torch.no_grad():
+            t_emb_table = self.acoustic_transformer.time_embedding(self.timesteps.view(-1, 1)).to(dtype)
+            self.t_proj_table = self.acoustic_transformer.time_projection(t_emb_table)
         self.fake_eos_one = torch.tensor(1.0, dtype=dtype, device=device)
         self.fake_eos_zero = torch.tensor(0.0, dtype=dtype, device=device)
 
@@ -142,21 +148,21 @@ class CUDAGraphAcousticTransformerWrapper:
 
         x = noise
 
-        # Pre-compute zero hidden states for unconditional CFG branch
-        hidden_states_zero = torch.zeros_like(hidden_states)
+        # Hoist the step-invariant concat + llm_projection out of the loop; inside the
+        # captured graph these would otherwise be baked in and replayed every step.
+        llm_batched = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=0)  # (2B, D)
+        llm_proj_batched = at.llm_projection(llm_batched)  # (2B, D)
 
         timesteps = self.timesteps
         for i in range(len(timesteps) - 1):
-            t = timesteps[i]
-            dt = timesteps[i + 1] - timesteps[i]
+            dt = self.dts[i]
 
-            # Batch conditional + unconditional velocity in a single forward pass
-            t_emb = at.time_embedding(t.view(-1, 1).repeat(B, 1)).to(hidden_states.dtype)
+            # Batch cond + uncond in a single pass; reuse the cached projected-t_emb row.
+            t_proj = self.t_proj_table[i].unsqueeze(0).expand(B, -1)
             x_batched = torch.cat([x, x], dim=0)  # (2B, C)
-            llm_batched = torch.cat([hidden_states, hidden_states_zero], dim=0)  # (2B, D)
-            t_emb_batched = t_emb.repeat(2, 1)  # (2B, D)
+            t_proj_batched = t_proj.repeat(2, 1)  # (2B, D)
 
-            v_all = at._predict_velocity(x_t=x_batched, llm_output=llm_batched, t_emb=t_emb_batched)
+            v_all = at._predict_velocity(x_t=x_batched, llm_proj=llm_proj_batched, t_proj=t_proj_batched)
             v_t, uncond_v_t = v_all[:B], v_all[B:]
 
             # CFG combination (cfg_alpha is (B, 1), v_t is (B, C))
@@ -237,6 +243,10 @@ class CUDAGraphAcousticTransformerWrapper:
         actual_size = hidden_states.shape[0]
 
         if not self.enabled or not self._warmed_up:
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+
+        # Inner graph replay is illegal during an outer stream capture.
+        if torch.cuda.is_current_stream_capturing():
             return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
 
         padded_size = self._get_padded_size(actual_size)

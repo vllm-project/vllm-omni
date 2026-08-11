@@ -37,6 +37,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "ref_audio_data",
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
+            "initial_user_text",
         }
     )
 
@@ -90,6 +91,9 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        initial_user_text = extra_body.pop("duplex_initial_user_text", None)
+        if isinstance(initial_user_text, str) and initial_user_text:
+            runtime_config["initial_user_text"] = initial_user_text
         cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
 
         ref_audio = config.ref_audio
@@ -108,6 +112,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
                 runtime_config,
                 model_config=model_config,
                 instructions=config.instructions,
+                initial_user_text=initial_user_text,
                 ref_sample_count=None,
             )
             config.extra_body = extra_body
@@ -130,6 +135,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             runtime_config,
             model_config=model_config,
             instructions=config.instructions,
+            initial_user_text=initial_user_text,
             ref_sample_count=len(wav_np),
         )
         config.extra_body = extra_body
@@ -167,6 +173,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         *,
         model_config: Any,
         instructions: object,
+        initial_user_text: object,
         ref_sample_count: int | None,
     ) -> None:
         """Precompute the exact session-context token count for the engine.
@@ -186,6 +193,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             instructions,
             ref_sample_count is not None,
+            initial_user_text,
         )
         try:
             prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)

@@ -91,6 +91,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "MiniMaxH3ModularPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -120,6 +125,11 @@ _DIFFUSION_MODELS = {
         "longcat_image",
         "pipeline_longcat_image",
         "LongCatImagePipeline",
+    ),
+    "LongCatVideoAvatarPipeline": (
+        "longcat_video",
+        "pipeline_longcat_video_avatar",
+        "LongCatVideoAvatarPipeline",
     ),
     "BagelPipeline": (
         "bagel",
@@ -427,9 +437,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         if sp_size <= 1:
             return
 
-        # Find transformer model(s) in the pipeline that have _sp_plan
-        # Include transformer_2 for two-stage models (e.g., Wan MoE)
-        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+        # Prefer the pipeline's declared DiT components so custom component
+        # names receive the same SP hooks as conventional transformer names.
+        transformer_attrs = getattr(model, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
         applied_count = 0
 
         for attr in transformer_attrs:
@@ -508,6 +520,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
@@ -517,6 +530,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
@@ -567,6 +581,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
@@ -578,6 +593,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",

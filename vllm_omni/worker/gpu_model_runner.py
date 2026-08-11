@@ -206,8 +206,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
-        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", None)
+        # Preserve the legacy separate-talker default only when the model has
+        # not declared graph safety. An explicit False must disable wrapping.
+        if talker_mtp_graph_safe is None:
+            talker_mtp_graph_safe = has_separate_talker
+        if cudagraph_mode.has_full_cudagraphs() and talker_mtp_graph_safe:
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
             self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.

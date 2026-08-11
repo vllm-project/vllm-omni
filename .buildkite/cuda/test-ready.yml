@@ -47,15 +47,17 @@ steps:
           - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · Distributed Test"
+      - label: "Diffusion · Distributed & Attention Test"
         source_file_dependencies:
           - tests/diffusion/distributed/
+          - tests/diffusion/attention/test_attention_sp.py
           - vllm_omni/diffusion/distributed/
-          - vllm_omni/diffusion/attention/parallel/
+          - vllm_omni/diffusion/attention/
           - vllm_omni/diffusion/data.py
           - vllm_omni/diffusion/models/
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"
@@ -170,7 +172,7 @@ steps:
             timeout 20m bash -c "
               pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
             "
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Online Test"
         source_file_dependencies:
@@ -181,7 +183,7 @@ steps:
             timeout 20m bash -c "
               pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
             "
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies:
@@ -190,10 +192,10 @@ steps:
           - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
           - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
           - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
-          - tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py
+          - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
-          - tests/helpers/minicpmo_4_5_duplex.py
+          - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
           - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
@@ -208,7 +210,7 @@ steps:
             timeout 20m bash -c "
               pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py -m 'core_model and cuda' --run-level 'core_model'
             "
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
       - label: "TTS · VoxCPM2 Test"
         source_file_dependencies:

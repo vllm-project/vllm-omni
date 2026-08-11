@@ -390,6 +390,105 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
+def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
+    build_adapter,
+):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(
+        stage_id=0,
+        connector_extra={
+            "initial_codec_chunk_frames": 1,
+            "codec_chunk_frames": 5,
+        },
+    )
+    request = _req(
+        "req-personaplex",
+        RequestStatus.WAITING,
+        external_req_id="ext-personaplex",
+    )
+    request.resumable = True
+    request.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, dtype=torch.long).reshape(1, 8),
+        }
+    }
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": True,
+        }
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.codes is None
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
+def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(
+        stage_id=0,
+        connector_extra={
+            "initial_codec_chunk_frames": 1,
+            "codec_chunk_frames": 5,
+        },
+    )
+    request = _req(
+        "req-personaplex-first",
+        RequestStatus.WAITING,
+        external_req_id="ext-personaplex-reused",
+    )
+    request.resumable = True
+    request.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, dtype=torch.long).reshape(1, 8),
+        }
+    }
+
+    first = talker2code2wav_async_chunk(
+        adapter,
+        multimodal_output=None,
+        request=request,
+        is_finished=True,
+    )
+    assert first is not None
+    assert first.codes is None
+
+    adapter.cleanup_sender(request.external_req_id)
+
+    replacement = _req(
+        "req-personaplex-replacement",
+        RequestStatus.WAITING,
+        external_req_id=request.external_req_id,
+    )
+    replacement.resumable = True
+    replacement.additional_information = {
+        "codes": {
+            "audio": torch.arange(8, 16, dtype=torch.long).reshape(1, 8),
+        }
+    }
+    second = talker2code2wav_async_chunk(
+        adapter,
+        multimodal_output=None,
+        request=replacement,
+        is_finished=True,
+    )
+
+    assert second is not None
+    assert second.codes is None
+
+
 def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")

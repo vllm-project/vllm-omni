@@ -69,6 +69,7 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
+    is_new_format_deploy_config,
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
@@ -315,8 +316,16 @@ class AsyncOmniEngine:
             from types import SimpleNamespace
 
             from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
+            model_class_name = resolve_model_class_name(self.model)
+            metadata = get_diffusion_model_metadata(model_class_name)
+            self._diffusion_od_config_view = SimpleNamespace(
+                model_class_name=model_class_name,
+                supports_multimodal_inputs=metadata.supports_multimodal_inputs,
+                max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
+                supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+            )
         return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
@@ -1011,6 +1020,7 @@ class AsyncOmniEngine:
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
+            "task_type": kwargs.get("task_type", None),
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
@@ -1024,6 +1034,7 @@ class AsyncOmniEngine:
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
+            "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"
@@ -1033,6 +1044,7 @@ class AsyncOmniEngine:
             "diffusion_compile_dynamic": (
                 True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
             ),
+            "fa_deterministic": bool(kwargs.get("fa_deterministic", False)),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1182,7 +1194,12 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
-        if stage_configs_path is not None:
+        # Legacy ``stage_args`` YAMLs own per-stage EngineArgs completely, so
+        # strip parent CLI fields. New-format deploy YAMLs (also accepted via
+        # ``--stage-configs-path``) merge CLI overrides the same way as
+        # ``--deploy-config`` — do not strip, or flags like
+        # ``interleave_mm_strings`` / ``media_io_kwargs`` are silently dropped.
+        if stage_configs_path is not None and not is_new_format_deploy_config(stage_configs_path):
             base_kwargs = self._strip_single_engine_args(kwargs)
         else:
             base_kwargs = kwargs
@@ -1394,6 +1411,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1406,6 +1424,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
             message_type="streaming_update",
         )
@@ -1420,6 +1439,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1432,6 +1452,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
         )
 
