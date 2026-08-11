@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import io
 import json
 import math
 import os
 import re
 import struct
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -1537,7 +1539,172 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
-    async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+    def _get_moss_realtime_components(self):
+        """Load the Realtime processor and reference codec on CPU.
+
+        ``MossTTSRealtimeProcessor`` is shipped as a standalone module rather
+        than an AutoProcessor, so the online path must load it explicitly.
+        The standalone reference codec stays on CPU; Stage 1 keeps its
+        independent GPU decoder instance.
+        """
+        cached = getattr(self, "_moss_realtime_components_cache", None)
+        if cached is not None:
+            return cached
+
+        from huggingface_hub import snapshot_download
+        from transformers import AutoModel, AutoTokenizer
+
+        model_id = self.engine_client.model_config.model
+        candidate_path = Path(model_id).expanduser()
+        model_path = (
+            candidate_path.resolve()
+            if candidate_path.is_dir()
+            else Path(
+                snapshot_download(
+                    repo_id=model_id,
+                    revision=getattr(self.engine_client.model_config, "revision", None),
+                )
+            )
+        )
+        processor_path = model_path / "processing_mossttsrealtime.py"
+        if not processor_path.is_file():
+            raise RuntimeError(
+                f"MOSS-TTS-Realtime processor module is missing: {processor_path}"
+            )
+        module_digest = hashlib.sha256(str(processor_path).encode()).hexdigest()[:12]
+        module_name = f"_vllm_omni_moss_tts_realtime_processor_{module_digest}"
+        module = sys.modules.get(module_name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(module_name, processor_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(
+                    f"Cannot load MOSS-TTS-Realtime processor: {processor_path}"
+                )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        processor = module.MossTTSRealtimeProcessor(tokenizer=tokenizer)
+        codec_id = os.environ.get(
+            "MOSS_TTS_CODEC_PATH", "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+        )
+        codec = AutoModel.from_pretrained(codec_id, trust_remote_code=True)
+        codec = codec.to("cpu").eval()
+        cached = (tokenizer, processor, codec, codec_id)
+        self._moss_realtime_components_cache = cached
+        return cached
+
+    @staticmethod
+    def _encode_moss_realtime_wav_sync(
+        codec: Any, wav_list: list[float], sr: int
+    ) -> torch.Tensor:
+        wav = torch.tensor(wav_list, dtype=torch.float32)
+        if sr != 24_000:
+            import torchaudio
+
+            wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, 24_000).squeeze(
+                0
+            )
+        with torch.no_grad():
+            encoded = codec.batch_encode([wav], num_quantizers=16)
+        length = int(encoded.audio_codes_lengths[0].item())
+        codes = encoded.audio_codes[:, 0, :length].transpose(0, 1)
+        codes = codes.detach().to("cpu", dtype=torch.long).contiguous()
+        if codes.ndim != 2 or codes.shape[1] != 16 or codes.shape[0] < 1:
+            raise RuntimeError(
+                f"Invalid MOSS-TTS-Realtime reference codes shape: {tuple(codes.shape)}"
+            )
+        return codes
+
+    async def _encode_moss_realtime_reference(
+        self, ref_audio: str
+    ) -> tuple[Any, Any, torch.Tensor]:
+        wav_list, sr = await self._resolve_ref_audio(ref_audio)
+        tokenizer, processor, codec, codec_id = self._get_moss_realtime_components()
+        artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio)
+        if not artifact_key:
+            raise RuntimeError("MOSS-TTS-Realtime reference identity is unavailable")
+        cache_key = self._speaker_cache.make_cache_key(
+            f"ref:{artifact_key}",
+            model_type=f"moss_tts_realtime:{codec_id}:nq16:sr24000",
+        )
+        cached = self._speaker_cache.get(cache_key)
+        if cached is not None:
+            return tokenizer, processor, cached["codes"].clone()
+
+        inflight = getattr(self, "_moss_realtime_ref_code_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._moss_realtime_ref_code_inflight = inflight
+        task = inflight.get(cache_key)
+        if task is None:
+            encode_lock = getattr(self, "_moss_realtime_encode_lock", None)
+            if encode_lock is None:
+                encode_lock = asyncio.Lock()
+                self._moss_realtime_encode_lock = encode_lock
+
+            async def _encode_and_cache() -> torch.Tensor:
+                async with encode_lock:
+                    already_cached = self._speaker_cache.get(cache_key)
+                    if already_cached is not None:
+                        return already_cached["codes"].clone()
+                    codes = await asyncio.to_thread(
+                        self._encode_moss_realtime_wav_sync,
+                        codec,
+                        wav_list,
+                        sr,
+                    )
+                    self._speaker_cache.put(cache_key, {"codes": codes})
+                    return codes.clone()
+
+            task = asyncio.create_task(_encode_and_cache())
+            inflight[cache_key] = task
+        try:
+            return tokenizer, processor, (await task).clone()
+        finally:
+            if inflight.get(cache_key) is task:
+                inflight.pop(cache_key, None)
+
+    async def _build_moss_realtime_params(
+        self, request: OpenAICreateSpeechRequest
+    ) -> dict[str, Any]:
+        """Build the exact upstream ``(L, 17)`` conditioned prompt grid."""
+        if not request.ref_audio:
+            raise ValueError("MOSS-TTS-Realtime requires ref_audio")
+        tokenizer, processor, audio_tokens = await self._encode_moss_realtime_reference(
+            request.ref_audio
+        )
+        system_grid = processor.make_ensemble(prompt_audio_tokens=audio_tokens.numpy())
+
+        assistant_ids = tokenizer.encode(
+            "<|im_start|>assistant\n", add_special_tokens=False
+        )
+        assistant_grid = np.full((len(assistant_ids), 17), 1024, dtype=np.int64)
+        assistant_grid[:, 0] = assistant_ids
+
+        text_ids = tokenizer.encode(request.input or "", add_special_tokens=False)
+        if not text_ids:
+            raise ValueError("MOSS-TTS-Realtime input produced no text tokens")
+        prefill_text = min(len(text_ids), 12)
+        text_grid = np.full((prefill_text, 17), 1024, dtype=np.int64)
+        text_grid[:, 0] = text_ids[:prefill_text]
+        text_grid[-1, 1] = 1025
+
+        grid = np.concatenate((system_grid, assistant_grid, text_grid), axis=0)
+        params: dict[str, Any] = {
+            "prompt_token_ids": grid[:, 0].tolist(),
+            "codes": {"ref": torch.from_numpy(grid[:, 1:].copy()).to(torch.long)},
+        }
+        if len(text_ids) > prefill_text:
+            params["ids"] = {"all": list(text_ids[prefill_text:])}
+        if request.max_new_tokens is not None:
+            params["max_new_frames"] = [request.max_new_tokens]
+        return params
+
+    async def _build_moss_tts_params(
+        self, request: OpenAICreateSpeechRequest
+    ) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
 
@@ -1569,24 +1736,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
-        # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
-        # ``AutoProcessor.from_pretrained`` doesn't auto-discover
-        # ``MossTTSRealtimeProcessor`` (no ``processor_config.json`` in the
-        # snapshot), and Realtime's prompt format diverges from MossTTSDelay
-        # (16-channel grid, separate per-step text feed). The
-        # ``prompt_audio_array`` shape lines up well enough with what the
-        # talker reads for short prompts; full Realtime support needs a
-        # separate processor.from_module path which we don't wire here.
+        # ---- MOSS-TTS-Realtime: explicit processor + codec path ----
         if v == "realtime":
-            params: dict[str, Any] = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
-            }
-            if request.max_new_tokens is not None:
-                params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            return params
+            return await self._build_moss_realtime_params(request)
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
         # and MOSS-TTS-Local-Transformer-v1.5: call the upstream processor

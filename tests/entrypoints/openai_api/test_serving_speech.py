@@ -1106,6 +1106,62 @@ class TestTTSMethods:
             ref_audio
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
+    def test_encode_moss_realtime_reference_keeps_sixteen_codebooks(self, speech_server, mocker: MockerFixture):
+        codec = mocker.MagicMock()
+        codec.batch_encode.return_value = SimpleNamespace(
+            audio_codes=torch.arange(16 * 3).reshape(16, 1, 3),
+            audio_codes_lengths=torch.tensor([2]),
+        )
+
+        codes = speech_server._encode_moss_realtime_wav_sync(codec, [0.0, 0.25, -0.25], 24000)
+
+        codec.batch_encode.assert_called_once()
+        assert codec.batch_encode.call_args.kwargs == {"num_quantizers": 16}
+        assert codes.shape == (2, 16)
+        assert torch.equal(codes, torch.arange(16 * 3).reshape(16, 3)[:, :2].transpose(0, 1))
+
+    @pytest.mark.asyncio
+    async def test_build_moss_realtime_params_conditions_prompt_on_reference(
+        self, speech_server, mocker: MockerFixture
+    ):
+        tokenizer = mocker.MagicMock()
+
+        def encode(text, *, add_special_tokens):
+            assert add_special_tokens is False
+            if text == "<|im_start|>assistant\n":
+                return [50, 51]
+            assert text == "Hello from Realtime"
+            return list(range(100, 115))
+
+        tokenizer.encode.side_effect = encode
+        processor = mocker.MagicMock()
+        system_grid = np.arange(2 * 17, dtype=np.int64).reshape(2, 17)
+        processor.make_ensemble.return_value = system_grid
+        audio_tokens = torch.arange(3 * 16).reshape(3, 16)
+        mocker.patch.object(
+            speech_server,
+            "_encode_moss_realtime_reference",
+            new=mocker.AsyncMock(return_value=(tokenizer, processor, audio_tokens)),
+        )
+        speech_server._moss_variant = "realtime"
+        request = OpenAICreateSpeechRequest(
+            input="Hello from Realtime",
+            ref_audio="data:audio/wav;base64,ZmFrZQ==",
+            max_new_tokens=96,
+        )
+
+        params = await speech_server._build_moss_tts_params(request)
+
+        np.testing.assert_array_equal(
+            processor.make_ensemble.call_args.kwargs["prompt_audio_tokens"],
+            audio_tokens.numpy(),
+        )
+        assert params["prompt_token_ids"] == [0, 17, 50, 51, *range(100, 112)]
+        assert params["codes"]["ref"].shape == (16, 16)
+        assert params["codes"]["ref"][-1, 0].item() == 1025
+        assert params["ids"] == {"all": [112, 113, 114]}
+        assert params["max_new_frames"] == [96]
+
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
         speech_server._tts_model_type = "qwen3_tts"
