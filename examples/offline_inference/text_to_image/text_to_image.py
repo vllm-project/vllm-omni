@@ -203,14 +203,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=1,
-        help="Number of GPUs to shard weights across for HSDP.",
+        default=None,
+        help=(
+            "Number of GPUs to shard weights across for HSDP. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default) wins."
+        ),
     )
     parser.add_argument(
         "--hsdp-replicate-size",
         type=int,
-        default=1,
-        help="Number of HSDP replica groups.",
+        default=None,
+        help=(
+            "Number of HSDP replica groups. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default) wins."
+        ),
     )
     parser.add_argument(
         "--quantization",
@@ -446,6 +454,12 @@ def main():
     }
     if args.tensor_parallel_size is not None:
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.use_hsdp:
+        omni_kwargs["use_hsdp"] = True
+    if args.hsdp_shard_size is not None:
+        omni_kwargs["hsdp_shard_size"] = args.hsdp_shard_size
+    if args.hsdp_replicate_size is not None:
+        omni_kwargs["hsdp_replicate_size"] = args.hsdp_replicate_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.stage_configs_path:
@@ -477,12 +491,17 @@ def main():
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
+    hsdp_display = args.use_hsdp if args.use_hsdp else "deploy/default"
+    hsdp_shard_display = args.hsdp_shard_size if args.hsdp_shard_size is not None else "deploy/default"
+    hsdp_replicate_display = args.hsdp_replicate_size if args.hsdp_replicate_size is not None else "deploy/default"
     print(
         f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
-        f"enable_expert_parallel={args.enable_expert_parallel}."
+        f"enable_expert_parallel={args.enable_expert_parallel}, "
+        f"use_hsdp={hsdp_display}, hsdp_shard_size={hsdp_shard_display}, "
+        f"hsdp_replicate_size={hsdp_replicate_display}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")

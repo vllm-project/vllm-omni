@@ -26,7 +26,7 @@ Use this recipe when you want a known-good starting point for serving
 
 ## Hardware Support
 
-This recipe currently documents one CUDA GPU serving configuration.
+This recipe documents single CUDA GPU and two CUDA GPU serving configurations.
 
 ## GPU
 
@@ -104,3 +104,39 @@ curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: applicatio
 #### Notes
 
 - Key flags: `--auxiliary-text-encoder` designates the path for the auxiliary text model meta-llama/Llama-3.1-8B-Instruct. For HiDream-I1-Full, unspecified use defaults meta-llama/Llama-3.1-8B-Instruct (downloaded from official Hugging Face), and custom paths are supported.
+
+### 2x A800 80GB (HSDP)
+
+Use HSDP to shard DiT weights across two GPUs when you want lower per-GPU transformer memory without tensor parallelism. HSDP cannot be combined with `--tensor-parallel-size > 1`. The auxiliary Llama-8B and CLIP/T5 encoders remain replicated on each GPU.
+
+#### Command
+
+```bash
+export MODEL_NAME_OR_PATH=HiDream-ai/HiDream-I1-Full
+vllm serve ${MODEL_NAME_OR_PATH} \
+   --omni \
+   --port 8092 \
+   --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
+   --use-hsdp \
+   --hsdp-shard-size 2 \
+   --tensor-parallel-size 1 \
+   --vae_use_slicing \
+   --vae_use_tiling
+```
+
+Offline inference with the same parallelism:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model HiDream-ai/HiDream-I1-Full \
+  --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
+  --seed 42 \
+  --guidance-scale 5.0 \
+  --use-hsdp \
+  --hsdp-shard-size 2 \
+  --tensor-parallel-size 1 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 50 \
+  --auxiliary-text-encoder meta-llama/Llama-3.1-8B-Instruct \
+  --output /tmp/hidream_i1_hsdp.png
+```
