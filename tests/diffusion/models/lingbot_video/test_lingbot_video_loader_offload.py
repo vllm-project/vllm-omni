@@ -11,6 +11,13 @@ from vllm.config.load import LoadConfig
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.fixture(autouse=True)
+def _single_rank_cfg_state(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video
+
+    monkeypatch.setattr(pipeline_lingbot_video, "get_classifier_free_guidance_world_size", lambda: 1)
+
+
 class _TinyComponent(nn.Module):
     def __init__(self, *, dtype: torch.dtype = torch.float32):
         super().__init__()
@@ -72,11 +79,6 @@ def _build_pipeline(
 
     mocker.patch.object(module, "get_local_device", return_value=torch.device("cpu"))
     prefetch = mocker.patch.object(module, "prefetch_subfolders")
-    eager_load = mocker.patch.object(
-        module.LingBotVideoTransformer3DModel,
-        "from_pretrained",
-        side_effect=AssertionError("Transformer eager loading must not be used"),
-    )
     load_config = mocker.patch.object(
         module.LingBotVideoTransformer3DModel,
         "load_config",
@@ -114,7 +116,6 @@ def _build_pipeline(
         revision=revision,
         subfolders=subfolders,
         prefetch=prefetch,
-        eager_load=eager_load,
         load_config=load_config,
         text_encoder_load=text_encoder_load,
         processor_load=processor_load,
@@ -128,7 +129,7 @@ def test_constructor_uses_native_transformer_source_and_component_revision(mocke
     pipeline, calls = _build_pipeline(mocker)
 
     component_subfolders = list(calls.subfolders.values())
-    calls.eager_load.assert_not_called()
+    assert not hasattr(type(pipeline.transformer), "from_pretrained")
     calls.prefetch.assert_called_once_with(
         calls.model,
         local_files_only=False,

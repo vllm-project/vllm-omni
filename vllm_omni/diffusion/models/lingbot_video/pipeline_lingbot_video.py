@@ -23,7 +23,11 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_world_size,
+    get_sp_group,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import (
@@ -76,6 +80,34 @@ logger = init_logger(__name__)
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
 LOW_NOISE_TAIL_V1_DEFAULT_STEPS = 2
+
+
+def _resolve_lingbot_seed(seed: int | None) -> int:
+    """Resolve one request seed and synchronize it across SP/CFG workers."""
+    if seed is not None:
+        return int(seed)
+
+    resolved = int(torch.seed() % torch.iinfo(torch.int64).max)
+    if not torch.distributed.is_initialized():
+        return resolved
+
+    # SP and CFG ranks execute the same request. Broadcast orthogonally so all
+    # ranks in their Cartesian product converge without coupling independent
+    # data-parallel requests through the full DiT group.
+    for get_group in (get_sp_group, get_cfg_group):
+        try:
+            group = get_group()
+        except AssertionError:
+            continue
+        if group.world_size > 1:
+            resolved = int(
+                group.broadcast_object(
+                    resolved if group.rank_in_group == 0 else None,
+                    src=0,
+                )
+            )
+    return resolved
+
 
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nGiven a user input that may include a text prompt alone, "
@@ -601,7 +633,10 @@ class LingBotVideoPipeline(
             TransformerConfig.from_dict(transformer_config),
             LingBotVideoTransformer3DModel,
         )
-        self.transformer = LingBotVideoTransformer3DModel(**transformer_kwargs)
+        self.transformer = LingBotVideoTransformer3DModel(
+            **transformer_kwargs,
+            prefix="transformer",
+        )
         self.transformer.to(dtype=transformer_dtype)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -627,7 +662,10 @@ class LingBotVideoPipeline(
                     TransformerConfig.from_dict(refiner_transformer_config),
                     LingBotVideoTransformer3DModel,
                 )
-                self.refiner_transformer = LingBotVideoTransformer3DModel(**refiner_transformer_kwargs)
+                self.refiner_transformer = LingBotVideoTransformer3DModel(
+                    **refiner_transformer_kwargs,
+                    prefix="refiner_transformer",
+                )
                 self.refiner_transformer.to(dtype=transformer_dtype)
                 self.refiner_scheduler = FlowUniPCMultistepScheduler.from_pretrained(
                     refiner_model,
@@ -1510,7 +1548,7 @@ class LingBotVideoPipeline(
         if isinstance(generator, list):
             generator = generator[0] if generator else None
         if generator is None:
-            seed = int(sampling.seed) if sampling.seed is not None else int(torch.seed())
+            seed = _resolve_lingbot_seed(sampling.seed)
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
         sampling.height = request_config.height

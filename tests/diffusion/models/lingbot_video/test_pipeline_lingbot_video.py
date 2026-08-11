@@ -44,6 +44,55 @@ def _make_request_batch(prompt, **sampling_overrides):
     return DiffusionRequestBatch([request])
 
 
+class _SeedGroup:
+    def __init__(self, *, rank_in_group, broadcast_value):
+        self.world_size = 2
+        self.rank_in_group = rank_in_group
+        self.broadcast_value = broadcast_value
+        self.calls = []
+
+    def broadcast_object(self, value, *, src):
+        self.calls.append((value, src))
+        return self.broadcast_value
+
+
+def test_seed_resolution_preserves_explicit_seed_without_collectives(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    monkeypatch.setattr(torch, "seed", lambda: pytest.fail("explicit seeds must not be regenerated"))
+    monkeypatch.setattr(
+        torch.distributed,
+        "is_initialized",
+        lambda: pytest.fail("explicit seeds must not inspect distributed state"),
+    )
+
+    assert module._resolve_lingbot_seed(1234) == 1234
+
+
+def test_seed_resolution_uses_local_random_seed_without_distributed_runtime(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    monkeypatch.setattr(torch, "seed", lambda: 1234)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert module._resolve_lingbot_seed(None) == 1234
+
+
+def test_seed_resolution_broadcasts_across_sp_then_cfg(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    sp_group = _SeedGroup(rank_in_group=1, broadcast_value=111)
+    cfg_group = _SeedGroup(rank_in_group=1, broadcast_value=111)
+    monkeypatch.setattr(torch, "seed", lambda: 999)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(module, "get_sp_group", lambda: sp_group)
+    monkeypatch.setattr(module, "get_cfg_group", lambda: cfg_group)
+
+    assert module._resolve_lingbot_seed(None) == 111
+    assert sp_group.calls == [(None, 0)]
+    assert cfg_group.calls == [(None, 0)]
+
+
 def test_lingbot_video_pipeline_import_and_registry():
     from vllm_omni.diffusion.models.lingbot_video import (
         LingBotVideoPipeline,
